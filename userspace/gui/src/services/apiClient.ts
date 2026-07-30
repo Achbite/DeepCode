@@ -251,10 +251,14 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
 }
 
 /** 通用 GET 包装 */
-async function getJson<T>(url: string): Promise<ApiResponse<T>> {
+async function getJson<T>(
+  url: string,
+  signal?: AbortSignal
+): Promise<ApiResponse<T>> {
   try {
     const response = await fetch(url, {
       headers: getHostAdmissionHeaders(),
+      signal,
     });
     if (!response.ok) {
       return {
@@ -668,12 +672,14 @@ export function getCurrentAgentSession(
 }
 
 export function activateAgentSession(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
   return sendJson<AgentSessionResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/activate`,
     'POST',
-    {}
+    {},
+    { signal }
   );
 }
 
@@ -767,18 +773,22 @@ export async function deleteAgentSession(
 }
 
 export function getAgentSession(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
   return getJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`,
+    signal
   );
 }
 
 export function getAgentTimeline(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentTimelineResult>> {
   return getJson<AgentTimelineResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`,
+    signal
   );
 }
 
@@ -794,10 +804,12 @@ export function startAgentRun(
 
 export function getAgentRun(
   sessionId: string,
-  runId: string
+  runId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentRunResult>> {
   return getJson<AgentRunResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
+    signal
   );
 }
 

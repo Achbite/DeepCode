@@ -387,9 +387,10 @@ export function getCurrentAgentSession(
 }
 
 export function activateAgentSession(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
-  return api.activateAgentSession(sessionId);
+  return api.activateAgentSession(sessionId, signal);
 }
 
 export function renameAgentSession(
@@ -449,12 +450,18 @@ export function deleteAgentSession(
   return api.deleteAgentSession(sessionId);
 }
 
-export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
-  return api.getAgentSession(sessionId);
+export function getAgentSession(
+  sessionId: string,
+  signal?: AbortSignal
+): Promise<ApiResponse<AgentSessionResult>> {
+  return api.getAgentSession(sessionId, signal);
 }
 
-export function getAgentTimeline(sessionId: string) {
-  return api.getAgentTimeline(sessionId);
+export function getAgentTimeline(
+  sessionId: string,
+  signal?: AbortSignal
+) {
+  return api.getAgentTimeline(sessionId, signal);
 }
 
 export function startAgentRun(
@@ -466,9 +473,10 @@ export function startAgentRun(
 
 export function getAgentRun(
   sessionId: string,
-  runId: string
+  runId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.getAgentRun(sessionId, runId);
+  return api.getAgentRun(sessionId, runId, signal);
 }
 
 export function streamAgentRun(

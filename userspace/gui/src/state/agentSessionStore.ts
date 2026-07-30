@@ -114,11 +114,62 @@ type Store = AgentSessionState & AgentSessionActions;
 interface ActiveAgentRunIdentity {
   hostRunId: string;
   kernelRunId?: string;
+  timelineRevision: number;
 }
 
 const activeAgentRunIds = new Map<string, ActiveAgentRunIdentity>();
 const workspaceTreeRevisionBySession = new Map<string, number>();
 const MAX_AGENT_INPUT_ATTACHMENTS_V2 = 32;
+const CANONICAL_PROGRESS_REFRESH_INTERVAL_MS = 300;
+const CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS = 5_000;
+const CANONICAL_PROGRESS_TRAILING_ATTEMPTS = 3;
+
+interface CanonicalProgressWatcher {
+  readonly sessionId: string;
+  acquire: () => () => Promise<void>;
+  stop: () => void;
+}
+
+const canonicalProgressWatchers =
+  new Map<string, CanonicalProgressWatcher>();
+const canonicalTimelineFetches =
+  new Map<string, ReturnType<typeof getAgentTimeline>>();
+const canonicalTimelineStaleSessions = new Set<string>();
+const canonicalTimelineGenerations = new Map<string, number>();
+let agentSessionActivationGeneration = 0;
+let settledAgentSessionActivationGeneration = 0;
+let agentSessionActivationQueue: Promise<void> = Promise.resolve();
+
+function markCanonicalTimelineStale(sessionId: string): void {
+  canonicalTimelineGenerations.set(
+    sessionId,
+    (canonicalTimelineGenerations.get(sessionId) ?? 0) + 1
+  );
+  canonicalTimelineStaleSessions.add(sessionId);
+}
+
+function currentTimelineRevision(sessionId: string): number {
+  const timeline = useAgentSessionStore.getState().timeline;
+  return timeline?.sessionId === sessionId
+    ? timeline.revision ?? 0
+    : 0;
+}
+
+function hostObservedRunIdentity(
+  sessionId: string,
+  hostRunId: string,
+  previous?: ActiveAgentRunIdentity,
+  timelineRevisionFloor = 0
+): ActiveAgentRunIdentity {
+  if (previous?.hostRunId === hostRunId) return { ...previous };
+  return {
+    hostRunId,
+    timelineRevision: Math.max(
+      timelineRevisionFloor,
+      currentTimelineRevision(sessionId)
+    ),
+  };
+}
 
 function createLocalEvent(
   sessionId: string,
@@ -489,13 +540,99 @@ function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentE
   return [...byId.values()].sort((left, right) => (left.ts ?? '').localeCompare(right.ts ?? ''));
 }
 
+function boundedAgentSessionRequest(
+  sessionId: string
+): ReturnType<typeof getAgentSession> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS
+  );
+  return getAgentSession(sessionId, controller.signal).finally(() => {
+    window.clearTimeout(timeout);
+  });
+}
+
+function boundedAgentTimelineRequest(
+  sessionId: string
+): ReturnType<typeof getAgentTimeline> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS
+  );
+  return getAgentTimeline(sessionId, controller.signal).finally(() => {
+    window.clearTimeout(timeout);
+  });
+}
+
+function boundedAgentRunRequest(
+  sessionId: string,
+  runId: string
+): ReturnType<typeof getAgentRun> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS
+  );
+  return getAgentRun(sessionId, runId, controller.signal).finally(() => {
+    window.clearTimeout(timeout);
+  });
+}
+
+function boundedAgentSessionActivationRequest(
+  sessionId: string
+): ReturnType<typeof activateAgentSession> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS
+  );
+  return activateAgentSession(sessionId, controller.signal).finally(() => {
+    window.clearTimeout(timeout);
+  });
+}
+
 async function refreshCanonicalTimeline(
   sessionId: string,
-  preservePlayback: boolean
-): Promise<void> {
-  const result = await getAgentTimeline(sessionId);
-  if (!result.ok || !result.data) return;
-  if (useAgentSessionStore.getState().session?.id !== sessionId) return;
+  preservePlayback: boolean,
+  forceFresh = false
+): Promise<boolean> {
+  const staleAtStart = canonicalTimelineStaleSessions.has(sessionId);
+  const refreshGeneration =
+    canonicalTimelineGenerations.get(sessionId) ?? 0;
+  if (forceFresh) {
+    const existing = canonicalTimelineFetches.get(sessionId);
+    if (existing) {
+      try {
+        await existing;
+      } catch {
+        // A trailing refresh still needs a new request after a failed or stale
+        // in-flight fetch.
+      }
+      if (canonicalTimelineFetches.get(sessionId) === existing) {
+        canonicalTimelineFetches.delete(sessionId);
+      }
+    }
+  }
+  let request = canonicalTimelineFetches.get(sessionId);
+  if (!request) {
+    const created = boundedAgentTimelineRequest(sessionId);
+    request = created;
+    canonicalTimelineFetches.set(sessionId, created);
+    const clear = () => {
+      if (canonicalTimelineFetches.get(sessionId) === created) {
+        canonicalTimelineFetches.delete(sessionId);
+      }
+    };
+    void created.then(clear, clear);
+  }
+  const result = await request;
+  if (!result.ok || !result.data) {
+    canonicalTimelineStaleSessions.add(sessionId);
+    return false;
+  }
+  if (useAgentSessionStore.getState().session?.id !== sessionId) return true;
   const incomingTimeline = result.data;
   let nextTimeline: AgentTimelineResult | null = null;
   useAgentSessionStore.setState((state) => {
@@ -513,34 +650,213 @@ async function refreshCanonicalTimeline(
   });
   if (nextTimeline) {
     refreshWorkspaceTreeForTimeline(nextTimeline);
-    await refreshActiveAgentRunIdentity(nextTimeline);
+    if (!await refreshActiveAgentRunIdentity(nextTimeline)) {
+      canonicalTimelineStaleSessions.add(sessionId);
+      return false;
+    }
+  } else {
+    canonicalTimelineStaleSessions.add(sessionId);
+    return false;
   }
+  if (
+    (canonicalTimelineGenerations.get(sessionId) ?? 0)
+      !== refreshGeneration
+    || (staleAtStart && !forceFresh)
+  ) {
+    return false;
+  }
+  canonicalTimelineStaleSessions.delete(sessionId);
+  return true;
+}
+
+function startCanonicalProgressWatcher(
+  sessionId: string
+): () => Promise<void> {
+  const existing = canonicalProgressWatchers.get(sessionId);
+  if (existing) return existing.acquire();
+
+  let stopped = false;
+  let consumers = 0;
+  let refreshInFlight: Promise<boolean> | undefined;
+  let releaseInFlight: Promise<void> | undefined;
+  let timer: number | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const isActiveSession = () =>
+    !stopped
+    && useAgentSessionStore.getState().session?.id === sessionId;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timer = undefined;
+    }
+    unsubscribe?.();
+    unsubscribe = undefined;
+    if (canonicalProgressWatchers.get(sessionId) === watcher) {
+      canonicalProgressWatchers.delete(sessionId);
+    }
+  };
+  const refreshSessionEvents = async (): Promise<boolean> => {
+    const current = await boundedAgentSessionRequest(sessionId);
+    if (!current.ok || !current.data) return false;
+    if (!isActiveSession()) return true;
+    useAgentSessionStore.setState((state) => {
+      if (state.session?.id !== sessionId || !isActiveSession()) return state;
+      const events = mergeEventsById(state.events, current.data!.events);
+      return {
+        session: current.data!.session,
+        events,
+        pendingPermission: findLatestPendingPermission(events),
+      };
+    });
+    return true;
+  };
+  const refresh = async (forceFresh = false): Promise<boolean> => {
+    if (!isActiveSession()) return true;
+    if (refreshInFlight) return refreshInFlight;
+    const current = Promise.allSettled([
+      refreshSessionEvents(),
+      refreshCanonicalTimeline(sessionId, true, forceFresh),
+    ]).then((results) => results.every(
+      (result) => result.status === 'fulfilled' && result.value
+    ));
+    refreshInFlight = current;
+    try {
+      await current;
+    } finally {
+      if (refreshInFlight === current) {
+        refreshInFlight = undefined;
+      }
+      if (consumers > 0 && isActiveSession()) {
+        timer = window.setTimeout(() => {
+          timer = undefined;
+          void refresh();
+        }, CANONICAL_PROGRESS_REFRESH_INTERVAL_MS);
+      }
+    }
+    return current;
+  };
+  const schedule = () => {
+    if (stopped || consumers === 0 || refreshInFlight || timer !== undefined) {
+      return;
+    }
+    if (isActiveSession()) void refresh();
+  };
+  const releaseWhenUnused = (): Promise<void> => {
+    if (releaseInFlight) return releaseInFlight;
+    const current = (async () => {
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+      const pendingRefresh = refreshInFlight;
+      if (pendingRefresh) await pendingRefresh;
+      if (consumers > 0) {
+        schedule();
+        return;
+      }
+      if (!isActiveSession()) {
+        stop();
+        return;
+      }
+      for (
+        let attempt = 0;
+        attempt < CANONICAL_PROGRESS_TRAILING_ATTEMPTS;
+        attempt += 1
+      ) {
+        if (consumers > 0 || !isActiveSession()) break;
+        if (await refresh(true)) break;
+        if (attempt + 1 < CANONICAL_PROGRESS_TRAILING_ATTEMPTS) {
+          await sleep(CANONICAL_PROGRESS_REFRESH_INTERVAL_MS);
+        }
+      }
+      if (consumers === 0) {
+        stop();
+      } else {
+        schedule();
+      }
+    })().catch(() => {
+      if (consumers === 0) stop();
+    });
+    releaseInFlight = current;
+    const finish = () => {
+      if (releaseInFlight === current) {
+        releaseInFlight = undefined;
+      }
+      if (!stopped && consumers === 0) {
+        void releaseWhenUnused();
+      }
+    };
+    void current.then(finish, finish);
+    return current;
+  };
+  const watcher: CanonicalProgressWatcher = {
+    sessionId,
+    acquire: () => {
+      if (stopped) return async () => {};
+      consumers += 1;
+      schedule();
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        consumers -= 1;
+        if (consumers > 0) return;
+        await releaseWhenUnused();
+      };
+    },
+    stop,
+  };
+  canonicalProgressWatchers.set(sessionId, watcher);
+  unsubscribe = useAgentSessionStore.subscribe((state) => {
+    if (state.session?.id === sessionId) {
+      schedule();
+      return;
+    }
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timer = undefined;
+    }
+  });
+  return watcher.acquire();
 }
 
 async function refreshActiveAgentRunIdentity(
   timeline: AgentTimelineResult
-): Promise<void> {
+): Promise<boolean> {
   const runProjection = timeline.runProjection;
   const routeRunId = runProjection?.runId.trim();
-  if (!runProjection || !routeRunId) return;
-  const knownIdentity = activeAgentRunIds.get(timeline.sessionId);
+  if (!runProjection || !routeRunId) {
+    return !activeAgentRunIds.has(timeline.sessionId);
+  }
+  const timelineRevision = timeline.revision ?? 0;
+  let knownIdentity = activeAgentRunIds.get(timeline.sessionId);
   if (
     knownIdentity?.kernelRunId
     && knownIdentity.kernelRunId !== routeRunId
   ) {
-    return;
+    if (timelineRevision <= knownIdentity.timelineRevision) return false;
+    replaceActiveAgentRunIdentityIfCurrent(
+      timeline.sessionId,
+      knownIdentity,
+      null
+    );
+    knownIdentity = undefined;
   }
-  const projectionTerminal =
-    runProjection.status === 'succeeded'
-    || runProjection.status === 'cancelled';
-  const current = await getAgentRun(timeline.sessionId, routeRunId);
-  if (!current.ok || !current.data) return;
-  if (activeAgentRunIds.get(timeline.sessionId) !== knownIdentity) return;
+  const current = await boundedAgentRunRequest(
+    timeline.sessionId,
+    routeRunId
+  );
+  if (!current.ok || !current.data) return false;
+  if (activeAgentRunIds.get(timeline.sessionId) !== knownIdentity) return true;
   if (
     knownIdentity
+    && !knownIdentity.kernelRunId
     && current.data.run.runId !== knownIdentity.hostRunId
+    && timelineRevision <= knownIdentity.timelineRevision
   ) {
-    return;
+    return false;
   }
   const latestTimeline = useAgentSessionStore.getState().timeline;
   const latestRunId = latestTimeline?.runProjection?.runId.trim();
@@ -549,11 +865,10 @@ async function refreshActiveAgentRunIdentity(
     && latestRunId
     && latestRunId !== routeRunId
   ) {
-    return;
+    return true;
   }
   if (
-    projectionTerminal
-    || isTerminalRunStatus(current.data.run.status)
+    isTerminalRunStatus(current.data.run.status)
   ) {
     replaceActiveAgentRunIdentityIfCurrent(
       timeline.sessionId,
@@ -567,9 +882,11 @@ async function refreshActiveAgentRunIdentity(
       {
         hostRunId: current.data.run.runId,
         kernelRunId: routeRunId,
+        timelineRevision,
       }
     );
   }
+  return true;
 }
 
 function refreshWorkspaceTreeForTimeline(timeline: AgentTimelineResult): void {
@@ -623,13 +940,22 @@ async function startAndWaitAgentRun(
     onEvents?: (events: AgentEvent[]) => void;
   } = {}
 ): Promise<AgentRunResult> {
+  const timelineRevisionFloor = currentTimelineRevision(sessionId);
   const started = await startAgentRun(sessionId, request);
   if (!started.ok || !started.data) {
     throw new Error(started.message ?? started.error ?? 'Shared session run start failed');
   }
   let result = started.data;
   const runId = result.run.runId;
-  publishActiveAgentRunIdentity(sessionId, { hostRunId: runId });
+  publishActiveAgentRunIdentity(
+    sessionId,
+    hostObservedRunIdentity(
+      sessionId,
+      runId,
+      undefined,
+      timelineRevisionFloor
+    )
+  );
   handlers.onEvents?.(result.events);
   const controller = new AbortController();
   let lastEventCount = result.events.length;
@@ -688,7 +1014,10 @@ async function startAndWaitAgentRun(
       if (!terminalStreamObserved) {
         await Promise.race([sleep(300), terminalStreamEvent]);
       }
-      const current = await getAgentRun(result.run.sessionId, result.run.runId);
+      const current = await boundedAgentRunRequest(
+        result.run.sessionId,
+        result.run.runId
+      );
       if (!current.ok || !current.data) {
         throw new Error(current.message ?? current.error ?? 'Shared session run refresh failed');
       }
@@ -708,7 +1037,7 @@ async function startAndWaitAgentRun(
     await streamDone;
     if (
       activeAgentRunIds.get(sessionId)?.hostRunId === runId
-      && result.run.status !== 'waiting'
+      && isTerminalRunStatus(result.run.status)
     ) {
       clearActiveAgentRunIdentityByHostRunId(sessionId, runId);
     }
@@ -897,45 +1226,82 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   },
 
   activateSession: async (sessionId) => {
-    if (get().session?.id === sessionId) return;
+    if (
+      get().session?.id === sessionId
+      && settledAgentSessionActivationGeneration
+        === agentSessionActivationGeneration
+    ) {
+      return;
+    }
+    const activationGeneration = ++agentSessionActivationGeneration;
     set({ loading: true, errorMessage: null });
-    try {
-      const result = await activateAgentSession(sessionId);
-      if (result.ok && result.data) {
-        const timelineResult = await getAgentTimeline(result.data.session.id);
-        const timeline = timelineResult.ok && timelineResult.data
-          ? timelineAsReplay(timelineResult.data)
-          : emptyTimeline(result.data.session.id);
-        await refreshActiveAgentRunIdentity(timeline);
-        const restoredAttachments = restoredSessionAttachmentState(
-          result.data.events,
-          result.data.session.id
-        );
+    const activate = async () => {
+      if (activationGeneration !== agentSessionActivationGeneration) return;
+      try {
+        const result = await boundedAgentSessionActivationRequest(sessionId);
+        if (activationGeneration !== agentSessionActivationGeneration) return;
+        if (result.ok && result.data) {
+          const timelineGeneration =
+            canonicalTimelineGenerations.get(sessionId) ?? 0;
+          const timelineResult = await boundedAgentTimelineRequest(
+            result.data.session.id
+          );
+          if (activationGeneration !== agentSessionActivationGeneration) return;
+          const timeline = timelineResult.ok && timelineResult.data
+            ? timelineAsReplay(timelineResult.data)
+            : emptyTimeline(result.data.session.id);
+          const identityReady = timelineResult.ok && timelineResult.data
+            ? await refreshActiveAgentRunIdentity(timeline)
+            : false;
+          if (activationGeneration !== agentSessionActivationGeneration) return;
+          const canonicalReady = identityReady
+            && (canonicalTimelineGenerations.get(sessionId) ?? 0)
+              === timelineGeneration;
+          if (canonicalReady) {
+            canonicalTimelineStaleSessions.delete(sessionId);
+          } else {
+            markCanonicalTimelineStale(sessionId);
+          }
+          const restoredAttachments = restoredSessionAttachmentState(
+            result.data.events,
+            result.data.session.id
+          );
+          set({
+            session: result.data.session,
+            localWorkspaceScopeKey: currentWorkspaceScopeKey(),
+            currentSessionId: result.data.session.id,
+            events: result.data.events,
+            timeline,
+            profileId: result.data.session.profileId,
+            pendingPermission: findLatestPendingPermission(result.data.events),
+            resolvingPermission: null,
+            resolvingPlan: null,
+            messageAttachments: [],
+            sessionAttachments: restoredAttachments.sessionAttachments,
+            errorMessage: canonicalReady
+              ? restoredAttachments.attachmentError
+              : 'Canonical Session timeline is unavailable; refresh before sending guidance.',
+            loading: false,
+          });
+          settledAgentSessionActivationGeneration = activationGeneration;
+          void get().refreshSessions();
+          return;
+        }
         set({
-          session: result.data.session,
-          localWorkspaceScopeKey: currentWorkspaceScopeKey(),
-          currentSessionId: result.data.session.id,
-          events: result.data.events,
-          timeline,
-          profileId: result.data.session.profileId,
-          pendingPermission: findLatestPendingPermission(result.data.events),
-          resolvingPermission: null,
-          resolvingPlan: null,
-          messageAttachments: [],
-          sessionAttachments: restoredAttachments.sessionAttachments,
-          errorMessage: restoredAttachments.attachmentError,
+          errorMessage: result.message ?? 'Agent session activate failed',
           loading: false,
         });
-        void get().refreshSessions();
-        return;
+      } catch (err) {
+        if (activationGeneration !== agentSessionActivationGeneration) return;
+        set({
+          errorMessage: err instanceof Error ? err.message : String(err),
+          loading: false,
+        });
       }
-      set({ errorMessage: result.message ?? 'Agent session activate failed', loading: false });
-    } catch (err) {
-      set({
-        errorMessage: err instanceof Error ? err.message : String(err),
-        loading: false,
-      });
-    }
+    };
+    const queued = agentSessionActivationQueue.then(activate, activate);
+    agentSessionActivationQueue = queued.catch(() => {});
+    await queued;
   },
 
   renameSession: async (sessionId, title) => {
@@ -1229,6 +1595,23 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       });
       return;
     }
+    if (canonicalTimelineStaleSessions.has(session.id)) {
+      const refreshed = await refreshCanonicalTimeline(
+        session.id,
+        true,
+        true
+      );
+      if (!refreshed) {
+        set((state) => state.session?.id === session.id
+          ? {
+              errorMessage:
+                'Canonical Session timeline is unavailable; refresh before sending guidance.',
+            }
+          : state);
+        return;
+      }
+    }
+    if (get().session?.id !== session.id) return;
 
     const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
     const interactionRunId = activeInteraction?.kind === 'permission'
@@ -1242,6 +1625,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
         errorMessage: null,
       }));
+      const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
       try {
         const result = await submitAgentRunGuidance(session.id, interactionRunId, {
           guidance: trimmed,
@@ -1258,35 +1642,54 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             replaceActiveAgentRunIdentityIfCurrent(
               session.id,
               observedIdentity,
-              {
-                hostRunId: result.data.run.runId,
-                ...(observedIdentity?.hostRunId === result.data.run.runId
-                  && observedIdentity.kernelRunId
-                  ? { kernelRunId: observedIdentity.kernelRunId }
-                  : {}),
-              }
+              hostObservedRunIdentity(
+                session.id,
+                result.data.run.runId,
+                observedIdentity
+              )
             );
           }
-          set({
-            session: result.data.session,
-            sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
-            currentSessionId: result.data.session.id,
-            events: mergeEventsById(get().events, result.data.events),
-            pendingPermission: findLatestPendingPermission(result.data.events),
-            messageAttachments: [],
-            errorMessage: null,
+          set((state) => {
+            const sessions = [
+              result.data!.session,
+              ...state.sessions.filter(
+                (item) => item.id !== result.data!.session.id
+              ),
+            ];
+            if (state.session?.id !== session.id) return { sessions };
+            const events = mergeEventsById(
+              state.events,
+              result.data!.events
+            );
+            return {
+              session: result.data!.session,
+              sessions,
+              currentSessionId: result.data!.session.id,
+              events,
+              pendingPermission: findLatestPendingPermission(events),
+              messageAttachments: [],
+              errorMessage: null,
+            };
           });
-          void refreshCanonicalTimeline(result.data.session.id, true);
+          markCanonicalTimelineStale(result.data.session.id);
+          void refreshCanonicalTimeline(result.data.session.id, true, true);
         } else {
-          set({
-            errorMessage: result.message ?? 'New user input append failed',
-          });
+          set((state) => state.session?.id === session.id
+            ? {
+                errorMessage:
+                  result.message ?? 'New user input append failed',
+              }
+            : state);
         }
       } catch (error) {
-        set({
-          errorMessage: error instanceof Error ? error.message : String(error),
-        });
+        set((state) => state.session?.id === session.id
+          ? {
+              errorMessage:
+                error instanceof Error ? error.message : String(error),
+            }
+          : state);
       } finally {
+        void stopProgressWatcher();
         set((state) => ({
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
         }));
@@ -1304,6 +1707,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
         errorMessage: null,
       }));
+      const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
       try {
         const result = await submitAgentRunGuidance(session.id, activeRun.hostRunId, {
           guidance: trimmed,
@@ -1320,35 +1724,54 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             replaceActiveAgentRunIdentityIfCurrent(
               session.id,
               activeRun,
-              {
-                hostRunId: result.data.run.runId,
-                ...(activeRun.hostRunId === result.data.run.runId
-                  && activeRun.kernelRunId
-                  ? { kernelRunId: activeRun.kernelRunId }
-                  : {}),
-              }
+              hostObservedRunIdentity(
+                session.id,
+                result.data.run.runId,
+                activeRun
+              )
             );
           }
-          set({
-            session: result.data.session,
-            sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
-            currentSessionId: result.data.session.id,
-            events: mergeEventsById(get().events, result.data.events),
-            pendingPermission: findLatestPendingPermission(result.data.events),
-            messageAttachments: [],
-            errorMessage: null,
+          set((state) => {
+            const sessions = [
+              result.data!.session,
+              ...state.sessions.filter(
+                (item) => item.id !== result.data!.session.id
+              ),
+            ];
+            if (state.session?.id !== session.id) return { sessions };
+            const events = mergeEventsById(
+              state.events,
+              result.data!.events
+            );
+            return {
+              session: result.data!.session,
+              sessions,
+              currentSessionId: result.data!.session.id,
+              events,
+              pendingPermission: findLatestPendingPermission(events),
+              messageAttachments: [],
+              errorMessage: null,
+            };
           });
-          void refreshCanonicalTimeline(result.data.session.id, true);
+          markCanonicalTimelineStale(result.data.session.id);
+          void refreshCanonicalTimeline(result.data.session.id, true, true);
         } else {
-          set({
-            errorMessage: result.message ?? 'User guidance append failed',
-          });
+          set((state) => state.session?.id === session.id
+            ? {
+                errorMessage:
+                  result.message ?? 'User guidance append failed',
+              }
+            : state);
         }
       } catch (error) {
-        set({
-          errorMessage: error instanceof Error ? error.message : String(error),
-        });
+        set((state) => state.session?.id === session.id
+          ? {
+              errorMessage:
+                error instanceof Error ? error.message : String(error),
+            }
+          : state);
       } finally {
+        void stopProgressWatcher();
         set((state) => ({
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
         }));
@@ -1365,25 +1788,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       errorMessage: null,
     }));
 
-    let progressTimer: number | undefined;
-    let pollingStopped = false;
-    const refreshProgress = async () => {
-      if (pollingStopped) return;
-      const current = await getAgentSession(session.id);
-      if (current.ok && current.data) {
-        if (get().session?.id === session.id) {
-          set({
-            session: current.data.session,
-            events: mergeEventsById(get().events, current.data.events),
-            pendingPermission: findLatestPendingPermission(current.data.events),
-          });
-        }
-      }
-    };
-    progressTimer = window.setInterval(() => {
-      void refreshProgress();
-    }, 300);
-    void refreshProgress();
+    const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
 
     try {
       const workspacePath = session.projectId ? undefined : currentWorkspacePath();
@@ -1399,29 +1804,25 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.session,
         events: result.events,
       };
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      const isActiveSession = get().session?.id === data.session.id;
       set((state) => {
         const nextState: Partial<Store> = {
           sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
           resolvingPermission: null,
           resolvingPlan: null,
-          messageAttachments: [],
         };
-        if (isActiveSession) {
+        if (state.session?.id === data.session.id) {
           nextState.session = data.session;
           nextState.currentSessionId = data.session.id;
           nextState.events = mergeEventsById(state.events, data.events);
           nextState.pendingPermission = findLatestPendingPermission(data.events);
+          nextState.messageAttachments = [];
         }
         return nextState;
       });
-      void refreshCanonicalTimeline(data.session.id, true);
+      markCanonicalTimelineStale(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true, true);
     } catch (err) {
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
         events: state.session?.id === session.id
@@ -1433,6 +1834,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         errorMessage: state.session?.id === session.id ? message : state.errorMessage,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
+    } finally {
+      void stopProgressWatcher();
     }
 
   },
@@ -1461,6 +1864,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }));
 
     let result;
+    const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const callerRequestId = newHostCallerRequestId('cancel');
       result = await cancelAgentRunById(
@@ -1471,32 +1875,56 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     } catch (error) {
       set((state) => ({
         cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
-        errorMessage: error instanceof Error ? error.message : String(error),
+        errorMessage: state.session?.id === session.id
+          ? error instanceof Error ? error.message : String(error)
+          : state.errorMessage,
       }));
       return;
+    } finally {
+      void stopProgressWatcher();
     }
     if (result.ok && result.data) {
       clearActiveAgentRunIdentityByHostRunId(session.id, activeRunId);
-      set({
-        session: result.data.session,
-        sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
-        currentSessionId: result.data.session.id,
-        events: mergeEventsById(get().events, result.data.events),
-        pendingPermission: findLatestPendingPermission(result.data.events),
-        resolvingPermission: null,
-        resolvingPlan: null,
-        cancellingSessionIds: removeRunningSessionId(get().cancellingSessionIds, session.id),
-        loading: false,
-        errorMessage: null,
+      set((state) => {
+        const sessions = [
+          result.data!.session,
+          ...state.sessions.filter(
+            (item) => item.id !== result.data!.session.id
+          ),
+        ];
+        const nextState: Partial<Store> = {
+          sessions,
+          resolvingPermission: null,
+          resolvingPlan: null,
+          cancellingSessionIds: removeRunningSessionId(
+            state.cancellingSessionIds,
+            session.id
+          ),
+        };
+        if (state.session?.id === session.id) {
+          const events = mergeEventsById(
+            state.events,
+            result.data!.events
+          );
+          nextState.session = result.data!.session;
+          nextState.currentSessionId = result.data!.session.id;
+          nextState.events = events;
+          nextState.pendingPermission =
+            findLatestPendingPermission(events);
+          nextState.errorMessage = null;
+        }
+        return nextState;
       });
-      void refreshCanonicalTimeline(result.data.session.id, true);
+      markCanonicalTimelineStale(result.data.session.id);
+      void refreshCanonicalTimeline(result.data.session.id, true, true);
       return;
     }
 
     set((state) => ({
-      loading: false,
       cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
-      errorMessage: result.message ?? 'Agent run cancellation failed',
+      errorMessage: state.session?.id === session.id
+        ? result.message ?? 'Agent run cancellation failed'
+        : state.errorMessage,
     }));
   },
 
@@ -1514,25 +1942,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
-    let progressTimer: number | undefined;
-    let pollingStopped = false;
-    const refreshProgress = async () => {
-      if (pollingStopped) return;
-      const current = await getAgentSession(session.id);
-      if (current.ok && current.data) {
-        if (get().session?.id === session.id) {
-          set({
-            session: current.data.session,
-            events: mergeEventsById(get().events, current.data.events),
-            pendingPermission: findLatestPendingPermission(current.data.events),
-          });
-        }
-      }
-    };
-    progressTimer = window.setInterval(() => {
-      void refreshProgress();
-    }, 300);
-    void refreshProgress();
+    const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const result = await startAndWaitAgentRun(session.id, {
         op: 'resolveDecision',
@@ -1546,25 +1956,42 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.session,
         events: result.events,
       };
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      set((state) => ({
-        session: data.session,
-        events: mergeEventsById(state.events, data.events),
-        pendingPermission: findLatestPendingPermission(data.events),
-        resolvingPermission: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
-      }));
-      void refreshCanonicalTimeline(data.session.id, true);
+      set((state) => {
+        const nextState: Partial<Store> = {
+          sessions: [
+            data.session,
+            ...state.sessions.filter(
+              (item) => item.id !== data.session.id
+            ),
+          ],
+          resolvingPermission: null,
+          runningSessionIds: removeRunningSessionId(
+            state.runningSessionIds,
+            data.session.id
+          ),
+        };
+        if (state.session?.id === data.session.id) {
+          const events = mergeEventsById(state.events, data.events);
+          nextState.session = data.session;
+          nextState.events = events;
+          nextState.pendingPermission =
+            findLatestPendingPermission(events);
+        }
+        return nextState;
+      });
+      markCanonicalTimelineStale(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true, true);
     } catch (err) {
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
-        errorMessage: message,
+        errorMessage: state.session?.id === session.id
+          ? message
+          : state.errorMessage,
         resolvingPermission: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
+    } finally {
+      void stopProgressWatcher();
     }
   },
 
@@ -1582,25 +2009,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
-    let progressTimer: number | undefined;
-    let pollingStopped = false;
-    const refreshProgress = async () => {
-      if (pollingStopped) return;
-      const current = await getAgentSession(session.id);
-      if (current.ok && current.data) {
-        if (get().session?.id === session.id) {
-          set({
-            session: current.data.session,
-            events: mergeEventsById(get().events, current.data.events),
-            pendingPermission: findLatestPendingPermission(current.data.events),
-          });
-        }
-      }
-    };
-    progressTimer = window.setInterval(() => {
-      void refreshProgress();
-    }, 300);
-    void refreshProgress();
+    const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const result = await startAndWaitAgentRun(session.id, {
         op: 'resolveDecision',
@@ -1614,25 +2023,42 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.session,
         events: result.events,
       };
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      set((state) => ({
-        session: data.session,
-        events: mergeEventsById(state.events, data.events),
-        pendingPermission: findLatestPendingPermission(data.events),
-        resolvingPermission: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
-      }));
-      void refreshCanonicalTimeline(data.session.id, true);
+      set((state) => {
+        const nextState: Partial<Store> = {
+          sessions: [
+            data.session,
+            ...state.sessions.filter(
+              (item) => item.id !== data.session.id
+            ),
+          ],
+          resolvingPermission: null,
+          runningSessionIds: removeRunningSessionId(
+            state.runningSessionIds,
+            data.session.id
+          ),
+        };
+        if (state.session?.id === data.session.id) {
+          const events = mergeEventsById(state.events, data.events);
+          nextState.session = data.session;
+          nextState.events = events;
+          nextState.pendingPermission =
+            findLatestPendingPermission(events);
+        }
+        return nextState;
+      });
+      markCanonicalTimelineStale(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true, true);
     } catch (err) {
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
-        errorMessage: message,
+        errorMessage: state.session?.id === session.id
+          ? message
+          : state.errorMessage,
         resolvingPermission: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
+    } finally {
+      void stopProgressWatcher();
     }
   },
 
@@ -1644,25 +2070,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
-    let progressTimer: number | undefined;
-    let pollingStopped = false;
-    const refreshProgress = async () => {
-      if (pollingStopped) return;
-      const current = await getAgentSession(session.id);
-      if (current.ok && current.data) {
-        if (get().session?.id === session.id) {
-          set({
-            session: current.data.session,
-            events: mergeEventsById(get().events, current.data.events),
-            pendingPermission: findLatestPendingPermission(current.data.events),
-          });
-        }
-      }
-    };
-    progressTimer = window.setInterval(() => {
-      void refreshProgress();
-    }, 300);
-    void refreshProgress();
+    const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const result = await startAndWaitAgentRun(session.id, {
         op: 'resolveDecision',
@@ -1677,28 +2085,44 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.session,
         events: result.events,
       };
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      set((state) => ({
-        session: data.session,
-        sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
-        currentSessionId: data.session.id,
-        events: mergeEventsById(state.events, data.events),
-        pendingPermission: findLatestPendingPermission(data.events),
-        resolvingPermission: null,
-        resolvingPlan: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
-      }));
-      void refreshCanonicalTimeline(data.session.id, true);
+      set((state) => {
+        const nextState: Partial<Store> = {
+          sessions: [
+            data.session,
+            ...state.sessions.filter(
+              (item) => item.id !== data.session.id
+            ),
+          ],
+          resolvingPermission: null,
+          resolvingPlan: null,
+          runningSessionIds: removeRunningSessionId(
+            state.runningSessionIds,
+            data.session.id
+          ),
+        };
+        if (state.session?.id === data.session.id) {
+          const events = mergeEventsById(state.events, data.events);
+          nextState.session = data.session;
+          nextState.currentSessionId = data.session.id;
+          nextState.events = events;
+          nextState.pendingPermission =
+            findLatestPendingPermission(events);
+        }
+        return nextState;
+      });
+      markCanonicalTimelineStale(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true, true);
     } catch (err) {
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
-        errorMessage: message,
+        errorMessage: state.session?.id === session.id
+          ? message
+          : state.errorMessage,
         resolvingPlan: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
+    } finally {
+      void stopProgressWatcher();
     }
   },
 
