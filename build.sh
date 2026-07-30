@@ -1210,6 +1210,7 @@ verify_linux_package_runtime() {
   [ -d "$LINUX_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check linux-x64 package"
   verify_runtime_executable "$LINUX_DIR/deepcode-kernel" "linux kernel" || missing=1
+  verify_runtime_executable "$LINUX_DIR/deepcode-host-web" "linux private Host proxy" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-cli" "linux cli" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-tui" "linux tui" || missing=1
   verify_frontend_package_assets "$LINUX_DIR/web" "linux editor web" || missing=1
@@ -1222,6 +1223,7 @@ verify_windows_package_runtime() {
   [ -d "$WIN_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check win64 package"
   verify_runtime_file "$WIN_DIR/deepcode-kernel.exe" "windows kernel" || missing=1
+  verify_runtime_file "$WIN_DIR/deepcode-host-web.exe" "windows private Host proxy" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-cli.exe" "windows cli" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-tui.exe" "windows tui" || missing=1
   verify_runtime_file "$WIN_DIR/DeepCode.exe" "windows editor shell" || missing=1
@@ -1250,6 +1252,7 @@ verify_macos_package_runtime() {
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/DeepCode" "macOS DeepCode app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode bundled kernel" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode private Host proxy" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/MacOS/web" "macOS DeepCode bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode.app" "DeepCode" || missing=1
   fi
@@ -1257,6 +1260,7 @@ verify_macos_package_runtime() {
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/DeepCode-GUI" "macOS DeepCode-GUI app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode-GUI bundled kernel" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode-GUI private Host proxy" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode-GUI.app" "DeepCode-GUI" || missing=1
   fi

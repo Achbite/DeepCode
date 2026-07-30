@@ -1161,11 +1161,13 @@ PLIST
 
 sign_app_bundle() {
   local app_dir="$1"
-  command -v codesign >/dev/null 2>&1 || return
+  command -v codesign >/dev/null 2>&1 \
+    || fail "codesign is required to publish $APP_NAME.app"
   log "ad-hoc sign $APP_NAME.app"
-  codesign --force --deep --sign - "$app_dir" >/dev/null 2>&1 || {
-    log "warning: ad-hoc signing failed; leaving local app unsigned"
-  }
+  codesign --force --deep --sign - "$app_dir" >/dev/null 2>&1 \
+    || fail "ad-hoc signing failed for $APP_NAME.app"
+  codesign --verify --deep --strict "$app_dir" >/dev/null 2>&1 \
+    || fail "strict signature verification failed for $APP_NAME.app"
 }
 
 sync_signed_kernel_sidecar_to_root() {
@@ -1362,7 +1364,7 @@ finalize_shared_distribution() {
 verify_packaged_kernel_markers() {
   local kernel_bin="$BIN_DIR/deepcode-kernel"
   local original_product="$PRODUCT"
-  local product app_kernel_bin root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product
+  local product app_kernel_bin app_host_proxy root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product
   local build_info_kernel_abi build_info_tool_registry build_info_session_bridge strings_file
   local checked_app=0
   [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
@@ -1387,8 +1389,12 @@ verify_packaged_kernel_markers() {
     [ -d "$BIN_DIR/$APP_NAME.app" ] || continue
     checked_app=1
     app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+    app_host_proxy="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-host-web"
     build_info="$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"
     [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
+    [ -x "$app_host_proxy" ] || fail "missing bundled private Host proxy: $app_host_proxy"
+    codesign --verify --deep --strict "$BIN_DIR/$APP_NAME.app" >/dev/null 2>&1 \
+      || fail "published $APP_NAME.app failed strict signature verification"
     app_hash="$(shasum -a 256 "$app_kernel_bin" | awk '{print $1}')"
     [ "$root_hash" = "$app_hash" ] || fail "root deepcode-kernel and $APP_NAME.app bundled Kernel differ"
     [ -f "$build_info" ] || fail "missing bundled build-info.json: $build_info"
