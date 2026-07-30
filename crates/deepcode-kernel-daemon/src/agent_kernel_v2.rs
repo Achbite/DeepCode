@@ -13,7 +13,7 @@ use crate::host_run_broker_v2::{
     HostActiveRunRecordV2, HostRunSettingsCeilingV2, HostRunWorkspaceKindV2,
 };
 use crate::host_services::{HostPreparedBoundWorkspaceV2, HostPreparedEmptyWorkspaceV2};
-use crate::host_v2_storage::{canonical_sha256, HostV2StorageError};
+use crate::host_v2_storage::{canonical_sha256, stable_json_sha256, HostV2StorageError};
 use crate::kernel_v2_transport::{
     HostAuthorityRevokeResolveRequestV2, HostCapabilityDecisionApplyErrorV2,
     HostCapabilityDecisionKindV2, HostCapabilityDecisionRequestV2, HostResolvedAuthorityRevokeV2,
@@ -234,6 +234,9 @@ pub(crate) async fn open_agent_kernel_run_v2(
             ),
         ));
     }
+    let settings_transition = crate::settings_api::settings_transition_gate_v2()
+        .read()
+        .await;
     let provider_profile = provider_profile_bootstrap_v2(state, profile_id)?;
     let prior_session_events = {
         let sessions_dir = state
@@ -252,9 +255,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
         CallerDriveAdmissionV2::Acquired(binding) => binding,
         CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(host_run_id),
     };
-    let settings_transition = crate::settings_api::settings_transition_gate_v2()
-        .read()
-        .await;
     let prepared_workspace =
         match prepare_agent_workspace_v2(state, session_id, &host_run_id, body, project_context) {
             Ok(prepared_workspace) => prepared_workspace,
@@ -3459,7 +3459,7 @@ fn provider_profile_bootstrap_v2(
             "Selected LLM Profile is unavailable for the immutable v2 Run bootstrap.",
         )
     })?;
-    let revision_digest = canonical_sha256(&profile).map_err(AgentKernelV2Error::from_storage)?;
+    let revision_digest = stable_json_sha256(&profile).map_err(AgentKernelV2Error::from_storage)?;
     let context_window_tokens = profile
         .get("contextWindowTokens")
         .and_then(Value::as_u64)

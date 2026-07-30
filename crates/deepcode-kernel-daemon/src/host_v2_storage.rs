@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 const STORAGE_LOCK_SHARDS: usize = 64;
 const ATOMIC_WRITE_ATTEMPTS: u64 = 8;
+const STABLE_JSON_MAX_DEPTH: usize = 128;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +153,79 @@ pub(crate) fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, HostV2Stora
 
 pub(crate) fn canonical_sha256(value: &Value) -> Result<String, HostV2StorageError> {
     Ok(sha256_prefixed(&canonical_json_bytes(value)?))
+}
+
+/// Produces a deterministic Kernel-local digest for configuration JSON.
+///
+/// ABI canonical JSON intentionally rejects fractional numbers, while provider
+/// configuration legitimately contains values such as `temperature: 0.2`.
+/// Keep that ABI boundary strict and use this full-JSON encoding only for
+/// Kernel-owned configuration identity and revision checks.
+pub(crate) fn stable_json_sha256(value: &Value) -> Result<String, HostV2StorageError> {
+    let mut output = Vec::new();
+    write_stable_json(value, &mut output, 0)?;
+    Ok(sha256_prefixed(&output))
+}
+
+fn write_stable_json(
+    value: &Value,
+    output: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), HostV2StorageError> {
+    if depth > STABLE_JSON_MAX_DEPTH {
+        return Err(HostV2StorageError::invalid(
+            "host_v2_stable_json_depth_exceeded",
+            "Stable configuration JSON exceeds the maximum nesting depth",
+        ));
+    }
+    match value {
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(value) => {
+            output.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        Value::Number(number) => {
+            if let Ok(canonical) = canonical_json_bytes(value) {
+                output.extend_from_slice(&canonical);
+            } else {
+                output.extend_from_slice(number.to_string().as_bytes());
+            }
+        }
+        Value::String(_) => write_json_scalar(value, output)?,
+        Value::Array(values) => {
+            output.push(b'[');
+            for (index, nested) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_stable_json(nested, output, depth + 1)?;
+            }
+            output.push(b']');
+        }
+        Value::Object(values) => {
+            output.push(b'{');
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_json_scalar(&Value::String((*key).clone()), output)?;
+                output.push(b':');
+                write_stable_json(&values[*key], output, depth + 1)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn write_json_scalar(value: &Value, output: &mut Vec<u8>) -> Result<(), HostV2StorageError> {
+    serde_json::to_writer(output, value).map_err(|error| {
+        HostV2StorageError::invalid(
+            "host_v2_stable_json_failed",
+            format!("Encode stable configuration JSON: {error}"),
+        )
+    })
 }
 
 pub(crate) fn sha256_prefixed(value: &[u8]) -> String {

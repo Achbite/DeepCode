@@ -37,13 +37,23 @@ pub(crate) async fn user_settings_patch(
     ) = {
         let gui = state.gui.lock().expect("gui state lock");
         let old_settings = gui.user_settings.clone();
-        let old_hash = config_value_hash(&gui.user_settings);
+        let old_hash = match config_value_hash(&gui.user_settings) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return ApiResponse::error("config_digest_failed", error.message);
+            }
+        };
         let mut next_settings = gui.user_settings.clone();
         merge_object(&mut next_settings, &patches);
         if let Err(message) = validate_permission_settings(&next_settings) {
             return ApiResponse::error("invalid_permission_setting", message);
         }
-        let new_hash = config_value_hash(&next_settings);
+        let new_hash = match config_value_hash(&next_settings) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return ApiResponse::error("config_digest_failed", error.message);
+            }
+        };
         let changed_keys = patches
             .as_object()
             .map(|object| object.keys().cloned().collect::<Vec<_>>())
@@ -456,14 +466,28 @@ pub(crate) async fn llm_profiles_patch(
 
     let old_profiles = gui.llm_profiles.clone();
     let old_sessions = gui.sessions.clone();
-    let old_hash = config_value_hash(&json!({
+    let old_secret_hash = match config_value_hash(&old_secret_store) {
+        Ok(hash) => hash,
+        Err(error) => return ApiResponse::error("config_digest_failed", error.message),
+    };
+    let old_hash = match config_value_hash(&json!({
         "profiles": &old_profiles,
-        "secretStoreDigest": config_value_hash(&old_secret_store)
-    }));
-    let new_hash = config_value_hash(&json!({
+        "secretStoreDigest": old_secret_hash
+    })) {
+        Ok(hash) => hash,
+        Err(error) => return ApiResponse::error("config_digest_failed", error.message),
+    };
+    let new_secret_hash = match config_value_hash(&secret_store) {
+        Ok(hash) => hash,
+        Err(error) => return ApiResponse::error("config_digest_failed", error.message),
+    };
+    let new_hash = match config_value_hash(&json!({
         "profiles": &next_profiles,
-        "secretStoreDigest": config_value_hash(&secret_store)
-    }));
+        "secretStoreDigest": new_secret_hash
+    })) {
+        Ok(hash) => hash,
+        Err(error) => return ApiResponse::error("config_digest_failed", error.message),
+    };
     let preferred_profile_id = preferred_enabled_llm_profile_id(&next_profiles);
     let mut next_sessions = old_sessions.clone();
     let mut profile_migrations = Vec::new();
@@ -792,9 +816,10 @@ fn record_config_modified_audit(
     }
 }
 
-fn config_value_hash(value: &Value) -> String {
-    crate::host_v2_storage::canonical_sha256(value)
-        .expect("serde_json::Value must have a canonical SHA-256 encoding")
+fn config_value_hash(
+    value: &Value,
+) -> Result<String, crate::host_v2_storage::HostV2StorageError> {
+    crate::host_v2_storage::stable_json_sha256(value)
 }
 
 pub(crate) async fn llm_probe(
@@ -1015,7 +1040,7 @@ fn authorize_llm_chat_transport(
                 )
             })
             .and_then(|profile| {
-                crate::host_v2_storage::canonical_sha256(profile).map_err(|_| {
+                crate::host_v2_storage::stable_json_sha256(profile).map_err(|_| {
                     ApiResponse::error(
                         "provider_profile_revision_stale",
                         "Run-bound Provider profile revision cannot be verified",
