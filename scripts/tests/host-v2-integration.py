@@ -30,6 +30,7 @@ CLI = TARGET_DIR / "debug" / "deepcode-cli"
 ABI_VERSION = "deepcode.kernel.abi.v2"
 HOST_HEADER = "x-deepcode-host-shell-capability"
 FINAL_TEXT = "Host v2 integration completed through the real Session bridge."
+CLI_PROMPT = "Return the controlled Host integration response through the CLI."
 TEST_API_KEY = "host-v2-integration-key"
 EXEC_DAEMON_ARGUMENT = "--exec-owned-daemon"
 EXEC_SIGNAL_MASK_ENV = "DEEPCODE_HOST_V2_EXEC_SIGNAL_MASK"
@@ -214,6 +215,10 @@ class ProviderServer(http.server.ThreadingHTTPServer):
         with self.request_lock:
             return len(self.requests)
 
+    def request_snapshot(self) -> list[dict[str, Any]]:
+        with self.request_lock:
+            return json.loads(json.dumps(self.requests))
+
     def handle_error(
         self,
         _request: Any,
@@ -234,6 +239,41 @@ class ProviderServer(http.server.ThreadingHTTPServer):
         except BaseException as error:
             with self.request_lock:
                 self.errors.append(safe_diagnostic(error))
+
+
+def assert_provider_received_current_input(
+    request: dict[str, Any],
+    expected_text: str,
+) -> None:
+    messages = request.get("messages")
+    require(isinstance(messages, list), "Provider request omitted messages")
+    current_inputs: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schemaVersion")
+            == "deepcode.session.provider-current-input.v2"
+        ):
+            current_inputs.append(payload)
+    require(
+        len(current_inputs) == 1,
+        "Provider request did not contain one exact current-input envelope",
+    )
+    current_input = current_inputs[0].get("currentInput")
+    require(
+        isinstance(current_input, dict)
+        and current_input.get("text") == expected_text,
+        "Provider request changed or omitted the CLI instruction",
+    )
 
 
 @dataclass(frozen=True)
@@ -796,6 +836,58 @@ def read_host_kernel_run_identity(
     return run_id
 
 
+def read_cli_ask_host_run_identity(
+    config_root: pathlib.Path,
+    session_id: str,
+) -> str:
+    database = host_operation_store(config_root)
+    require(database.is_file(), "CLI Host operation store is missing")
+    try:
+        with sqlite3.connect(
+            f"file:{database}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        ) as connection:
+            caller_rows = connection.execute(
+                "SELECT caller_request_id, response_identity_json, drive_state, "
+                "outcome_json, settled_at FROM host_caller_requests "
+                "WHERE session_id = ?1 AND caller_request_id LIKE 'cli-ask-%' "
+                "ORDER BY id",
+                (session_id,),
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise IntegrationFailure(
+            f"CLI caller identity query failed: {safe_diagnostic(error)}"
+        ) from error
+    require(len(caller_rows) == 1, "CLI ask did not create one exact caller identity")
+    caller_request_id, response_identity_json, drive_state, outcome_json, settled_at = (
+        caller_rows[0]
+    )
+    require(
+        isinstance(caller_request_id, str)
+        and caller_request_id.startswith("cli-ask-")
+        and drive_state == "Driving"
+        and isinstance(outcome_json, str)
+        and isinstance(settled_at, str),
+        "CLI ask caller identity was not durably settled",
+    )
+    try:
+        response_identity = json.loads(response_identity_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure("CLI caller response identity is invalid") from error
+    host_run_id = (
+        response_identity.get("hostRunId")
+        if isinstance(response_identity, dict)
+        else None
+    )
+    require(
+        isinstance(host_run_id, str) and host_run_id,
+        "CLI caller identity omitted its exact Host Run",
+    )
+    read_host_kernel_run_identity(config_root, session_id, host_run_id)
+    return host_run_id
+
+
 def canonical_run_snapshot(
     config_root: pathlib.Path,
     session_id: str,
@@ -1112,6 +1204,44 @@ def run() -> None:
         )
         passed("CLI v2 public Host transport")
 
+        provider_count_before_cli_ask = provider.request_count()
+        cli_ask = run_cli(
+            owned.base_url,
+            owned.host_capability,
+            [
+                "--print",
+                "--session",
+                session_id,
+                "--workspace",
+                str(workspace),
+                "ask",
+                CLI_PROMPT,
+            ],
+            expect_success=True,
+        )
+        require(
+            cli_ask.stdout.strip() == FINAL_TEXT,
+            "CLI ask did not print the controlled Provider response",
+        )
+        provider_count_after_cli_ask = provider.request_count()
+        require(
+            provider_count_after_cli_ask == provider_count_before_cli_ask + 1,
+            "CLI ask did not call the controlled Provider exactly once",
+        )
+        provider_requests = provider.request_snapshot()
+        require(
+            len(provider_requests) == provider_count_after_cli_ask,
+            "Provider request snapshot changed while validating CLI ask",
+        )
+        assert_provider_received_current_input(provider_requests[-1], CLI_PROMPT)
+        cli_host_run_id = read_cli_ask_host_run_identity(
+            config_root,
+            session_id,
+        )
+        canonical_run_snapshot(config_root, session_id, cli_host_run_id)
+        provider.require_healthy()
+        passed("CLI ask through Session bridge and canonical Kernel facts")
+
         caller_request = {
             "op": "ask",
             "content": "Return the controlled Host integration response.",
@@ -1128,7 +1258,11 @@ def run() -> None:
         first_run = open_host_run(owned, session_id, config_root, caller_request)
         host_run_id = first_run.get("id") or first_run.get("runId")
         require(isinstance(host_run_id, str) and host_run_id, "Host Run ID is missing")
-        require(provider.request_count() == 1, "initial Host Run did not call Provider once")
+        provider_count_after_direct_run = provider.request_count()
+        require(
+            provider_count_after_direct_run == provider_count_after_cli_ask + 1,
+            "initial Host Run did not call Provider once",
+        )
         first_snapshot = canonical_run_snapshot(config_root, session_id, host_run_id)
         provider.require_healthy()
         passed("Host-owned workspace-bound RunOpen")
@@ -1150,7 +1284,7 @@ def run() -> None:
             "restart replay changed the Host Run identity",
         )
         require(
-            provider.request_count() == 1,
+            provider.request_count() == provider_count_after_direct_run,
             "exact restart replay called Provider a second time",
         )
         replayed_snapshot = canonical_run_snapshot(
