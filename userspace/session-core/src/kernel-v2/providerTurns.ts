@@ -265,15 +265,21 @@ export class SessionKernelProviderTurnsV2 {
           if (latest.providerTurn?.providerTurnId === providerTurnId) {
             latest.providerTurn.status = 'failed';
             await this.host.saveCheckpoint();
-            await this.host.project(
-              `provider:${providerTurnId}:failed`,
-              'diagnostic',
-              {
-                providerTurnId,
-                code: safeErrorCode(error),
-                stage: 'provider.requestTurn',
-              }
-            );
+            try {
+              await this.host.project(
+                `provider:${providerTurnId}:failed`,
+                'diagnostic',
+                {
+                  providerTurnId,
+                  code: safeErrorCode(error),
+                  message: safeErrorMessage(error),
+                  stage: 'provider.requestTurn',
+                }
+              );
+            } catch {
+              // The failed Provider checkpoint is already durable. Preserve
+              // its no-effect boundary even if diagnostic projection fails.
+            }
           }
         } finally {
           this.endAdmissionCommit(failureCommit);
@@ -902,6 +908,18 @@ function safeErrorCode(error: unknown): string {
     return error.code;
   }
   return 'provider_request_failed';
+}
+
+function safeErrorMessage(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const message = error.message.trim();
+  if (
+    !message
+    || new TextEncoder().encode(message).byteLength > 2_048
+  ) {
+    return undefined;
+  }
+  return message;
 }
 
 function unique(values: string[]): string[] {

@@ -572,7 +572,8 @@ function applyPublicRequestOutcome(
       host.replaceState(result.state);
       const reviewReady =
         result.caughtUp
-        && !sessionKernelFactBarriersPendingV2(result.state);
+        && !sessionKernelFactBarriersPendingV2(result.state)
+        && result.state.plan !== undefined;
       if (reviewReady) {
         result.state.review = buildSessionKernelReviewV2(result.state, now);
       }
@@ -644,12 +645,14 @@ function applyPublicRequestOutcome(
           record.startedAt
         ));
       }
-      events.push(host.event(
-        `${record.requestId}:wait`,
-        'wait.changed',
-        result.state.activeWait,
-        record.startedAt
-      ));
+      if (result.waitChanged) {
+        events.push(host.event(
+          `${record.requestId}:wait`,
+          'wait.changed',
+          result.state.activeWait,
+          record.startedAt
+        ));
+      }
       break;
     }
     case 'controlEpochAdvance':
@@ -718,6 +721,7 @@ function applyToolIntentReply(
   events: SessionKernelProjectionEventV2[]
 ): void {
   if (record.intent.kind !== 'toolIntentSubmit') return;
+  const previousWait = JSON.stringify(state.activeWait);
   const intent = record.intent.payload.intent;
   const planActionAuthority =
     intent.authority.kind === 'planAction'
@@ -866,12 +870,14 @@ function applyToolIntentReply(
     state.activeWait = undefined;
     appendUniqueGuidance(state.pendingGuidance, reply.data.guidance);
   }
-  events.push(host.event(
-    `${record.requestId}:wait`,
-    'wait.changed',
-    state.activeWait,
-    record.startedAt
-  ));
+  if (previousWait !== JSON.stringify(state.activeWait)) {
+    events.push(host.event(
+      `${record.requestId}:wait`,
+      'wait.changed',
+      state.activeWait,
+      record.startedAt
+    ));
+  }
 }
 
 function authorizationDecisionPreviewId(

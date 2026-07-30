@@ -24,6 +24,9 @@ import type {
 import type {
   SessionKernelTransportPrivateAuthV2,
 } from './SessionKernelPortV2.js';
+import type {
+  SessionPriorEventsSourceV2,
+} from './sessionMemory.js';
 
 export const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA =
   'deepcode.session.kernel-host-projection-request.v2' as const;
@@ -80,12 +83,26 @@ implements SessionKernelHostProjectionSinkV2 {
   constructor(
     private readonly sessionId: string,
     private readonly hostRunId: string,
+    private readonly priorSessionEvents: SessionPriorEventsSourceV2,
     apiBase: string,
     privateAuth: SessionKernelTransportPrivateAuthV2,
     private readonly fetchImpl: typeof fetch = fetch
   ) {
     requiredIdentity(sessionId, 'sessionId');
     requiredIdentity(hostRunId, 'hostRunId');
+    if (
+      priorSessionEvents.sessionId !== sessionId
+      || priorSessionEvents.selectedEventCount
+        !== priorSessionEvents.events.length
+      || priorSessionEvents.selectedEventCount
+        + priorSessionEvents.omittedEventCount
+        !== priorSessionEvents.sourceEventVersion
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_prefix_invalid',
+        'Session projection prefix does not match the immutable Run bootstrap.'
+      );
+    }
     this.#runCapability = requiredIdentity(
       privateAuth.runCapability,
       'runCapability'
@@ -113,29 +130,42 @@ implements SessionKernelHostProjectionSinkV2 {
       this.sessionId,
       event
     );
-    const agentEvents = projectionHistory.map(
+    const currentRunAgentEvents = projectionHistory.map(
       (projection) =>
         sessionKernelAgentEventV2(this.sessionId, projection)
     );
+    const agentEvents = [
+      ...cloneJson(this.priorSessionEvents.events),
+      ...currentRunAgentEvents,
+    ];
+    const sourceEventVersion =
+      this.priorSessionEvents.sourceEventVersion
+      + currentRunAgentEvents.length;
+    if (!Number.isSafeInteger(sourceEventVersion)) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_version_exhausted',
+        'Session projection source-event version is exhausted.'
+      );
+    }
     const projected = new CanonicalTimelineProjector(
       this.sessionId,
       agentEvents
     ).snapshot();
     const timeline: AgentTimelineResult = {
       ...projected,
-      revision: agentEvents.length,
-      sourceEventVersion: agentEvents.length,
+      revision: sourceEventVersion,
+      sourceEventVersion,
       generatedAt: event.recordedAt,
     };
     if (
       agentEvents.at(-1)?.id !== agentEvent.id
       || timeline.sessionId !== this.sessionId
       || timeline.eventCount !== agentEvents.length
-      || timeline.sourceEventVersion !== agentEvents.length
+      || timeline.sourceEventVersion !== sourceEventVersion
     ) {
       throw new SessionKernelProjectionTransportError(
         'session_kernel_timeline_snapshot_identity_mismatch',
-        'Canonical timeline does not cover the current durable AgentEvent prefix.'
+        'Canonical timeline does not end at the current durable AgentEvent high-water.'
       );
     }
     const projectionDigest = sha256Hash(canonicalJson({
@@ -164,15 +194,13 @@ implements SessionKernelHostProjectionSinkV2 {
       body: JSON.stringify(request),
     });
     if (!response.ok) {
-      if (response.status === 409) {
-        throw new SessionKernelProjectionTransportError(
-          'session_kernel_projection_identity_conflict',
-          `Projection ${projectionId} conflicts with Host content.`
-        );
-      }
+      const failure = await projectionHttpFailure(
+        response,
+        projectionId
+      );
       throw new SessionKernelProjectionTransportError(
-        'session_kernel_projection_http_failed',
-        `Session v2 projection failed with HTTP ${response.status}.`
+        failure.code,
+        failure.message
       );
     }
     const envelope = exactObject(await response.json(), ['ok', 'data']);
@@ -198,6 +226,40 @@ implements SessionKernelHostProjectionSinkV2 {
       throw invalidProjectionReply();
     }
   }
+}
+
+async function projectionHttpFailure(
+  response: Response,
+  projectionId: string
+): Promise<{ code: string; message: string }> {
+  try {
+    const envelope = objectRecord(await response.json());
+    const error = objectRecord(envelope?.error);
+    const code = error?.code;
+    const message = error?.message;
+    if (
+      envelope?.ok === false
+      && typeof code === 'string'
+      && /^[a-z][a-z0-9_]{0,127}$/u.test(code)
+      && typeof message === 'string'
+      && message.length > 0
+      && new TextEncoder().encode(message).byteLength <= 8_192
+    ) {
+      return { code, message };
+    }
+  } catch {
+    // Preserve a typed local transport failure when Host returned no JSON.
+  }
+  return response.status === 409
+    ? {
+        code: 'session_kernel_projection_identity_conflict',
+        message: `Projection ${projectionId} conflicts with Host content.`,
+      }
+    : {
+        code: 'session_kernel_projection_http_failed',
+        message:
+          `Session v2 projection failed with HTTP ${response.status}.`,
+      };
 }
 
 /**
@@ -471,7 +533,7 @@ function publicPresentation(
               summary: `Session is waiting for ${String(wait.kind)}.`,
             }
           : {
-              status: 'running',
+              status: 'completed',
               reason: 'waitCleared',
               summary: 'Session wait cleared.',
             },
@@ -484,6 +546,7 @@ function publicPresentation(
         visibility: 'conversation',
         fields: {
           code: textField(data, 'code') ?? 'session_kernel_diagnostic',
+          providerTurnId: textField(data, 'providerTurnId'),
           message: textField(data, 'message')
             ?? textField(data, 'stage')
             ?? 'Session Kernel diagnostic.',

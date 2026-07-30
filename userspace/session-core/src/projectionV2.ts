@@ -104,24 +104,24 @@ export function buildNarrativeTimelineProjection(
   }
 
   const interactionProjection = buildInteractionProjection(input.events);
-  const turns = settleInteractionBlocks(
+  const turns = convergeTerminalTurnBlocks(settleInteractionBlocks(
     context.turns
-    .filter((turn) => turn.blocks.length > 0)
-    .map<AgentTimelineTurn>((turn, turnIndex) => ({
-      id: turn.id,
-      sequence: turnIndex,
-      sessionId: turn.sessionId,
-      status: turn.status,
-      startedAt: turn.startedAt,
-      completedAt: turn.completedAt,
-      blocks: turn.blocks.map((block, blockIndex) => ({
-        ...block,
-        sequence: blockIndex,
+      .filter((turn) => turn.blocks.length > 0)
+      .map<AgentTimelineTurn>((turn, turnIndex) => ({
+        id: turn.id,
+        sequence: turnIndex,
+        sessionId: turn.sessionId,
+        status: turn.status,
+        startedAt: turn.startedAt,
+        completedAt: turn.completedAt,
+        blocks: turn.blocks.map((block, blockIndex) => ({
+          ...block,
+          sequence: blockIndex,
+        })),
       })),
-    })),
     input.events,
     interactionProjection?.pending
-  );
+  ));
   const events = [...input.events, ...auxiliaryEvents];
   const projection: AgentTimelineResult = {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
@@ -195,6 +195,46 @@ function settleInteractionBlocks(
       };
     }),
   }));
+}
+
+function convergeTerminalTurnBlocks(
+  turns: AgentTimelineTurn[]
+): AgentTimelineTurn[] {
+  return turns.map((turn) => {
+    if (!terminalTimelineStatus(turn.status)) return turn;
+    return {
+      ...turn,
+      blocks: turn.blocks.map((block) => {
+        if (
+          terminalTimelineStatus(block.status)
+          || block.status === 'blocked'
+          || block.interaction?.state === 'open'
+        ) {
+          return block;
+        }
+        const status: AgentTimelineStatus =
+          block.kind === 'user' ? 'completed' : turn.status;
+        return {
+          ...block,
+          status,
+          ...(block.activity
+            ? {
+                activity: {
+                  ...block.activity,
+                  status,
+                },
+              }
+            : {}),
+        };
+      }),
+    };
+  });
+}
+
+function terminalTimelineStatus(status: AgentTimelineStatus): boolean {
+  return status === 'completed'
+    || status === 'cancelled'
+    || status === 'failed';
 }
 
 function interactionDecisionIndex(
@@ -630,7 +670,10 @@ function createProjectionTurn(
     && previousRunTurn.status !== 'failed'
   ) {
     previousRunTurn.status = 'cancelled';
-    previousRunTurn.completedAt = event.ts;
+    previousRunTurn.completedAt = nondecreasingTimestamp(
+      previousRunTurn.startedAt,
+      event.ts
+    );
   }
   const id = inputId
     ? `turn:${runKey}:input:${inputId}`
@@ -750,6 +793,19 @@ function logicalBlockId(
   payload: Record<string, unknown> | undefined
 ): string {
   const runId = stringValue(payload?.runId) ?? 'run';
+  const providerTurnId = stringValue(payload?.providerTurnId);
+  const projectionKind = stringValue(payload?.projectionKind);
+  if (
+    providerTurnId
+    && (
+      projectionKind === 'provider.started'
+      || projectionKind === 'provider.completed'
+      || projectionKind === 'provider.stale'
+      || projectionKind === 'diagnostic'
+    )
+  ) {
+    return `provider:${runId}:${providerTurnId}`;
+  }
   if (event.kind === 'plan_card') {
     return `plan:${runId}:${stringValue(payload?.planId) ?? event.id}`;
   }
@@ -770,12 +826,12 @@ function updateTurnStatus(
 ): void {
   if (block.status === 'failed') {
     turn.status = 'failed';
-    turn.completedAt = event.ts;
+    turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
     return;
   }
   if (block.status === 'cancelled') {
     turn.status = 'cancelled';
-    turn.completedAt = event.ts;
+    turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
     return;
   }
   if (
@@ -783,7 +839,7 @@ function updateTurnStatus(
     || (event.kind === 'review_summary' && stringValue(payload?.status) === 'completed')
   ) {
     turn.status = 'completed';
-    turn.completedAt = event.ts;
+    turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
     return;
   }
   if (
@@ -945,8 +1001,15 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
         status = 'failed';
         phase = 'settled';
       } else if (next === 'completed') {
-        status = 'succeeded';
-        phase = 'settled';
+        if (stringValue(payload?.reason) === 'waitCleared') {
+          status = 'active';
+          phase = 'processing';
+          waitReason = undefined;
+          activeInteractionId = undefined;
+        } else {
+          status = 'succeeded';
+          phase = 'settled';
+        }
       } else {
         status = 'active';
         phase = 'processing';
@@ -1592,10 +1655,27 @@ function activityForEvent(
 function hiddenProjectionEvent(event: AgentEvent): boolean {
   const payload = recordValue(event.payload);
   const channel = stringValue(payload?.channel);
+  const visibility = stringValue(payload?.visibility);
   return channel === 'reasoning'
     || channel === 'thinking'
+    || visibility === 'trace'
+    || visibility === 'hidden'
     || payload?.reasoningTrace === true
     || String(event.kind).includes('reasoning');
+}
+
+function nondecreasingTimestamp(
+  startedAt: string | undefined,
+  candidate: string
+): string {
+  if (!startedAt) return candidate;
+  const started = Date.parse(startedAt);
+  const completed = Date.parse(candidate);
+  return Number.isFinite(started)
+    && Number.isFinite(completed)
+    && completed < started
+    ? startedAt
+    : candidate;
 }
 
 function containsPrivateProjectionData(value: unknown): boolean {
@@ -1621,7 +1701,9 @@ function eventStatus(
   if (status === 'awaitingUserApproval' || status === 'awaitingUserDecision') {
     return 'waiting';
   }
-  if (status === 'awaitingCapability') return 'waiting';
+  if (status === 'awaitingCapability' || status === 'waitingUserReview') {
+    return 'waiting';
+  }
   if (status === 'skipped') return 'cancelled';
   if (status === 'allowed' || status === 'accepted' || status === 'reconciled') {
     return 'completed';

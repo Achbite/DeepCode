@@ -677,50 +677,28 @@ impl SessionKernelProjectionSinkV2 {
             capability,
         )?;
         let path = self.projection_path(session_id, host_run_id)?;
-        let replayed = with_storage_path_lock(&path, || {
-            let values = read_bounded_json_lines(&path)?;
-            for value in values {
-                let existing: SessionKernelHostProjectionRequestV2 = serde_json::from_value(value)
-                    .map_err(|error| {
-                        HostV2StorageError::conflict(
-                            "session_kernel_projection_history_corrupt",
-                            format!("decode Host projection record: {error}"),
+        let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
+        let replayed = with_storage_path_lock(&guard_path, || {
+            self.preflight_public_projection(session_id, &request)?;
+            let replayed = if projection_request_replayed(&path, session_id, host_run_id, &request)?
+            {
+                true
+            } else {
+                append_json_line_durable(
+                    &path,
+                    &serde_json::to_value(&request).map_err(|error| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_projection_record_invalid",
+                            format!("encode Host projection record: {error}"),
                         )
-                    })?;
-                validate_projection_request(&existing, session_id, host_run_id).map_err(
-                    |error| {
-                        HostV2StorageError::conflict(
-                            "session_kernel_projection_history_corrupt",
-                            error.message,
-                        )
-                    },
+                    })?,
                 )?;
-                if existing.projection_id == request.projection_id {
-                    if existing.projection_digest == request.projection_digest
-                        && existing.event == request.event
-                        && existing.agent_event == request.agent_event
-                        && existing.timeline == request.timeline
-                    {
-                        return Ok(true);
-                    }
-                    return Err(HostV2StorageError::conflict(
-                        "session_kernel_projection_identity_conflict",
-                        "Session Kernel projectionId has different durable content",
-                    ));
-                }
-            }
-            append_json_line_durable(
-                &path,
-                &serde_json::to_value(&request).map_err(|error| {
-                    HostV2StorageError::invalid(
-                        "session_kernel_projection_record_invalid",
-                        format!("encode Host projection record: {error}"),
-                    )
-                })?,
-            )?;
-            Ok(false)
+                false
+            };
+            self.publish_agent_event_locked(session_id, &request)?;
+            self.publish_timeline_locked(session_id, &request)?;
+            Ok(replayed)
         })?;
-        self.publish_public_projection(session_id, &request)?;
         self.remember_projection(session_id, host_run_id, &request)?;
         Ok(SessionKernelHostProjectionReplyV2 {
             schema_version: SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA,
@@ -745,19 +723,6 @@ impl SessionKernelProjectionSinkV2 {
             "status": "ready",
             "cachedRunCount": run_count,
             "cachedProjectionCount": projection_count
-        })
-    }
-
-    fn publish_public_projection(
-        &self,
-        session_id: &str,
-        request: &SessionKernelHostProjectionRequestV2,
-    ) -> Result<(), HostV2StorageError> {
-        let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        with_storage_path_lock(&guard_path, || {
-            self.preflight_public_projection(session_id, request)?;
-            self.publish_agent_event_locked(session_id, request)?;
-            self.publish_timeline_locked(session_id, request)
         })
     }
 
@@ -955,6 +920,41 @@ impl SessionKernelProjectionSinkV2 {
     }
 }
 
+fn projection_request_replayed(
+    path: &FsPath,
+    session_id: &str,
+    host_run_id: &str,
+    request: &SessionKernelHostProjectionRequestV2,
+) -> Result<bool, HostV2StorageError> {
+    for value in read_bounded_json_lines(path)? {
+        let existing: SessionKernelHostProjectionRequestV2 = serde_json::from_value(value)
+            .map_err(|error| {
+                HostV2StorageError::conflict(
+                    "session_kernel_projection_history_corrupt",
+                    format!("decode Host projection record: {error}"),
+                )
+            })?;
+        validate_projection_request(&existing, session_id, host_run_id).map_err(|error| {
+            HostV2StorageError::conflict("session_kernel_projection_history_corrupt", error.message)
+        })?;
+        if existing.projection_id != request.projection_id {
+            continue;
+        }
+        if existing.projection_digest == request.projection_digest
+            && existing.event == request.event
+            && existing.agent_event == request.agent_event
+            && existing.timeline == request.timeline
+        {
+            return Ok(true);
+        }
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_projection_identity_conflict",
+            "Session Kernel projectionId has different durable content",
+        ));
+    }
+    Ok(false)
+}
+
 fn validate_projection_request(
     request: &SessionKernelHostProjectionRequestV2,
     session_id: &str,
@@ -1147,7 +1147,7 @@ fn read_public_timeline_records(
         if record.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id)
             || timeline_u64(&record.timeline, "revision")? != record.timeline_revision
             || timeline_u64(&record.timeline, "sourceEventVersion")? != record.source_event_version
-            || timeline_u64(&record.timeline, "eventCount")? != record.source_event_version
+            || timeline_u64(&record.timeline, "eventCount")? > record.source_event_version
         {
             return Err(HostV2StorageError::conflict(
                 "session_kernel_public_timeline_history_corrupt",
@@ -1184,10 +1184,10 @@ fn public_timeline_record(
 ) -> Result<HostSessionPublicTimelineRecordV2, HostV2StorageError> {
     let timeline_revision = timeline_u64(&request.timeline, "revision")?;
     let source_event_version = timeline_u64(&request.timeline, "sourceEventVersion")?;
-    if timeline_u64(&request.timeline, "eventCount")? != source_event_version {
+    if timeline_u64(&request.timeline, "eventCount")? > source_event_version {
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_version_mismatch",
-            "Session public timeline eventCount does not match sourceEventVersion",
+            "Session public timeline eventCount exceeds sourceEventVersion",
         ));
     }
     Ok(HostSessionPublicTimelineRecordV2 {

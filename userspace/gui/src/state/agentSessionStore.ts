@@ -73,6 +73,7 @@ interface AgentSessionState {
   profileSelectionBusy: boolean;
   loading: boolean;
   runningSessionIds: string[];
+  activeRunSessionIds: string[];
   cancellingSessionIds: string[];
   errorMessage: string | null;
   messageAttachments: AgentInputAttachmentV2[];
@@ -110,7 +111,12 @@ interface AgentSessionActions {
 
 type Store = AgentSessionState & AgentSessionActions;
 
-const activeAgentRunIds = new Map<string, string>();
+interface ActiveAgentRunIdentity {
+  hostRunId: string;
+  kernelRunId?: string;
+}
+
+const activeAgentRunIds = new Map<string, ActiveAgentRunIdentity>();
 const workspaceTreeRevisionBySession = new Map<string, number>();
 const MAX_AGENT_INPUT_ATTACHMENTS_V2 = 32;
 
@@ -436,6 +442,42 @@ function removeRunningSessionId(ids: string[], sessionId: string): string[] {
   return ids.filter((id) => id !== sessionId);
 }
 
+function publishActiveAgentRunIdentity(
+  sessionId: string,
+  identity: ActiveAgentRunIdentity | null
+): void {
+  if (identity) {
+    activeAgentRunIds.set(sessionId, identity);
+  } else {
+    activeAgentRunIds.delete(sessionId);
+  }
+  useAgentSessionStore.setState((state) => ({
+    activeRunSessionIds: identity
+      ? addRunningSessionId(state.activeRunSessionIds, sessionId)
+      : removeRunningSessionId(state.activeRunSessionIds, sessionId),
+  }));
+}
+
+function replaceActiveAgentRunIdentityIfCurrent(
+  sessionId: string,
+  observed: ActiveAgentRunIdentity | undefined,
+  identity: ActiveAgentRunIdentity | null
+): boolean {
+  if (activeAgentRunIds.get(sessionId) !== observed) return false;
+  publishActiveAgentRunIdentity(sessionId, identity);
+  return true;
+}
+
+function clearActiveAgentRunIdentityByHostRunId(
+  sessionId: string,
+  hostRunId: string
+): boolean {
+  const current = activeAgentRunIds.get(sessionId);
+  if (!current || current.hostRunId !== hostRunId) return false;
+  publishActiveAgentRunIdentity(sessionId, null);
+  return true;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -469,7 +511,65 @@ async function refreshCanonicalTimeline(
       : timelineAsReplay(incomingTimeline);
     return { timeline: nextTimeline };
   });
-  if (nextTimeline) refreshWorkspaceTreeForTimeline(nextTimeline);
+  if (nextTimeline) {
+    refreshWorkspaceTreeForTimeline(nextTimeline);
+    await refreshActiveAgentRunIdentity(nextTimeline);
+  }
+}
+
+async function refreshActiveAgentRunIdentity(
+  timeline: AgentTimelineResult
+): Promise<void> {
+  const runProjection = timeline.runProjection;
+  const routeRunId = runProjection?.runId.trim();
+  if (!runProjection || !routeRunId) return;
+  const knownIdentity = activeAgentRunIds.get(timeline.sessionId);
+  if (
+    knownIdentity?.kernelRunId
+    && knownIdentity.kernelRunId !== routeRunId
+  ) {
+    return;
+  }
+  const projectionTerminal =
+    runProjection.status === 'succeeded'
+    || runProjection.status === 'cancelled';
+  const current = await getAgentRun(timeline.sessionId, routeRunId);
+  if (!current.ok || !current.data) return;
+  if (activeAgentRunIds.get(timeline.sessionId) !== knownIdentity) return;
+  if (
+    knownIdentity
+    && current.data.run.runId !== knownIdentity.hostRunId
+  ) {
+    return;
+  }
+  const latestTimeline = useAgentSessionStore.getState().timeline;
+  const latestRunId = latestTimeline?.runProjection?.runId.trim();
+  if (
+    latestTimeline?.sessionId === timeline.sessionId
+    && latestRunId
+    && latestRunId !== routeRunId
+  ) {
+    return;
+  }
+  if (
+    projectionTerminal
+    || isTerminalRunStatus(current.data.run.status)
+  ) {
+    replaceActiveAgentRunIdentityIfCurrent(
+      timeline.sessionId,
+      knownIdentity,
+      null
+    );
+  } else {
+    replaceActiveAgentRunIdentityIfCurrent(
+      timeline.sessionId,
+      knownIdentity,
+      {
+        hostRunId: current.data.run.runId,
+        kernelRunId: routeRunId,
+      }
+    );
+  }
 }
 
 function refreshWorkspaceTreeForTimeline(timeline: AgentTimelineResult): void {
@@ -504,6 +604,10 @@ function isTerminalRunStatus(status: string): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
+function isQuiescentRunStatus(status: string): boolean {
+  return isTerminalRunStatus(status) || status === 'waiting';
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -525,7 +629,7 @@ async function startAndWaitAgentRun(
   }
   let result = started.data;
   const runId = result.run.runId;
-  activeAgentRunIds.set(sessionId, runId);
+  publishActiveAgentRunIdentity(sessionId, { hostRunId: runId });
   handlers.onEvents?.(result.events);
   const controller = new AbortController();
   let lastEventCount = result.events.length;
@@ -580,7 +684,7 @@ async function startAndWaitAgentRun(
     }
   })();
   try {
-    while (!isTerminalRunStatus(result.run.status)) {
+    while (!isQuiescentRunStatus(result.run.status)) {
       if (!terminalStreamObserved) {
         await Promise.race([sleep(300), terminalStreamEvent]);
       }
@@ -589,10 +693,11 @@ async function startAndWaitAgentRun(
         throw new Error(current.message ?? current.error ?? 'Shared session run refresh failed');
       }
       result = current.data;
+      await refreshCanonicalTimeline(sessionId, true);
     }
     handlers.onEvents?.(result.events);
     lastEventCount = Math.max(lastEventCount, result.events.length);
-    if (!terminalStreamObserved) {
+    if (isTerminalRunStatus(result.run.status) && !terminalStreamObserved) {
       await Promise.race([terminalStreamEvent, sleep(1500)]);
     }
     await refreshCanonicalTimeline(sessionId, true);
@@ -601,8 +706,11 @@ async function startAndWaitAgentRun(
     stopStream = true;
     controller.abort();
     await streamDone;
-    if (activeAgentRunIds.get(sessionId) === runId) {
-      activeAgentRunIds.delete(sessionId);
+    if (
+      activeAgentRunIds.get(sessionId)?.hostRunId === runId
+      && result.run.status !== 'waiting'
+    ) {
+      clearActiveAgentRunIdentityByHostRunId(sessionId, runId);
     }
   }
 }
@@ -633,6 +741,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   profileSelectionBusy: false,
   loading: false,
   runningSessionIds: [],
+  activeRunSessionIds: [],
   cancellingSessionIds: [],
   errorMessage: null,
   messageAttachments: [],
@@ -669,6 +778,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const current = await getCurrentAgentSession(scope);
       if (current.ok && current.data) {
         const timelineResult = await getAgentTimeline(current.data.session.id);
+        const timeline = timelineResult.ok && timelineResult.data
+          ? timelineAsReplay(timelineResult.data)
+          : emptyTimeline(current.data.session.id);
+        await refreshActiveAgentRunIdentity(timeline);
         const restoredAttachments = restoredSessionAttachmentState(
           current.data.events,
           current.data.session.id
@@ -677,9 +790,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           session: current.data.session,
           localWorkspaceScopeKey: nextScopeKey,
           events: current.data.events,
-          timeline: timelineResult.ok && timelineResult.data
-            ? timelineAsReplay(timelineResult.data)
-            : emptyTimeline(current.data.session.id),
+          timeline,
           profileId: current.data.session.profileId,
           messageAttachments: [],
           sessionAttachments: restoredAttachments.sessionAttachments,
@@ -792,6 +903,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const result = await activateAgentSession(sessionId);
       if (result.ok && result.data) {
         const timelineResult = await getAgentTimeline(result.data.session.id);
+        const timeline = timelineResult.ok && timelineResult.data
+          ? timelineAsReplay(timelineResult.data)
+          : emptyTimeline(result.data.session.id);
+        await refreshActiveAgentRunIdentity(timeline);
         const restoredAttachments = restoredSessionAttachmentState(
           result.data.events,
           result.data.session.id
@@ -801,9 +916,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           localWorkspaceScopeKey: currentWorkspaceScopeKey(),
           currentSessionId: result.data.session.id,
           events: result.data.events,
-          timeline: timelineResult.ok && timelineResult.data
-            ? timelineAsReplay(timelineResult.data)
-            : emptyTimeline(result.data.session.id),
+          timeline,
           profileId: result.data.session.profileId,
           pendingPermission: findLatestPendingPermission(result.data.events),
           resolvingPermission: null,
@@ -813,7 +926,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           errorMessage: restoredAttachments.attachmentError,
           loading: false,
         });
-        void refreshCanonicalTimeline(result.data.session.id, false);
         void get().refreshSessions();
         return;
       }
@@ -841,6 +953,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   archiveSession: async (sessionId) => {
     const result = await archiveAgentSession(sessionId, { archived: true });
     if (result.ok && result.data) {
+      publishActiveAgentRunIdentity(sessionId, null);
       const data = result.data;
       const wasActive = get().session?.id === sessionId;
       set((state) => ({
@@ -876,6 +989,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   deleteSession: async (sessionId) => {
     const result = await deleteAgentSession(sessionId);
     if (result.ok && result.data) {
+      publishActiveAgentRunIdentity(sessionId, null);
       const data = result.data;
       const wasActive = get().session?.id === sessionId;
       set((state) => ({
@@ -913,7 +1027,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const locked = state.loading
       || state.profileSelectionBusy
       || state.runningSessionIds.includes(session.id)
+      || state.activeRunSessionIds.includes(session.id)
       || state.cancellingSessionIds.includes(session.id)
+      || activeAgentRunIds.has(session.id)
       || Boolean(state.timeline?.interactionProjection?.pending)
       || Boolean(
         state.resolvingPermission
@@ -1121,29 +1237,59 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ? activeInteraction.runId
         : null;
     if (interactionRunId) {
-      set({
+      const observedIdentity = activeAgentRunIds.get(session.id);
+      set((state) => ({
+        runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
         errorMessage: null,
-      });
-      const result = await submitAgentRunGuidance(session.id, interactionRunId, {
-        guidance: trimmed,
-        ...(attachments.length > 0 ? { attachments } : {}),
-        callerRequestId: newHostCallerRequestId('input'),
-      });
-      if (result.ok && result.data) {
-        set({
-          session: result.data.session,
-          sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
-          currentSessionId: result.data.session.id,
-          events: mergeEventsById(get().events, result.data.events),
-          pendingPermission: findLatestPendingPermission(result.data.events),
-          messageAttachments: [],
-          errorMessage: null,
+      }));
+      try {
+        const result = await submitAgentRunGuidance(session.id, interactionRunId, {
+          guidance: trimmed,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          callerRequestId: newHostCallerRequestId('input'),
         });
-        void refreshCanonicalTimeline(result.data.session.id, true);
-      } else {
+        if (result.ok && result.data) {
+          if (isTerminalRunStatus(result.data.run.status)) {
+            clearActiveAgentRunIdentityByHostRunId(
+              session.id,
+              result.data.run.runId
+            );
+          } else {
+            replaceActiveAgentRunIdentityIfCurrent(
+              session.id,
+              observedIdentity,
+              {
+                hostRunId: result.data.run.runId,
+                ...(observedIdentity?.hostRunId === result.data.run.runId
+                  && observedIdentity.kernelRunId
+                  ? { kernelRunId: observedIdentity.kernelRunId }
+                  : {}),
+              }
+            );
+          }
+          set({
+            session: result.data.session,
+            sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
+            currentSessionId: result.data.session.id,
+            events: mergeEventsById(get().events, result.data.events),
+            pendingPermission: findLatestPendingPermission(result.data.events),
+            messageAttachments: [],
+            errorMessage: null,
+          });
+          void refreshCanonicalTimeline(result.data.session.id, true);
+        } else {
+          set({
+            errorMessage: result.message ?? 'New user input append failed',
+          });
+        }
+      } catch (error) {
         set({
-          errorMessage: result.message ?? 'New user input append failed',
+          errorMessage: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        set((state) => ({
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        }));
       }
       return;
     }
@@ -1152,36 +1298,65 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       return;
     }
 
-    if (get().runningSessionIds.includes(session.id)) {
-      const activeRunId = activeAgentRunIds.get(session.id);
-      if (!activeRunId) {
-        set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
-        return;
-      }
-      set({
+    const activeRun = activeAgentRunIds.get(session.id);
+    if (activeRun) {
+      set((state) => ({
+        runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
         errorMessage: null,
-      });
-      const result = await submitAgentRunGuidance(session.id, activeRunId, {
-        guidance: trimmed,
-        ...(attachments.length > 0 ? { attachments } : {}),
-        callerRequestId: newHostCallerRequestId('input'),
-      });
-      if (result.ok && result.data) {
-        set({
-          session: result.data.session,
-          sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
-          currentSessionId: result.data.session.id,
-          events: mergeEventsById(get().events, result.data.events),
-          pendingPermission: findLatestPendingPermission(result.data.events),
-          messageAttachments: [],
-          errorMessage: null,
+      }));
+      try {
+        const result = await submitAgentRunGuidance(session.id, activeRun.hostRunId, {
+          guidance: trimmed,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          callerRequestId: newHostCallerRequestId('input'),
         });
-        void refreshCanonicalTimeline(result.data.session.id, true);
-      } else {
+        if (result.ok && result.data) {
+          if (isTerminalRunStatus(result.data.run.status)) {
+            clearActiveAgentRunIdentityByHostRunId(
+              session.id,
+              result.data.run.runId
+            );
+          } else {
+            replaceActiveAgentRunIdentityIfCurrent(
+              session.id,
+              activeRun,
+              {
+                hostRunId: result.data.run.runId,
+                ...(activeRun.hostRunId === result.data.run.runId
+                  && activeRun.kernelRunId
+                  ? { kernelRunId: activeRun.kernelRunId }
+                  : {}),
+              }
+            );
+          }
+          set({
+            session: result.data.session,
+            sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
+            currentSessionId: result.data.session.id,
+            events: mergeEventsById(get().events, result.data.events),
+            pendingPermission: findLatestPendingPermission(result.data.events),
+            messageAttachments: [],
+            errorMessage: null,
+          });
+          void refreshCanonicalTimeline(result.data.session.id, true);
+        } else {
+          set({
+            errorMessage: result.message ?? 'User guidance append failed',
+          });
+        }
+      } catch (error) {
         set({
-          errorMessage: result.message ?? 'User guidance append failed',
+          errorMessage: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        set((state) => ({
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        }));
       }
+      return;
+    }
+    if (get().runningSessionIds.includes(session.id)) {
+      set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
       return;
     }
 
@@ -1267,7 +1442,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
     if (get().cancellingSessionIds.includes(session.id)) return;
     const activeRunId =
-      activeAgentRunIds.get(session.id)
+      activeAgentRunIds.get(session.id)?.hostRunId
       ?? cancellableTimelineRunId(get().timeline);
     if (!activeRunId) {
       set({
@@ -1301,7 +1476,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       return;
     }
     if (result.ok && result.data) {
-      activeAgentRunIds.delete(session.id);
+      clearActiveAgentRunIdentityByHostRunId(session.id, activeRunId);
       set({
         session: result.data.session,
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
@@ -1319,19 +1494,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
 
     set((state) => ({
-      events: [
-        ...state.events,
-        createLocalEvent(session.id, 'workflow_stage', {
-          stage: 'session_run',
-          status: 'cancelled',
-          summary: agentSessionMessage('agent.run.cancelled'),
-          channel: 'task',
-          visibility: 'task',
-        }),
-      ],
       loading: false,
       cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
-      errorMessage: result.message ?? null,
+      errorMessage: result.message ?? 'Agent run cancellation failed',
     }));
   },
 

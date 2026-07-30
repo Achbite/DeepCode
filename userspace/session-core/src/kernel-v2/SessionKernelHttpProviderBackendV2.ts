@@ -58,27 +58,42 @@ implements SessionKernelLlmTransportV2 {
     request: LlmChatRequest,
     signal: AbortSignal
   ): Promise<ApiResponse<LlmChatResult>> {
-    const response = await this.fetchImpl(
-      `${normalizeApiBase(this.apiBase)}/api/llm/chat`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-deepcode-run-capability': this.#runCapability,
-          'x-deepcode-session-id': this.sessionId,
-          'x-deepcode-run-id': this.runId,
-        },
-        body: JSON.stringify(request),
-        signal,
-      }
-    );
+    let response: Response;
+    try {
+      response = await this.fetchImpl(
+        `${normalizeApiBase(this.apiBase)}/api/llm/chat`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-deepcode-run-capability': this.#runCapability,
+            'x-deepcode-session-id': this.sessionId,
+            'x-deepcode-run-id': this.runId,
+          },
+          body: JSON.stringify(request),
+          signal,
+        }
+      );
+    } catch {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_transport_failed',
+        'Provider transport failed before receiving an HTTP response.'
+      );
+    }
     if (!response.ok) {
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_http_failed',
         `Provider transport failed with HTTP ${response.status}.`
       );
     }
-    return await response.json() as ApiResponse<LlmChatResult>;
+    try {
+      return await response.json() as ApiResponse<LlmChatResult>;
+    } catch {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_response_decode_failed',
+        'Provider transport returned an invalid JSON response.'
+      );
+    }
   }
 }
 

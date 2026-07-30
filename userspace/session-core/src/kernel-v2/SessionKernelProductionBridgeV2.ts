@@ -28,8 +28,10 @@ import {
 import {
   HttpSessionKernelLlmTransportV2,
   HttpSessionKernelProviderBackendV2,
+  SessionKernelProviderTransportError,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
+  SessionKernelProviderAdapterError,
   StrictSessionKernelProviderAdapterV2,
 } from './SessionKernelProviderAdapterV2.js';
 import {
@@ -658,7 +660,10 @@ export class SessionKernelProductionActorV2 {
           frame.operationRequestId,
           sessionKernelProductionFailureV2(
             error,
-            failureBoundaryFromState(this.runnerSnapshot())
+            failureBoundaryFromError(
+              error,
+              this.runnerSnapshot()
+            )
           )
         )
       );
@@ -1068,6 +1073,7 @@ async function createProductionRunner(
     new HttpSessionKernelHostProjectionSinkV2(
       request.sessionId,
       request.hostRunId,
+      request.priorSessionEvents,
       trustedApiBase,
       privateAuth,
       fetchImpl
@@ -2941,6 +2947,19 @@ function failureBoundaryFromState(
         ).sort()
       : []
   );
+}
+
+function failureBoundaryFromError(
+  error: unknown,
+  state: SessionKernelLoopStateV2 | undefined
+): SessionKernelFailureBoundaryV2 {
+  if (
+    error instanceof SessionKernelProviderTransportError
+    || error instanceof SessionKernelProviderAdapterError
+  ) {
+    return failureBoundary('doNotRetry', 'none', 'none');
+  }
+  return failureBoundaryFromState(state);
 }
 
 function causalStateSummary(

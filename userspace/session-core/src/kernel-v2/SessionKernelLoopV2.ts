@@ -567,9 +567,9 @@ export class SessionKernelLoopV2 {
       await this.saveCheckpoint();
 
       await this.advancePendingInput(oldInvocationId);
+      await this.ensureInputProjected(input);
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
-      await this.ensureInputProjected(input);
       transitionCompleted = true;
     } finally {
       if (liveFence && transitionCompleted) {
@@ -789,13 +789,13 @@ export class SessionKernelLoopV2 {
       } else {
         await this.requests.replay('control');
       }
+      for (const input of this.state.inputs) {
+        await this.ensureInputProjected(input);
+      }
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
       await this.ensurePlanProjected();
       await this.ensurePlanDecisionProjected();
-      for (const input of this.state.inputs) {
-        await this.ensureInputProjected(input);
-      }
       await this.ensurePlanActionSettlementsProjected();
       await this.ports.projection.flushPending(this.state.runId);
       recovered = true;

@@ -42,6 +42,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 }) => {
   const session = useAgentSessionStore((s) => s.session);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
@@ -69,7 +70,11 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const [modelAvailable, setModelAvailable] = useState(false);
   const sessionRunning = Boolean(
     session?.id
-    && (runningSessionIds.includes(session.id) || cancellingSessionIds.includes(session.id))
+    && (
+      runningSessionIds.includes(session.id)
+      || activeRunSessionIds.includes(session.id)
+      || cancellingSessionIds.includes(session.id)
+    )
   );
 
   useEffect(() => {

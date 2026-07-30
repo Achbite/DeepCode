@@ -270,7 +270,7 @@ async fn wait_for_started_run(
     if show_progress {
         print_run_progress(&result.run);
     }
-    while !result.run.is_terminal() {
+    while !run_is_quiescent(&result.run) {
         if let Some(limit) = run_timeout {
             if run_started.elapsed() >= limit {
                 return Err(format!(
@@ -303,7 +303,23 @@ async fn wait_for_started_run(
     if show_progress && run_progress_key(&result.run) != last_progress_key {
         print_run_progress(&result.run);
     }
+    if matches!(result.run.status.as_str(), "failed" | "cancelled") {
+        let message = result
+            .run
+            .message
+            .as_deref()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("the shared Session run did not complete successfully");
+        return Err(format!(
+            "shared session run {} {}: {message}",
+            result.run.run_id, result.run.status
+        ));
+    }
     Ok(result)
+}
+
+fn run_is_quiescent(run: &deepcode_kernel_client::AgentRunStatus) -> bool {
+    run.is_terminal() || run.status == "waiting"
 }
 
 fn cli_run_timeout() -> Result<Option<Duration>, String> {

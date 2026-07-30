@@ -442,6 +442,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const activeSession = useAgentSessionStore((s) => s.session);
   const loadingSession = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const events = useAgentSessionStore((s) => s.events);
   const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
@@ -566,7 +568,14 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     }
     return Array.from(byId.values());
   }, [activeSession, events.length, knownSessions, sessions]);
-  const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
+  const activeSessionRunning = Boolean(
+    activeSession?.id
+    && (
+      runningSessionIds.includes(activeSession.id)
+      || activeRunSessionIds.includes(activeSession.id)
+      || cancellingSessionIds.includes(activeSession.id)
+    )
+  );
   const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);

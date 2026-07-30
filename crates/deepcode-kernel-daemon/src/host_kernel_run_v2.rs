@@ -487,8 +487,14 @@ impl HostKernelRunCoordinatorV2 {
         host_run_id: &str,
         run_id: &str,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
-        self.retire_run_with_caller_correlation(session_id, host_run_id, run_id, None)
-            .await
+        self.retire_run_with_caller_correlation(
+            session_id,
+            host_run_id,
+            run_id,
+            RunRetirementReasonCodeV2::SessionEnded,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn retire_run_for_caller(
@@ -503,6 +509,7 @@ impl HostKernelRunCoordinatorV2 {
             session_id,
             host_run_id,
             run_id,
+            RunRetirementReasonCodeV2::HostRequested,
             Some((caller_request_id, request_digest)),
         )
         .await
@@ -513,6 +520,7 @@ impl HostKernelRunCoordinatorV2 {
         session_id: &str,
         host_run_id: &str,
         run_id: &str,
+        retirement_reason: RunRetirementReasonCodeV2,
         caller_correlation: Option<(&str, &str)>,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
         let turn = self
@@ -539,7 +547,7 @@ impl HostKernelRunCoordinatorV2 {
             &turn,
             host_run_id,
             run_id,
-            RunRetirementReasonCodeV2::SessionEnded,
+            retirement_reason,
             None,
         )?;
         match caller_correlation {

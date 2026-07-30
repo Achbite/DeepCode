@@ -1056,7 +1056,12 @@ fn authorize_llm_chat_transport(
 }
 
 fn llm_provider_error_code(error: &LlmProviderDiagnostic) -> &str {
-    if error.reason == "provider_thinking_continuation_invalid" {
+    if matches!(
+        error.reason.as_str(),
+        "ProviderProfileMissingApiKey"
+            | "ProviderUnsupportedKind"
+            | "provider_thinking_continuation_invalid"
+    ) {
         return error.reason.as_str();
     }
     if matches!(

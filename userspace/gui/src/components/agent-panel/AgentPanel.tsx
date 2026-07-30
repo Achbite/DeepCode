@@ -19,6 +19,7 @@ const AgentPanel: React.FC = () => {
   const sessions = useAgentSessionStore((s) => s.sessions);
   const loading = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
@@ -48,7 +49,11 @@ const AgentPanel: React.FC = () => {
   );
   const activeSessionRunning = Boolean(
     session?.id
-    && (runningSessionIds.includes(session.id) || cancellingSessionIds.includes(session.id))
+    && (
+      runningSessionIds.includes(session.id)
+      || activeRunSessionIds.includes(session.id)
+      || cancellingSessionIds.includes(session.id)
+    )
   );
   const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
