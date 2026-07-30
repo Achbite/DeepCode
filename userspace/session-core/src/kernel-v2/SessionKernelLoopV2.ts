@@ -1200,7 +1200,11 @@ export class SessionKernelLoopV2 {
     recordedAt?: string
   ): SessionKernelProjectionEventV2 {
     return {
-      projectionId,
+      projectionId: [
+        'run',
+        this.state.runId,
+        projectionId,
+      ].join(':'),
       runId: this.state.runId,
       recordedAt: recordedAt ?? this.ports.clock.now(),
       kind,
