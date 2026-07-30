@@ -1,11 +1,13 @@
 use crate::host_run_broker_v2::HostActiveRunBrokerV2;
 use crate::host_v2_storage::{
-    append_json_line_durable, canonical_sha256, reject_transport_capabilities,
-    sha256_path_component, validate_bounded_identity, validate_safe_session_identity,
-    value_without_field, with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
+    append_json_line_durable, canonical_json_bytes, canonical_sha256,
+    reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
+    validate_safe_session_identity, value_without_field, with_storage_path_lock,
+    HostV2StorageError, HostV2StorageErrorKind,
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
+use crate::session_bootstrap_v2::HostSessionPriorEventsV2;
 use crate::AppState;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -34,6 +36,7 @@ const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-request.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-reply.v2";
+const HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA: &str = "deepcode.host.session-prior-events-page.v2";
 const HOST_SESSION_PUBLIC_AGENT_EVENT_V2_SCHEMA: &str =
     "deepcode.host.session-public-agent-event.v2";
 const HOST_SESSION_PUBLIC_TIMELINE_V2_SCHEMA: &str = "deepcode.host.session-public-timeline.v2";
@@ -41,6 +44,11 @@ pub(crate) const SESSION_KERNEL_V2_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_V2_STORE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_V2_STORE_RECORD_BYTES: usize = SESSION_KERNEL_V2_BODY_LIMIT_BYTES;
 const MAX_V2_STORE_RECORDS: usize = 100_000;
+const MAX_PRIOR_EVENTS_PAGE_COUNT_V2: usize = 128;
+const MAX_PRIOR_EVENTS_PAGE_BYTES_V2: usize = 1024 * 1024;
+const MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_BYTES_V2: usize = 8 * 1024 * 1024;
+const MAX_PRIOR_EVENTS_PROJECTION_BYTES_V2: usize = 12 * 1024 * 1024;
+const MAX_PRIOR_EVENTS_PAGE_CACHE_V2: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -617,6 +625,31 @@ struct SessionKernelHostProjectionReplyV2 {
     replayed: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HostSessionPriorEventsPageQueryV2 {
+    continuation: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostSessionPriorEventsPageReplyV2 {
+    schema_version: &'static str,
+    session_id: String,
+    host_run_id: String,
+    run_id: String,
+    source_event_version: u64,
+    source_events_digest: String,
+    snapshot_digest: String,
+    start_event_index: u64,
+    end_event_index_exclusive: u64,
+    event_count: u64,
+    events: Vec<Value>,
+    events_digest: String,
+    next_continuation: Option<String>,
+    page_digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostSessionPublicAgentEventRecordV2 {
@@ -644,6 +677,7 @@ pub(crate) struct SessionKernelProjectionSinkV2 {
     sessions_dir: Arc<PathBuf>,
     active_runs: HostActiveRunBrokerV2,
     projections: Arc<Mutex<HashMap<String, BTreeMap<String, (String, Value)>>>>,
+    prior_event_prefixes: Arc<Mutex<HashMap<String, Arc<Vec<Value>>>>>,
 }
 
 impl SessionKernelProjectionSinkV2 {
@@ -652,6 +686,7 @@ impl SessionKernelProjectionSinkV2 {
             sessions_dir: Arc::new(sessions_dir),
             active_runs,
             projections: Arc::new(Mutex::new(HashMap::new())),
+            prior_event_prefixes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -684,6 +719,7 @@ impl SessionKernelProjectionSinkV2 {
             {
                 true
             } else {
+                self.preflight_public_projection_appends(session_id, host_run_id, &request, false)?;
                 append_json_line_durable(
                     &path,
                     &serde_json::to_value(&request).map_err(|error| {
@@ -695,6 +731,9 @@ impl SessionKernelProjectionSinkV2 {
                 )?;
                 false
             };
+            if replayed {
+                self.preflight_public_projection_appends(session_id, host_run_id, &request, true)?;
+            }
             self.publish_agent_event_locked(session_id, &request)?;
             self.publish_timeline_locked(session_id, &request)?;
             Ok(replayed)
@@ -706,6 +745,230 @@ impl SessionKernelProjectionSinkV2 {
             projection_digest: request.projection_digest,
             replayed,
         })
+    }
+
+    fn prior_events_page(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        capability: &RunCapabilityV2,
+        frozen: &HostSessionPriorEventsV2,
+        continuation: Option<&str>,
+    ) -> Result<HostSessionPriorEventsPageReplyV2, HostV2StorageError> {
+        frozen.validate(session_id)?;
+        self.active_runs.authorize_host_run_transport(
+            session_id,
+            host_run_id,
+            run_id,
+            capability,
+        )?;
+        let (cache_key, source_events) =
+            self.frozen_prior_event_prefix(session_id, host_run_id, run_id, frozen)?;
+        let frozen_count = source_events.len();
+        let start = decode_prior_events_continuation(
+            continuation,
+            session_id,
+            host_run_id,
+            run_id,
+            frozen,
+        )?;
+        if start > frozen_count {
+            return Err(HostV2StorageError::invalid(
+                "host_session_prior_events_continuation_invalid",
+                "Prior Session event continuation exceeds the frozen prefix",
+            ));
+        }
+        let mut events = Vec::new();
+        let mut encoded_bytes = 2usize;
+        for event in source_events
+            .iter()
+            .skip(start)
+            .take(MAX_PRIOR_EVENTS_PAGE_COUNT_V2)
+        {
+            let separator_bytes = usize::from(!events.is_empty());
+            let event_bytes = canonical_json_bytes(event)?.len();
+            let candidate_bytes = encoded_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(event_bytes);
+            if events.is_empty() && candidate_bytes > MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_BYTES_V2 {
+                return Err(HostV2StorageError::invalid(
+                    "host_session_prior_event_projection_limit_exceeded",
+                    "A prior Session event exceeds the bounded projection page limit",
+                ));
+            }
+            if !events.is_empty() && candidate_bytes > MAX_PRIOR_EVENTS_PAGE_BYTES_V2 {
+                break;
+            }
+            events.push(event.clone());
+            encoded_bytes = candidate_bytes;
+        }
+        let end = start.checked_add(events.len()).ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_session_prior_events_index_invalid",
+                "Prior Session event page index is exhausted",
+            )
+        })?;
+        let start_event_index = u64::try_from(start).map_err(|_| {
+            HostV2StorageError::conflict(
+                "host_session_prior_events_index_invalid",
+                "Prior Session event page index is not representable",
+            )
+        })?;
+        let end_event_index_exclusive = u64::try_from(end).map_err(|_| {
+            HostV2StorageError::conflict(
+                "host_session_prior_events_index_invalid",
+                "Prior Session event page index is not representable",
+            )
+        })?;
+        let event_count = u64::try_from(events.len()).map_err(|_| {
+            HostV2StorageError::conflict(
+                "host_session_prior_events_count_invalid",
+                "Prior Session event page count is not representable",
+            )
+        })?;
+        let events_digest = canonical_sha256(&Value::Array(events.clone()))?;
+        let next_continuation = if end < frozen_count {
+            Some(prior_events_continuation(
+                end,
+                session_id,
+                host_run_id,
+                run_id,
+                frozen,
+            )?)
+        } else {
+            None
+        };
+        let page_digest = canonical_sha256(&json!({
+            "schemaVersion": HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA,
+            "sessionId": session_id,
+            "hostRunId": host_run_id,
+            "runId": run_id,
+            "sourceEventVersion": frozen.source_event_version,
+            "sourceEventsDigest": frozen.source_events_digest,
+            "snapshotDigest": frozen.snapshot_digest,
+            "startEventIndex": start_event_index,
+            "endEventIndexExclusive": end_event_index_exclusive,
+            "eventCount": event_count,
+            "events": events,
+            "eventsDigest": events_digest,
+            "nextContinuation": next_continuation,
+        }))?;
+        if next_continuation.is_none() {
+            if let Ok(mut prefixes) = self.prior_event_prefixes.lock() {
+                prefixes.remove(&cache_key);
+            }
+        }
+        Ok(HostSessionPriorEventsPageReplyV2 {
+            schema_version: HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA,
+            session_id: session_id.to_string(),
+            host_run_id: host_run_id.to_string(),
+            run_id: run_id.to_string(),
+            source_event_version: frozen.source_event_version,
+            source_events_digest: frozen.source_events_digest.clone(),
+            snapshot_digest: frozen.snapshot_digest.clone(),
+            start_event_index,
+            end_event_index_exclusive,
+            event_count,
+            events,
+            events_digest,
+            next_continuation,
+            page_digest,
+        })
+    }
+
+    fn frozen_prior_event_prefix(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        frozen: &HostSessionPriorEventsV2,
+    ) -> Result<(String, Arc<Vec<Value>>), HostV2StorageError> {
+        let cache_key = canonical_sha256(&json!({
+            "schemaVersion": "deepcode.host.session-prior-events-cache-key.v2",
+            "sessionId": session_id,
+            "hostRunId": host_run_id,
+            "runId": run_id,
+            "snapshotDigest": frozen.snapshot_digest,
+        }))?;
+        if let Some(events) = self
+            .prior_event_prefixes
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_session_prior_events_cache_unavailable",
+                    "Prior Session event cache is unavailable",
+                )
+            })?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok((cache_key, events));
+        }
+        let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
+        let source_events = with_storage_path_lock(&guard_path, || {
+            let durable = read_session_kernel_v2_public_agent_events_unlocked(
+                self.sessions_dir.as_ref(),
+                session_id,
+            )?;
+            let frozen_count = usize::try_from(frozen.source_event_version).map_err(|_| {
+                HostV2StorageError::conflict(
+                    "host_session_prior_events_version_invalid",
+                    "Frozen prior Session event version is not representable",
+                )
+            })?;
+            if durable.len() < frozen_count {
+                return Err(HostV2StorageError::conflict(
+                    "host_session_prior_events_prefix_missing",
+                    "Durable Session history no longer covers the frozen Run prefix",
+                ));
+            }
+            let source_events = durable[..frozen_count].to_vec();
+            let source_value = Value::Array(source_events.clone());
+            if canonical_json_bytes(&source_value)?.len() > MAX_PRIOR_EVENTS_PROJECTION_BYTES_V2 {
+                return Err(HostV2StorageError::conflict(
+                    "host_session_prior_events_projection_limit_exceeded",
+                    "Frozen Session history exceeds the bounded full-timeline projection limit",
+                ));
+            }
+            if canonical_sha256(&source_value)? != frozen.source_events_digest {
+                return Err(HostV2StorageError::conflict(
+                    "host_session_prior_events_source_digest_mismatch",
+                    "Durable Session history does not match the Run-bound frozen prefix",
+                ));
+            }
+            let suffix_start = frozen_count
+                .checked_sub(frozen.events.len())
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_session_prior_events_suffix_invalid",
+                        "Frozen prior Session event suffix is inconsistent",
+                    )
+                })?;
+            if source_events[suffix_start..] != frozen.events {
+                return Err(HostV2StorageError::conflict(
+                    "host_session_prior_events_suffix_mismatch",
+                    "Durable Session history does not match the bounded Run bootstrap suffix",
+                ));
+            }
+            Ok(Arc::new(source_events))
+        })?;
+        let mut prefixes = self.prior_event_prefixes.lock().map_err(|_| {
+            HostV2StorageError::io(
+                "host_session_prior_events_cache_unavailable",
+                "Prior Session event cache is unavailable",
+            )
+        })?;
+        if prefixes.len() >= MAX_PRIOR_EVENTS_PAGE_CACHE_V2 {
+            if let Some(oldest_key) = prefixes.keys().next().cloned() {
+                prefixes.remove(&oldest_key);
+            }
+        }
+        let events = prefixes
+            .entry(cache_key.clone())
+            .or_insert_with(|| Arc::clone(&source_events))
+            .clone();
+        Ok((cache_key, events))
     }
 
     pub(crate) fn status(&self) -> Value {
@@ -787,6 +1050,83 @@ impl SessionKernelProjectionSinkV2 {
                     "Session public timeline revision cannot replace a newer durable snapshot",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn preflight_public_projection_appends(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        request: &SessionKernelHostProjectionRequestV2,
+        host_projection_replayed: bool,
+    ) -> Result<(), HostV2StorageError> {
+        let projection_path = self.projection_path(session_id, host_run_id)?;
+        if !host_projection_replayed {
+            let projection_value = serde_json::to_value(request).map_err(|error| {
+                HostV2StorageError::invalid(
+                    "session_kernel_projection_record_invalid",
+                    format!("encode Host projection record: {error}"),
+                )
+            })?;
+            let record_count = read_bounded_json_lines(&projection_path)?.len();
+            preflight_projection_store_append(&projection_path, record_count, &projection_value)?;
+        }
+
+        let agent_record = HostSessionPublicAgentEventRecordV2 {
+            schema_version: HOST_SESSION_PUBLIC_AGENT_EVENT_V2_SCHEMA.to_string(),
+            projection_id: request.projection_id.clone(),
+            projection_digest: request.projection_digest.clone(),
+            agent_event_digest: canonical_sha256(&request.agent_event)?,
+            agent_event: request.agent_event.clone(),
+        };
+        let agent_path = public_agent_event_path(self.sessions_dir.as_ref(), session_id)?;
+        let agent_values = read_bounded_json_lines(&agent_path)?;
+        let mut agent_replayed = false;
+        for value in &agent_values {
+            let existing = decode_public_agent_event_record(value.clone(), session_id)?;
+            if public_agent_event_id(&existing.agent_event)?
+                == public_agent_event_id(&agent_record.agent_event)?
+            {
+                if existing != agent_record {
+                    return Err(HostV2StorageError::conflict(
+                        "session_kernel_public_event_identity_conflict",
+                        "Session public AgentEvent id has different durable content",
+                    ));
+                }
+                agent_replayed = true;
+                break;
+            }
+        }
+        if !agent_replayed {
+            let agent_value = serde_json::to_value(&agent_record).map_err(|error| {
+                HostV2StorageError::invalid(
+                    "session_kernel_public_event_invalid",
+                    format!("encode Session public AgentEvent: {error}"),
+                )
+            })?;
+            preflight_projection_store_append(&agent_path, agent_values.len(), &agent_value)?;
+        }
+
+        let timeline_record = public_timeline_record(request)?;
+        let timeline_path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
+        let timeline_records = read_public_timeline_records(&timeline_path, session_id)?;
+        let timeline_replayed = timeline_records
+            .iter()
+            .find(|existing| existing.projection_id == request.projection_id)
+            .is_some_and(|existing| existing == &timeline_record);
+        if !timeline_replayed {
+            let timeline_value = serde_json::to_value(&timeline_record).map_err(|error| {
+                HostV2StorageError::invalid(
+                    "session_kernel_public_timeline_invalid",
+                    format!("encode Session public timeline: {error}"),
+                )
+            })?;
+            preflight_projection_store_append(
+                &timeline_path,
+                timeline_records.len(),
+                &timeline_value,
+            )?;
         }
         Ok(())
     }
@@ -920,6 +1260,26 @@ impl SessionKernelProjectionSinkV2 {
     }
 }
 
+fn preflight_projection_store_append(
+    path: &FsPath,
+    record_count: usize,
+    value: &Value,
+) -> Result<(), HostV2StorageError> {
+    preflight_store_append(path, record_count, value).map_err(|error| {
+        if matches!(
+            error.code,
+            "host_v2_storage_limit_exceeded" | "host_v2_storage_record_invalid"
+        ) {
+            HostV2StorageError::conflict(
+                "session_kernel_projection_limit_exceeded",
+                "Session projection would exceed the bounded durable Host projection store",
+            )
+        } else {
+            error
+        }
+    })
+}
+
 fn projection_request_replayed(
     path: &FsPath,
     session_id: &str,
@@ -1044,6 +1404,71 @@ fn validate_projection_request(
         ));
     }
     Ok(())
+}
+
+fn prior_events_continuation(
+    next_event_index: usize,
+    session_id: &str,
+    host_run_id: &str,
+    run_id: &str,
+    frozen: &HostSessionPriorEventsV2,
+) -> Result<String, HostV2StorageError> {
+    let digest = canonical_sha256(&json!({
+        "schemaVersion": "deepcode.host.session-prior-events-continuation.v2",
+        "sessionId": session_id,
+        "hostRunId": host_run_id,
+        "runId": run_id,
+        "sourceEventVersion": frozen.source_event_version,
+        "sourceEventsDigest": frozen.source_events_digest,
+        "snapshotDigest": frozen.snapshot_digest,
+        "nextEventIndex": next_event_index,
+    }))?;
+    Ok(format!(
+        "v2.{next_event_index}.{}",
+        digest.strip_prefix("sha256:").unwrap_or(&digest)
+    ))
+}
+
+fn decode_prior_events_continuation(
+    continuation: Option<&str>,
+    session_id: &str,
+    host_run_id: &str,
+    run_id: &str,
+    frozen: &HostSessionPriorEventsV2,
+) -> Result<usize, HostV2StorageError> {
+    let Some(continuation) = continuation else {
+        return Ok(0);
+    };
+    validate_bounded_identity(continuation, "continuation", 256)?;
+    let mut fields = continuation.split('.');
+    if fields.next() != Some("v2") {
+        return Err(HostV2StorageError::invalid(
+            "host_session_prior_events_continuation_invalid",
+            "Prior Session event continuation is invalid",
+        ));
+    }
+    let index = fields
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_session_prior_events_continuation_invalid",
+                "Prior Session event continuation is invalid",
+            )
+        })?;
+    if fields.next().is_none() || fields.next().is_some() {
+        return Err(HostV2StorageError::invalid(
+            "host_session_prior_events_continuation_invalid",
+            "Prior Session event continuation is invalid",
+        ));
+    }
+    if prior_events_continuation(index, session_id, host_run_id, run_id, frozen)? != continuation {
+        return Err(HostV2StorageError::invalid(
+            "host_session_prior_events_continuation_invalid",
+            "Prior Session event continuation does not match the frozen Run prefix",
+        ));
+    }
+    Ok(index)
 }
 
 pub(crate) fn read_session_kernel_v2_public_agent_events(
@@ -1458,11 +1883,16 @@ pub(crate) async fn session_kernel_v2_projection_append(
     let Json(request) = match body {
         Ok(body) => body,
         Err(rejection) => {
+            let code = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                "session_kernel_projection_limit_exceeded"
+            } else {
+                "session_kernel_projection_request_invalid"
+            };
             return v2_error_response(
                 rejection.status(),
-                "session_kernel_projection_request_invalid",
+                code,
                 "Session Kernel projection request body is invalid",
-            )
+            );
         }
     };
     let sink = state.host_services.projection_v2.clone();
@@ -1479,6 +1909,70 @@ pub(crate) async fn session_kernel_v2_projection_append(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session_kernel_projection_task_failed",
             "Session Kernel projection task failed",
+        ),
+    }
+}
+
+pub(crate) async fn session_kernel_v2_prior_events_page(
+    State(state): State<AppState>,
+    Path((session_id, host_run_id)): Path<(String, String)>,
+    Query(query): Query<HostSessionPriorEventsPageQueryV2>,
+    headers: HeaderMap,
+) -> Response {
+    if !crate::session_metadata_v2::trusted_private_storage_origin(&headers) {
+        return v2_error_response(
+            StatusCode::FORBIDDEN,
+            "host_session_prior_events_origin_forbidden",
+            "Prior Session events accept only trusted local clients",
+        );
+    }
+    let capability = match run_transport_capability(&headers) {
+        Ok(capability) => capability,
+        Err(error) => return storage_error_response(error),
+    };
+    let active = match state
+        .host_services
+        .active_runs_v2
+        .authorize_host_run_transport_binding(&session_id, &host_run_id, &capability)
+    {
+        Ok(active) => active,
+        Err(error) => return storage_error_response(error),
+    };
+    let bootstrap = match state
+        .host_services
+        .kernel_operations_v2
+        .get_bootstrap(&session_id, &host_run_id)
+    {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => return storage_error_response(error),
+    };
+    if bootstrap.run_id != active.run_id {
+        return storage_error_response(HostV2StorageError::unauthorized(
+            "host_run_transport_capability_invalid",
+            "Host Run transport capability is invalid for this Session and Run",
+        ));
+    }
+    let sink = state.host_services.projection_v2.clone();
+    let read_session_id = session_id.clone();
+    let read_host_run_id = host_run_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        sink.prior_events_page(
+            &read_session_id,
+            &read_host_run_id,
+            &bootstrap.run_id,
+            &capability,
+            &bootstrap.prior_session_events,
+            query.continuation.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(reply)) => v2_success_response(StatusCode::OK, &reply),
+        Ok(Err(error)) => storage_error_response(error),
+        Err(_) => v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "host_session_prior_events_task_failed",
+            "Prior Session event page read failed",
         ),
     }
 }

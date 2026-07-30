@@ -334,31 +334,48 @@ impl HostActiveRunBrokerV2 {
         run_id: &str,
         capability: &RunCapabilityV2,
     ) -> Result<(), HostV2StorageError> {
+        let active =
+            self.authorize_host_run_transport_binding(session_id, host_run_id, capability)?;
+        validate_bounded_identity(run_id, "runId", 512)?;
+        if active.run_id == run_id {
+            Ok(())
+        } else {
+            Err(invalid_run_transport_capability())
+        }
+    }
+
+    pub(crate) fn authorize_host_run_transport_binding(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        capability: &RunCapabilityV2,
+    ) -> Result<HostActiveRunRecordV2, HostV2StorageError> {
         validate_safe_session_identity(session_id)?;
         validate_bounded_identity(host_run_id, "hostRunId", 512)?;
-        validate_bounded_identity(run_id, "runId", 512)?;
-        let active = self.resolve(session_id, host_run_id)?;
-        if active.run_id != run_id {
-            return Err(invalid_run_transport_capability());
-        }
-        let binding = HostRunTransportBindingV2 {
-            session_id: session_id.to_string(),
-            host_run_id: host_run_id.to_string(),
-            run_id: run_id.to_string(),
-        };
         let submitted: [u8; 32] =
             Sha256::digest(capability.expose_to_transport().as_bytes()).into();
-        let capabilities = self.run_transport_capabilities.lock().map_err(|_| {
-            HostV2StorageError::io(
-                "host_run_transport_authority_unavailable",
-                "Host Run transport authority is unavailable",
-            )
-        })?;
-        if capabilities
-            .get(&binding)
-            .is_some_and(|expected| constant_time_digest_eq(&expected.digest, &submitted))
-        {
-            Ok(())
+        let binding = self
+            .run_transport_capabilities
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_run_transport_authority_unavailable",
+                    "Host Run transport authority is unavailable",
+                )
+            })?
+            .iter()
+            .find(|(binding, expected)| {
+                binding.session_id == session_id
+                    && binding.host_run_id == host_run_id
+                    && constant_time_digest_eq(&expected.digest, &submitted)
+            })
+            .map(|(binding, _)| binding.clone())
+            .ok_or_else(invalid_run_transport_capability)?;
+        let active = self
+            .resolve(&binding.session_id, &binding.host_run_id)
+            .map_err(|_| invalid_run_transport_capability())?;
+        if active.run_id == binding.run_id {
+            Ok(active)
         } else {
             Err(invalid_run_transport_capability())
         }

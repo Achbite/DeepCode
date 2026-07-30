@@ -4,7 +4,9 @@ use crate::host_v2_storage::{
     reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
     validate_safe_session_identity, validate_sha256_digest, HostV2StorageError,
 };
-use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPriorEventsV2};
+use crate::session_bootstrap_v2::{
+    HostProviderProfileBootstrapV2, HostSessionPriorEventsV2, HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3,
+};
 use crate::AgentInputAttachmentV2;
 use deepcode_kernel_abi::v2_command::{KernelCommandEnvelopeV2, KernelCommandV2, RunOpenReplyV2};
 use rusqlite::{
@@ -309,6 +311,7 @@ pub(crate) struct HostKernelStartupReconciliationV2 {
     pub(crate) opening_runs: Vec<HostKernelRunOpeningRecordV2>,
     pub(crate) active_runs: Vec<HostKernelBootstrapRecordV2>,
     pub(crate) pending_operations: Vec<HostKernelPendingOperationV2>,
+    pub(crate) unsupported_history_runs: Vec<(String, String)>,
     pub(crate) attempts_marked_indeterminate: usize,
 }
 
@@ -829,7 +832,9 @@ impl HostKernelOperationStoreV2 {
                     "RunOpen request identity is permanently bound to different durable content",
                 ));
             }
-            if stored_live_run_for_session(transaction, &prepared.session_id)?.is_some() {
+            if let Some(existing) = stored_live_run_for_session(transaction, &prepared.session_id)?
+            {
+                decode_opening_record(&existing)?;
                 return Err(HostV2StorageError::conflict(
                     "host_kernel_session_run_already_live",
                     "Session already has an Opening or Active Host Kernel Run",
@@ -977,6 +982,29 @@ impl HostKernelOperationStoreV2 {
                     )
                 })?;
             decode_bootstrap_record(&stored)
+        })
+    }
+
+    pub(crate) fn live_run_has_supported_history_schema(
+        &self,
+        session_id: &str,
+        route_run_id: &str,
+    ) -> Result<bool, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        validate_bounded_identity(route_run_id, "routeRunId", 512)?;
+        self.with_connection(|connection| {
+            let Some(stored) = stored_live_run_for_session(connection, session_id)? else {
+                return Ok(false);
+            };
+            if stored.host_run_id != route_run_id && stored.run_id.as_deref() != Some(route_run_id)
+            {
+                return Ok(false);
+            }
+            let session_bootstrap_value: Value =
+                serde_json::from_str(&stored.initial_input_json)
+                    .map_err(|_| corrupt("Host Kernel Session bootstrap JSON is corrupt"))?;
+            require_supported_prior_events_schema(&session_bootstrap_value)?;
+            Ok(true)
         })
     }
 
@@ -1869,34 +1897,69 @@ impl HostKernelOperationStoreV2 {
     ) -> Result<HostKernelStartupReconciliationV2, HostV2StorageError> {
         validate_bounded_identity(reconciled_at, "reconciledAt", 1024)?;
         self.with_write_transaction(|transaction| {
-            let marked = transaction
-                .execute(
-                    "UPDATE host_kernel_dispatch_attempts
-                     SET state = 'Indeterminate', state_recorded_at = ?1,
-                         state_reason_code = 'host_restart_write_outcome_unknown'
-                     WHERE state IN ('Prepared', 'Committed')",
-                    params![reconciled_at],
-                )
-                .map_err(|error| {
-                    database_error("host_kernel_startup_reconciliation_failed", error)
-                })?;
-
             let stored_runs = query_live_runs(transaction)?;
             let mut opening_runs = Vec::new();
             let mut active_runs = Vec::new();
+            let mut unsupported_history_runs = Vec::new();
+            let mut unsupported_run_row_ids = Vec::new();
+            let mut supported_run_row_ids = Vec::new();
             for stored in &stored_runs {
-                match parse_run_lifecycle(&stored.lifecycle)? {
+                let decoded = match parse_run_lifecycle(&stored.lifecycle)? {
                     HostKernelStoredRunLifecycleV2::Opening => {
-                        opening_runs.push(decode_opening_record(stored)?)
+                        decode_opening_record(stored).map(|record| (Some(record), None))
                     }
                     HostKernelStoredRunLifecycleV2::Active => {
-                        active_runs.push(decode_bootstrap_record(stored)?)
+                        decode_bootstrap_record(stored).map(|record| (None, Some(record)))
                     }
-                    HostKernelStoredRunLifecycleV2::Retired => {}
+                    HostKernelStoredRunLifecycleV2::Retired => continue,
+                };
+                match decoded {
+                    Ok((Some(opening), None)) => {
+                        supported_run_row_ids.push(stored.id);
+                        opening_runs.push(opening);
+                    }
+                    Ok((None, Some(active))) => {
+                        supported_run_row_ids.push(stored.id);
+                        active_runs.push(active);
+                    }
+                    Ok(_) => {
+                        return Err(corrupt(
+                            "Host Kernel startup reconciliation decoded an invalid Run state",
+                        ))
+                    }
+                    Err(error) if error.code == "unsupported_history_schema" => {
+                        unsupported_run_row_ids.push(stored.id);
+                        unsupported_history_runs
+                            .push((stored.session_id.clone(), stored.host_run_id.clone()));
+                    }
+                    Err(error) => return Err(error),
                 }
+            }
+            let mut marked = 0usize;
+            for run_row_id in supported_run_row_ids {
+                marked = marked.saturating_add(
+                    transaction
+                        .execute(
+                            "UPDATE host_kernel_dispatch_attempts
+                             SET state = 'Indeterminate', state_recorded_at = ?1,
+                                 state_reason_code = 'host_restart_write_outcome_unknown'
+                             WHERE state IN ('Prepared', 'Committed')
+                               AND operation_row_id IN (
+                                   SELECT id FROM host_kernel_operations
+                                   WHERE run_row_id = ?2
+                               )",
+                            params![reconciled_at, run_row_id],
+                        )
+                        .map_err(|error| {
+                            database_error("host_kernel_startup_reconciliation_failed", error)
+                        })?,
+                );
             }
             let mut pending_operations = Vec::new();
             for stored in &stored_runs {
+                if unsupported_run_row_ids.contains(&stored.id) {
+                    continue;
+                }
                 if parse_run_lifecycle(&stored.lifecycle)? == HostKernelStoredRunLifecycleV2::Active
                 {
                     pending_operations.extend(query_pending_operations_for_run(
@@ -1916,6 +1979,7 @@ impl HostKernelOperationStoreV2 {
                 opening_runs,
                 active_runs,
                 pending_operations,
+                unsupported_history_runs,
                 attempts_marked_indeterminate: marked,
             })
         })
@@ -3863,6 +3927,9 @@ fn decode_opening_record(
     if stored.schema_version != RUN_ROW_SCHEMA_V2 {
         return Err(corrupt("Host Kernel Run row schema is not exact v2"));
     }
+    let session_bootstrap_value: Value = serde_json::from_str(&stored.initial_input_json)
+        .map_err(|_| corrupt("Host Kernel Session bootstrap JSON is corrupt"))?;
+    require_supported_prior_events_schema(&session_bootstrap_value)?;
     let lifecycle = parse_run_lifecycle(&stored.lifecycle)?;
     let envelope_value: Value = serde_json::from_str(&stored.run_open_envelope_json)
         .map_err(|_| corrupt("Host Kernel RunOpen envelope JSON is corrupt"))?;
@@ -3878,8 +3945,6 @@ fn decode_opening_record(
         .map_err(|_| corrupt("Host Kernel Settings JSON is corrupt"))?;
     let run_settings: HostRunSettingsCeilingV2 = serde_json::from_value(settings_value.clone())
         .map_err(|_| corrupt("Host Kernel Settings ceiling is not exact v2"))?;
-    let session_bootstrap_value: Value = serde_json::from_str(&stored.initial_input_json)
-        .map_err(|_| corrupt("Host Kernel Session bootstrap JSON is corrupt"))?;
     reject_host_private_persistence_fields(&session_bootstrap_value)?;
     let session_bootstrap: HostKernelSessionBootstrapMaterialV2 =
         serde_json::from_value(session_bootstrap_value)
@@ -3896,7 +3961,13 @@ fn decode_opening_record(
     session_bootstrap
         .prior_session_events
         .validate(&stored.session_id)
-        .map_err(|_| corrupt("Host Kernel prior Session events are not exact v2"))?;
+        .map_err(|error| {
+            if error.code == "unsupported_history_schema" {
+                error
+            } else {
+                corrupt("Host Kernel prior Session events are not exact v2")
+            }
+        })?;
     let initial_input = session_bootstrap.initial_input;
     let workspace_kind = parse_workspace_kind(&stored.workspace_kind)?;
     validate_workspace_shape(
@@ -4032,6 +4103,24 @@ fn decode_opening_record(
         opening_recorded_at: stored.opening_recorded_at.clone(),
         opening_digest: stored.opening_digest.clone(),
     })
+}
+
+fn require_supported_prior_events_schema(
+    session_bootstrap_value: &Value,
+) -> Result<(), HostV2StorageError> {
+    if session_bootstrap_value
+        .get("priorSessionEvents")
+        .and_then(|value| value.get("schemaVersion"))
+        .and_then(Value::as_str)
+        == Some(HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3)
+    {
+        Ok(())
+    } else {
+        Err(HostV2StorageError::invalid(
+            "unsupported_history_schema",
+            "UnsupportedHistorySchema: Host Kernel prior Session events use an unsupported schema",
+        ))
+    }
 }
 
 fn decode_bootstrap_record(

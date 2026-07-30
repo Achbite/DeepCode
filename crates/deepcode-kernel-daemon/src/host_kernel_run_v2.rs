@@ -1658,6 +1658,12 @@ impl HostKernelRunCoordinatorV2 {
         recovery_status.active_run_count = reconciliation.active_runs.len();
         recovery_status.attempts_marked_indeterminate =
             reconciliation.attempts_marked_indeterminate;
+        for _ in &reconciliation.unsupported_history_runs {
+            recovery_status.record_error("unsupported_history_schema");
+            self.host_services
+                .active_runs_v2
+                .record_startup_error("unsupported_history_schema");
+        }
 
         for opening in &reconciliation.opening_runs {
             if let Err(error) = self.recover_opening_run(opening).await {

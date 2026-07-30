@@ -218,6 +218,11 @@ pub(crate) async fn open_agent_kernel_run_v2(
         .resolve_session_active_run(session_id)
         .map_err(AgentKernelV2Error::from_storage)?
     {
+        state
+            .host_services
+            .kernel_operations_v2
+            .live_run_has_supported_history_schema(session_id, &active.host_run_id)
+            .map_err(AgentKernelV2Error::from_storage)?;
         if binding.replayed && active.host_run_id == host_run_id {
             let error = AgentKernelV2Error::invalid(
                 "host_caller_request_indeterminate",
@@ -1103,7 +1108,18 @@ pub(crate) fn restore_agent_kernel_run_cache_v2(
     session_id: &str,
     route_run_id: &str,
 ) -> Result<String, AgentKernelV2Error> {
-    let active = require_active_agent_kernel_run_v2(state, session_id, Some(route_run_id))?;
+    let active = match require_active_agent_kernel_run_v2(state, session_id, Some(route_run_id)) {
+        Ok(active) => active,
+        Err(error) if error.code == "agent_run_not_active" => {
+            state
+                .host_services
+                .kernel_operations_v2
+                .live_run_has_supported_history_schema(session_id, route_run_id)
+                .map_err(AgentKernelV2Error::from_storage)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     ensure_agent_run_cache_v2(state, &active)?;
     Ok(active.host_run_id)
 }

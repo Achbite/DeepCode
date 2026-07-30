@@ -27,6 +27,9 @@ import type {
 import type {
   SessionPriorEventsSourceV2,
 } from './sessionMemory.js';
+import {
+  decodeSessionPriorAgentEventV2,
+} from './sessionMemory.js';
 
 export const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA =
   'deepcode.session.kernel-host-projection-request.v2' as const;
@@ -34,6 +37,13 @@ export const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA =
   'deepcode.session.kernel-host-projection-reply.v2' as const;
 export const SESSION_KERNEL_PUBLIC_PROJECTION_V2_SCHEMA =
   'deepcode.session.kernel-public-projection.v2' as const;
+export const HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA =
+  'deepcode.host.session-prior-events-page.v2' as const;
+const MAX_PROJECTION_REQUEST_UTF8_BYTES = 16 * 1024 * 1024;
+const MAX_PRIOR_EVENTS_PAGE_COUNT = 128;
+const MAX_PRIOR_EVENTS_PAGE_UTF8_BYTES = 1024 * 1024;
+const MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_UTF8_BYTES =
+  8 * 1024 * 1024;
 
 export interface SessionKernelPublicProjectionPayloadV2 {
   schemaVersion: typeof SESSION_KERNEL_PUBLIC_PROJECTION_V2_SCHEMA;
@@ -75,14 +85,34 @@ export interface SessionKernelHostProjectionReplyV2 {
   replayed: boolean;
 }
 
+interface HostSessionPriorEventsPageV2 {
+  schemaVersion: typeof HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA;
+  sessionId: string;
+  hostRunId: string;
+  runId: string;
+  sourceEventVersion: number;
+  sourceEventsDigest: string;
+  snapshotDigest: string;
+  startEventIndex: number;
+  endEventIndexExclusive: number;
+  eventCount: number;
+  events: AgentEvent[];
+  eventsDigest: string;
+  nextContinuation: string | null;
+  pageDigest: string;
+}
+
 export class HttpSessionKernelHostProjectionSinkV2
 implements SessionKernelHostProjectionSinkV2 {
   private readonly endpoint: string;
+  private readonly priorEventsEndpoint: string;
   readonly #runCapability: string;
+  private fullPriorSessionEvents?: Promise<AgentEvent[]>;
 
   constructor(
     private readonly sessionId: string,
     private readonly hostRunId: string,
+    private readonly runId: string,
     private readonly priorSessionEvents: SessionPriorEventsSourceV2,
     apiBase: string,
     privateAuth: SessionKernelTransportPrivateAuthV2,
@@ -90,6 +120,7 @@ implements SessionKernelHostProjectionSinkV2 {
   ) {
     requiredIdentity(sessionId, 'sessionId');
     requiredIdentity(hostRunId, 'hostRunId');
+    requiredIdentity(runId, 'runId');
     if (
       priorSessionEvents.sessionId !== sessionId
       || priorSessionEvents.selectedEventCount
@@ -115,6 +146,14 @@ implements SessionKernelHostProjectionSinkV2 {
       encodeURIComponent(hostRunId),
       'kernel-v2/projections',
     ].join('/');
+    this.priorEventsEndpoint = [
+      normalizeApiBase(apiBase),
+      'api/agent/sessions',
+      encodeURIComponent(sessionId),
+      'runs',
+      encodeURIComponent(hostRunId),
+      'kernel-v2/prior-events',
+    ].join('/');
   }
 
   async publish(
@@ -134,8 +173,9 @@ implements SessionKernelHostProjectionSinkV2 {
       (projection) =>
         sessionKernelAgentEventV2(this.sessionId, projection)
     );
+    const priorEvents = await this.priorEventsForProjection();
     const agentEvents = [
-      ...cloneJson(this.priorSessionEvents.events),
+      ...priorEvents,
       ...currentRunAgentEvents,
     ];
     const sourceEventVersion =
@@ -185,13 +225,23 @@ implements SessionKernelHostProjectionSinkV2 {
       timeline,
     };
     assertNoTransportCapabilities(request);
+    const encodedRequest = JSON.stringify(request);
+    if (
+      new TextEncoder().encode(encodedRequest).byteLength
+        > MAX_PROJECTION_REQUEST_UTF8_BYTES
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_limit_exceeded',
+        'Session v2 projection request exceeds the Host transport limit.'
+      );
+    }
     const response = await this.fetchImpl(this.endpoint, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-deepcode-run-capability': this.#runCapability,
       },
-      body: JSON.stringify(request),
+      body: encodedRequest,
     });
     if (!response.ok) {
       const failure = await projectionHttpFailure(
@@ -225,6 +275,92 @@ implements SessionKernelHostProjectionSinkV2 {
     ) {
       throw invalidProjectionReply();
     }
+  }
+
+  private priorEventsForProjection(): Promise<AgentEvent[]> {
+    if (this.priorSessionEvents.omittedEventCount === 0) {
+      return Promise.resolve(
+        cloneJson(this.priorSessionEvents.events)
+      );
+    }
+    if (!this.fullPriorSessionEvents) {
+      const loading = this.fetchFrozenPriorEvents();
+      const recoverable = loading.catch((error: unknown) => {
+        if (this.fullPriorSessionEvents === recoverable) {
+          this.fullPriorSessionEvents = undefined;
+        }
+        throw error;
+      });
+      this.fullPriorSessionEvents = recoverable;
+    }
+    return this.fullPriorSessionEvents.then(cloneJson);
+  }
+
+  private async fetchFrozenPriorEvents(): Promise<AgentEvent[]> {
+    const events: AgentEvent[] = [];
+    let continuation: string | null = null;
+    do {
+      const endpoint = continuation === null
+        ? this.priorEventsEndpoint
+        : `${this.priorEventsEndpoint}?continuation=${
+          encodeURIComponent(continuation)
+        }`;
+      const response = await this.fetchImpl(endpoint, {
+        method: 'GET',
+        headers: {
+          'x-deepcode-run-capability': this.#runCapability,
+        },
+      });
+      if (!response.ok) {
+        const failure = await priorEventsHttpFailure(response);
+        throw new SessionKernelProjectionTransportError(
+          failure.code,
+          failure.message
+        );
+      }
+      const envelope = exactObject(
+        await response.json(),
+        ['ok', 'data']
+      );
+      if (envelope.ok !== true) {
+        throw invalidPriorEventsReply();
+      }
+      const page = decodePriorEventsPage(
+        envelope.data,
+        this.sessionId,
+        this.hostRunId,
+        this.runId,
+        this.priorSessionEvents,
+        events.length
+      );
+      events.push(...page.events);
+      continuation = page.nextContinuation;
+      if (
+        continuation !== null
+        && events.length >= this.priorSessionEvents.sourceEventVersion
+      ) {
+        throw invalidPriorEventsReply();
+      }
+    } while (continuation !== null);
+    if (
+      events.length !== this.priorSessionEvents.sourceEventVersion
+      || sha256Hash(canonicalJson(events))
+        !== this.priorSessionEvents.sourceEventsDigest
+    ) {
+      throw invalidPriorEventsReply();
+    }
+    const suffix = events.slice(
+      events.length - this.priorSessionEvents.selectedEventCount
+    );
+    if (
+      sha256Hash(canonicalJson(suffix))
+        !== this.priorSessionEvents.eventsDigest
+      || canonicalJson(suffix)
+        !== canonicalJson(this.priorSessionEvents.events)
+    ) {
+      throw invalidPriorEventsReply();
+    }
+    return events;
   }
 }
 
@@ -260,6 +396,152 @@ async function projectionHttpFailure(
         message:
           `Session v2 projection failed with HTTP ${response.status}.`,
       };
+}
+
+async function priorEventsHttpFailure(
+  response: Response
+): Promise<{ code: string; message: string }> {
+  try {
+    const envelope = objectRecord(await response.json());
+    const error = objectRecord(envelope?.error);
+    const code = error?.code;
+    const message = error?.message;
+    if (
+      envelope?.ok === false
+      && typeof code === 'string'
+      && /^[a-z][a-z0-9_]{0,127}$/u.test(code)
+      && typeof message === 'string'
+      && message.length > 0
+      && new TextEncoder().encode(message).byteLength <= 8_192
+    ) {
+      return { code, message };
+    }
+  } catch {
+    // Preserve a typed local transport failure when Host returned no JSON.
+  }
+  return {
+    code: 'host_session_prior_events_http_failed',
+    message:
+      `Prior Session event read failed with HTTP ${response.status}.`,
+  };
+}
+
+function decodePriorEventsPage(
+  value: unknown,
+  expectedSessionId: string,
+  expectedHostRunId: string,
+  expectedRunId: string,
+  frozen: SessionPriorEventsSourceV2,
+  expectedStartEventIndex: number
+): HostSessionPriorEventsPageV2 {
+  assertNoTransportCapabilities(value);
+  const record = exactObject(value, [
+    'schemaVersion',
+    'sessionId',
+    'hostRunId',
+    'runId',
+    'sourceEventVersion',
+    'sourceEventsDigest',
+    'snapshotDigest',
+    'startEventIndex',
+    'endEventIndexExclusive',
+    'eventCount',
+    'events',
+    'eventsDigest',
+    'nextContinuation',
+    'pageDigest',
+  ]);
+  const sessionId = requiredIdentity(record.sessionId, 'sessionId');
+  const hostRunId = requiredIdentity(record.hostRunId, 'hostRunId');
+  const runId = requiredIdentity(record.runId, 'runId');
+  const sourceEventVersion = projectionCount(
+    record.sourceEventVersion
+  );
+  const sourceEventsDigest = projectionDigest(
+    record.sourceEventsDigest
+  );
+  const snapshotDigest = projectionDigest(record.snapshotDigest);
+  const startEventIndex = projectionCount(record.startEventIndex);
+  const endEventIndexExclusive = projectionCount(
+    record.endEventIndexExclusive
+  );
+  const eventCount = projectionCount(record.eventCount);
+  if (
+    record.schemaVersion !== HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA
+    || sessionId !== expectedSessionId
+    || hostRunId !== expectedHostRunId
+    || runId !== expectedRunId
+    || sourceEventVersion !== frozen.sourceEventVersion
+    || sourceEventsDigest !== frozen.sourceEventsDigest
+    || snapshotDigest !== frozen.snapshotDigest
+    || startEventIndex !== expectedStartEventIndex
+    || endEventIndexExclusive
+      !== startEventIndex + eventCount
+    || endEventIndexExclusive > sourceEventVersion
+    || (
+      startEventIndex < sourceEventVersion
+      && eventCount === 0
+    )
+    || eventCount > MAX_PRIOR_EVENTS_PAGE_COUNT
+    || !Array.isArray(record.events)
+    || record.events.length !== eventCount
+  ) {
+    throw invalidPriorEventsReply();
+  }
+  const events = record.events.map((event) =>
+    decodeSessionPriorAgentEventV2(event, expectedSessionId)
+  );
+  const encodedEventsBytes =
+    new TextEncoder().encode(canonicalJson(events)).byteLength;
+  if (
+    encodedEventsBytes > MAX_PRIOR_EVENTS_PAGE_UTF8_BYTES
+    && (
+      eventCount !== 1
+      || encodedEventsBytes
+        > MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_UTF8_BYTES
+    )
+  ) {
+    throw invalidPriorEventsReply();
+  }
+  const eventsDigest = projectionDigest(record.eventsDigest);
+  if (eventsDigest !== sha256Hash(canonicalJson(events))) {
+    throw invalidPriorEventsReply();
+  }
+  const nextContinuation = record.nextContinuation === null
+    ? null
+    : requiredIdentity(
+        record.nextContinuation,
+        'nextContinuation'
+      );
+  if (
+    (endEventIndexExclusive < sourceEventVersion)
+      !== (nextContinuation !== null)
+  ) {
+    throw invalidPriorEventsReply();
+  }
+  const pageDigest = projectionDigest(record.pageDigest);
+  const withoutPageDigest = {
+    schemaVersion: HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA,
+    sessionId,
+    hostRunId,
+    runId,
+    sourceEventVersion,
+    sourceEventsDigest,
+    snapshotDigest,
+    startEventIndex,
+    endEventIndexExclusive,
+    eventCount,
+    events,
+    eventsDigest,
+    nextContinuation,
+  };
+  if (pageDigest !== sha256Hash(canonicalJson(withoutPageDigest))) {
+    throw invalidPriorEventsReply();
+  }
+  return {
+    ...withoutPageDigest,
+    pageDigest,
+  };
 }
 
 /**
@@ -921,6 +1203,27 @@ function exactObject(
   return record;
 }
 
+function projectionCount(value: unknown): number {
+  if (
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value < 0
+  ) {
+    throw invalidPriorEventsReply();
+  }
+  return value;
+}
+
+function projectionDigest(value: unknown): string {
+  if (
+    typeof value !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(value)
+  ) {
+    throw invalidPriorEventsReply();
+  }
+  return value;
+}
+
 function requiredIdentity(value: unknown, field: string): string {
   if (
     typeof value !== 'string'
@@ -1005,6 +1308,13 @@ function invalidProjectionReply(): SessionKernelProjectionTransportError {
   return new SessionKernelProjectionTransportError(
     'session_kernel_projection_response_invalid',
     'Host returned an invalid Session v2 projection acknowledgement.'
+  );
+}
+
+function invalidPriorEventsReply(): SessionKernelProjectionTransportError {
+  return new SessionKernelProjectionTransportError(
+    'host_session_prior_events_response_invalid',
+    'Host returned an invalid run-bound prior Session event page.'
   );
 }
 

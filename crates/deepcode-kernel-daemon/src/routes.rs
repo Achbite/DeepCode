@@ -128,6 +128,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/prior-events",
+            get(session_kernel_v2_prior_events_page),
+        )
+        .route(
             "/api/agent/sessions/:session_id/runs/:run_id",
             get(agent_session_run_get),
         )

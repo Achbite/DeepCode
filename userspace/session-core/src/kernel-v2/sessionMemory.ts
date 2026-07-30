@@ -12,7 +12,7 @@ import {
 } from './inputAttachmentsV2.js';
 
 export const SESSION_PRIOR_EVENTS_SOURCE_V2_SCHEMA =
-  'deepcode.host.session-prior-events.v2' as const;
+  'deepcode.host.session-prior-events.v3' as const;
 export const SESSION_CONTEXT_MEMORY_V2_SCHEMA =
   'deepcode.session.context-memory.v2' as const;
 
@@ -30,6 +30,7 @@ export interface SessionPriorEventsSourceV2 {
   selectedEventCount: number;
   omittedEventCount: number;
   events: AgentEvent[];
+  sourceEventsDigest: string;
   eventsDigest: string;
   snapshotDigest: string;
 }
@@ -69,6 +70,19 @@ export interface BuildSessionContextMemoryV2Input {
 export function decodeSessionPriorEventsSourceV2(
   value: unknown
 ): SessionPriorEventsSourceV2 {
+  const discriminator = (
+    typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value)
+  )
+    ? (value as Record<string, unknown>).schemaVersion
+    : undefined;
+  if (discriminator !== SESSION_PRIOR_EVENTS_SOURCE_V2_SCHEMA) {
+    throw invalidMemory(
+      'unsupported_history_schema',
+      'UnsupportedHistorySchema: prior Session events use an unsupported schema.'
+    );
+  }
   const record = exactObject(value, [
     'schemaVersion',
     'sessionId',
@@ -76,15 +90,10 @@ export function decodeSessionPriorEventsSourceV2(
     'selectedEventCount',
     'omittedEventCount',
     'events',
+    'sourceEventsDigest',
     'eventsDigest',
     'snapshotDigest',
   ]);
-  if (record.schemaVersion !== SESSION_PRIOR_EVENTS_SOURCE_V2_SCHEMA) {
-    throw invalidMemory(
-      'session_prior_events_schema_unsupported',
-      'Prior Session events have an unsupported schema.'
-    );
-  }
   const sessionId = identity(record.sessionId, 'sessionId');
   const sourceEventVersion = safeCount(
     record.sourceEventVersion,
@@ -110,7 +119,7 @@ export function decodeSessionPriorEventsSourceV2(
     );
   }
   const events = record.events.map((event) =>
-    decodeSourceEvent(event, sessionId)
+    decodeSessionPriorAgentEventV2(event, sessionId)
   );
   if (utf8Bytes(canonicalJson(events)) > MAX_SOURCE_UTF8_BYTES) {
     throw invalidMemory(
@@ -128,6 +137,19 @@ export function decodeSessionPriorEventsSourceV2(
       'Prior Session events failed exact digest verification.'
     );
   }
+  const sourceEventsDigest = sha256Digest(
+    record.sourceEventsDigest,
+    'sourceEventsDigest'
+  );
+  if (
+    omittedEventCount === 0
+    && sourceEventsDigest !== eventsDigest
+  ) {
+    throw invalidMemory(
+      'session_prior_events_source_digest_mismatch',
+      'Complete prior Session events do not match their frozen source digest.'
+    );
+  }
   const withoutSnapshotDigest = {
     schemaVersion: SESSION_PRIOR_EVENTS_SOURCE_V2_SCHEMA,
     sessionId,
@@ -135,6 +157,7 @@ export function decodeSessionPriorEventsSourceV2(
     selectedEventCount,
     omittedEventCount,
     events,
+    sourceEventsDigest,
     eventsDigest,
   };
   const snapshotDigest = sha256Digest(
@@ -154,6 +177,18 @@ export function decodeSessionPriorEventsSourceV2(
     ...withoutSnapshotDigest,
     snapshotDigest,
   };
+}
+
+/**
+ * Strictly decodes one public AgentEvent without applying the model-memory
+ * source bound. The projection transport uses this for the run-bound frozen
+ * prefix; prompt memory continues to use decodeSessionPriorEventsSourceV2.
+ */
+export function decodeSessionPriorAgentEventV2(
+  value: unknown,
+  expectedSessionId: string
+): AgentEvent {
+  return decodeSourceEvent(value, expectedSessionId);
 }
 
 /**

@@ -902,7 +902,7 @@ export class SessionKernelProductionActorV2 {
     );
     if (!this.runner) {
       this.bootstrapDigest = digest;
-      this.runner = createProductionRunner(
+      const creating = createProductionRunner(
         request,
         this.privateAuth,
         this.trustedApiBase,
@@ -911,7 +911,16 @@ export class SessionKernelProductionActorV2 {
         this.activeRunner = runner;
         return runner;
       });
-      return this.runner;
+      const recoverable = creating.catch((error: unknown) => {
+        if (this.runner === recoverable) {
+          this.runner = undefined;
+          this.activeRunner = undefined;
+          this.bootstrapDigest = undefined;
+        }
+        throw error;
+      });
+      this.runner = recoverable;
+      return recoverable;
     }
     if (this.bootstrapDigest !== digest) {
       throw new SessionKernelProductionBridgeError(
@@ -1073,6 +1082,7 @@ async function createProductionRunner(
     new HttpSessionKernelHostProjectionSinkV2(
       request.sessionId,
       request.hostRunId,
+      request.runId,
       request.priorSessionEvents,
       trustedApiBase,
       privateAuth,

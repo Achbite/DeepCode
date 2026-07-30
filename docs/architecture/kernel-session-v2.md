@@ -63,15 +63,29 @@ Session fetches the replacement once before the next provider turn.
 
 ## Session bootstrap and provider context
 
-Before `RunOpen`, Host freezes a bounded immutable prefix view of the Session's
-already durable public v2 `AgentEvent` records. The bootstrap carries the
-selected suffix, omitted count, source high-water, and canonical digest.
-Session strictly decodes only public v2 `user_msg` and `assistant_msg` text into
-untrusted prior memory and excludes the current Run. Prior-memory attachments
-are always empty: a prior Session's message/session attachment references are
-not an active-set authority source and cannot be resurrected without a separate
-durable snapshot/delta/tombstone contract. Unsupported historical schemas fail
-closed.
+Before `RunOpen`, Host freezes the exact high-water and canonical root of the
+Session's already durable public v2 `AgentEvent` prefix. The bootstrap carries
+that root plus a bounded suffix, omitted count, and suffix digest. The bounded
+suffix is the only prior-event source admitted to model memory: Session
+strictly decodes only public v2 `user_msg` and `assistant_msg` text from it and
+excludes the current Run. Prior-memory attachments are always empty: a prior
+Session's message/session attachment references are not an active-set authority
+source and cannot be resurrected without a separate durable
+snapshot/delta/tombstone contract. Unsupported historical schemas fail closed.
+
+Timeline projection is a separate data path. When the bounded bootstrap omits
+events, Session reads the complete frozen prefix from a private, paginated Host
+endpoint. Host chooses the immutable high-water from the durable Run bootstrap;
+the client cannot widen it. Every page and continuation is bound to the exact
+Session, Host Run, Kernel Run, snapshot digest, source root, and monotonic event
+index, and the request still requires the process-private Run capability.
+Session verifies page digests, continuity, the complete source root, and the
+bootstrap suffix before projecting. These full-history pages never enter the
+provider request, memory builder, capability scope, or authority calculation.
+The current full-timeline projection transport remains explicitly bounded; an
+oversized frozen prefix returns a typed projection-limit failure. Arbitrarily
+long histories require a future delta or paginated Host/UI timeline contract,
+not silent truncation.
 
 Inside an active Run, earlier user text remains bounded Session-owned
 conversation context. It is assembled with the frozen prior-Run memory, while
@@ -146,6 +160,11 @@ Ordinary Session and CLI commands use the untrusted command ingress. User
 decisions use a distinct Host-only ingress protected by a short-lived
 capability bound to the run, decision, expected versions, and digest. A payload
 claim such as `trusted: true` has no meaning.
+
+The private prior-history read is transport-only and Run-bound. Its continuation
+is a cursor, not a credential; it cannot replace the Run capability or be
+reused across Runs. Appends after the frozen high-water are excluded and are
+projected only through the current Run's durable projection history.
 
 The browser-facing Host façade accepts only exact Plan/capability decisions and
 authority revocations under Host-shell admission. For a revoke, Host first

@@ -6,7 +6,8 @@ use crate::host_v2_storage::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const PRIOR_EVENTS_SCHEMA_V2: &str = "deepcode.host.session-prior-events.v2";
+pub(crate) const HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3: &str =
+    "deepcode.host.session-prior-events.v3";
 const PROVIDER_PROFILE_SCHEMA_V2: &str = "deepcode.host.provider-profile-bootstrap.v2";
 const MAX_PRIOR_EVENTS_V2: usize = 512;
 const MAX_PRIOR_EVENTS_BYTES_V2: usize = 2 * 1024 * 1024;
@@ -21,6 +22,7 @@ pub(crate) struct HostSessionPriorEventsV2 {
     pub(crate) selected_event_count: u64,
     pub(crate) omitted_event_count: u64,
     pub(crate) events: Vec<Value>,
+    pub(crate) source_events_digest: String,
     pub(crate) events_digest: String,
     pub(crate) snapshot_digest: String,
 }
@@ -37,6 +39,10 @@ impl HostSessionPriorEventsV2 {
                 "Prior Session event count is not representable",
             )
         })?;
+        for event in &source_events {
+            reject_transport_capabilities(event)?;
+        }
+        let source_events_digest = canonical_sha256(&Value::Array(source_events.clone()))?;
         let mut selected = Vec::new();
         for event in source_events.into_iter().rev() {
             if selected.len() >= MAX_PRIOR_EVENTS_V2 {
@@ -69,21 +75,23 @@ impl HostSessionPriorEventsV2 {
         let events_value = Value::Array(selected.clone());
         let events_digest = canonical_sha256(&events_value)?;
         let snapshot_digest = canonical_sha256(&json!({
-            "schemaVersion": PRIOR_EVENTS_SCHEMA_V2,
+            "schemaVersion": HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3,
             "sessionId": session_id,
             "sourceEventVersion": source_event_version,
             "selectedEventCount": selected_event_count,
             "omittedEventCount": omitted_event_count,
             "events": events_value,
+            "sourceEventsDigest": source_events_digest,
             "eventsDigest": events_digest,
         }))?;
         let snapshot = Self {
-            schema_version: PRIOR_EVENTS_SCHEMA_V2.to_string(),
+            schema_version: HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3.to_string(),
             session_id: session_id.to_string(),
             source_event_version,
             selected_event_count,
             omitted_event_count,
             events: selected,
+            source_events_digest,
             events_digest,
             snapshot_digest,
         };
@@ -92,13 +100,20 @@ impl HostSessionPriorEventsV2 {
     }
 
     pub(crate) fn validate(&self, expected_session_id: &str) -> Result<(), HostV2StorageError> {
-        if self.schema_version != PRIOR_EVENTS_SCHEMA_V2 || self.session_id != expected_session_id {
+        if self.schema_version != HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3 {
             return Err(HostV2StorageError::invalid(
-                "host_session_prior_events_schema_unsupported",
-                "Prior Session events are not the exact run-bound v2 snapshot",
+                "unsupported_history_schema",
+                "UnsupportedHistorySchema: prior Session events are not the exact run-bound schema",
+            ));
+        }
+        if self.session_id != expected_session_id {
+            return Err(HostV2StorageError::invalid(
+                "host_session_prior_events_session_mismatch",
+                "Prior Session events belong to another Session",
             ));
         }
         validate_safe_session_identity(&self.session_id)?;
+        validate_sha256_digest(&self.source_events_digest, "sourceEventsDigest")?;
         validate_sha256_digest(&self.events_digest, "eventsDigest")?;
         validate_sha256_digest(&self.snapshot_digest, "snapshotDigest")?;
         let events_value = Value::Array(self.events.clone());
@@ -110,6 +125,7 @@ impl HostSessionPriorEventsV2 {
                 .checked_add(self.omitted_event_count)
                 != Some(self.source_event_version)
             || canonical_sha256(&events_value)? != self.events_digest
+            || (self.omitted_event_count == 0 && self.source_events_digest != self.events_digest)
         {
             return Err(HostV2StorageError::invalid(
                 "host_session_prior_events_invalid",
@@ -136,12 +152,13 @@ impl HostSessionPriorEventsV2 {
             }
         }
         let expected_snapshot_digest = canonical_sha256(&json!({
-            "schemaVersion": PRIOR_EVENTS_SCHEMA_V2,
+            "schemaVersion": HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3,
             "sessionId": self.session_id,
             "sourceEventVersion": self.source_event_version,
             "selectedEventCount": self.selected_event_count,
             "omittedEventCount": self.omitted_event_count,
             "events": events_value,
+            "sourceEventsDigest": self.source_events_digest,
             "eventsDigest": self.events_digest,
         }))?;
         if expected_snapshot_digest != self.snapshot_digest {
