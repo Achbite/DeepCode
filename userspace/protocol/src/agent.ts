@@ -336,7 +336,6 @@ export interface AgentTimelineTokenUsageTotals {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
-  cacheHitRate: number | null;
   providerCallCount: number;
   providers: string[];
 }

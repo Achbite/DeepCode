@@ -58,25 +58,35 @@ export function deriveTokenUsageStats(
 }
 
 function statsFromTokenUsageProjection(projection: AgentTimelineTokenUsageProjection): TokenUsageStats {
-  const requests = projection.requests.map((request): TokenUsageRequestStats => ({
-    id: request.requestId,
-    title: request.title,
-    startedAt: request.startedAt,
-    providerIds: request.providers,
-    stages: request.stages,
-    providerCallCount: request.providerCallCount,
-    promptCacheHitTokens: request.promptCacheHitTokens,
-    promptCacheMissTokens: request.promptCacheMissTokens,
-    cachedTokens: request.cachedTokens,
-    promptTokens: request.promptTokens,
-    completionTokens: request.completionTokens,
-    totalTokens: request.totalTokens,
-    cacheHitRate: request.cacheHitRate,
-    hasCacheData: request.cacheHitRate !== null,
-    hasTokenData: request.totalTokens > 0 || request.promptTokens > 0 || request.completionTokens > 0,
-  }));
+  const requests = projection.requests.map((request): TokenUsageRequestStats => {
+    const cacheHitRate = cacheHitRateFromCounters(
+      request.promptCacheHitTokens,
+      request.promptCacheMissTokens
+    );
+    return {
+      id: request.requestId,
+      title: request.title,
+      startedAt: request.startedAt,
+      providerIds: request.providers,
+      stages: request.stages,
+      providerCallCount: request.providerCallCount,
+      promptCacheHitTokens: request.promptCacheHitTokens,
+      promptCacheMissTokens: request.promptCacheMissTokens,
+      cachedTokens: request.cachedTokens,
+      promptTokens: request.promptTokens,
+      completionTokens: request.completionTokens,
+      totalTokens: request.totalTokens,
+      cacheHitRate,
+      hasCacheData: cacheHitRate !== null,
+      hasTokenData: request.totalTokens > 0 || request.promptTokens > 0 || request.completionTokens > 0,
+    };
+  });
 
   const totals = projection.totals;
+  const cacheHitRate = cacheHitRateFromCounters(
+    totals.promptCacheHitTokens,
+    totals.promptCacheMissTokens
+  );
   return {
     requestCount: requests.length,
     providerCallCount: totals.providerCallCount,
@@ -88,10 +98,29 @@ function statsFromTokenUsageProjection(projection: AgentTimelineTokenUsageProjec
     promptTokens: totals.promptTokens,
     completionTokens: totals.completionTokens,
     totalTokens: totals.totalTokens,
-    cacheHitRate: totals.cacheHitRate,
-    hasCacheData: totals.cacheHitRate !== null,
+    cacheHitRate,
+    hasCacheData: cacheHitRate !== null,
     hasTokenData: totals.totalTokens > 0 || totals.promptTokens > 0 || totals.completionTokens > 0,
   };
+}
+
+function cacheHitRateFromCounters(
+  promptCacheHitTokens: number,
+  promptCacheMissTokens: number
+): number | null {
+  if (
+    !Number.isSafeInteger(promptCacheHitTokens)
+    || promptCacheHitTokens < 0
+    || !Number.isSafeInteger(promptCacheMissTokens)
+    || promptCacheMissTokens < 0
+  ) {
+    return null;
+  }
+  const denominator = promptCacheHitTokens + promptCacheMissTokens;
+  if (!Number.isSafeInteger(denominator) || denominator <= 0) {
+    return null;
+  }
+  return promptCacheHitTokens / denominator;
 }
 
 export function formatPercent(value: number | null): string {

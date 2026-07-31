@@ -509,7 +509,6 @@ function validTokenUsageProjection(value: unknown): boolean {
         'promptTokens',
         'completionTokens',
         'totalTokens',
-        'cacheHitRate',
         'providerCallCount',
         'providers',
       ]).has(key))
@@ -548,15 +547,6 @@ function validTokenUsageTotals(value: Record<string, unknown>): boolean {
       && Number(value[field]) >= 0
       && Number(value[field]) <= MAX_PROVIDER_USAGE_TOKENS_V2
   )
-    && (
-      value.cacheHitRate === null
-      || (
-        typeof value.cacheHitRate === 'number'
-        && Number.isFinite(value.cacheHitRate)
-        && value.cacheHitRate >= 0
-        && value.cacheHitRate <= 1
-      )
-    )
     && Array.isArray(value.providers)
     && value.providers.every(
       (provider) =>
@@ -1139,7 +1129,6 @@ function buildTokenUsageProjection(
       providerCallCount: 1,
       providers,
       ...usage,
-      cacheHitRate: providerCacheHitRate(usage),
     });
   }
 
@@ -1184,7 +1173,6 @@ function buildTokenUsageProjection(
     requests,
     totals: {
       ...totals,
-      cacheHitRate: providerCacheHitRate(totals),
       providerCallCount: requests.length,
       providers: [...new Set(
         requests.flatMap((request) => request.providers)
@@ -1298,19 +1286,6 @@ function checkedProviderUsageSum(left: number, right: number): number {
     throw new Error('session_projection_v2_provider_usage_overflow');
   }
   return sum;
-}
-
-function providerCacheHitRate(
-  usage: Pick<
-    ProviderUsageCountersV2,
-    'promptCacheHitTokens' | 'promptCacheMissTokens'
-  >
-): number | null {
-  const denominator =
-    usage.promptCacheHitTokens + usage.promptCacheMissTokens;
-  return denominator > 0
-    ? usage.promptCacheHitTokens / denominator
-    : null;
 }
 
 function providerUsageTurnKey(
