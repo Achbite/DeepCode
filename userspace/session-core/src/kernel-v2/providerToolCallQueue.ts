@@ -595,8 +595,7 @@ export function reconcileSessionProviderToolCallQueueV2(
       state,
       'capabilityDenied',
       recordedAt,
-      item.intent.operationId,
-      denied
+      item.intent.operationId
     );
     return { changed: true, settlement: 'aborted' };
   }

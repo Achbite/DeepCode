@@ -1233,6 +1233,7 @@ export class SessionKernelLoopV2 {
       queue.status === 'aborted'
       && queue.abortReason !== 'userInput'
       && queue.abortReason !== 'runCancelled'
+      && queue.abortReason !== 'capabilityDenied'
     ) {
       const guidance = [
         'The ordered Provider tool-call sequence stopped after',
