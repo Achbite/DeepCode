@@ -14,6 +14,7 @@ import type {
 } from '@deepcode/protocol';
 import {
   CanonicalTimelineProjector,
+  normalizeAgentTimelineSnapshot,
 } from '../timelineDelta.js';
 import type {
   SessionKernelHostProjectionSinkV2,
@@ -109,8 +110,10 @@ export class HttpSessionKernelHostProjectionSinkV2
 implements SessionKernelHostProjectionSinkV2 {
   private readonly endpoint: string;
   private readonly priorEventsEndpoint: string;
+  private readonly priorTimelineEndpoint: string;
   readonly #runCapability: string;
   private fullPriorSessionEvents?: Promise<AgentEvent[]>;
+  private frozenPriorTimeline?: Promise<AgentTimelineResult | undefined>;
 
   constructor(
     private readonly sessionId: string,
@@ -157,6 +160,12 @@ implements SessionKernelHostProjectionSinkV2 {
       encodeURIComponent(hostRunId),
       'kernel-v2/prior-events',
     ].join('/');
+    this.priorTimelineEndpoint = [
+      normalizeApiBase(apiBase),
+      'api/agent/sessions',
+      encodeURIComponent(sessionId),
+      'timeline',
+    ].join('/');
   }
 
   async publish(
@@ -176,7 +185,10 @@ implements SessionKernelHostProjectionSinkV2 {
       (projection) =>
         sessionKernelAgentEventV2(this.sessionId, projection)
     );
-    const priorEvents = await this.priorEventsForProjection();
+    const [priorEvents, priorTimeline] = await Promise.all([
+      this.priorEventsForProjection(),
+      this.priorTimelineForProjection(),
+    ]);
     const agentEvents = [
       ...priorEvents,
       ...currentRunAgentEvents,
@@ -190,10 +202,20 @@ implements SessionKernelHostProjectionSinkV2 {
         'Session projection source-event version is exhausted.'
       );
     }
-    const projected = new CanonicalTimelineProjector(
-      this.sessionId,
-      agentEvents
-    ).snapshot();
+    const projected = priorTimeline
+      ? appendCurrentRunProjection(
+          priorTimeline,
+          new CanonicalTimelineProjector(
+            this.sessionId,
+            currentRunAgentEvents
+          ).snapshot(),
+          sourceEventVersion,
+          event.recordedAt
+        )
+      : new CanonicalTimelineProjector(
+          this.sessionId,
+          agentEvents
+        ).snapshot();
     const timeline: AgentTimelineResult = {
       ...projected,
       revision: sourceEventVersion,
@@ -304,6 +326,81 @@ implements SessionKernelHostProjectionSinkV2 {
     return this.fullPriorSessionEvents.then(cloneJson);
   }
 
+  private priorTimelineForProjection():
+  Promise<AgentTimelineResult | undefined> {
+    if (this.priorSessionEvents.sourceEventVersion === 0) {
+      return Promise.resolve(undefined);
+    }
+    if (!this.frozenPriorTimeline) {
+      const loading = this.fetchFrozenPriorTimeline();
+      const recoverable = loading.catch((error: unknown) => {
+        if (this.frozenPriorTimeline === recoverable) {
+          this.frozenPriorTimeline = undefined;
+        }
+        throw error;
+      });
+      this.frozenPriorTimeline = recoverable;
+    }
+    return this.frozenPriorTimeline.then(cloneJson);
+  }
+
+  private async fetchFrozenPriorTimeline():
+  Promise<AgentTimelineResult> {
+    const response = await this.fetchImpl(this.priorTimelineEndpoint, {
+      method: 'GET',
+      headers: {
+        'x-deepcode-run-capability': this.#runCapability,
+      },
+    });
+    if (!response.ok) {
+      throw new SessionKernelProjectionTransportError(
+        'host_session_prior_timeline_http_failed',
+        `Prior Session timeline read failed with HTTP ${response.status}.`
+      );
+    }
+    const rawEnvelope = objectRecord(await response.json());
+    if (rawEnvelope?.ok !== true) {
+      const error = objectRecord(rawEnvelope?.error);
+      const code = textField(error, 'code');
+      throw new SessionKernelProjectionTransportError(
+        code === 'UnsupportedHistorySchema'
+          ? 'UnsupportedHistorySchema'
+          : 'host_session_prior_timeline_unavailable',
+        code === 'UnsupportedHistorySchema'
+          ? 'Prior active flat-v2 history cannot be resumed.'
+          : 'Prior Session timeline is unavailable.'
+      );
+    }
+    const envelope = exactObject(rawEnvelope, ['ok', 'data']);
+    let timeline: AgentTimelineResult;
+    try {
+      timeline = normalizeAgentTimelineSnapshot(envelope.data).timeline;
+    } catch (error) {
+      const code = objectRecord(error)?.code;
+      throw new SessionKernelProjectionTransportError(
+        code === 'UnsupportedHistorySchema'
+          ? 'UnsupportedHistorySchema'
+          : 'host_session_prior_timeline_invalid',
+        code === 'UnsupportedHistorySchema'
+          ? 'Prior active flat-v2 history cannot be resumed.'
+          : 'Prior Session timeline failed native projection validation.'
+      );
+    }
+    if (
+      timeline.sessionId !== this.sessionId
+      || timeline.sourceEventVersion
+        !== this.priorSessionEvents.sourceEventVersion
+      || timeline.eventCount
+        !== this.priorSessionEvents.sourceEventVersion
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'host_session_prior_timeline_identity_mismatch',
+        'Prior Session timeline does not match the frozen event prefix.'
+      );
+    }
+    return timeline;
+  }
+
   private async fetchFrozenPriorEvents(): Promise<AgentEvent[]> {
     const events: AgentEvent[] = [];
     let continuation: string | null = null;
@@ -370,6 +467,144 @@ implements SessionKernelHostProjectionSinkV2 {
     }
     return events;
   }
+}
+
+function appendCurrentRunProjection(
+  history: AgentTimelineResult,
+  current: AgentTimelineResult,
+  sourceEventVersion: number,
+  generatedAt: string
+): AgentTimelineResult {
+  const historyRun = history.runProjection;
+  if (
+    historyRun
+    && (
+      historyRun.phase !== 'settled'
+      || (
+        historyRun.status !== 'succeeded'
+        && historyRun.status !== 'failed'
+        && historyRun.status !== 'cancelled'
+      )
+    )
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'UnsupportedHistorySchema',
+      'Only settled prior Session history can be extended.'
+    );
+  }
+  if (
+    history.eventCount + current.eventCount !== sourceEventVersion
+    || history.sourceEventVersion + current.sourceEventVersion
+      !== sourceEventVersion
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_timeline_prefix_mismatch',
+      'Current Run projection does not extend the frozen Session prefix.'
+    );
+  }
+  const turnIds = new Set(history.turns.map((turn) => turn.id));
+  if (current.turns.some((turn) => turnIds.has(turn.id))) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_timeline_turn_identity_conflict',
+      'Current Run projection reuses a prior Session turn identity.'
+    );
+  }
+  const tokenUsageProjection = mergeTimelineTokenUsage(
+    history.tokenUsageProjection,
+    current.tokenUsageProjection
+  );
+  const timeline: AgentTimelineResult = {
+    schemaVersion: current.schemaVersion,
+    shapeVersion: current.shapeVersion,
+    sessionId: current.sessionId,
+    revision: sourceEventVersion,
+    sourceEventVersion,
+    generatedAt,
+    turns: [...history.turns, ...current.turns].map(
+      (turn, sequence) => ({
+        ...turn,
+        sequence,
+      })
+    ),
+    eventCount: sourceEventVersion,
+    ...(current.taskProjection
+      ? { taskProjection: current.taskProjection }
+      : {}),
+    ...(current.interactionProjection
+      ? { interactionProjection: current.interactionProjection }
+      : {}),
+    ...(current.runProjection
+      ? { runProjection: current.runProjection }
+      : {}),
+    ...(tokenUsageProjection ? { tokenUsageProjection } : {}),
+    ...(current.workspaceProjection ?? history.workspaceProjection
+      ? {
+          workspaceProjection:
+            current.workspaceProjection
+            ?? history.workspaceProjection!,
+        }
+      : {}),
+  };
+  return normalizeAgentTimelineSnapshot(timeline).timeline;
+}
+
+function mergeTimelineTokenUsage(
+  history: AgentTimelineResult['tokenUsageProjection'],
+  current: AgentTimelineResult['tokenUsageProjection']
+): AgentTimelineResult['tokenUsageProjection'] {
+  const requests = [
+    ...(history?.requests ?? []),
+    ...(current?.requests ?? []),
+  ];
+  if (requests.length === 0) return undefined;
+  const requestIds = new Set<string>();
+  for (const request of requests) {
+    if (requestIds.has(request.requestId)) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_timeline_usage_identity_conflict',
+        'Provider usage request identity is not unique across Session history.'
+      );
+    }
+    requestIds.add(request.requestId);
+  }
+  const numericFields = [
+    'promptCacheHitTokens',
+    'promptCacheMissTokens',
+    'cachedTokens',
+    'promptTokens',
+    'completionTokens',
+    'totalTokens',
+  ] as const;
+  const totals = Object.fromEntries(
+    numericFields.map((field) => [
+      field,
+      requests.reduce((sum, request) => {
+        const next = sum + request[field];
+        if (!Number.isSafeInteger(next) || next < 0) {
+          throw new SessionKernelProjectionTransportError(
+            'session_kernel_timeline_usage_overflow',
+            'Provider usage total exceeds the safe integer boundary.'
+          );
+        }
+        return next;
+      }, 0),
+    ])
+  ) as Pick<
+    NonNullable<
+      AgentTimelineResult['tokenUsageProjection']
+    >['totals'],
+    typeof numericFields[number]
+  >;
+  return {
+    requests,
+    totals: {
+      ...totals,
+      providerCallCount: requests.length,
+      providers: [...new Set(
+        requests.flatMap((request) => request.providers)
+      )].sort(),
+    },
+  };
 }
 
 async function projectionHttpFailure(
@@ -665,8 +900,10 @@ function publicPresentation(
         fields: {
           status: textField(data, 'replyKind') ?? 'submitted',
           operationId: textField(data, 'operationId'),
+          invocationId: textField(data, 'invocationId'),
           requestId: textField(data, 'requestId'),
           toolId: textField(data, 'toolId'),
+          replyReason: textField(data, 'replyReason'),
           controlEpoch: data?.expectedControlEpoch,
           authorityKind: textField(data, 'authorityKind'),
           planRevision: textField(data, 'planRevision'),
@@ -683,6 +920,9 @@ function publicPresentation(
           status: 'reconciled',
           factIds: Array.isArray(data?.pageFactIds)
             ? cloneJson(data.pageFactIds)
+            : [],
+          operationFacts: Array.isArray(data?.operationFacts)
+            ? cloneJson(data.operationFacts)
             : [],
           snapshotHighWater: data?.snapshotHighWater,
           summary: 'Canonical Kernel facts reconciled.',
@@ -707,6 +947,7 @@ function publicPresentation(
           factId: textField(data, 'factId'),
           factKind,
           operationId: textField(data, 'operationId'),
+          toolId: textField(data, 'toolId'),
           planActionIds: Array.isArray(data?.planActionIds)
             ? cloneJson(data.planActionIds)
             : [],
@@ -1162,7 +1403,9 @@ function permissionRequestPresentation(
       permissionId: previewId,
       requestKind: 'scopeExpansion',
       operationId,
+      invocationId: textField(data, 'invocationId'),
       affectedOperationIds: operationId ? [operationId] : [],
+      toolId: textField(preview, 'toolId'),
       toolName: textField(preview, 'toolId') ?? 'kernel.tool',
       riskLevel: textField(preview, 'risk') ?? 'medium',
       summary: 'Review the exact canonical Kernel scope.',

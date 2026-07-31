@@ -10,6 +10,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod agent;
+mod agent_projection;
 mod bootstrap;
 mod v2;
 
@@ -18,6 +19,39 @@ pub use agent::{
     AgentInputAttachmentV2, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
     AgentRunStatus, AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
     ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+};
+pub use agent_projection::{
+    AgentConversationActivity, AgentConversationActivityKind, AgentConversationActivitySource,
+    AgentProjectionValidationError, AgentTimelineAttachment, AgentTimelineAttachmentKind,
+    AgentTimelineAttachmentScope, AgentTimelineBlock, AgentTimelineBlockKind,
+    AgentTimelineCheckpointKind, AgentTimelineCurrentActivity, AgentTimelineCurrentActivityCode,
+    AgentTimelineDecisionRequest, AgentTimelineDecisionSource, AgentTimelineDeliveryMode,
+    AgentTimelineDelta, AgentTimelineDisplayDensity, AgentTimelineDisplayHints,
+    AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineEvidenceMode,
+    AgentTimelineExecutionPhase, AgentTimelineInteractionKind, AgentTimelineInteractionOption,
+    AgentTimelineInteractionProjection, AgentTimelineInteractionState,
+    AgentTimelineInteractionView, AgentTimelineLanguage, AgentTimelineLanguageBinding,
+    AgentTimelineLanguageBindingStatus, AgentTimelineLocalizedText, AgentTimelineNarrativeKind,
+    AgentTimelineNullableCurrentActivity, AgentTimelineNullableWait,
+    AgentTimelineNullableWorkAttention, AgentTimelinePendingInteraction,
+    AgentTimelinePendingPermission, AgentTimelinePendingPlan, AgentTimelinePermissionRequestKind,
+    AgentTimelinePermissionRequestView, AgentTimelineProjectionReplacement,
+    AgentTimelineProvenance, AgentTimelineProvenanceAuthority, AgentTimelineProvenanceOrigin,
+    AgentTimelineProviderPhase, AgentTimelineRiskLevel, AgentTimelineRootProjectionReplacements,
+    AgentTimelineRunPhase, AgentTimelineRunProjection, AgentTimelineRunStatus,
+    AgentTimelineSelectedDecision, AgentTimelineSnapshot, AgentTimelineStatus,
+    AgentTimelineStreamEvent, AgentTimelineStructuredProjection,
+    AgentTimelineStructuredProjectionItem, AgentTimelineStructuredProjectionKind,
+    AgentTimelineStructuredProjectionSection, AgentTimelineTaskProjection,
+    AgentTimelineTaskProjectionItem, AgentTimelineTaskSettlementKind,
+    AgentTimelineTokenUsageProjection, AgentTimelineTokenUsageRequest,
+    AgentTimelineTokenUsageTotals, AgentTimelineTurn, AgentTimelineTurnPart, AgentTimelineWait,
+    AgentTimelineWaitKind, AgentTimelineWorkAttention, AgentTimelineWorkAttentionKind,
+    AgentTimelineWorkAttentionStatus, AgentTimelineWorkOperation,
+    AgentTimelineWorkOperationAttempt, AgentTimelineWorkOperationStatus, AgentTimelineWorkSegment,
+    AgentTimelineWorkSegmentLifecycle, AgentTimelineWorkspaceProjection,
+    AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
+    AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
 };
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 pub use v2::{
@@ -198,6 +232,28 @@ impl HttpKernelClient {
             .json::<Value>()
             .await?;
         api_data(value)
+    }
+
+    pub async fn agent_timeline_v2(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<AgentTimelineSnapshot> {
+        let value = self
+            .http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let value = api_data(value)?;
+        agent_projection::reject_private_projection_fields(&value)
+            .map_err(|error| KernelClientError::Api(error.to_string()))?;
+        let timeline = serde_json::from_value::<AgentTimelineSnapshot>(value)?;
+        timeline
+            .validate()
+            .map_err(|error| KernelClientError::Api(error.to_string()))?;
+        Ok(timeline)
     }
 
     pub async fn list_agent_sessions(

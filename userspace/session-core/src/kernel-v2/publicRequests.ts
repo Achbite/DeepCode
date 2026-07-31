@@ -2,6 +2,7 @@ import type {
   CapabilityScopePreviewReplyV2,
   ControlEpochAdvancedReplyV2,
   InvocationCancelReplyV2,
+  KernelFactProjectionV2,
   KernelFactProjectionPageV2,
   ToolContextGetReplyV2,
   ToolIntentSubmitReplyV2,
@@ -43,6 +44,7 @@ import type {
 } from './types.js';
 import {
   SESSION_KERNEL_FACT_KINDS_V2,
+  SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
 } from './factKinds.js';
 import {
   registerSessionKernelFactBarrierV2,
@@ -614,6 +616,9 @@ function applyPublicRequestOutcome(
           requestId: record.requestId,
           pageFactIds: outcome.reply.facts.map((fact) => fact.factId),
           pageFactCount: outcome.reply.facts.length,
+          operationFacts: outcome.reply.facts.map(
+            publicWorkFactProjection
+          ),
           nextAfterLedgerSequence:
             outcome.reply.nextAfterLedgerSequence,
           snapshotHighWater: outcome.reply.snapshotHighWater,
@@ -646,6 +651,10 @@ function applyPublicRequestOutcome(
             controlEpoch: fact.lineage.controlEpoch,
             planActionIds: fact.lineage.planActionIds,
             operationId: fact.lineage.operationId,
+            toolId:
+              typeof fact.details.toolId === 'string'
+                ? fact.details.toolId
+                : undefined,
             capabilityLease: fact.lineage.capabilityLease,
             resourceIds: fact.lineage.resourceIds,
             guidance: typeof fact.details.guidance === 'string'
@@ -848,6 +857,13 @@ function applyToolIntentReply(
           }
         : {}),
       replyKind: reply.kind,
+      ...(reply.kind === 'admitted'
+        || reply.kind === 'awaitingCapability'
+        ? { invocationId: reply.data.invocationId }
+        : {}),
+      ...(reply.kind === 'rejected'
+        ? { replyReason: reply.data.reason }
+        : {}),
     },
     record.startedAt
   ));
@@ -958,6 +974,76 @@ function authorizationDecisionPreviewId(
     return typeof previewId === 'string' ? previewId : undefined;
   }
   return undefined;
+}
+
+function publicWorkFactProjection(
+  fact: KernelFactProjectionV2
+): Record<string, unknown> {
+  const toolId =
+    typeof fact.details.toolId === 'string'
+      ? fact.details.toolId
+      : undefined;
+  const resourceIds = [...fact.lineage.resourceIds];
+  const targets = publicCanonicalWorkspaceTargets(fact.details);
+  return {
+    factId: fact.factId,
+    domain: fact.domain,
+    factKind: fact.factKind,
+    recordedAt: fact.recordedAt,
+    operationId: fact.lineage.operationId,
+    invocationId: fact.lineage.invocationId,
+    attemptId: fact.lineage.attemptId,
+    effectId: fact.lineage.effectId,
+    resourceIds,
+    ...(toolId
+      ? {
+          toolId,
+        }
+      : {}),
+    ...(targets.length > 0 ? { targets } : {}),
+    ...(SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(fact.factKind)
+      ? {
+          effectSummary: resourceIds.length > 0
+            ? `Observed effect on ${resourceIds.length} canonical resource(s).`
+            : 'Observed canonical tool effect.',
+        }
+      : {}),
+  };
+}
+
+function publicCanonicalWorkspaceTargets(
+  details: Record<string, unknown>
+): string[] {
+  const scope = objectValue(details.resourceScope);
+  if (
+    scope?.kind !== 'workspace'
+    || !objectValue(scope.data)
+    || !Array.isArray(objectValue(scope.data)?.targets)
+  ) {
+    return [];
+  }
+  return [
+    ...new Set(
+      (objectValue(scope.data)!.targets as unknown[])
+        .map((target) => objectValue(target)?.relativePath)
+        .filter(
+          (target): target is string =>
+            typeof target === 'string'
+            && target.trim() === target
+            && target.length > 0
+        )
+    ),
+  ];
+}
+
+function objectValue(
+  value: unknown
+): Record<string, unknown> | undefined {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined;
 }
 
 function authorizationScopeDelta(

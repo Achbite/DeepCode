@@ -285,12 +285,14 @@ pub(crate) fn session_has_pending_interaction(state: &AppState, session_id: &str
         .host_services
         .projection_v2
         .latest_timeline(session_id)
-        .ok()
-        .flatten()
-        .as_ref()
-        .and_then(|timeline| timeline.get("interactionProjection"))
-        .and_then(|projection| projection.get("pending"))
-        .is_some_and(Value::is_object)
+        .map(|timeline| {
+            timeline
+                .as_ref()
+                .and_then(|timeline| timeline.get("interactionProjection"))
+                .and_then(|projection| projection.get("pending"))
+                .is_some_and(Value::is_object)
+        })
+        .unwrap_or(true)
 }
 
 pub(crate) async fn agent_session_delete(

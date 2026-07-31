@@ -1260,6 +1260,7 @@ impl SessionKernelProjectionSinkV2 {
                 ));
             }
         }
+        validate_preserved_legacy_prefix(&records, &request.timeline)?;
         Ok(())
     }
 
@@ -1416,9 +1417,11 @@ impl SessionKernelProjectionSinkV2 {
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
         with_storage_path_lock(&guard_path, || {
             let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
-            Ok(read_public_timeline_records(&path, session_id)?
+            let records = read_public_timeline_records(&path, session_id)?;
+            records
                 .last()
-                .map(|record| record.timeline.clone()))
+                .map(|record| normalize_latest_public_timeline(&record.timeline))
+                .transpose()
         })
     }
 
@@ -1592,10 +1595,12 @@ fn validate_projection_request(
         Some((&request.projection_id, &request.event.recorded_at)),
     )?;
     reject_transport_capabilities(&request.timeline)?;
-    crate::session_public_projection_v2::validate_shared_projection_timeline(&request.timeline)
-        .map_err(|message| {
-            HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
-        })?;
+    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+        &request.timeline,
+    )
+    .map_err(|message| {
+        HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
+    })?;
     if request.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_identity_mismatch",
@@ -1755,6 +1760,9 @@ fn read_public_timeline_records(
 ) -> Result<Vec<HostSessionPublicTimelineRecordV2>, HostV2StorageError> {
     let mut records: Vec<HostSessionPublicTimelineRecordV2> = Vec::new();
     let mut projections = HashMap::new();
+    let mut legacy_prefix: Option<Vec<Value>> = None;
+    let mut latest_flat_was_unsupported = false;
+    let mut work_segments_shape_seen = false;
     for value in read_bounded_json_lines(path)? {
         let record: HostSessionPublicTimelineRecordV2 =
             serde_json::from_value(value).map_err(|error| {
@@ -1772,13 +1780,65 @@ fn read_public_timeline_records(
             ));
         }
         reject_transport_capabilities(&record.timeline)?;
-        crate::session_public_projection_v2::validate_shared_projection_timeline(&record.timeline)
+        let timeline_kind =
+            crate::session_public_projection_v2::classify_shared_projection_timeline(
+                &record.timeline,
+            )
             .map_err(|message| {
                 HostV2StorageError::conflict(
                     "session_kernel_public_timeline_history_corrupt",
                     message,
                 )
             })?;
+        match timeline_kind {
+            crate::session_public_projection_v2::SharedProjectionTimelineKind::LegacyFlatV2 => {
+                if work_segments_shape_seen {
+                    return Err(HostV2StorageError::conflict(
+                        "session_kernel_public_timeline_history_corrupt",
+                        "Session public timeline cannot downgrade from work-segments to flat-v2",
+                    ));
+                }
+                latest_flat_was_unsupported = !legacy_flat_projection_is_terminal(&record.timeline);
+                legacy_prefix = if latest_flat_was_unsupported {
+                    None
+                } else {
+                    Some(normalized_turns_from_settled_flat(&record.timeline)?)
+                };
+            }
+            crate::session_public_projection_v2::SharedProjectionTimelineKind::NativeWorkSegmentsV1 => {
+                if latest_flat_was_unsupported {
+                    return Err(HostV2StorageError::conflict(
+                        "UnsupportedHistorySchema",
+                        "Active flat-v2 Session projection lacks ordered work segments and cannot be resumed",
+                    ));
+                }
+                let compatible_prefix_len =
+                    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+                        &record.timeline,
+                    )
+                    .map_err(|message| {
+                        HostV2StorageError::conflict(
+                            "session_kernel_public_timeline_history_corrupt",
+                            message,
+                        )
+                    })?;
+                match legacy_prefix.as_deref() {
+                    Some(prefix) => ensure_legacy_turn_prefix(
+                        &record.timeline,
+                        prefix,
+                        compatible_prefix_len,
+                    )?,
+                    None if compatible_prefix_len > 0 => {
+                        return Err(HostV2StorageError::conflict(
+                            "session_kernel_public_timeline_history_corrupt",
+                            "Session public timeline created legacy-compatible turns without a settled flat-v2 source",
+                        ))
+                    }
+                    None => {}
+                }
+                work_segments_shape_seen = true;
+            }
+        }
         if record.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id)
             || timeline_u64(&record.timeline, "revision")? != record.timeline_revision
             || timeline_u64(&record.timeline, "sourceEventVersion")? != record.source_event_version
@@ -1812,6 +1872,203 @@ fn read_public_timeline_records(
         records.push(record);
     }
     Ok(records)
+}
+
+fn validate_preserved_legacy_prefix(
+    records: &[HostSessionPublicTimelineRecordV2],
+    incoming: &Value,
+) -> Result<(), HostV2StorageError> {
+    let compatible_prefix_len =
+        crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+            incoming,
+        )
+        .map_err(|message| {
+            HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
+        })?;
+    let mut legacy_prefix = None;
+    let mut latest_flat_was_unsupported = false;
+    for record in records {
+        match crate::session_public_projection_v2::classify_shared_projection_timeline(
+            &record.timeline,
+        )
+        .map_err(|message| {
+            HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
+        })? {
+            crate::session_public_projection_v2::SharedProjectionTimelineKind::LegacyFlatV2 => {
+                latest_flat_was_unsupported = !legacy_flat_projection_is_terminal(&record.timeline);
+                legacy_prefix = if latest_flat_was_unsupported {
+                    None
+                } else {
+                    Some(normalized_turns_from_settled_flat(&record.timeline)?)
+                };
+            }
+            crate::session_public_projection_v2::SharedProjectionTimelineKind::NativeWorkSegmentsV1 => {
+                latest_flat_was_unsupported = false;
+            }
+        }
+    }
+    if latest_flat_was_unsupported {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Active flat-v2 Session projection lacks ordered work segments and cannot be resumed",
+        ));
+    }
+    match legacy_prefix.as_deref() {
+        Some(prefix) => ensure_legacy_turn_prefix(incoming, prefix, compatible_prefix_len),
+        None if compatible_prefix_len > 0 => Err(HostV2StorageError::invalid(
+            "session_kernel_public_timeline_legacy_source_missing",
+            "Session public timeline cannot create legacy-compatible turns without a settled flat-v2 source",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn normalized_turns_from_settled_flat(timeline: &Value) -> Result<Vec<Value>, HostV2StorageError> {
+    let normalized = normalize_settled_legacy_flat_projection(timeline)?;
+    normalized
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Settled flat-v2 Session projection does not contain turns",
+            )
+        })
+}
+
+fn ensure_legacy_turn_prefix(
+    timeline: &Value,
+    legacy_prefix: &[Value],
+    compatible_prefix_len: usize,
+) -> Result<(), HostV2StorageError> {
+    let turns = timeline
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_public_timeline_invalid",
+                "Session public timeline does not contain turns",
+            )
+        })?;
+    if compatible_prefix_len > legacy_prefix.len()
+        || turns.len() < legacy_prefix.len()
+        || turns[..legacy_prefix.len()] != *legacy_prefix
+    {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_public_timeline_legacy_prefix_changed",
+            "Session public timeline changed the immutable settled flat-v2 turn prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    match crate::session_public_projection_v2::classify_shared_projection_timeline(timeline)
+        .map_err(|message| {
+            HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
+        })? {
+        crate::session_public_projection_v2::SharedProjectionTimelineKind::NativeWorkSegmentsV1 => {
+            Ok(timeline.clone())
+        }
+        crate::session_public_projection_v2::SharedProjectionTimelineKind::LegacyFlatV2 => {
+            if !legacy_flat_projection_is_terminal(timeline) {
+                return Err(HostV2StorageError::conflict(
+                    "UnsupportedHistorySchema",
+                    "Active flat-v2 Session projection lacks ordered work segments and cannot be resumed",
+                ));
+            }
+            normalize_settled_legacy_flat_projection(timeline)
+        }
+    }
+}
+
+fn legacy_flat_projection_is_terminal(timeline: &Value) -> bool {
+    let turns = timeline
+        .get("turns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let turns_are_terminal = turns.iter().all(|turn| {
+        matches!(
+            turn.get("status").and_then(Value::as_str),
+            Some("completed" | "cancelled" | "failed")
+        )
+    });
+    let run_is_terminal = timeline
+        .get("runProjection")
+        .and_then(Value::as_object)
+        .map(|run| {
+            run.get("phase").and_then(Value::as_str) == Some("settled")
+                && matches!(
+                    run.get("status").and_then(Value::as_str),
+                    Some("succeeded" | "failed" | "cancelled")
+                )
+        });
+    turns_are_terminal && run_is_terminal.unwrap_or(false)
+}
+
+fn normalize_settled_legacy_flat_projection(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    let mut normalized = timeline.clone();
+    let root = normalized.as_object_mut().ok_or_else(|| {
+        HostV2StorageError::conflict(
+            "session_kernel_public_timeline_history_corrupt",
+            "Legacy Session projection root is not an object",
+        )
+    })?;
+    root.insert(
+        "shapeVersion".to_string(),
+        Value::String("deepcode.shared-conversation.work-segments.v1".to_string()),
+    );
+    if let Some(run) = root.get_mut("runProjection").and_then(Value::as_object_mut) {
+        run.remove("waitReason");
+        run.remove("activeInteractionId");
+        run.insert("currentActivity".to_string(), Value::Null);
+        run.insert("wait".to_string(), Value::Null);
+    }
+    let turns = root
+        .get_mut("turns")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Legacy Session projection does not contain turns",
+            )
+        })?;
+    for turn in turns {
+        let turn = turn.as_object_mut().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Legacy Session projection contains an invalid turn",
+            )
+        })?;
+        let parts = turn
+            .get("blocks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_history_corrupt",
+                    "Legacy Session projection turn does not contain blocks",
+                )
+            })?
+            .iter()
+            .map(|block| {
+                let block_id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "session_kernel_public_timeline_history_corrupt",
+                        "Legacy Session projection contains a block without an identity",
+                    )
+                })?;
+                Ok(json!({
+                    "kind": "block",
+                    "blockId": block_id,
+                }))
+            })
+            .collect::<Result<Vec<_>, HostV2StorageError>>()?;
+        turn.insert("workSegments".to_string(), Value::Array(Vec::new()));
+        turn.insert("parts".to_string(), Value::Array(parts));
+    }
+    Ok(normalized)
 }
 
 fn public_timeline_record(

@@ -13,12 +13,13 @@ workspace binding, settings ceilings, capability leases, admission, execution,
 cancellation, resources, canonical facts, and audit evidence.
 
 Session owns the loop, provider lifecycle, context and memory, natural-language
-plans, structured plan revisions, task settlement, reconciliation, and review
-narration.
+plans, structured plan revisions, task settlement, reconciliation, review
+narration, and the semantic shared-conversation projection.
 
-Host owns workspace management, trusted user-decision capture, and projection.
-Host does not canonicalize authority scopes, mint leases, or execute agent
-tools.
+Host owns workspace management, trusted user-decision capture, projection
+storage and transport, and user-initiated private-trace audit export. Host does
+not reinterpret projection semantics, canonicalize authority scopes, mint
+Kernel leases, or execute agent tools.
 
 The effective authority for an invocation is the intersection of:
 
@@ -117,12 +118,14 @@ Kernel fixedPrompt bytes
 ```
 
 The Kernel prompt bytes and tool semantics are not rewritten. Each
-`provider.started` public projection records the profile binding, input budget,
-memory snapshot/omission/digest, and deterministic trimming receipt. Each
-`provider.completed` public projection records the provider profile, provider,
-model, and validated nonnegative bounded token usage returned by the provider.
-The timeline token-usage projection accepts documented snake_case and camelCase
-provider counters; it does not synthesize cache telemetry.
+Provider lifecycle records retain the profile binding, input budget, memory
+snapshot/omission/digest, and deterministic trimming receipt, but lifecycle
+records are not permanent conversation blocks. The replaceable run projection
+may expose a safe current activity while the provider is active. Provider
+completion records retain the provider profile, provider, model, and validated
+nonnegative bounded token usage returned by the provider. The timeline
+token-usage projection accepts documented snake_case and camelCase provider
+counters; it does not synthesize cache telemetry.
 `estimatedInputTokens` conservatively counts one budget unit per UTF-8 byte over
 the actual message and encoded tool-definition envelope. This intentionally
 underfills tokenizers whose tokens cover multiple bytes; it does not claim to
@@ -282,6 +285,137 @@ approved scope amendments, actual effects, denied and unexecuted operations,
 cleanup, and indeterminate state. New facts create a new review revision.
 Unexecuted PlanActions are derived from the immutable Plan and canonical facts;
 there is no separate `SkipPlanAction` mutation or narration-controlled shortcut.
+
+For a Run that used a Plan or Kernel tools, a finalized Review is not the
+terminal user answer. After actions, facts, cleanup, and indeterminate state
+have settled, Session freezes the Review at an exact fact high-water and starts
+a no-tools final-answer provider turn bound to the control epoch, plan
+revision, review revision, and high-water. A changed high-water makes that
+candidate stale without rerunning tools. Only a committed final answer, a
+terminal final-answer failure, cancellation, or another canonical terminal
+condition may complete the public turn and retire the Host Run. Pure
+question-and-answer turns may complete in one provider turn.
+
+## Shared conversation projection
+
+The canonical public read model remains
+`deepcode.shared-conversation-projection.v2`. Native records additionally
+require:
+
+```text
+shapeVersion = deepcode.shared-conversation.work-segments.v1
+```
+
+Every native turn contains three coordinated collections:
+
+```text
+blocks       = user text, assistant commentary/final text, interactions,
+               Review, and necessary diagnostics
+workSegments = ordered Kernel/Session work derived from canonical facts
+parts        = the sole public ordering of block and work-segment references
+```
+
+Provider lifecycle, wait changes, workflow stages, context refreshes,
+cancellation requests, and ToolIntent submission update a replaceable
+`runProjection` or an existing work segment. They do not append permanent
+conversation cards. Reasoning, raw provider envelopes, raw tool arguments, and
+raw AgentEvents never enter this read model.
+
+Assistant text may carry the optional provider metadata
+`commentary | final_answer`. Absence means unknown and is never inferred from
+text. Structural settlement may assign an unknown no-tools response the public
+final-answer role without rewriting the missing provider metadata. Commentary
+is a hard boundary between adjacent work segments.
+
+A work segment has a stable identity and revision, lifecycle
+`active | completed | cancelled | failed`, one orthogonal attention state, and
+ordered operations. An operation is stable by Session `operationId`; Kernel
+admission adds `invocationId`, while attempts remain nested evidence. Tool
+arguments are never streamed publicly. Only catalog-validated tool identity,
+Kernel-canonical targets, resource references, facts, and effect summaries may
+populate a public operation.
+
+The replaceable run projection carries `currentActivity` and `wait`. Current
+activity codes are limited to:
+
+```text
+session.admitting
+provider.awaitingFirstByte
+provider.reasoning
+provider.composing
+resource.resolving
+kernel.executing
+session.validating
+session.persisting
+retry.backoff
+```
+
+Shells may render these semantics at different densities, but cannot convert
+them into durable messages or parse localized text to derive state.
+
+The Session timeline stream exposes only version-bound public snapshot/delta
+data. A delta binds base and next revisions and atomically replaces complete
+affected turns or root projections. Revision gaps require a fresh snapshot,
+and terminal delivery is reconciled with a final snapshot. GUI, CLI, and TUI
+use the same typed reducer.
+
+Settled historical flat-v2 timelines are normalized read-only by preserving
+the original block order, setting `workSegments = []`, and generating `parts`
+as the same ordered block references. No legacy group field is added and no
+tool, path, permission, or effect semantics are invented. Historical bytes
+are not rewritten. An active v2 checkpoint or queue without the work-segment,
+provider trace, and final-answer state returns `UnsupportedHistorySchema`.
+
+## Provider streaming and private trace
+
+OpenAI-compatible, Anthropic, and Ollama provider transports use one streaming
+production path. Native completion is provider-specific:
+
+- OpenAI-compatible requires `stop | tool_calls` and `[DONE]`;
+- Anthropic requires `message_stop`;
+- Ollama requires `done:true`.
+
+EOF, disconnect, cancellation, unsupported finish reasons, and length or
+content filtering are not successful completion. No ToolIntent is admitted
+until the complete native response, provider protocol, durable trace, and
+ordered tool-call queue checkpoint have all been validated.
+
+Every provider turn, including the post-Review final answer, requires nonempty
+readable reasoning through a profile-declared `reasoningTransport`. Supported
+plaintext sources are OpenAI `reasoning_content`/`reasoning`, Anthropic
+`thinking_delta`, and Ollama `thinking`/`reasoning`. Opaque, signed, or redacted
+blocks do not satisfy the requirement. A profile without a statically
+compatible transport remains visible but unavailable. Missing runtime
+reasoning fails the turn before tools or final content and quarantines the exact
+profile revision until explicit re-enable or a new configuration revision.
+
+The daemon stores one plaintext `deepcode.session.provider-trace.v1` per
+provider turn. It contains the exact serialized outbound request bytes,
+normalized chronological events, raw upstream envelopes, terminal state, and a
+monotonic digest chain and seal. The exact bytes archived for a request are the
+bytes sent on the network. Secrets, authorization and cookie headers, Kernel
+capabilities, and leases are excluded before trace serialization.
+
+Trace publication follows archive-before-publication. Buffered data is flushed
+after 250 ms or 16 KiB, whichever occurs first, and at request, response, and
+terminal boundaries. Raw upstream source bytes have a 1 MiB soft per-turn
+limit: the complete envelope that crosses the limit is archived once, then the
+turn terminates without tool admission. One raw envelope and one outbound
+request each have an independent 16 MiB hard limit. Trace directories use mode
+0700 and files use 0600.
+
+Archived Sessions retain traces. Explicit Session deletion uses visible,
+retryable two-stage deletion. It does not claim cryptographic erasure or
+removal from filesystem snapshots or backups.
+
+Private trace contents have no Session/model, CLI, TUI, public projection,
+Copy, Memory, GoalProjection, or cache ingress. A GUI Session-menu user action
+may list metadata and mint a process-memory capability bound to the exact
+Session, Run, trace digest, request identity, and payload digest. The
+capability lasts 60 seconds, permits only idempotent replay of that one logical
+request, and is invalid after daemon restart. Export revalidates the trace
+chain and seal, uses no-store/nosniff response headers, and audits metadata and
+result only.
 
 ## Host management and removal boundary
 

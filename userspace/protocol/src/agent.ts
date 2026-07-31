@@ -88,6 +88,11 @@ export interface AgentEvent {
 
 export type ConversationLanguage = 'zh-CN' | 'en-US';
 
+export const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2 =
+  'deepcode.shared-conversation-projection.v2' as const;
+export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1 =
+  'deepcode.shared-conversation.work-segments.v1' as const;
+
 export type AgentTimelineBlockKind =
   | 'user'
   | 'assistant'
@@ -176,6 +181,31 @@ export type AgentTimelineRunPhase =
   | 'waiting'
   | 'settled';
 
+export type AgentTimelineCurrentActivityCode =
+  | 'session.admitting'
+  | 'provider.awaitingFirstByte'
+  | 'provider.reasoning'
+  | 'provider.composing'
+  | 'resource.resolving'
+  | 'kernel.executing'
+  | 'session.validating'
+  | 'session.persisting'
+  | 'retry.backoff';
+
+export interface AgentTimelineCurrentActivity {
+  code: AgentTimelineCurrentActivityCode;
+  summary?: string;
+  operationId?: string;
+  workSegmentId?: string;
+  updatedAt: string;
+}
+
+export interface AgentTimelineWait {
+  kind: 'user' | 'external' | 'paused';
+  reason?: string;
+  interactionId?: string;
+}
+
 export interface AgentTimelineRunProjection {
   runId: string;
   turnId?: string;
@@ -183,8 +213,8 @@ export interface AgentTimelineRunProjection {
   revision: number;
   status: AgentTimelineRunStatus;
   phase: AgentTimelineRunPhase;
-  waitReason?: string;
-  activeInteractionId?: string;
+  currentActivity: AgentTimelineCurrentActivity | null;
+  wait: AgentTimelineWait | null;
   languageBinding: AgentTimelineLanguageBinding;
 }
 
@@ -400,6 +430,7 @@ export interface AgentTimelineStructuredProjection {
 }
 
 export type AgentTimelineDeliveryMode = 'live' | 'buffered' | 'replay';
+export type AgentTimelineProviderPhase = 'commentary' | 'final_answer';
 
 export interface AgentTimelineBlock {
   id: string;
@@ -410,6 +441,7 @@ export interface AgentTimelineBlock {
   kind: AgentTimelineBlockKind;
   narrativeKind?: AgentTimelineNarrativeKind;
   entryRole: AgentTimelineEntryRole;
+  providerPhase?: AgentTimelineProviderPhase;
   activity?: AgentConversationActivity;
   title: string;
   summary: string;
@@ -429,6 +461,74 @@ export interface AgentTimelineBlock {
   taskProjectionRef?: string;
 }
 
+export type AgentTimelineWorkOperationStatus =
+  | 'preparing'
+  | 'queued'
+  | 'running'
+  | 'awaitingCapability'
+  | 'completed'
+  | 'denied'
+  | 'failed'
+  | 'failedAfterObservedEffect'
+  | 'indeterminate'
+  | 'cancelled'
+  | 'stale'
+  | 'unexecuted';
+
+export interface AgentTimelineWorkOperationAttempt {
+  attemptId: string;
+  status?: AgentTimelineWorkOperationStatus;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface AgentTimelineWorkOperation {
+  operationId: string;
+  invocationId?: string;
+  attempts?: AgentTimelineWorkOperationAttempt[];
+  toolId: string;
+  displayName?: string;
+  status: AgentTimelineWorkOperationStatus;
+  canonicalAction?: string;
+  targets?: string[];
+  effectSummary?: string;
+  resourceRefs: string[];
+  factRefs: string[];
+  effectRefs: string[];
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface AgentTimelineWorkAttention {
+  kind:
+    | 'capability'
+    | 'denial'
+    | 'failure'
+    | 'observedEffectFailure'
+    | 'indeterminate';
+  status: 'unresolved' | 'resolved';
+  summary: string;
+  operationId?: string;
+  factRefs: string[];
+}
+
+export interface AgentTimelineWorkSegment {
+  id: string;
+  revision: number;
+  sequence: number;
+  lifecycle: 'active' | 'completed' | 'cancelled' | 'failed';
+  attention: AgentTimelineWorkAttention | null;
+  operations: AgentTimelineWorkOperation[];
+  startedAt?: string;
+  completedAt?: string;
+  provenance: AgentTimelineProvenance;
+  factRefs: string[];
+}
+
+export type AgentTimelineTurnPart =
+  | { kind: 'block'; blockId: string }
+  | { kind: 'workSegment'; workSegmentId: string };
+
 export interface AgentTimelineTurn {
   id: string;
   sequence?: number;
@@ -437,10 +537,13 @@ export interface AgentTimelineTurn {
   startedAt?: string;
   completedAt?: string;
   blocks: AgentTimelineBlock[];
+  workSegments: AgentTimelineWorkSegment[];
+  parts: AgentTimelineTurnPart[];
 }
 
 export interface AgentTimelineResult {
-  schemaVersion: 'deepcode.shared-conversation-projection.v2';
+  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
   sessionId: string;
   revision: number;
   sourceEventVersion: number;
@@ -455,6 +558,42 @@ export interface AgentTimelineResult {
 }
 
 export type AgentTimelineSnapshot = AgentTimelineResult;
+
+export interface AgentTimelineRootProjectionReplacements {
+  taskProjection?: AgentTimelineTaskProjection | null;
+  interactionProjection?: AgentTimelineInteractionProjection | null;
+  runProjection?: AgentTimelineRunProjection | null;
+  tokenUsageProjection?: AgentTimelineTokenUsageProjection | null;
+  workspaceProjection?: AgentTimelineWorkspaceProjection | null;
+}
+
+export interface AgentTimelineDelta {
+  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
+  sessionId: string;
+  baseRevision: number;
+  revision: number;
+  sourceEventVersion: number;
+  generatedAt: string;
+  eventCount: number;
+  turnReplacements: AgentTimelineTurn[];
+  removedTurnIds: string[];
+  rootReplacements: AgentTimelineRootProjectionReplacements;
+}
+
+export type AgentTimelineStreamEvent =
+  | {
+      type: 'snapshot';
+      sessionId: string;
+      revision: number;
+      snapshot: AgentTimelineSnapshot;
+    }
+  | {
+      type: 'delta';
+      sessionId: string;
+      revision: number;
+      delta: AgentTimelineDelta;
+    };
 
 /**
  * A model-visible, workspace-relative reference supplied with one user input.
