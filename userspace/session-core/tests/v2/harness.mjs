@@ -4,7 +4,12 @@ import {
   KERNEL_ABI_V2_VERSION, decodeKernelCommandResponseEnvelopeV2,
   decodeKernelFactProjectionV2, decodeToolContextBundleV2,
 } from '@deepcode/protocol';
-import { SessionKernelLoopV2, canonicalJson, sha256Hash } from '../../dist/index.js';
+import {
+  SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+  SessionKernelLoopV2,
+  canonicalJson,
+  sha256Hash,
+} from '../../dist/index.js';
 export { assert };
 export const NOW = '2026-07-29T00:00:00.000Z';
 export const RUN_ID = 'run-session-v2-contract';
@@ -793,20 +798,52 @@ export function providerToolIntent(
   argumentsValue,
   callId = `call-${toolId.replace('.', '-')}`
 ) {
-  return {
+  return providerToolIntents([{
+    callId,
+    toolName: toolId,
+    toolId,
+    arguments: argumentsValue,
+  }]);
+}
+export function providerToolIntents(calls) {
+  const normalized = calls.map((call) => ({
+    callId: call.callId,
+    toolName: call.toolName ?? call.toolId,
+    toolId: call.toolId,
+    arguments: clone(call.arguments),
+  }));
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'nativeToolCalls',
+    calls: normalized,
+  }));
+  return (input) => ({
     kind: 'toolIntent',
-    source: {
+    sources: normalized.map((call) => ({
       source: 'providerNative',
-      callId,
-      toolId,
-      arguments: clone(argumentsValue),
+      callId: call.callId,
+      toolId: call.toolId,
+      arguments: clone(call.arguments),
+    })),
+    receipt: {
+      schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+      providerTurnId: input.providerTurnId,
+      responseDigest,
+      callCount: normalized.length,
+      calls: normalized.map((call, index) => ({
+        ordinal: index + 1,
+        callId: call.callId,
+        toolName: call.toolName,
+        toolId: call.toolId,
+        argumentsDigest: sha256Hash(canonicalJson(call.arguments)),
+      })),
+      recordedAt: NOW,
     },
     providerResult: {
       providerProfileId: 'provider-profile-v2-contract',
       provider: 'contract-provider',
       model: 'contract-model',
     },
-  };
+  });
 }
 export function providerAnswer(text = 'Session answer') {
   return {

@@ -1,16 +1,21 @@
 import {
   buildSessionKernelReviewV2,
+  buildNarrativeTimelineProjection,
+  canonicalJson,
   canFinalizeSessionKernelReviewV2,
   createSessionKernelLoopStateV2,
+  findLatestPendingPermission,
   finalizeSessionKernelReviewV2,
   reconcileSessionKernelFactsPageV2,
   recordSessionPlanDecisionV2,
   recordSessionPlanV2,
+  sha256Hash,
 } from '../../dist/index.js';
 
 import {
   NOW,
   RUN_ID,
+  admittedReply,
   assert,
   createFactsPage,
   createInitialState,
@@ -19,6 +24,7 @@ import {
   openSessionHarness,
   persistPreviewAndAcceptPlan,
   providerAnswer,
+  providerToolIntents,
 } from './harness.mjs';
 
 export const contractCases = [
@@ -38,7 +44,528 @@ export const contractCases = [
     id: 'indeterminate_or_unsettled_cleanup_blocks_final_review',
     run: indeterminateOrUnsettledCleanupBlocksFinalReview,
   },
+  {
+    id: 'canonical_terminal_facts_settle_queue_before_next_provider_or_review',
+    run: canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview,
+  },
+  {
+    id: 'latest_run_drives_live_projection_without_truncating_history',
+    run: latestRunDrivesLiveProjectionWithoutTruncatingHistory,
+  },
+  {
+    id: 'recoverable_blocked_error_does_not_fail_latest_run',
+    run: recoverableBlockedErrorDoesNotFailLatestRun,
+  },
+  {
+    id: 'provider_token_usage_projection_is_canonical_digest_safe',
+    run: providerTokenUsageProjectionIsCanonicalDigestSafe,
+  },
 ];
+
+async function providerTokenUsageProjectionIsCanonicalDigestSafe() {
+  const sessionId = 'session-provider-token-usage';
+  const runId = 'run-provider-token-usage';
+  const providerTurnId = 'provider-turn-token-usage';
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    generatedAt: '2026-07-29T00:06:00.000Z',
+    events: [
+      agentEvent(
+        sessionId,
+        'event-token-usage-user',
+        'user_msg',
+        runId,
+        {
+          inputId: 'input-token-usage',
+          text: 'Report canonical Provider token counters.',
+          attachments: [],
+        },
+        0
+      ),
+      agentEvent(
+        sessionId,
+        'event-token-usage-started',
+        'workflow_stage',
+        runId,
+        {
+          projectionKind: 'provider.started',
+          providerTurnId,
+        },
+        1
+      ),
+      agentEvent(
+        sessionId,
+        'event-token-usage-completed',
+        'tool_result',
+        runId,
+        {
+          projectionKind: 'provider.completed',
+          providerTurnId,
+          providerOutcome: {
+            providerProfileId: 'provider-profile-token-usage',
+            provider: 'deepseek',
+            model: 'deepseek-token-usage-contract',
+            usage: {
+              prompt_cache_hit_tokens: 1,
+              prompt_cache_miss_tokens: 2,
+              cached_tokens: 1,
+              prompt_tokens: 3,
+              completion_tokens: 4,
+              total_tokens: 7,
+            },
+          },
+        },
+        2
+      ),
+    ],
+  });
+
+  const tokenUsage = projection.tokenUsageProjection;
+  assert(tokenUsage, 'Provider usage must produce a token projection');
+  assert.deepEqual(tokenUsage.totals, {
+    promptCacheHitTokens: 1,
+    promptCacheMissTokens: 2,
+    cachedTokens: 1,
+    promptTokens: 3,
+    completionTokens: 4,
+    totalTokens: 7,
+    providerCallCount: 1,
+    providers: ['deepseek'],
+  });
+  assert.equal(tokenUsage.requests.length, 1);
+  assert.deepEqual(
+    {
+      promptCacheHitTokens:
+        tokenUsage.requests[0].promptCacheHitTokens,
+      promptCacheMissTokens:
+        tokenUsage.requests[0].promptCacheMissTokens,
+      cachedTokens: tokenUsage.requests[0].cachedTokens,
+      promptTokens: tokenUsage.requests[0].promptTokens,
+      completionTokens: tokenUsage.requests[0].completionTokens,
+      totalTokens: tokenUsage.requests[0].totalTokens,
+      providerCallCount: tokenUsage.requests[0].providerCallCount,
+      providers: tokenUsage.requests[0].providers,
+    },
+    tokenUsage.totals
+  );
+  assert.equal(
+    Object.hasOwn(tokenUsage.totals, 'cacheHitRate'),
+    false
+  );
+  assert.equal(
+    Object.hasOwn(tokenUsage.requests[0], 'cacheHitRate'),
+    false
+  );
+
+  const canonicalWire = canonicalJson(projection);
+  assert.equal(
+    canonicalWire.includes('"cacheHitRate"'),
+    false,
+    'canonical Session wire must contain only integer cache counters'
+  );
+  const projectionDigest = sha256Hash(canonicalWire);
+  assert.match(projectionDigest, /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(
+    sha256Hash(canonicalJson(JSON.parse(canonicalWire))),
+    projectionDigest,
+    'canonical parse/re-encode must preserve the projection digest'
+  );
+}
+
+async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
+  const harness = await openSessionHarness();
+  const plan = createPlan();
+  await persistPreviewAndAcceptPlan(harness, plan);
+  harness.enqueueProvider(providerToolIntents([
+    {
+      callId: 'provider-call-review-queue-1',
+      toolId: 'fs.write',
+      arguments: { path: 'output.txt', content: 'contract output' },
+    },
+    {
+      callId: 'provider-call-review-queue-2',
+      toolId: 'fs.write',
+      arguments: { path: 'output.txt', content: 'contract output' },
+    },
+  ]));
+  harness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(harness, request, {
+      invocationId: 'invocation-review-queue-1',
+      attemptId: 'attempt-review-queue-1',
+    })
+  );
+  const admitted = await harness.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: plan.actions[0].manifest.planActionId,
+    },
+    remainingToolCallBudget: 2,
+  });
+  assert.equal(admitted.kind, 'admitted');
+  assert.equal(
+    harness.loop.snapshot().providerToolCallQueue.outcomeRecorded,
+    false
+  );
+  assert.throws(
+    () => buildSessionKernelReviewV2(
+      harness.loop.snapshot(),
+      '2026-07-29T00:04:00.000Z'
+    ),
+    (error) =>
+      error?.code === 'session_kernel_review_snapshot_incomplete'
+  );
+  assert.equal(
+    canFinalizeSessionKernelReviewV2(harness.loop.snapshot()),
+    false
+  );
+  assert.throws(
+    () => finalizeSessionKernelReviewV2(
+      harness.loop.snapshot(),
+      '2026-07-29T00:04:00.001Z'
+    ),
+    (error) =>
+      error?.code === 'session_kernel_review_not_finalizable'
+  );
+  assert.equal(
+    harness.store.projectionEvents.some(
+      (event) =>
+        event.kind === 'provider.completed'
+        && event.data?.outputKind === 'toolIntent'
+    ),
+    false,
+    'a submission reply cannot manufacture the queue outcome'
+  );
+
+  const firstCompleted = appendMutationCompletion(
+    harness,
+    plan,
+    admitted,
+    'attempt-review-queue-1',
+    'review-queue-first'
+  );
+  await harness.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: admitted.operationId,
+    invocationId: admitted.invocationId,
+    planActionId: plan.actions[0].manifest.planActionId,
+    expectedPlanRevision: plan.planRevision,
+  });
+
+  const betweenCalls = harness.loop.snapshot();
+  assert.deepEqual(
+    betweenCalls.providerToolCallQueue.calls.map((call) => call.status),
+    ['completed', 'pending']
+  );
+  assert.equal(
+    betweenCalls.providerToolCallQueue.calls[0].terminalFactId,
+    firstCompleted.factId
+  );
+  await assert.rejects(
+    harness.loop.runProviderTurn({
+      reason: 'planExecution',
+      target: {
+        kind: 'planAction',
+        planActionId: plan.actions[0].manifest.planActionId,
+      },
+      remainingToolCallBudget: 1,
+    }),
+    (error) =>
+      error?.code === 'session_kernel_provider_tool_call_queue_active'
+  );
+  assert.equal(
+    harness.providerInputs.length,
+    1,
+    'an active queue must reject a new Provider turn before transport'
+  );
+
+  harness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(harness, request, {
+      admissionFactId: 'fact-review-queue-admitted-2',
+      invocationId: 'invocation-review-queue-2',
+      attemptId: 'attempt-review-queue-2',
+    })
+  );
+  const second = await harness.loop.resumePendingProviderToolCalls();
+  assert.equal(second.kind, 'admitted');
+  const secondCompleted = appendMutationCompletion(
+    harness,
+    plan,
+    second,
+    'attempt-review-queue-2',
+    'review-queue-second'
+  );
+  await harness.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: second.operationId,
+    invocationId: second.invocationId,
+    planActionId: plan.actions[0].manifest.planActionId,
+    expectedPlanRevision: plan.planRevision,
+  });
+
+  let settled = harness.loop.snapshot();
+  assert.equal(settled.providerToolCallQueue.status, 'completed');
+  assert.equal(settled.providerToolCallQueue.outcomeRecorded, true);
+  assert.equal(
+    settled.providerToolCallQueue.calls[1].terminalFactId,
+    secondCompleted.factId
+  );
+  assert.equal(
+    harness.store.projectionEvents.some(
+      (event) =>
+        event.kind === 'provider.completed'
+        && event.data?.result?.kind === 'orderedToolCallsCompleted'
+        && event.data?.result?.callCount === 2
+    ),
+    true
+  );
+  harness.enqueueProvider(providerAnswer('continued after queue settlement'));
+  const continued = await harness.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: plan.actions[0].manifest.planActionId,
+    },
+    remainingToolCallBudget: 1,
+  });
+  assert.deepEqual(continued, {
+    kind: 'answer',
+    text: 'continued after queue settlement',
+  });
+  assert.equal(harness.providerInputs.length, 2);
+  settled = harness.loop.snapshot();
+  const review = buildSessionKernelReviewV2(
+    settled,
+    '2026-07-29T00:04:01.000Z'
+  );
+  assert.equal(
+    review.snapshotHighWater,
+    harness.kernelState.snapshotHighWater
+  );
+}
+
+function appendMutationCompletion(
+  harness,
+  plan,
+  result,
+  attemptId,
+  label
+) {
+  const effectId = `effect-${label}`;
+  const observed = corpusFact('effectToolObserved', {
+    factId: `fact-${label}-observed`,
+    ledgerSequence: harness.nextFactSequence(),
+    runSequence: harness.nextRunSequence(),
+    identities: {
+      runId: harness.initial.runId,
+      planRevision: plan.planRevision,
+      planActionId: plan.actions[0].manifest.planActionId,
+      operationId: result.operationId,
+      invocationId: result.invocationId,
+      attemptId,
+      effectId,
+    },
+  });
+  const completed = corpusFact('invocationToolCompleted', {
+    factId: `fact-${label}-completed`,
+    ledgerSequence: harness.nextFactSequence() + 1,
+    runSequence: harness.nextRunSequence() + 1,
+    identities: {
+      runId: harness.initial.runId,
+      planRevision: plan.planRevision,
+      planActionId: plan.actions[0].manifest.planActionId,
+      operationId: result.operationId,
+      invocationId: result.invocationId,
+      attemptId,
+      effectId,
+      observedFactId: observed.factId,
+    },
+  });
+  harness.appendFacts(observed, completed);
+  return completed;
+}
+
+async function latestRunDrivesLiveProjectionWithoutTruncatingHistory() {
+  const sessionId = 'session-latest-run-projection';
+  const events = [
+    agentEvent(sessionId, 'event-a-user', 'user_msg', 'run-a', {
+      inputId: 'input-a',
+      text: 'old run input',
+      attachments: [],
+    }, 0),
+    agentEvent(sessionId, 'event-a-plan', 'plan_card', 'run-a', {
+      planId: 'plan-a',
+      title: 'Old plan',
+      tasks: [{
+        taskId: 'task-a',
+        toolId: 'fs.read',
+        operationId: 'operation-a',
+      }],
+    }, 1),
+    agentEvent(
+      sessionId,
+      'event-a-permission',
+      'permission_request',
+      'run-a',
+      {
+        permissionId: 'permission-a',
+        toolId: 'fs.read',
+        toolName: 'Old read',
+      },
+      2
+    ),
+    agentEvent(sessionId, 'event-a-error', 'error', 'run-a', {
+      status: 'failed',
+      message: 'old run failed',
+    }, 3),
+    agentEvent(sessionId, 'event-b-user', 'user_msg', 'run-b', {
+      inputId: 'input-b',
+      text: 'current run input',
+      attachments: [],
+    }, 4),
+    agentEvent(sessionId, 'event-b-plan', 'plan_card', 'run-b', {
+      planId: 'plan-b',
+      title: 'Current plan',
+      confirmable: false,
+      tasks: [{
+        taskId: 'task-b',
+        toolId: 'fs.write',
+        operationId: 'operation-b',
+      }],
+    }, 5),
+    agentEvent(
+      sessionId,
+      'event-b-permission',
+      'permission_request',
+      'run-b',
+      {
+        permissionId: 'permission-b',
+        toolId: 'fs.write',
+        toolName: 'Current write',
+      },
+      6
+    ),
+    agentEvent(
+      sessionId,
+      'event-b-waiting',
+      'session_run_state',
+      'run-b',
+      {
+        status: 'waiting',
+        reason: 'scopeExpansion',
+        targetId: 'permission-b',
+      },
+      7
+    ),
+  ];
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events,
+    generatedAt: '2026-07-29T00:05:00.000Z',
+  });
+
+  assert.equal(projection.revision, events.length);
+  assert.equal(projection.sourceEventVersion, events.length);
+  assert.equal(projection.eventCount, events.length);
+  assert.equal(projection.turns.length, 2);
+  assert.equal(
+    projection.turns.some((turn) =>
+      turn.blocks.some((block) => block.id === 'event:event-a-user')
+    ),
+    true,
+    'full Run A history must remain visible'
+  );
+  assert.deepEqual(
+    projection.taskProjection.items.map((item) => item.id),
+    ['task-b']
+  );
+  assert.equal(
+    projection.interactionProjection.pending.requestId,
+    'permission-b'
+  );
+  assert.equal(projection.runProjection.runId, 'run-b');
+  assert.equal(projection.runProjection.status, 'waitingUser');
+  assert.equal(projection.runProjection.activeInteractionId, 'permission-b');
+  assert.equal(
+    findLatestPendingPermission(events).request.id,
+    'permission-b'
+  );
+}
+
+async function recoverableBlockedErrorDoesNotFailLatestRun() {
+  const sessionId = 'session-blocked-error-projection';
+  const events = [
+    agentEvent(sessionId, 'event-blocked-user', 'user_msg', 'run-current', {
+      inputId: 'input-current',
+      text: 'current input',
+      attachments: [],
+    }, 0),
+    agentEvent(sessionId, 'event-blocked-error', 'error', 'run-current', {
+      status: 'blocked',
+      code: 'session_kernel_provider_tool_calls_aborted',
+      message: 'Replanning is required.',
+    }, 1),
+  ];
+  const recoverable = buildNarrativeTimelineProjection({
+    sessionId,
+    events,
+  });
+  assert.equal(recoverable.runProjection.runId, 'run-current');
+  assert.equal(recoverable.runProjection.status, 'active');
+  assert.notEqual(recoverable.runProjection.phase, 'settled');
+  assert.equal(recoverable.turns[0].status, 'running');
+  assert.equal(
+    recoverable.turns[0].blocks.find(
+      (block) => block.id === 'event:event-blocked-error'
+    )?.status,
+    'blocked'
+  );
+
+  const failed = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [
+      ...events,
+      agentEvent(
+        sessionId,
+        'event-terminal-error',
+        'error',
+        'run-current',
+        {
+          status: 'failed',
+          code: 'provider.requestTurn',
+          message: 'Terminal Provider failure.',
+        },
+        2
+      ),
+    ],
+  });
+  assert.equal(failed.runProjection.status, 'failed');
+  assert.equal(failed.turns[0].status, 'failed');
+}
+
+function agentEvent(
+  sessionId,
+  id,
+  kind,
+  runId,
+  payload,
+  second
+) {
+  return {
+    id,
+    sessionId,
+    ts: new Date(
+      Date.parse('2026-07-29T00:05:00.000Z') + second * 1_000
+    ).toISOString(),
+    kind,
+    payload: {
+      runId,
+      ...payload,
+    },
+  };
+}
 
 async function reviewRevisionIsPinnedToOneFactsHighWater() {
   let state = acceptedPlanState();
@@ -137,6 +664,7 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
       kind: 'planAction',
       planActionId: loopPlan.actions[0].manifest.planActionId,
     },
+    remainingToolCallBudget: 32,
   });
   const loopFirst = await harness.loop.finalizeReview(
     loopPlan.planRevision

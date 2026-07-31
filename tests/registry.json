@@ -164,8 +164,8 @@
     },
     {
       "id": "session.v2.contracts",
-      "description": "Required Session v2 ToolContext, ToolIntent, TypeScript shared-vector decoding, Loop fencing, facts reconciliation, recovery, and review contracts; the required profile combines this with the Rust half in kernel.v2.contracts.",
-      "layer": "session",
+      "description": "Required Session v2 ToolContext, ToolIntent, TypeScript shared-vector decoding, Loop fencing, facts reconciliation, recovery, review, GUI canonical progress, and Session switching contracts; the required profile combines this with the Rust half in kernel.v2.contracts.",
+      "layer": "cross-layer",
       "kind": "contract",
       "owner": "session",
       "approvalClass": "test-runtime",
@@ -182,7 +182,11 @@
         "container": "optional",
         "hostPolicy": "allowed"
       },
-      "resources": [],
+      "resources": [
+        "test-owned-loopback-listener",
+        "test-owned-http-sse-connections",
+        "test-owned-window-timers"
+      ],
       "contractSources": [
         "scripts/tests/session-v2-contracts.sh",
         "fixtures/kernel-session-v2/wire-golden.json",
@@ -192,7 +196,8 @@
         "userspace/session-core/tests/v2/authority-contracts.mjs",
         "userspace/session-core/tests/v2/loop-contracts.mjs",
         "userspace/session-core/tests/v2/recovery-contracts.mjs",
-        "userspace/session-core/tests/v2/review-contracts.mjs"
+        "userspace/session-core/tests/v2/review-contracts.mjs",
+        "userspace/gui/tests/agent-session-store-contracts.mjs"
       ]
     },
     {

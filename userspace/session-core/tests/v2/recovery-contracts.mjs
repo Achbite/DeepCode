@@ -22,6 +22,7 @@ import {
   persistPreviewAndAcceptPlan,
   providerAnswer,
   providerToolIntent,
+  providerToolIntents,
   toolContextRef,
 } from './harness.mjs';
 
@@ -33,6 +34,14 @@ export const contractCases = [
   {
     id: 'restart_rebuilds_session_state_from_canonical_facts',
     run: restartRebuildsSessionStateFromCanonicalFacts,
+  },
+  {
+    id: 'restart_resumes_queue_without_replaying_completed_calls',
+    run: restartResumesQueueWithoutReplayingCompletedCalls,
+  },
+  {
+    id: 'corrupted_provider_tool_queue_checkpoint_fails_closed',
+    run: corruptedProviderToolQueueCheckpointFailsClosed,
   },
   {
     id: 'indeterminate_mutation_requires_manual_recovery_without_retry',
@@ -92,6 +101,16 @@ async function unknownEffectOutcomeReplaysTheExactIdentityAfterRestart() {
   );
 
   const firstSubmission = first.calls('submitToolIntent')[0];
+  const firstQueue = first.loop.snapshot().providerToolCallQueue;
+  assert.ok(firstQueue);
+  assert.equal(firstQueue.status, 'active');
+  assert.equal(firstQueue.calls[0].status, 'submitting');
+  assert.equal(firstQueue.calls[0].requestId, firstSubmission.requestId);
+  assert.deepEqual(
+    firstQueue.calls[0].intent,
+    firstSubmission.intent,
+    'the durable queue must retain the exact unknown-outcome payload'
+  );
   const pending = first.store.pendingRequests.get('effect');
   assert.ok(pending, 'unknown transport outcome must remain durable');
   assert.equal(pending.requestId, firstSubmission.requestId);
@@ -122,6 +141,11 @@ async function unknownEffectOutcomeReplaysTheExactIdentityAfterRestart() {
     'recovery may only replay the exact persisted request payload'
   );
   assert.equal(
+    canonicalJson(replay.intent),
+    canonicalJson(firstQueue.calls[0].intent),
+    'unknown replay must retain the same canonical payload digest'
+  );
+  assert.equal(
     first.store.pendingRequests.has('effect'),
     false,
     'a confirmed replay outcome must settle the durable effect lane'
@@ -130,6 +154,234 @@ async function unknownEffectOutcomeReplaysTheExactIdentityAfterRestart() {
     restarted.loop.snapshot().activeWait?.invocationId,
     'invocation-replayed-after-restart'
   );
+  assert.equal(
+    restarted.loop.snapshot().providerToolCallQueue.calls[0].requestId,
+    firstSubmission.requestId
+  );
+}
+
+async function restartResumesQueueWithoutReplayingCompletedCalls() {
+  const first = await openSessionHarness();
+  first.enqueueProvider(providerToolIntents([
+    {
+      callId: 'provider-call-restart-queue-1',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+    {
+      callId: 'provider-call-restart-queue-2',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+  ]));
+  first.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(first, request, {
+      invocationId: 'invocation-restart-queue-1',
+      attemptId: 'attempt-restart-queue-1',
+    })
+  );
+  const admitted = await first.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  assert.equal(admitted.kind, 'admitted');
+  appendContextReadCompletion(
+    first,
+    admitted,
+    'attempt-restart-queue-1',
+    'restart-queue-first'
+  );
+  await first.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: admitted.operationId,
+    invocationId: admitted.invocationId,
+  });
+  const beforeRestart = first.loop.snapshot().providerToolCallQueue;
+  assert.deepEqual(
+    beforeRestart.calls.map((call) => call.status),
+    ['completed', 'pending']
+  );
+  const completedRequestId = beforeRestart.calls[0].requestId;
+
+  const restarted = createSessionHarness({
+    initial: first.initial,
+    store: first.store,
+    kernelState: first.kernelState,
+  });
+  await restarted.open();
+  assert.equal(
+    restarted.calls('submitToolIntent').length,
+    0,
+    'restart must not replay a canonically completed queue item'
+  );
+  assert.deepEqual(
+    restarted.loop.snapshot().providerToolCallQueue.calls.map(
+      (call) => call.status
+    ),
+    ['completed', 'pending']
+  );
+  assert.equal(
+    restarted.loop.snapshot().providerToolCallQueue.calls[0].requestId,
+    completedRequestId
+  );
+
+  restarted.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(restarted, request, {
+      admissionFactId: 'fact-restart-queue-admitted-2',
+      invocationId: 'invocation-restart-queue-2',
+      attemptId: 'attempt-restart-queue-2',
+    })
+  );
+  const second = await restarted.loop.resumePendingProviderToolCalls();
+  assert.equal(second.kind, 'admitted');
+  assert.equal(restarted.calls('submitToolIntent').length, 1);
+  assert.equal(
+    restarted.calls('submitToolIntent')[0].intent.operationId,
+    beforeRestart.calls[1].intent.operationId
+  );
+  assert.notEqual(
+    restarted.calls('submitToolIntent')[0].requestId,
+    completedRequestId
+  );
+
+  appendContextReadCompletion(
+    restarted,
+    second,
+    'attempt-restart-queue-2',
+    'restart-queue-second'
+  );
+  await restarted.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: second.operationId,
+    invocationId: second.invocationId,
+  });
+  assert.equal(
+    restarted.loop.snapshot().providerToolCallQueue.status,
+    'completed'
+  );
+  assert.equal(
+    restarted.loop.snapshot().providerToolCallQueue.outcomeRecorded,
+    true
+  );
+}
+
+async function corruptedProviderToolQueueCheckpointFailsClosed() {
+  const harness = await openSessionHarness();
+  harness.enqueueProvider(providerToolIntents([
+    {
+      callId: 'provider-call-corrupt-queue-1',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+    {
+      callId: 'provider-call-corrupt-queue-2',
+      toolId: 'fs.read',
+      arguments: { path: 'notes/context.md' },
+    },
+  ]));
+  harness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(harness, request, {
+      invocationId: 'invocation-corrupt-queue',
+      attemptId: 'attempt-corrupt-queue',
+    })
+  );
+  await harness.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  const checkpoint = harness.store.checkpoint;
+  assert.ok(checkpoint?.state.providerToolCallQueue);
+  const corruptions = [
+    (value) => {
+      value.state.providerToolCallQueue.receipt.calls[0].argumentsDigest =
+        `sha256:${'0'.repeat(64)}`;
+    },
+    (value) => {
+      value.state.providerToolCallQueue.calls[0].ordinal = 2;
+    },
+    (value) => {
+      value.state.providerToolCallQueue.calls[0].requestId = undefined;
+    },
+    (value) => {
+      value.state.providerToolCallQueue.target = {
+        kind: 'planAction',
+        planActionId: 'plan-action-forged',
+      };
+    },
+    (value) => {
+      value.state.providerToolCallQueue.calls[1].intent.operationId =
+        value.state.providerToolCallQueue.calls[0].intent.operationId;
+    },
+    (value) => {
+      const call = value.state.providerToolCallQueue.calls[0];
+      call.terminalFactId = 'fact-forged-terminal';
+      call.terminalFactKind = 'toolCompleted';
+    },
+    (value) => {
+      delete value.state.providerToolCallQueue.calls[0].invocationId;
+    },
+    (value) => {
+      const call = value.state.providerToolCallQueue.calls[0];
+      call.status = 'completed';
+      delete call.terminalFactId;
+      delete call.terminalFactKind;
+    },
+  ];
+  for (const corrupt of corruptions) {
+    const invalid = JSON.parse(JSON.stringify(checkpoint));
+    corrupt(invalid);
+    assert.throws(
+      () => restoreSessionKernelLoopStateV2(
+        invalid,
+        {
+          runId: harness.initial.runId,
+          workspaceBindingDigest:
+            harness.initial.workspaceBindingDigest,
+          sessionMemory: harness.initial.sessionMemory,
+          providerProfile: harness.initial.providerProfile,
+        }
+      ),
+      (error) =>
+        error?.code === 'session_provider_tool_call_queue_invalid'
+    );
+  }
+}
+
+function appendContextReadCompletion(
+  harness,
+  result,
+  attemptId,
+  label
+) {
+  const effectId = `effect-${label}`;
+  const observed = corpusFact('effectContextReadObserved', {
+    factId: `fact-${label}-observed`,
+    ledgerSequence: harness.nextFactSequence(),
+    runSequence: harness.nextRunSequence(),
+    identities: {
+      runId: harness.initial.runId,
+      contextReadOperationId: result.operationId,
+      contextReadInvocationId: result.invocationId,
+      contextReadAttemptId: attemptId,
+      contextReadEffectId: effectId,
+    },
+  });
+  const completed = corpusFact('invocationContextReadCompleted', {
+    factId: `fact-${label}-completed`,
+    ledgerSequence: harness.nextFactSequence() + 1,
+    runSequence: harness.nextRunSequence() + 1,
+    identities: {
+      runId: harness.initial.runId,
+      contextReadOperationId: result.operationId,
+      contextReadInvocationId: result.invocationId,
+      contextReadAttemptId: attemptId,
+      contextReadEffectId: effectId,
+    },
+  });
+  harness.appendFacts(observed, completed);
 }
 
 async function restartRebuildsSessionStateFromCanonicalFacts() {
@@ -234,6 +486,7 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
       kind: 'planAction',
       planActionId: 'plan-action-golden-1',
     },
+    remainingToolCallBudget: 32,
   });
   assert.deepEqual(
     restarted.calls('submitToolIntent').at(-1).intent.authority.data.lease,
@@ -273,6 +526,7 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
       kind: 'planAction',
       planActionId: 'plan-action-golden-1',
     },
+    remainingToolCallBudget: 32,
   });
   assert.equal(admitted.kind, 'admitted');
 
@@ -315,6 +569,7 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
         kind: 'planAction',
         planActionId: 'plan-action-golden-1',
       },
+      remainingToolCallBudget: 32,
     }),
     (error) => error?.code === 'session_kernel_active_wait'
   );
@@ -588,6 +843,7 @@ async function capabilityAllowContinuesSameInvocationWithNewLease() {
       kind: 'planAction',
       planActionId: 'plan-action-golden-1',
     },
+    remainingToolCallBudget: 32,
   });
   assert.equal(waiting.kind, 'awaitingCapability');
   assert.deepEqual(harness.loop.snapshot().activeWait, {
@@ -728,6 +984,7 @@ async function capabilityDenyGuidesNextTurnWithoutSessionManufacturedEffect() {
       kind: 'planAction',
       planActionId: 'plan-action-golden-deny-1',
     },
+    remainingToolCallBudget: 32,
   });
   assert.equal(harness.loop.snapshot().activeWait?.kind, 'capability');
   assert.deepEqual(

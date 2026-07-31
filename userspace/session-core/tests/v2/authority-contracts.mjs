@@ -1,7 +1,10 @@
 import {
+  StrictSessionKernelProviderAdapterV2,
   normalizeProviderKernelToolIntentV2,
   providerCallableToolsV2,
   recordSessionToolIntentSubmissionV2,
+  sha256Hash,
+  canonicalJson,
 } from '../../dist/index.js';
 
 import {
@@ -16,6 +19,7 @@ import {
   persistPreviewAndAcceptPlan,
   providerAnswer,
   providerToolIntent,
+  providerToolIntents,
   toolContextRef,
 } from './harness.mjs';
 
@@ -27,6 +31,14 @@ export const contractCases = [
   {
     id: 'provider_native_call_becomes_one_strict_context_read_intent',
     run: providerNativeCallBecomesOneStrictContextReadIntent,
+  },
+  {
+    id: 'provider_native_calls_create_safe_ordered_queue_and_serialize_submission',
+    run: providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission,
+  },
+  {
+    id: 'provider_tool_call_budget_rejects_whole_response_before_submission',
+    run: providerToolCallBudgetRejectsWholeResponseBeforeSubmission,
   },
   {
     id: 'ordinary_narration_never_submits_an_intent',
@@ -166,6 +178,343 @@ async function providerNativeCallBecomesOneStrictContextReadIntent() {
   );
 }
 
+async function providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission() {
+  const harness = await openSessionHarness();
+  const backendCalls = [
+    {
+      callId: 'provider-call-ordered-read-1',
+      toolName: 'read_file',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+    {
+      callId: 'provider-call-ordered-read-2',
+      toolName: 'read_file_again',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+  ];
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'nativeToolCalls',
+    calls: backendCalls,
+  }));
+  const adapter = new StrictSessionKernelProviderAdapterV2(
+    {
+      async requestTurn() {
+        return {
+          kind: 'nativeToolCalls',
+          calls: backendCalls,
+          providerResult: {
+            providerProfileId: 'provider-profile-v2-contract',
+            provider: 'contract-provider',
+            model: 'contract-model',
+          },
+          responseDigest,
+        };
+      },
+    },
+    { now: () => '2026-07-29T00:00:10.000Z' }
+  );
+  harness.enqueueProvider((input) => adapter.requestTurn(input));
+  harness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(harness, request, {
+      invocationId: 'invocation-ordered-read-1',
+      attemptId: 'attempt-ordered-read-1',
+    })
+  );
+
+  const first = await harness.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  assert.equal(first.kind, 'admitted');
+  assert.equal(harness.calls('submitToolIntent').length, 1);
+
+  let queue = harness.loop.snapshot().providerToolCallQueue;
+  assert.ok(queue);
+  assert.equal(queue.status, 'active');
+  assert.equal(queue.outcomeRecorded, false);
+  assert.deepEqual(
+    queue.calls.map((call) => ({
+      ordinal: call.ordinal,
+      status: call.status,
+      toolId: call.intent.toolId,
+    })),
+    [
+      { ordinal: 1, status: 'awaitingInvocation', toolId: 'fs.read' },
+      { ordinal: 2, status: 'pending', toolId: 'fs.read' },
+    ]
+  );
+  assert.equal(queue.receipt.responseDigest, responseDigest);
+  assert.deepEqual(
+    queue.receipt.calls.map((call) => ({
+      ordinal: call.ordinal,
+      callId: call.callId,
+      toolName: call.toolName,
+      toolId: call.toolId,
+    })),
+    [
+      {
+        ordinal: 1,
+        callId: 'provider-call-ordered-read-1',
+        toolName: 'read_file',
+        toolId: 'fs.read',
+      },
+      {
+        ordinal: 2,
+        callId: 'provider-call-ordered-read-2',
+        toolName: 'read_file_again',
+        toolId: 'fs.read',
+      },
+    ]
+  );
+  const receiptJson = JSON.stringify(queue.receipt);
+  assert.equal(receiptJson.includes('README.md'), false);
+  assert.equal(receiptJson.includes(RUN_CAPABILITY_SECRET), false);
+  assert.equal(receiptJson.includes(DECISION_CAPABILITY_SECRET), false);
+  assert.equal(
+    queue.receipt.calls[0].argumentsDigest,
+    sha256Hash(canonicalJson({ path: 'README.md' }))
+  );
+
+  appendContextReadCompletion(
+    harness,
+    first,
+    'attempt-ordered-read-1',
+    'ordered-first'
+  );
+  await harness.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: first.operationId,
+    invocationId: first.invocationId,
+  });
+  queue = harness.loop.snapshot().providerToolCallQueue;
+  assert.deepEqual(
+    queue.calls.map((call) => call.status),
+    ['completed', 'pending']
+  );
+  assert.equal(
+    harness.calls('submitToolIntent').length,
+    1,
+    'the second call cannot submit before the first canonical terminal fact'
+  );
+
+  harness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(harness, request, {
+      admissionFactId: 'fact-ordered-read-admitted-2',
+      invocationId: 'invocation-ordered-read-2',
+      attemptId: 'attempt-ordered-read-2',
+    })
+  );
+  const second = await harness.loop.resumePendingProviderToolCalls();
+  assert.equal(second.kind, 'admitted');
+  assert.equal(harness.calls('submitToolIntent').length, 2);
+  queue = harness.loop.snapshot().providerToolCallQueue;
+  assert.deepEqual(
+    queue.calls.map((call) => call.status),
+    ['completed', 'awaitingInvocation']
+  );
+  assert.equal(
+    new Set(queue.calls.map((call) => call.intent.operationId)).size,
+    2
+  );
+  assert.equal(
+    new Set(queue.calls.map((call) => call.intent.idempotencyKey)).size,
+    2
+  );
+  assert.equal(
+    new Set(queue.calls.map((call) => call.requestId)).size,
+    2
+  );
+
+  appendContextReadCompletion(
+    harness,
+    second,
+    'attempt-ordered-read-2',
+    'ordered-second'
+  );
+  await harness.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: second.operationId,
+    invocationId: second.invocationId,
+  });
+  queue = harness.loop.snapshot().providerToolCallQueue;
+  assert.equal(queue.status, 'completed');
+  assert.equal(queue.outcomeRecorded, true);
+  assert.deepEqual(
+    queue.calls.map((call) => call.status),
+    ['completed', 'completed']
+  );
+  assert.equal(
+    harness.store.projectionEvents.some(
+      (event) =>
+        event.kind === 'provider.completed'
+        && event.data?.result?.kind === 'orderedToolCallsCompleted'
+        && event.data?.result?.callCount === 2
+    ),
+    true,
+    'the durable provider outcome must follow both canonical terminal facts'
+  );
+}
+
+async function providerToolCallBudgetRejectsWholeResponseBeforeSubmission() {
+  const harness = await openSessionHarness();
+  const plan = createPlan();
+  await persistPreviewAndAcceptPlan(harness, plan);
+  harness.enqueueProvider(providerToolIntents([
+    {
+      callId: 'provider-call-budget-write-1',
+      toolId: 'fs.write',
+      arguments: { path: 'output.txt', content: 'contract output' },
+    },
+    {
+      callId: 'provider-call-budget-write-2',
+      toolId: 'fs.write',
+      arguments: { path: 'output.txt', content: 'contract output' },
+    },
+  ]));
+
+  await assert.rejects(
+    harness.loop.runProviderTurn({
+      reason: 'planExecution',
+      target: {
+        kind: 'planAction',
+        planActionId: plan.actions[0].manifest.planActionId,
+      },
+      remainingToolCallBudget: 1,
+    }),
+    (error) =>
+      error?.code === 'session_kernel_provider_tool_call_budget_exceeded'
+  );
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(
+    harness.loop.snapshot().providerToolCallQueue,
+    undefined,
+    'budget rejection must not persist a partial queue'
+  );
+  assert.equal(harness.loop.snapshot().providerTurn.status, 'failed');
+  assert.deepEqual(
+    harness.loop.snapshot().operationPlanActionBindings,
+    {},
+    'whole-response rejection must not leave hidden dynamic PlanAction bindings'
+  );
+
+  const tooManyCalls = Array.from({ length: 33 }, (_, index) => ({
+    callId: `provider-call-over-limit-${index + 1}`,
+    toolName: 'write_file',
+    toolId: 'fs.write',
+    arguments: { path: 'output.txt', content: 'contract output' },
+  }));
+  const rejectingAdapter = new StrictSessionKernelProviderAdapterV2(
+    {
+      async requestTurn() {
+        return {
+          kind: 'nativeToolCalls',
+          calls: tooManyCalls,
+          providerResult: {
+            providerProfileId: 'provider-profile-v2-contract',
+            provider: 'contract-provider',
+            model: 'contract-model',
+          },
+          responseDigest: sha256Hash(canonicalJson(tooManyCalls)),
+        };
+      },
+    },
+    { now: () => '2026-07-29T00:00:20.000Z' }
+  );
+  await assert.rejects(
+    rejectingAdapter.requestTurn(harness.providerInputs[0]),
+    (error) =>
+      error?.code === 'session_kernel_provider_tool_call_count_invalid'
+  );
+  assert.equal(
+    harness.calls('submitToolIntent').length,
+    0,
+    '33 Provider calls must be rejected before any Kernel submission'
+  );
+
+  const maximum = await openSessionHarness();
+  const maximumCalls = Array.from({ length: 32 }, (_, index) => ({
+    callId: `provider-call-at-limit-${index + 1}`,
+    toolName: 'read_file',
+    toolId: 'fs.read',
+    arguments: { path: 'README.md' },
+  }));
+  const maximumAdapter = new StrictSessionKernelProviderAdapterV2(
+    {
+      async requestTurn() {
+        return {
+          kind: 'nativeToolCalls',
+          calls: maximumCalls,
+          providerResult: {
+            providerProfileId: 'provider-profile-v2-contract',
+            provider: 'contract-provider',
+            model: 'contract-model',
+          },
+          responseDigest: sha256Hash(canonicalJson(maximumCalls)),
+        };
+      },
+    },
+    { now: () => '2026-07-29T00:00:21.000Z' }
+  );
+  maximum.enqueueProvider((input) => maximumAdapter.requestTurn(input));
+  maximum.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(maximum, request, {
+      invocationId: 'invocation-at-limit-1',
+      attemptId: 'attempt-at-limit-1',
+    })
+  );
+  const atLimit = await maximum.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  assert.equal(atLimit.kind, 'admitted');
+  assert.equal(
+    maximum.loop.snapshot().providerToolCallQueue.calls.length,
+    32
+  );
+  assert.equal(maximum.calls('submitToolIntent').length, 1);
+  assert.equal(
+    maximum.loop.snapshot().providerToolCallQueue.calls
+      .slice(1)
+      .every((call) => call.status === 'pending'),
+    true,
+    'the 32-call upper bound still admits only the first call initially'
+  );
+}
+
+function appendContextReadCompletion(harness, result, attemptId, label) {
+  const effectId = `effect-${label}`;
+  const observed = corpusFact('effectContextReadObserved', {
+    factId: `fact-${label}-observed`,
+    ledgerSequence: harness.nextFactSequence(),
+    runSequence: harness.nextRunSequence(),
+    identities: {
+      runId: harness.initial.runId,
+      contextReadOperationId: result.operationId,
+      contextReadInvocationId: result.invocationId,
+      contextReadAttemptId: attemptId,
+      contextReadEffectId: effectId,
+    },
+  });
+  const completed = corpusFact('invocationContextReadCompleted', {
+    factId: `fact-${label}-completed`,
+    ledgerSequence: harness.nextFactSequence() + 1,
+    runSequence: harness.nextRunSequence() + 1,
+    identities: {
+      runId: harness.initial.runId,
+      contextReadOperationId: result.operationId,
+      contextReadInvocationId: result.invocationId,
+      contextReadAttemptId: attemptId,
+      contextReadEffectId: effectId,
+    },
+  });
+  harness.appendFacts(observed, completed);
+}
+
 async function ordinaryNarrationNeverSubmitsAnIntent() {
   const harness = await openSessionHarness();
   const embedded = JSON.stringify({
@@ -283,6 +632,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
       kind: 'planAction',
       planActionId: 'plan-action-golden-1',
     },
+    remainingToolCallBudget: 32,
   });
 
   assert.equal(firstResult.kind, 'admitted');
@@ -389,6 +739,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
       kind: 'planAction',
       planActionId: 'plan-action-golden-1',
     },
+    remainingToolCallBudget: 32,
   });
   assert.equal(secondResult.kind, 'admitted');
   const secondIntent =
@@ -467,6 +818,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
         kind: 'planAction',
         planActionId: 'plan-action-golden-1',
       },
+      remainingToolCallBudget: 32,
     })
   );
   assert.deepEqual(postRevocationIntent.authority, {

@@ -8,7 +8,12 @@ import {
   openSessionHarness,
   providerAnswer,
   providerToolIntent,
+  providerToolIntents,
 } from './harness.mjs';
+import {
+  canonicalJson,
+  sha256Hash,
+} from '../../dist/index.js';
 
 export const contractCases = [
   {
@@ -18,6 +23,10 @@ export const contractCases = [
   {
     id: 'late_provider_output_is_stale_after_the_input_fence',
     run: lateProviderOutputIsStaleAfterTheInputFence,
+  },
+  {
+    id: 'input_fence_aborts_active_queue_and_marks_tail_unexecuted',
+    run: inputFenceAbortsActiveQueueAndMarksTailUnexecuted,
   },
   {
     id: 'plan_acceptance_requires_every_canonical_scope_preview',
@@ -128,6 +137,12 @@ async function inputFenceOrdersEpochCancelFactsBeforeNextProvider() {
   );
 
   await harness.loop.applyFencedUserInput(nextInput, generation);
+  const supersededQueue =
+    harness.loop.snapshot().providerToolCallQueue;
+  assert.equal(supersededQueue.status, 'aborted');
+  assert.equal(supersededQueue.abortReason, 'userInput');
+  assert.equal(supersededQueue.calls[0].status, 'aborted');
+  assert.equal(supersededQueue.outcomeRecorded, true);
   harness.enqueueProvider(providerAnswer('new-input answer'));
   const secondResult = await harness.loop.runProviderTurn({
     reason: 'userInput',
@@ -237,6 +252,285 @@ async function inputFenceOrdersEpochCancelFactsBeforeNextProvider() {
   assert.deepEqual(fallbackCancellations[0].target, {
     kind: 'exact',
     data: { invocationId: 'invocation-before-recovery-fence' },
+  });
+}
+
+async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
+  const harness = await openSessionHarness();
+  harness.enqueueProvider(providerToolIntents([
+    {
+      callId: 'provider-call-before-multi-fence-1',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+    {
+      callId: 'provider-call-before-multi-fence-2',
+      toolId: 'fs.read',
+      arguments: { path: 'notes/context.md' },
+    },
+    {
+      callId: 'provider-call-before-multi-fence-3',
+      toolId: 'fs.read',
+      arguments: { path: 'notes/other.md' },
+    },
+  ]));
+  harness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(harness, request, {
+      invocationId: 'invocation-before-multi-fence',
+      attemptId: 'attempt-before-multi-fence',
+    })
+  );
+  const first = await harness.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  assert.equal(first.kind, 'admitted');
+  const initialQueue = harness.loop.snapshot().providerToolCallQueue;
+  assert.deepEqual(
+    initialQueue.calls.map((call) => call.status),
+    ['awaitingInvocation', 'pending', 'pending']
+  );
+  assert.equal(harness.calls('submitToolIntent').length, 1);
+
+  const nextInput = createInput({
+    inputId: 'input-aborts-multi-queue',
+    opaqueInputRef: 'session-input:aborts-multi-queue',
+    text: 'Supersede the complete queued tool sequence.',
+    recordedAt: '2026-07-29T00:02:30.000Z',
+  });
+  const generation =
+    await harness.loop.persistUserInputBeforeFence(nextInput);
+  await harness.loop.applyFencedUserInput(nextInput, generation);
+
+  const queue = harness.loop.snapshot().providerToolCallQueue;
+  assert.equal(queue.status, 'aborted');
+  assert.equal(queue.abortReason, 'userInput');
+  assert.equal(queue.outcomeRecorded, true);
+  assert.deepEqual(
+    queue.calls.map((call) => call.status),
+    ['aborted', 'unexecuted', 'unexecuted']
+  );
+  assert.deepEqual(
+    queue.calls.slice(1).map((call) => call.settlementReason),
+    ['userInput', 'userInput']
+  );
+  assert.equal(
+    harness.calls('submitToolIntent').length,
+    1,
+    'the input fence must not dispatch any queued tail call'
+  );
+  const unexecutedOperationIds = new Set(
+    queue.calls.slice(1).map((call) => call.intent.operationId)
+  );
+  assert.equal(
+    harness.kernelState.facts.some((fact) =>
+      unexecutedOperationIds.has(fact.lineage.operationId)
+    ),
+    false,
+    'unexecuted tail calls must have no attempt or effect fact'
+  );
+  assert.equal(
+    harness.store.projectionEvents.some(
+      (event) =>
+        event.kind === 'diagnostic'
+        && event.data?.status === 'blocked'
+        && event.data?.reason === 'userInput'
+        && event.data?.unexecutedOrdinals?.join(',') === '2,3'
+    ),
+    true
+  );
+
+  const cancelHarness = await openSessionHarness();
+  cancelHarness.enqueueProvider(providerToolIntents([
+    {
+      callId: 'provider-call-before-run-cancel-1',
+      toolId: 'fs.read',
+      arguments: { path: 'README.md' },
+    },
+    {
+      callId: 'provider-call-before-run-cancel-2',
+      toolId: 'fs.read',
+      arguments: { path: 'notes/context.md' },
+    },
+    {
+      callId: 'provider-call-before-run-cancel-3',
+      toolId: 'fs.read',
+      arguments: { path: 'notes/other.md' },
+    },
+  ]));
+  cancelHarness.enqueueKernel(
+    'submitToolIntent',
+    (request) => admittedReply(cancelHarness, request, {
+      invocationId: 'invocation-before-run-cancel',
+      attemptId: 'attempt-before-run-cancel',
+      admissionFactId: 'fact-before-run-cancel-admitted',
+    })
+  );
+  const beforeCancel = await cancelHarness.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  assert.equal(beforeCancel.kind, 'admitted');
+  const cancelQueueBefore =
+    cancelHarness.loop.snapshot().providerToolCallQueue;
+  assert.deepEqual(
+    cancelQueueBefore.calls.map((call) => call.status),
+    ['awaitingInvocation', 'pending', 'pending']
+  );
+  assert.equal(cancelHarness.calls('submitToolIntent').length, 1);
+
+  const cancellationFactId =
+    'fact-explicit-run-cancellation-requested';
+  const cancelRequestId = 'cancel-explicit-run-cancellation';
+  cancelHarness.enqueueKernel('cancelInvocation', (request) => {
+    assert.deepEqual(request.target, {
+      kind: 'currentForRun',
+      data: {},
+    });
+    assert.equal(request.reasonCode, 'userRequested');
+    const fact = corpusFact('controlCancellationRequested', {
+      factId: cancellationFactId,
+      ledgerSequence: cancelHarness.nextFactSequence(),
+      runSequence: cancelHarness.nextRunSequence(),
+      identities: {
+        runId: cancelHarness.initial.runId,
+        cancellationInvocationId: 'invocation-before-run-cancel',
+        cancelRequestId,
+        epochAdvancedFactId: request.requestId,
+      },
+    });
+    fact.lineage.controlEpoch = request.expectedControlEpoch;
+    fact.details.identity.controlEpoch = request.expectedControlEpoch;
+    fact.details.source = 'explicitCommand';
+    fact.details.reasonCode = 'userRequested';
+    fact.details.reason =
+      'The trusted user requested this Session Run to stop.';
+    cancelHarness.appendFacts(fact);
+    return {
+      kind: 'requested',
+      data: {
+        cancelRequestId,
+        invocationId: 'invocation-before-run-cancel',
+        factId: cancellationFactId,
+        ledgerSequence: cancelHarness.kernelState.snapshotHighWater,
+      },
+    };
+  });
+  const project = cancelHarness.ports.projection.project.bind(
+    cancelHarness.ports.projection
+  );
+  cancelHarness.ports.projection.project = async (event) => {
+    await project(event);
+    return {
+      delivered: true,
+      projectionId: event.projectionId,
+      projectionDigest: sha256Hash(canonicalJson(event)),
+    };
+  };
+  const callerRequestId = 'caller-request-explicit-run-cancel';
+  const cancelOperationId = 'operation-explicit-run-cancel';
+  const callerRequestDigest = sha256Hash(canonicalJson({
+    callerRequestId,
+    cancelOperationId,
+  }));
+  const cancelled = await cancelHarness.loop.cancelRun({
+    callerRequestId,
+    callerRequestDigest,
+    cancelOperationId,
+  });
+
+  const cancelQueue =
+    cancelHarness.loop.snapshot().providerToolCallQueue;
+  assert.equal(cancelQueue.status, 'aborted');
+  assert.equal(cancelQueue.abortReason, 'runCancelled');
+  assert.equal(cancelQueue.outcomeRecorded, true);
+  assert.deepEqual(
+    cancelQueue.calls.map((call) => call.status),
+    ['aborted', 'unexecuted', 'unexecuted']
+  );
+  assert.deepEqual(
+    cancelQueue.calls.slice(1).map((call) => call.settlementReason),
+    ['runCancelled', 'runCancelled']
+  );
+  assert.equal(
+    cancelHarness.calls('submitToolIntent').length,
+    1,
+    'Run cancellation must not dispatch any queued tail call'
+  );
+  const cancelledTailOperationIds = new Set(
+    cancelQueue.calls.slice(1).map((call) => call.intent.operationId)
+  );
+  assert.equal(
+    cancelHarness.kernelState.facts.some((fact) =>
+      cancelledTailOperationIds.has(fact.lineage.operationId)
+    ),
+    false,
+    'Run-cancelled tail calls must have no submit, attempt, or effect fact'
+  );
+  assert.equal(cancelHarness.calls('cancelInvocation').length, 1);
+  assert.equal(
+    cancelHarness.kernelState.facts.some(
+      (fact) =>
+        fact.factId === cancellationFactId
+        && fact.domain === 'control'
+        && fact.factKind === 'cancellationRequested'
+        && fact.details.source === 'explicitCommand'
+        && fact.details.reasonCode === 'userRequested'
+    ),
+    true,
+    'Run cancellation must reconcile its canonical explicit cancellation fact'
+  );
+  assert.equal(
+    cancelHarness.store.projectionEvents.some(
+      (event) =>
+        event.kind === 'diagnostic'
+        && event.data?.status === 'blocked'
+        && event.data?.reason === 'runCancelled'
+        && event.data?.unexecutedOrdinals?.join(',') === '2,3'
+    ),
+    true
+  );
+  assert.equal(
+    cancelHarness.loop.snapshot().providerOutcomes.some(
+      (outcome) =>
+        outcome.providerTurnId === cancelQueue.providerTurnId
+        && outcome.outputKind === 'toolIntent'
+        && outcome.toolCallReceipt?.callCount === 3
+        && outcome.summary.includes('runCancelled')
+    ),
+    true,
+    'Run cancellation must durably record the whole Provider queue outcome'
+  );
+  assert.deepEqual(cancelled, {
+    callerRequestId,
+    callerRequestDigest,
+    cancelOperationId,
+    controlEpoch: cancelHarness.initial.controlEpoch,
+    cancellation: {
+      kind: 'requested',
+      data: {
+        cancelRequestId,
+        invocationId: 'invocation-before-run-cancel',
+        factId: cancellationFactId,
+        ledgerSequence: cancelHarness.kernelState.snapshotHighWater,
+      },
+    },
+    facts: {
+      afterLedgerSequence:
+        cancelHarness.kernelState.snapshotHighWater,
+      snapshotHighWater:
+        cancelHarness.kernelState.snapshotHighWater,
+      runSequenceHighWater:
+        cancelHarness.kernelState.facts.length,
+      caughtUp: true,
+      pendingFactBarrierCount: 0,
+    },
+    projection: {
+      projectionId:
+        `run:${cancelHarness.initial.runId}:cancel:${cancelOperationId}:settled`,
+      projectionDigest: cancelled.projection.projectionDigest,
+    },
   });
 }
 

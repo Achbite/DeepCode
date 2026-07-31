@@ -43,6 +43,8 @@ run_quiet "Protocol production build" \
   pnpm --filter @deepcode/protocol build
 run_quiet "Session production build" \
   pnpm --filter @deepcode/session-core build
+run_quiet "GUI TypeScript build" \
+  pnpm --filter @deepcode/client build:types
 [ ! -e userspace/session-core/dist/__tests__ ] \
   || fail "Session production output contains test assets"
 pass "Session v2 production packages"
@@ -54,3 +56,7 @@ pass "TypeScript consumption of shared Kernel-Session v2 wire vectors"
 info "Session v2 orchestration, recovery, and review contracts"
 node userspace/session-core/tests/v2/runner.mjs
 pass "Session v2 orchestration, recovery, and review contracts"
+
+info "GUI canonical progress and Session switching contracts"
+node userspace/gui/tests/agent-session-store-contracts.mjs
+pass "GUI canonical progress and Session switching contracts"
