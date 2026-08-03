@@ -1,6 +1,7 @@
 import type {
   AgentInputAttachmentV2,
   LlmChatMessage,
+  LlmReasoningTransport,
   CapabilityScopePreviewRecordV2,
   DeadlineRequestV2,
   InvocationCancelReplyV2,
@@ -35,11 +36,69 @@ export const SESSION_PROVIDER_CONTEXT_RECEIPT_V2_SCHEMA =
   'deepcode.session.provider-context-receipt.v2' as const;
 export const SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA =
   'deepcode.session.provider-tool-call-receipt.v2' as const;
+export const SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA =
+  'deepcode.provider-stream-terminal.v1' as const;
+
+export type SessionProviderNativeCompletionV1 =
+  | {
+      providerKind: 'openaiCompatible';
+      terminalSignal: '[DONE]';
+      finishReason: 'stop' | 'tool_calls';
+    }
+  | {
+      providerKind: 'anthropic';
+      terminalSignal: 'message_stop';
+    }
+  | {
+      providerKind: 'ollama';
+      terminalSignal: 'done:true';
+    };
+
+/**
+ * Safe terminal evidence produced only after the Daemon has observed the
+ * provider-native completion marker and durably sealed the private trace.
+ * It deliberately carries no reasoning text, raw provider envelope, secret,
+ * capability, or lease.
+ */
+export interface SessionProviderCompletionReceiptV1 {
+  schemaVersion: typeof SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA;
+  nativeCompletion: SessionProviderNativeCompletionV1;
+  reasoningPresent: true;
+  reasoningTransport:
+    | 'openaiPlaintext'
+    | 'anthropicPlaintext'
+    | 'ollamaPlaintext';
+  reasoningDigest: string;
+  responseDigest: string;
+  trace: {
+    sealed: true;
+    sealDigest: string;
+    terminalDigest: string;
+    recordCount: number;
+  };
+}
+
+export type SessionProviderOrderedItemV2 =
+  | {
+      kind: 'text';
+      phase: 'commentary' | 'final_answer' | 'unknown';
+      text: string;
+    }
+  | {
+      kind: 'toolCall';
+      source: 'providerNative';
+      ordinal: number;
+      callId: string;
+      toolName: string;
+      toolId: string;
+      arguments: RawToolArgumentsV2;
+    };
 
 export interface SessionProviderProfileBootstrapV2 {
   schemaVersion: typeof SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA;
   providerProfileId: string;
   providerProfileRevisionDigest: string;
+  reasoningTransport: LlmReasoningTransport;
   contextWindowTokens: number;
   maxOutputTokens: number;
 }
@@ -67,6 +126,7 @@ export interface SessionProviderContextReceiptV2 {
   providerProfile: {
     providerProfileId: string;
     providerProfileRevisionDigest: string;
+    reasoningTransport: LlmReasoningTransport;
     contextWindowTokens: number;
     maxOutputTokens: number;
   };
@@ -200,6 +260,7 @@ export interface SessionProviderFactProjectionReceiptV2 {
 
 export interface SessionProviderTurnInputV2 {
   providerTurnId: string;
+  purpose: 'primary' | 'continuation' | 'finalAnswer';
   runId: string;
   controlEpoch: number;
   currentInput: SessionUserInputRecordV2;
@@ -233,28 +294,29 @@ export interface SessionProviderOutcomeRecordV2 {
   providerResult: SessionProviderResultMetadataV2;
 }
 
-export type SessionProviderTurnOutputV2 =
+export type SessionProviderTurnOutputV2 = (
   | {
       kind: 'plan';
       plan: SessionNaturalLanguagePlanV2;
-      providerResult: SessionProviderResultMetadataV2;
     }
   | {
       kind: 'toolIntent';
       sources: ProviderKernelToolSourceV2[];
       receipt: SessionProviderToolCallReceiptV2;
-      providerResult: SessionProviderResultMetadataV2;
     }
   | {
       kind: 'answer';
       text: string;
-      providerResult: SessionProviderResultMetadataV2;
     }
   | {
       kind: 'noTool';
       guidance?: string;
-      providerResult: SessionProviderResultMetadataV2;
-    };
+    }
+) & {
+  items: SessionProviderOrderedItemV2[];
+  completion: SessionProviderCompletionReceiptV1;
+  providerResult: SessionProviderResultMetadataV2;
+};
 
 export type SessionActiveWaitV2 =
   | {
@@ -370,6 +432,10 @@ export interface SessionProviderTurnRecordV2 {
     | 'runCancelled'
     | 'superseded'
     | 'shutdown';
+  response?: {
+    items: SessionProviderOrderedItemV2[];
+    completion: SessionProviderCompletionReceiptV1;
+  };
 }
 
 export interface SessionRunCancellationV2 {

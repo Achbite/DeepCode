@@ -1,0 +1,1168 @@
+import type { LlmChatRequest } from '@deepcode/protocol';
+import { canonicalJson } from '../cache/canonicalizer.js';
+import type {
+  SessionKernelTransportPrivateAuthV2,
+} from './SessionKernelPortV2.js';
+import type {
+  SessionProviderCompletionReceiptV1,
+} from './types.js';
+import {
+  SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
+} from './types.js';
+
+/**
+ * Session-facing Provider stream boundary.
+ *
+ * Daemon-private reasoning and raw upstream envelopes are intentionally not
+ * representable here. A response exists only after provider-native completion
+ * and a durable trace seal arrive in one exact terminal receipt.
+ */
+export interface SessionKernelLlmStreamTextItemV2 {
+  kind: 'text';
+  phase: 'commentary' | 'final_answer' | 'unknown';
+  text: string;
+}
+
+export interface SessionKernelLlmStreamToolItemV2 {
+  kind: 'toolCall';
+  index: number;
+  callId: string;
+  name: string;
+  arguments: string;
+}
+
+interface SessionKernelLlmStreamToolPositionV2 {
+  kind: 'toolQueueMarker';
+  nativeIndex: number;
+}
+
+type SessionKernelLlmStreamPendingItemV2 =
+  | SessionKernelLlmStreamTextItemV2
+  | SessionKernelLlmStreamToolPositionV2;
+
+export interface SessionKernelLlmStreamResultV2 {
+  requestId: string;
+  items: Array<
+    SessionKernelLlmStreamTextItemV2
+    | SessionKernelLlmStreamToolItemV2
+  >;
+  usage?: Record<string, unknown>;
+  providerProfileId: string;
+  provider: string;
+  model: string;
+  completion: SessionProviderCompletionReceiptV1;
+}
+
+export interface SessionKernelLlmTransportV2 {
+  request(
+    request: LlmChatRequest,
+    signal: AbortSignal
+  ): Promise<SessionKernelLlmStreamResultV2>;
+}
+
+const MAX_SSE_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_TEXT_BYTES = 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES = 1024 * 1024;
+
+export class HttpSessionKernelLlmTransportV2
+implements SessionKernelLlmTransportV2 {
+  readonly #runCapability: string;
+
+  constructor(
+    private readonly apiBase: string,
+    privateAuth: SessionKernelTransportPrivateAuthV2,
+    private readonly sessionId: string,
+    private readonly runId: string,
+    private readonly fetchImpl: typeof fetch = fetch
+  ) {
+    this.#runCapability = privateAuth.runCapability;
+  }
+
+  async request(
+    request: LlmChatRequest,
+    signal: AbortSignal
+  ): Promise<SessionKernelLlmStreamResultV2> {
+    let response: Response;
+    try {
+      response = await this.fetchImpl(
+        `${normalizeApiBase(this.apiBase)}/api/llm/chat/stream`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-deepcode-run-capability': this.#runCapability,
+            'x-deepcode-session-id': this.sessionId,
+            'x-deepcode-run-id': this.runId,
+          },
+          body: JSON.stringify(request),
+          signal,
+        }
+      );
+    } catch (error) {
+      if (signal.aborted) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_cancelled',
+          'Provider stream was cancelled before a terminal receipt.'
+        );
+      }
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_transport_failed',
+        safeProviderTransportMessage(
+          error,
+          'Provider transport failed before receiving an HTTP response.'
+        )
+      );
+    }
+    if (!response.ok) {
+      await cancelBody(response.body);
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_http_failed',
+        `Provider transport failed with HTTP ${response.status}.`
+      );
+    }
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!/^text\/event-stream(?:;|$)/iu.test(contentType)) {
+      await cancelBody(response.body);
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_content_type_invalid',
+        'Provider stream did not return text/event-stream.'
+      );
+    }
+    if (!response.body) {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_stream_missing',
+        'Provider stream response has no readable body.'
+      );
+    }
+    return await consumeProviderSseV1(
+      response.body,
+      request.requestId,
+      signal
+    );
+  }
+}
+
+export async function consumeProviderSseV1(
+  body: ReadableStream<Uint8Array>,
+  expectedRequestId: string,
+  signal: AbortSignal
+): Promise<SessionKernelLlmStreamResultV2> {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const reader = body.getReader();
+  let streamExhausted = false;
+  let buffer = '';
+  let metadata:
+    | {
+        providerProfileId: string;
+        provider: string;
+        model: string;
+      }
+    | undefined;
+  let usage: Record<string, unknown> | undefined;
+  let completion: SessionProviderCompletionReceiptV1 | undefined;
+  let sealedItems: SessionKernelLlmStreamResultV2['items'] | undefined;
+  let totalTextBytes = 0;
+  let finalStarted = false;
+  const pendingItems: SessionKernelLlmStreamPendingItemV2[] = [];
+  const toolItems = new Map<number, SessionKernelLlmStreamToolItemV2>();
+
+  const accept = (frame: string): void => {
+    const event = decodeSseFrame(frame, expectedRequestId);
+    if (completion) {
+      throw protocolViolation(
+        'Provider emitted data after its sealed terminal receipt.'
+      );
+    }
+    switch (event.name) {
+      case 'provider_metadata': {
+        if (metadata) {
+          throw protocolViolation(
+            'Provider stream emitted duplicate response metadata.'
+          );
+        }
+        exactKeys(event.data, [
+          'type',
+          'requestId',
+          'providerProfileId',
+          'provider',
+          'model',
+        ]);
+        metadata = {
+          providerProfileId: identity(
+            event.data.providerProfileId,
+            'providerProfileId',
+            1024
+          ),
+          provider: identity(event.data.provider, 'provider', 1024),
+          model: identity(event.data.model, 'model', 1024),
+        };
+        return;
+      }
+      case 'provider_delta':
+      case 'provider_commentary_delta':
+      case 'provider_final_delta': {
+        requireMetadata(metadata);
+        exactKeys(event.data, ['type', 'requestId', 'chunk']);
+        const chunk = record(event.data.chunk, 'chunk');
+        exactKeys(
+          chunk,
+          ['type', 'content'],
+          ['index', 'providerPhase']
+        );
+        if (chunk.type !== 'delta') {
+          throw protocolViolation(
+            'Provider text event has an invalid chunk type.'
+          );
+        }
+        const content = text(
+          chunk.content,
+          'chunk.content',
+          MAX_TEXT_BYTES
+        );
+        const phase = textPhase(event.name, chunk.providerPhase);
+        if (finalStarted && phase === 'commentary') {
+          throw protocolViolation(
+            'Provider emitted commentary after final answer output began.'
+          );
+        }
+        if (phase === 'final_answer') {
+          if (toolItems.size > 0) {
+            throw protocolViolation(
+              'Provider final answer cannot share a response with tool calls.'
+            );
+          }
+          finalStarted = true;
+        }
+        totalTextBytes += utf8Bytes(content);
+        if (totalTextBytes > MAX_TEXT_BYTES) {
+          throw new SessionKernelProviderTransportError(
+            'session_kernel_provider_text_limit_exceeded',
+            'Provider normalized text exceeded the one-turn limit.'
+          );
+        }
+        const previous = pendingItems.at(-1);
+        if (
+          previous?.kind === 'text'
+          && previous.phase === phase
+        ) {
+          previous.text += content;
+        } else {
+          pendingItems.push({ kind: 'text', phase, text: content });
+        }
+        return;
+      }
+      case 'provider_tool_call_delta': {
+        requireMetadata(metadata);
+        if (finalStarted) {
+          throw protocolViolation(
+            'Provider tool calls cannot appear after final answer output began.'
+          );
+        }
+        exactKeys(event.data, ['type', 'requestId', 'chunk']);
+        const chunk = record(event.data.chunk, 'chunk');
+        exactKeys(
+          chunk,
+          ['type', 'toolCallDelta'],
+          ['index', 'callId']
+        );
+        if (chunk.type !== 'tool_call') {
+          throw protocolViolation(
+            'Provider tool-call event has an invalid chunk type.'
+          );
+        }
+        const delta = record(
+          chunk.toolCallDelta,
+          'chunk.toolCallDelta'
+        );
+        exactKeys(
+          delta,
+          [],
+          ['id', 'index', 'name', 'argumentsDelta']
+        );
+        const index = nativeToolIndex(delta.index ?? chunk.index);
+        let item = toolItems.get(index);
+        if (!item) {
+          if (toolItems.size >= 32) {
+            throw new SessionKernelProviderTransportError(
+              'session_kernel_provider_tool_call_count_exceeded',
+              'One Provider turn may return at most 32 ordered Kernel tool calls.'
+            );
+          }
+          item = {
+            kind: 'toolCall',
+            index,
+            callId: '',
+            name: '',
+            arguments: '',
+          };
+          pendingItems.push({
+            kind: 'toolQueueMarker',
+            nativeIndex: index,
+          });
+          toolItems.set(index, item);
+        }
+        const callId = optionalText(
+          delta.id ?? chunk.callId,
+          'toolCallDelta.id',
+          1024
+        );
+        const name = optionalText(
+          delta.name,
+          'toolCallDelta.name',
+          1024
+        );
+        if (callId) {
+          if (item.callId && item.callId !== callId) {
+            throw protocolViolation(
+              'Provider changed a tool-call identity during streaming.'
+            );
+          }
+          item.callId = callId;
+        }
+        if (name) {
+          if (item.name && item.name !== name) {
+            throw protocolViolation(
+              'Provider changed a tool-call name during streaming.'
+            );
+          }
+          item.name = name;
+        }
+        const argumentsDelta = optionalText(
+          delta.argumentsDelta,
+          'toolCallDelta.argumentsDelta',
+          MAX_TOOL_ARGUMENT_BYTES,
+          true
+        ) ?? '';
+        item.arguments += argumentsDelta;
+        if (utf8Bytes(item.arguments) > MAX_TOOL_ARGUMENT_BYTES) {
+          throw new SessionKernelProviderTransportError(
+            'session_kernel_provider_tool_arguments_limit_exceeded',
+            'Provider tool-call arguments exceeded the one-call limit.'
+          );
+        }
+        return;
+      }
+      case 'provider_usage':
+        requireMetadata(metadata);
+        exactKeys(event.data, ['type', 'requestId', 'usage']);
+        usage = boundedProviderUsageRecordV2(event.data.usage);
+        return;
+      case 'provider_terminal':
+        requireMetadata(metadata);
+        exactKeys(event.data, ['type', 'requestId', 'receipt']);
+        {
+          const decodedCompletion = decodeCompletionReceipt(
+            event.data.receipt
+          );
+          sealedItems = materializeCompletedItems(
+            pendingItems,
+            toolItems,
+            decodedCompletion
+          );
+          completion = decodedCompletion;
+        }
+        return;
+      case 'provider_error':
+        exactKeys(
+          event.data,
+          ['type', 'requestId', 'error'],
+          ['message']
+        );
+        const providerErrorCode = identity(
+          event.data.error,
+          'error',
+          256
+        );
+        if (!/^[A-Za-z][A-Za-z0-9_.-]{0,255}$/u.test(
+          providerErrorCode
+        )) {
+          throw protocolViolation(
+            'Provider stream error code is not a stable identity.'
+          );
+        }
+        throw new SessionKernelProviderTransportError(
+          providerErrorCode,
+          providerPublicErrorMessage(providerErrorCode)
+        );
+      case 'provider_reasoning_delta':
+        throw protocolViolation(
+          'Provider reasoning text is private Daemon trace data and cannot enter the Session stream.'
+        );
+      case 'provider_done':
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_terminal_receipt_missing',
+          'Legacy provider_done is not a sealed native completion receipt.'
+        );
+      default:
+        throw protocolViolation(
+          `Unsupported Provider stream event: ${event.name}.`
+        );
+    }
+  };
+
+  try {
+    while (true) {
+      const chunk = await readChunk(reader, signal);
+      if (chunk.done) {
+        streamExhausted = true;
+        buffer += finishUtf8(decoder);
+        if (buffer.trim()) {
+          throw new SessionKernelProviderTransportError(
+            'session_kernel_provider_stream_truncated',
+            'Provider stream ended with an incomplete SSE frame.'
+          );
+        }
+        if (!completion || !metadata || !sealedItems) {
+          throw new SessionKernelProviderTransportError(
+            'session_kernel_provider_terminal_receipt_missing',
+            'Provider stream reached EOF without a sealed native completion receipt.'
+          );
+        }
+        return {
+          requestId: expectedRequestId,
+          items: sealedItems,
+          ...(usage ? { usage } : {}),
+          ...metadata,
+          completion,
+        };
+      }
+      if (!(chunk.value instanceof Uint8Array)) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_stream_chunk_invalid',
+          'Provider stream returned a non-binary chunk.'
+        );
+      }
+      try {
+        buffer += decoder.decode(chunk.value, { stream: true });
+      } catch {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_stream_utf8_invalid',
+          'Provider stream contains invalid UTF-8.'
+        );
+      }
+      while (true) {
+        const boundary = nextBoundary(buffer);
+        if (!boundary) break;
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        if (frame.trim()) accept(frame);
+      }
+      if (utf8Bytes(buffer) > MAX_SSE_FRAME_BYTES) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_sse_frame_limit_exceeded',
+          'Provider SSE frame exceeded the 16 MiB hard limit.'
+        );
+      }
+    }
+  } finally {
+    if (!streamExhausted) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Preserve the original transport/protocol error.
+      }
+    }
+    reader.releaseLock();
+  }
+}
+
+async function readChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  try {
+    return await reader.read();
+  } catch (error) {
+    if (signal.aborted) {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_cancelled',
+        'Provider stream was cancelled before a terminal receipt.'
+      );
+    }
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_stream_read_failed',
+      safeProviderTransportMessage(
+        error,
+        'Provider stream failed before a terminal receipt.'
+      )
+    );
+  }
+}
+
+function finishUtf8(decoder: TextDecoder): string {
+  try {
+    return decoder.decode();
+  } catch {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_stream_utf8_invalid',
+      'Provider stream ended with invalid UTF-8.'
+    );
+  }
+}
+
+function decodeSseFrame(
+  frame: string,
+  expectedRequestId: string
+): { name: string; data: Record<string, unknown> } {
+  let name: string | undefined;
+  const dataLines: string[] = [];
+  for (const line of frame.split(/\r\n|\r|\n/u)) {
+    if (!line || line.startsWith(':')) continue;
+    const separator = line.indexOf(':');
+    const field = separator < 0 ? line : line.slice(0, separator);
+    const rawValue = separator < 0 ? '' : line.slice(separator + 1);
+    const value = rawValue.startsWith(' ')
+      ? rawValue.slice(1)
+      : rawValue;
+    if (field === 'event') {
+      if (name !== undefined || !value) {
+        throw protocolViolation(
+          'Provider SSE frame has an invalid event field.'
+        );
+      }
+      name = value;
+    } else if (field === 'data') {
+      dataLines.push(value);
+    } else {
+      throw protocolViolation(
+        `Provider SSE field is not permitted: ${field}.`
+      );
+    }
+  }
+  if (!name || dataLines.length === 0) {
+    throw protocolViolation(
+      'Provider SSE frame must contain event and data fields.'
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(dataLines.join('\n')) as unknown;
+  } catch {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_sse_json_invalid',
+      'Provider SSE data is not valid JSON.'
+    );
+  }
+  const data = record(parsed, 'event.data');
+  rejectPrivateFields(data);
+  if (data.type !== name) {
+    throw protocolViolation(
+      'Provider SSE event name does not match data.type.'
+    );
+  }
+  if (data.requestId !== expectedRequestId) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_identity_mismatch',
+      'Provider stream event identity does not match the persisted turn.'
+    );
+  }
+  return { name, data };
+}
+
+function decodeCompletionReceipt(
+  value: unknown
+): SessionProviderCompletionReceiptV1 {
+  const receipt = record(value, 'receipt');
+  exactKeys(receipt, [
+    'schemaVersion',
+    'nativeCompletion',
+    'reasoningPresent',
+    'reasoningTransport',
+    'reasoningDigest',
+    'responseDigest',
+    'trace',
+  ]);
+  if (
+    receipt.schemaVersion
+      !== SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA
+    || receipt.reasoningPresent !== true
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_completion_receipt_invalid',
+      'Provider terminal receipt is not a reasoning-complete v1 receipt.'
+    );
+  }
+  const native = record(receipt.nativeCompletion, 'nativeCompletion');
+  let nativeCompletion:
+    SessionProviderCompletionReceiptV1['nativeCompletion'];
+  switch (native.providerKind) {
+    case 'openaiCompatible':
+      exactKeys(native, [
+        'providerKind',
+        'terminalSignal',
+        'finishReason',
+      ]);
+      if (
+        native.terminalSignal !== '[DONE]'
+        || (
+          native.finishReason !== 'stop'
+          && native.finishReason !== 'tool_calls'
+        )
+      ) {
+        throw protocolViolation(
+          'OpenAI-compatible native completion is invalid.'
+        );
+      }
+      nativeCompletion = {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+        finishReason: native.finishReason,
+      };
+      break;
+    case 'anthropic':
+      exactKeys(native, ['providerKind', 'terminalSignal']);
+      if (native.terminalSignal !== 'message_stop') {
+        throw protocolViolation(
+          'Anthropic native completion is invalid.'
+        );
+      }
+      nativeCompletion = {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+      };
+      break;
+    case 'ollama':
+      exactKeys(native, ['providerKind', 'terminalSignal']);
+      if (native.terminalSignal !== 'done:true') {
+        throw protocolViolation(
+          'Ollama native completion is invalid.'
+        );
+      }
+      nativeCompletion = {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+      };
+      break;
+    default:
+      throw protocolViolation(
+        'Provider native completion kind is unsupported.'
+      );
+  }
+  const trace = record(receipt.trace, 'trace');
+  exactKeys(trace, [
+    'sealed',
+    'sealDigest',
+    'terminalDigest',
+    'recordCount',
+  ]);
+  if (
+    trace.sealed !== true
+    || !Number.isSafeInteger(trace.recordCount)
+    || Number(trace.recordCount) <= 0
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_trace_seal_invalid',
+      'Provider terminal receipt does not bind a durable sealed trace.'
+    );
+  }
+  const reasoningTransport = identity(
+    receipt.reasoningTransport,
+    'reasoningTransport',
+    256
+  );
+  if (
+    reasoningTransport !== 'openaiPlaintext'
+    && reasoningTransport !== 'anthropicPlaintext'
+    && reasoningTransport !== 'ollamaPlaintext'
+  ) {
+    throw protocolViolation(
+      'Provider reasoningTransport is unsupported.'
+    );
+  }
+  const expectedReasoningTransport =
+    nativeCompletion.providerKind === 'openaiCompatible'
+      ? 'openaiPlaintext'
+      : nativeCompletion.providerKind === 'anthropic'
+        ? 'anthropicPlaintext'
+        : 'ollamaPlaintext';
+  if (reasoningTransport !== expectedReasoningTransport) {
+    throw protocolViolation(
+      'Provider reasoningTransport conflicts with native completion kind.'
+    );
+  }
+  return {
+    schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
+    nativeCompletion,
+    reasoningPresent: true,
+    reasoningTransport,
+    reasoningDigest: digest(
+      receipt.reasoningDigest,
+      'reasoningDigest'
+    ),
+    responseDigest: digest(
+      receipt.responseDigest,
+      'responseDigest'
+    ),
+    trace: {
+      sealed: true,
+      sealDigest: digest(trace.sealDigest, 'trace.sealDigest'),
+      terminalDigest: digest(
+        trace.terminalDigest,
+        'trace.terminalDigest'
+      ),
+      recordCount: Number(trace.recordCount),
+    },
+  };
+}
+
+function materializeCompletedItems(
+  pendingItems: SessionKernelLlmStreamPendingItemV2[],
+  toolItems: Map<number, SessionKernelLlmStreamToolItemV2>,
+  completion: SessionProviderCompletionReceiptV1
+): SessionKernelLlmStreamResultV2['items'] {
+  const callIds = new Set<string>();
+  for (const item of toolItems.values()) {
+    identity(item.callId, 'toolCall.id', 1024);
+    identity(item.name, 'toolCall.name', 1024);
+    if (callIds.has(item.callId)) {
+      throw protocolViolation(
+        'Provider tool-call identities must be unique within one response.'
+      );
+    }
+    callIds.add(item.callId);
+    try {
+      JSON.parse(item.arguments || '{}');
+    } catch {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_tool_arguments_invalid',
+        'Provider-native tool arguments are not valid JSON.'
+      );
+    }
+  }
+  const hasFinal = pendingItems.some(
+    (item) => item.kind === 'text'
+      && item.phase === 'final_answer'
+  );
+  if (hasFinal && toolItems.size > 0) {
+    throw protocolViolation(
+      'Provider final answer cannot share a response with tool calls.'
+    );
+  }
+  const native = completion.nativeCompletion;
+  if (
+    native.providerKind === 'openaiCompatible'
+    && (
+      (toolItems.size > 0 && native.finishReason !== 'tool_calls')
+      || (toolItems.size === 0 && native.finishReason !== 'stop')
+    )
+  ) {
+    throw protocolViolation(
+      'OpenAI-compatible finish_reason conflicts with the completed response.'
+    );
+  }
+  const toolOrdinals = completedToolOrdinals(
+    pendingItems,
+    toolItems,
+    completion.nativeCompletion.providerKind
+  );
+  const materialized: SessionKernelLlmStreamResultV2['items'] = [];
+  for (const item of pendingItems) {
+    if (item.kind === 'toolQueueMarker') {
+      const tool = toolItems.get(item.nativeIndex);
+      const ordinal = toolOrdinals.get(item.nativeIndex);
+      if (!tool || ordinal === undefined) {
+        throw protocolViolation(
+          'Provider tool-call position does not match the sealed response.'
+        );
+      }
+      materialized.push({ ...tool, index: ordinal });
+    } else {
+      materialized.push(item);
+    }
+  }
+  return materialized;
+}
+
+function completedToolOrdinals(
+  pendingItems: SessionKernelLlmStreamPendingItemV2[],
+  toolItems: Map<number, SessionKernelLlmStreamToolItemV2>,
+  providerKind:
+    SessionProviderCompletionReceiptV1['nativeCompletion']['providerKind']
+): Map<number, number> {
+  // OpenAI/Ollama indexes are tool ordinals. Anthropic indexes address all
+  // content blocks, so non-tool blocks may create gaps between tool indexes.
+  // In both cases first occurrence fixes the public semantic position.
+  const nativeIndexes = pendingItems.flatMap((item) =>
+    item.kind === 'toolQueueMarker' ? [item.nativeIndex] : []
+  );
+  if (
+    nativeIndexes.length !== toolItems.size
+    || new Set(nativeIndexes).size !== nativeIndexes.length
+    || nativeIndexes.some((index) => !toolItems.has(index))
+  ) {
+    throw protocolViolation(
+      'Provider tool-call positions do not match the sealed response.'
+    );
+  }
+
+  if (
+    providerKind === 'openaiCompatible'
+    || providerKind === 'ollama'
+  ) {
+    for (const [ordinal, nativeIndex] of nativeIndexes.entries()) {
+      if (nativeIndex !== ordinal) {
+        throw protocolViolation(
+          'Provider-native tool ordinals must first appear continuously from zero.'
+        );
+      }
+    }
+  } else {
+    for (let ordinal = 1; ordinal < nativeIndexes.length; ordinal += 1) {
+      if (nativeIndexes[ordinal] <= nativeIndexes[ordinal - 1]) {
+        throw protocolViolation(
+          'Anthropic tool content-block indexes must first appear in native order.'
+        );
+      }
+    }
+  }
+
+  return new Map(
+    nativeIndexes.map((nativeIndex, ordinal) => [nativeIndex, ordinal])
+  );
+}
+
+function textPhase(
+  eventName: string,
+  declared: unknown
+): 'commentary' | 'final_answer' | 'unknown' {
+  if (
+    declared !== undefined
+    && declared !== 'commentary'
+    && declared !== 'final_answer'
+  ) {
+    throw protocolViolation(
+      'Provider text delta has an invalid providerPhase.'
+    );
+  }
+  const eventPhase = eventName === 'provider_commentary_delta'
+    ? 'commentary'
+    : eventName === 'provider_final_delta'
+      ? 'final_answer'
+      : undefined;
+  if (
+    eventPhase !== undefined
+    && declared !== undefined
+    && eventPhase !== declared
+  ) {
+    throw protocolViolation(
+      'Provider text event conflicts with its declared providerPhase.'
+    );
+  }
+  return eventPhase ?? declared ?? 'unknown';
+}
+
+function nextBoundary(
+  buffer: string
+): { index: number; length: number } | undefined {
+  return [
+    { value: '\r\n\r\n', length: 4 },
+    { value: '\n\n', length: 2 },
+    { value: '\r\r', length: 2 },
+  ]
+    .map((candidate) => ({
+      index: buffer.indexOf(candidate.value),
+      length: candidate.length,
+    }))
+    .filter((candidate) => candidate.index >= 0)
+    .sort((left, right) => left.index - right.index)[0];
+}
+
+function requireMetadata(
+  metadata: unknown
+): asserts metadata is {
+  providerProfileId: string;
+  provider: string;
+  model: string;
+} {
+  if (!metadata) {
+    throw protocolViolation(
+      'Provider response data arrived before response metadata.'
+    );
+  }
+}
+
+function rejectPrivateFields(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) rejectPrivateFields(item);
+    return;
+  }
+  const candidate = value && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : undefined;
+  if (!candidate) return;
+  for (const [key, nested] of Object.entries(candidate)) {
+    const normalized = key.replace(/[^A-Za-z0-9]/gu, '').toLowerCase();
+    if (
+      normalized === 'rawprovider'
+      || normalized === 'reasoning'
+      || normalized === 'reasoningcontent'
+      || normalized === 'thinking'
+      || normalized === 'analysis'
+      || normalized === 'chainofthought'
+    ) {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_private_field_forbidden',
+        'Provider stream exposed private reasoning or raw Provider data.'
+      );
+    }
+    rejectPrivateFields(nested);
+  }
+}
+
+function exactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = []
+): void {
+  const permitted = new Set([...required, ...optional]);
+  if (
+    required.some(
+      (key) => !Object.prototype.hasOwnProperty.call(value, key)
+    )
+    || Object.keys(value).some((key) => !permitted.has(key))
+  ) {
+    throw protocolViolation(
+      'Provider stream event has an unexpected field set.'
+    );
+  }
+}
+
+function record(
+  value: unknown,
+  field: string
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw protocolViolation(
+      `Provider stream ${field} must be an object.`
+    );
+  }
+  return value as Record<string, unknown>;
+}
+
+function text(
+  value: unknown,
+  field: string,
+  limit: number
+): string {
+  const decoded = optionalText(value, field, limit, true);
+  if (decoded === undefined || decoded.length === 0) {
+    throw protocolViolation(
+      `Provider stream ${field} must be a nonempty string.`
+    );
+  }
+  return decoded;
+}
+
+function optionalText(
+  value: unknown,
+  field: string,
+  limit: number,
+  allowControls = false
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== 'string'
+    || utf8Bytes(value) > limit
+    || (!allowControls && /[\u0000-\u001f\u007f-\u009f]/u.test(value))
+  ) {
+    throw protocolViolation(
+      `Provider stream ${field} is invalid.`
+    );
+  }
+  return value;
+}
+
+function identity(
+  value: unknown,
+  field: string,
+  limit: number
+): string {
+  const decoded = text(value, field, limit);
+  if (decoded.trim() !== decoded) {
+    throw protocolViolation(
+      `Provider stream ${field} is not a canonical identity.`
+    );
+  }
+  return decoded;
+}
+
+function digest(value: unknown, field: string): string {
+  const decoded = identity(value, field, 128);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(decoded)) {
+    throw protocolViolation(
+      `Provider stream ${field} is not a canonical digest.`
+    );
+  }
+  return decoded;
+}
+
+function nativeToolIndex(value: unknown): number {
+  if (
+    !Number.isSafeInteger(value)
+    || Number(value) < 0
+  ) {
+    throw protocolViolation(
+      'Provider tool-call native index must be a nonnegative safe integer.'
+    );
+  }
+  return Number(value);
+}
+
+function providerPublicErrorMessage(code: string): string {
+  switch (code) {
+    case 'ProviderProfileMissingApiKey':
+      return 'Selected Provider Profile has no configured API key.';
+    case 'provider_reasoning_missing':
+      return 'Provider response did not contain the required plaintext reasoning.';
+    case 'provider_final_answer_tool_call_forbidden':
+      return 'Provider returned a tool call during a no-tools finalAnswer turn.';
+    case 'provider_trace_raw_limit_exceeded':
+      return 'Provider response crossed the private trace source-byte limit.';
+    case 'provider_retryable_no_mutation':
+      return 'Provider transport ended before a validated response was committed.';
+    default:
+      return 'Provider stream failed before a validated terminal receipt.';
+  }
+}
+
+function protocolViolation(
+  message: string
+): SessionKernelProviderTransportError {
+  return new SessionKernelProviderTransportError(
+    'session_kernel_provider_protocol_violation',
+    message
+  );
+}
+
+export function boundedProviderUsageRecordV2(
+  value: unknown
+): Record<string, unknown> {
+  const maximum = 1_000_000_000_000;
+  const usage = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  let visited = 0;
+  const sanitize = (
+    candidate: Record<string, unknown>,
+    depth: number
+  ): Record<string, unknown> => {
+    if (depth > 4) return {};
+    const output: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(candidate).sort()) {
+      visited += 1;
+      if (
+        visited > 256
+        || !/^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(key)
+      ) {
+        continue;
+      }
+      if (
+        typeof nested === 'number'
+        && Number.isSafeInteger(nested)
+        && nested >= 0
+        && nested <= maximum
+      ) {
+        output[key] = nested;
+      } else if (
+        nested
+        && typeof nested === 'object'
+        && !Array.isArray(nested)
+      ) {
+        output[key] = sanitize(
+          nested as Record<string, unknown>,
+          depth + 1
+        );
+      }
+    }
+    return output;
+  };
+  const sanitized = sanitize(usage, 0);
+  return utf8Bytes(canonicalJson(sanitized)) <= 64 * 1024
+    ? sanitized
+    : {};
+}
+
+export function safeProviderTransportMessage(
+  error: unknown,
+  fallback: string
+): string {
+  if (!(error instanceof Error) || !error.message.trim()) {
+    return fallback;
+  }
+  const message = error.message.trim().slice(0, 4096);
+  return /authorization|api[-_ ]?key|cookie|token|secret/iu.test(message)
+    ? fallback
+    : message;
+}
+
+function normalizeApiBase(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw invalidApiBase();
+  }
+  const authority = value
+    .split('://')[1]
+    ?.split('/')[0] ?? '';
+  const hostname = url.hostname.startsWith('[')
+    ? url.hostname.slice(1, -1)
+    : url.hostname;
+  const loopback = hostname === '::1'
+    || (
+      hostname.split('.').length === 4
+      && hostname.split('.').every(
+        (part) =>
+          /^\d{1,3}$/u.test(part)
+          && Number(part) >= 0
+          && Number(part) <= 255
+      )
+      && Number(hostname.split('.')[0]) === 127
+    );
+  if (
+    value.trim() !== value
+    || url.protocol !== 'http:'
+    || !loopback
+    || authority.includes('@')
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+    || !['', '/'].includes(url.pathname)
+  ) {
+    throw invalidApiBase();
+  }
+  return url.origin;
+}
+
+function invalidApiBase(): SessionKernelProviderTransportError {
+  return new SessionKernelProviderTransportError(
+    'session_kernel_provider_api_base_invalid',
+    'Provider transport requires an absolute loopback HTTP origin.'
+  );
+}
+
+async function cancelBody(
+  body: ReadableStream<Uint8Array> | null
+): Promise<void> {
+  if (!body) return;
+  try {
+    await body.cancel();
+  } catch {
+    // The HTTP/status error remains authoritative.
+  }
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+export class SessionKernelProviderTransportError extends Error {
+  constructor(
+    readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'SessionKernelProviderTransportError';
+  }
+}

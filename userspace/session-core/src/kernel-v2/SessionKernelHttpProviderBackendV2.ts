@@ -1,8 +1,6 @@
 import type {
-  ApiResponse,
   DeadlineRequestV2,
   LlmChatRequest,
-  LlmChatResult,
   RawToolArgumentsV2,
   RequestedResourceV2,
   ProviderWireToolDefinition,
@@ -19,83 +17,34 @@ import {
 import type {
   SessionKernelProviderBackendOutputV2,
   SessionKernelProviderBackendV2,
+  SessionKernelProviderOrderedItemV2,
   SessionProviderPlanActionDraftV2,
   SessionProviderPlanDraftV2,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
-  SessionKernelTransportPrivateAuthV2,
-} from './SessionKernelPortV2.js';
-import type {
   SessionProviderResultMetadataV2,
   SessionProviderTurnInputV2,
 } from './types.js';
+import {
+  boundedProviderUsageRecordV2,
+  SessionKernelProviderTransportError,
+} from './providerStreamV1.js';
+import type {
+  SessionKernelLlmStreamResultV2,
+  SessionKernelLlmStreamToolItemV2,
+  SessionKernelLlmTransportV2,
+} from './providerStreamV1.js';
+
+export {
+  HttpSessionKernelLlmTransportV2,
+  SessionKernelProviderTransportError,
+} from './providerStreamV1.js';
+export type {
+  SessionKernelLlmTransportV2,
+} from './providerStreamV1.js';
 
 export const SESSION_PROVIDER_PLAN_DRAFT_V2_SCHEMA =
   'deepcode.session.plan-draft.v2' as const;
-
-export interface SessionKernelLlmTransportV2 {
-  request(
-    request: LlmChatRequest,
-    signal: AbortSignal
-  ): Promise<ApiResponse<LlmChatResult>>;
-}
-
-export class HttpSessionKernelLlmTransportV2
-implements SessionKernelLlmTransportV2 {
-  readonly #runCapability: string;
-
-  constructor(
-    private readonly apiBase: string,
-    privateAuth: SessionKernelTransportPrivateAuthV2,
-    private readonly sessionId: string,
-    private readonly runId: string,
-    private readonly fetchImpl: typeof fetch = fetch
-  ) {
-    this.#runCapability = privateAuth.runCapability;
-  }
-
-  async request(
-    request: LlmChatRequest,
-    signal: AbortSignal
-  ): Promise<ApiResponse<LlmChatResult>> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(
-        `${normalizeApiBase(this.apiBase)}/api/llm/chat`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-deepcode-run-capability': this.#runCapability,
-            'x-deepcode-session-id': this.sessionId,
-            'x-deepcode-run-id': this.runId,
-          },
-          body: JSON.stringify(request),
-          signal,
-        }
-      );
-    } catch {
-      throw new SessionKernelProviderTransportError(
-        'session_kernel_provider_transport_failed',
-        'Provider transport failed before receiving an HTTP response.'
-      );
-    }
-    if (!response.ok) {
-      throw new SessionKernelProviderTransportError(
-        'session_kernel_provider_http_failed',
-        `Provider transport failed with HTTP ${response.status}.`
-      );
-    }
-    try {
-      return await response.json() as ApiResponse<LlmChatResult>;
-    } catch {
-      throw new SessionKernelProviderTransportError(
-        'session_kernel_provider_response_decode_failed',
-        'Provider transport returned an invalid JSON response.'
-      );
-    }
-  }
-}
 
 /**
  * Provider-specific wire adapter. Kernel ToolIds are reversibly encoded only
@@ -113,7 +62,10 @@ implements SessionKernelProviderBackendV2 {
     input: SessionProviderTurnInputV2
   ): Promise<SessionKernelProviderBackendOutputV2> {
     assertProviderToolContextBindingV2(input);
-    const exposed = providerCallableToolsV2(input);
+    const purpose = input.purpose;
+    const exposed = purpose === 'finalAnswer'
+      ? []
+      : providerCallableToolsV2(input);
     const encodedNames = new Map(
       exposed.map((tool) => [
         providerWireToolNameV2(tool.toolId),
@@ -123,6 +75,7 @@ implements SessionKernelProviderBackendV2 {
     const request: LlmChatRequest = {
       requestId: input.providerTurnId,
       profileId: this.profileId,
+      stream: true,
       messages: cloneJson(input.contextAssembly.messages),
       tools: exposed.map((tool): ProviderWireToolDefinition => ({
         name: providerWireToolNameV2(tool.toolId),
@@ -140,84 +93,140 @@ implements SessionKernelProviderBackendV2 {
             factsOmittedCount: input.kernelFacts.omittedCount,
             providerProfileRevisionDigest:
               input.providerProfile.providerProfileRevisionDigest,
+            reasoningTransport:
+              input.providerProfile.reasoningTransport,
             memoryContextDigest:
               input.contextAssembly.receipt.memory.contextDigest,
             contextAssemblyDigest: sha256Hash(
               canonicalJson(input.contextAssembly.receipt)
             ),
+            userTurnId: input.currentInput.inputId,
+            controlEpoch: input.controlEpoch,
+            purpose,
           },
         },
       },
     };
     const response = await this.transport.request(request, input.signal);
-    if (!response.ok || !response.data) {
-      throw new SessionKernelProviderTransportError(
-        response.error ?? 'session_kernel_provider_failed',
-        response.message ?? 'Provider request failed.'
-      );
-    }
-    if (
-      response.data.requestId
-      && response.data.requestId !== input.providerTurnId
-    ) {
+    if (response.requestId !== input.providerTurnId) {
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_identity_mismatch',
         'Provider response identity does not match the persisted turn.'
       );
     }
-    const assistant = response.data.assistantMessage;
-    if (!assistant || assistant.role !== 'assistant') {
-      throw new SessionKernelProviderTransportError(
-        'session_kernel_provider_response_missing',
-        'Provider response has no assistant message.'
-      );
-    }
-    const calls = assistant.toolCalls ?? [];
     const providerResult = providerResultMetadataV2(
-      response.data,
+      response,
       this.profileId
     );
-    const responseDigest = sha256Hash(canonicalJson(response.data));
-    if (calls.length > 32) {
+    const streamCalls = response.items.filter(
+      (item): item is SessionKernelLlmStreamToolItemV2 =>
+        item.kind === 'toolCall'
+    );
+    if (streamCalls.length > 32) {
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_tool_call_count_exceeded',
         'One Provider turn may return at most 32 ordered Kernel tool calls.'
       );
     }
-    if (calls.length > 0) {
-      const decodedCalls = calls.map((call) => {
-        const toolId = encodedNames.get(call.name);
+    let toolOrdinal = 0;
+    const decodedItems: SessionKernelProviderOrderedItemV2[] =
+      response.items.map((item) => {
+        if (item.kind === 'text') {
+          return {
+            kind: 'text',
+            phase: item.phase,
+            text: item.text,
+          };
+        }
+        const toolId = encodedNames.get(item.name);
         if (!toolId) {
           throw new SessionKernelProviderTransportError(
             'session_kernel_provider_tool_name_unknown',
             'Provider returned a tool name outside the current encoded ToolContext.'
           );
         }
+        toolOrdinal += 1;
         return {
-          callId: requiredIdentity(call.id, 'callId'),
-          toolName: requiredIdentity(call.name, 'toolName'),
+          kind: 'toolCall',
+          source: 'providerNative',
+          ordinal: toolOrdinal,
+          callId: requiredIdentity(item.callId, 'callId'),
+          toolName: requiredIdentity(item.name, 'toolName'),
           toolId,
-          arguments: decodeProviderNativeArguments(call.arguments),
+          arguments: decodeProviderNativeArguments(item.arguments),
         };
       });
+    const decodedCalls = decodedItems.filter(
+      (item): item is Extract<
+        SessionKernelProviderOrderedItemV2,
+        { kind: 'toolCall' }
+      > => item.kind === 'toolCall'
+    );
+    const responseDigest = response.completion.responseDigest;
+    if (decodedCalls.length > 0) {
       return {
         kind: 'nativeToolCalls',
         calls: decodedCalls,
+        items: decodedItems,
+        completion: response.completion,
         providerResult,
         responseDigest,
       };
     }
-    const text = assistant.content ?? '';
+    const textItems = decodedItems.filter(
+      (item): item is Extract<
+        SessionKernelProviderOrderedItemV2,
+        { kind: 'text' }
+      > => item.kind === 'text'
+    );
+    const firstFinalIndex = textItems.findIndex(
+      (item) => item.phase === 'final_answer'
+    );
+    const lastCommentaryIndex = textItems.findLastIndex(
+      (item) => item.phase === 'commentary'
+    );
+    const finalItems = firstFinalIndex >= 0
+      ? textItems.slice(firstFinalIndex)
+      : textItems
+        .slice(lastCommentaryIndex + 1)
+        .filter((item) => item.phase === 'unknown');
+    if (textItems.length > 0 && finalItems.length === 0) {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_final_answer_missing',
+        'Provider response ended after commentary without final or unphased answer text.'
+      );
+    }
+    const text = finalItems.map((item) => item.text).join('');
     if (!text.trim()) {
-      return { kind: 'noTool', providerResult, responseDigest };
+      return {
+        kind: 'noTool',
+        items: decodedItems,
+        completion: response.completion,
+        providerResult,
+        responseDigest,
+      };
     }
     if (input.target.kind === 'planning') {
       const plan = decodeProviderPlanDraftFrame(text);
       if (plan) {
-        return { kind: 'plan', plan, providerResult, responseDigest };
+        return {
+          kind: 'plan',
+          plan,
+          items: decodedItems,
+          completion: response.completion,
+          providerResult,
+          responseDigest,
+        };
       }
     }
-    return { kind: 'text', text, providerResult, responseDigest };
+    return {
+      kind: 'text',
+      text,
+      items: decodedItems,
+      completion: response.completion,
+      providerResult,
+      responseDigest,
+    };
   }
 }
 
@@ -260,6 +269,9 @@ function assertProviderToolContextBindingV2(
     || input.contextAssembly.receipt.providerProfile
       .providerProfileRevisionDigest
       !== input.providerProfile.providerProfileRevisionDigest
+    || input.contextAssembly.receipt.providerProfile
+      .reasoningTransport
+      !== input.providerProfile.reasoningTransport
   ) {
     throw new SessionKernelProviderTransportError(
       'session_kernel_provider_tool_context_binding_invalid',
@@ -431,7 +443,7 @@ function exactKeys(
 }
 
 function providerResultMetadataV2(
-  result: LlmChatResult,
+  result: SessionKernelLlmStreamResultV2,
   expectedProfileId: string
 ): SessionProviderResultMetadataV2 {
   if (
@@ -450,58 +462,13 @@ function providerResultMetadataV2(
   const model = optionalMetadataIdentity(result.model, 'model');
   const usage = result.usage === undefined
     ? undefined
-    : boundedUsageRecord(result.usage);
+    : boundedProviderUsageRecordV2(result.usage);
   return {
     providerProfileId: expectedProfileId,
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
     ...(usage ? { usage } : {}),
   };
-}
-
-function boundedUsageRecord(
-  value: unknown
-): Record<string, unknown> {
-  const maximumUsageCounter = 1_000_000_000_000;
-  const usage = objectRecord(value);
-  if (!usage) return {};
-  let visited = 0;
-  const sanitize = (
-    candidate: Record<string, unknown>,
-    depth: number
-  ): Record<string, unknown> => {
-    if (depth > 4) return {};
-    const sanitized: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(candidate).sort()) {
-      visited += 1;
-      if (
-        visited > 256
-        || !/^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(key)
-      ) {
-        continue;
-      }
-      if (
-        typeof nested === 'number'
-        && Number.isSafeInteger(nested)
-        && nested >= 0
-        && nested <= maximumUsageCounter
-      ) {
-        sanitized[key] = nested;
-      } else {
-        const child = objectRecord(nested);
-        if (child) sanitized[key] = sanitize(child, depth + 1);
-      }
-    }
-    return sanitized;
-  };
-  const sanitized = sanitize(usage, 0);
-  if (
-    new TextEncoder().encode(canonicalJson(sanitized)).byteLength
-      > 64 * 1024
-  ) {
-    return {};
-  }
-  return sanitized;
 }
 
 function optionalMetadataIdentity(
@@ -560,61 +527,4 @@ function invalidPlanFrame(): SessionKernelProviderTransportError {
     'session_kernel_provider_plan_frame_invalid',
     'Provider plan frame is invalid.'
   );
-}
-
-function normalizeApiBase(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw invalidApiBase();
-  }
-  const authority = value
-    .split('://')[1]
-    ?.split('/')[0] ?? '';
-  const hostname = url.hostname.startsWith('[')
-    ? url.hostname.slice(1, -1)
-    : url.hostname;
-  const loopback = hostname === '::1'
-    || (
-      hostname.split('.').length === 4
-      && hostname.split('.').every(
-        (part) =>
-          /^\d{1,3}$/u.test(part)
-          && Number(part) >= 0
-          && Number(part) <= 255
-      )
-      && Number(hostname.split('.')[0]) === 127
-    );
-  if (
-    value.trim() !== value
-    || url.protocol !== 'http:'
-    || !loopback
-    || authority.includes('@')
-    || url.username
-    || url.password
-    || url.search
-    || url.hash
-    || !['', '/'].includes(url.pathname)
-  ) {
-    throw invalidApiBase();
-  }
-  return url.origin;
-}
-
-function invalidApiBase(): SessionKernelProviderTransportError {
-  return new SessionKernelProviderTransportError(
-    'session_kernel_provider_api_base_invalid',
-    'Provider transport requires an absolute loopback HTTP origin.'
-  );
-}
-
-export class SessionKernelProviderTransportError extends Error {
-  constructor(
-    readonly code: string,
-    message: string
-  ) {
-    super(message);
-    this.name = 'SessionKernelProviderTransportError';
-  }
 }

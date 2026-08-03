@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type {
   AgentSessionProfileMigration,
-  LlmProviderProfile,
+  ReadableLlmProviderProfile,
 } from '@deepcode/protocol';
+import { hasCompatibleReasoningTransport } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
@@ -18,7 +19,7 @@ interface ProfilesUpdatedDetail {
   profileMigrations?: AgentSessionProfileMigration[];
 }
 
-function profileLabel(profile: LlmProviderProfile): string {
+function profileLabel(profile: ReadableLlmProviderProfile): string {
   return profile.name;
 }
 
@@ -32,12 +33,12 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const profileSelectionBusy = useAgentSessionStore((state) => state.profileSelectionBusy);
   const selectProfile = useAgentSessionStore((state) => state.selectProfile);
   const refreshSessionProfile = useAgentSessionStore((state) => state.refreshSessionProfile);
-  const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
+  const [profiles, setProfiles] = useState<ReadableLlmProviderProfile[]>([]);
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [migrationNotice, setMigrationNotice] = useState<string | null>(null);
 
-  const loadProfiles = useCallback(async (): Promise<LlmProviderProfile[]> => {
+  const loadProfiles = useCallback(async (): Promise<ReadableLlmProviderProfile[]> => {
     let result;
     try {
       result = await getLlmProfiles();
@@ -55,7 +56,13 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
       onAvailabilityChange(false);
       return [];
     }
-    const enabledProfiles = result.data.profiles.filter((profile) => profile.enabled);
+    const enabledProfiles = result.data.profiles.filter(
+      (profile) => (
+        profile.enabled
+        && profile.thinking === 'enabled'
+        && hasCompatibleReasoningTransport(profile)
+      )
+    );
     setProfiles(enabledProfiles);
     setDefaultProfileId(
       enabledProfiles.some((profile) => profile.id === result.data!.defaultProfileId)

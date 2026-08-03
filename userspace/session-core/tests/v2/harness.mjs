@@ -5,6 +5,7 @@ import {
   decodeKernelFactProjectionV2, decodeToolContextBundleV2,
 } from '@deepcode/protocol';
 import {
+  SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
   canonicalJson,
@@ -117,6 +118,7 @@ function createProviderProfile() {
     schemaVersion: 'deepcode.host.provider-profile-bootstrap.v2',
     providerProfileId: 'provider-profile-v2-contract',
     providerProfileRevisionDigest: `sha256:${'6'.repeat(64)}`,
+    reasoningTransport: 'openaiPlaintext',
     contextWindowTokens: 128_000,
     maxOutputTokens: 8_000,
   };
@@ -816,43 +818,116 @@ export function providerToolIntents(calls) {
     kind: 'nativeToolCalls',
     calls: normalized,
   }));
-  return (input) => ({
-    kind: 'toolIntent',
-    sources: normalized.map((call) => ({
-      source: 'providerNative',
-      callId: call.callId,
-      toolId: call.toolId,
-      arguments: clone(call.arguments),
-    })),
-    receipt: {
-      schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
-      providerTurnId: input.providerTurnId,
-      responseDigest,
-      callCount: normalized.length,
-      calls: normalized.map((call, index) => ({
-        ordinal: index + 1,
+  return (input) => {
+    const items = providerOrderedToolItems(normalized);
+    return {
+      kind: 'toolIntent',
+      items,
+      completion: createProviderCompletionReceipt(responseDigest, {
+        hasToolCalls: true,
+        reasoningTransport: input.providerProfile.reasoningTransport,
+      }),
+      sources: normalized.map((call) => ({
+        source: 'providerNative',
         callId: call.callId,
-        toolName: call.toolName,
         toolId: call.toolId,
-        argumentsDigest: sha256Hash(canonicalJson(call.arguments)),
+        arguments: clone(call.arguments),
       })),
-      recordedAt: NOW,
-    },
-    providerResult: {
-      providerProfileId: 'provider-profile-v2-contract',
-      provider: 'contract-provider',
-      model: 'contract-model',
-    },
-  });
+      receipt: {
+        schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+        providerTurnId: input.providerTurnId,
+        responseDigest,
+        callCount: normalized.length,
+        calls: normalized.map((call, index) => ({
+          ordinal: index + 1,
+          callId: call.callId,
+          toolName: call.toolName,
+          toolId: call.toolId,
+          argumentsDigest: sha256Hash(canonicalJson(call.arguments)),
+        })),
+        recordedAt: NOW,
+      },
+      providerResult: {
+        providerProfileId: 'provider-profile-v2-contract',
+        provider: 'contract-provider',
+        model: 'contract-model',
+      },
+    };
+  };
 }
 export function providerAnswer(text = 'Session answer') {
+  const items = [{ kind: 'text', phase: 'unknown', text }];
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'text',
+    items,
+  }));
   return {
     kind: 'answer',
+    items,
+    completion: createProviderCompletionReceipt(responseDigest),
     text,
     providerResult: {
       providerProfileId: 'provider-profile-v2-contract',
       provider: 'contract-provider',
       model: 'contract-model',
+    },
+  };
+}
+
+export function providerOrderedToolItems(calls) {
+  return calls.map((call, index) => ({
+    kind: 'toolCall',
+    source: 'providerNative',
+    ordinal: index + 1,
+    callId: call.callId,
+    toolName: call.toolName ?? call.toolId,
+    toolId: call.toolId,
+    arguments: clone(call.arguments),
+  }));
+}
+
+export function createProviderCompletionReceipt(
+  responseDigest,
+  overrides = {}
+) {
+  const reasoningTransport = overrides.reasoningTransport
+    ?? 'openaiPlaintext';
+  const providerKind = {
+    openaiPlaintext: 'openaiCompatible',
+    anthropicPlaintext: 'anthropic',
+    ollamaPlaintext: 'ollama',
+  }[reasoningTransport];
+  if (!providerKind) {
+    throw new Error(
+      `Unsupported Provider reasoning transport ${reasoningTransport}.`
+    );
+  }
+  const nativeCompletion = providerKind === 'openaiCompatible'
+    ? {
+        providerKind,
+        terminalSignal: '[DONE]',
+        finishReason: overrides.hasToolCalls ? 'tool_calls' : 'stop',
+      }
+    : providerKind === 'anthropic'
+      ? { providerKind, terminalSignal: 'message_stop' }
+      : { providerKind, terminalSignal: 'done:true' };
+  const receiptIdentity = canonicalJson({
+    responseDigest,
+    reasoningTransport,
+    nativeCompletion,
+  });
+  return {
+    schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
+    nativeCompletion,
+    reasoningPresent: true,
+    reasoningTransport,
+    reasoningDigest: sha256Hash(`reasoning:${receiptIdentity}`),
+    responseDigest,
+    trace: {
+      sealed: true,
+      sealDigest: sha256Hash(`seal:${receiptIdentity}`),
+      terminalDigest: sha256Hash(`terminal:${receiptIdentity}`),
+      recordCount: overrides.recordCount ?? 4,
     },
   };
 }

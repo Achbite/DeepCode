@@ -3084,6 +3084,7 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
         const waitKind =
           reason === 'capability'
           || reason === 'plan'
+          || reason === 'scopeExpansion'
           || reason === 'userDecision'
             ? 'user'
             : reason === 'manualRecovery'

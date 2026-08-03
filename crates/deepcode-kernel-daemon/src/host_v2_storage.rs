@@ -270,22 +270,38 @@ pub(crate) fn with_storage_path_lock<T>(
     path: &Path,
     operation: impl FnOnce() -> Result<T, HostV2StorageError>,
 ) -> Result<T, HostV2StorageError> {
+    with_storage_path_locks(&[path], operation)
+}
+
+pub(crate) fn with_storage_path_locks<T>(
+    paths: &[&Path],
+    operation: impl FnOnce() -> Result<T, HostV2StorageError>,
+) -> Result<T, HostV2StorageError> {
     use std::hash::{Hash, Hasher};
 
     static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| (0..STORAGE_LOCK_SHARDS).map(|_| Mutex::new(())).collect());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    let guard = locks[(hasher.finish() as usize) % STORAGE_LOCK_SHARDS]
-        .lock()
-        .map_err(|_| {
+    let mut shard_indices = paths
+        .iter()
+        .map(|path| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hasher);
+            (hasher.finish() as usize) % STORAGE_LOCK_SHARDS
+        })
+        .collect::<Vec<_>>();
+    shard_indices.sort_unstable();
+    shard_indices.dedup();
+    let mut guards = Vec::with_capacity(shard_indices.len());
+    for shard_index in shard_indices {
+        guards.push(locks[shard_index].lock().map_err(|_| {
             HostV2StorageError::io(
                 "host_v2_storage_lock_unavailable",
                 "Host v2 storage lock is unavailable",
             )
-        })?;
+        })?);
+    }
     let result = operation();
-    drop(guard);
+    drop(guards);
     result
 }
 

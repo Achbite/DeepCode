@@ -1,4 +1,5 @@
 use super::*;
+use deepcode_kernel_abi::LlmProviderErrorLayer;
 
 fn test_profile() -> ResolvedLlmProfile {
     ResolvedLlmProfile {
@@ -259,5 +260,161 @@ data: [DONE]
     assert_eq!(
         output.tool_calls[0].arguments["path"].as_str(),
         Some("generic.txt")
+    );
+}
+
+#[test]
+fn provider_native_stream_completion_and_reasoning_gate() {
+    let mut openai =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::OpenAiCompatible);
+    openai
+        .ingest_payload(br#"{"choices":[{"index":0,"delta":{"reasoning_content":"reason "}}]}"#)
+        .unwrap();
+    openai
+        .ingest_payload(
+            br#"{"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+    openai.ingest_payload(b"[DONE]").unwrap();
+    let openai = openai.finalize().unwrap();
+    assert_eq!(
+        openai.completion.provider_kind,
+        ProviderNativeStreamKindV1::OpenAiCompatible
+    );
+    assert_eq!(openai.completion.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(openai.output.reasoning.as_deref(), Some("reason "));
+    assert_eq!(openai.output.content, "OK");
+
+    let mut anthropic =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::Anthropic);
+    anthropic
+        .ingest_payload(
+            br#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason "}}"#,
+        )
+        .unwrap();
+    anthropic
+        .ingest_payload(
+            br#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"OK"}}"#,
+        )
+        .unwrap();
+    anthropic
+        .ingest_payload(br#"{"type":"message_stop"}"#)
+        .unwrap();
+    let anthropic = anthropic.finalize().unwrap();
+    assert_eq!(
+        anthropic.completion.provider_kind,
+        ProviderNativeStreamKindV1::Anthropic
+    );
+    assert_eq!(anthropic.output.reasoning.as_deref(), Some("reason "));
+    assert_eq!(anthropic.output.content, "OK");
+
+    let mut ollama = ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::Ollama);
+    ollama
+        .ingest_payload(br#"{"message":{"thinking":"reason ","content":"OK"},"done":true}"#)
+        .unwrap();
+    let ollama = ollama.finalize().unwrap();
+    assert_eq!(
+        ollama.completion.provider_kind,
+        ProviderNativeStreamKindV1::Ollama
+    );
+    assert_eq!(ollama.output.reasoning.as_deref(), Some("reason "));
+    assert_eq!(ollama.output.content, "OK");
+
+    for (kind, terminal) in [
+        (
+            ProviderNativeStreamKindV1::OpenAiCompatible,
+            vec![
+                br#"{"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}"#
+                    .as_slice(),
+                b"[DONE]".as_slice(),
+            ],
+        ),
+        (
+            ProviderNativeStreamKindV1::Anthropic,
+            vec![br#"{"type":"message_stop"}"#.as_slice()],
+        ),
+        (
+            ProviderNativeStreamKindV1::Ollama,
+            vec![br#"{"message":{"content":"OK"},"done":true}"#.as_slice()],
+        ),
+    ] {
+        let mut accumulator = ProviderNativeStreamAccumulatorV1::new(kind);
+        for payload in terminal {
+            accumulator.ingest_payload(payload).unwrap();
+        }
+        let error = accumulator.finalize().unwrap_err();
+        assert_eq!(error.code, "provider_reasoning_missing");
+    }
+}
+
+#[test]
+fn provider_native_stream_eof_and_invalid_finish_fail_closed() {
+    for (kind, payload) in [
+        (
+            ProviderNativeStreamKindV1::OpenAiCompatible,
+            br#"{"choices":[{"index":0,"delta":{"reasoning":"reason"}}]}"#.as_slice(),
+        ),
+        (
+            ProviderNativeStreamKindV1::Anthropic,
+            br#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}"#.as_slice(),
+        ),
+        (
+            ProviderNativeStreamKindV1::Ollama,
+            br#"{"message":{"thinking":"reason"},"done":false}"#.as_slice(),
+        ),
+    ] {
+        let mut accumulator = ProviderNativeStreamAccumulatorV1::new(kind);
+        accumulator.ingest_payload(payload).unwrap();
+        let error = accumulator.finalize().unwrap_err();
+        assert_eq!(error.code, "provider_stream_native_terminal_missing");
+    }
+
+    let mut invalid_finish =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::OpenAiCompatible);
+    let error = invalid_finish
+        .ingest_payload(
+            br#"{"choices":[{"index":0,"delta":{"reasoning":"reason"},"finish_reason":"length"}]}"#,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "provider_stream_finish_reason_invalid");
+    assert!(!invalid_finish.source_done());
+}
+
+#[test]
+fn ollama_complete_arguments_are_deduplicated_and_conflicts_fail() {
+    let first = br#"{"message":{"thinking":"reason","tool_calls":[{"function":{"name":"fs__read","arguments":{"path":"README.md"}}}]},"done":false}"#;
+    let repeated = br#"{"message":{"tool_calls":[{"function":{"name":"fs__read","arguments":{"path":"README.md"}}}]},"done":false}"#;
+    let conflict = br#"{"message":{"tool_calls":[{"function":{"name":"fs__read","arguments":{"path":"NOTICE.md"}}}]},"done":false}"#;
+
+    let mut deduplicated =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::Ollama);
+    let first_emissions = deduplicated.ingest_payload(first).unwrap();
+    assert_eq!(first_emissions.len(), 2);
+    assert!(deduplicated.ingest_payload(repeated).unwrap().is_empty());
+    deduplicated.ingest_payload(br#"{"done":true}"#).unwrap();
+    let result = deduplicated.finalize().unwrap();
+    assert_eq!(result.output.tool_calls.len(), 1);
+    assert_eq!(
+        result.output.tool_calls[0].arguments["path"].as_str(),
+        Some("README.md")
+    );
+
+    let mut conflicting =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::Ollama);
+    conflicting.ingest_payload(first).unwrap();
+    let error = conflicting.ingest_payload(conflict).unwrap_err();
+    assert_eq!(error.code, "provider_tool_call_arguments_conflict");
+    assert!(!conflicting.source_done());
+}
+
+#[test]
+fn provider_probe_timeout_mapping_is_stable() {
+    assert_eq!(LLM_PROFILE_PROBE_TIMEOUT, Duration::from_secs(60));
+    let error = provider_probe_timeout_error();
+    assert_eq!(error.code, "provider_probe_timeout");
+    assert_eq!(error.http_status, None);
+    assert_eq!(
+        error.safe_message(),
+        "Provider probe did not reach a validated native completion before its deadline."
     );
 }

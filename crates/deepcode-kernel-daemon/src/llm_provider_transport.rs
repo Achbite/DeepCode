@@ -4,26 +4,27 @@ use deepcode_kernel_abi::{LlmProviderDiagnostic, LlmProviderErrorLayer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-pub(crate) async fn call_anthropic_profile(
+pub(crate) fn anthropic_stream_request_body(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
-    tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatDecodedResponse, LlmProviderDiagnostic> {
-    let api_key = profile.api_key.as_deref().ok_or_else(|| {
-        provider_local_error(
-            profile,
-            "anthropic",
-            "ProviderProfileMissingApiKey",
-            LlmProviderErrorLayer::Transport,
-            format!("LLM profile `{}` has no API key", profile.name),
-        )
-    })?;
+    tools: &[LlmToolDefinition],
+) -> Value {
     let (system, chat_messages) = split_system_messages(messages);
     let mut body = json!({
         "model": profile.model,
         "messages": chat_messages,
-        "max_tokens": profile.max_output_tokens.unwrap_or(4096)
+        "max_tokens": profile.max_output_tokens.unwrap_or(4096),
+        "stream": true,
     });
+    if profile.thinking.as_deref() == Some("enabled") {
+        let max_tokens = profile.max_output_tokens.unwrap_or(4096);
+        if max_tokens > 1024 {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": (max_tokens / 2).max(1024).min(max_tokens - 1),
+            });
+        }
+    }
     if !system.is_empty() {
         body["system"] = json!(system);
     }
@@ -37,47 +38,19 @@ pub(crate) async fn call_anthropic_profile(
             }))
             .collect::<Vec<_>>());
     }
-    let response = reqwest::Client::new()
-        .post(normalize_anthropic_base_url(profile))
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
-            provider_transport_error(profile, "anthropic", "request_failed", error.to_string())
-        })?;
-    let response = read_provider_json_response(
-        profile,
-        "anthropic",
-        response,
-        "anthropic.messages.v1: content[]",
-        false,
-    )
-    .await?;
-    if !has_anthropic_message(&response) {
-        return Err(provider_schema_error(
-            profile,
-            "anthropic",
-            &response,
-            "Anthropic response must contain content array",
-        ));
-    }
-    Ok(LlmChatDecodedResponse {
-        output: parse_anthropic_message(&response.value),
-        raw_provider: Some(response.value.clone()),
-    })
+    body
 }
 
-pub(crate) async fn call_ollama_profile(
+pub(crate) fn ollama_stream_request_body(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
-    tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatDecodedResponse, LlmProviderDiagnostic> {
+    tools: &[LlmToolDefinition],
+) -> Value {
     let mut body = json!({
         "model": profile.model,
         "messages": messages,
-        "stream": false
+        "stream": true,
+        "think": profile.thinking.as_deref() == Some("enabled"),
     });
     if !tools.is_empty() {
         body["tools"] = json!(tools
@@ -92,34 +65,7 @@ pub(crate) async fn call_ollama_profile(
             }))
             .collect::<Vec<_>>());
     }
-    let response = reqwest::Client::new()
-        .post(normalize_ollama_base_url(profile))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
-            provider_transport_error(profile, "ollama", "request_failed", error.to_string())
-        })?;
-    let response = read_provider_json_response(
-        profile,
-        "ollama",
-        response,
-        "ollama.chat.v1: message",
-        false,
-    )
-    .await?;
-    let message = ollama_message(&response).ok_or_else(|| {
-        provider_schema_error(
-            profile,
-            "ollama",
-            &response,
-            "Ollama response must contain message object",
-        )
-    })?;
-    Ok(LlmChatDecodedResponse {
-        output: parse_openai_message(message),
-        raw_provider: Some(response.value.clone()),
-    })
+    body
 }
 
 #[derive(Debug, Clone)]

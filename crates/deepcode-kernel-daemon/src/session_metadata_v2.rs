@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use crate::*;
+use std::collections::HashSet;
 
 const AGENT_SESSION_INDEX_SCHEMA_V2: &str = "deepcode.agent.sessions.v2";
 
@@ -17,21 +18,44 @@ pub(crate) fn restore_session_index(paths: &HostPaths) -> Result<Vec<Value>, Str
             AGENT_SESSION_INDEX_SCHEMA_V2
         ));
     }
-    let mut sessions = document
+    let sessions = document
         .get("sessions")
         .and_then(Value::as_array)
         .cloned()
         .ok_or_else(|| {
             "UnsupportedHistorySchema: Session metadata sessions must be an array".to_string()
-        })?
-        .into_iter()
-        .filter(|session| {
-            session
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.trim().is_empty())
-        })
-        .collect::<Vec<_>>();
+        })?;
+    let mut session_ids = HashSet::with_capacity(sessions.len());
+    for session in &sessions {
+        let id = session.get("id").and_then(Value::as_str).ok_or_else(|| {
+            "UnsupportedHistorySchema: every Session metadata entry must have a string id"
+                .to_string()
+        })?;
+        if crate::host_v2_storage::validate_safe_session_identity(id).is_err() {
+            return Err(
+                "UnsupportedHistorySchema: Session metadata id must be a non-empty path-safe identity"
+                    .to_string(),
+            );
+        }
+        if !session_ids.insert(id.to_string()) {
+            return Err(
+                "UnsupportedHistorySchema: Session metadata contains a duplicate Session id"
+                    .to_string(),
+            );
+        }
+        if let Some(deletion) = session.get("deletion") {
+            let status = deletion
+                .as_object()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str);
+            if !matches!(status, Some("pending" | "failed")) {
+                return Err(
+                    "UnsupportedHistorySchema: Session deletion state is invalid".to_string(),
+                );
+            }
+        }
+    }
+    let mut sessions = sessions;
     sessions.sort_by_key(|session| {
         std::cmp::Reverse(
             session
@@ -63,19 +87,20 @@ pub(crate) fn persist_session_index_values(
     path: &PathBuf,
     sessions: &[Value],
 ) -> Result<(), String> {
-    atomic_write_json(
+    crate::host_v2_storage::atomic_write_private_json(
         path,
         &json!({
             "schemaVersion": AGENT_SESSION_INDEX_SCHEMA_V2,
             "sessions": sessions
         }),
     )
+    .map_err(|error| format!("{}: {}", error.code, error.message))
 }
 
 pub(crate) fn restored_current_session_ids_by_scope(sessions: &[Value]) -> HashMap<String, String> {
     let mut current = HashMap::new();
     for session in sessions {
-        if is_archived_session(session) {
+        if !session_is_selectable(session) {
             continue;
         }
         let Some(session_id) = session.get("id").and_then(Value::as_str) else {

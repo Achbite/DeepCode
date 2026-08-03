@@ -61,11 +61,143 @@ pub(crate) fn is_archived_session(session: &Value) -> bool {
     session.get("archivedAt").and_then(Value::as_str).is_some()
 }
 
-pub(crate) fn remove_session_storage_dir(sessions_dir: &FsPath, safe_session_id: &str) {
-    let path = sessions_dir.join(safe_session_id);
-    if path.starts_with(sessions_dir) {
-        let _ = fs::remove_dir_all(path);
+pub(crate) fn session_deletion_status(session: &Value) -> Option<&str> {
+    session
+        .get("deletion")
+        .and_then(|deletion| deletion.get("status"))
+        .and_then(Value::as_str)
+}
+
+pub(crate) fn session_is_deletion_tombstone(session: &Value) -> bool {
+    matches!(session_deletion_status(session), Some("pending" | "failed"))
+}
+
+pub(crate) fn session_is_verified_selectable(session: &Value) -> bool {
+    session_schema_is_compatible(session)
+        && !is_archived_session(session)
+        && session.get("deletion").is_none()
+}
+
+pub(crate) fn session_is_selectable(session: &Value) -> bool {
+    session_is_verified_selectable(session)
+}
+
+pub(crate) fn allocate_agent_session_id(gui: &GuiState) -> Result<String, String> {
+    for _ in 0..8 {
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy)
+            .map_err(|error| format!("generate Session identity entropy: {error}"))?;
+        let mut suffix = String::with_capacity(entropy.len() * 2);
+        for byte in entropy {
+            use std::fmt::Write as _;
+            write!(&mut suffix, "{byte:02x}")
+                .map_err(|error| format!("encode Session identity entropy: {error}"))?;
+        }
+        let id = format!("session-{}-{suffix}", now_millis());
+        let metadata_conflict = gui
+            .sessions
+            .iter()
+            .any(|session| session.get("id").and_then(Value::as_str) == Some(id.as_str()));
+        let storage_conflict = gui.paths.sessions_dir.join(&id).exists();
+        if !metadata_conflict && !storage_conflict {
+            return Ok(id);
+        }
     }
+    Err("could not allocate a unique Session identity".to_string())
+}
+
+pub(crate) fn session_private_io_lock(session_id: &str) -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("Session private I/O lock registry");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::RwLock::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+pub(crate) fn mark_session_deletion_pending(session: &mut Value, attempted_at: &str) {
+    let requested_at = session
+        .get("deletion")
+        .and_then(|deletion| deletion.get("requestedAt"))
+        .and_then(Value::as_str)
+        .unwrap_or(attempted_at)
+        .to_string();
+    let attempt = session
+        .get("deletion")
+        .and_then(|deletion| deletion.get("attempt"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    session["deletion"] = json!({
+        "status": "pending",
+        "requestedAt": requested_at,
+        "lastAttemptAt": attempted_at,
+        "attempt": attempt
+    });
+    session["updatedAt"] = json!(attempted_at);
+}
+
+pub(crate) fn mark_session_deletion_failed(
+    session: &mut Value,
+    failed_at: &str,
+    code: &str,
+    message: &str,
+) {
+    let requested_at = session
+        .get("deletion")
+        .and_then(|deletion| deletion.get("requestedAt"))
+        .and_then(Value::as_str)
+        .unwrap_or(failed_at)
+        .to_string();
+    let last_attempt_at = session
+        .get("deletion")
+        .and_then(|deletion| deletion.get("lastAttemptAt"))
+        .and_then(Value::as_str)
+        .unwrap_or(failed_at)
+        .to_string();
+    let attempt = session
+        .get("deletion")
+        .and_then(|deletion| deletion.get("attempt"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    session["deletion"] = json!({
+        "status": "failed",
+        "requestedAt": requested_at,
+        "lastAttemptAt": last_attempt_at,
+        "failedAt": failed_at,
+        "attempt": attempt,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    });
+    session["updatedAt"] = json!(failed_at);
+}
+
+pub(crate) fn remove_session_storage_dir(
+    sessions_dir: &FsPath,
+    safe_session_id: &str,
+) -> Result<(), String> {
+    let path = sessions_dir.join(safe_session_id);
+    if !path.starts_with(sessions_dir) {
+        return Err("resolved Session storage path escaped the Session root".to_string());
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    if sessions_dir.exists() {
+        crate::host_v2_storage::sync_directory(sessions_dir)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn scope_key_from_query(query: &AgentSessionScopeQuery) -> String {
@@ -140,7 +272,7 @@ pub(crate) fn current_agent_session_id_for_project(
         if gui.sessions.iter().any(|session| {
             session.get("id").and_then(Value::as_str) == Some(current_id)
                 && session.get("projectId").and_then(Value::as_str) == Some(project_id)
-                && !is_archived_session(session)
+                && session_is_selectable(session)
         }) {
             return Some(current_id.to_string());
         }
@@ -149,7 +281,7 @@ pub(crate) fn current_agent_session_id_for_project(
         .iter()
         .find(|session| {
             session.get("projectId").and_then(Value::as_str) == Some(project_id)
-                && !is_archived_session(session)
+                && session_is_selectable(session)
         })
         .and_then(|session| session.get("id").and_then(Value::as_str))
         .map(str::to_string)
@@ -177,9 +309,38 @@ pub(crate) fn apply_workspace_binding_to_session(session: &mut Value, binding: &
 }
 
 pub(crate) fn session_by_id<'a>(gui: &'a GuiState, session_id: &str) -> Option<&'a Value> {
-    gui.sessions
+    verified_selectable_session(gui, session_id).ok()
+}
+
+pub(crate) fn verified_selectable_session<'a>(
+    gui: &'a GuiState,
+    session_id: &str,
+) -> Result<&'a Value, Json<ApiResponse>> {
+    let session = gui
+        .sessions
         .iter()
         .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+        .ok_or_else(|| ApiResponse::error("agent_session_not_found", "agent session not found"))?;
+    if !session_schema_is_compatible(session) {
+        return Err(incompatible_session_response());
+    }
+    if session.get("deletion").is_some() {
+        return Err(if session_is_deletion_tombstone(session) {
+            ApiResponse::error(
+                "agent_session_deletion_in_progress",
+                "Session deletion is pending or failed and must be retried before use",
+            )
+        } else {
+            incompatible_session_response()
+        });
+    }
+    if is_archived_session(session) {
+        return Err(ApiResponse::error(
+            "agent_session_archived",
+            "Archived Session cannot admit Run or projection activity",
+        ));
+    }
+    Ok(session)
 }
 
 pub(crate) fn current_agent_session_id_for_scope(
@@ -189,7 +350,7 @@ pub(crate) fn current_agent_session_id_for_scope(
     if let Some(current_id) = gui.current_session_ids_by_scope.get(scope_key) {
         if gui.sessions.iter().any(|session| {
             session.get("id").and_then(Value::as_str) == Some(current_id.as_str())
-                && !is_archived_session(session)
+                && session_is_selectable(session)
                 && session_scope_key(session) == scope_key
         }) {
             return Some(current_id.clone());
@@ -199,7 +360,7 @@ pub(crate) fn current_agent_session_id_for_scope(
     let next_id = gui
         .sessions
         .iter()
-        .find(|session| !is_archived_session(session) && session_scope_key(session) == scope_key)
+        .find(|session| session_is_selectable(session) && session_scope_key(session) == scope_key)
         .and_then(|session| session.get("id").and_then(Value::as_str))
         .map(ToOwned::to_owned);
     if let Some(next_id) = next_id.as_ref() {
@@ -217,7 +378,7 @@ pub(crate) fn ensure_current_agent_session_for_scope(
     if let Some(next_id) = gui
         .sessions
         .iter()
-        .find(|session| !is_archived_session(session) && session_scope_key(session) == scope_key)
+        .find(|session| session_is_selectable(session) && session_scope_key(session) == scope_key)
         .and_then(|session| session.get("id").and_then(Value::as_str))
         .map(ToOwned::to_owned)
     {
@@ -227,7 +388,7 @@ pub(crate) fn ensure_current_agent_session_for_scope(
         return Ok(());
     }
 
-    let id = format!("session-{}", now_millis());
+    let id = allocate_agent_session_id(gui)?;
     let now = now_text();
     let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
     let session = create_agent_session_value(
@@ -238,12 +399,6 @@ pub(crate) fn ensure_current_agent_session_for_scope(
         workspace_id.as_deref(),
         workspace_hash.as_deref(),
     );
-    let new_session_storage_dir = gui.paths.sessions_dir.join(safe_path_segment(&id));
-    if new_session_storage_dir.exists() {
-        return Err(
-            "generated replacement Session identity already has private storage".to_string(),
-        );
-    }
     gui.current_session_id = Some(id.clone());
     gui.current_session_ids_by_scope
         .insert(session_scope_key(&session), id.clone());
@@ -304,6 +459,9 @@ pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
         .sessions
         .iter()
         .filter(|session| {
+            if session_is_deletion_tombstone(session) {
+                return false;
+            }
             session
                 .get("titleSource")
                 .and_then(Value::as_str)
@@ -324,29 +482,21 @@ pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
 }
 
 pub(crate) fn has_session(gui: &GuiState, session_id: &str) -> bool {
-    gui.sessions.iter().any(|session| {
-        session.get("id").and_then(Value::as_str) == Some(session_id)
-            && !is_archived_session(session)
-    })
+    verified_selectable_session(gui, session_id).is_ok()
 }
 
 pub(crate) fn session_mut<'a>(gui: &'a mut GuiState, session_id: &str) -> Option<&'a mut Value> {
-    gui.sessions
-        .iter_mut()
-        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+    gui.sessions.iter_mut().find(|session| {
+        session.get("id").and_then(Value::as_str) == Some(session_id)
+            && !session_is_deletion_tombstone(session)
+    })
 }
 
 pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
-    let Some(session) = gui
-        .sessions
-        .iter()
-        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
-    else {
-        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    let session = match verified_selectable_session(gui, session_id) {
+        Ok(session) => session,
+        Err(response) => return response,
     };
-    if !session_schema_is_compatible(session) {
-        return incompatible_session_response();
-    }
     let events =
         match read_session_kernel_v2_public_agent_events(&gui.paths.sessions_dir, session_id) {
             Ok(events) => events,

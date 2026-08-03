@@ -48,7 +48,10 @@ pub(crate) fn route_uses_specialized_transport(method: &Method, path: &str) -> b
     }
     if matches!(
         path,
-        "/api/kernel/v2/commands" | "/api/kernel/v2/user-decisions" | "/api/llm/chat"
+        "/api/kernel/v2/commands"
+            | "/api/kernel/v2/user-decisions"
+            | "/api/llm/chat"
+            | "/api/llm/chat/stream"
     ) {
         return true;
     }
@@ -56,7 +59,9 @@ pub(crate) fn route_uses_specialized_transport(method: &Method, path: &str) -> b
         return true;
     }
     path.starts_with("/api/agent/sessions/")
-        && (path.ends_with("/kernel-v2/projections") || path.ends_with("/kernel-v2/prior-events"))
+        && (path.ends_with("/kernel-v2/projections")
+            || path.ends_with("/kernel-v2/prior-events")
+            || path.ends_with("/timeline"))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

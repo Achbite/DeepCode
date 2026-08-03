@@ -5,15 +5,33 @@ export type LlmProviderKind =
   | 'anthropic'
   | 'ollama';
 
+export type LlmReasoningTransport =
+  | 'openaiPlaintext'
+  | 'anthropicPlaintext'
+  | 'ollamaPlaintext';
+
+export type LlmProviderReasoningContract =
+  | {
+      kind: 'openaiCompatible';
+      reasoningTransport: 'openaiPlaintext';
+    }
+  | {
+      kind: 'anthropic';
+      reasoningTransport: 'anthropicPlaintext';
+    }
+  | {
+      kind: 'ollama';
+      reasoningTransport: 'ollamaPlaintext';
+    };
+
 export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu';
 export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
 export type LlmThinkingMode = 'enabled' | 'disabled';
 export type LlmResponseFormat = { type: 'json_object' };
 
-export interface LlmProviderProfile {
+interface LlmProviderProfileFields {
   id: string;
   name: string;
-  kind: LlmProviderKind;
   providerFlavor?: LlmProviderFlavor;
   baseUrl?: string;
   model: string;
@@ -25,6 +43,54 @@ export interface LlmProviderProfile {
   thinking?: LlmThinkingMode;
   secretRef?: string;
   enabled: boolean;
+}
+
+export type LlmProviderProfile =
+  LlmProviderProfileFields & LlmProviderReasoningContract;
+
+/**
+ * Read model for stores created before the reasoning transport contract.
+ *
+ * This shape is intentionally excluded from write requests and execution
+ * selection. It only lets settings surfaces show and repair the old profile.
+ */
+export type LegacyReadableLlmProviderProfile = LlmProviderProfileFields & {
+  kind: LlmProviderKind;
+  reasoningTransport?: undefined;
+};
+
+export type ReadableLlmProviderProfile =
+  | LlmProviderProfile
+  | LegacyReadableLlmProviderProfile;
+
+export const LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND = {
+  openaiCompatible: 'openaiPlaintext',
+  anthropic: 'anthropicPlaintext',
+  ollama: 'ollamaPlaintext',
+} as const satisfies Readonly<Record<LlmProviderKind, LlmReasoningTransport>>;
+
+export function reasoningTransportForProviderKind<
+  Kind extends LlmProviderKind,
+>(
+  kind: Kind,
+): (typeof LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND)[Kind] {
+  return LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND[kind];
+}
+
+/**
+ * Runtime compatibility check for profiles loaded from durable stores.
+ *
+ * Older profiles without `reasoningTransport` remain readable, but callers
+ * must not offer them for execution until the user saves a matching contract.
+ */
+export function hasCompatibleReasoningTransport<
+  Profile extends {
+    kind: LlmProviderKind;
+    reasoningTransport?: unknown;
+  },
+>(profile: Profile): profile is Profile & LlmProviderReasoningContract {
+  return profile.reasoningTransport
+    === LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND[profile.kind];
 }
 
 export const DEEPSEEK_OPENAI_BASE_URL = 'https://api.deepseek.com';
@@ -47,6 +113,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     id: 'deepseek-v4-flash-openai',
     name: 'DeepSeek V4 Flash',
     kind: 'openaiCompatible',
+    reasoningTransport: 'openaiPlaintext',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-flash',
@@ -61,6 +128,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     id: 'deepseek-v4-pro-openai',
     name: 'DeepSeek V4 Pro',
     kind: 'openaiCompatible',
+    reasoningTransport: 'openaiPlaintext',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-pro',
@@ -74,7 +142,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
 ];
 
 export interface LlmProfilesResult {
-  profiles: LlmProviderProfile[];
+  profiles: ReadableLlmProviderProfile[];
   defaultProfileId?: string;
   storePath?: string;
   profileMigrations?: AgentSessionProfileMigration[];
@@ -90,6 +158,7 @@ export interface PatchLlmProfilesRequest {
   profiles: LlmProviderProfile[];
   defaultProfileId?: string;
   secrets?: Record<string, string | null>;
+  reenableProfileIds?: string[];
 }
 
 export interface LlmChatMessage {
@@ -116,59 +185,10 @@ export interface LlmChatRequest {
   profileId?: string;
   messages: LlmChatMessage[];
   tools?: ProviderWireToolDefinition[];
-  stream?: boolean;
+  stream: true;
   providerUserId?: string;
   responseFormat?: LlmResponseFormat;
   providerOptions?: Record<string, unknown>;
-}
-
-export interface LlmChatChunk {
-  type: 'delta' | 'reasoning_delta' | 'tool_call' | 'part' | 'done' | 'error';
-  content?: string;
-  toolCall?: ToolCall;
-  toolCallDelta?: {
-    id?: string;
-    index?: number;
-    name?: string;
-    argumentsDelta?: string;
-  };
-  error?: string;
-  index?: number;
-  callId?: string;
-  finishReason?: string;
-  usage?: Record<string, unknown>;
-  rawProvider?: unknown;
-}
-
-export interface LlmChatResult {
-  requestId?: string;
-  chunks: LlmChatChunk[];
-  assistantMessage?: LlmChatMessage;
-  usage?: Record<string, unknown>;
-  providerProfileId?: string;
-  provider?: string;
-  model?: string;
-}
-
-export type LlmChatStreamEventType =
-  | 'provider_metadata'
-  | 'provider_delta'
-  | 'provider_reasoning_delta'
-  | 'provider_tool_call_delta'
-  | 'provider_usage'
-  | 'provider_done'
-  | 'provider_error';
-
-export interface LlmChatStreamEvent {
-  requestId?: string;
-  type: LlmChatStreamEventType;
-  chunk?: LlmChatChunk;
-  error?: string;
-  usage?: Record<string, unknown>;
-  providerProfileId?: string;
-  provider?: string;
-  model?: string;
-  rawProvider?: unknown;
 }
 
 export interface LlmProbeRequest {
@@ -180,5 +200,14 @@ export interface LlmProbeResult {
   provider: LlmProviderKind;
   model?: string;
   latencyMs?: number;
+  reasoningPresent?: boolean;
+  responsePresent?: boolean;
+  nativeCompletion?: {
+    providerKind: LlmProviderKind;
+    terminalSignal: string;
+    finishReason?: 'stop' | 'tool_calls';
+  };
+  errorCode?: string;
+  httpStatus?: number;
   error?: string;
 }

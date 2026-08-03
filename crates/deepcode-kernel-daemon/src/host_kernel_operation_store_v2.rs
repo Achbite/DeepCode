@@ -155,6 +155,12 @@ pub(crate) struct HostKernelBootstrapReceiptV2 {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum HostKernelLiveRunForDeletionV2 {
+    Opening(HostKernelRunOpeningRecordV2),
+    Active(HostKernelBootstrapRecordV2),
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct HostCallerRequestBindingInputV2 {
     pub(crate) session_id: String,
     pub(crate) caller_request_id: String,
@@ -1177,6 +1183,39 @@ impl HostKernelOperationStoreV2 {
         })
     }
 
+    pub(crate) fn session_has_live_run(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        self.with_connection(|connection| {
+            Ok(stored_live_run_for_session(connection, session_id)?.is_some())
+        })
+    }
+
+    pub(crate) fn live_run_for_deletion(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<HostKernelLiveRunForDeletionV2>, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        self.with_connection(|connection| {
+            let Some(stored) = stored_live_run_for_session(connection, session_id)? else {
+                return Ok(None);
+            };
+            match parse_run_lifecycle(&stored.lifecycle)? {
+                HostKernelStoredRunLifecycleV2::Opening => decode_opening_record(&stored)
+                    .map(HostKernelLiveRunForDeletionV2::Opening)
+                    .map(Some),
+                HostKernelStoredRunLifecycleV2::Active => decode_bootstrap_record(&stored)
+                    .map(HostKernelLiveRunForDeletionV2::Active)
+                    .map(Some),
+                HostKernelStoredRunLifecycleV2::Retired => {
+                    Err(corrupt("Live Host Kernel Run query returned a retired Run"))
+                }
+            }
+        })
+    }
+
     pub(crate) fn abandon_opening(
         &self,
         session_id: &str,
@@ -2087,6 +2126,8 @@ impl HostKernelOperationStoreV2 {
     pub(crate) fn reconcile_startup(
         &self,
         reconciled_at: &str,
+        recoverable_session_ids: &HashSet<String>,
+        deletion_tombstone_ids: &HashSet<String>,
     ) -> Result<HostKernelStartupReconciliationV2, HostV2StorageError> {
         validate_bounded_identity(reconciled_at, "reconciledAt", 1024)?;
         self.with_write_transaction(|transaction| {
@@ -2097,6 +2138,14 @@ impl HostKernelOperationStoreV2 {
             let mut unsupported_run_row_ids = Vec::new();
             let mut supported_run_row_ids = Vec::new();
             for stored in &stored_runs {
+                let recoverable = recoverable_session_ids.contains(&stored.session_id);
+                let deletion_tombstone = deletion_tombstone_ids.contains(&stored.session_id);
+                if !recoverable && !deletion_tombstone {
+                    unsupported_run_row_ids.push(stored.id);
+                    unsupported_history_runs
+                        .push((stored.session_id.clone(), stored.host_run_id.clone()));
+                    continue;
+                }
                 let decoded = match parse_run_lifecycle(&stored.lifecycle)? {
                     HostKernelStoredRunLifecycleV2::Opening => {
                         decode_opening_record(stored).map(|record| (Some(record), None))
@@ -2108,11 +2157,15 @@ impl HostKernelOperationStoreV2 {
                 };
                 match decoded {
                     Ok((Some(opening), None)) => {
-                        supported_run_row_ids.push(stored.id);
+                        if recoverable {
+                            supported_run_row_ids.push(stored.id);
+                        }
                         opening_runs.push(opening);
                     }
                     Ok((None, Some(active))) => {
-                        supported_run_row_ids.push(stored.id);
+                        if recoverable {
+                            supported_run_row_ids.push(stored.id);
+                        }
                         active_runs.push(active);
                     }
                     Ok(_) => {

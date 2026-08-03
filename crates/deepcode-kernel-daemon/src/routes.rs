@@ -53,6 +53,18 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/llm/probe", post(llm_probe))
         .route(
+            "/api/host/provider-traces/:session_id",
+            get(provider_trace_metadata_list),
+        )
+        .route(
+            "/api/host/provider-traces/:session_id/:provider_turn_id/export-capability",
+            post(provider_trace_export_capability_mint),
+        )
+        .route(
+            "/api/host/provider-traces/:session_id/:provider_turn_id/export",
+            post(provider_trace_export).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/api/llm/chat",
             post(llm_chat).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )

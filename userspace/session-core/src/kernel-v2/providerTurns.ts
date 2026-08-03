@@ -219,6 +219,13 @@ export class SessionKernelProviderTurnsV2 {
       );
       const providerInput = {
         providerTurnId,
+        purpose: String(
+          (request.target as { kind: string }).kind
+        ) === 'finalAnswer'
+          ? 'finalAnswer' as const
+          : request.reason === 'userInput'
+            ? 'primary' as const
+            : 'continuation' as const,
         runId: state.runId,
         controlEpoch: state.controlEpoch,
         currentInput: currentSessionUserInputV2(state),
@@ -346,7 +353,22 @@ export class SessionKernelProviderTurnsV2 {
         return await this.settleStale(providerTurnId);
       }
       try {
-        this.host.readState().pendingGuidance = [];
+        const acceptingState = this.host.readState();
+        acceptingState.pendingGuidance = [];
+        if (
+          acceptingState.providerTurn?.providerTurnId
+            !== providerTurnId
+        ) {
+          throw new SessionKernelProviderTurnError(
+            'session_kernel_provider_turn_identity_mismatch',
+            'Provider response cannot be attached to a different active turn.'
+          );
+        }
+        acceptingState.providerTurn.response = {
+          items: cloneJson(output.items),
+          completion: cloneJson(output.completion),
+        };
+        await this.host.saveCheckpoint();
         try {
           if (output.kind === 'answer') {
             result = { kind: 'answer', text: output.text };
@@ -389,6 +411,8 @@ export class SessionKernelProviderTurnsV2 {
                 target: request.target,
                 receipt: output.receipt,
                 providerResult: output.providerResult,
+                orderedItems: output.items,
+                completion: output.completion,
                 intents,
               });
             latest.providerTurn!.status = 'awaitingTools';
@@ -1269,6 +1293,10 @@ function safeErrorMessage(error: unknown): string | undefined {
 
 function unique(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim()))];
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 export class SessionKernelProviderTurnError extends Error {

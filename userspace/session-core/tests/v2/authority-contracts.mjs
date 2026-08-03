@@ -13,11 +13,13 @@ import {
   admittedReply,
   assert,
   corpusFact,
+  createProviderCompletionReceipt,
   createPlan,
   createToolContext,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
   providerAnswer,
+  providerOrderedToolItems,
   providerToolIntent,
   providerToolIntents,
   toolContextRef,
@@ -204,6 +206,10 @@ async function providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission()
         return {
           kind: 'nativeToolCalls',
           calls: backendCalls,
+          items: providerOrderedToolItems(backendCalls),
+          completion: createProviderCompletionReceipt(responseDigest, {
+            hasToolCalls: true,
+          }),
           providerResult: {
             providerProfileId: 'provider-profile-v2-contract',
             provider: 'contract-provider',
@@ -410,15 +416,20 @@ async function providerToolCallBudgetRejectsWholeResponseBeforeSubmission() {
   const rejectingAdapter = new StrictSessionKernelProviderAdapterV2(
     {
       async requestTurn() {
+        const responseDigest = sha256Hash(canonicalJson(tooManyCalls));
         return {
           kind: 'nativeToolCalls',
           calls: tooManyCalls,
+          items: providerOrderedToolItems(tooManyCalls),
+          completion: createProviderCompletionReceipt(responseDigest, {
+            hasToolCalls: true,
+          }),
           providerResult: {
             providerProfileId: 'provider-profile-v2-contract',
             provider: 'contract-provider',
             model: 'contract-model',
           },
-          responseDigest: sha256Hash(canonicalJson(tooManyCalls)),
+          responseDigest,
         };
       },
     },
@@ -445,15 +456,20 @@ async function providerToolCallBudgetRejectsWholeResponseBeforeSubmission() {
   const maximumAdapter = new StrictSessionKernelProviderAdapterV2(
     {
       async requestTurn() {
+        const responseDigest = sha256Hash(canonicalJson(maximumCalls));
         return {
           kind: 'nativeToolCalls',
           calls: maximumCalls,
+          items: providerOrderedToolItems(maximumCalls),
+          completion: createProviderCompletionReceipt(responseDigest, {
+            hasToolCalls: true,
+          }),
           providerResult: {
             providerProfileId: 'provider-profile-v2-contract',
             provider: 'contract-provider',
             model: 'contract-model',
           },
-          responseDigest: sha256Hash(canonicalJson(maximumCalls)),
+          responseDigest,
         };
       },
     },

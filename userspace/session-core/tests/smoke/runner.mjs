@@ -1,7 +1,12 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonicalJson, SessionKernelHostRunnerV2,
-  sha256Hash } from '../../dist/index.js';
+import {
+  SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
+  SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+  SessionKernelHostRunnerV2,
+  canonicalJson,
+  sha256Hash,
+} from '../../dist/index.js';
 import {
   createCorpusToolContext,
   decodedSemanticReply,
@@ -9,6 +14,8 @@ import {
 const NOW = '2026-01-01T00:00:00.000Z';
 const RUN_ID = 'run-1';
 const WORKSPACE_REF = 'workspace-binding-session-smoke-v2';
+const PROVIDER_PROFILE_ID = 'session-smoke-provider';
+const PROVIDER_REASONING_TRANSPORT = 'openaiPlaintext';
 const digest = (value) => `sha256:${value.repeat(64)}`;
 const WORKSPACE_DIGEST = digest('d');
 const REPLY_KINDS = Object.freeze({
@@ -29,7 +36,7 @@ export function answerOutput(text) {
   return {
     kind: 'answer',
     text,
-    providerResult: { providerProfileId: 'session-smoke-provider',
+    providerResult: { providerProfileId: PROVIDER_PROFILE_ID,
       provider: 'controlled-smoke', model: 'session-v2-loop' },
   };
 }
@@ -63,7 +70,10 @@ export async function openSmokeSession(options) {
   const provider = {
     async requestTurn(input) {
       state.timeline.push(`provider:${input.currentInput.inputId}`);
-      return options.provider(input, state);
+      return sealProviderOutput(
+        input,
+        await options.provider(input, state)
+      );
     },
   };
   const runner = await SessionKernelHostRunnerV2.open({
@@ -72,8 +82,9 @@ export async function openSmokeSession(options) {
     sessionMemory: emptySessionMemory(),
     providerProfile: {
       schemaVersion: 'deepcode.host.provider-profile-bootstrap.v2',
-      providerProfileId: 'session-smoke-provider',
+      providerProfileId: PROVIDER_PROFILE_ID,
       providerProfileRevisionDigest: digest('5'),
+      reasoningTransport: PROVIDER_REASONING_TRANSPORT,
       contextWindowTokens: 100_000,
       maxOutputTokens: 4_096,
     },
@@ -96,6 +107,89 @@ export async function openSmokeSession(options) {
     },
   });
   return { runner, state, toolContext, workspaceBindingRef: WORKSPACE_REF };
+}
+function sealProviderOutput(input, output) {
+  if (output.kind === 'answer') {
+    const items = [{ kind: 'text', phase: 'unknown', text: output.text }];
+    const responseDigest = sha256Hash(canonicalJson({
+      kind: 'answer',
+      items,
+    }));
+    return {
+      ...output,
+      items,
+      completion: providerCompletionReceipt(responseDigest, false),
+    };
+  }
+  if (output.kind === 'toolIntent') {
+    const source = output.source;
+    const toolName = source.toolId;
+    const items = [{
+      kind: 'toolCall',
+      source: 'providerNative',
+      ordinal: 1,
+      callId: source.callId,
+      toolName,
+      toolId: source.toolId,
+      arguments: clone(source.arguments),
+    }];
+    const responseDigest = sha256Hash(canonicalJson({
+      kind: 'toolIntent',
+      items,
+    }));
+    return {
+      kind: 'toolIntent',
+      items,
+      completion: providerCompletionReceipt(responseDigest, true),
+      sources: [{
+        source: 'providerNative',
+        callId: source.callId,
+        toolId: source.toolId,
+        arguments: clone(source.arguments),
+      }],
+      receipt: {
+        schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+        providerTurnId: input.providerTurnId,
+        responseDigest,
+        callCount: 1,
+        calls: [{
+          ordinal: 1,
+          callId: source.callId,
+          toolName,
+          toolId: source.toolId,
+          argumentsDigest: sha256Hash(canonicalJson(source.arguments)),
+        }],
+        recordedAt: NOW,
+      },
+      providerResult: clone(output.providerResult),
+    };
+  }
+  throw new Error(`unsupported controlled smoke Provider output: ${output.kind}`);
+}
+function providerCompletionReceipt(responseDigest, hasToolCalls) {
+  const identity = canonicalJson({
+    responseDigest,
+    reasoningTransport: PROVIDER_REASONING_TRANSPORT,
+    finishReason: hasToolCalls ? 'tool_calls' : 'stop',
+  });
+  return {
+    schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
+    nativeCompletion: {
+      providerKind: 'openaiCompatible',
+      terminalSignal: '[DONE]',
+      finishReason: hasToolCalls ? 'tool_calls' : 'stop',
+    },
+    reasoningPresent: true,
+    reasoningTransport: PROVIDER_REASONING_TRANSPORT,
+    reasoningDigest: sha256Hash(`reasoning:${identity}`),
+    responseDigest,
+    trace: {
+      sealed: true,
+      sealDigest: sha256Hash(`seal:${identity}`),
+      terminalDigest: sha256Hash(`terminal:${identity}`),
+      recordCount: 4,
+    },
+  };
 }
 function scriptedKernelPort(state) {
   const invoke = async (method, request) => {

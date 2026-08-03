@@ -234,6 +234,7 @@ function eventRecord(sessionId, id, kind = 'workflow_stage', payload = {}) {
 function emptyTimeline(sessionId, revision = 0) {
   return {
     schemaVersion: 'deepcode.shared-conversation-projection.v2',
+    shapeVersion: 'deepcode.shared-conversation.work-segments.v1',
     sessionId,
     revision,
     sourceEventVersion: revision,
@@ -251,6 +252,8 @@ function activeTimeline(sessionId, kernelRunId, revision = 1) {
       revision,
       status: 'active',
       phase: 'processing',
+      currentActivity: null,
+      wait: null,
       languageBinding: {
         language: 'neutral',
         status: 'unavailable',

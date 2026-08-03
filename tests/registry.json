@@ -158,6 +158,8 @@
         "crates/deepcode-kernel-runtime/src/tests/v2_unified_tests.rs",
         "crates/deepcode-kernel-daemon/src/agent_api_tests.rs",
         "crates/deepcode-kernel-daemon/src/llm_stream_parser.rs",
+        "crates/deepcode-kernel-daemon/src/llm_transport_tests.rs",
+        "crates/deepcode-kernel-daemon/src/session_kernel_v2_store_dispatch_tests.rs",
         "shells/cli/src/main.rs",
         "shells/cli/src/cli_tests.rs"
       ]
@@ -197,6 +199,7 @@
         "userspace/session-core/tests/v2/loop-contracts.mjs",
         "userspace/session-core/tests/v2/recovery-contracts.mjs",
         "userspace/session-core/tests/v2/review-contracts.mjs",
+        "userspace/session-core/tests/v2/provider-lifecycle-contracts.mjs",
         "userspace/gui/tests/agent-session-store-contracts.mjs"
       ]
     },

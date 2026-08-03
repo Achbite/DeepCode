@@ -1,6 +1,5 @@
 use crate::prelude::*;
 use crate::*;
-use deepcode_kernel_abi::LlmProviderDiagnostic;
 use std::sync::OnceLock;
 
 pub(crate) fn settings_transition_gate_v2() -> &'static tokio::sync::RwLock<()> {
@@ -324,14 +323,72 @@ fn validate_permission_settings(settings: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn mask_unavailable_llm_profile_revisions(
+    state: &AppState,
+    profiles: &mut Value,
+    assumed_available_profile_ids: &std::collections::HashSet<String>,
+) -> Result<(), (String, String)> {
+    let Some(profile_items) = profiles.get_mut("profiles").and_then(Value::as_array_mut) else {
+        return Err((
+            "invalid_llm_profiles".to_string(),
+            "The LLM Profile store does not contain a profiles array".to_string(),
+        ));
+    };
+    for profile in profile_items {
+        if profile.get("enabled").and_then(Value::as_bool) != Some(true)
+            || !profile_reasoning_transport_is_compatible(profile)
+        {
+            continue;
+        }
+        let Some(profile_id) = profile.get("id").and_then(Value::as_str) else {
+            return Err((
+                "invalid_llm_profile".to_string(),
+                "An enabled LLM Profile has no identity".to_string(),
+            ));
+        };
+        if assumed_available_profile_ids.contains(profile_id.trim()) {
+            continue;
+        }
+        let profile_revision = config_value_hash(profile)
+            .map_err(|error| ("config_digest_failed".to_string(), error.message))?;
+        match state
+            .provider_trace_v1
+            .profile_revision_is_unavailable(profile_id, &profile_revision)
+        {
+            Ok(false) => {}
+            Ok(true) => profile["enabled"] = Value::Bool(false),
+            Err(error) => {
+                return Err((
+                    error.code.to_string(),
+                    "Provider Profile availability could not be verified".to_string(),
+                ))
+            }
+        }
+    }
+    profiles["defaultProfileId"] = preferred_enabled_llm_profile_id(profiles)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    Ok(())
+}
+
 pub(crate) async fn llm_profiles_get(State(state): State<AppState>) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    let mut profiles = gui.llm_profiles.clone();
+    let _transition = settings_transition_gate_v2().read().await;
+    let (mut profiles, store_path) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.llm_profiles.clone(),
+            gui.paths.llm_profiles_path.to_string_lossy().to_string(),
+        )
+    };
+    if let Err((code, message)) = mask_unavailable_llm_profile_revisions(
+        &state,
+        &mut profiles,
+        &std::collections::HashSet::new(),
+    ) {
+        return ApiResponse::error(code, message);
+    }
     if let Some(object) = profiles.as_object_mut() {
-        object.insert(
-            "storePath".to_string(),
-            Value::String(gui.paths.llm_profiles_path.to_string_lossy().to_string()),
-        );
+        object.insert("storePath".to_string(), Value::String(store_path));
     }
     ApiResponse::ok(profiles)
 }
@@ -365,7 +422,62 @@ pub(crate) async fn llm_profiles_patch(
                 format!("LLM Profile id `{profile_id}` is duplicated"),
             );
         }
+        if !profile_reasoning_transport_is_compatible(profile) {
+            return ApiResponse::error(
+                "invalid_llm_profile_reasoning_transport",
+                format!("LLM Profile `{profile_id}` requires a kind-compatible reasoningTransport"),
+            );
+        }
+        if profile.get("enabled").and_then(Value::as_bool) == Some(true)
+            && profile.get("thinking").and_then(Value::as_str) != Some("enabled")
+        {
+            return ApiResponse::error(
+                "invalid_llm_profile_thinking",
+                format!(
+                    "Enabled LLM Profile `{profile_id}` requires plaintext thinking to be enabled"
+                ),
+            );
+        }
     }
+    let reenable_profile_ids = match body.get("reenableProfileIds") {
+        None => std::collections::HashSet::new(),
+        Some(Value::Array(profile_ids_to_reenable)) => {
+            let mut requested = std::collections::HashSet::new();
+            for profile_id in profile_ids_to_reenable {
+                let Some(profile_id) = profile_id
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|profile_id| !profile_id.is_empty())
+                else {
+                    return ApiResponse::error(
+                        "invalid_llm_profile_reenable_ids",
+                        "reenableProfileIds must contain only non-empty Profile ids",
+                    );
+                };
+                if !requested.insert(profile_id.to_string()) {
+                    return ApiResponse::error(
+                        "duplicate_llm_profile_reenable_id",
+                        format!("LLM Profile re-enable id `{profile_id}` is duplicated"),
+                    );
+                }
+                if !profile_ids.contains(profile_id) {
+                    return ApiResponse::error(
+                        "unknown_llm_profile_reenable_id",
+                        format!(
+                            "LLM Profile re-enable id `{profile_id}` is not present in profiles"
+                        ),
+                    );
+                }
+            }
+            requested
+        }
+        Some(_) => {
+            return ApiResponse::error(
+                "invalid_llm_profile_reenable_ids",
+                "reenableProfileIds must be an array when provided",
+            )
+        }
+    };
     let secrets = body.get("secrets").cloned().unwrap_or_else(|| json!({}));
     let Some(secret_items) = secrets.as_object() else {
         return ApiResponse::error("invalid_llm_secrets", "secrets must be an object");
@@ -488,7 +600,51 @@ pub(crate) async fn llm_profiles_patch(
         Ok(hash) => hash,
         Err(error) => return ApiResponse::error("config_digest_failed", error.message),
     };
-    let preferred_profile_id = preferred_enabled_llm_profile_id(&next_profiles);
+    let mut reenabled_profile_revisions = Vec::new();
+    for profile in next_profiles
+        .get("profiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|profile| {
+            profile
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|profile_id| reenable_profile_ids.contains(profile_id.trim()))
+        })
+    {
+        let Some(profile_id) = profile.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let profile_revision = match config_value_hash(profile) {
+            Ok(revision) => revision,
+            Err(error) => return ApiResponse::error("config_digest_failed", error.message),
+        };
+        match state
+            .provider_trace_v1
+            .profile_revision_is_unavailable(profile_id, &profile_revision)
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                reenabled_profile_revisions.push((profile_id.to_string(), profile_revision))
+            }
+            Err(error) => {
+                return ApiResponse::error(
+                    error.code,
+                    "Provider Profile availability could not be verified before applying the configuration",
+                )
+            }
+        }
+    }
+    let mut effective_next_profiles = next_profiles.clone();
+    if let Err((code, message)) = mask_unavailable_llm_profile_revisions(
+        &state,
+        &mut effective_next_profiles,
+        &reenable_profile_ids,
+    ) {
+        return ApiResponse::error(code, message);
+    }
+    let preferred_profile_id = preferred_enabled_llm_profile_id(&effective_next_profiles);
     let mut next_sessions = old_sessions.clone();
     let mut profile_migrations = Vec::new();
     if let Some(preferred_profile_id) = preferred_profile_id.as_deref() {
@@ -497,10 +653,9 @@ pub(crate) async fn llm_profiles_patch(
                 .get("profileId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            if current_profile_id
-                .as_deref()
-                .is_some_and(|profile_id| llm_profile_is_enabled(&next_profiles, profile_id))
-            {
+            if current_profile_id.as_deref().is_some_and(|profile_id| {
+                llm_profile_is_enabled(&effective_next_profiles, profile_id)
+            }) {
                 continue;
             }
             let Some(session_id) = session
@@ -723,6 +878,23 @@ pub(crate) async fn llm_profiles_patch(
 
     gui.llm_profiles = next_profiles.clone();
     gui.sessions = next_sessions;
+    drop(gui);
+    for (profile_id, profile_revision) in &reenabled_profile_revisions {
+        if let Err(error) = state
+            .provider_trace_v1
+            .mark_profile_revision_available(profile_id, profile_revision)
+        {
+            return ApiResponse::error_with_data(
+                "provider_profile_reenable_record_failed",
+                "LLM Profile configuration was saved, but its explicit availability record could not be persisted",
+                json!({
+                    "profileId": profile_id,
+                    "profileRevision": profile_revision,
+                    "recordError": error.code,
+                }),
+            );
+        }
+    }
     let transition = json!({
         "status": "applied",
         "executorTransition": executor_transition,
@@ -739,6 +911,13 @@ pub(crate) async fn llm_profiles_patch(
         transition.clone(),
     );
     let mut output = next_profiles;
+    if let Err((code, message)) = mask_unavailable_llm_profile_revisions(
+        &state,
+        &mut output,
+        &std::collections::HashSet::new(),
+    ) {
+        return ApiResponse::error(code, message);
+    }
     if let Some(object) = output.as_object_mut() {
         object.insert("configAudit".to_string(), config_audit);
         object.insert(
@@ -843,118 +1022,59 @@ pub(crate) async fn llm_probe(
             }));
         }
     };
-    let output = call_llm_profile(
-        &profile,
-        json!({
-            "messages": [{ "role": "user", "content": "Reply with OK." }],
-            "tools": []
-        }),
-    )
-    .await;
+    let output = probe_llm_profile_native_stream(&profile).await;
     match output {
-        Ok(_) => ApiResponse::ok(json!({
-            "ok": true,
-            "provider": profile.kind,
-            "model": profile.model,
-            "latencyMs": now_millis().saturating_sub(started)
-        })),
-        Err(error) => ApiResponse::ok(json!({
-            "ok": false,
+        Ok(output) => ApiResponse::ok(json!({
+            "ok": output.reasoning_present && output.response_present,
             "provider": profile.kind,
             "model": profile.model,
             "latencyMs": now_millis().saturating_sub(started),
-            "error": error.to_string(),
-            "providerError": error
+            "reasoningPresent": output.reasoning_present,
+            "responsePresent": output.response_present,
+            "nativeCompletion": {
+                "providerKind": output.provider_kind,
+                "terminalSignal": output.terminal_signal,
+                "finishReason": output.finish_reason
+            }
         })),
+        Err(error) => {
+            let mut result = json!({
+                "ok": false,
+                "provider": profile.kind,
+                "model": profile.model,
+                "latencyMs": now_millis().saturating_sub(started),
+                "error": error.safe_message(),
+                "errorCode": error.code
+            });
+            if let Some(http_status) = error.http_status {
+                result["httpStatus"] = json!(http_status);
+            }
+            ApiResponse::ok(result)
+        }
     }
 }
 
 pub(crate) async fn llm_chat(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: Result<Json<Value>, JsonRejection>,
+    State(_state): State<AppState>,
+    _headers: axum::http::HeaderMap,
+    _body: Result<Json<Value>, JsonRejection>,
 ) -> Json<ApiResponse> {
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(rejection) => return json_body_rejection_response("/api/llm/chat", rejection),
-    };
-    let request_id = match llm_request_id(&body) {
-        Ok(request_id) => request_id,
-        Err(message) => return ApiResponse::error("provider_request_identity_invalid", message),
-    };
-    let profile_id = body
-        .get("profileId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if let Err(response) = authorize_llm_chat_transport(&state, &headers, profile_id.as_deref()) {
-        return response;
-    }
-    let profile = {
-        let gui = state.gui.lock().expect("gui state lock");
-        resolve_llm_profile(&gui, profile_id.as_deref())
-    };
-    let profile = match profile {
-        Ok(profile) => profile,
-        Err(error) => return ApiResponse::error("llm_profile_error", error),
-    };
-    if let Err(message) = validate_provider_identity_expectation(&profile, &body) {
-        return Json(ApiResponse {
-            ok: false,
-            data: Some(json!({ "requestId": request_id })),
-            error: Some("provider_profile_identity_invalid".to_string()),
-            message: Some(message),
-        });
-    }
-    let messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut request_envelope = json!({
-        "messages": messages,
-        "tools": body.get("tools").cloned().unwrap_or_else(|| json!([]))
-    });
-    if let Some(response_format) = body
-        .get("responseFormat")
-        .or_else(|| body.get("response_format"))
-    {
-        request_envelope["responseFormat"] = response_format.clone();
-    }
-    match call_llm_profile(&profile, request_envelope).await {
-        Ok(output) => {
-            let mut payload = llm_decoded_response_payload(output);
-            payload["providerProfileId"] = json!(profile.id);
-            payload["provider"] = json!(profile
-                .provider_flavor
-                .as_deref()
-                .unwrap_or(profile.kind.as_str()));
-            payload["model"] = json!(profile.model);
-            payload["requestId"] = json!(request_id);
-            ApiResponse::ok(payload)
-        }
-        Err(error) => {
-            let error_code = llm_provider_error_code(&error).to_string();
-            Json(ApiResponse {
-                ok: false,
-                data: Some(json!({
-                    "requestId": request_id,
-                    "providerError": error
-                })),
-                error: Some(error_code),
-                message: Some(error.to_string()),
-            })
-        }
-    }
+    ApiResponse::error(
+        "provider_nonstream_route_removed",
+        "Provider turns must use /api/llm/chat/stream",
+    )
+}
+
+struct AuthorizedLlmChatProfile {
+    profile: ResolvedLlmProfile,
+    profile_revision: String,
 }
 
 fn authorize_llm_chat_transport(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     requested_profile_id: Option<&str>,
-) -> Result<(), Json<ApiResponse>> {
-    if state.host_shell_authority.authorize(headers) {
-        return Ok(());
-    }
+) -> Result<AuthorizedLlmChatProfile, Json<ApiResponse>> {
     let required_header = |name: &'static str| {
         headers
             .get(name)
@@ -1020,72 +1140,62 @@ fn authorize_llm_chat_transport(
             "Session Provider transport cannot change the Run-bound Provider profile",
         ));
     }
-    let current_profile_digest = {
+    let authorized_profile = {
         let gui = state.gui.lock().expect("gui state lock");
-        gui.llm_profiles
-            .get("profiles")
-            .and_then(Value::as_array)
-            .and_then(|profiles| {
-                profiles.iter().find(|profile| {
-                    profile.get("id").and_then(Value::as_str) == requested_profile_id
-                        && profile.get("enabled").and_then(Value::as_bool) == Some(true)
-                })
-            })
-            .ok_or_else(|| {
+        let profile_id = bootstrap.provider_profile.provider_profile_id.as_str();
+        let profile_value =
+            profile_value_by_id(&gui.llm_profiles, profile_id).ok_or_else(|| {
                 ApiResponse::error(
                     "provider_profile_revision_stale",
                     "Run-bound Provider profile is no longer available",
                 )
-            })
-            .and_then(|profile| {
-                crate::host_v2_storage::stable_json_sha256(profile).map_err(|_| {
-                    ApiResponse::error(
-                        "provider_profile_revision_stale",
-                        "Run-bound Provider profile revision cannot be verified",
-                    )
-                })
-            })?
+            })?;
+        let profile_revision =
+            crate::host_v2_storage::stable_json_sha256(profile_value).map_err(|_| {
+                ApiResponse::error(
+                    "provider_profile_revision_stale",
+                    "Run-bound Provider profile revision cannot be verified",
+                )
+            })?;
+        if profile_revision != bootstrap.provider_profile.provider_profile_revision_digest {
+            return Err(ApiResponse::error(
+                "provider_profile_revision_stale",
+                "Run-bound Provider profile changed after immutable bootstrap",
+            ));
+        }
+        let profile = resolve_llm_profile(&gui, Some(profile_id)).map_err(|_| {
+            ApiResponse::error(
+                "provider_profile_revision_stale",
+                "Run-bound Provider profile is no longer available",
+            )
+        })?;
+        if profile.id != profile_id {
+            return Err(ApiResponse::error(
+                "provider_profile_identity_invalid",
+                "Run-bound Provider profile resolution changed identity",
+            ));
+        }
+        AuthorizedLlmChatProfile {
+            profile,
+            profile_revision,
+        }
     };
-    if current_profile_digest != bootstrap.provider_profile.provider_profile_revision_digest {
-        return Err(ApiResponse::error(
-            "provider_profile_revision_stale",
-            "Run-bound Provider profile changed after immutable bootstrap",
-        ));
-    }
-    Ok(())
-}
-
-fn llm_provider_error_code(error: &LlmProviderDiagnostic) -> &str {
-    if matches!(
-        error.reason.as_str(),
-        "ProviderProfileMissingApiKey"
-            | "ProviderUnsupportedKind"
-            | "provider_thinking_continuation_invalid"
-    ) {
-        return error.reason.as_str();
-    }
-    if matches!(
-        error.reason.as_str(),
-        "ProviderTransportFailed" | "ProviderResponseReadFailed"
-    ) || error.status.is_some_and(retryable_provider_http_status)
-    {
-        return "provider_retryable_no_mutation";
-    }
-    "llm_chat_failed"
-}
-
-pub(crate) fn retryable_provider_http_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+    Ok(authorized_profile)
 }
 
 pub(crate) async fn llm_chat_stream(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => {
-            let (_, message) = json_body_rejection_error("/api/llm/chat/stream", &rejection);
+            let message = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                "Provider stream request exceeded the local HTTP body limit."
+            } else {
+                "Provider stream request body is invalid JSON."
+            };
             return llm_stream_error_response(json!({
                 "type": "provider_error",
                 "error": "http_body_rejected",
@@ -1111,20 +1221,50 @@ pub(crate) async fn llm_chat_stream(
         .get("profileId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let profile = {
-        let gui = state.gui.lock().expect("gui state lock");
-        resolve_llm_profile(&gui, profile_id.as_deref())
+    let Some(session_id) = headers
+        .get("x-deepcode-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return llm_stream_error_response(json!({
+            "type": "provider_error",
+            "requestId": request_id,
+            "error": "provider_transport_authority_required",
+            "message": "Session Provider transport requires x-deepcode-session-id",
+        }));
     };
-    let profile = match profile {
-        Ok(profile) => profile,
-        Err(error) => {
+    let session_io_guard = session_private_io_lock(&session_id).read_owned().await;
+    {
+        let gui = state.gui.lock().expect("gui state lock");
+        if let Err(response) = verified_selectable_session(&gui, &session_id) {
+            let payload = response.0;
             return llm_stream_error_response(json!({
                 "type": "provider_error",
                 "requestId": request_id,
-                "error": error,
+                "error": payload.error.unwrap_or_else(|| "agent_session_unavailable".to_string()),
+                "message": payload.message.unwrap_or_else(|| "Session is unavailable for Provider transport.".to_string()),
+            }));
+        }
+    }
+    let authorized_profile = match authorize_llm_chat_transport(
+        &state,
+        &headers,
+        profile_id.as_deref(),
+    ) {
+        Ok(profile) => profile,
+        Err(response) => {
+            let payload = response.0;
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "requestId": request_id,
+                "error": payload.error.unwrap_or_else(|| "provider_transport_authority_invalid".to_string()),
+                "message": payload.message.unwrap_or_else(|| "Provider transport authority is invalid".to_string()),
             }));
         }
     };
+    let profile = authorized_profile.profile;
+    let profile_revision = authorized_profile.profile_revision;
     if let Err(message) = validate_provider_identity_expectation(&profile, &body) {
         return llm_stream_error_response(json!({
             "type": "provider_error",
@@ -1132,6 +1272,46 @@ pub(crate) async fn llm_chat_stream(
             "error": "provider_profile_identity_invalid",
             "message": message,
         }));
+    }
+    let (trace_identity, dispatch_authority) = match provider_trace_identity_from_request(
+        &state,
+        &headers,
+        &body,
+        &profile,
+        &profile_revision,
+        &request_id,
+    ) {
+        Ok(identity) => identity,
+        Err((code, message)) => {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "requestId": request_id,
+                "error": code,
+                "message": message,
+            }));
+        }
+    };
+    match state.provider_trace_v1.profile_revision_is_unavailable(
+        &trace_identity.profile_id,
+        &trace_identity.profile_revision,
+    ) {
+        Ok(false) => {}
+        Ok(true) => {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "requestId": request_id,
+                "error": "llm_profile_revision_unavailable",
+                "message": "Selected Provider Profile revision is unavailable until explicitly re-enabled or revised.",
+            }));
+        }
+        Err(error) => {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "requestId": request_id,
+                "error": error.code,
+                "message": "Provider Profile availability could not be verified.",
+            }));
+        }
     }
     let messages = body
         .get("messages")
@@ -1148,7 +1328,228 @@ pub(crate) async fn llm_chat_stream(
     {
         request_envelope["responseFormat"] = response_format.clone();
     }
-    llm_stream_response(profile, request_envelope, request_id)
+    llm_stream_response(
+        profile,
+        request_envelope,
+        request_id,
+        ProviderStreamTraceContextV1 {
+            store: state.provider_trace_v1.clone(),
+            identity: trace_identity,
+            dispatch_authority,
+        },
+        session_io_guard,
+    )
+}
+
+fn provider_trace_identity_from_request(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: &Value,
+    profile: &ResolvedLlmProfile,
+    profile_revision: &str,
+    request_id: &str,
+) -> Result<(ProviderTraceIdentityV1, ProviderStreamDispatchAuthorityV1), (String, String)> {
+    let header = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                (
+                    "provider_trace_identity_missing".to_string(),
+                    format!("Provider trace identity requires {name}"),
+                )
+            })
+    };
+    let session_id = header("x-deepcode-session-id")?.to_string();
+    let run_id = header("x-deepcode-run-id")?.to_string();
+    let capability =
+        deepcode_kernel_abi::RunCapabilityV2::new(header("x-deepcode-run-capability")?.to_string())
+            .map_err(|_| {
+                (
+                    "provider_trace_identity_invalid".to_string(),
+                    "Provider trace Run capability is invalid".to_string(),
+                )
+            })?;
+    let admission = state
+        .host_services
+        .session_kernel_v2
+        .provider_turn_admission(&session_id, &run_id, &capability, request_id)
+        .map_err(|error| (error.code.to_string(), error.message))?;
+    let trace = body
+        .get("providerOptions")
+        .and_then(|value| value.get("deepcode"))
+        .and_then(|value| value.get("sessionKernelV2"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            (
+                "provider_trace_identity_missing".to_string(),
+                "Provider request is missing Session trace identity".to_string(),
+            )
+        })?;
+    let submitted_user_turn_id = trace
+        .get("userTurnId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                "provider_trace_user_turn_invalid".to_string(),
+                "Provider trace userTurnId must be non-empty".to_string(),
+            )
+        })?;
+    let submitted_control_epoch = trace
+        .get("controlEpoch")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            (
+                "provider_trace_control_epoch_invalid".to_string(),
+                "Provider trace controlEpoch must be a positive integer".to_string(),
+            )
+        })?;
+    let submitted_purpose = trace
+        .get("purpose")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                "provider_trace_purpose_invalid".to_string(),
+                "Provider trace purpose must be non-empty".to_string(),
+            )
+        })?;
+    let current_input = provider_current_input_context(body)?;
+    let current_input_digest = crate::host_v2_storage::canonical_sha256(&current_input)
+        .map_err(|error| (error.code.to_string(), error.message))?;
+    let current_input_record = current_input
+        .get("currentInput")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            (
+                "provider_trace_context_invalid".to_string(),
+                "Provider current-input context is invalid".to_string(),
+            )
+        })?;
+    let context_purpose = current_input
+        .get("purpose")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            (
+                "provider_trace_purpose_invalid".to_string(),
+                "Provider current-input context has no turn purpose".to_string(),
+            )
+        })?;
+    let target_kind = current_input
+        .get("target")
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            (
+                "provider_trace_context_invalid".to_string(),
+                "Provider current-input context has no target kind".to_string(),
+            )
+        })?;
+    if current_input_digest != admission.current_input_digest
+        || current_input.get("providerTurnId").and_then(Value::as_str)
+            != Some(admission.provider_turn_id.as_str())
+        || current_input.get("runId").and_then(Value::as_str) != Some(run_id.as_str())
+        || current_input.get("controlEpoch").and_then(Value::as_u64)
+            != Some(admission.control_epoch)
+        || current_input_record.get("inputId").and_then(Value::as_str)
+            != Some(admission.current_input_id.as_str())
+        || submitted_user_turn_id != admission.current_input_id
+        || submitted_control_epoch != admission.control_epoch
+        || submitted_purpose != context_purpose
+        || admission.provider_profile_id != profile.id
+        || admission.provider_profile_revision != profile_revision
+    {
+        return Err((
+            "provider_trace_identity_mismatch".to_string(),
+            "Provider trace identity does not match the durable Session turn admission".to_string(),
+        ));
+    }
+    let purpose = match context_purpose {
+        "primary" => ProviderTracePurposeV1::Primary,
+        "continuation" => ProviderTracePurposeV1::Continuation,
+        "finalAnswer" => ProviderTracePurposeV1::FinalAnswer,
+        _ => {
+            return Err((
+                "provider_trace_purpose_invalid".to_string(),
+                "Provider trace purpose is unsupported".to_string(),
+            ))
+        }
+    };
+    if matches!(purpose, ProviderTracePurposeV1::FinalAnswer) != (target_kind == "finalAnswer") {
+        return Err((
+            "provider_trace_purpose_invalid".to_string(),
+            "Provider finalAnswer purpose does not match the durable turn target".to_string(),
+        ));
+    }
+    if matches!(purpose, ProviderTracePurposeV1::FinalAnswer)
+        && body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err((
+            "provider_final_answer_tools_forbidden".to_string(),
+            "A finalAnswer Provider request cannot expose tools".to_string(),
+        ));
+    }
+    let identity = ProviderTraceIdentityV1 {
+        session_id,
+        run_id,
+        user_turn_id: admission.current_input_id.clone(),
+        provider_turn_id: request_id.to_string(),
+        provider_kind: profile.kind.clone(),
+        model: profile.model.clone(),
+        profile_id: profile.id.clone(),
+        profile_revision: profile_revision.to_string(),
+        control_epoch: admission.control_epoch,
+        purpose,
+    };
+    Ok((
+        identity,
+        ProviderStreamDispatchAuthorityV1 {
+            session_store: state.host_services.session_kernel_v2.clone(),
+            run_capability: capability,
+            admission,
+        },
+    ))
+}
+
+fn provider_current_input_context(body: &Value) -> Result<Value, (String, String)> {
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            (
+                "provider_trace_context_invalid".to_string(),
+                "Provider request has no message array".to_string(),
+            )
+        })?;
+    let mut matches = messages.iter().filter_map(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        let content = message.get("content").and_then(Value::as_str)?;
+        let value = serde_json::from_str::<Value>(content).ok()?;
+        (value.get("schemaVersion").and_then(Value::as_str)
+            == Some("deepcode.session.provider-current-input.v2"))
+        .then_some(value)
+    });
+    let current_input = matches.next().ok_or_else(|| {
+        (
+            "provider_trace_context_invalid".to_string(),
+            "Provider request has no exact current-input context".to_string(),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err((
+            "provider_trace_context_invalid".to_string(),
+            "Provider request has multiple current-input contexts".to_string(),
+        ));
+    }
+    Ok(current_input)
 }
 
 fn llm_request_id(body: &Value) -> Result<String, String> {
@@ -1161,11 +1562,15 @@ fn llm_request_id(body: &Value) -> Result<String, String> {
 }
 
 fn llm_stream_error_response(data: Value) -> Response {
-    let body = format!(
-        "event: provider_error\ndata: {}\n\n",
-        serde_json::to_string(&data)
-            .unwrap_or_else(|_| "{\"type\":\"provider_error\"}".to_string())
-    );
+    let request_id = data
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code = data
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("provider_stream_failed");
+    let body = provider_public_error_event(request_id, code, "");
     (
         [
             (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
@@ -1246,6 +1651,7 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "high",
                 "thinking": "enabled",
+                "reasoningTransport": "openaiPlaintext",
                 "enabled": true
             },
             {
@@ -1259,6 +1665,7 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "max",
                 "thinking": "enabled",
+                "reasoningTransport": "openaiPlaintext",
                 "enabled": true
             }
         ],

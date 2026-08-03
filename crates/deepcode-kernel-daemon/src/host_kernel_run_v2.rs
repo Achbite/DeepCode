@@ -1,12 +1,12 @@
 use crate::host_kernel_operation_store_v2::{
     HostKernelBootstrapActivationV2, HostKernelBootstrapInitialInputV2,
     HostKernelBootstrapRecordV2, HostKernelDispatchAttemptStateV2, HostKernelDispatchPrepareV2,
-    HostKernelDispatchRecoveryV2, HostKernelOperationCallerCorrelationV2,
-    HostKernelOperationPreparedV2, HostKernelOperationRefV2,
-    HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
-    HostKernelOperationStoreV2, HostKernelPendingOperationV2, HostKernelRunOpeningInputV2,
-    HostKernelRunOpeningRecordV2, HostKernelStartupCancelRecoveryV2,
-    HostKernelStartupReconciliationV2, HostKernelStoredRunLifecycleV2,
+    HostKernelDispatchRecoveryV2, HostKernelLiveRunForDeletionV2,
+    HostKernelOperationCallerCorrelationV2, HostKernelOperationPreparedV2,
+    HostKernelOperationRefV2, HostKernelOperationSettlementReceiptV2,
+    HostKernelOperationSettlementV2, HostKernelOperationStoreV2, HostKernelPendingOperationV2,
+    HostKernelRunOpeningInputV2, HostKernelRunOpeningRecordV2, HostKernelStartupCancelRecoveryV2,
+    HostKernelStoredRunLifecycleV2,
 };
 use crate::host_run_broker_v2::{
     HostActiveRunBrokerV2, HostActiveRunRecordV2, HostActiveRunRegistrationV2,
@@ -246,6 +246,17 @@ pub(crate) struct HostKernelStartupRecoveryStatusV2 {
     pub(crate) pending_dispatch_count: usize,
     pub(crate) startup_error_codes: Vec<String>,
     pub(crate) operations: Vec<HostKernelOperationRecoveryStatusV2>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostKernelStartupTombstoneFailureV2 {
+    pub(crate) session_id: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
+pub(crate) struct HostKernelStartupReconciliationOutcomeV2 {
+    pub(crate) tombstone_failures: Vec<HostKernelStartupTombstoneFailureV2>,
 }
 
 impl HostKernelStartupRecoveryStatusV2 {
@@ -1838,6 +1849,69 @@ impl HostKernelRunCoordinatorV2 {
         }
     }
 
+    pub(crate) async fn retire_session_durable_run(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, HostV2StorageError> {
+        let Some(live_run) = self
+            .host_services
+            .kernel_operations_v2
+            .live_run_for_deletion(session_id)?
+        else {
+            return Ok(false);
+        };
+        match live_run {
+            HostKernelLiveRunForDeletionV2::Opening(opening) => {
+                self.retire_tombstoned_opening_run(&opening).await?
+            }
+            HostKernelLiveRunForDeletionV2::Active(bootstrap) => {
+                self.retire_tombstoned_active_run(
+                    &bootstrap,
+                    RunRetirementReasonCodeV2::SessionEnded,
+                )
+                .await?
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn verify_session_retired_for_deletion(
+        &self,
+        session_id: &str,
+    ) -> Result<(), HostV2StorageError> {
+        let _turn = self
+            .host_services
+            .active_runs_v2
+            .begin_session_turn(session_id)
+            .await?;
+        if self
+            .host_services
+            .kernel_operations_v2
+            .session_has_live_run(session_id)?
+        {
+            return Err(HostV2StorageError::conflict(
+                "agent_session_kernel_retirement_pending",
+                "Session still has an Opening or Active Host Kernel Run",
+            ));
+        }
+        self.host_services
+            .active_runs_v2
+            .verify_session_has_no_run_residue(session_id)?;
+        if self
+            .live_bridges
+            .lock()
+            .map_err(|_| live_registry_unavailable())?
+            .keys()
+            .any(|key| key.session_id == session_id)
+        {
+            return Err(HostV2StorageError::conflict(
+                "host_session_live_bridge_retirement_pending",
+                "Session still has a live Kernel bridge registry entry",
+            ));
+        }
+        Ok(())
+    }
+
     /// Rebinds cold Runs and resumes only dispatches whose durable evidence
     /// proves that no prior write crossed the effect boundary. A missing
     /// attempt is a first dispatch, and `Lost` proves pre-write failure.
@@ -1846,7 +1920,9 @@ impl HostKernelRunCoordinatorV2 {
     /// reconciliation.
     pub(crate) async fn reconcile_startup(
         &self,
-    ) -> Result<HostKernelStartupReconciliationV2, HostV2StorageError> {
+        recoverable_session_ids: &std::collections::HashSet<String>,
+        deletion_tombstones: &std::collections::HashSet<String>,
+    ) -> Result<HostKernelStartupReconciliationOutcomeV2, HostV2StorageError> {
         if !self
             .live_bridges
             .lock()
@@ -1863,11 +1939,11 @@ impl HostKernelRunCoordinatorV2 {
         recovery_status.phase = HostKernelStartupRecoveryPhaseV2::Reconciling;
         recovery_status.reconciled_at = Some(reconciled_at.clone());
         self.replace_startup_recovery_status(recovery_status.clone())?;
-        let reconciliation = match self
-            .host_services
-            .kernel_operations_v2
-            .reconcile_startup(&reconciled_at)
-        {
+        let reconciliation = match self.host_services.kernel_operations_v2.reconcile_startup(
+            &reconciled_at,
+            recoverable_session_ids,
+            deletion_tombstones,
+        ) {
             Ok(reconciliation) => reconciliation,
             Err(error) => {
                 recovery_status.record_error(error.code);
@@ -1880,14 +1956,52 @@ impl HostKernelRunCoordinatorV2 {
         recovery_status.active_run_count = reconciliation.active_runs.len();
         recovery_status.attempts_marked_indeterminate =
             reconciliation.attempts_marked_indeterminate;
-        for _ in &reconciliation.unsupported_history_runs {
+        let mut tombstone_failures = Vec::new();
+        for (session_id, _) in &reconciliation.unsupported_history_runs {
             recovery_status.record_error("unsupported_history_schema");
             self.host_services
                 .active_runs_v2
                 .record_startup_error("unsupported_history_schema");
+            if deletion_tombstones.contains(session_id) {
+                record_startup_tombstone_failure(
+                    &mut tombstone_failures,
+                    session_id,
+                    HostV2StorageError::conflict(
+                        "unsupported_history_schema",
+                        "Deletion tombstone refers to an unsupported Host Kernel Run history",
+                    ),
+                );
+            }
         }
 
         for cancellation in &reconciliation.cancel_recoveries {
+            if deletion_tombstones.contains(&cancellation.bootstrap.session_id) {
+                if let Err(error) = self
+                    .retire_tombstoned_active_run(
+                        &cancellation.bootstrap,
+                        RunRetirementReasonCodeV2::HostRequested,
+                    )
+                    .await
+                {
+                    recovery_status.record_error(error.code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(error.code);
+                    if let Some(operation) = &cancellation.pending_operation {
+                        recovery_status.operations.push(startup_operation_status(
+                            operation,
+                            HostKernelOperationRecoveryStateV2::RecoveryFailed,
+                            Some(error.code),
+                        ));
+                    }
+                    record_startup_tombstone_failure(
+                        &mut tombstone_failures,
+                        &cancellation.bootstrap.session_id,
+                        error,
+                    );
+                }
+                continue;
+            }
             match self.recover_startup_cancel(cancellation).await {
                 Ok(HostKernelStartupCancelDispositionV2::CanonicalRetired) => {
                     if let Some(operation) = &cancellation.pending_operation {
@@ -1935,6 +2049,20 @@ impl HostKernelRunCoordinatorV2 {
         }
 
         for opening in &reconciliation.opening_runs {
+            if deletion_tombstones.contains(&opening.session_id) {
+                if let Err(error) = self.retire_tombstoned_opening_run(opening).await {
+                    recovery_status.record_error(error.code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(error.code);
+                    record_startup_tombstone_failure(
+                        &mut tombstone_failures,
+                        &opening.session_id,
+                        error,
+                    );
+                }
+                continue;
+            }
             if let Err(error) = self.recover_opening_run(opening).await {
                 recovery_status.record_error(error.code);
                 self.host_services
@@ -1960,6 +2088,35 @@ impl HostKernelRunCoordinatorV2 {
         for bootstrap in &reconciliation.active_runs {
             let run_key = (bootstrap.session_id.clone(), bootstrap.host_run_id.clone());
             let pending = pending_by_run.remove(&run_key).unwrap_or_default();
+            if deletion_tombstones.contains(&bootstrap.session_id) {
+                if let Err(error) = self
+                    .retire_tombstoned_active_run(
+                        bootstrap,
+                        RunRetirementReasonCodeV2::SessionEnded,
+                    )
+                    .await
+                {
+                    recovery_status.record_error(error.code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(error.code);
+                    recovery_status
+                        .operations
+                        .extend(pending.iter().map(|operation| {
+                            startup_operation_status(
+                                operation,
+                                HostKernelOperationRecoveryStateV2::RecoveryFailed,
+                                Some(error.code),
+                            )
+                        }));
+                    record_startup_tombstone_failure(
+                        &mut tombstone_failures,
+                        &bootstrap.session_id,
+                        error,
+                    );
+                }
+                continue;
+            }
             let mut unresolved = Vec::new();
             let mut observation_failure = None;
             for operation in pending {
@@ -2231,7 +2388,71 @@ impl HostKernelRunCoordinatorV2 {
                 result.as_ref().err().map(|error| error.code),
             );
         }
-        Ok(reconciliation)
+        Ok(HostKernelStartupReconciliationOutcomeV2 { tombstone_failures })
+    }
+
+    async fn retire_tombstoned_opening_run(
+        &self,
+        opening: &HostKernelRunOpeningRecordV2,
+    ) -> Result<(), HostV2StorageError> {
+        let _turn = self
+            .host_services
+            .active_runs_v2
+            .begin_session_turn(&opening.session_id)
+            .await?;
+        let (response, _capability) = self
+            .kernel_transport
+            .open_run_host_with_settings(
+                opening.run_open_envelope.clone(),
+                self.resolve_recovery_settings(
+                    opening.workspace_kind,
+                    &opening.workspace_binding_ref,
+                )?,
+            )
+            .map_err(workspace_resolve_error)?;
+        let exact_reply = run_open_reply(response, &opening.run_open_request_id)?;
+        self.kernel_transport
+            .service()
+            .retire_run_host(
+                exact_reply.run_id,
+                RunRetirementReasonCodeV2::SessionEnded,
+                None,
+            )
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_kernel_tombstone_opening_retirement_pending",
+                    "Deletion tombstone RunOpen was recovered, but its Kernel Run could not be retired",
+                )
+            })?;
+        self.host_services.kernel_operations_v2.abandon_opening(
+            &opening.session_id,
+            &opening.host_run_id,
+            &opening.run_open_request_id,
+            &opening.opening_digest,
+            &crate::utils::now_text(),
+        )?;
+        Ok(())
+    }
+
+    async fn retire_tombstoned_active_run(
+        &self,
+        bootstrap: &HostKernelBootstrapRecordV2,
+        retirement_reason: RunRetirementReasonCodeV2,
+    ) -> Result<(), HostV2StorageError> {
+        let turn = self
+            .host_services
+            .active_runs_v2
+            .begin_session_turn(&bootstrap.session_id)
+            .await?;
+        self.retire_run_with_turn_and_caller_correlation(
+            &turn,
+            &bootstrap.session_id,
+            &bootstrap.host_run_id,
+            &bootstrap.run_id,
+            retirement_reason,
+            None,
+        )?;
+        Ok(())
     }
 
     async fn recover_startup_cancel(
@@ -2796,6 +3017,26 @@ fn pending_operation_ref(operation: &HostKernelPendingOperationV2) -> HostKernel
         bootstrap_digest: operation.bootstrap_digest.clone(),
         operation_request_id: operation.operation_request_id.clone(),
     }
+}
+
+fn record_startup_tombstone_failure(
+    failures: &mut Vec<HostKernelStartupTombstoneFailureV2>,
+    session_id: &str,
+    error: HostV2StorageError,
+) {
+    if let Some(existing) = failures
+        .iter_mut()
+        .find(|failure| failure.session_id == session_id)
+    {
+        existing.code = error.code;
+        existing.message = error.message;
+        return;
+    }
+    failures.push(HostKernelStartupTombstoneFailureV2 {
+        session_id: session_id.to_string(),
+        code: error.code,
+        message: error.message,
+    });
 }
 
 fn startup_operation_status(

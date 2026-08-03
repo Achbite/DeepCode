@@ -24,6 +24,8 @@ mod llm_stream_parser;
 mod llm_transport;
 mod prelude;
 mod project_store;
+mod provider_trace_api;
+mod provider_trace_v1;
 mod routes;
 mod session_bootstrap_v2;
 mod session_kernel_v2_store;
@@ -55,6 +57,8 @@ pub(crate) use llm_provider_transport::*;
 pub(crate) use llm_stream_parser::*;
 pub(crate) use llm_transport::*;
 pub(crate) use project_store::*;
+pub(crate) use provider_trace_api::*;
+pub(crate) use provider_trace_v1::*;
 pub(crate) use session_kernel_v2_store::*;
 pub(crate) use settings_api::*;
 pub(crate) use skill_api::*;
@@ -62,6 +66,46 @@ pub(crate) use state::*;
 pub(crate) use terminal_api::*;
 pub(crate) use utils::*;
 pub(crate) use workspace_api::*;
+
+fn persist_startup_tombstone_outcomes(
+    gui: &Arc<Mutex<GuiState>>,
+    tombstone_session_ids: &std::collections::HashSet<String>,
+    failures: &[crate::host_kernel_run_v2::HostKernelStartupTombstoneFailureV2],
+) -> Result<(), String> {
+    if tombstone_session_ids.is_empty() {
+        return Ok(());
+    }
+    let failed_at = now_text();
+    let mut gui = gui.lock().expect("gui state lock");
+    let mut changed = false;
+    for session in &mut gui.sessions {
+        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !tombstone_session_ids.contains(session_id) || !session_is_deletion_tombstone(session) {
+            continue;
+        }
+        if let Some(failure) = failures
+            .iter()
+            .find(|failure| failure.session_id == session_id)
+        {
+            mark_session_deletion_failed(session, &failed_at, failure.code, &failure.message);
+            changed = true;
+        } else if session_deletion_status(session) == Some("pending") {
+            mark_session_deletion_failed(
+                session,
+                &failed_at,
+                "agent_session_deletion_interrupted",
+                "The previous Session deletion owner ended before index finalization; retry deletion explicitly.",
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        crate::session_metadata_v2::persist_session_index(&gui)?;
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -76,6 +120,21 @@ async fn main() {
         "Kernel v2 capability transport requires a loopback listener"
     );
     let gui_state = GuiState::new();
+    let metadata_available = gui_state.session_metadata_error.is_none();
+    let recoverable_session_ids = gui_state
+        .sessions
+        .iter()
+        .filter(|session| metadata_available && session_is_verified_selectable(session))
+        .filter_map(|session| session.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    let deletion_tombstones = gui_state
+        .sessions
+        .iter()
+        .filter(|session| metadata_available && session_is_deletion_tombstone(session))
+        .filter_map(|session| session.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
     let (kernel_v2_executor_config, kernel_v2_secrets) = runtime_tool_configuration(&gui_state);
     let kernel_v2_fact_store_path =
         deepcode_kernel_ledger::v2::configured_fact_store_path(user_config_root())
@@ -86,11 +145,14 @@ async fn main() {
         Arc::new(kernel_v2_secrets),
     )
     .expect("open canonical Kernel v2 service");
+    let provider_trace_v1 = ProviderTraceStoreV1::new(gui_state.paths.sessions_dir.clone());
     let host_services = HostServices::from_projects(
         &gui_state.projects,
         gui_state.paths.sessions_dir.clone(),
         kernel_v2_service.clone(),
         Some(kernel_v2_service.fact_reader()),
+        &recoverable_session_ids,
+        &deletion_tombstones,
     )
     .expect("initialize Host services with operating-system authority entropy");
     let gui = Arc::new(Mutex::new(gui_state));
@@ -115,10 +177,49 @@ async fn main() {
         format!("http://{addr}"),
     )
     .expect("initialize Host-owned Session Kernel v2 coordinator");
-    if let Err(error) = kernel_session_v2.reconcile_startup().await {
-        host_services
-            .active_runs_v2
-            .record_startup_error(error.code);
+    match kernel_session_v2
+        .reconcile_startup(&recoverable_session_ids, &deletion_tombstones)
+        .await
+    {
+        Ok(outcome) => {
+            if let Err(error) = persist_startup_tombstone_outcomes(
+                &gui,
+                &deletion_tombstones,
+                &outcome.tombstone_failures,
+            ) {
+                host_services
+                    .active_runs_v2
+                    .record_startup_error("agent_session_deletion_startup_failure_persist_failed");
+                gui.lock().expect("gui state lock").session_metadata_error = Some(format!(
+                    "Session deletion startup failure state could not be persisted: {error}"
+                ));
+            }
+        }
+        Err(error) => {
+            host_services
+                .active_runs_v2
+                .record_startup_error(error.code);
+            let failures = deletion_tombstones
+                .iter()
+                .map(
+                    |session_id| crate::host_kernel_run_v2::HostKernelStartupTombstoneFailureV2 {
+                        session_id: session_id.clone(),
+                        code: error.code,
+                        message: error.message.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            if let Err(persist_error) =
+                persist_startup_tombstone_outcomes(&gui, &deletion_tombstones, &failures)
+            {
+                host_services
+                    .active_runs_v2
+                    .record_startup_error("agent_session_deletion_startup_failure_persist_failed");
+                gui.lock().expect("gui state lock").session_metadata_error = Some(format!(
+                    "Session deletion startup failure state could not be persisted: {persist_error}"
+                ));
+            }
+        }
     }
     let state = AppState {
         kernel_v2,
@@ -126,6 +227,9 @@ async fn main() {
         host_shell_authority,
         gui,
         host_services,
+        provider_trace_v1,
+        provider_trace_export_limiter_v1:
+            crate::provider_trace_api::ProviderTraceExportLimiterV1::default(),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
         session_runs: Arc::new(Mutex::new(HashMap::new())),
     };

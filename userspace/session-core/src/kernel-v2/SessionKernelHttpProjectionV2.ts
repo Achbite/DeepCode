@@ -278,19 +278,48 @@ implements SessionKernelHostProjectionSinkV2 {
         failure.message
       );
     }
-    const envelope = exactObject(await response.json(), ['ok', 'data']);
-    if (envelope.ok !== true) {
-      throw invalidProjectionReply();
+    const rawReply: unknown = await response.json();
+    let envelope: Record<string, unknown>;
+    try {
+      envelope = exactObject(rawReply, ['ok', 'data']);
+    } catch {
+      throw invalidProjectionReply(
+        projectionReplyShapeDiagnostic(
+          rawReply,
+          projectionId,
+          projectionDigest
+        )
+      );
     }
-    const data = exactObject(
-      envelope.data,
-      [
-        'schemaVersion',
-        'projectionId',
-        'projectionDigest',
-        'replayed',
-      ]
-    );
+    if (envelope.ok !== true) {
+      throw invalidProjectionReply(
+        projectionReplyShapeDiagnostic(
+          rawReply,
+          projectionId,
+          projectionDigest
+        )
+      );
+    }
+    let data: Record<string, unknown>;
+    try {
+      data = exactObject(
+        envelope.data,
+        [
+          'schemaVersion',
+          'projectionId',
+          'projectionDigest',
+          'replayed',
+        ]
+      );
+    } catch {
+      throw invalidProjectionReply(
+        projectionReplyShapeDiagnostic(
+          rawReply,
+          projectionId,
+          projectionDigest
+        )
+      );
+    }
     if (
       data.schemaVersion
         !== SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA
@@ -298,7 +327,13 @@ implements SessionKernelHostProjectionSinkV2 {
       || data.projectionDigest !== projectionDigest
       || typeof data.replayed !== 'boolean'
     ) {
-      throw invalidProjectionReply();
+      throw invalidProjectionReply(
+        projectionReplyShapeDiagnostic(
+          rawReply,
+          projectionId,
+          projectionDigest
+        )
+      );
     }
     return {
       projectionId,
@@ -349,6 +384,7 @@ implements SessionKernelHostProjectionSinkV2 {
     const response = await this.fetchImpl(this.priorTimelineEndpoint, {
       method: 'GET',
       headers: {
+        'x-deepcode-run-id': this.runId,
         'x-deepcode-run-capability': this.#runCapability,
       },
     });
@@ -358,10 +394,22 @@ implements SessionKernelHostProjectionSinkV2 {
         `Prior Session timeline read failed with HTTP ${response.status}.`
       );
     }
-    const rawEnvelope = objectRecord(await response.json());
-    if (rawEnvelope?.ok !== true) {
-      const error = objectRecord(rawEnvelope?.error);
-      const code = textField(error, 'code');
+    let envelope: Record<string, unknown>;
+    try {
+      envelope = exactObject(
+        await response.json(),
+        ['ok', 'data', 'error', 'message']
+      );
+    } catch {
+      throw new SessionKernelProjectionTransportError(
+        'host_session_prior_timeline_response_invalid',
+        'Prior Session timeline returned an invalid Host response.'
+      );
+    }
+    if (envelope.ok !== true) {
+      const code = typeof envelope.error === 'string'
+        ? envelope.error
+        : undefined;
       throw new SessionKernelProjectionTransportError(
         code === 'UnsupportedHistorySchema'
           ? 'UnsupportedHistorySchema'
@@ -371,7 +419,12 @@ implements SessionKernelHostProjectionSinkV2 {
           : 'Prior Session timeline is unavailable.'
       );
     }
-    const envelope = exactObject(rawEnvelope, ['ok', 'data']);
+    if (envelope.error !== null || envelope.message !== null) {
+      throw new SessionKernelProjectionTransportError(
+        'host_session_prior_timeline_response_invalid',
+        'Successful prior Session timeline response contains an error.'
+      );
+    }
     let timeline: AgentTimelineResult;
     try {
       timeline = normalizeAgentTimelineSnapshot(envelope.data).timeline;
@@ -1573,10 +1626,35 @@ function invalidApiBase(): SessionKernelProjectionTransportError {
   );
 }
 
-function invalidProjectionReply(): SessionKernelProjectionTransportError {
+function projectionReplyShapeDiagnostic(
+  value: unknown,
+  projectionId: string,
+  projectionDigestValue: string
+): string {
+  const root = objectRecord(value);
+  const data = objectRecord(root?.data);
+  return JSON.stringify({
+    rootKeys: root ? Object.keys(root).sort() : [],
+    dataKeys: data ? Object.keys(data).sort() : [],
+    ok: root?.ok === true,
+    schemaMatches:
+      data?.schemaVersion
+      === SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA,
+    projectionIdMatches: data?.projectionId === projectionId,
+    projectionDigestMatches:
+      data?.projectionDigest === projectionDigestValue,
+    replayedIsBoolean: typeof data?.replayed === 'boolean',
+  });
+}
+
+function invalidProjectionReply(
+  diagnostic?: string
+): SessionKernelProjectionTransportError {
   return new SessionKernelProjectionTransportError(
     'session_kernel_projection_response_invalid',
-    'Host returned an invalid Session v2 projection acknowledgement.'
+    diagnostic
+      ? `Host returned an invalid Session v2 projection acknowledgement: ${diagnostic}`
+      : 'Host returned an invalid Session v2 projection acknowledgement.'
   );
 }
 

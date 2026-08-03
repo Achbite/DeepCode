@@ -7,6 +7,10 @@ use crate::host_v2_storage::{
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
+use crate::provider_trace_v1::{
+    ProviderTraceErrorV1, ProviderTraceIdentityV1, ProviderTracePurposeV1, ProviderTraceStoreV1,
+    ProviderTraceWriterV1,
+};
 use crate::session_bootstrap_v2::HostSessionPriorEventsV2;
 use crate::AppState;
 use axum::body::Body;
@@ -30,6 +34,7 @@ const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-list-reply.v2";
 const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-append-reply.v2";
+const SESSION_KERNEL_CHECKPOINT_V2_SCHEMA: &str = "deepcode.session.kernel-checkpoint.v2";
 const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA: &str =
     "deepcode.session.kernel-operation-result.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
@@ -113,6 +118,26 @@ pub(crate) struct SessionKernelV2Store {
     active_runs: HostActiveRunBrokerV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionProviderTurnAdmissionV2 {
+    pub(crate) provider_turn_id: String,
+    pub(crate) control_epoch: u64,
+    pub(crate) current_input_id: String,
+    pub(crate) current_input_digest: String,
+    pub(crate) provider_profile_id: String,
+    pub(crate) provider_profile_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionProviderDispatchBindingV2 {
+    pub(crate) provider_turn_id: String,
+    pub(crate) run_id: String,
+    pub(crate) control_epoch: u64,
+    pub(crate) current_input_id: String,
+    pub(crate) current_input_digest: String,
+    pub(crate) purpose: ProviderTracePurposeV1,
+}
+
 impl SessionKernelV2Store {
     pub(crate) fn new(sessions_dir: PathBuf, active_runs: HostActiveRunBrokerV2) -> Self {
         Self {
@@ -131,6 +156,71 @@ impl SessionKernelV2Store {
             .authorize_session_run_transport(session_id, run_id, capability)?;
         let path = self.run_store_path(session_id, run_id)?;
         with_storage_path_lock(&path, || read_run_store(&path, session_id, run_id))
+    }
+
+    pub(crate) fn provider_turn_admission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        capability: &RunCapabilityV2,
+        provider_turn_id: &str,
+    ) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
+        validate_bounded_identity(provider_turn_id, "providerTurnId", 512)?;
+        let records = self.list(session_id, run_id, capability)?;
+        provider_turn_admission_from_records(&records, run_id, provider_turn_id)
+    }
+
+    pub(crate) fn commit_provider_dispatch(
+        &self,
+        capability: &RunCapabilityV2,
+        expected_admission: &SessionProviderTurnAdmissionV2,
+        exact_request_binding: &SessionProviderDispatchBindingV2,
+        trace_store: &ProviderTraceStoreV1,
+        trace_identity: ProviderTraceIdentityV1,
+        exact_request_body: &[u8],
+    ) -> Result<ProviderTraceWriterV1, ProviderTraceErrorV1> {
+        let session_id = trace_identity.session_id.clone();
+        let run_id = trace_identity.run_id.clone();
+        let path = self.run_store_path(&session_id, &run_id)?;
+        self.active_runs
+            .with_authorized_session_run_transport_storage(
+                &session_id,
+                &run_id,
+                capability,
+                &path,
+                || {
+                    let records =
+                        read_run_store(&path, &trace_identity.session_id, &trace_identity.run_id)?;
+                    let current_admission = provider_turn_admission_from_records(
+                        &records,
+                        &trace_identity.run_id,
+                        &trace_identity.provider_turn_id,
+                    )?;
+                    if &current_admission != expected_admission
+                        || current_admission.provider_turn_id != trace_identity.provider_turn_id
+                        || current_admission.control_epoch != trace_identity.control_epoch
+                        || current_admission.current_input_id != trace_identity.user_turn_id
+                        || current_admission.provider_profile_id != trace_identity.profile_id
+                        || current_admission.provider_profile_revision
+                            != trace_identity.profile_revision
+                        || exact_request_binding.provider_turn_id
+                            != current_admission.provider_turn_id
+                        || exact_request_binding.run_id != trace_identity.run_id
+                        || exact_request_binding.control_epoch != current_admission.control_epoch
+                        || exact_request_binding.current_input_id
+                            != current_admission.current_input_id
+                        || exact_request_binding.current_input_digest
+                            != current_admission.current_input_digest
+                        || exact_request_binding.purpose != trace_identity.purpose
+                    {
+                        return Err(provider_dispatch_stale());
+                    }
+                    trace_store
+                        .begin_committed_turn(trace_identity, exact_request_body)
+                        .map_err(|error| HostV2StorageError::io(error.code, error.message))
+                },
+            )
+            .map_err(ProviderTraceErrorV1::from)
     }
 
     fn append(
@@ -375,6 +465,159 @@ impl SessionKernelV2Store {
             .join("kernel-v2")
             .join(format!("{}.jsonl", sha256_path_component(run_id))))
     }
+}
+
+fn provider_turn_admission_from_records(
+    records: &[SessionKernelPersistenceRecordV2],
+    run_id: &str,
+    provider_turn_id: &str,
+) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
+    let mut latest: Option<(u64, String, &Value, bool)> = None;
+    for record in records {
+        let checkpoint = match record.record_kind {
+            SessionKernelPersistenceRecordKindV2::Checkpoint => Some(&record.data),
+            SessionKernelPersistenceRecordKindV2::PublicRequestSettled => {
+                record.data.get("checkpoint")
+            }
+            _ => None,
+        };
+        let Some(checkpoint) = checkpoint else {
+            continue;
+        };
+        let revision = checkpoint
+            .get("checkpointRevision")
+            .and_then(Value::as_u64)
+            .ok_or_else(provider_turn_admission_invalid)?;
+        match latest.as_mut() {
+            None => {
+                let digest =
+                    canonical_sha256(checkpoint).map_err(|_| provider_turn_admission_invalid())?;
+                latest = Some((revision, digest, checkpoint, false));
+            }
+            Some((latest_revision, latest_digest, latest_checkpoint, conflict))
+                if revision > *latest_revision =>
+            {
+                let digest =
+                    canonical_sha256(checkpoint).map_err(|_| provider_turn_admission_invalid())?;
+                *latest_revision = revision;
+                *latest_digest = digest;
+                *latest_checkpoint = checkpoint;
+                *conflict = false;
+            }
+            Some((latest_revision, latest_digest, _, conflict)) if revision == *latest_revision => {
+                let digest =
+                    canonical_sha256(checkpoint).map_err(|_| provider_turn_admission_invalid())?;
+                if digest != *latest_digest {
+                    *conflict = true;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    let (checkpoint_revision, _, checkpoint, revision_conflict) =
+        latest.ok_or_else(provider_turn_admission_missing)?;
+    if revision_conflict {
+        return Err(provider_turn_admission_invalid());
+    }
+    if checkpoint.get("schemaVersion").and_then(Value::as_str)
+        != Some(SESSION_KERNEL_CHECKPOINT_V2_SCHEMA)
+    {
+        return Err(provider_turn_admission_invalid());
+    }
+    let state = checkpoint
+        .get("state")
+        .and_then(Value::as_object)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    if state.get("runId").and_then(Value::as_str) != Some(run_id) {
+        return Err(provider_turn_admission_invalid());
+    }
+    if state.get("checkpointRevision").and_then(Value::as_u64) != Some(checkpoint_revision) {
+        return Err(provider_turn_admission_invalid());
+    }
+    let control_epoch = state
+        .get("controlEpoch")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let current_input_id = state
+        .get("currentInputId")
+        .and_then(Value::as_str)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    validate_bounded_identity(current_input_id, "currentInputId", 512)?;
+    let provider_turn = state
+        .get("providerTurn")
+        .and_then(Value::as_object)
+        .ok_or_else(provider_turn_admission_missing)?;
+    if provider_turn.get("providerTurnId").and_then(Value::as_str) != Some(provider_turn_id)
+        || provider_turn.get("controlEpoch").and_then(Value::as_u64) != Some(control_epoch)
+        || provider_turn.get("status").and_then(Value::as_str) != Some("active")
+    {
+        return Err(provider_turn_admission_missing());
+    }
+    let context_assembly = provider_turn
+        .get("contextAssembly")
+        .and_then(Value::as_object)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let profile = context_assembly
+        .get("providerProfile")
+        .and_then(Value::as_object)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let provider_profile_id = profile
+        .get("providerProfileId")
+        .and_then(Value::as_str)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    validate_bounded_identity(provider_profile_id, "providerProfileId", 512)?;
+    let provider_profile_revision = profile
+        .get("providerProfileRevisionDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    validate_sha256_digest(provider_profile_revision, "providerProfileRevisionDigest")?;
+    let sections = context_assembly
+        .get("trimming")
+        .and_then(|value| value.get("sections"))
+        .and_then(Value::as_array)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let current_input_sections = sections
+        .iter()
+        .filter(|section| section.get("section").and_then(Value::as_str) == Some("currentInput"))
+        .collect::<Vec<_>>();
+    if current_input_sections.len() != 1 {
+        return Err(provider_turn_admission_invalid());
+    }
+    let current_input_digest = current_input_sections[0]
+        .get("digest")
+        .and_then(Value::as_str)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    validate_sha256_digest(current_input_digest, "currentInputDigest")?;
+    Ok(SessionProviderTurnAdmissionV2 {
+        provider_turn_id: provider_turn_id.to_string(),
+        control_epoch,
+        current_input_id: current_input_id.to_string(),
+        current_input_digest: current_input_digest.to_string(),
+        provider_profile_id: provider_profile_id.to_string(),
+        provider_profile_revision: provider_profile_revision.to_string(),
+    })
+}
+
+fn provider_turn_admission_missing() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_admission_missing",
+        "Provider transport has no exact active durable Session turn admission",
+    )
+}
+
+fn provider_turn_admission_invalid() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_admission_invalid",
+        "Provider transport durable Session turn admission is invalid",
+    )
+}
+
+fn provider_dispatch_stale() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_dispatch_stale",
+        "Provider dispatch no longer matches the exact active durable Session turn",
+    )
 }
 
 fn preflight_store_append(
@@ -2209,6 +2452,38 @@ fn public_agent_event_id(event: &Value) -> Result<&str, HostV2StorageError> {
     })
 }
 
+fn session_private_write_unavailable_response(
+    state: &AppState,
+    session_id: &str,
+) -> Option<Response> {
+    let gui = state.gui.lock().expect("gui state lock");
+    if let Some(error) = gui.session_metadata_error.as_deref() {
+        return Some(v2_error_response(
+            StatusCode::CONFLICT,
+            "unsupported_history_schema",
+            error,
+        ));
+    }
+    if let Err(response) = crate::verified_selectable_session(&gui, session_id) {
+        let payload = response.0;
+        let code = payload
+            .error
+            .as_deref()
+            .unwrap_or("agent_session_unavailable");
+        let message = payload
+            .message
+            .as_deref()
+            .unwrap_or("Session private storage is unavailable");
+        let status = if code == "agent_session_not_found" {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::CONFLICT
+        };
+        return Some(v2_error_response(status, code, message));
+    }
+    None
+}
+
 pub(crate) async fn session_kernel_v2_store_get(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
@@ -2221,6 +2496,12 @@ pub(crate) async fn session_kernel_v2_store_get(
             "Session Kernel v2 persistence accepts only trusted local clients",
         );
     }
+    let io_guard = crate::session_private_io_lock(&session_id)
+        .read_owned()
+        .await;
+    if let Some(response) = session_private_write_unavailable_response(&state, &session_id) {
+        return response;
+    }
     let capability = match run_transport_capability(&headers) {
         Ok(capability) => capability,
         Err(error) => return storage_error_response(error),
@@ -2229,6 +2510,7 @@ pub(crate) async fn session_kernel_v2_store_get(
     let read_session_id = session_id.clone();
     let read_run_id = run_id.clone();
     match tokio::task::spawn_blocking(move || {
+        let _io_guard = io_guard;
         store.list(&read_session_id, &read_run_id, &capability)
     })
     .await
@@ -2264,6 +2546,12 @@ pub(crate) async fn session_kernel_v2_store_append(
             "Session Kernel v2 persistence accepts only trusted local clients",
         );
     }
+    let io_guard = crate::session_private_io_lock(&session_id)
+        .read_owned()
+        .await;
+    if let Some(response) = session_private_write_unavailable_response(&state, &session_id) {
+        return response;
+    }
     let capability = match run_transport_capability(&headers) {
         Ok(capability) => capability,
         Err(error) => return storage_error_response(error),
@@ -2282,6 +2570,7 @@ pub(crate) async fn session_kernel_v2_store_append(
     let write_session_id = session_id.clone();
     let write_run_id = run_id.clone();
     match tokio::task::spawn_blocking(move || {
+        let _io_guard = io_guard;
         store.append(&write_session_id, &write_run_id, &capability, request)
     })
     .await
@@ -2308,6 +2597,12 @@ pub(crate) async fn session_kernel_v2_store_record_get(
             "Session Kernel v2 persistence accepts only trusted local clients",
         );
     }
+    let io_guard = crate::session_private_io_lock(&session_id)
+        .read_owned()
+        .await;
+    if let Some(response) = session_private_write_unavailable_response(&state, &session_id) {
+        return response;
+    }
     let capability = match run_transport_capability(&headers) {
         Ok(capability) => capability,
         Err(error) => return storage_error_response(error),
@@ -2316,6 +2611,7 @@ pub(crate) async fn session_kernel_v2_store_record_get(
     let read_session_id = session_id.clone();
     let read_run_id = run_id.clone();
     match tokio::task::spawn_blocking(move || {
+        let _io_guard = io_guard;
         store.get_record(&read_session_id, &read_run_id, &record_id, &capability)
     })
     .await
@@ -2343,6 +2639,12 @@ pub(crate) async fn session_kernel_v2_projection_append(
             "Session Kernel v2 projection accepts only trusted local clients",
         );
     }
+    let io_guard = crate::session_private_io_lock(&session_id)
+        .read_owned()
+        .await;
+    if let Some(response) = session_private_write_unavailable_response(&state, &session_id) {
+        return response;
+    }
     let capability = match run_transport_capability(&headers) {
         Ok(capability) => capability,
         Err(error) => return storage_error_response(error),
@@ -2366,6 +2668,7 @@ pub(crate) async fn session_kernel_v2_projection_append(
     let write_session_id = session_id.clone();
     let write_host_run_id = host_run_id.clone();
     match tokio::task::spawn_blocking(move || {
+        let _io_guard = io_guard;
         sink.publish(&write_session_id, &write_host_run_id, &capability, request)
     })
     .await
@@ -2392,6 +2695,12 @@ pub(crate) async fn session_kernel_v2_prior_events_page(
             "host_session_prior_events_origin_forbidden",
             "Prior Session events accept only trusted local clients",
         );
+    }
+    let io_guard = crate::session_private_io_lock(&session_id)
+        .read_owned()
+        .await;
+    if let Some(response) = session_private_write_unavailable_response(&state, &session_id) {
+        return response;
     }
     let capability = match run_transport_capability(&headers) {
         Ok(capability) => capability,
@@ -2423,6 +2732,7 @@ pub(crate) async fn session_kernel_v2_prior_events_page(
     let read_session_id = session_id.clone();
     let read_host_run_id = host_run_id.clone();
     match tokio::task::spawn_blocking(move || {
+        let _io_guard = io_guard;
         sink.prior_events_page(
             &read_session_id,
             &read_host_run_id,
@@ -2514,3 +2824,7 @@ fn v2_json_response(status: StatusCode, body: Vec<u8>) -> Response {
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
+
+#[cfg(test)]
+#[path = "session_kernel_v2_store_dispatch_tests.rs"]
+mod dispatch_tests;

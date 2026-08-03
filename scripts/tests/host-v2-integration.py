@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import http.server
+import http.client
 import json
 import os
 import pathlib
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -29,7 +31,13 @@ DAEMON = TARGET_DIR / "debug" / "deepcode-kernel-daemon"
 CLI = TARGET_DIR / "debug" / "deepcode-cli"
 ABI_VERSION = "deepcode.kernel.abi.v2"
 HOST_HEADER = "x-deepcode-host-shell-capability"
+PROVIDER_TRACE_CAPABILITY_HEADER = "x-deepcode-provider-trace-capability"
+PROVIDER_TRACE_DIGEST_HEADER = "x-deepcode-provider-trace-digest"
 FINAL_TEXT = "Host v2 integration completed through the real Session bridge."
+PROVIDER_REASONING = (
+    "The controlled Provider verified the current Session input before answering. "
+    * 12_000
+)
 CLI_PROMPT = "Return the controlled Host integration response through the CLI."
 TEST_API_KEY = "host-v2-integration-key"
 EXEC_DAEMON_ARGUMENT = "--exec-owned-daemon"
@@ -50,6 +58,11 @@ CHILD_ENVIRONMENT_ALLOWLIST = (
     "TZ",
     "USER",
 )
+PROVIDER_TRACE_EXPORT_RESULT_SUCCEEDED = (
+    "succeeded_body_producer_fully_delivered"
+)
+PROVIDER_TRACE_EXPORT_RESULT_RECEIVER_CLOSED = "body_receiver_closed"
+PROVIDER_TRACE_EXPORT_RESULT_DEADLINE_EXCEEDED = "export_deadline_exceeded"
 
 
 class IntegrationFailure(RuntimeError):
@@ -128,6 +141,113 @@ def request_json(
     return status, decoded
 
 
+def request_bytes(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    payload: Any | None = None,
+    host_capability: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> tuple[int, dict[str, str], bytes]:
+    body = None
+    headers = {"Accept": "application/x-ndjson, application/json"}
+    if payload is not None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if host_capability is not None:
+        headers[HOST_HEADER] = host_capability
+    if extra_headers is not None:
+        headers.update(extra_headers)
+    request = urllib.request.Request(
+        f"{base_url}{path}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = int(response.status)
+            response_headers = {
+                key.lower(): value for key, value in response.headers.items()
+            }
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        status = int(error.code)
+        response_headers = {
+            key.lower(): value for key, value in error.headers.items()
+        }
+        raw = error.read()
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
+        raise IntegrationFailure(f"{method} {path} transport failed: {error}") from error
+    return status, response_headers, raw
+
+
+@dataclass
+class HeldProviderTraceExport:
+    connection: http.client.HTTPConnection
+    response: http.client.HTTPResponse
+
+    def close(self) -> None:
+        try:
+            self.response.close()
+        finally:
+            self.connection.close()
+
+
+def open_unconsumed_provider_trace_export(
+    daemon: OwnedDaemon,
+    path: str,
+    payload: dict[str, Any],
+    capability: str,
+    expected_trace_digest: str,
+) -> HeldProviderTraceExport:
+    parsed = urllib.parse.urlsplit(daemon.base_url)
+    require(
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and isinstance(parsed.port, int),
+        "Provider trace export requires the owned loopback daemon",
+    )
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    connection = http.client.HTTPConnection(
+        parsed.hostname,
+        parsed.port,
+        timeout=10.0,
+    )
+    receive_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    receive_socket.settimeout(10.0)
+    receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    receive_socket.connect((parsed.hostname, parsed.port))
+    connection.sock = receive_socket
+    try:
+        connection.request(
+            "POST",
+            f"{path}/export",
+            body=encoded,
+            headers={
+                "Accept": "application/x-ndjson",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(encoded)),
+                "Connection": "close",
+                HOST_HEADER: daemon.host_capability,
+                PROVIDER_TRACE_CAPABILITY_HEADER: capability,
+            },
+        )
+        response = connection.getresponse()
+        require(
+            response.status == 200
+            and response.getheader(PROVIDER_TRACE_DIGEST_HEADER)
+            == expected_trace_digest,
+            f"Unconsumed Provider trace export returned HTTP {response.status}",
+        )
+        return HeldProviderTraceExport(connection, response)
+    except BaseException:
+        connection.close()
+        raise
+
+
 def require_api_ok(status: int, body: Any, context: str) -> Any:
     require(status == 200, f"{context} returned HTTP {status}")
     if not isinstance(body, dict) or body.get("ok") is not True:
@@ -160,39 +280,84 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
             or self.headers.get("Authorization") != f"Bearer {TEST_API_KEY}"
             or not isinstance(request, dict)
             or request.get("model") != "host-v2-integration-model"
-            or request.get("stream") is not False
+            or request.get("stream") is not True
         ):
             self.send_error(400)
             return
         with server.request_lock:
             server.requests.append(request)
-        response = {
-            "id": "chatcmpl-host-v2-integration",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "host-v2-integration-model",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": FINAL_TEXT,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 8,
-                "completion_tokens": 9,
-                "total_tokens": 17,
+        chunks = [
+            {
+                "id": "chatcmpl-host-v2-integration",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "host-v2-integration-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "reasoning_content": PROVIDER_REASONING,
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             },
-        }
-        encoded = json.dumps(response, separators=(",", ":")).encode("utf-8")
+            {
+                "id": "chatcmpl-host-v2-integration",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "host-v2-integration-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": FINAL_TEXT},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-host-v2-integration",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "host-v2-integration-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-host-v2-integration",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "host-v2-integration-model",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 9,
+                    "total_tokens": 17,
+                },
+            },
+        ]
+        frames = [
+            b"data: "
+            + json.dumps(chunk, separators=(",", ":")).encode("utf-8")
+            + b"\n\n"
+            for chunk in chunks
+        ]
+        frames.append(b"data: [DONE]\n\n")
+        encoded = b"".join(frames)
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(encoded)
+        for frame in frames:
+            self.wfile.write(frame)
+            self.wfile.flush()
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -368,6 +533,8 @@ def write_profile(config_root: pathlib.Path, provider_port: int) -> None:
                 "name": "Host v2 integration",
                 "kind": "openaiCompatible",
                 "providerFlavor": "generic",
+                "reasoningTransport": "openaiPlaintext",
+                "thinking": "enabled",
                 "baseUrl": f"http://127.0.0.1:{provider_port}/v1",
                 "model": "host-v2-integration-model",
                 "contextWindowTokens": 65536,
@@ -790,6 +957,25 @@ def create_session(daemon: OwnedDaemon) -> str:
     return session_id
 
 
+def delete_session_and_require_private_storage_released(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+) -> None:
+    status, body = request_json(
+        daemon.base_url,
+        "DELETE",
+        f"/api/agent/sessions/{urllib.parse.quote(session_id, safe='')}",
+        host_capability=daemon.host_capability,
+        timeout=15.0,
+    )
+    require_api_ok(status, body, "Provider trace resource Session deletion")
+    require(
+        not (config_root / "sessions" / session_id).exists(),
+        "Provider trace resource Session retained private storage after deletion",
+    )
+
+
 @dataclass(frozen=True)
 class CanonicalRunSnapshot:
     run_id: str
@@ -805,6 +991,43 @@ def host_operation_store(config_root: pathlib.Path) -> pathlib.Path:
     return config_root / "sessions" / ".host-v2" / "host-kernel-v2.sqlite3"
 
 
+def query_host_operation_snapshot(
+    database: pathlib.Path,
+    query: str,
+    parameters: tuple[Any, ...],
+) -> list[tuple[Any, ...]]:
+    sidecars = [
+        database.with_name(f"{database.name}-wal"),
+        database.with_name(f"{database.name}-shm"),
+    ]
+    deadline = time.monotonic() + 5.0
+    last_error: sqlite3.Error | None = None
+    while time.monotonic() < deadline:
+        if any(sidecar.exists() for sidecar in sidecars):
+            time.sleep(0.05)
+            continue
+        try:
+            with sqlite3.connect(
+                f"file:{database}?mode=ro&immutable=1",
+                uri=True,
+                timeout=1.0,
+            ) as connection:
+                rows = connection.execute(query, parameters).fetchall()
+        except sqlite3.Error as error:
+            last_error = error
+            time.sleep(0.05)
+            continue
+        if any(sidecar.exists() for sidecar in sidecars):
+            time.sleep(0.05)
+            continue
+        return rows
+    if last_error is not None:
+        raise IntegrationFailure(
+            f"Host operation snapshot query failed: {safe_diagnostic(last_error)}"
+        ) from last_error
+    raise IntegrationFailure("Host operation snapshot did not reach a stable WAL boundary")
+
+
 def read_host_kernel_run_identity(
     config_root: pathlib.Path,
     session_id: str,
@@ -812,21 +1035,12 @@ def read_host_kernel_run_identity(
 ) -> str:
     database = host_operation_store(config_root)
     require(database.is_file(), "exact Host operation store is missing")
-    try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
-        ) as connection:
-            rows = connection.execute(
-                "SELECT run_id, lifecycle FROM host_kernel_runs "
-                "WHERE session_id = ?1 AND host_run_id = ?2",
-                (session_id, host_run_id),
-            ).fetchall()
-    except sqlite3.Error as error:
-        raise IntegrationFailure(
-            f"Host operation identity query failed: {safe_diagnostic(error)}"
-        ) from error
+    rows = query_host_operation_snapshot(
+        database,
+        "SELECT run_id, lifecycle FROM host_kernel_runs "
+        "WHERE session_id = ?1 AND host_run_id = ?2",
+        (session_id, host_run_id),
+    )
     require(len(rows) == 1, "Host operation store omitted the exact Run identity")
     run_id, lifecycle = rows[0]
     require(
@@ -842,23 +1056,14 @@ def read_cli_ask_host_run_identity(
 ) -> str:
     database = host_operation_store(config_root)
     require(database.is_file(), "CLI Host operation store is missing")
-    try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
-        ) as connection:
-            caller_rows = connection.execute(
-                "SELECT caller_request_id, response_identity_json, drive_state, "
-                "outcome_json, settled_at FROM host_caller_requests "
-                "WHERE session_id = ?1 AND caller_request_id LIKE 'cli-ask-%' "
-                "ORDER BY id",
-                (session_id,),
-            ).fetchall()
-    except sqlite3.Error as error:
-        raise IntegrationFailure(
-            f"CLI caller identity query failed: {safe_diagnostic(error)}"
-        ) from error
+    caller_rows = query_host_operation_snapshot(
+        database,
+        "SELECT caller_request_id, response_identity_json, drive_state, "
+        "outcome_json, settled_at FROM host_caller_requests "
+        "WHERE session_id = ?1 AND caller_request_id LIKE 'cli-ask-%' "
+        "ORDER BY id",
+        (session_id,),
+    )
     require(len(caller_rows) == 1, "CLI ask did not create one exact caller identity")
     caller_request_id, response_identity_json, drive_state, outcome_json, settled_at = (
         caller_rows[0]
@@ -974,6 +1179,1200 @@ def canonical_run_snapshot(
         fact_sequences=tuple(
             (kind, sequences[0]) for kind, sequences in expected.items()
         ),
+    )
+
+
+def validate_provider_trace_export(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        f"/api/host/provider-traces/{encoded_session_id}",
+        host_capability=daemon.host_capability,
+    )
+    data = require_api_ok(status, body, "Provider trace metadata list")
+    require(
+        isinstance(data, dict)
+        and data.get("schemaVersion") == "deepcode.provider-trace-metadata-list.v1"
+        and data.get("sessionId") == session_id
+        and isinstance(data.get("traces"), list),
+        "Provider trace metadata list is invalid",
+    )
+    matching = [
+        trace
+        for trace in data["traces"]
+        if isinstance(trace, dict) and trace.get("runId") == run_id
+    ]
+    require(len(matching) == 1, "CLI Run did not produce one sealed Provider trace")
+    metadata = matching[0]
+    provider_turn_id = metadata.get("providerTurnId")
+    trace_digest = metadata.get("sealDigest")
+    require(
+        isinstance(provider_turn_id, str)
+        and provider_turn_id
+        and isinstance(trace_digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", trace_digest) is not None
+        and metadata.get("terminalKind") == "completed"
+        and isinstance(metadata.get("recordCount"), int)
+        and metadata["recordCount"] >= 3,
+        "Provider trace metadata omitted its completed seal identity",
+    )
+
+    encoded_provider_turn_id = urllib.parse.quote(provider_turn_id, safe="")
+    trace_path = (
+        f"/api/host/provider-traces/{encoded_session_id}/"
+        f"{encoded_provider_turn_id}"
+    )
+    request_id = "request-provider-trace-host-integration"
+    mint_payload = {
+        "runId": run_id,
+        "traceDigest": trace_digest,
+        "requestId": request_id,
+    }
+    status, body = request_json(
+        daemon.base_url,
+        "POST",
+        f"{trace_path}/export-capability",
+        payload=mint_payload,
+        host_capability=daemon.host_capability,
+    )
+    capability_data = require_api_ok(
+        status,
+        body,
+        "Provider trace export capability mint",
+    )
+    capability = (
+        capability_data.get("capability")
+        if isinstance(capability_data, dict)
+        else None
+    )
+    payload_digest = (
+        capability_data.get("payloadDigest")
+        if isinstance(capability_data, dict)
+        else None
+    )
+    require(
+        isinstance(capability, str)
+        and capability.startswith("provider-trace-v1.")
+        and isinstance(payload_digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", payload_digest) is not None
+        and capability_data.get("expiresInSeconds") == 60,
+        "Provider trace export capability binding is invalid",
+    )
+    export_payload = {
+        **mint_payload,
+        "payloadDigest": payload_digest,
+    }
+    status, response_headers, trace_bytes = request_bytes(
+        daemon.base_url,
+        "POST",
+        f"{trace_path}/export",
+        payload=export_payload,
+        host_capability=daemon.host_capability,
+        extra_headers={PROVIDER_TRACE_CAPABILITY_HEADER: capability},
+    )
+    require(status == 200, f"Provider trace export returned HTTP {status}")
+    require(
+        response_headers.get("cache-control") == "no-store"
+        and response_headers.get("x-content-type-options") == "nosniff"
+        and response_headers.get(PROVIDER_TRACE_DIGEST_HEADER) == trace_digest,
+        "Provider trace export omitted required safe response headers",
+    )
+    try:
+        records = [
+            json.loads(line.decode("utf-8"))
+            for line in trace_bytes.splitlines()
+            if line
+        ]
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure("Provider trace export is not valid JSONL") from error
+    record_kinds = [
+        record.get("recordKind") if isinstance(record, dict) else None
+        for record in records
+    ]
+    require(
+        len(records) == metadata["recordCount"]
+        and record_kinds[0] == "request"
+        and "rawUpstreamEnvelope" in record_kinds
+        and "normalizedEvent" in record_kinds
+        and record_kinds[-2:] == ["terminal", "seal"],
+        "Provider trace export lost its chronological chain boundaries",
+    )
+    for secret in (TEST_API_KEY, daemon.host_capability, capability):
+        require(
+            secret.encode("utf-8") not in trace_bytes,
+            "Provider trace archive leaked transport authority material",
+        )
+
+    replay_status, replay_headers, replay_bytes = request_bytes(
+        daemon.base_url,
+        "POST",
+        f"{trace_path}/export",
+        payload=export_payload,
+        host_capability=daemon.host_capability,
+        extra_headers={PROVIDER_TRACE_CAPABILITY_HEADER: capability},
+    )
+    require(
+        replay_status == 200
+        and replay_headers.get(PROVIDER_TRACE_DIGEST_HEADER) == trace_digest
+        and replay_bytes == trace_bytes,
+        "Provider trace exact request replay changed its verified export",
+    )
+
+    conflicting_payload = {**export_payload, "requestId": f"{request_id}-conflict"}
+    conflict_status, _, conflict_bytes = request_bytes(
+        daemon.base_url,
+        "POST",
+        f"{trace_path}/export",
+        payload=conflicting_payload,
+        host_capability=daemon.host_capability,
+        extra_headers={PROVIDER_TRACE_CAPABILITY_HEADER: capability},
+    )
+    try:
+        conflict = json.loads(conflict_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure("Provider trace conflict returned invalid JSON") from error
+    require(
+        conflict_status == 400
+        and isinstance(conflict, dict)
+        and conflict.get("error") == "provider_trace_capability_conflict",
+        "Provider trace capability accepted a different request identity",
+    )
+
+    audit_path = (
+        config_root
+        / "sessions"
+        / ".host-management-v2"
+        / "provider-trace-audit.jsonl"
+    )
+    require(audit_path.is_file(), "Provider trace metadata audit is missing")
+    audit_bytes = audit_path.read_bytes()
+    try:
+        audit_records = [
+            json.loads(line.decode("utf-8"))
+            for line in audit_bytes.splitlines()
+            if line
+        ]
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure("Provider trace audit is not valid JSONL") from error
+    allowed_audit_keys = {
+        "schemaVersion",
+        "recordedAt",
+        "action",
+        "sessionId",
+        "runId",
+        "providerTurnId",
+        "requestId",
+        "payloadDigest",
+        "traceDigest",
+        "resultCode",
+    }
+    require(
+        audit_records
+        and all(
+            isinstance(record, dict)
+            and set(record).issubset(allowed_audit_keys)
+            for record in audit_records
+        ),
+        "Provider trace audit contains non-metadata fields",
+    )
+    successful_exports = [
+        record
+        for record in audit_records
+        if record.get("action") == "export"
+        and record.get("sessionId") == session_id
+        and record.get("runId") == run_id
+        and record.get("providerTurnId") == provider_turn_id
+        and record.get("requestId") == request_id
+        and record.get("resultCode") == PROVIDER_TRACE_EXPORT_RESULT_SUCCEEDED
+    ]
+    require(
+        len(successful_exports) == 2,
+        "Provider trace full export and exact replay lacked success audits",
+    )
+    for forbidden in (
+        TEST_API_KEY,
+        daemon.host_capability,
+        capability,
+        FINAL_TEXT,
+        PROVIDER_REASONING,
+    ):
+        require(
+            forbidden.encode("utf-8") not in audit_bytes,
+            "Provider trace audit leaked body or authority material",
+        )
+    return {
+        "path": trace_path,
+        "payload": export_payload,
+        "capability": capability,
+        "metadata": metadata,
+        "byteLength": len(trace_bytes),
+    }
+
+
+def provider_trace_audit_path(config_root: pathlib.Path) -> pathlib.Path:
+    return (
+        config_root
+        / "sessions"
+        / ".host-management-v2"
+        / "provider-trace-audit.jsonl"
+    )
+
+
+def try_read_provider_trace_audit(
+    config_root: pathlib.Path,
+) -> list[dict[str, Any]] | None:
+    path = provider_trace_audit_path(config_root)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    if raw and not raw.endswith(b"\n"):
+        return None
+    records: list[dict[str, Any]] = []
+    try:
+        for line in raw.splitlines():
+            if not line:
+                continue
+            record = json.loads(line.decode("utf-8"))
+            if not isinstance(record, dict):
+                return None
+            records.append(record)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return records
+
+
+def require_provider_trace_audit_snapshot(
+    config_root: pathlib.Path,
+) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        records = try_read_provider_trace_audit(config_root)
+        if records is not None:
+            return records
+        time.sleep(0.02)
+    raise IntegrationFailure("Provider trace audit did not reach a complete JSONL boundary")
+
+
+def require_provider_trace_audit_is_metadata_only(
+    config_root: pathlib.Path,
+    daemon: OwnedDaemon,
+    extra_capabilities: list[str],
+) -> None:
+    audit_path = provider_trace_audit_path(config_root)
+    records = require_provider_trace_audit_snapshot(config_root)
+    allowed_audit_keys = {
+        "schemaVersion",
+        "recordedAt",
+        "action",
+        "sessionId",
+        "runId",
+        "providerTurnId",
+        "requestId",
+        "payloadDigest",
+        "traceDigest",
+        "resultCode",
+    }
+    require(
+        records
+        and all(set(record).issubset(allowed_audit_keys) for record in records),
+        "Provider trace audit contains non-metadata fields",
+    )
+    audit_bytes = audit_path.read_bytes()
+    forbidden_values = [
+        TEST_API_KEY,
+        daemon.host_capability,
+        FINAL_TEXT,
+        PROVIDER_REASONING,
+        *extra_capabilities,
+    ]
+    for forbidden in forbidden_values:
+        require(
+            not forbidden or forbidden.encode("utf-8") not in audit_bytes,
+            "Provider trace audit leaked body or authority material",
+        )
+
+
+def wait_for_provider_trace_export_audit(
+    config_root: pathlib.Path,
+    *,
+    after_record_count: int,
+    session_id: str,
+    export: dict[str, Any],
+    result_code: str,
+    timeout: float,
+) -> tuple[dict[str, Any], float]:
+    metadata = export.get("metadata")
+    payload = export.get("payload")
+    require(
+        isinstance(metadata, dict) and isinstance(payload, dict),
+        "Provider trace export audit identity is incomplete",
+    )
+    run_id = metadata.get("runId")
+    provider_turn_id = metadata.get("providerTurnId")
+    request_id = payload.get("requestId")
+    payload_digest = payload.get("payloadDigest")
+    trace_digest = metadata.get("sealDigest")
+    require(
+        all(
+            isinstance(value, str) and value
+            for value in (
+                run_id,
+                provider_turn_id,
+                request_id,
+                payload_digest,
+                trace_digest,
+            )
+        ),
+        "Provider trace export audit identity omitted a bound field",
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        records = try_read_provider_trace_audit(config_root)
+        if records is not None and len(records) >= after_record_count:
+            for record in records[after_record_count:]:
+                if (
+                    record.get("action") == "export"
+                    and record.get("sessionId") == session_id
+                    and record.get("runId") == run_id
+                    and record.get("providerTurnId") == provider_turn_id
+                    and record.get("requestId") == request_id
+                    and record.get("payloadDigest") == payload_digest
+                    and record.get("traceDigest") == trace_digest
+                    and record.get("resultCode") == result_code
+                ):
+                    return record, time.monotonic()
+        time.sleep(0.05)
+    raise IntegrationFailure(
+        "Provider trace export audit did not record "
+        f"{result_code} for {request_id}"
+    )
+
+
+def mint_provider_trace_export(
+    daemon: OwnedDaemon,
+    replay: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    metadata = replay.get("metadata")
+    require(isinstance(metadata, dict), "Provider trace replay omitted metadata")
+    run_id = metadata.get("runId")
+    trace_digest = metadata.get("sealDigest")
+    require(
+        isinstance(run_id, str)
+        and run_id
+        and isinstance(trace_digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", trace_digest) is not None,
+        "Provider trace replay metadata omitted its immutable identity",
+    )
+    mint_payload = {
+        "runId": run_id,
+        "traceDigest": trace_digest,
+        "requestId": request_id,
+    }
+    mint_started = time.monotonic()
+    status, body = request_json(
+        daemon.base_url,
+        "POST",
+        f"{replay['path']}/export-capability",
+        payload=mint_payload,
+        host_capability=daemon.host_capability,
+    )
+    mint_completed = time.monotonic()
+    data = require_api_ok(status, body, "Provider trace resource capability mint")
+    capability = data.get("capability") if isinstance(data, dict) else None
+    payload_digest = data.get("payloadDigest") if isinstance(data, dict) else None
+    require(
+        isinstance(capability, str)
+        and capability.startswith("provider-trace-v1.")
+        and isinstance(payload_digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", payload_digest) is not None
+        and data.get("expiresInSeconds") == 60,
+        "Provider trace resource capability binding is invalid",
+    )
+    return {
+        "path": replay["path"],
+        "payload": {**mint_payload, "payloadDigest": payload_digest},
+        "capability": capability,
+        "metadata": metadata,
+        "mintStarted": mint_started,
+        "mintCompleted": mint_completed,
+    }
+
+
+def require_provider_trace_export_session_busy(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+    export: dict[str, Any],
+    *,
+    after_record_count: int,
+) -> None:
+    status, _, raw = request_bytes(
+        daemon.base_url,
+        "POST",
+        f"{export['path']}/export",
+        payload=export["payload"],
+        host_capability=daemon.host_capability,
+        extra_headers={
+            PROVIDER_TRACE_CAPABILITY_HEADER: export["capability"],
+        },
+    )
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure(
+            "Concurrent Provider trace export returned invalid JSON"
+        ) from error
+    require(
+        status == 409
+        and isinstance(body, dict)
+        and body.get("error") == "provider_trace_export_session_busy",
+        "Concurrent Provider trace export did not fail immediately with typed Session busy",
+    )
+    wait_for_provider_trace_export_audit(
+        config_root,
+        after_record_count=after_record_count,
+        session_id=session_id,
+        export=export,
+        result_code="provider_trace_export_session_busy",
+        timeout=5.0,
+    )
+
+
+def complete_provider_trace_export(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+    export: dict[str, Any],
+) -> bytes:
+    before = require_provider_trace_audit_snapshot(config_root)
+    status, headers, raw = request_bytes(
+        daemon.base_url,
+        "POST",
+        f"{export['path']}/export",
+        payload=export["payload"],
+        host_capability=daemon.host_capability,
+        extra_headers={
+            PROVIDER_TRACE_CAPABILITY_HEADER: export["capability"],
+        },
+        timeout=20.0,
+    )
+    trace_digest = export["metadata"]["sealDigest"]
+    require(
+        status == 200
+        and headers.get(PROVIDER_TRACE_DIGEST_HEADER) == trace_digest
+        and raw,
+        "Provider trace sequential export did not fully deliver",
+    )
+    wait_for_provider_trace_export_audit(
+        config_root,
+        after_record_count=len(before),
+        session_id=session_id,
+        export=export,
+        result_code=PROVIDER_TRACE_EXPORT_RESULT_SUCCEEDED,
+        timeout=5.0,
+    )
+    return raw
+
+
+def wait_until_monotonic(target: float) -> None:
+    while True:
+        remaining = target - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.1))
+
+
+def load_real_provider_trace_replay(
+    daemon: OwnedDaemon,
+    session_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        f"/api/host/provider-traces/{encoded_session_id}",
+        host_capability=daemon.host_capability,
+    )
+    data = require_api_ok(status, body, "Provider trace capacity metadata list")
+    require(
+        isinstance(data, dict)
+        and data.get("schemaVersion") == "deepcode.provider-trace-metadata-list.v1"
+        and data.get("sessionId") == session_id
+        and isinstance(data.get("traces"), list),
+        "Provider trace capacity metadata list is invalid",
+    )
+    matching = [
+        trace
+        for trace in data["traces"]
+        if isinstance(trace, dict) and trace.get("runId") == run_id
+    ]
+    require(
+        len(matching) == 1,
+        "Provider trace capacity Session did not produce one exact sealed trace",
+    )
+    metadata = matching[0]
+    provider_turn_id = metadata.get("providerTurnId")
+    trace_digest = metadata.get("sealDigest")
+    require(
+        isinstance(provider_turn_id, str)
+        and provider_turn_id
+        and isinstance(trace_digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", trace_digest) is not None
+        and metadata.get("terminalKind") == "completed"
+        and isinstance(metadata.get("rawSourceBytes"), int)
+        and metadata["rawSourceBytes"] >= 512 * 1024,
+        "Provider trace capacity test requires a real sealed backpressured archive",
+    )
+    return {
+        "path": (
+            f"/api/host/provider-traces/{encoded_session_id}/"
+            f"{urllib.parse.quote(provider_turn_id, safe='')}"
+        ),
+        "metadata": metadata,
+    }
+
+
+def create_real_provider_trace_for_capacity(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    workspace: pathlib.Path,
+    session_id: str,
+    ordinal: int,
+) -> dict[str, Any]:
+    prompt = f"{CLI_PROMPT} Capacity trace {ordinal}."
+    cli_ask = run_cli(
+        daemon.base_url,
+        daemon.host_capability,
+        [
+            "--print",
+            "--session",
+            session_id,
+            "--workspace",
+            str(workspace),
+            "ask",
+            prompt,
+        ],
+        expect_success=True,
+    )
+    require(
+        cli_ask.stdout.strip() == FINAL_TEXT,
+        "Provider trace capacity Session did not complete its real CLI turn",
+    )
+    host_run_id = read_cli_ask_host_run_identity(config_root, session_id)
+    snapshot = canonical_run_snapshot(config_root, session_id, host_run_id)
+    replay = load_real_provider_trace_replay(
+        daemon,
+        session_id,
+        snapshot.run_id,
+    )
+    return replay
+
+
+def provider_trace_daemon_capacity_releases_owned_resources(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    workspace: pathlib.Path,
+) -> list[str]:
+    session_ids: list[str] = []
+    replays: list[dict[str, Any]] = []
+    held_exports: list[tuple[str, dict[str, Any], HeldProviderTraceExport]] = []
+    capabilities: list[str] = []
+    primary_error: BaseException | None = None
+    cleanup_errors: list[str] = []
+    try:
+        for ordinal in range(1, 10):
+            session_id = create_session(daemon)
+            session_ids.append(session_id)
+            replay = create_real_provider_trace_for_capacity(
+                daemon,
+                config_root,
+                workspace,
+                session_id,
+                ordinal,
+            )
+            replays.append(replay)
+        require(
+            len(set(session_ids)) == 9
+            and len({replay["metadata"]["providerTurnId"] for replay in replays}) == 9
+            and len({replay["metadata"]["sealDigest"] for replay in replays}) == 9,
+            "Provider trace capacity test did not create nine distinct real traces",
+        )
+
+        exports = [
+            mint_provider_trace_export(
+                daemon,
+                replay,
+                f"request-provider-trace-daemon-capacity-{ordinal}",
+            )
+            for ordinal, replay in enumerate(replays, start=1)
+        ]
+        capabilities.extend(export["capability"] for export in exports)
+        capacity_audit = require_provider_trace_audit_snapshot(config_root)
+        for session_id, export in zip(session_ids[:8], exports[:8]):
+            held_exports.append(
+                (
+                    session_id,
+                    export,
+                    open_unconsumed_provider_trace_export(
+                        daemon,
+                        export["path"],
+                        export["payload"],
+                        export["capability"],
+                        export["metadata"]["sealDigest"],
+                    ),
+                )
+            )
+
+        capacity_export = exports[8]
+        status, _, raw = request_bytes(
+            daemon.base_url,
+            "POST",
+            f"{capacity_export['path']}/export",
+            payload=capacity_export["payload"],
+            host_capability=daemon.host_capability,
+            extra_headers={
+                PROVIDER_TRACE_CAPABILITY_HEADER: capacity_export["capability"],
+            },
+        )
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise IntegrationFailure(
+                "Provider trace daemon capacity rejection returned invalid JSON"
+            ) from error
+        require(
+            status == 409
+            and isinstance(body, dict)
+            and body.get("error") == "provider_trace_export_capacity_exceeded",
+            "Ninth Provider trace export did not fail with typed daemon capacity",
+        )
+        wait_for_provider_trace_export_audit(
+            config_root,
+            after_record_count=len(capacity_audit),
+            session_id=session_ids[8],
+            export=capacity_export,
+            result_code="provider_trace_export_capacity_exceeded",
+            timeout=5.0,
+        )
+
+        for _, _, held in held_exports:
+            held.close()
+        for session_id, export, _ in held_exports:
+            wait_for_provider_trace_export_audit(
+                config_root,
+                after_record_count=len(capacity_audit),
+                session_id=session_id,
+                export=export,
+                result_code=PROVIDER_TRACE_EXPORT_RESULT_RECEIVER_CLOSED,
+                timeout=10.0,
+            )
+        held_exports.clear()
+
+        post_capacity = mint_provider_trace_export(
+            daemon,
+            replays[8],
+            "request-provider-trace-after-daemon-capacity",
+        )
+        capabilities.append(post_capacity["capability"])
+        require(
+            complete_provider_trace_export(
+                daemon,
+                config_root,
+                session_ids[8],
+                post_capacity,
+            ),
+            "Provider trace daemon capacity permits were not released",
+        )
+    except BaseException as error:
+        primary_error = error
+    finally:
+        for _, _, held in held_exports:
+            try:
+                held.close()
+            except BaseException as error:
+                cleanup_errors.append(
+                    f"capacity export close: {safe_diagnostic(error)}"
+                )
+        for session_id in reversed(session_ids):
+            try:
+                delete_session_and_require_private_storage_released(
+                    daemon,
+                    config_root,
+                    session_id,
+                )
+            except BaseException as error:
+                cleanup_errors.append(
+                    f"capacity Session {session_id} cleanup: {safe_diagnostic(error)}"
+                )
+    if primary_error is not None:
+        if cleanup_errors:
+            raise IntegrationFailure(
+                f"{safe_diagnostic(primary_error)}; " + "; ".join(cleanup_errors)
+            ) from primary_error
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    require(
+        not cleanup_errors,
+        "Provider trace daemon capacity cleanup failed: " + "; ".join(cleanup_errors),
+    )
+    return capabilities
+
+
+def provider_trace_export_deadline_and_concurrency_release_owned_resources(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+    replay: dict[str, Any],
+    workspace: pathlib.Path,
+) -> list[str]:
+    require(
+        isinstance(replay.get("byteLength"), int)
+        and replay["byteLength"] >= 2 * 1024 * 1024,
+        "Provider trace resource test requires a real backpressured archive",
+    )
+    trace_digest = replay["metadata"]["sealDigest"]
+    capabilities: list[str] = []
+
+    dropped = mint_provider_trace_export(
+        daemon,
+        replay,
+        "request-provider-trace-drop-resource",
+    )
+    drop_busy = mint_provider_trace_export(
+        daemon,
+        replay,
+        "request-provider-trace-drop-session-busy",
+    )
+    require(
+        dropped["payload"]["requestId"] != drop_busy["payload"]["requestId"]
+        and dropped["capability"] != drop_busy["capability"],
+        "Provider trace Session busy check requires a separately minted request",
+    )
+    capabilities.extend([dropped["capability"], drop_busy["capability"]])
+    drop_audit = require_provider_trace_audit_snapshot(config_root)
+    held_drop = open_unconsumed_provider_trace_export(
+        daemon,
+        dropped["path"],
+        dropped["payload"],
+        dropped["capability"],
+        trace_digest,
+    )
+    try:
+        require_provider_trace_export_session_busy(
+            daemon,
+            config_root,
+            session_id,
+            drop_busy,
+            after_record_count=len(drop_audit),
+        )
+    finally:
+        held_drop.close()
+    wait_for_provider_trace_export_audit(
+        config_root,
+        after_record_count=len(drop_audit),
+        session_id=session_id,
+        export=dropped,
+        result_code=PROVIDER_TRACE_EXPORT_RESULT_RECEIVER_CLOSED,
+        timeout=10.0,
+    )
+    require(
+        len(complete_provider_trace_export(
+            daemon,
+            config_root,
+            session_id,
+            dropped,
+        ))
+        == replay["byteLength"],
+        "Provider trace drop did not release its owned export resources",
+    )
+
+    deadline_export = mint_provider_trace_export(
+        daemon,
+        replay,
+        "request-provider-trace-deadline-resource",
+    )
+    deadline_busy = mint_provider_trace_export(
+        daemon,
+        replay,
+        "request-provider-trace-deadline-session-busy",
+    )
+    require(
+        deadline_export["payload"]["requestId"]
+        != deadline_busy["payload"]["requestId"]
+        and deadline_export["capability"] != deadline_busy["capability"],
+        "Provider trace deadline busy check requires a separately minted request",
+    )
+    capabilities.extend(
+        [deadline_export["capability"], deadline_busy["capability"]]
+    )
+    wait_until_monotonic(deadline_export["mintCompleted"] + 15.0)
+    deadline_audit = require_provider_trace_audit_snapshot(config_root)
+    export_started = time.monotonic()
+    held_deadline = open_unconsumed_provider_trace_export(
+        daemon,
+        deadline_export["path"],
+        deadline_export["payload"],
+        deadline_export["capability"],
+        trace_digest,
+    )
+    try:
+        require_provider_trace_export_session_busy(
+            daemon,
+            config_root,
+            session_id,
+            deadline_busy,
+            after_record_count=len(deadline_audit),
+        )
+        _, deadline_observed = wait_for_provider_trace_export_audit(
+            config_root,
+            after_record_count=len(deadline_audit),
+            session_id=session_id,
+            export=deadline_export,
+            result_code=PROVIDER_TRACE_EXPORT_RESULT_DEADLINE_EXCEEDED,
+            timeout=60.0,
+        )
+    finally:
+        held_deadline.close()
+    require(
+        58.0
+        <= deadline_observed - deadline_export["mintStarted"]
+        <= 66.0
+        and 57.0
+        <= deadline_observed - deadline_export["mintCompleted"]
+        <= 65.0
+        and 40.0 <= deadline_observed - export_started <= 52.0,
+        "Provider trace Body deadline was not bound to capability remaining TTL",
+    )
+
+    after_deadline = mint_provider_trace_export(
+        daemon,
+        replay,
+        "request-provider-trace-after-deadline",
+    )
+    capabilities.append(after_deadline["capability"])
+    require(
+        len(complete_provider_trace_export(
+            daemon,
+            config_root,
+            session_id,
+            after_deadline,
+        ))
+        == replay["byteLength"],
+        "Provider trace deadline did not release its owned export resources",
+    )
+    capabilities.extend(
+        provider_trace_daemon_capacity_releases_owned_resources(
+            daemon,
+            config_root,
+            workspace,
+        )
+    )
+    return capabilities
+
+
+def append_profile_availability_fixture(
+    config_root: pathlib.Path,
+    profile_id: str,
+    profile_revision: str,
+) -> pathlib.Path:
+    require(
+        isinstance(profile_id, str) and profile_id,
+        "Profile availability fixture requires a Profile id",
+    )
+    require(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", profile_revision) is not None,
+        "Profile availability fixture requires an exact revision digest",
+    )
+    availability_dir = config_root / "sessions" / ".host-management-v2"
+    availability_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    availability_path = availability_dir / "provider-profile-availability.jsonl"
+    record = {
+        "schemaVersion": "deepcode.provider-profile-availability.v1",
+        "recordedAt": str(int(time.time() * 1000)),
+        "profileId": profile_id,
+        "profileRevision": profile_revision,
+        "state": "unavailable",
+        "reasonCode": "host_v2_integration_quarantine_fixture",
+    }
+    encoded = json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+    descriptor = os.open(
+        availability_path,
+        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            require(written > 0, "Provider Profile availability fixture append stalled")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.chmod(availability_path, 0o600)
+    return availability_path
+
+
+def read_profile_availability_records(path: pathlib.Path) -> list[dict[str, Any]]:
+    require(path.is_file(), "Provider Profile availability ledger is missing")
+    try:
+        records = [
+            json.loads(line.decode("utf-8"))
+            for line in path.read_bytes().splitlines()
+            if line
+        ]
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure(
+            "Provider Profile availability ledger is not valid JSONL"
+        ) from error
+    require(
+        all(isinstance(record, dict) for record in records),
+        "Provider Profile availability ledger contains a non-object record",
+    )
+    return records
+
+
+def latest_profile_availability_state(
+    records: list[dict[str, Any]],
+    profile_id: str,
+    profile_revision: str,
+) -> str | None:
+    state = None
+    for record in records:
+        if (
+            record.get("profileId") == profile_id
+            and record.get("profileRevision") == profile_revision
+        ):
+            state = record.get("state")
+    require(
+        state is None or state in {"available", "unavailable"},
+        "Provider Profile availability ledger contains an invalid state",
+    )
+    return state
+
+
+def profile_from_settings(data: Any, profile_id: str) -> dict[str, Any]:
+    require(
+        isinstance(data, dict) and isinstance(data.get("profiles"), list),
+        "LLM Profile settings response is invalid",
+    )
+    matching = [
+        profile
+        for profile in data["profiles"]
+        if isinstance(profile, dict) and profile.get("id") == profile_id
+    ]
+    require(len(matching) == 1, "LLM Profile settings omitted the exact Profile")
+    return matching[0]
+
+
+def provider_profile_quarantine_requires_explicit_reenable_intent(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    trace_metadata: Any,
+) -> None:
+    require(
+        isinstance(trace_metadata, dict),
+        "Provider trace metadata is unavailable for Profile quarantine validation",
+    )
+    profile_id = trace_metadata.get("profileId")
+    profile_revision = trace_metadata.get("profileRevision")
+    require(
+        isinstance(profile_id, str)
+        and profile_id
+        and isinstance(profile_revision, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", profile_revision) is not None,
+        "Provider trace metadata omitted its exact Profile revision",
+    )
+
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        "/api/llm/profiles",
+        host_capability=daemon.host_capability,
+    )
+    stale_settings = require_api_ok(status, body, "LLM Profile settings before quarantine")
+    stale_profile = profile_from_settings(stale_settings, profile_id)
+    require(
+        stale_profile.get("enabled") is True
+        and stale_settings.get("defaultProfileId") == profile_id,
+        "Provider trace Profile was not the effective Profile before quarantine",
+    )
+    stale_patch = {
+        "profiles": stale_settings["profiles"],
+        "defaultProfileId": stale_settings.get("defaultProfileId"),
+    }
+
+    alternate_revision = authority_value("sha256:", "d")
+    unrelated_profile_id = "host-v2-integration-unrelated-profile"
+    unrelated_revision = authority_value("sha256:", "e")
+    require(
+        profile_revision not in {alternate_revision, unrelated_revision},
+        "Profile quarantine fixture revisions unexpectedly overlap",
+    )
+    availability_path = append_profile_availability_fixture(
+        config_root,
+        profile_id,
+        profile_revision,
+    )
+    append_profile_availability_fixture(
+        config_root,
+        profile_id,
+        alternate_revision,
+    )
+    append_profile_availability_fixture(
+        config_root,
+        unrelated_profile_id,
+        unrelated_revision,
+    )
+    quarantined_records = read_profile_availability_records(availability_path)
+
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        "/api/llm/profiles",
+        host_capability=daemon.host_capability,
+    )
+    quarantined_settings = require_api_ok(
+        status,
+        body,
+        "LLM Profile settings after quarantine",
+    )
+    require(
+        profile_from_settings(quarantined_settings, profile_id).get("enabled") is False
+        and quarantined_settings.get("defaultProfileId") is None,
+        "Exact quarantined Profile revision remained effectively selectable",
+    )
+
+    status, body = request_json(
+        daemon.base_url,
+        "PATCH",
+        "/api/llm/profiles",
+        payload=stale_patch,
+        host_capability=daemon.host_capability,
+    )
+    stale_result = require_api_ok(
+        status,
+        body,
+        "Stale LLM Profile full-array save without re-enable intent",
+    )
+    require(
+        profile_from_settings(stale_result, profile_id).get("enabled") is False
+        and stale_result.get("defaultProfileId") is None,
+        "Stale full-array save cleared Profile quarantine without explicit intent",
+    )
+    records_after_stale_patch = read_profile_availability_records(availability_path)
+    require(
+        records_after_stale_patch == quarantined_records
+        and latest_profile_availability_state(
+            records_after_stale_patch,
+            profile_id,
+            profile_revision,
+        )
+        == "unavailable",
+        "Save without re-enable intent changed the Profile availability ledger",
+    )
+
+    status, body = request_json(
+        daemon.base_url,
+        "PATCH",
+        "/api/llm/profiles",
+        payload={**stale_patch, "reenableProfileIds": [profile_id]},
+        host_capability=daemon.host_capability,
+    )
+    reenabled_result = require_api_ok(
+        status,
+        body,
+        "Explicit LLM Profile revision re-enable",
+    )
+    require(
+        profile_from_settings(reenabled_result, profile_id).get("enabled") is True
+        and reenabled_result.get("defaultProfileId") == profile_id,
+        "Explicit re-enable did not restore the exact Profile revision",
+    )
+
+    final_records = read_profile_availability_records(availability_path)
+    require(
+        len(final_records) == len(quarantined_records) + 1
+        and latest_profile_availability_state(
+            final_records,
+            profile_id,
+            profile_revision,
+        )
+        == "available"
+        and latest_profile_availability_state(
+            final_records,
+            profile_id,
+            alternate_revision,
+        )
+        == "unavailable"
+        and latest_profile_availability_state(
+            final_records,
+            unrelated_profile_id,
+            unrelated_revision,
+        )
+        == "unavailable",
+        "Explicit re-enable changed an unlisted Profile id or revision",
+    )
+    last_record = final_records[-1]
+    require(
+        last_record.get("profileId") == profile_id
+        and last_record.get("profileRevision") == profile_revision
+        and last_record.get("state") == "available"
+        and last_record.get("reasonCode") == "user_profile_revision_saved",
+        "Explicit re-enable availability fact did not bind the exact incoming Profile",
+    )
+
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        "/api/llm/profiles",
+        host_capability=daemon.host_capability,
+    )
+    effective_settings = require_api_ok(
+        status,
+        body,
+        "LLM Profile settings after explicit re-enable",
+    )
+    require(
+        profile_from_settings(effective_settings, profile_id).get("enabled") is True
+        and effective_settings.get("defaultProfileId") == profile_id,
+        "Re-enabled exact Profile revision was not restored to effective selection",
+    )
+
+
+def require_provider_trace_capability_invalid_after_restart(
+    daemon: OwnedDaemon,
+    replay: dict[str, Any],
+) -> None:
+    status, _, raw = request_bytes(
+        daemon.base_url,
+        "POST",
+        f"{replay['path']}/export",
+        payload=replay["payload"],
+        host_capability=daemon.host_capability,
+        extra_headers={
+            PROVIDER_TRACE_CAPABILITY_HEADER: replay["capability"],
+        },
+    )
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure(
+            "Restarted Provider trace capability check returned invalid JSON"
+        ) from error
+    require(
+        status == 400
+        and isinstance(body, dict)
+        and body.get("error") == "provider_trace_capability_invalid",
+        "Provider trace export capability survived daemon restart",
     )
 
 
@@ -1238,9 +2637,26 @@ def run() -> None:
             config_root,
             session_id,
         )
-        canonical_run_snapshot(config_root, session_id, cli_host_run_id)
+        cli_snapshot = canonical_run_snapshot(
+            config_root,
+            session_id,
+            cli_host_run_id,
+        )
+        provider_trace_replay = validate_provider_trace_export(
+            owned,
+            config_root,
+            session_id,
+            cli_snapshot.run_id,
+        )
+        provider_profile_quarantine_requires_explicit_reenable_intent(
+            owned,
+            config_root,
+            provider_trace_replay["metadata"],
+        )
         provider.require_healthy()
         passed("CLI ask through Session bridge and canonical Kernel facts")
+        passed("Provider trace seal, bounded export, replay, and metadata-only audit")
+        passed("Provider Profile quarantine requires exact explicit re-enable intent")
 
         caller_request = {
             "op": "ask",
@@ -1268,6 +2684,7 @@ def run() -> None:
         passed("Host-owned workspace-bound RunOpen")
         passed("Canonical Run retirement facts and authority cleanup")
 
+        first_host_capability = owned.host_capability
         first_process_group = owned.process_group
         stop_owned_process_group(owned, graceful=True)
         owned = None
@@ -1277,6 +2694,10 @@ def run() -> None:
         )
 
         owned = start_daemon(config_root, port, owner_registry, generation=2)
+        require_provider_trace_capability_invalid_after_restart(
+            owned,
+            provider_trace_replay,
+        )
         replayed_run = open_host_run(owned, session_id, config_root, caller_request)
         replayed_host_run_id = replayed_run.get("id") or replayed_run.get("runId")
         require(
@@ -1297,6 +2718,7 @@ def run() -> None:
             "exact restart replay changed canonical facts or their high-water",
         )
         provider.require_healthy()
+        passed("Provider trace export capability invalidated by daemon restart")
         run_cli(
             owned.base_url,
             owned.host_capability,
@@ -1304,6 +2726,69 @@ def run() -> None:
             expect_success=True,
         )
         passed("Daemon restart and exact caller replay")
+
+        resource_session_id = create_session(owned)
+        provider_count_before_resource_run = provider.request_count()
+        resource_cli_ask = run_cli(
+            owned.base_url,
+            owned.host_capability,
+            [
+                "--print",
+                "--session",
+                resource_session_id,
+                "--workspace",
+                str(workspace),
+                "ask",
+                CLI_PROMPT,
+            ],
+            expect_success=True,
+        )
+        require(
+            resource_cli_ask.stdout.strip() == FINAL_TEXT
+            and provider.request_count() == provider_count_before_resource_run + 1,
+            "Provider trace resource Session did not complete one real Provider turn",
+        )
+        resource_host_run_id = read_cli_ask_host_run_identity(
+            config_root,
+            resource_session_id,
+        )
+        resource_snapshot = canonical_run_snapshot(
+            config_root,
+            resource_session_id,
+            resource_host_run_id,
+        )
+        resource_trace = validate_provider_trace_export(
+            owned,
+            config_root,
+            resource_session_id,
+            resource_snapshot.run_id,
+        )
+        resource_test_capabilities = (
+            provider_trace_export_deadline_and_concurrency_release_owned_resources(
+                owned,
+                config_root,
+                resource_session_id,
+                resource_trace,
+                workspace,
+            )
+        )
+        delete_session_and_require_private_storage_released(
+            owned,
+            config_root,
+            resource_session_id,
+        )
+        require_provider_trace_audit_is_metadata_only(
+            config_root,
+            owned,
+            [
+                first_host_capability,
+                provider_trace_replay["capability"],
+                resource_trace["capability"],
+                *resource_test_capabilities,
+            ],
+        )
+        provider.require_healthy()
+        passed("Provider trace export deadline, concurrency, audit, and resource release")
 
         second_process_group = owned.process_group
         stop_owned_process_group(owned, graceful=True)

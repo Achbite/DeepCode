@@ -26,7 +26,7 @@ use deepcode_kernel_abi::{
 use deepcode_kernel_ledger::v2::CanonicalFactReader;
 use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
 use deepcode_kernel_skills::{scan_skill_mount, SkillActivationStatus, SkillMountEntry};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -642,14 +642,19 @@ impl HostServices {
         sessions_dir: PathBuf,
         kernel_v2_service: KernelSessionServiceV2,
         audit_reader: Option<CanonicalFactReader>,
+        recoverable_session_ids: &HashSet<String>,
+        deletion_tombstone_ids: &HashSet<String>,
     ) -> Result<Self, HostV2StorageError> {
         let active_runs_v2 = HostActiveRunBrokerV2::new(sessions_dir.clone())?;
         let workspace = HostWorkspaceService::from_projects(
             projects,
-            active_runs_v2.workspace_rehydrate_records(),
+            active_runs_v2.workspace_rehydrate_records(recoverable_session_ids),
         );
+        let mut retirement_session_ids = recoverable_session_ids.clone();
+        retirement_session_ids.extend(deletion_tombstone_ids.iter().cloned());
         let recovery_kernel_v2_service = kernel_v2_service.clone();
         if let Err(error) = active_runs_v2.recover_retiring_runs(
+            &retirement_session_ids,
             |run_id, reason_code, reason| {
                 retire_kernel_authority_v2(&recovery_kernel_v2_service, run_id, reason_code, reason)
             },

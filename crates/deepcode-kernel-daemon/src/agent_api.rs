@@ -87,6 +87,14 @@ fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiRes
     }))
 }
 
+fn require_verified_selectable_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), Json<ApiResponse>> {
+    let gui = state.gui.lock().expect("gui state lock");
+    verified_selectable_session(&gui, session_id).map(|_| ())
+}
+
 fn session_payload(state: &AppState, session_id: &str) -> Option<(Value, Vec<Value>)> {
     let (session, sessions_dir) = {
         let gui = state.gui.lock().expect("gui state lock");
@@ -200,7 +208,9 @@ fn authoritative_project_run_context(
     })))
 }
 
-fn session_run_start_admission_lock(session_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn session_run_start_admission_lock(
+    session_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     use std::sync::{Arc, Mutex, OnceLock, Weak};
 
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
@@ -215,7 +225,9 @@ fn session_run_start_admission_lock(session_id: &str) -> std::sync::Arc<tokio::s
     lock
 }
 
-fn session_run_cancel_admission_lock(session_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn session_run_cancel_admission_lock(
+    session_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     use std::sync::{Arc, Mutex, OnceLock, Weak};
 
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
@@ -240,14 +252,17 @@ pub(crate) async fn agent_session_run_start(
     {
         return response;
     }
+    let run_start_lock = session_run_start_admission_lock(&session_id);
+    let _run_start_guard = run_start_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
     let Some((session, _events)) = session_payload(&state, &session_id) else {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
     };
     if !session_schema_is_compatible(&session) {
         return incompatible_session_response();
     }
-    let run_start_lock = session_run_start_admission_lock(&session_id);
-    let _run_start_guard = run_start_lock.lock_owned().await;
     match body.op.as_str() {
         "resolveDecision" => {
             if body.content.is_some()
@@ -319,11 +334,33 @@ pub(crate) async fn agent_session_run_start(
             .get("profileId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let profile_id = stored_profile_id
-            .as_deref()
-            .filter(|profile_id| llm_profile_is_enabled(&llm_profiles, profile_id))
-            .map(str::to_string)
-            .or_else(|| preferred_enabled_llm_profile_id(&llm_profiles));
+        let stored_profile_available = match stored_profile_id.as_deref() {
+            Some(profile_id) => {
+                match effective_llm_profile_is_enabled(&state, &llm_profiles, profile_id) {
+                    Ok(available) => available,
+                    Err(error) => {
+                        return ApiResponse::error(
+                            error.code,
+                            "Provider Profile availability could not be verified before starting the Session Run",
+                        )
+                    }
+                }
+            }
+            None => false,
+        };
+        let profile_id = if stored_profile_available {
+            stored_profile_id.clone()
+        } else {
+            match preferred_effective_llm_profile_id(&state, &llm_profiles) {
+                Ok(profile_id) => profile_id,
+                Err(error) => {
+                    return ApiResponse::error(
+                        error.code,
+                        "Provider Profile availability could not be verified before starting the Session Run",
+                    )
+                }
+            }
+        };
         let Some(profile_id) = profile_id else {
             return ApiResponse::error(
                 "llm_profile_unavailable",
@@ -366,6 +403,11 @@ pub(crate) async fn agent_session_run_get(
     {
         return response;
     }
+    let admission_lock = session_run_start_admission_lock(&session_id);
+    let _admission_guard = admission_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
     if run_belongs_to_session(&state, &session_id, &run_id) {
         return run_response(&state, &session_id, &run_id);
     }
@@ -387,6 +429,9 @@ pub(crate) async fn agent_session_run_cancel(
     }
     let mutation_lock = session_run_cancel_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
     match cancel_agent_kernel_run_v2(&state, &session_id, &run_id, &body.caller_request_id).await {
         Ok(Some(host_run_id)) => run_response(&state, &session_id, &host_run_id),
         Ok(None) => ApiResponse::error("agent_run_not_found", "agent run not found"),
@@ -406,6 +451,9 @@ pub(crate) async fn agent_session_run_guidance(
     }
     let mutation_lock = session_run_start_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
     match submit_agent_kernel_user_input_v2(
         &state,
         &session_id,
@@ -433,6 +481,9 @@ pub(crate) async fn agent_session_run_authority_revoke(
     }
     let mutation_lock = session_run_start_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
     match revoke_agent_kernel_authority_v2(&state, &session_id, &run_id, &body) {
         Ok(result) => ApiResponse::ok(result),
         Err(error) => ApiResponse::error(error.code, error.message),
@@ -449,8 +500,15 @@ pub(crate) async fn agent_session_run_stream(
     {
         return response.into_response();
     }
+    let admission_lock = session_run_start_admission_lock(&session_id);
+    let _admission_guard = admission_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response.into_response();
+    }
+    let session_io_guard = session_private_io_lock(&session_id).read_owned().await;
     let stream_state = state.clone();
     let stream = async_stream::stream! {
+        let _session_io_guard = session_io_guard;
         let mut sent_event_count = query.since_event_count.unwrap_or_else(|| {
             let runs = stream_state.session_runs.lock().expect("session run state lock");
             runs.get(&run_id).map(|run| run.start_event_count).unwrap_or(0)

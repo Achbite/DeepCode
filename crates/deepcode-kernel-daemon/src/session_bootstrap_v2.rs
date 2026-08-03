@@ -177,6 +177,7 @@ pub(crate) struct HostProviderProfileBootstrapV2 {
     pub(crate) schema_version: String,
     pub(crate) provider_profile_id: String,
     pub(crate) provider_profile_revision_digest: String,
+    pub(crate) reasoning_transport: String,
     pub(crate) context_window_tokens: u64,
     pub(crate) max_output_tokens: u64,
 }
@@ -185,6 +186,7 @@ impl HostProviderProfileBootstrapV2 {
     pub(crate) fn new(
         provider_profile_id: String,
         provider_profile_revision_digest: String,
+        reasoning_transport: String,
         context_window_tokens: u64,
         max_output_tokens: u64,
     ) -> Result<Self, HostV2StorageError> {
@@ -192,6 +194,7 @@ impl HostProviderProfileBootstrapV2 {
             schema_version: PROVIDER_PROFILE_SCHEMA_V2.to_string(),
             provider_profile_id,
             provider_profile_revision_digest,
+            reasoning_transport,
             context_window_tokens,
             max_output_tokens,
         };
@@ -211,6 +214,15 @@ impl HostProviderProfileBootstrapV2 {
             &self.provider_profile_revision_digest,
             "providerProfileRevisionDigest",
         )?;
+        if !matches!(
+            self.reasoning_transport.as_str(),
+            "openaiPlaintext" | "anthropicPlaintext" | "ollamaPlaintext"
+        ) {
+            return Err(HostV2StorageError::invalid(
+                "host_provider_profile_reasoning_transport_invalid",
+                "Provider Profile bootstrap requires a supported plaintext reasoning transport",
+            ));
+        }
         if self.context_window_tokens == 0
             || self.context_window_tokens > MAX_PROVIDER_TOKENS_V2
             || self.max_output_tokens == 0

@@ -1,8 +1,8 @@
 use crate::host_kernel_operation_store_v2::{
     HostCallerRequestBindingInputV2, HostCallerRequestBindingReceiptV2,
     HostCallerRequestDriveStateV2, HostCallerRequestRecoveryEvidenceV2,
-    HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
-    HostKernelStoredRunLifecycleV2,
+    HostKernelLiveRunForDeletionV2, HostKernelOperationSettlementReceiptV2,
+    HostKernelOperationSettlementV2, HostKernelStoredRunLifecycleV2,
 };
 use crate::host_kernel_run_v2::{
     HostKernelBridgeOperationV2, HostKernelCapabilityDecisionV2, HostKernelInitialInputV2,
@@ -1101,31 +1101,57 @@ pub(crate) async fn retire_agent_kernel_run_v2(
     terminal_status: &str,
     message: &str,
 ) -> Result<Option<String>, AgentKernelV2Error> {
-    let Some(active) = state
+    let Some(live_run) = state
         .host_services
-        .active_runs_v2
-        .resolve_session_active_run(session_id)
+        .kernel_operations_v2
+        .live_run_for_deletion(session_id)
         .map_err(AgentKernelV2Error::from_storage)?
     else {
         return Ok(None);
     };
+    let (host_run_id, kernel_run_id) = match &live_run {
+        HostKernelLiveRunForDeletionV2::Opening(opening) => (opening.host_run_id.as_str(), None),
+        HostKernelLiveRunForDeletionV2::Active(bootstrap) => (
+            bootstrap.host_run_id.as_str(),
+            Some(bootstrap.run_id.as_str()),
+        ),
+    };
     if let Some(route_run_id) = route_run_id {
-        require_route_run_identity_v2(&active, route_run_id)?;
+        if route_run_id != host_run_id && kernel_run_id != Some(route_run_id) {
+            return Err(AgentKernelV2Error::invalid(
+                "agent_run_identity_conflict",
+                "Run identity does not match the exact durable Host/Kernel Run.",
+            ));
+        }
     }
-    ensure_agent_run_cache_v2(state, &active)?;
-    state
+    let host_run_id = host_run_id.to_string();
+    let retired = state
         .kernel_session_v2
-        .retire_run(session_id, &active.host_run_id, &active.run_id)
+        .retire_session_durable_run(session_id)
         .await
         .map_err(AgentKernelV2Error::from_storage)?;
+    if !retired {
+        state
+            .kernel_session_v2
+            .verify_session_retired_for_deletion(session_id)
+            .await
+            .map_err(AgentKernelV2Error::from_storage)?;
+        if route_run_id.is_some() {
+            return Err(AgentKernelV2Error::invalid(
+                "agent_run_retirement_identity_stale",
+                "Exact Run identity became terminal before the requested retirement completed.",
+            ));
+        }
+        return Ok(None);
+    }
     mark_agent_run_v2(
         state,
-        &active.host_run_id,
+        &host_run_id,
         terminal_status,
         Some(message.to_string()),
         None,
     );
-    Ok(Some(active.host_run_id))
+    Ok(Some(host_run_id))
 }
 
 pub(crate) fn restore_agent_kernel_run_cache_v2(
@@ -3846,6 +3872,7 @@ fn provider_profile_bootstrap_v2(
                 profiles.iter().find(|profile| {
                     profile.get("id").and_then(Value::as_str) == Some(profile_id)
                         && profile.get("enabled").and_then(Value::as_bool) == Some(true)
+                        && profile_reasoning_transport_is_compatible(profile)
                 })
             })
             .cloned()
@@ -3857,6 +3884,21 @@ fn provider_profile_bootstrap_v2(
         )
     })?;
     let revision_digest = stable_json_sha256(&profile).map_err(AgentKernelV2Error::from_storage)?;
+    if state
+        .provider_trace_v1
+        .profile_revision_is_unavailable(profile_id, &revision_digest)
+        .map_err(|error| {
+            AgentKernelV2Error::invalid(
+                error.code,
+                "Provider Profile availability could not be verified for Run bootstrap.",
+            )
+        })?
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "llm_profile_revision_unavailable",
+            "Selected LLM Profile revision is unavailable until the user explicitly re-enables it or saves a new revision.",
+        ));
+    }
     let context_window_tokens = profile
         .get("contextWindowTokens")
         .and_then(Value::as_u64)
@@ -3875,9 +3917,19 @@ fn provider_profile_bootstrap_v2(
                 "Selected LLM Profile requires a positive maxOutputTokens value.",
             )
         })?;
+    let reasoning_transport = profile
+        .get("reasoningTransport")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "llm_profile_reasoning_transport_invalid",
+                "Selected LLM Profile requires a compatible reasoningTransport.",
+            )
+        })?;
     HostProviderProfileBootstrapV2::new(
         profile_id.to_string(),
         revision_digest,
+        reasoning_transport.to_string(),
         context_window_tokens,
         max_output_tokens,
     )

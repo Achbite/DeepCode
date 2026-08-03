@@ -67,6 +67,7 @@ export function buildSessionProviderContextV2(
     providerTurnId: input.providerTurnId,
     runId: input.runId,
     controlEpoch: input.controlEpoch,
+    purpose: input.purpose,
     toolContextRef: input.toolContext.contextRef,
     currentInput: input.currentInput,
     target: input.target,
@@ -284,6 +285,8 @@ export function buildSessionProviderContextV2(
           input.providerProfile.providerProfileId,
         providerProfileRevisionDigest:
           input.providerProfile.providerProfileRevisionDigest,
+        reasoningTransport:
+          input.providerProfile.reasoningTransport,
         contextWindowTokens:
           input.providerProfile.contextWindowTokens,
         maxOutputTokens:

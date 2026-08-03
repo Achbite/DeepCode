@@ -487,7 +487,7 @@ async function latestRunDrivesLiveProjectionWithoutTruncatingHistory() {
   );
   assert.equal(projection.runProjection.runId, 'run-b');
   assert.equal(projection.runProjection.status, 'waitingUser');
-  assert.equal(projection.runProjection.activeInteractionId, 'permission-b');
+  assert.equal(projection.runProjection.wait.interactionId, 'permission-b');
   assert.equal(
     findLatestPendingPermission(events).request.id,
     'permission-b'

@@ -2,7 +2,7 @@ use crate::host_v2_storage::{
     atomic_write_private_json, canonical_sha256, create_private_directory, read_json,
     reject_transport_capabilities, sha256_path_component, sync_directory,
     validate_bounded_identity, validate_safe_session_identity, value_without_field,
-    with_storage_path_lock, HostV2StorageError,
+    with_storage_path_lock, with_storage_path_locks, HostV2StorageError,
 };
 use crate::host_workspace_registry_v2::HostWorkspaceRehydrateRecordV2;
 use deepcode_kernel_abi::v2::RunRetirementReasonCodeV2;
@@ -10,10 +10,10 @@ use deepcode_kernel_abi::{RunCapabilityV2, WorkspaceBindingRefV2};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -325,6 +325,65 @@ impl HostActiveRunBrokerV2 {
         } else {
             Err(invalid_run_transport_capability())
         }
+    }
+
+    pub(crate) fn with_authorized_session_run_transport_storage<T>(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        capability: &RunCapabilityV2,
+        coordinated_path: &Path,
+        operation: impl FnOnce() -> Result<T, HostV2StorageError>,
+    ) -> Result<T, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        validate_bounded_identity(run_id, "runId", 512)?;
+        let submitted: [u8; 32] =
+            Sha256::digest(capability.expose_to_transport().as_bytes()).into();
+        let binding = self
+            .run_transport_capabilities
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_run_transport_authority_unavailable",
+                    "Host Run transport authority is unavailable",
+                )
+            })?
+            .iter()
+            .find(|(binding, expected)| {
+                binding.session_id == session_id
+                    && binding.run_id == run_id
+                    && constant_time_digest_eq(&expected.digest, &submitted)
+            })
+            .map(|(binding, _)| binding.clone())
+            .ok_or_else(invalid_run_transport_capability)?;
+        let active_path = self.active_run_path(&binding.session_id, &binding.host_run_id)?;
+        with_storage_path_locks(&[&active_path, coordinated_path], || {
+            let value = read_json(&active_path)?.ok_or_else(invalid_run_transport_capability)?;
+            let active =
+                decode_active_run_record(value).map_err(|_| invalid_run_transport_capability())?;
+            if active.lifecycle != HostRunLifecycleV2::Active
+                || active.session_id != binding.session_id
+                || active.host_run_id != binding.host_run_id
+                || active.run_id != binding.run_id
+            {
+                return Err(invalid_run_transport_capability());
+            }
+            let capability_still_bound = self
+                .run_transport_capabilities
+                .lock()
+                .map_err(|_| {
+                    HostV2StorageError::io(
+                        "host_run_transport_authority_unavailable",
+                        "Host Run transport authority is unavailable",
+                    )
+                })?
+                .get(&binding)
+                .is_some_and(|expected| constant_time_digest_eq(&expected.digest, &submitted));
+            if !capability_still_bound {
+                return Err(invalid_run_transport_capability());
+            }
+            operation()
+        })
     }
 
     pub(crate) fn authorize_host_run_transport(
@@ -903,6 +962,114 @@ impl HostActiveRunBrokerV2 {
         Ok(active)
     }
 
+    pub(crate) fn verify_session_has_no_run_residue(
+        &self,
+        session_id: &str,
+    ) -> Result<(), HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        let active_dir = self
+            .sessions_dir
+            .join(session_id)
+            .join("kernel-v2")
+            .join("active-runs");
+        let entries = match fs::read_dir(active_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(HostV2StorageError::io(
+                    "host_active_run_scan_failed",
+                    format!("scan Session active-run directory before deletion: {error}"),
+                ))
+            }
+        };
+        if let Some(entries) = entries {
+            let mut record_count = 0usize;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    HostV2StorageError::io(
+                        "host_active_run_scan_failed",
+                        format!("scan Session active-run record before deletion: {error}"),
+                    )
+                })?;
+                if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                record_count = record_count.saturating_add(1);
+                if record_count > MAX_ACTIVE_RUN_RECORDS {
+                    return Err(HostV2StorageError::conflict(
+                        "host_active_run_scan_limit",
+                        "Session active-run records exceed the bounded deletion scan limit",
+                    ));
+                }
+                let value = read_json(&entry.path())?.ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_active_run_record_missing",
+                        "Session active-run record disappeared during deletion verification",
+                    )
+                })?;
+                let record = decode_active_run_record(value)?;
+                if record.session_id != session_id {
+                    return Err(HostV2StorageError::conflict(
+                        "host_active_run_identity_conflict",
+                        "Session active-run record does not match its deletion scope",
+                    ));
+                }
+                return Err(HostV2StorageError::conflict(
+                    "host_session_run_retirement_pending",
+                    "Session still has an Active or Retiring Host Run",
+                ));
+            }
+        }
+
+        let bridge_slot = self
+            .bridge_slots
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_bridge_v2_owner_unavailable",
+                    "Host bridge child registry is unavailable during deletion verification",
+                )
+            })?
+            .get(session_id)
+            .cloned();
+        if let Some(bridge_slot) = bridge_slot {
+            if bridge_slot
+                .lock()
+                .map_err(|_| {
+                    HostV2StorageError::io(
+                        "host_bridge_v2_owner_unavailable",
+                        "Host bridge child owner is unavailable during deletion verification",
+                    )
+                })?
+                .is_some()
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_session_bridge_child_retirement_pending",
+                    "Session still owns a live bridge child",
+                ));
+            }
+        }
+
+        if self
+            .run_transport_capabilities
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_run_transport_capability_registry_unavailable",
+                    "Host Run transport capability registry is unavailable during deletion verification",
+                )
+            })?
+            .keys()
+            .any(|binding| binding.session_id == session_id)
+        {
+            return Err(HostV2StorageError::conflict(
+                "host_session_transport_capability_retirement_pending",
+                "Session still owns a process-private Run transport capability",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn active_run_records(
         &self,
     ) -> Result<Vec<HostActiveRunRecordV2>, HostV2StorageError> {
@@ -963,6 +1130,7 @@ impl HostActiveRunBrokerV2 {
     /// Retiring workspaces are excluded from registry rehydration.
     pub(crate) fn recover_retiring_runs(
         &self,
+        admitted_session_ids: &HashSet<String>,
         mut retire_kernel_run: impl FnMut(
             &str,
             RunRetirementReasonCodeV2,
@@ -974,10 +1142,17 @@ impl HostActiveRunBrokerV2 {
             &str,
         ) -> Result<(), HostV2StorageError>,
     ) -> Result<usize, HostV2StorageError> {
-        let retiring = self
-            .scan_active_run_records()?
+        let records = self.scan_active_run_records()?;
+        if records.iter().any(|record| {
+            record.lifecycle == HostRunLifecycleV2::Retiring
+                && !admitted_session_ids.contains(&record.session_id)
+        }) {
+            self.record_startup_error("host_session_recovery_not_admitted");
+        }
+        let retiring = records
             .into_iter()
             .filter(|record| record.lifecycle == HostRunLifecycleV2::Retiring)
+            .filter(|record| admitted_session_ids.contains(&record.session_id))
             .collect::<Vec<_>>();
         let mut recovered = 0_usize;
         let mut first_error = None;
@@ -1601,28 +1776,40 @@ impl HostActiveRunBrokerV2 {
         })
     }
 
-    pub(crate) fn workspace_rehydrate_records(&self) -> Vec<HostWorkspaceRehydrateRecordV2> {
+    pub(crate) fn workspace_rehydrate_records(
+        &self,
+        recoverable_session_ids: &HashSet<String>,
+    ) -> Vec<HostWorkspaceRehydrateRecordV2> {
         match self.scan_active_run_records() {
             Ok(records) => {
+                let unadmitted = records.iter().any(|record| {
+                    record.lifecycle == HostRunLifecycleV2::Active
+                        && !recoverable_session_ids.contains(&record.session_id)
+                });
                 let owner_lost = records.iter().any(|record| {
-                    matches!(
-                        &record.bridge_ownership,
-                        HostBridgeOwnershipV2::SpawnPrepared {
-                            owner_instance_id,
-                            ..
-                        } | HostBridgeOwnershipV2::Owned {
-                            owner_instance_id,
-                            ..
-                        } if owner_instance_id != self.owner_instance_id.as_ref()
-                    )
+                    recoverable_session_ids.contains(&record.session_id)
+                        && matches!(
+                            &record.bridge_ownership,
+                            HostBridgeOwnershipV2::SpawnPrepared {
+                                owner_instance_id,
+                                ..
+                            } | HostBridgeOwnershipV2::Owned {
+                                owner_instance_id,
+                                ..
+                            } if owner_instance_id != self.owner_instance_id.as_ref()
+                        )
                 });
                 let mut errors = Vec::new();
                 if owner_lost {
                     errors.push("host_bridge_v2_owner_lost".to_string());
                 }
+                if unadmitted {
+                    errors.push("host_session_recovery_not_admitted".to_string());
+                }
                 self.replace_startup_errors(errors);
                 records
                     .into_iter()
+                    .filter(|record| recoverable_session_ids.contains(&record.session_id))
                     .filter(|record| record.lifecycle == HostRunLifecycleV2::Active)
                     .filter(|record| record.workspace_kind == HostRunWorkspaceKindV2::Empty)
                     .filter_map(|record| {

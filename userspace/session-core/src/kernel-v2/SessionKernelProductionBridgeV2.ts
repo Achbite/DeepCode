@@ -1705,6 +1705,7 @@ function decodeProviderProfileBootstrapV2(
     'schemaVersion',
     'providerProfileId',
     'providerProfileRevisionDigest',
+    'reasoningTransport',
     'contextWindowTokens',
     'maxOutputTokens',
   ]);
@@ -1728,6 +1729,16 @@ function decodeProviderProfileBootstrapV2(
       'session_kernel_provider_profile_budget_invalid'
     );
   }
+  const reasoningTransport = record.reasoningTransport;
+  if (
+    reasoningTransport !== 'openaiPlaintext'
+    && reasoningTransport !== 'anthropicPlaintext'
+    && reasoningTransport !== 'ollamaPlaintext'
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_provider_reasoning_transport_invalid'
+    );
+  }
   return {
     schemaVersion: SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA,
     providerProfileId: identity(
@@ -1738,6 +1749,7 @@ function decodeProviderProfileBootstrapV2(
       record.providerProfileRevisionDigest,
       'providerProfileRevisionDigest'
     ),
+    reasoningTransport,
     contextWindowTokens,
     maxOutputTokens,
   };

@@ -24,7 +24,13 @@ pub(crate) fn localhost_cors_layer() -> CorsLayer {
             header::HeaderName::from_static(
                 crate::host_admission_v2::HOST_SHELL_CAPABILITY_HEADER_V2,
             ),
+            header::HeaderName::from_static(
+                crate::provider_trace_api::PROVIDER_TRACE_CAPABILITY_HEADER_V1,
+            ),
         ])
+        .expose_headers([header::HeaderName::from_static(
+            crate::provider_trace_api::PROVIDER_TRACE_DIGEST_HEADER_V1,
+        )])
 }
 
 pub(crate) async fn trusted_local_origin_gate(request: Request, next: Next) -> Response {

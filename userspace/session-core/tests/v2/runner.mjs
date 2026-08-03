@@ -5,6 +5,9 @@ import {
   contractCases as loopCases,
 } from './loop-contracts.mjs';
 import {
+  contractCases as providerLifecycleCases,
+} from './provider-lifecycle-contracts.mjs';
+import {
   contractCases as recoveryCases,
 } from './recovery-contracts.mjs';
 import {
@@ -15,6 +18,7 @@ const SUITE_ID = 'session.v2.contracts';
 const cases = [
   ...authorityCases,
   ...loopCases,
+  ...providerLifecycleCases,
   ...recoveryCases,
   ...reviewCases,
 ];

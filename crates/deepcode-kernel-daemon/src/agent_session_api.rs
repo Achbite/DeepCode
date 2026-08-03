@@ -47,7 +47,10 @@ pub(crate) async fn agent_session_create(
         return response;
     }
     let mut gui = state.gui.lock().expect("gui state lock");
-    let id = format!("session-{}", now_millis());
+    let id = match allocate_agent_session_id(&gui) {
+        Ok(id) => id,
+        Err(error) => return ApiResponse::error("agent_session_identity_unavailable", error),
+    };
     let now = now_text();
     let project_id = body
         .get("projectId")
@@ -80,7 +83,15 @@ pub(crate) async fn agent_session_create(
     } else {
         body.get("workspaceHash").and_then(Value::as_str)
     };
-    let default_profile_id = preferred_enabled_llm_profile_id(&gui.llm_profiles);
+    let default_profile_id = match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            return ApiResponse::error(
+                error.code,
+                "Provider Profile availability could not be verified for Session creation",
+            )
+        }
+    };
     let mut session = create_agent_session_value(
         &id,
         &now,
@@ -94,13 +105,6 @@ pub(crate) async fn agent_session_create(
     if let Some(project_id) = project_id {
         session["projectId"] = json!(project_id);
         session["workspaceBinding"] = project_binding.clone().unwrap_or(Value::Null);
-    }
-    let new_session_storage_dir = gui.paths.sessions_dir.join(safe_path_segment(&id));
-    if new_session_storage_dir.exists() {
-        return ApiResponse::error(
-            "agent_session_identity_conflict",
-            "generated Session identity already has private storage",
-        );
     }
     let scope_key = session_scope_key(&session);
     let previous_current_session_id = gui.current_session_id.clone();
@@ -207,16 +211,32 @@ pub(crate) async fn agent_session_rename(
             );
         }
         let profile_id = if requested_profile_id.is_null() {
-            preferred_enabled_llm_profile_id(&gui.llm_profiles)
+            match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
+                Ok(profile_id) => profile_id,
+                Err(error) => {
+                    return ApiResponse::error(
+                        error.code,
+                        "Provider Profile availability could not be verified for Session selection",
+                    )
+                }
+            }
         } else if let Some(profile_id) = requested_profile_id
             .as_str()
             .map(str::trim)
             .filter(|profile_id| !profile_id.is_empty())
         {
-            if !llm_profile_is_enabled(&gui.llm_profiles, profile_id) {
+            let profile_available =
+                match effective_llm_profile_is_enabled(&state, &gui.llm_profiles, profile_id) {
+                    Ok(available) => available,
+                    Err(error) => return ApiResponse::error(
+                        error.code,
+                        "Provider Profile availability could not be verified for Session selection",
+                    ),
+                };
+            if !profile_available {
                 return ApiResponse::error(
                     "llm_profile_unavailable",
-                    "selected LLM Profile does not exist or is disabled",
+                    "selected LLM Profile does not exist, is disabled, or its revision is unavailable",
                 );
             }
             Some(profile_id.to_string())
@@ -295,6 +315,54 @@ pub(crate) fn session_has_pending_interaction(state: &AppState, session_id: &str
         .unwrap_or(true)
 }
 
+fn session_deletion_failure_response(
+    state: &AppState,
+    session_id: &str,
+    failure_code: &str,
+    failure_message: &str,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let Some(position) = gui
+        .sessions
+        .iter()
+        .position(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+    else {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    };
+    mark_session_deletion_failed(
+        &mut gui.sessions[position],
+        &now_text(),
+        failure_code,
+        failure_message,
+    );
+    let failed_session = gui.sessions[position].clone();
+    match crate::session_metadata_v2::persist_session_index(&gui) {
+        Ok(()) => ApiResponse::error_with_data(
+            failure_code,
+            failure_message,
+            json!({
+                "session": failed_session,
+                "deletionRetryable": true
+            }),
+        ),
+        Err(persist_error) => ApiResponse::error_with_data(
+            "agent_session_deletion_failure_persist_failed",
+            format!(
+                "{failure_message}; additionally failed to persist the retryable Session deletion state: {persist_error}"
+            ),
+            json!({
+                "session": failed_session,
+                "deletionRetryable": true,
+                "deletionFailure": {
+                    "code": failure_code,
+                    "message": failure_message
+                },
+                "persistenceFailure": persist_error
+            }),
+        ),
+    }
+}
+
 pub(crate) async fn agent_session_delete(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -304,6 +372,49 @@ pub(crate) async fn agent_session_delete(
     {
         return response;
     }
+    if session_id.is_empty() || safe_path_segment(&session_id) != session_id {
+        return ApiResponse::error(
+            "agent_session_identity_invalid",
+            "Session deletion requires a non-empty canonical path-safe Session id",
+        );
+    }
+    let run_start_lock = session_run_start_admission_lock(&session_id);
+    let _run_start_guard = run_start_lock.lock_owned().await;
+    let run_cancel_lock = session_run_cancel_admission_lock(&session_id);
+    let _run_cancel_guard = run_cancel_lock.lock_owned().await;
+    let safe_session_id = safe_path_segment(&session_id);
+    let (sessions_dir, response_scope_key) = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let Some(position) = gui.sessions.iter().position(|session| {
+            session.get("id").and_then(Value::as_str) == Some(session_id.as_str())
+        }) else {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        };
+        let previous_session = gui.sessions[position].clone();
+        let scope_key = session_scope_key(&previous_session);
+        mark_session_deletion_pending(&mut gui.sessions[position], &now_text());
+        if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
+            gui.sessions[position] = previous_session;
+            return ApiResponse::error(
+                "agent_session_deletion_pending_persist_failed",
+                format!(
+                    "Session deletion did not start because its pending state could not be persisted: {error}"
+                ),
+            );
+        }
+        gui.current_session_ids_by_scope
+            .retain(|_, current_id| current_id != &session_id);
+        if gui.current_session_id.as_deref() == Some(session_id.as_str()) {
+            gui.current_session_id = gui
+                .sessions
+                .iter()
+                .find(|session| session_is_selectable(session))
+                .and_then(|session| session.get("id").and_then(Value::as_str))
+                .map(ToOwned::to_owned);
+        }
+        (gui.paths.sessions_dir.clone(), scope_key)
+    };
+
     if let Err(error) = retire_agent_kernel_run_v2(
         &state,
         &session_id,
@@ -313,43 +424,88 @@ pub(crate) async fn agent_session_delete(
     )
     .await
     {
-        return ApiResponse::error(error.code, error.message);
+        return session_deletion_failure_response(&state, &session_id, &error.code, &error.message);
     }
-    let safe_session_id = safe_path_segment(&session_id);
-    let (sessions_dir, response_scope_key, response_current_id, response_sessions) = {
+    let session_io_lock = session_private_io_lock(&session_id);
+    let _session_io_guard = session_io_lock.write_owned().await;
+    if let Err(error) = state
+        .kernel_session_v2
+        .verify_session_retired_for_deletion(&session_id)
+        .await
+    {
+        return session_deletion_failure_response(&state, &session_id, error.code, &error.message);
+    }
+    if let Err(error) = remove_session_storage_dir(&sessions_dir, &safe_session_id) {
+        return session_deletion_failure_response(
+            &state,
+            &session_id,
+            "agent_session_storage_delete_failed",
+            &format!("Session private storage could not be removed: {error}"),
+        );
+    }
+
+    let (response_current_id, response_sessions) = {
         let mut gui = state.gui.lock().expect("gui state lock");
         let Some(position) = gui.sessions.iter().position(|session| {
             session.get("id").and_then(Value::as_str) == Some(session_id.as_str())
         }) else {
             return ApiResponse::error("agent_session_not_found", "agent session not found");
         };
-
-        let scope_key = session_scope_key(&gui.sessions[position]);
-        gui.sessions.remove(position);
+        let mut remaining_sessions = gui.sessions.clone();
+        remaining_sessions.remove(position);
+        if let Err(error) = crate::session_metadata_v2::persist_session_index_values(
+            &gui.paths.sessions_index_path,
+            &remaining_sessions,
+        ) {
+            mark_session_deletion_failed(
+                &mut gui.sessions[position],
+                &now_text(),
+                "agent_session_index_finalize_failed",
+                &error,
+            );
+            let failed_session = gui.sessions[position].clone();
+            return match crate::session_metadata_v2::persist_session_index(&gui) {
+                Ok(()) => ApiResponse::error_with_data(
+                    "agent_session_index_finalize_failed",
+                    format!(
+                        "Session private storage was removed, but the Session index could not be finalized: {error}"
+                    ),
+                    json!({
+                        "session": failed_session,
+                        "deletionRetryable": true,
+                        "storageRemoved": true
+                    }),
+                ),
+                Err(failed_state_error) => ApiResponse::error_with_data(
+                    "agent_session_index_finalize_failed",
+                    format!(
+                        "Session private storage was removed, but neither index finalization nor the retryable failure state could be persisted: {error}; failure state: {failed_state_error}"
+                    ),
+                    json!({
+                        "session": failed_session,
+                        "deletionRetryable": true,
+                        "storageRemoved": true,
+                        "persistenceFailure": failed_state_error
+                    }),
+                ),
+            };
+        }
+        gui.sessions = remaining_sessions;
         gui.current_session_ids_by_scope
             .retain(|_, current_id| current_id != &session_id);
         if gui.current_session_id.as_deref() == Some(session_id.as_str()) {
             gui.current_session_id = gui
                 .sessions
                 .iter()
-                .find(|session| !is_archived_session(session))
+                .find(|session| session_is_selectable(session))
                 .and_then(|session| session.get("id").and_then(Value::as_str))
                 .map(ToOwned::to_owned);
         }
-        let response_current_id = current_agent_session_id_for_scope(&mut gui, &scope_key);
-        let response_sessions = scoped_sessions(&gui, &scope_key, false);
-        if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
-            return ApiResponse::error("agent_session_persist_failed", error);
-        }
         (
-            gui.paths.sessions_dir.clone(),
-            scope_key,
-            response_current_id,
-            response_sessions,
+            current_agent_session_id_for_scope(&mut gui, &response_scope_key),
+            scoped_sessions(&gui, &response_scope_key, false),
         )
     };
-
-    remove_session_storage_dir(&sessions_dir, &safe_session_id);
 
     ApiResponse::ok(json!({
         "sessions": response_sessions,
@@ -368,10 +524,33 @@ pub(crate) async fn agent_session_archive(
     {
         return response;
     }
+    let run_start_lock = session_run_start_admission_lock(&session_id);
+    let _run_start_guard = run_start_lock.lock_owned().await;
+    let run_cancel_lock = session_run_cancel_admission_lock(&session_id);
+    let _run_cancel_guard = run_cancel_lock.lock_owned().await;
     let should_archive = body
         .get("archived")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    {
+        let gui = state.gui.lock().expect("gui state lock");
+        let Some(session) = gui
+            .sessions
+            .iter()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+        else {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        };
+        if !session_schema_is_compatible(session) {
+            return incompatible_session_response();
+        }
+        if session_is_deletion_tombstone(session) {
+            return ApiResponse::error(
+                "agent_session_deletion_in_progress",
+                "Session deletion is pending or failed and must be retried before archival",
+            );
+        }
+    }
     if should_archive {
         if let Err(error) = retire_agent_kernel_run_v2(
             &state,
@@ -385,23 +564,72 @@ pub(crate) async fn agent_session_archive(
             return ApiResponse::error(error.code, error.message);
         }
     }
+    let session_io_lock = session_private_io_lock(&session_id);
+    let _session_io_guard = session_io_lock.write_owned().await;
+    if should_archive {
+        if let Err(error) = state
+            .kernel_session_v2
+            .verify_session_retired_for_deletion(&session_id)
+            .await
+        {
+            return ApiResponse::error(error.code, error.message);
+        }
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
-    let archived_scope_key = session_by_id(&gui, &session_id).map(session_scope_key);
+    let archived_scope_key = gui
+        .sessions
+        .iter()
+        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+        .map(session_scope_key);
     let was_global_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
     let was_scoped_current = archived_scope_key
         .as_ref()
         .and_then(|scope| gui.current_session_ids_by_scope.get(scope))
         .map(|current| current == &session_id)
         .unwrap_or(false);
+    let replacement_profile_id = if should_archive && (was_global_current || was_scoped_current) {
+        let previous_profile_id = gui
+            .sessions
+            .iter()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+            .and_then(|session| session.get("profileId"))
+            .and_then(Value::as_str);
+        let previous_available = match previous_profile_id {
+            Some(profile_id) => {
+                match effective_llm_profile_is_enabled(&state, &gui.llm_profiles, profile_id) {
+                    Ok(available) => available,
+                    Err(error) => {
+                        return ApiResponse::error(
+                            error.code,
+                            "Provider Profile availability could not be verified for replacement Session creation",
+                        )
+                    }
+                }
+            }
+            None => false,
+        };
+        if previous_available {
+            previous_profile_id.map(ToOwned::to_owned)
+        } else {
+            match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
+                Ok(profile_id) => profile_id,
+                Err(error) => {
+                    return ApiResponse::error(
+                        error.code,
+                        "Provider Profile availability could not be verified for replacement Session creation",
+                    )
+                }
+            }
+        }
+    } else {
+        None
+    };
     let mut replacement_scope: Option<(Option<String>, Option<String>, Option<String>)> = None;
     if let Some(session) = session_mut(&mut gui, &session_id) {
         if should_archive {
             if was_global_current || was_scoped_current {
                 replacement_scope = Some((
-                    session
-                        .get("profileId")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
+                    replacement_profile_id.clone(),
                     session
                         .get("workspaceId")
                         .and_then(Value::as_str)
@@ -455,6 +683,7 @@ pub(crate) async fn agent_session_events(
     {
         return response;
     }
+    let _io_guard = session_private_io_lock(&session_id).read_owned().await;
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
 }

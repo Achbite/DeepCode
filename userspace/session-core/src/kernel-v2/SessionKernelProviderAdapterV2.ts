@@ -19,6 +19,8 @@ import {
 } from './toolIntent.js';
 import type {
   SessionNaturalLanguagePlanV2,
+  SessionProviderCompletionReceiptV1,
+  SessionProviderOrderedItemV2,
   SessionProviderResultMetadataV2,
   SessionProviderToolCallReceiptV2,
   SessionProviderTurnInputV2,
@@ -46,6 +48,9 @@ export interface SessionProviderPlanDraftV2 {
   actions: SessionProviderPlanActionDraftV2[];
 }
 
+export type SessionKernelProviderOrderedItemV2 =
+  SessionProviderOrderedItemV2;
+
 export type SessionKernelProviderBackendOutputV2 = (
   | {
       kind: 'plan';
@@ -69,6 +74,8 @@ export type SessionKernelProviderBackendOutputV2 = (
       guidance?: string;
     }
 ) & {
+  items: SessionKernelProviderOrderedItemV2[];
+  completion: SessionProviderCompletionReceiptV1;
   providerResult: SessionProviderResultMetadataV2;
   responseDigest: string;
 };
@@ -104,6 +111,11 @@ implements SessionKernelProviderAdapterV2 {
     input: SessionProviderTurnInputV2
   ): Promise<SessionProviderTurnOutputV2> {
     const output = await this.backend.requestTurn(input);
+    assertCompletedProviderBackendOutputV2(input, output);
+    const completionFields = {
+      items: cloneJson(output.items),
+      completion: cloneJson(output.completion),
+    };
     switch (output.kind) {
       case 'plan':
         if (input.target.kind !== 'planning') {
@@ -114,6 +126,7 @@ implements SessionKernelProviderAdapterV2 {
         }
         return {
           kind: 'plan',
+          ...completionFields,
           plan: materializeProviderPlanV2(
             input,
             output.plan,
@@ -134,6 +147,7 @@ implements SessionKernelProviderAdapterV2 {
         });
         return {
           kind: 'toolIntent',
+          ...completionFields,
           sources,
           receipt: providerToolCallReceipt(
             input.providerTurnId,
@@ -153,16 +167,23 @@ implements SessionKernelProviderAdapterV2 {
         if (!output.text.trim()) {
           return {
             kind: 'noTool',
+            ...completionFields,
             providerResult: output.providerResult,
           };
         }
         requiredText(output.text, 'Provider text', 1024 * 1024);
         if (claimsToolIntentFrame(output.text)) {
+          assertSealedTextFrameSource(input, output);
           const frame =
             decodeProviderToolIntentTextFrameV2(output.text);
           requirePermittedTool(input, frame.toolId);
+          const textCallId =
+            `text-${sha256Hash(output.text.trim())
+              .slice('sha256:'.length)}`;
           return {
             kind: 'toolIntent',
+            items: cloneJson(output.items),
+            completion: cloneJson(output.completion),
             sources: [{
               source: 'textFrame',
               frame: output.text,
@@ -171,8 +192,7 @@ implements SessionKernelProviderAdapterV2 {
               input.providerTurnId,
               output.responseDigest,
               [{
-                callId: `text-${sha256Hash(output.text.trim())
-                  .slice('sha256:'.length)}`,
+                callId: textCallId,
                 toolName: frame.toolId,
                 toolId: frame.toolId,
                 arguments: frame.arguments,
@@ -184,12 +204,14 @@ implements SessionKernelProviderAdapterV2 {
         }
         return {
           kind: 'answer',
+          ...completionFields,
           text: output.text,
           providerResult: output.providerResult,
         };
       case 'noTool':
         return {
           kind: 'noTool',
+          ...completionFields,
           ...(output.guidance?.trim()
             ? { guidance: output.guidance }
             : {}),
@@ -197,6 +219,204 @@ implements SessionKernelProviderAdapterV2 {
         };
     }
   }
+}
+
+function assertSealedTextFrameSource(
+  input: SessionProviderTurnInputV2,
+  output: SessionKernelProviderBackendOutputV2 & { kind: 'text' }
+): void {
+  const item = output.items[0];
+  if (
+    input.purpose === 'finalAnswer'
+    || output.items.length !== 1
+    || item?.kind !== 'text'
+    || item.phase !== 'unknown'
+    || item.text !== output.text
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_text_frame_source_invalid',
+      'A text ToolIntent requires one exact unphased sealed text item and is forbidden during finalAnswer.'
+    );
+  }
+}
+
+function assertCompletedProviderBackendOutputV2(
+  input: SessionProviderTurnInputV2,
+  output: SessionKernelProviderBackendOutputV2
+): void {
+  const completion = output.completion;
+  if (
+    !completion
+    || !completion.nativeCompletion
+    || completion.schemaVersion
+      !== 'deepcode.provider-stream-terminal.v1'
+    || completion.reasoningPresent !== true
+    || completion.trace?.sealed !== true
+    || !Number.isSafeInteger(completion.trace.recordCount)
+    || completion.trace.recordCount <= 0
+    || output.responseDigest !== completion.responseDigest
+  ) {
+    throw providerCompletionInvalid();
+  }
+  requiredDigest(completion.reasoningDigest, 'reasoningDigest');
+  requiredDigest(completion.responseDigest, 'responseDigest');
+  requiredDigest(completion.trace.sealDigest, 'trace.sealDigest');
+  requiredDigest(
+    completion.trace.terminalDigest,
+    'trace.terminalDigest'
+  );
+  const expectedReasoningTransport =
+    completion.nativeCompletion.providerKind === 'openaiCompatible'
+      ? 'openaiPlaintext'
+      : completion.nativeCompletion.providerKind === 'anthropic'
+        ? 'anthropicPlaintext'
+        : completion.nativeCompletion.providerKind === 'ollama'
+          ? 'ollamaPlaintext'
+          : undefined;
+  if (
+    !expectedReasoningTransport
+    || completion.reasoningTransport !== expectedReasoningTransport
+  ) {
+    throw providerCompletionInvalid();
+  }
+  if (
+    completion.reasoningTransport
+      !== input.providerProfile.reasoningTransport
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_reasoning_transport_mismatch',
+      'Provider completion reasoning transport differs from the immutable Profile revision.'
+    );
+  }
+  if (
+    output.providerResult.providerProfileId !== undefined
+    && output.providerResult.providerProfileId
+      !== input.providerProfile.providerProfileId
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_profile_result_mismatch',
+      'Provider result profile differs from the immutable Run bootstrap.'
+    );
+  }
+  if (!Array.isArray(output.items) || output.items.length > 96) {
+    throw providerCompletionInvalid();
+  }
+  let finalStarted = false;
+  const orderedTools: Array<
+    Extract<SessionKernelProviderOrderedItemV2, { kind: 'toolCall' }>
+  > = [];
+  for (const [index, item] of output.items.entries()) {
+    if (item.kind === 'text') {
+      requiredText(item.text, 'Provider ordered text', 1024 * 1024);
+      if (
+        item.phase !== 'commentary'
+        && item.phase !== 'final_answer'
+        && item.phase !== 'unknown'
+      ) {
+        throw providerCompletionInvalid();
+      }
+      if (finalStarted && item.phase === 'commentary') {
+        throw new SessionKernelProviderAdapterError(
+          'session_kernel_provider_phase_conflict',
+          'Provider commentary cannot appear after final answer output began.'
+        );
+      }
+      if (item.phase === 'final_answer') finalStarted = true;
+      continue;
+    }
+    if (item.kind !== 'toolCall' || finalStarted) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_phase_conflict',
+        'Provider final answer and tool calls cannot share one response.'
+      );
+    }
+    if (item.ordinal !== orderedTools.length + 1) {
+      throw providerCompletionInvalid();
+    }
+    if (item.source !== 'providerNative') {
+      throw providerCompletionInvalid();
+    }
+    requiredIdentity(item.callId, `items[${index}].callId`);
+    requiredIdentity(item.toolName, `items[${index}].toolName`);
+    requiredToolId(item.toolId);
+    orderedTools.push(item);
+  }
+  if (
+    String((input.target as { kind: string }).kind) === 'finalAnswer'
+    && orderedTools.length > 0
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_final_answer_tool_forbidden',
+      'A final-answer Provider turn cannot return tool calls.'
+    );
+  }
+  if (
+    finalStarted
+    && orderedTools.length > 0
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_phase_conflict',
+      'Provider final answer and tool calls cannot share one response.'
+    );
+  }
+  if (output.kind === 'nativeToolCalls') {
+    if (
+      orderedTools.length !== output.calls.length
+      || output.calls.some((call, index) => {
+        const ordered = orderedTools[index];
+        return !ordered
+          || ordered.callId !== call.callId
+          || ordered.toolName !== call.toolName
+          || ordered.toolId !== call.toolId
+          || canonicalJson(ordered.arguments)
+            !== canonicalJson(call.arguments);
+      })
+    ) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_ordered_items_mismatch',
+        'Provider semantic tool calls differ from the sealed ordered response.'
+      );
+    }
+  } else if (orderedTools.length > 0) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_ordered_items_mismatch',
+      'Provider semantic output omitted sealed ordered tool calls.'
+    );
+  }
+  const native = completion.nativeCompletion;
+  if (
+    native.providerKind === 'openaiCompatible'
+    && (
+      native.terminalSignal !== '[DONE]'
+      || (
+        orderedTools.length > 0
+          ? native.finishReason !== 'tool_calls'
+          : native.finishReason !== 'stop'
+      )
+    )
+  ) {
+    throw providerCompletionInvalid();
+  }
+  if (
+    native.providerKind === 'anthropic'
+    && native.terminalSignal !== 'message_stop'
+  ) {
+    throw providerCompletionInvalid();
+  }
+  if (
+    native.providerKind === 'ollama'
+    && native.terminalSignal !== 'done:true'
+  ) {
+    throw providerCompletionInvalid();
+  }
+}
+
+function providerCompletionInvalid():
+  SessionKernelProviderAdapterError {
+  return new SessionKernelProviderAdapterError(
+    'session_kernel_provider_completion_receipt_invalid',
+    'Provider output is not bound to a valid native completion and durable trace receipt.'
+  );
 }
 
 function providerToolCallReceipt(

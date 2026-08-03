@@ -242,6 +242,9 @@ export function restoreSessionKernelLoopStateV2(
   state.providerOutcomeHistoryOmittedCount +=
     boundedOutcomes.omittedCount;
   state.planActionSettlements ??= {};
+  if (state.providerTurn) {
+    validateProviderTurnResponse(state.providerTurn);
+  }
   if (state.providerToolCallQueue) {
     validateSessionProviderToolCallQueueV2(
       state.providerToolCallQueue,
@@ -259,6 +262,11 @@ export function restoreSessionKernelLoopStateV2(
       || state.providerTurn.controlEpoch
         !== state.providerToolCallQueue.controlEpoch
       || state.providerTurn.status !== 'awaitingTools'
+      || JSON.stringify(state.providerTurn.response)
+        !== JSON.stringify({
+          items: state.providerToolCallQueue.orderedItems,
+          completion: state.providerToolCallQueue.completion,
+        })
     )
   ) {
     throw new SessionKernelStateError(
@@ -1101,6 +1109,11 @@ function validateProviderProfile(
     || !/^sha256:[0-9a-f]{64}$/u.test(
       profile.providerProfileRevisionDigest
     )
+    || (
+      profile.reasoningTransport !== 'openaiPlaintext'
+      && profile.reasoningTransport !== 'anthropicPlaintext'
+      && profile.reasoningTransport !== 'ollamaPlaintext'
+    )
     || !Number.isSafeInteger(profile.contextWindowTokens)
     || profile.contextWindowTokens <= 0
     || profile.contextWindowTokens > 1_000_000_000
@@ -1111,6 +1124,116 @@ function validateProviderProfile(
     throw new SessionKernelStateError(
       'session_kernel_provider_profile_invalid',
       'Session provider profile bootstrap is not exact v2.'
+    );
+  }
+}
+
+function validateProviderTurnResponse(
+  turn: SessionProviderTurnRecordV2
+): void {
+  const response = turn.response;
+  if (!response) {
+    if (
+      turn.status === 'awaitingTools'
+      || turn.status === 'completed'
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_provider_response_missing',
+        'Settled Provider turn has no durable ordered response receipt.'
+      );
+    }
+    return;
+  }
+  const completion = response.completion;
+  if (
+    !Array.isArray(response.items)
+    || response.items.length > 96
+    || completion.schemaVersion
+      !== 'deepcode.provider-stream-terminal.v1'
+    || completion.reasoningPresent !== true
+    || completion.reasoningTransport
+      !== turn.contextAssembly.providerProfile.reasoningTransport
+    || completion.trace?.sealed !== true
+    || !Number.isSafeInteger(completion.trace.recordCount)
+    || completion.trace.recordCount <= 0
+    || !/^sha256:[0-9a-f]{64}$/u.test(
+      completion.reasoningDigest
+    )
+    || !/^sha256:[0-9a-f]{64}$/u.test(
+      completion.responseDigest
+    )
+    || !/^sha256:[0-9a-f]{64}$/u.test(
+      completion.trace.sealDigest
+    )
+    || !/^sha256:[0-9a-f]{64}$/u.test(
+      completion.trace.terminalDigest
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_response_invalid',
+      'Provider turn durable ordered response receipt is invalid.'
+    );
+  }
+  let finalStarted = false;
+  let toolOrdinal = 0;
+  for (const item of response.items) {
+    if (item.kind === 'text') {
+      if (
+        !item.text.trim()
+        || new TextEncoder().encode(item.text).byteLength
+          > 1024 * 1024
+        || (
+          item.phase !== 'commentary'
+          && item.phase !== 'final_answer'
+          && item.phase !== 'unknown'
+        )
+        || (finalStarted && item.phase === 'commentary')
+      ) {
+        throw new SessionKernelStateError(
+          'session_kernel_provider_response_invalid',
+          'Provider turn ordered text item is invalid.'
+        );
+      }
+      if (item.phase === 'final_answer') finalStarted = true;
+      continue;
+    }
+    toolOrdinal += 1;
+    if (
+      item.kind !== 'toolCall'
+      || finalStarted
+      || item.ordinal !== toolOrdinal
+      || item.source !== 'providerNative'
+      || !item.callId.trim()
+      || !item.toolName.trim()
+      || !item.toolId.trim()
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_provider_response_invalid',
+        'Provider turn ordered tool item is invalid.'
+      );
+    }
+  }
+  const native = completion.nativeCompletion;
+  const nativeInvalid =
+    native.providerKind === 'openaiCompatible'
+      ? native.terminalSignal !== '[DONE]'
+        || (
+          toolOrdinal > 0
+            ? native.finishReason !== 'tool_calls'
+            : native.finishReason !== 'stop'
+        )
+        || completion.reasoningTransport !== 'openaiPlaintext'
+      : native.providerKind === 'anthropic'
+        ? native.terminalSignal !== 'message_stop'
+          || completion.reasoningTransport !== 'anthropicPlaintext'
+        : native.providerKind === 'ollama'
+          ? native.terminalSignal !== 'done:true'
+            || completion.reasoningTransport !== 'ollamaPlaintext'
+          : true;
+  if (nativeInvalid) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_response_invalid',
+      'Provider turn native completion conflicts with ordered response.'
     );
   }
 }

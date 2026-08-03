@@ -14,10 +14,13 @@ import {
 import type { SessionKernelLoopStateV2 } from './state.js';
 import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+  type SessionProviderCompletionReceiptV1,
+  type SessionProviderOrderedItemV2,
   type SessionProviderResultMetadataV2,
   type SessionProviderToolCallReceiptV2,
   type SessionProviderTurnTargetV2,
 } from './types.js';
+import { decodeProviderToolIntentTextFrameV2 } from './toolIntent.js';
 
 const MAX_PROVIDER_TOOL_CALLS_PER_TURN = 32;
 const MAX_PROVIDER_TOOL_CALL_QUEUE_BYTES = 4 * 1024 * 1024;
@@ -49,6 +52,8 @@ export interface SessionProviderToolCallQueueV2 {
   target: SessionProviderTurnTargetV2;
   receipt: SessionProviderToolCallReceiptV2;
   providerResult: SessionProviderResultMetadataV2;
+  orderedItems: SessionProviderOrderedItemV2[];
+  completion: SessionProviderCompletionReceiptV1;
   calls: SessionProviderToolCallQueueItemV2[];
   status: 'active' | 'completed' | 'aborted';
   outcomeRecorded: boolean;
@@ -67,6 +72,8 @@ export function createSessionProviderToolCallQueueV2(input: {
   target: SessionProviderTurnTargetV2;
   receipt: SessionProviderToolCallReceiptV2;
   providerResult: SessionProviderResultMetadataV2;
+  orderedItems: SessionProviderOrderedItemV2[];
+  completion: SessionProviderCompletionReceiptV1;
   intents: ToolIntentV2[];
 }): SessionProviderToolCallQueueV2 {
   const queue: SessionProviderToolCallQueueV2 = {
@@ -75,6 +82,8 @@ export function createSessionProviderToolCallQueueV2(input: {
     target: cloneJson(input.target),
     receipt: cloneJson(input.receipt),
     providerResult: cloneJson(input.providerResult),
+    orderedItems: cloneJson(input.orderedItems),
+    completion: cloneJson(input.completion),
     calls: input.intents.map((intent, index) => ({
       ordinal: index + 1,
       intent: cloneJson(intent),
@@ -112,6 +121,7 @@ export function validateSessionProviderToolCallQueueV2(
     || !Number.isSafeInteger(queue.controlEpoch)
     || queue.controlEpoch <= 0
     || !Array.isArray(queue.calls)
+    || !Array.isArray(queue.orderedItems)
     || queue.calls.length === 0
     || queue.calls.length > MAX_PROVIDER_TOOL_CALLS_PER_TURN
     || queue.receipt.callCount !== queue.calls.length
@@ -128,6 +138,7 @@ export function validateSessionProviderToolCallQueueV2(
   requiredIdentity(queue.providerTurnId, 'providerTurnId');
   requiredDigest(queue.receipt.responseDigest, 'responseDigest');
   requiredInstant(queue.receipt.recordedAt, 'receipt.recordedAt');
+  validateQueueOrderedProviderResponseV2(queue);
   if (queue.target.kind === 'planAction') {
     requiredIdentity(queue.target.planActionId, 'target.planActionId');
   } else if (queue.target.kind === 'contextRead') {
@@ -715,6 +726,140 @@ function mergedOrderedFacts(
       left.ledgerSequence - right.ledgerSequence
       || left.factId.localeCompare(right.factId)
   );
+}
+
+function validateQueueOrderedProviderResponseV2(
+  queue: SessionProviderToolCallQueueV2
+): void {
+  const completion = queue.completion;
+  if (
+    !completion
+    || completion.schemaVersion
+      !== 'deepcode.provider-stream-terminal.v1'
+    || completion.reasoningPresent !== true
+    || completion.trace?.sealed !== true
+    || !Number.isSafeInteger(completion.trace.recordCount)
+    || completion.trace.recordCount <= 0
+    || completion.responseDigest !== queue.receipt.responseDigest
+  ) {
+    throw invalidQueue();
+  }
+  requiredDigest(completion.reasoningDigest, 'reasoningDigest');
+  requiredDigest(completion.responseDigest, 'responseDigest');
+  requiredDigest(completion.trace.sealDigest, 'trace.sealDigest');
+  requiredDigest(
+    completion.trace.terminalDigest,
+    'trace.terminalDigest'
+  );
+  if (queue.orderedItems.length > 96) throw invalidQueue();
+  const orderedCalls: Array<
+    Extract<SessionProviderOrderedItemV2, { kind: 'toolCall' }>
+  > = [];
+  let finalStarted = false;
+  for (const item of queue.orderedItems) {
+    if (item.kind === 'text') {
+      if (
+        !item.text.trim()
+        || jsonByteLength(item.text) > 1024 * 1024
+        || (
+          item.phase !== 'commentary'
+          && item.phase !== 'final_answer'
+          && item.phase !== 'unknown'
+        )
+        || (finalStarted && item.phase === 'commentary')
+      ) {
+        throw invalidQueue();
+      }
+      if (item.phase === 'final_answer') finalStarted = true;
+      continue;
+    }
+    if (
+      item.kind !== 'toolCall'
+      || finalStarted
+      || item.ordinal !== orderedCalls.length + 1
+      || item.source !== 'providerNative'
+    ) {
+      throw invalidQueue();
+    }
+    requiredIdentity(item.callId, 'orderedItems.callId');
+    requiredIdentity(item.toolName, 'orderedItems.toolName');
+    requiredIdentity(item.toolId, 'orderedItems.toolId');
+    orderedCalls.push(item);
+  }
+  if (!receiptMatchesSealedProviderItems(queue, orderedCalls)) {
+    throw invalidQueue();
+  }
+  const providerNativeCalls = orderedCalls.length > 0;
+  const native = completion.nativeCompletion;
+  const expectedReasoningTransport =
+    native.providerKind === 'openaiCompatible'
+      ? 'openaiPlaintext'
+      : native.providerKind === 'anthropic'
+        ? 'anthropicPlaintext'
+        : native.providerKind === 'ollama'
+          ? 'ollamaPlaintext'
+          : undefined;
+  if (
+    completion.reasoningTransport !== expectedReasoningTransport
+    || (
+      native.providerKind === 'openaiCompatible'
+      ? native.terminalSignal !== '[DONE]'
+        || native.finishReason
+          !== (providerNativeCalls ? 'tool_calls' : 'stop')
+      : native.providerKind === 'anthropic'
+        ? native.terminalSignal !== 'message_stop'
+        : native.providerKind === 'ollama'
+          ? native.terminalSignal !== 'done:true'
+          : true
+    )
+  ) {
+    throw invalidQueue();
+  }
+}
+
+function receiptMatchesSealedProviderItems(
+  queue: SessionProviderToolCallQueueV2,
+  orderedCalls: Array<
+    Extract<SessionProviderOrderedItemV2, { kind: 'toolCall' }>
+  >
+): boolean {
+  if (orderedCalls.length > 0) {
+    return orderedCalls.length === queue.receipt.calls.length
+      && orderedCalls.every((call, index) => {
+        const receipt = queue.receipt.calls[index];
+        return Boolean(receipt)
+          && call.ordinal === receipt!.ordinal
+          && call.callId === receipt!.callId
+          && call.toolName === receipt!.toolName
+          && call.toolId === receipt!.toolId
+          && sha256Hash(canonicalJson(call.arguments))
+            === receipt!.argumentsDigest;
+      });
+  }
+  if (
+    queue.orderedItems.length !== 1
+    || queue.receipt.calls.length !== 1
+  ) {
+    return false;
+  }
+  const item = queue.orderedItems[0];
+  if (item?.kind !== 'text' || item.phase !== 'unknown') {
+    return false;
+  }
+  try {
+    const frame = decodeProviderToolIntentTextFrameV2(item.text);
+    const call = queue.receipt.calls[0]!;
+    const callId = `text-${sha256Hash(item.text.trim())
+      .slice('sha256:'.length)}`;
+    return call.ordinal === 1
+      && call.callId === callId
+      && call.toolName === frame.toolId
+      && call.toolId === frame.toolId
+      && call.argumentsDigest
+        === sha256Hash(canonicalJson(frame.arguments));
+  } catch {
+    return false;
+  }
 }
 
 function requiredIdentity(value: unknown, field: string): string {
