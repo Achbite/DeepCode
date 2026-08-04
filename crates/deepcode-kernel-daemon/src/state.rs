@@ -5,6 +5,8 @@ use crate::*;
 pub(crate) struct AppState {
     pub(crate) kernel_v2: crate::kernel_v2_transport::KernelV2TransportState,
     pub(crate) kernel_session_v2: crate::host_kernel_run_v2::HostKernelRunCoordinatorV2,
+    pub(crate) kernel_wake_v2: crate::host_kernel_wake_v2::HostKernelWakeSupervisorV2,
+    pub(crate) startup_readiness_v2: crate::startup_readiness_v2::HostStartupReadinessV2,
     pub(crate) host_shell_authority: crate::host_admission_v2::HostShellAuthorityV2,
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) host_services: HostServices,
@@ -47,6 +49,8 @@ pub(crate) struct GuiState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentRunState {
     pub(crate) run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kernel_run_id: Option<String>,
     pub(crate) session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile_id: Option<String>,
@@ -72,6 +76,7 @@ impl AgentRunState {
         let now = now_text();
         Self {
             run_id,
+            kernel_run_id: None,
             session_id,
             profile_id: Some(profile_id),
             status: "running".to_string(),

@@ -4,11 +4,13 @@ use crate::host_v2_storage::{
     reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
     validate_safe_session_identity, validate_sha256_digest, HostV2StorageError,
 };
+use crate::host_workspace_registry_v2::HostWorkspaceRehydrateRecordV2;
 use crate::session_bootstrap_v2::{
     HostProviderProfileBootstrapV2, HostSessionPriorEventsV2, HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3,
 };
 use crate::AgentInputAttachmentV2;
 use deepcode_kernel_abi::v2_command::{KernelCommandEnvelopeV2, KernelCommandV2, RunOpenReplyV2};
+use deepcode_kernel_abi::WorkspaceBindingRefV2;
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
@@ -21,20 +23,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const STORE_SCHEMA_V2: &str = "deepcode.host.kernel-durable-store.v2";
-const RUN_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-run.v2";
+const STORE_SCHEMA_V2: &str = "deepcode.host.kernel-durable-store.v4";
+const RUN_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-run.v4";
 const BOOTSTRAP_SCHEMA_V2: &str = "deepcode.host.kernel-run-bootstrap.v2";
-const CALLER_REQUEST_SCHEMA_V2: &str = "deepcode.host.caller-request.v2";
+const CALLER_REQUEST_SCHEMA_V2: &str = "deepcode.host.caller-request.v3";
 const OPERATION_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-operation.v2";
 const ATTEMPT_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-dispatch-attempt.v2";
-const HISTORY_SCHEMA_V2: &str = "deepcode.session.kernel-persistence.v2";
+const HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v3";
 const PRODUCTION_FRAME_SCHEMA_V2: &str = "deepcode.session.kernel-production-request-frame.v2";
 const PRODUCTION_REQUEST_SCHEMA_V2: &str = "deepcode.session.kernel-production-request.v2";
+const PRODUCTION_RESPONSE_SCHEMA_V2: &str = "deepcode.session.kernel-production-response.v2";
 const PREFETCHED_RUN_SCHEMA_V2: &str = "deepcode.session.prefetched-kernel-run.v2";
 const SESSION_BOOTSTRAP_MATERIAL_SCHEMA_V2: &str =
     "deepcode.host.kernel-session-bootstrap-material.v2";
+const HOST_RUN_OPEN_REQUEST_KIND_V2: &str = "agent.run.open.v2";
 const HOST_CANCEL_REQUEST_KIND_V2: &str = "agent.run.cancel.v2";
-const SQLITE_USER_VERSION_V2: i64 = 5;
+const HOST_DECISION_REQUEST_KIND_V2: &str = "agent.run.decision.v2";
+const HOST_USER_INPUT_REQUEST_KIND_V2: &str = "agent.run.user-input.v2";
+const SQLITE_USER_VERSION_V2: i64 = 7;
 
 const MAX_BOOTSTRAP_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INITIAL_INPUT_BYTES: usize = 1024 * 1024;
@@ -79,6 +85,7 @@ pub(crate) struct HostKernelRunOpeningInputV2 {
     pub(crate) run_open_request_id: String,
     pub(crate) run_open_envelope: KernelCommandEnvelopeV2,
     pub(crate) workspace_binding_identity: String,
+    pub(crate) workspace_canonical_root: PathBuf,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
     pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
@@ -105,6 +112,7 @@ pub(crate) struct HostKernelRunOpeningRecordV2 {
     pub(crate) run_open_envelope: KernelCommandEnvelopeV2,
     pub(crate) workspace_binding_ref: String,
     pub(crate) workspace_binding_identity: String,
+    pub(crate) workspace_canonical_root: Option<PathBuf>,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
     pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
@@ -138,6 +146,7 @@ pub(crate) struct HostKernelBootstrapRecordV2 {
     pub(crate) workspace_binding_ref: String,
     pub(crate) workspace_binding_digest: String,
     pub(crate) workspace_binding_identity: String,
+    pub(crate) workspace_canonical_root: Option<PathBuf>,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
     pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
@@ -181,6 +190,9 @@ pub(crate) struct HostCallerRequestBindingReceiptV2 {
     pub(crate) drive_state: HostCallerRequestDriveStateV2,
     pub(crate) drive_owner_instance_id: Option<String>,
     pub(crate) drive_started_at: Option<String>,
+    pub(crate) admission: Option<Value>,
+    pub(crate) admission_digest: Option<String>,
+    pub(crate) admitted_at: Option<String>,
     pub(crate) outcome: Option<Value>,
     pub(crate) outcome_digest: Option<String>,
     pub(crate) replayed: bool,
@@ -211,6 +223,14 @@ pub(crate) struct HostCallerRequestRecoveryEvidenceV2 {
     pub(crate) first_operation_pending: bool,
     pub(crate) first_settlement: Option<HostKernelOperationSettlementReceiptV2>,
     pub(crate) latest_settlement: Option<HostKernelOperationSettlementReceiptV2>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HostRunCallerDriveRecoveryV2 {
+    NoDrive,
+    Unadmitted(HostCallerRequestBindingReceiptV2),
+    Admitted(HostCallerRequestBindingReceiptV2),
+    Indeterminate(HostCallerRequestBindingReceiptV2),
 }
 
 #[derive(Debug, Clone)]
@@ -297,10 +317,54 @@ pub(crate) enum HostKernelOperationSettlementV2 {
     },
     FailedRecoverable {
         error_code: String,
+        boundary: HostKernelOperationFailureBoundaryV2,
     },
     FailedTerminal {
         error_code: String,
+        boundary: HostKernelOperationFailureBoundaryV2,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostKernelFailureDispositionV2 {
+    CorrectRequest,
+    RetrySameRequest,
+    QueryFacts,
+    DoNotRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostKernelFailureCommitV2 {
+    None,
+    Committed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostKernelFailureEffectV2 {
+    None,
+    Possible,
+    Observed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostKernelPendingRequestLaneV2 {
+    Control,
+    Effect,
+    Query,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HostKernelOperationFailureBoundaryV2 {
+    pub(crate) disposition: HostKernelFailureDispositionV2,
+    pub(crate) commit: HostKernelFailureCommitV2,
+    pub(crate) effect: HostKernelFailureEffectV2,
+    pub(crate) pending_request_lanes: Vec<HostKernelPendingRequestLaneV2>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +415,45 @@ impl HostKernelOperationStoreV2 {
         Self {
             sessions_dir: Arc::new(sessions_dir),
         }
+    }
+
+    pub(crate) fn workspace_rehydrate_records(
+        &self,
+        recoverable_session_ids: &HashSet<String>,
+    ) -> Result<Vec<HostWorkspaceRehydrateRecordV2>, HostV2StorageError> {
+        self.with_connection(|connection| {
+            let stored_runs = query_live_runs(connection)?;
+            let mut records = Vec::with_capacity(stored_runs.len());
+            for stored in stored_runs {
+                if !recoverable_session_ids.contains(&stored.session_id) {
+                    continue;
+                }
+                let opening = match parse_run_lifecycle(&stored.lifecycle)? {
+                    HostKernelStoredRunLifecycleV2::Opening
+                    | HostKernelStoredRunLifecycleV2::Active => decode_opening_record(&stored)?,
+                    HostKernelStoredRunLifecycleV2::Retired => continue,
+                };
+                let root = opening.workspace_canonical_root.ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_kernel_workspace_recovery_material_missing",
+                        "UnsupportedHistorySchema: live Host Kernel Run has no Host-only workspace recovery root",
+                    )
+                })?;
+                let reference = WorkspaceBindingRefV2::new(opening.workspace_binding_ref)
+                    .map_err(|_| {
+                        HostV2StorageError::conflict(
+                            "host_kernel_recovery_workspace_binding_invalid",
+                            "Durable Host bootstrap contains an invalid workspace binding reference",
+                        )
+                    })?;
+                records.push(HostWorkspaceRehydrateRecordV2::new(
+                    reference,
+                    root,
+                    Some(opening.workspace_binding_identity),
+                ));
+            }
+            Ok(records)
+        })
     }
 
     pub(crate) fn caller_request_binding(
@@ -436,6 +539,9 @@ impl HostKernelOperationStoreV2 {
                 drive_state: HostCallerRequestDriveStateV2::Bound,
                 drive_owner_instance_id: None,
                 drive_started_at: None,
+                admission: None,
+                admission_digest: None,
+                admitted_at: None,
                 outcome: None,
                 outcome_digest: None,
                 replayed: false,
@@ -567,6 +673,389 @@ impl HostKernelOperationStoreV2 {
         })
     }
 
+    /// Persists the stable HTTP admission result without releasing the
+    /// ordinary Run drive. The exact owner remains responsible for either a
+    /// terminal caller outcome or an explicit indeterminate settlement.
+    pub(crate) fn admit_caller_request(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        admission: Value,
+        admitted_at: &str,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_bounded_identity(admitted_at, "admittedAt", 1024)?;
+        reject_transport_capabilities(&admission)?;
+        let admission_json = canonical_json_string(&admission)?;
+        if admission_json.len() > MAX_RESPONSE_BYTES {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_admission_too_large",
+                "Host caller request admission exceeds its bounded size",
+            ));
+        }
+        let admission_digest = canonical_sha256(&admission)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_not_found",
+                        "Host caller request must be bound before admission",
+                    )
+                })?;
+            let existing =
+                decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            if let Some(existing_digest) = existing.admission_digest.as_deref() {
+                if existing_digest == admission_digest {
+                    return Ok(existing);
+                }
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_admission_conflict",
+                    "Host caller request admission is permanently bound to different content",
+                ));
+            }
+            if existing.drive_state != HostCallerRequestDriveStateV2::Driving
+                || existing.drive_owner_instance_id.as_deref() != Some(owner_instance_id)
+                || existing.outcome.is_some()
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_not_driving",
+                    "Only the exact unsettled drive owner may admit a Host caller request",
+                ));
+            }
+            let host_run_id = existing
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Host caller request admission has no exact Host Run identity",
+                    )
+                })?;
+            let run = stored_run_by_session_host(transaction, session_id, host_run_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_run_not_found",
+                        "Host caller request admission is bound to a missing Run",
+                    )
+                })?;
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+                || run.drive_caller_request_id.as_deref() != Some(caller_request_id)
+                || run.drive_request_digest.as_deref() != Some(request_digest)
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_run_drive_conflict",
+                    "Host caller request admission does not own the exact active Run drive",
+                ));
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE host_caller_requests
+                     SET admission_json = ?1, admission_digest = ?2, admitted_at = ?3
+                     WHERE session_id = ?4 AND caller_request_id = ?5
+                       AND drive_state = 'Driving' AND drive_owner_instance_id = ?6
+                       AND admission_json IS NULL AND outcome_json IS NULL",
+                    params![
+                        admission_json,
+                        admission_digest,
+                        admitted_at,
+                        session_id,
+                        caller_request_id,
+                        owner_instance_id,
+                    ],
+                )
+                .map_err(|error| database_error("host_caller_request_admission_failed", error))?;
+            if changed != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_admission_conflict",
+                    "Host caller request drive changed before durable admission",
+                ));
+            }
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::io(
+                        "host_caller_request_admission_lost",
+                        "Admitted Host caller request disappeared before commit",
+                    )
+                })?;
+            decode_caller_request_binding(stored, request_kind, request_digest, false)
+        })
+    }
+
+    /// Classifies the exact durable caller correlation before startup restores
+    /// any Run owner. A generic facts wait is safe only for `NoDrive`.
+    pub(crate) fn caller_drive_recovery_for_run(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+    ) -> Result<HostRunCallerDriveRecoveryV2, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        validate_bounded_identity(host_run_id, "hostRunId", 512)?;
+        self.with_connection(|connection| {
+            let Some(run) = stored_run_by_session_host(connection, session_id, host_run_id)? else {
+                return Ok(HostRunCallerDriveRecoveryV2::NoDrive);
+            };
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active {
+                return Ok(HostRunCallerDriveRecoveryV2::NoDrive);
+            }
+            let (caller_request_id, request_digest) = match (
+                run.drive_caller_request_id.as_deref(),
+                run.drive_request_digest.as_deref(),
+            ) {
+                (None, None) => return Ok(HostRunCallerDriveRecoveryV2::NoDrive),
+                (Some(caller_request_id), Some(request_digest)) => {
+                    (caller_request_id, request_digest)
+                }
+                _ => {
+                    return Err(corrupt(
+                        "Active Host Run has a partial caller drive identity",
+                    ))
+                }
+            };
+            let stored = stored_caller_request(connection, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    corrupt("Active Host Run drive references a missing caller request")
+                })?;
+            let request_kind = stored.request_kind.clone();
+            let binding =
+                decode_caller_request_binding(stored, &request_kind, request_digest, true)?;
+            if binding.drive_state != HostCallerRequestDriveStateV2::Driving {
+                return Err(corrupt(
+                    "Active Host Run drive references a caller that is not Driving",
+                ));
+            }
+            if binding
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("disposition"))
+                .and_then(Value::as_str)
+                == Some("indeterminate")
+            {
+                return Ok(HostRunCallerDriveRecoveryV2::Indeterminate(binding));
+            }
+            if binding.outcome.is_some() {
+                return Err(corrupt(
+                    "Terminal Host caller outcome retained an active Run drive",
+                ));
+            }
+            if binding.admission.is_some() {
+                Ok(HostRunCallerDriveRecoveryV2::Admitted(binding))
+            } else {
+                Ok(HostRunCallerDriveRecoveryV2::Unadmitted(binding))
+            }
+        })
+    }
+
+    pub(crate) fn unadmitted_driving_run_open_callers(
+        &self,
+        recoverable_session_ids: &HashSet<String>,
+    ) -> Result<Vec<HostCallerRequestBindingReceiptV2>, HostV2StorageError> {
+        for session_id in recoverable_session_ids {
+            validate_safe_session_identity(session_id)?;
+        }
+        if recoverable_session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT {} FROM host_caller_requests
+                     WHERE request_kind = ?1
+                       AND drive_state = 'Driving'
+                       AND admission_json IS NULL
+                       AND outcome_json IS NULL
+                     ORDER BY session_id, caller_request_id",
+                    CALLER_REQUEST_COLUMNS
+                ))
+                .map_err(|error| {
+                    database_error("host_run_open_unadmitted_startup_query_failed", error)
+                })?;
+            let rows = statement
+                .query_map(
+                    params![HOST_RUN_OPEN_REQUEST_KIND_V2],
+                    StoredCallerRequestV2::from_row,
+                )
+                .map_err(|error| {
+                    database_error("host_run_open_unadmitted_startup_query_failed", error)
+                })?;
+            let mut bindings = Vec::new();
+            for row in rows {
+                let stored = row.map_err(|error| {
+                    database_error("host_run_open_unadmitted_startup_query_failed", error)
+                })?;
+                if !recoverable_session_ids.contains(&stored.session_id) {
+                    continue;
+                }
+                let request_digest = stored.request_digest.clone();
+                let binding = decode_caller_request_binding(
+                    stored,
+                    HOST_RUN_OPEN_REQUEST_KIND_V2,
+                    &request_digest,
+                    true,
+                )?;
+                if binding.drive_state != HostCallerRequestDriveStateV2::Driving
+                    || binding.admission.is_some()
+                    || binding.outcome.is_some()
+                {
+                    return Err(corrupt(
+                        "RunOpen unadmitted startup query returned an invalid caller boundary",
+                    ));
+                }
+                bindings.push(binding);
+            }
+            Ok(bindings)
+        })
+    }
+
+    pub(crate) fn reclaim_admitted_caller_request_drive(
+        &self,
+        binding: &HostCallerRequestBindingReceiptV2,
+        owner_instance_id: &str,
+        reclaimed_at: &str,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        self.reclaim_caller_request_drive_inner(binding, owner_instance_id, reclaimed_at, true)
+    }
+
+    fn reclaim_caller_request_drive_inner(
+        &self,
+        binding: &HostCallerRequestBindingReceiptV2,
+        owner_instance_id: &str,
+        reclaimed_at: &str,
+        require_admission: bool,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_bounded_identity(reclaimed_at, "driveStartedAt", 1024)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "host_caller_request_not_found",
+                    "Startup caller drive recovery requires an exact durable binding",
+                )
+            })?;
+            let current = decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                true,
+            )?;
+            if current.drive_state != HostCallerRequestDriveStateV2::Driving
+                || current.outcome.is_some()
+                || if require_admission {
+                    current.admission_digest != binding.admission_digest
+                        || current.admission.is_none()
+                } else {
+                    current.admission.is_some() || binding.admission.is_some()
+                }
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_reclaim_conflict",
+                    "Startup caller drive recovery no longer matches the exact request boundary",
+                ));
+            }
+            let host_run_id = current
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Startup caller drive recovery has no exact Host Run identity",
+                    )
+                })?;
+            let run = stored_run_by_session_host(transaction, &binding.session_id, host_run_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_run_not_found",
+                        "Startup caller drive recovery is bound to a missing Run",
+                    )
+                })?;
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+                || run.drive_caller_request_id.as_deref()
+                    != Some(binding.caller_request_id.as_str())
+                || run.drive_request_digest.as_deref() != Some(binding.request_digest.as_str())
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_run_drive_conflict",
+                    "Startup caller drive recovery no longer owns the exact active Run drive",
+                ));
+            }
+            let changed = if require_admission {
+                transaction.execute(
+                    "UPDATE host_caller_requests
+                     SET drive_owner_instance_id = ?1, drive_started_at = ?2
+                     WHERE session_id = ?3 AND caller_request_id = ?4
+                       AND request_digest = ?5 AND admission_digest = ?6
+                       AND drive_state = 'Driving' AND outcome_json IS NULL
+                       AND drive_owner_instance_id = ?7",
+                    params![
+                        owner_instance_id,
+                        reclaimed_at,
+                        binding.session_id,
+                        binding.caller_request_id,
+                        binding.request_digest,
+                        binding.admission_digest,
+                        binding.drive_owner_instance_id,
+                    ],
+                )
+            } else {
+                transaction.execute(
+                    "UPDATE host_caller_requests
+                     SET drive_owner_instance_id = ?1, drive_started_at = ?2
+                     WHERE session_id = ?3 AND caller_request_id = ?4
+                       AND request_digest = ?5 AND admission_digest IS NULL
+                       AND drive_state = 'Driving' AND outcome_json IS NULL
+                       AND drive_owner_instance_id = ?6",
+                    params![
+                        owner_instance_id,
+                        reclaimed_at,
+                        binding.session_id,
+                        binding.caller_request_id,
+                        binding.request_digest,
+                        binding.drive_owner_instance_id,
+                    ],
+                )
+            }
+            .map_err(|error| database_error("host_caller_request_reclaim_failed", error))?;
+            if changed != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_reclaim_conflict",
+                    "Startup caller drive ownership changed before recovery",
+                ));
+            }
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::io(
+                    "host_caller_request_reclaim_lost",
+                    "Reclaimed Host caller request disappeared before commit",
+                )
+            })?;
+            decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                false,
+            )
+        })
+    }
+
     /// Claims a high-priority control request without replacing the ordinary
     /// semantic caller that may still be driving the Run. The exact control
     /// operation is correlated separately when it is prepared.
@@ -686,6 +1175,395 @@ impl HostKernelOperationStoreV2 {
         outcome: Value,
         settled_at: String,
     ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        self.settle_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            None,
+            outcome,
+            settled_at,
+        )
+    }
+
+    pub(crate) fn settle_owned_caller_request(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        admission_digest: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_sha256_digest(admission_digest, "admissionDigest")?;
+        self.settle_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            Some((owner_instance_id, admission_digest)),
+            outcome,
+            settled_at,
+        )
+    }
+
+    pub(crate) fn settle_unadmitted_owned_caller_request(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        self.settle_unadmitted_owned_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            owner_instance_id,
+            outcome,
+            settled_at,
+            "failed",
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn settle_unadmitted_owned_caller_indeterminate(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        self.settle_unadmitted_owned_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            owner_instance_id,
+            outcome,
+            settled_at,
+            "indeterminate",
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn settle_unadmitted_owned_run_open_success(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        if request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2 {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_run_open_success_kind_invalid",
+                "Only RunOpen may persist an unadmitted successful caller outcome",
+            ));
+        }
+        self.settle_unadmitted_owned_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            owner_instance_id,
+            outcome,
+            settled_at,
+            "succeeded",
+            false,
+            true,
+        )
+    }
+
+    pub(crate) fn settle_unadmitted_owned_cancel_success(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        if request_kind != HOST_CANCEL_REQUEST_KIND_V2 {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_cancel_success_kind_invalid",
+                "Only an exact Run cancellation may persist a control success outcome",
+            ));
+        }
+        let evidence = self.caller_control_request_recovery_evidence(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        if evidence.run_lifecycle != Some(HostKernelStoredRunLifecycleV2::Retired)
+            || evidence.retirement_caller_request_id.as_deref() != Some(caller_request_id)
+            || evidence.retirement_request_digest.as_deref() != Some(request_digest)
+            || !canonical_cancel_settlement_matches_binding(&evidence)?
+        {
+            return Err(HostV2StorageError::conflict(
+                "host_caller_request_cancel_success_evidence_missing",
+                "Run cancellation success requires exact canonical settlement and caller-correlated retirement evidence",
+            ));
+        }
+        self.settle_unadmitted_owned_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            owner_instance_id,
+            outcome,
+            settled_at,
+            "succeeded",
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn settle_unadmitted_owned_cancel_indeterminate(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        if request_kind != HOST_CANCEL_REQUEST_KIND_V2 {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_cancel_indeterminate_kind_invalid",
+                "Only an exact Run cancellation may persist a control indeterminate outcome",
+            ));
+        }
+        let evidence = self.caller_control_request_recovery_evidence(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        if evidence.run_lifecycle != Some(HostKernelStoredRunLifecycleV2::Retired) {
+            return Err(HostV2StorageError::conflict(
+                "host_caller_request_cancel_indeterminate_retirement_missing",
+                "Indeterminate Run cancellation settlement requires completed run-wide safety retirement",
+            ));
+        }
+        self.settle_unadmitted_owned_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            owner_instance_id,
+            outcome,
+            settled_at,
+            "indeterminate",
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_unadmitted_owned_caller_request_inner(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+        expected_disposition: &str,
+        require_zero_operations: bool,
+        release_run_drive: bool,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        if require_zero_operations
+            && !matches!(
+                request_kind,
+                HOST_DECISION_REQUEST_KIND_V2 | HOST_USER_INPUT_REQUEST_KIND_V2
+            )
+        {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_abandon_kind_invalid",
+                "Only ordinary decision or user-input callers may use zero-effect abandonment",
+            ));
+        }
+        if !require_zero_operations
+            && !matches!(
+                request_kind,
+                HOST_RUN_OPEN_REQUEST_KIND_V2
+                    | HOST_DECISION_REQUEST_KIND_V2
+                    | HOST_USER_INPUT_REQUEST_KIND_V2
+                    | HOST_CANCEL_REQUEST_KIND_V2
+            )
+        {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_unadmitted_kind_invalid",
+                "Only RunOpen, decision, user-input, or exact cancellation callers may settle through the unadmitted owner boundary",
+            ));
+        }
+        validate_bounded_identity(&settled_at, "settledAt", 1024)?;
+        reject_transport_capabilities(&outcome)?;
+        if outcome.get("disposition").and_then(Value::as_str) != Some(expected_disposition) {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_unadmitted_disposition_invalid",
+                "Unadmitted caller settlement disposition does not match its requested boundary",
+            ));
+        }
+        let outcome_json = canonical_json_string(&outcome)?;
+        if outcome_json.len() > MAX_RESPONSE_BYTES {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_outcome_too_large",
+                "Host caller request outcome exceeds its bounded size",
+            ));
+        }
+        let outcome_digest = canonical_sha256(&outcome)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_not_found",
+                        "Host caller request must be bound before abandonment",
+                    )
+                })?;
+            let existing =
+                decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            if existing.drive_state != HostCallerRequestDriveStateV2::Driving
+                || existing.drive_owner_instance_id.as_deref() != Some(owner_instance_id)
+                || existing.admission.is_some()
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_abandon_owner_conflict",
+                    "Only the exact unadmitted caller owner may abandon this request",
+                ));
+            }
+            if require_zero_operations {
+                let correlated_operations: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM host_kernel_operations
+                         WHERE caller_request_id = ?1 AND caller_request_digest = ?2",
+                        params![caller_request_id, request_digest],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        database_error("host_caller_request_abandon_evidence_failed", error)
+                    })?;
+                if correlated_operations != 0 {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_abandon_effect_conflict",
+                        "A caller-correlated operation exists, so zero-effect abandonment is unsafe",
+                    ));
+                }
+            }
+            if let Some(existing_digest) = existing.outcome_digest.as_deref() {
+                if existing_digest == outcome_digest {
+                    return Ok(existing);
+                }
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_outcome_conflict",
+                    "Host caller request is already settled with different content",
+                ));
+            }
+            let host_run_id = existing
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Unadmitted caller abandonment has no exact Host Run identity",
+                    )
+                })?;
+            let changed = transaction
+                .execute(
+                    "UPDATE host_caller_requests
+                     SET outcome_json = ?1, outcome_digest = ?2, settled_at = ?3
+                     WHERE session_id = ?4 AND caller_request_id = ?5
+                       AND outcome_json IS NULL AND admission_json IS NULL
+                       AND drive_state = 'Driving' AND drive_owner_instance_id = ?6",
+                    params![
+                        outcome_json,
+                        outcome_digest,
+                        settled_at,
+                        session_id,
+                        caller_request_id,
+                        owner_instance_id,
+                    ],
+                )
+                .map_err(|error| database_error("host_caller_request_abandon_failed", error))?;
+            if changed != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_abandon_conflict",
+                    "Host caller request changed before zero-effect abandonment",
+                ));
+            }
+            if release_run_drive {
+                if stored_run_by_session_host(transaction, session_id, host_run_id)?.is_some() {
+                    let released = transaction
+                        .execute(
+                            "UPDATE host_kernel_runs
+                             SET drive_caller_request_id = NULL, drive_request_digest = NULL
+                             WHERE session_id = ?1 AND host_run_id = ?2
+                               AND drive_caller_request_id = ?3 AND drive_request_digest = ?4",
+                            params![session_id, host_run_id, caller_request_id, request_digest],
+                        )
+                        .map_err(|error| {
+                            database_error("host_caller_request_drive_release_failed", error)
+                        })?;
+                    if released != 1 {
+                        return Err(HostV2StorageError::conflict(
+                            "host_caller_request_drive_release_conflict",
+                            "Unadmitted caller settlement did not release its exact Run drive",
+                        ));
+                    }
+                } else if request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2 {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_run_missing",
+                        "Ordinary unadmitted caller settlement requires its exact active Run",
+                    ));
+                }
+            }
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::io(
+                        "host_caller_request_settlement_lost",
+                        "Abandoned Host caller request disappeared before commit",
+                    )
+                })?;
+            decode_caller_request_binding(stored, request_kind, request_digest, false)
+        })
+    }
+
+    fn settle_caller_request_inner(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        expected_owner: Option<(&str, &str)>,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
         validate_caller_request_identity(
             session_id,
             caller_request_id,
@@ -714,6 +1592,17 @@ impl HostKernelOperationStoreV2 {
                 })?;
             let existing =
                 decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            if let Some((owner_instance_id, admission_digest)) = expected_owner {
+                if existing.drive_state != HostCallerRequestDriveStateV2::Driving
+                    || existing.drive_owner_instance_id.as_deref() != Some(owner_instance_id)
+                    || existing.admission_digest.as_deref() != Some(admission_digest)
+                {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_owner_conflict",
+                        "Only the exact admitted caller owner may settle this request",
+                    ));
+                }
+            }
             if let Some(existing_digest) = &existing.outcome_digest {
                 if existing_digest == &outcome_digest {
                     return Ok(existing);
@@ -733,8 +1622,24 @@ impl HostKernelOperationStoreV2 {
                         "Host caller request settlement has no exact Host Run identity",
                     )
                 })?;
-            let changed = transaction
-                .execute(
+            let changed = match expected_owner {
+                Some((owner_instance_id, admission_digest)) => transaction.execute(
+                    "UPDATE host_caller_requests
+                     SET outcome_json = ?1, outcome_digest = ?2, settled_at = ?3
+                     WHERE session_id = ?4 AND caller_request_id = ?5
+                       AND outcome_json IS NULL AND drive_state = 'Driving'
+                       AND drive_owner_instance_id = ?6 AND admission_digest = ?7",
+                    params![
+                        outcome_json,
+                        outcome_digest,
+                        settled_at,
+                        session_id,
+                        caller_request_id,
+                        owner_instance_id,
+                        admission_digest,
+                    ],
+                ),
+                None => transaction.execute(
                     "UPDATE host_caller_requests
                      SET outcome_json = ?1, outcome_digest = ?2, settled_at = ?3
                      WHERE session_id = ?4 AND caller_request_id = ?5
@@ -746,8 +1651,9 @@ impl HostKernelOperationStoreV2 {
                         session_id,
                         caller_request_id,
                     ],
-                )
-                .map_err(|error| database_error("host_caller_request_settle_failed", error))?;
+                ),
+            }
+            .map_err(|error| database_error("host_caller_request_settle_failed", error))?;
             if changed != 1 {
                 return Err(HostV2StorageError::conflict(
                     "host_caller_request_settle_conflict",
@@ -755,7 +1661,7 @@ impl HostKernelOperationStoreV2 {
                 ));
             }
             if release_run_drive {
-                transaction
+                let released = transaction
                     .execute(
                         "UPDATE host_kernel_runs
                          SET drive_caller_request_id = NULL, drive_request_digest = NULL
@@ -766,6 +1672,12 @@ impl HostKernelOperationStoreV2 {
                     .map_err(|error| {
                         database_error("host_caller_request_drive_release_failed", error)
                     })?;
+                if expected_owner.is_some() && released != 1 {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_drive_release_conflict",
+                        "Exact admitted caller settlement did not release its Run drive",
+                    ));
+                }
             }
             let stored = stored_caller_request(transaction, session_id, caller_request_id)?
                 .ok_or_else(|| {
@@ -1021,14 +1933,15 @@ impl HostKernelOperationStoreV2 {
                     "INSERT INTO host_kernel_runs (
                         schema_version, session_id, host_run_id, run_open_request_id,
                         lifecycle, run_open_envelope_json, run_open_envelope_digest,
-                        workspace_binding_ref, workspace_binding_identity, workspace_kind,
-                        empty_workspace_key, run_settings_json, provider_profile_id,
+                        workspace_binding_ref, workspace_binding_identity,
+                        workspace_canonical_root, workspace_kind, empty_workspace_key,
+                        run_settings_json, provider_profile_id,
                         provider_revision_digest, initial_input_json, opening_recorded_at,
                         opening_digest, opening_caller_request_id, opening_request_digest,
                         drive_caller_request_id, drive_request_digest
                      ) VALUES (
                         ?1, ?2, ?3, ?4, 'Opening', ?5, ?6, ?7, ?8, ?9, ?10,
-                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?17, ?18
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?18, ?19
                      )",
                     params![
                         RUN_ROW_SCHEMA_V2,
@@ -1039,6 +1952,7 @@ impl HostKernelOperationStoreV2 {
                         prepared.run_open_envelope_digest,
                         prepared.workspace_binding_ref,
                         prepared.workspace_binding_identity,
+                        prepared.workspace_canonical_root,
                         workspace_kind_text(prepared.workspace_kind),
                         prepared.empty_workspace_key,
                         prepared.run_settings_json,
@@ -1253,7 +2167,8 @@ impl HostKernelOperationStoreV2 {
                     transaction
                         .execute(
                             "UPDATE host_kernel_runs
-                             SET lifecycle = 'Retired', retired_at = ?1
+                             SET lifecycle = 'Retired', retired_at = ?1,
+                                 workspace_canonical_root = NULL
                              WHERE id = ?2 AND lifecycle = 'Opening'",
                             params![retired_at, stored.id],
                         )
@@ -1361,7 +2276,8 @@ impl HostKernelOperationStoreV2 {
                             "UPDATE host_kernel_runs
                              SET lifecycle = 'Retired', retired_at = ?1,
                                  retirement_caller_request_id = ?2,
-                                 retirement_request_digest = ?3
+                                 retirement_request_digest = ?3,
+                                 workspace_canonical_root = NULL
                              WHERE id = ?4 AND lifecycle = 'Active'",
                             params![retired_at, caller_request_id, request_digest, stored.id],
                         )
@@ -1688,6 +2604,85 @@ impl HostKernelOperationStoreV2 {
         })
     }
 
+    pub(crate) fn prepare_response_retry_dispatch(
+        &self,
+        input: HostKernelDispatchRecoveryV2,
+        retry_settlement: &HostKernelOperationSettlementV2,
+    ) -> Result<HostKernelDispatchAttemptReceiptV2, HostV2StorageError> {
+        validate_dispatch_recovery(&input)?;
+        validate_settlement(retry_settlement)?;
+        if !matches!(
+            retry_settlement,
+            HostKernelOperationSettlementV2::FailedRecoverable {
+                boundary: HostKernelOperationFailureBoundaryV2 {
+                    disposition: HostKernelFailureDispositionV2::RetrySameRequest,
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(HostV2StorageError::invalid(
+                "host_kernel_dispatch_retry_boundary_invalid",
+                "Only an exact retrySameRequest response may create a response-bound retry attempt",
+            ));
+        }
+        self.with_write_transaction(|transaction| {
+            let operation = require_pending_operation(transaction, &input.operation, true)?;
+            let previous = stored_attempt_by_id(transaction, &input.previous_attempt_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_kernel_dispatch_retry_predecessor_missing",
+                        "Response-bound retry predecessor is missing",
+                    )
+                })?;
+            if previous.operation_row_id != operation.id
+                || parse_attempt_state(&previous.state)?
+                    != HostKernelDispatchAttemptStateV2::ResponseObserved
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_kernel_dispatch_retry_not_allowed",
+                    "Response-bound retry requires the exact ResponseObserved predecessor",
+                ));
+            }
+            validate_failure_settlement_matches_observed_response(&previous, retry_settlement)?;
+            let latest = latest_attempt(transaction, operation.id)?.ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "host_kernel_dispatch_retry_predecessor_missing",
+                    "Response-bound retry has no latest predecessor",
+                )
+            })?;
+            if let Some(existing) = stored_attempt_by_id(transaction, &input.attempt_id)? {
+                if latest.attempt_id != existing.attempt_id {
+                    return Err(HostV2StorageError::conflict(
+                        "host_kernel_dispatch_retry_not_latest",
+                        "Response-bound retry replay is not the latest operation attempt",
+                    ));
+                }
+                return replay_exact_attempt(
+                    existing,
+                    &operation,
+                    &input.owner_instance_id,
+                    Some(&input.previous_attempt_id),
+                    &input.prepared_at,
+                );
+            }
+            if latest.attempt_id != input.previous_attempt_id {
+                return Err(HostV2StorageError::conflict(
+                    "host_kernel_dispatch_retry_not_latest",
+                    "Only the latest observed retry response may create a new attempt",
+                ));
+            }
+            insert_attempt(
+                transaction,
+                &operation,
+                &input.attempt_id,
+                &input.owner_instance_id,
+                Some(&input.previous_attempt_id),
+                &input.prepared_at,
+            )
+        })
+    }
+
     pub(crate) fn mark_dispatch_committed(
         &self,
         operation: &HostKernelOperationRefV2,
@@ -1909,6 +2904,21 @@ impl HostKernelOperationStoreV2 {
     ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
         validate_attempt_transition(operation, attempt_id, owner_instance_id, settled_at)?;
         validate_settlement(&settlement)?;
+        if matches!(
+            &settlement,
+            HostKernelOperationSettlementV2::FailedRecoverable {
+                boundary: HostKernelOperationFailureBoundaryV2 {
+                    disposition: HostKernelFailureDispositionV2::RetrySameRequest,
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_retry_not_terminal",
+                "retrySameRequest is an observed retry directive and cannot terminally settle an operation",
+            ));
+        }
         let settlement_value = serde_json::to_value(&settlement).map_err(|error| {
             HostV2StorageError::invalid(
                 "host_kernel_operation_settlement_invalid",
@@ -1971,9 +2981,11 @@ impl HostKernelOperationStoreV2 {
                 (
                     HostKernelOperationSettlementV2::FailedRecoverable { .. }
                     | HostKernelOperationSettlementV2::FailedTerminal { .. },
-                    HostKernelDispatchAttemptStateV2::ResponseObserved
-                    | HostKernelDispatchAttemptStateV2::Lost,
-                ) => {}
+                    HostKernelDispatchAttemptStateV2::ResponseObserved,
+                ) => validate_failure_settlement_matches_observed_response(
+                    &attempt,
+                    &settlement,
+                )?,
                 _ => {
                     return Err(HostV2StorageError::conflict(
                         "host_kernel_operation_failure_unresolved",
@@ -2250,8 +3262,8 @@ impl HostKernelOperationStoreV2 {
 
     fn database_path(&self) -> PathBuf {
         self.sessions_dir
-            .join(".host-v2")
-            .join("host-kernel-v2.sqlite3")
+            .join(".host-v3")
+            .join("host-kernel-v3.sqlite3")
     }
 
     fn with_connection<T>(
@@ -2290,7 +3302,7 @@ impl HostKernelOperationStoreV2 {
     }
 
     fn open_connection(&self) -> Result<Connection, HostV2StorageError> {
-        let directory = self.sessions_dir.join(".host-v2");
+        let directory = self.sessions_dir.join(".host-v3");
         create_private_store_directory(&directory)?;
         let path = self.database_path();
         create_private_sqlite_file_if_missing(&path)?;
@@ -2311,6 +3323,84 @@ impl HostKernelOperationStoreV2 {
     }
 }
 
+fn canonical_cancel_settlement_matches_binding(
+    evidence: &HostCallerRequestRecoveryEvidenceV2,
+) -> Result<bool, HostV2StorageError> {
+    let identity = &evidence.binding.response_identity;
+    let operation_request_id = identity
+        .get("operationRequestId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_caller_request_operation_identity_missing",
+                "Run cancellation success requires an exact operation identity",
+            )
+        })?;
+    let cancel_operation_id = identity
+        .get("cancelOperationId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_caller_request_cancel_operation_identity_missing",
+                "Run cancellation success requires an exact cancel operation identity",
+            )
+        })?;
+    let Some(settlement) = evidence.first_settlement.as_ref() else {
+        return Ok(false);
+    };
+    if operation_request_id != cancel_operation_id
+        || settlement.operation_request_id != operation_request_id
+    {
+        return Ok(false);
+    }
+    let HostKernelOperationSettlementV2::Succeeded {
+        response,
+        continuation,
+    } = &settlement.settlement
+    else {
+        return Ok(false);
+    };
+    let outcome = response.get("outcome");
+    let facts = outcome.and_then(|value| value.get("facts"));
+    let projection = outcome.and_then(|value| value.get("projection"));
+    Ok(
+        continuation.get("kind").and_then(Value::as_str) == Some("terminalRunCancelled")
+            && response.get("operationKind").and_then(Value::as_str) == Some("cancelRun")
+            && outcome
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str)
+                == Some("runCancelled")
+            && outcome
+                .and_then(|value| value.get("callerRequestId"))
+                .and_then(Value::as_str)
+                == Some(evidence.binding.caller_request_id.as_str())
+            && outcome
+                .and_then(|value| value.get("callerRequestDigest"))
+                .and_then(Value::as_str)
+                == Some(evidence.binding.request_digest.as_str())
+            && outcome
+                .and_then(|value| value.get("cancelOperationId"))
+                .and_then(Value::as_str)
+                == Some(cancel_operation_id)
+            && facts
+                .and_then(|value| value.get("caughtUp"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && facts
+                .and_then(|value| value.get("pendingFactBarrierCount"))
+                .and_then(Value::as_u64)
+                == Some(0)
+            && projection
+                .and_then(|value| value.get("projectionId"))
+                .and_then(Value::as_str)
+                .is_some()
+            && projection
+                .and_then(|value| value.get("projectionDigest"))
+                .and_then(Value::as_str)
+                .is_some(),
+    )
+}
+
 struct PreparedOpeningV2 {
     session_id: String,
     host_run_id: String,
@@ -2321,6 +3411,7 @@ struct PreparedOpeningV2 {
     run_open_envelope_digest: String,
     workspace_binding_ref: String,
     workspace_binding_identity: String,
+    workspace_canonical_root: String,
     workspace_kind: HostRunWorkspaceKindV2,
     empty_workspace_key: Option<String>,
     run_settings_json: String,
@@ -2334,6 +3425,8 @@ struct PreparedOpeningV2 {
 impl PreparedOpeningV2 {
     fn new(input: HostKernelRunOpeningInputV2) -> Result<Self, HostV2StorageError> {
         validate_opening_input(&input)?;
+        let workspace_canonical_root =
+            canonical_workspace_root_text(&input.workspace_canonical_root)?;
         let run_open_envelope_value =
             serde_json::to_value(&input.run_open_envelope).map_err(|error| {
                 HostV2StorageError::invalid(
@@ -2377,6 +3470,7 @@ impl PreparedOpeningV2 {
             .len()
             .checked_add(run_settings_json.len())
             .and_then(|value| value.checked_add(initial_input_json.len()))
+            .and_then(|value| value.checked_add(workspace_canonical_root.len()))
             .ok_or_else(|| {
                 HostV2StorageError::invalid(
                     "host_kernel_run_opening_too_large",
@@ -2393,26 +3487,12 @@ impl PreparedOpeningV2 {
             KernelCommandV2::RunOpen(command) => command.workspace_binding_ref.to_string(),
             _ => unreachable!("validate_opening_input requires RunOpen"),
         };
-        let opening_digest = canonical_sha256(&json!({
-            "schemaVersion": RUN_ROW_SCHEMA_V2,
-            "historySchema": HISTORY_SCHEMA_V2,
-            "sessionId": input.session_id,
-            "hostRunId": input.host_run_id,
-            "driveCallerRequestId": input.drive_caller_request_id,
-            "driveRequestDigest": input.drive_request_digest,
-            "runOpenRequestId": input.run_open_request_id,
-            "runOpenEnvelopeDigest": run_open_envelope_digest,
-            "workspaceBindingRef": workspace_binding_ref,
-            "workspaceBindingIdentity": input.workspace_binding_identity,
-            "workspaceKind": workspace_kind_text(input.workspace_kind),
-            "activeFolderId": input.active_folder_id,
-            "emptyWorkspaceKey": input.empty_workspace_key,
-            "runSettings": run_settings_value,
-            "providerProfile": input.provider_profile,
-            "priorSessionEvents": input.prior_session_events,
-            "initialInput": input.initial_input,
-            "openingRecordedAt": input.opening_recorded_at,
-        }))?;
+        let opening_digest = opening_digest(
+            &input,
+            &workspace_binding_ref,
+            &run_open_envelope_digest,
+            &run_settings_value,
+        )?;
         Ok(Self {
             session_id: input.session_id,
             host_run_id: input.host_run_id,
@@ -2423,6 +3503,7 @@ impl PreparedOpeningV2 {
             run_open_envelope_digest,
             workspace_binding_ref,
             workspace_binding_identity: input.workspace_binding_identity,
+            workspace_canonical_root,
             workspace_kind: input.workspace_kind,
             empty_workspace_key: input.empty_workspace_key,
             run_settings_json,
@@ -2435,6 +3516,34 @@ impl PreparedOpeningV2 {
             opening_digest,
         })
     }
+}
+
+fn opening_digest(
+    input: &HostKernelRunOpeningInputV2,
+    workspace_binding_ref: &str,
+    run_open_envelope_digest: &str,
+    run_settings_value: &Value,
+) -> Result<String, HostV2StorageError> {
+    canonical_sha256(&json!({
+        "schemaVersion": RUN_ROW_SCHEMA_V2,
+        "historySchema": HISTORY_SCHEMA_V3,
+        "sessionId": input.session_id,
+        "hostRunId": input.host_run_id,
+        "driveCallerRequestId": input.drive_caller_request_id,
+        "driveRequestDigest": input.drive_request_digest,
+        "runOpenRequestId": input.run_open_request_id,
+        "runOpenEnvelopeDigest": run_open_envelope_digest,
+        "workspaceBindingRef": workspace_binding_ref,
+        "workspaceBindingIdentity": input.workspace_binding_identity,
+        "workspaceKind": workspace_kind_text(input.workspace_kind),
+        "activeFolderId": input.active_folder_id,
+        "emptyWorkspaceKey": input.empty_workspace_key,
+        "runSettings": run_settings_value,
+        "providerProfile": input.provider_profile,
+        "priorSessionEvents": input.prior_session_events,
+        "initialInput": input.initial_input,
+        "openingRecordedAt": input.opening_recorded_at,
+    }))
 }
 
 struct PreparedBootstrapV2 {
@@ -2507,7 +3616,7 @@ impl PreparedBootstrapV2 {
         let run_open_reply_json = canonical_json_string(&reply_value)?;
         let bootstrap_digest = canonical_sha256(&json!({
             "schemaVersion": BOOTSTRAP_SCHEMA_V2,
-            "historySchema": HISTORY_SCHEMA_V2,
+            "historySchema": HISTORY_SCHEMA_V3,
             "openingDigest": opening.opening_digest,
             "runId": run_id,
             "workspaceBindingRef": opening.workspace_binding_ref,
@@ -2655,6 +3764,9 @@ struct StoredCallerRequestV2 {
     drive_state: String,
     drive_owner_instance_id: Option<String>,
     drive_started_at: Option<String>,
+    admission_json: Option<String>,
+    admission_digest: Option<String>,
+    admitted_at: Option<String>,
     outcome_json: Option<String>,
     outcome_digest: Option<String>,
     settled_at: Option<String>,
@@ -2674,6 +3786,9 @@ impl StoredCallerRequestV2 {
             drive_state: row.get("drive_state")?,
             drive_owner_instance_id: row.get("drive_owner_instance_id")?,
             drive_started_at: row.get("drive_started_at")?,
+            admission_json: row.get("admission_json")?,
+            admission_digest: row.get("admission_digest")?,
+            admitted_at: row.get("admitted_at")?,
             outcome_json: row.get("outcome_json")?,
             outcome_digest: row.get("outcome_digest")?,
             settled_at: row.get("settled_at")?,
@@ -2693,6 +3808,7 @@ struct StoredRunV2 {
     run_open_envelope_digest: String,
     workspace_binding_ref: String,
     workspace_binding_identity: String,
+    workspace_canonical_root: Option<String>,
     workspace_kind: String,
     empty_workspace_key: Option<String>,
     run_settings_json: String,
@@ -2729,6 +3845,7 @@ impl StoredRunV2 {
             run_open_envelope_digest: row.get("run_open_envelope_digest")?,
             workspace_binding_ref: row.get("workspace_binding_ref")?,
             workspace_binding_identity: row.get("workspace_binding_identity")?,
+            workspace_canonical_root: row.get("workspace_canonical_root")?,
             workspace_kind: row.get("workspace_kind")?,
             empty_workspace_key: row.get("empty_workspace_key")?,
             run_settings_json: row.get("run_settings_json")?,
@@ -3009,7 +4126,7 @@ CREATE TABLE host_store_limits (
 CREATE TABLE host_caller_requests (
     id INTEGER PRIMARY KEY,
     schema_version TEXT NOT NULL
-        CHECK (schema_version = 'deepcode.host.caller-request.v2'),
+        CHECK (schema_version = 'deepcode.host.caller-request.v3'),
     session_id TEXT NOT NULL,
     caller_request_id TEXT NOT NULL,
     request_kind TEXT NOT NULL,
@@ -3021,6 +4138,9 @@ CREATE TABLE host_caller_requests (
         CHECK (drive_state IN ('Bound', 'Driving')),
     drive_owner_instance_id TEXT,
     drive_started_at TEXT,
+    admission_json TEXT,
+    admission_digest TEXT,
+    admitted_at TEXT,
     outcome_json TEXT,
     outcome_digest TEXT,
     settled_at TEXT,
@@ -3031,6 +4151,12 @@ CREATE TABLE host_caller_requests (
         OR (drive_state = 'Driving'
             AND drive_owner_instance_id IS NOT NULL
             AND drive_started_at IS NOT NULL)
+    ),
+    CHECK (
+        (admission_json IS NULL AND admission_digest IS NULL AND admitted_at IS NULL)
+        OR (admission_json IS NOT NULL
+            AND admission_digest IS NOT NULL
+            AND admitted_at IS NOT NULL)
     ),
     CHECK (
         (outcome_json IS NULL AND outcome_digest IS NULL AND settled_at IS NULL)
@@ -3046,7 +4172,7 @@ ON host_caller_requests(recorded_at, id);
 
 CREATE TABLE host_kernel_runs (
     id INTEGER PRIMARY KEY,
-    schema_version TEXT NOT NULL CHECK (schema_version = 'deepcode.host.kernel-run.v2'),
+    schema_version TEXT NOT NULL CHECK (schema_version = 'deepcode.host.kernel-run.v4'),
     session_id TEXT NOT NULL,
     host_run_id TEXT NOT NULL,
     run_open_request_id TEXT NOT NULL UNIQUE,
@@ -3055,6 +4181,7 @@ CREATE TABLE host_kernel_runs (
     run_open_envelope_digest TEXT NOT NULL,
     workspace_binding_ref TEXT NOT NULL,
     workspace_binding_identity TEXT NOT NULL,
+    workspace_canonical_root TEXT,
     workspace_kind TEXT NOT NULL CHECK (workspace_kind IN ('bound', 'empty')),
     empty_workspace_key TEXT,
     run_settings_json TEXT NOT NULL,
@@ -3088,6 +4215,7 @@ CREATE TABLE host_kernel_runs (
     ),
     CHECK (
         (lifecycle = 'Opening'
+            AND workspace_canonical_root IS NOT NULL
             AND run_id IS NULL
             AND run_open_reply_json IS NULL
             AND workspace_binding_digest IS NULL
@@ -3095,13 +4223,14 @@ CREATE TABLE host_kernel_runs (
             AND activated_at IS NULL
             AND retired_at IS NULL)
         OR (lifecycle = 'Active'
+            AND workspace_canonical_root IS NOT NULL
             AND run_id IS NOT NULL
             AND run_open_reply_json IS NOT NULL
             AND workspace_binding_digest IS NOT NULL
             AND bootstrap_digest IS NOT NULL
             AND activated_at IS NOT NULL
             AND retired_at IS NULL)
-        OR (lifecycle = 'Retired')
+        OR (lifecycle = 'Retired' AND workspace_canonical_root IS NULL)
     ),
     CHECK (
         length(opening_caller_request_id) > 0
@@ -3311,6 +4440,46 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
     Ok(())
 }
 
+fn canonical_workspace_root_text(root: &Path) -> Result<String, HostV2StorageError> {
+    if !root.is_absolute() {
+        return Err(HostV2StorageError::invalid(
+            "host_kernel_workspace_root_invalid",
+            "Host-only workspace recovery root must be absolute",
+        ));
+    }
+    let canonical = fs::canonicalize(root).map_err(|error| {
+        HostV2StorageError::io(
+            "host_kernel_workspace_root_unavailable",
+            format!("validate Host-only workspace recovery root: {error}"),
+        )
+    })?;
+    if canonical != root || !canonical.is_dir() {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_workspace_root_stale",
+            "Host-only workspace recovery root is no longer the exact canonical directory",
+        ));
+    }
+    fs::read_dir(&canonical).map_err(|error| {
+        HostV2StorageError::io(
+            "host_kernel_workspace_root_unavailable",
+            format!("read Host-only workspace recovery root: {error}"),
+        )
+    })?;
+    let text = canonical.to_str().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "host_kernel_workspace_root_encoding_unsupported",
+            "Host-only workspace recovery root must be valid UTF-8",
+        )
+    })?;
+    if text.is_empty() || text.len() > 64 * 1024 {
+        return Err(HostV2StorageError::invalid(
+            "host_kernel_workspace_root_invalid",
+            "Host-only workspace recovery root exceeds its bounded storage shape",
+        ));
+    }
+    Ok(text.to_string())
+}
+
 fn validate_caller_request_identity(
     session_id: &str,
     caller_request_id: &str,
@@ -3433,7 +4602,7 @@ fn validate_production_frame(
         "Production request",
     )?;
     if request.get("schemaVersion").and_then(Value::as_str) != Some(PRODUCTION_REQUEST_SCHEMA_V2)
-        || request.get("historySchema").and_then(Value::as_str) != Some(HISTORY_SCHEMA_V2)
+        || request.get("historySchema").and_then(Value::as_str) != Some(HISTORY_SCHEMA_V3)
         || !request.get("operation").is_some_and(Value::is_object)
     {
         return Err(HostV2StorageError::invalid(
@@ -3720,11 +4889,115 @@ fn validate_settlement(
             "host_kernel_operation_settlement_invalid",
             "Successful settlement requires object response and continuation",
         )),
-        HostKernelOperationSettlementV2::FailedRecoverable { error_code }
-        | HostKernelOperationSettlementV2::FailedTerminal { error_code } => {
-            validate_bounded_identity(error_code, "errorCode", 512)
+        HostKernelOperationSettlementV2::FailedRecoverable {
+            error_code,
+            boundary,
+        } => {
+            validate_bounded_identity(error_code, "errorCode", 512)?;
+            let valid = match boundary.disposition {
+                HostKernelFailureDispositionV2::RetrySameRequest => {
+                    boundary.commit == HostKernelFailureCommitV2::None
+                        && boundary.effect == HostKernelFailureEffectV2::None
+                        && boundary.pending_request_lanes.is_empty()
+                }
+                HostKernelFailureDispositionV2::QueryFacts => {
+                    boundary.commit == HostKernelFailureCommitV2::Unknown
+                        && boundary.effect == HostKernelFailureEffectV2::Possible
+                }
+                HostKernelFailureDispositionV2::CorrectRequest
+                | HostKernelFailureDispositionV2::DoNotRetry => false,
+            };
+            if !valid {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_operation_failure_boundary_invalid",
+                    "Recoverable Session failure has an inconsistent commit or effect boundary",
+                ));
+            }
+            Ok(())
+        }
+        HostKernelOperationSettlementV2::FailedTerminal {
+            error_code,
+            boundary,
+        } => {
+            validate_bounded_identity(error_code, "errorCode", 512)?;
+            if !matches!(
+                boundary.disposition,
+                HostKernelFailureDispositionV2::CorrectRequest
+                    | HostKernelFailureDispositionV2::DoNotRetry
+            ) || boundary.commit != HostKernelFailureCommitV2::None
+                || boundary.effect != HostKernelFailureEffectV2::None
+                || !boundary.pending_request_lanes.is_empty()
+            {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_operation_failure_boundary_invalid",
+                    "Terminal Session failure has an inconsistent commit or effect boundary",
+                ));
+            }
+            Ok(())
         }
     }
+}
+
+fn validate_failure_settlement_matches_observed_response(
+    attempt: &StoredAttemptV2,
+    settlement: &HostKernelOperationSettlementV2,
+) -> Result<(), HostV2StorageError> {
+    let observed = attempt
+        .response_json
+        .as_deref()
+        .map(|response| {
+            serde_json::from_str::<Value>(response)
+                .map_err(|_| corrupt("Observed failure response JSON is corrupt"))
+        })
+        .transpose()?;
+    validate_failure_settlement_matches_observed_response_record(observed.as_ref(), settlement)
+}
+
+fn validate_failure_settlement_matches_observed_response_record(
+    observed: Option<&Value>,
+    settlement: &HostKernelOperationSettlementV2,
+) -> Result<(), HostV2StorageError> {
+    let (error_code, boundary) = match settlement {
+        HostKernelOperationSettlementV2::FailedRecoverable {
+            error_code,
+            boundary,
+        }
+        | HostKernelOperationSettlementV2::FailedTerminal {
+            error_code,
+            boundary,
+        } => (error_code, boundary),
+        HostKernelOperationSettlementV2::Succeeded { .. } => {
+            return Err(HostV2StorageError::invalid(
+                "host_kernel_operation_failure_binding_invalid",
+                "Failure response verification cannot bind a successful settlement",
+            ))
+        }
+    };
+    let boundary_value = serde_json::to_value(boundary).map_err(|error| {
+        HostV2StorageError::invalid(
+            "host_kernel_operation_failure_binding_invalid",
+            format!("encode failure boundary: {error}"),
+        )
+    })?;
+    let mut error_value = boundary_value.as_object().cloned().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "host_kernel_operation_failure_binding_invalid",
+            "Failure boundary did not encode as an object",
+        )
+    })?;
+    error_value.insert("code".to_string(), Value::String(error_code.clone()));
+    let expected = json!({
+        "schemaVersion": PRODUCTION_RESPONSE_SCHEMA_V2,
+        "ok": false,
+        "error": error_value,
+    });
+    if observed != Some(&expected) {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_operation_failure_response_conflict",
+            "Failure settlement does not match the exact observed Session response",
+        ));
+    }
+    Ok(())
 }
 
 fn reject_host_private_persistence_fields(value: &Value) -> Result<(), HostV2StorageError> {
@@ -4157,12 +5430,35 @@ fn verified_settlement_receipt(
         ));
     }
     let settlement = settlement_receipt(operation)?;
-    if let HostKernelOperationSettlementV2::Succeeded { response, .. } = &settlement.settlement {
-        let response_digest = canonical_sha256(response)?;
-        if attempt.response_digest.as_deref() != Some(response_digest.as_str()) {
-            return Err(corrupt(
-                "Successful settlement is not bound to the observed response",
-            ));
+    if matches!(
+        &settlement.settlement,
+        HostKernelOperationSettlementV2::FailedRecoverable {
+            boundary: HostKernelOperationFailureBoundaryV2 {
+                disposition: HostKernelFailureDispositionV2::RetrySameRequest,
+                ..
+            },
+            ..
+        }
+    ) {
+        return Err(corrupt(
+            "Settled Host Kernel operation contains a non-terminal retrySameRequest directive",
+        ));
+    }
+    match &settlement.settlement {
+        HostKernelOperationSettlementV2::Succeeded { response, .. } => {
+            let response_digest = canonical_sha256(response)?;
+            if attempt.response_digest.as_deref() != Some(response_digest.as_str()) {
+                return Err(corrupt(
+                    "Successful settlement is not bound to the observed response",
+                ));
+            }
+        }
+        HostKernelOperationSettlementV2::FailedRecoverable { .. }
+        | HostKernelOperationSettlementV2::FailedTerminal { .. } => {
+            validate_failure_settlement_matches_observed_response_record(
+                attempt.observed_response.as_ref(),
+                &settlement.settlement,
+            )?;
         }
     }
     Ok(settlement)
@@ -4216,6 +5512,32 @@ fn decode_caller_request_binding(
         }
         _ => return Err(corrupt("Host caller request drive fields are partial")),
     }
+    let (admission, admission_digest, admitted_at) = match (
+        stored.admission_json,
+        stored.admission_digest,
+        stored.admitted_at,
+    ) {
+        (None, None, None) => (None, None, None),
+        (Some(admission_json), Some(admission_digest), Some(admitted_at)) => {
+            validate_sha256_digest(&admission_digest, "admissionDigest")?;
+            validate_bounded_identity(&admitted_at, "admittedAt", 1024)?;
+            let admission: Value = serde_json::from_str(&admission_json)
+                .map_err(|_| corrupt("Host caller request admission JSON is corrupt"))?;
+            reject_transport_capabilities(&admission)?;
+            if canonical_sha256(&admission)? != admission_digest {
+                return Err(corrupt(
+                    "Host caller request admission failed digest verification",
+                ));
+            }
+            (Some(admission), Some(admission_digest), Some(admitted_at))
+        }
+        _ => return Err(corrupt("Host caller request admission fields are partial")),
+    };
+    if admission.is_some() && drive_state != HostCallerRequestDriveStateV2::Driving {
+        return Err(corrupt(
+            "Host caller request admission is not bound to a live drive",
+        ));
+    }
     let (outcome, outcome_digest) = match (
         stored.outcome_json,
         stored.outcome_digest,
@@ -4247,6 +5569,9 @@ fn decode_caller_request_binding(
         drive_state,
         drive_owner_instance_id: stored.drive_owner_instance_id,
         drive_started_at: stored.drive_started_at,
+        admission,
+        admission_digest,
+        admitted_at,
         outcome,
         outcome_digest,
         replayed,
@@ -4326,6 +5651,27 @@ fn decode_opening_record(
             "Host Kernel Provider profile columns conflict with bootstrap material",
         ));
     }
+    let workspace_canonical_root = match lifecycle {
+        HostKernelStoredRunLifecycleV2::Opening | HostKernelStoredRunLifecycleV2::Active => {
+            let root = stored.workspace_canonical_root.as_deref().ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "host_kernel_workspace_recovery_material_missing",
+                    "UnsupportedHistorySchema: live Host Kernel Run has no Host-only workspace recovery root",
+                )
+            })?;
+            let root = PathBuf::from(root);
+            canonical_workspace_root_text(&root)?;
+            Some(root)
+        }
+        HostKernelStoredRunLifecycleV2::Retired => {
+            if stored.workspace_canonical_root.is_some() {
+                return Err(corrupt(
+                    "Retired Host Kernel Run retained a recoverable workspace root",
+                ));
+            }
+            None
+        }
+    };
     let candidate = HostKernelRunOpeningInputV2 {
         session_id: stored.session_id.clone(),
         host_run_id: stored.host_run_id.clone(),
@@ -4334,6 +5680,7 @@ fn decode_opening_record(
         run_open_request_id: stored.run_open_request_id.clone(),
         run_open_envelope: run_open_envelope.clone(),
         workspace_binding_identity: stored.workspace_binding_identity.clone(),
+        workspace_canonical_root: workspace_canonical_root.clone().unwrap_or_default(),
         workspace_kind,
         active_folder_id: session_bootstrap.active_folder_id.clone(),
         empty_workspace_key: stored.empty_workspace_key.clone(),
@@ -4343,9 +5690,23 @@ fn decode_opening_record(
         initial_input: initial_input.clone(),
         opening_recorded_at: stored.opening_recorded_at.clone(),
     };
-    let prepared = PreparedOpeningV2::new(candidate)?;
-    if prepared.opening_digest != stored.opening_digest
-        || prepared.workspace_binding_ref != stored.workspace_binding_ref
+    let (candidate_opening_digest, candidate_workspace_binding_ref) =
+        if lifecycle == HostKernelStoredRunLifecycleV2::Retired {
+            (
+                opening_digest(
+                    &candidate,
+                    &stored.workspace_binding_ref,
+                    &stored.run_open_envelope_digest,
+                    &settings_value,
+                )?,
+                stored.workspace_binding_ref.clone(),
+            )
+        } else {
+            let prepared = PreparedOpeningV2::new(candidate)?;
+            (prepared.opening_digest, prepared.workspace_binding_ref)
+        };
+    if candidate_opening_digest != stored.opening_digest
+        || candidate_workspace_binding_ref != stored.workspace_binding_ref
     {
         return Err(corrupt(
             "Host Kernel Opening row failed immutable digest verification",
@@ -4425,6 +5786,7 @@ fn decode_opening_record(
         run_open_envelope,
         workspace_binding_ref: stored.workspace_binding_ref.clone(),
         workspace_binding_identity: stored.workspace_binding_identity.clone(),
+        workspace_canonical_root,
         workspace_kind,
         active_folder_id: session_bootstrap.active_folder_id,
         empty_workspace_key: stored.empty_workspace_key.clone(),
@@ -4504,6 +5866,7 @@ fn decode_bootstrap_record(
         workspace_binding_ref: opening.workspace_binding_ref,
         workspace_binding_digest: prepared.workspace_binding_digest,
         workspace_binding_identity: opening.workspace_binding_identity,
+        workspace_canonical_root: opening.workspace_canonical_root,
         workspace_kind: opening.workspace_kind,
         active_folder_id: opening.active_folder_id,
         empty_workspace_key: opening.empty_workspace_key,
@@ -4895,7 +6258,8 @@ fn query_pending_operations_for_run(
         .prepare(
             "SELECT
                 o.id, o.schema_version, o.run_row_id, o.operation_sequence,
-                o.operation_request_id, o.run_id, o.bootstrap_digest,
+                o.operation_request_id, o.caller_request_id, o.caller_request_digest,
+                o.run_id, o.bootstrap_digest,
                 o.provider_revision_digest, o.production_frame_json,
                 o.production_frame_digest,
                 o.recorded_at, o.settlement_json, o.settlement_digest,
@@ -5155,8 +6519,8 @@ fn has_nonlost_newer_attempt(
 const RUN_COLUMNS: &str = "
     id, schema_version, session_id, host_run_id, run_open_request_id,
     lifecycle, run_open_envelope_json, run_open_envelope_digest,
-    workspace_binding_ref, workspace_binding_identity, workspace_kind,
-    empty_workspace_key, run_settings_json, provider_profile_id,
+    workspace_binding_ref, workspace_binding_identity, workspace_canonical_root,
+    workspace_kind, empty_workspace_key, run_settings_json, provider_profile_id,
     provider_revision_digest, initial_input_json, opening_recorded_at,
     opening_digest, run_id, run_open_reply_json, workspace_binding_digest,
     bootstrap_digest, activated_at, retired_at,
@@ -5170,6 +6534,7 @@ const CALLER_REQUEST_COLUMNS: &str = "
     schema_version, session_id, caller_request_id, request_kind,
     request_digest, response_identity_json, response_identity_digest, recorded_at,
     drive_state, drive_owner_instance_id, drive_started_at,
+    admission_json, admission_digest, admitted_at,
     outcome_json, outcome_digest, settled_at
 ";
 

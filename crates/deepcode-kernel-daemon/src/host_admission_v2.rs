@@ -55,13 +55,14 @@ pub(crate) fn route_uses_specialized_transport(method: &Method, path: &str) -> b
     ) {
         return true;
     }
-    if path.starts_with("/api/session-store/") && path.contains("/kernel-v2/") {
+    if path.starts_with("/api/session-store/") && path.contains("/kernel-v3/") {
         return true;
     }
     path.starts_with("/api/agent/sessions/")
         && (path.ends_with("/kernel-v2/projections")
             || path.ends_with("/kernel-v2/prior-events")
-            || path.ends_with("/timeline"))
+            || path.ends_with("/timeline")
+            || path.ends_with("/timeline/stream"))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

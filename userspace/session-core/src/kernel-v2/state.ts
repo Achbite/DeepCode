@@ -1,8 +1,13 @@
 import type {
   CapabilityScopePreviewRecordV2,
   KernelFactProjectionV2,
+  ToolIntentV2,
   ToolContextBundleV2,
 } from '@deepcode/protocol';
+import {
+  canonicalJson,
+  sha256Hash,
+} from '../cache/canonicalizer.js';
 import {
   createSessionKernelLineageStateV2,
   registerSessionOperationPlanActionLineageV2,
@@ -23,6 +28,7 @@ import {
 } from './sessionMemory.js';
 import {
   abortSessionProviderToolCallQueueV2,
+  isExactSessionProviderOutcomeRecordV2,
   validateSessionProviderToolCallQueueV2,
   type SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
@@ -31,6 +37,7 @@ import {
   SESSION_KERNEL_LOOP_V2_SCHEMA,
   type SessionActiveWaitV2,
   type SessionKernelFactBarrierV2,
+  type SessionFinalAnswerStateV3,
   type SessionOperationPlanActionBindingV2,
   type SessionKernelPublicRequestRecordV2,
   type SessionKernelReviewV2,
@@ -43,6 +50,7 @@ import {
   type SessionPlanActionSettlementV2,
   type SessionReviewFactAccumulatorV2,
   type SessionUserInputRecordV2,
+  type SessionWorkAuthorityV3,
 } from './types.js';
 
 const MAX_SESSION_INPUT_HISTORY_COUNT = 32;
@@ -56,6 +64,7 @@ const MAX_SESSION_PLAN_BYTES = 512 * 1024;
 // theoretical 65,536-entry Cartesian worst case into every checkpoint.
 const MAX_SESSION_OPERATIONS_PER_PLAN_ACTION = 256;
 const MAX_SESSION_OPERATION_PLAN_BINDINGS = 8_192;
+const MAX_SESSION_CONTEXT_READ_OPERATIONS = 8_192;
 
 export interface SessionKernelLoopStateV2 {
   schemaVersion: typeof SESSION_KERNEL_LOOP_V2_SCHEMA;
@@ -70,6 +79,7 @@ export interface SessionKernelLoopStateV2 {
   pendingEpochInput?: SessionUserInputRecordV2;
   projectedInputIds: string[];
   toolContext: SessionToolContextStateV2;
+  workAuthority?: SessionWorkAuthorityV3;
   plan?: SessionNaturalLanguagePlanV2;
   planDecision?: SessionPlanDecisionV2;
   projectedPlanRevision?: string;
@@ -98,6 +108,7 @@ export interface SessionKernelLoopStateV2 {
     >
   >;
   review?: SessionKernelReviewV2;
+  finalAnswer?: SessionFinalAnswerStateV3;
   runCancellation?: SessionRunCancellationV2;
   kernelWakeHint: boolean;
   checkpointRevision: number;
@@ -108,6 +119,18 @@ export interface SessionKernelCheckpointV2 {
   checkpointRevision: number;
   savedAt: string;
   state: SessionKernelLoopStateV2;
+}
+
+/**
+ * RunOpen-owned material that is intentionally not copied into the compact
+ * checkpoint wire. The persistence adapter uses it only to rebuild the full
+ * in-memory Loop state after all immutable refs have been verified.
+ */
+export interface SessionKernelCheckpointRecoveryInputV3 {
+  workspaceBindingDigest: string;
+  sessionMemory: SessionContextMemoryV2;
+  providerProfile: SessionProviderProfileBootstrapV2;
+  toolContext: ToolContextBundleV2;
 }
 
 export interface SessionKernelInitialStateV2 {
@@ -226,11 +249,29 @@ export function restoreSessionKernelLoopStateV2(
       );
     }
   }
+  validateSessionWorkAuthorityV3(state.workAuthority, state);
+  validateReviewWorkAuthorityV3(state.review, state);
   state.projectedInputIds = (state.projectedInputIds ?? [])
     .filter((inputId) =>
       state.inputs.some((input) => input.inputId === inputId)
     );
   state.providerOutcomes ??= [];
+  if (
+    state.providerOutcomes.some((outcome) =>
+      !isExactSessionProviderOutcomeRecordV2(
+        outcome,
+        state.providerProfile.providerProfileId
+      )
+    )
+    || new Set(
+      state.providerOutcomes.map((outcome) => outcome.providerTurnId)
+    ).size !== state.providerOutcomes.length
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_outcome_invalid',
+      'Provider outcome history is not exact durable v2 data.'
+    );
+  }
   state.providerOutcomeHistoryOmittedCount = nonnegativeSafeInteger(
     state.providerOutcomeHistoryOmittedCount ?? 0,
     'providerOutcomeHistoryOmittedCount'
@@ -244,6 +285,9 @@ export function restoreSessionKernelLoopStateV2(
   state.planActionSettlements ??= {};
   if (state.providerTurn) {
     validateProviderTurnResponse(state.providerTurn);
+  }
+  if (state.finalAnswer) {
+    validateFinalAnswerStateV3(state.finalAnswer, state);
   }
   if (state.providerToolCallQueue) {
     validateSessionProviderToolCallQueueV2(
@@ -330,14 +374,44 @@ export function restoreSessionKernelLoopStateV2(
     }
   }
   state.publicRequests ??= {};
-  if (state.providerTurn?.status === 'active') {
-    state.providerTurn = {
-      ...state.providerTurn,
-      status: 'stale',
-      cancellationReason: 'shutdown',
+  const completedFinalAnswerCandidate =
+    state.finalAnswer?.status === 'requesting'
+    && state.providerTurn?.purpose === 'finalAnswer'
+    && state.providerTurn.providerTurnId
+      === state.finalAnswer.providerTurnId
+    && state.providerTurn.status === 'active'
+    && Boolean(state.providerTurn.dispatchRef)
+    && Boolean(state.providerTurn.terminalRef)
+    && Boolean(state.providerTurn.response);
+  if (
+    state.finalAnswer?.status === 'requesting'
+    && !completedFinalAnswerCandidate
+  ) {
+    state.finalAnswer = {
+      ...state.finalAnswer,
+      status: state.finalAnswer.physicalRequestCount >= 3
+        ? 'finalAnswerFailed'
+        : 'pending',
+      ...(state.finalAnswer.physicalRequestCount >= 3
+        ? {
+            failedAt: state.providerTurn?.startedAt
+              ?? state.finalAnswer.startedAt,
+            lastErrorCode:
+              'session_kernel_final_answer_recovery_budget_exhausted',
+          }
+        : {}),
     };
+    delete state.finalAnswer.providerTurnId;
+    delete state.finalAnswer.startedAt;
+    validateFinalAnswerStateV3(state.finalAnswer, state);
   }
+  const factReplayAfterLedgerSequence = nonnegativeSafeInteger(
+    state.lineage.cursor.afterLedgerSequence,
+    'lineage.cursor.afterLedgerSequence'
+  );
   state.lineage = rebuildSessionKernelLineageV2(state);
+  state.lineage.cursor.afterLedgerSequence =
+    factReplayAfterLedgerSequence;
   return state;
 }
 
@@ -369,6 +443,16 @@ export function recordSessionPlanV2(
     next.lineage.planActions = {};
     next.lineage.operations = {};
     next.lineage.invocations = {};
+    next.review = undefined;
+    if (next.finalAnswer) {
+      next.finalAnswer = {
+        ...next.finalAnswer,
+        status: 'stale',
+        staleAt: plan.recordedAt,
+      };
+      delete next.finalAnswer.finalText;
+      delete next.finalAnswer.committedAt;
+    }
   }
   if (
     next.plan
@@ -387,6 +471,10 @@ export function recordSessionPlanV2(
     });
   }
   next.plan = cloneJson(plan);
+  next.workAuthority = {
+    kind: 'plan',
+    planRevision: plan.planRevision,
+  };
   return next;
 }
 
@@ -462,6 +550,7 @@ export function recordSessionUserInputV2(
     input.recordedAt
   );
   next.plan = undefined;
+  next.workAuthority = undefined;
   next.planDecision = undefined;
   next.projectedPlanRevision = undefined;
   next.projectedPlanDecisionKey = undefined;
@@ -479,6 +568,7 @@ export function recordSessionUserInputV2(
   next.lineage.operations = {};
   next.lineage.invocations = {};
   next.review = undefined;
+  next.finalAnswer = undefined;
   return next;
 }
 
@@ -486,6 +576,17 @@ export function recordSessionProviderOutcomeV2(
   state: SessionKernelLoopStateV2,
   outcome: SessionProviderOutcomeRecordV2
 ): void {
+  if (
+    !isExactSessionProviderOutcomeRecordV2(
+      outcome,
+      state.providerProfile.providerProfileId
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_outcome_invalid',
+      'Provider outcome must be exact durable v2 data.'
+    );
+  }
   state.providerOutcomes.push(cloneJson(outcome));
   const bounded = boundedProviderOutcomeHistory(
     state.providerOutcomes
@@ -493,6 +594,157 @@ export function recordSessionProviderOutcomeV2(
   state.providerOutcomes = bounded.records;
   state.providerOutcomeHistoryOmittedCount +=
     bounded.omittedCount;
+}
+
+export function recordSessionContextReadWorkAuthorityV3(
+  state: SessionKernelLoopStateV2,
+  intents: readonly ToolIntentV2[]
+): void {
+  if (intents.length === 0) {
+    throw new SessionKernelStateError(
+      'session_kernel_context_read_authority_empty',
+      'Context-read work authority requires at least one normalized ToolIntent.'
+    );
+  }
+  for (const intent of intents) {
+    if (
+      intent.runId !== state.runId
+      || intent.expectedControlEpoch !== state.controlEpoch
+      || intent.authority.kind !== 'contextRead'
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_context_read_authority_mismatch',
+        'Context-read work authority must bind exact current-run ToolIntents.'
+      );
+    }
+    requiredIdentity(intent.operationId, 'intent.operationId');
+  }
+  if (state.plan) {
+    validateSessionWorkAuthorityV3(state.workAuthority, state);
+    return;
+  }
+  const previousOperationIds = state.workAuthority?.kind === 'contextRead'
+    ? state.workAuthority.operationIds
+    : [];
+  if (
+    state.workAuthority
+    && state.workAuthority.kind !== 'contextRead'
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_context_read_authority_conflict',
+      'Context-read work cannot replace a different current work authority.'
+    );
+  }
+  const operationIds = [...new Set([
+    ...previousOperationIds,
+    ...intents.map((intent) => intent.operationId),
+  ])].sort();
+  if (operationIds.length > MAX_SESSION_CONTEXT_READ_OPERATIONS) {
+    throw new SessionKernelStateError(
+      'session_kernel_context_read_authority_limit',
+      'Current-turn context-read operations exceed the durable Session safety limit.'
+    );
+  }
+  state.workAuthority = {
+    kind: 'contextRead',
+    operationIds,
+    digest: sessionContextReadWorkAuthorityDigestV3(operationIds),
+  };
+}
+
+export function currentSessionWorkAuthorityV3(
+  state: SessionKernelLoopStateV2
+): SessionWorkAuthorityV3 | undefined {
+  validateSessionWorkAuthorityV3(state.workAuthority, state);
+  return state.workAuthority
+    ? cloneJson(state.workAuthority)
+    : undefined;
+}
+
+export function sameSessionWorkAuthorityV3(
+  left: SessionWorkAuthorityV3,
+  right: SessionWorkAuthorityV3
+): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+export function sessionContextReadWorkAuthorityDigestV3(
+  operationIds: readonly string[]
+): string {
+  return sha256Hash(canonicalJson({
+    kind: 'contextRead',
+    operationIds: [...operationIds],
+  }));
+}
+
+export function validateSessionWorkAuthorityShapeV3(
+  authority: SessionWorkAuthorityV3
+): void {
+  if (authority.kind === 'plan') {
+    requiredIdentity(authority.planRevision, 'workAuthority.planRevision');
+    return;
+  }
+  if (
+    authority.kind !== 'contextRead'
+    || !Array.isArray(authority.operationIds)
+    || authority.operationIds.length === 0
+    || authority.operationIds.length > MAX_SESSION_CONTEXT_READ_OPERATIONS
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_work_authority_invalid',
+      'Session work authority has an invalid discriminator or operation set.'
+    );
+  }
+  const normalized = [...new Set(authority.operationIds)].sort();
+  if (
+    normalized.length !== authority.operationIds.length
+    || normalized.some((operationId, index) =>
+      operationId !== authority.operationIds[index]
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_work_authority_invalid',
+      'Context-read work authority operation identities must be unique and canonically ordered.'
+    );
+  }
+  normalized.forEach((operationId) =>
+    requiredIdentity(operationId, 'workAuthority.operationId')
+  );
+  if (
+    authority.digest
+      !== sessionContextReadWorkAuthorityDigestV3(normalized)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_work_authority_digest_mismatch',
+      'Context-read work authority digest does not match its explicit operation identities.'
+    );
+  }
+}
+
+function validateSessionWorkAuthorityV3(
+  authority: SessionWorkAuthorityV3 | undefined,
+  state: SessionKernelLoopStateV2
+): void {
+  if (!authority) {
+    if (state.plan) {
+      throw new SessionKernelStateError(
+        'session_kernel_work_authority_missing',
+        'A current Plan requires explicit durable work authority.'
+      );
+    }
+    return;
+  }
+  validateSessionWorkAuthorityShapeV3(authority);
+  if (
+    (authority.kind === 'plan'
+      && authority.planRevision !== state.plan?.planRevision)
+    || (authority.kind === 'contextRead' && state.plan !== undefined)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_work_authority_stale',
+      'Session work authority does not bind the current Plan state.'
+    );
+  }
 }
 
 export function sessionPlanActionV2(
@@ -653,6 +905,53 @@ export function resetSessionKernelFactProjectionV2(
     barrier.observedFactIds = [];
   }
   state.review = undefined;
+  if (state.finalAnswer) {
+    state.finalAnswer = {
+      ...state.finalAnswer,
+      status: 'stale',
+    };
+    delete state.finalAnswer.finalText;
+    delete state.finalAnswer.committedAt;
+  }
+  state.kernelWakeHint = true;
+}
+
+/**
+ * Prepares a restored active-v3 state to rebuild its replayable Kernel
+ * projection from the exact current-epoch ledger boundary. Frozen Review and
+ * final-answer identities remain available so canonical replay can either
+ * validate them at the same high-water or stale them when new facts exist.
+ */
+export function prepareSessionKernelFactReplayV3(
+  state: SessionKernelLoopStateV2,
+  input: {
+    coverageAfterLedgerSequence: number;
+    snapshotHighWater: number;
+  }
+): void {
+  const coverageAfterLedgerSequence = nonnegativeSafeInteger(
+    input.coverageAfterLedgerSequence,
+    'coverageAfterLedgerSequence'
+  );
+  const snapshotHighWater = nonnegativeSafeInteger(
+    input.snapshotHighWater,
+    'snapshotHighWater'
+  );
+  state.factsById = {};
+  state.factHistoryOmittedCount = 0;
+  state.reviewFacts = createSessionReviewFactAccumulatorV2(
+    state.pendingEpochInput
+      ? state.controlEpoch + 1
+      : state.controlEpoch,
+    coverageAfterLedgerSequence
+  );
+  state.lineage = rebuildSessionKernelLineageV2(state);
+  state.lineage.cursor.afterLedgerSequence =
+    coverageAfterLedgerSequence;
+  state.lineage.cursor.snapshotHighWater = snapshotHighWater;
+  for (const barrier of Object.values(state.factBarriers)) {
+    barrier.observedFactIds = [];
+  }
   state.kernelWakeHint = true;
 }
 
@@ -688,7 +987,9 @@ export function createSessionReviewFactAccumulatorV2(
 function rebuildSessionKernelLineageV2(
   state: SessionKernelLoopStateV2
 ): SessionKernelLineageStateV2 {
+  const snapshotHighWater = state.lineage.cursor.snapshotHighWater;
   let lineage = createSessionKernelLineageStateV2(state.runId);
+  lineage.cursor.snapshotHighWater = snapshotHighWater;
   for (const action of state.plan?.actions ?? []) {
     lineage = registerSessionPlanActionLineageV2(
       lineage,
@@ -1131,11 +1432,47 @@ function validateProviderProfile(
 function validateProviderTurnResponse(
   turn: SessionProviderTurnRecordV2
 ): void {
+  const statusIsValid = [
+    'active',
+    'awaitingTools',
+    'cancelled',
+    'completed',
+    'aborted',
+    'stale',
+    'failed',
+  ].includes(turn.status);
+  if (
+    !turn.providerTurnId.trim()
+    || !Number.isSafeInteger(turn.controlEpoch)
+    || turn.controlEpoch < 1
+    || !['primary', 'continuation', 'finalAnswer'].includes(turn.purpose)
+    || (turn.purpose === 'finalAnswer')
+      !== (turn.target.kind === 'finalAnswer')
+    || (
+      turn.planRevision !== undefined
+      && !turn.planRevision.trim()
+    )
+    || (
+      turn.target.kind === 'planAction'
+        ? !Number.isSafeInteger(turn.remainingToolCallBudget)
+          || turn.remainingToolCallBudget! <= 0
+          || turn.remainingToolCallBudget! > 256
+        : turn.remainingToolCallBudget !== undefined
+    )
+    || (turn.terminalRef !== undefined && turn.dispatchRef === undefined)
+    || !statusIsValid
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_reservation_invalid',
+      'Provider reservation has an invalid purpose, target, epoch, or durable ref chain.'
+    );
+  }
   const response = turn.response;
   if (!response) {
     if (
       turn.status === 'awaitingTools'
       || turn.status === 'completed'
+      || turn.status === 'aborted'
     ) {
       throw new SessionKernelStateError(
         'session_kernel_provider_response_missing',
@@ -1143,6 +1480,12 @@ function validateProviderTurnResponse(
       );
     }
     return;
+  }
+  if (!turn.dispatchRef || !turn.terminalRef) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_response_evidence_missing',
+      'A reconstructed Provider response requires exact dispatch and terminal refs.'
+    );
   }
   const completion = response.completion;
   if (
@@ -1176,6 +1519,8 @@ function validateProviderTurnResponse(
   }
   let finalStarted = false;
   let toolOrdinal = 0;
+  let providerNativeToolCount = 0;
+  let textFrameToolCount = 0;
   for (const item of response.items) {
     if (item.kind === 'text') {
       if (
@@ -1202,7 +1547,10 @@ function validateProviderTurnResponse(
       item.kind !== 'toolCall'
       || finalStarted
       || item.ordinal !== toolOrdinal
-      || item.source !== 'providerNative'
+      || (
+        item.source !== 'providerNative'
+        && item.source !== 'textFrame'
+      )
       || !item.callId.trim()
       || !item.toolName.trim()
       || !item.toolId.trim()
@@ -1212,13 +1560,31 @@ function validateProviderTurnResponse(
         'Provider turn ordered tool item is invalid.'
       );
     }
+    if (item.source === 'providerNative') {
+      providerNativeToolCount += 1;
+    } else {
+      textFrameToolCount += 1;
+    }
+  }
+  if (
+    (providerNativeToolCount > 0 && textFrameToolCount > 0)
+    || textFrameToolCount > 1
+    || (
+      textFrameToolCount === 1
+      && response.items.length !== 1
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_response_invalid',
+      'Provider turn text-frame tool response is not isolated.'
+    );
   }
   const native = completion.nativeCompletion;
   const nativeInvalid =
     native.providerKind === 'openaiCompatible'
       ? native.terminalSignal !== '[DONE]'
         || (
-          toolOrdinal > 0
+          providerNativeToolCount > 0
             ? native.finishReason !== 'tool_calls'
             : native.finishReason !== 'stop'
         )
@@ -1234,6 +1600,160 @@ function validateProviderTurnResponse(
     throw new SessionKernelStateError(
       'session_kernel_provider_response_invalid',
       'Provider turn native completion conflicts with ordered response.'
+    );
+  }
+}
+
+function validateFinalAnswerStateV3(
+  finalAnswer: SessionFinalAnswerStateV3,
+  state: SessionKernelLoopStateV2
+): void {
+  const binding = finalAnswer.binding;
+  requiredIdentity(binding.inputId, 'finalAnswer.binding.inputId');
+  validateSessionWorkAuthorityShapeV3(binding.workAuthority);
+  positiveEpoch(binding.controlEpoch);
+  if (
+    !Number.isSafeInteger(binding.reviewRevision)
+    || binding.reviewRevision < 1
+    || !Number.isSafeInteger(binding.snapshotHighWater)
+    || binding.snapshotHighWater < 0
+    || !Number.isSafeInteger(finalAnswer.physicalRequestCount)
+    || finalAnswer.physicalRequestCount < 0
+    || finalAnswer.physicalRequestCount > 3
+    || ![
+      'pending',
+      'requesting',
+      'stale',
+      'committed',
+      'finalAnswerFailed',
+    ].includes(finalAnswer.status)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_final_answer_state_invalid',
+      'Final-answer control state has an invalid binding, status, or physical request count.'
+    );
+  }
+  if (binding.inputId !== state.currentInputId) {
+    throw new SessionKernelStateError(
+      'session_kernel_final_answer_authority_invalid',
+      'Final-answer control state does not bind the current user input.'
+    );
+  }
+  if (finalAnswer.status !== 'stale') {
+    if (
+      binding.controlEpoch !== state.controlEpoch
+      || !state.workAuthority
+      || !sameSessionWorkAuthorityV3(
+        binding.workAuthority,
+        state.workAuthority
+      )
+      || state.review?.status !== 'final'
+      || state.review.revision !== binding.reviewRevision
+      || state.review.snapshotHighWater !== binding.snapshotHighWater
+      || !state.review.workAuthority
+      || !sameSessionWorkAuthorityV3(
+        state.review.workAuthority,
+        binding.workAuthority
+      )
+      || state.lineage.cursor.snapshotHighWater
+        !== binding.snapshotHighWater
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_final_answer_review_binding_invalid',
+        'Live final-answer control state does not bind the frozen current Review.'
+      );
+    }
+  }
+  if (finalAnswer.providerTurnId !== undefined) {
+    requiredIdentity(
+      finalAnswer.providerTurnId,
+      'finalAnswer.providerTurnId'
+    );
+  }
+  for (const [field, value] of [
+    ['startedAt', finalAnswer.startedAt],
+    ['staleAt', finalAnswer.staleAt],
+    ['committedAt', finalAnswer.committedAt],
+    ['failedAt', finalAnswer.failedAt],
+  ] as const) {
+    if (value !== undefined) requiredText(value, `finalAnswer.${field}`);
+  }
+  if (finalAnswer.lastErrorCode !== undefined) {
+    requiredIdentity(
+      finalAnswer.lastErrorCode,
+      'finalAnswer.lastErrorCode'
+    );
+  }
+  const invalidStatusShape =
+    finalAnswer.status === 'pending'
+      ? finalAnswer.physicalRequestCount >= 3
+        || finalAnswer.providerTurnId !== undefined
+        || finalAnswer.finalText !== undefined
+      : finalAnswer.status === 'requesting'
+        ? !finalAnswer.providerTurnId
+          || !finalAnswer.startedAt
+          || finalAnswer.finalText !== undefined
+        : finalAnswer.status === 'stale'
+          ? finalAnswer.finalText !== undefined
+          : finalAnswer.status === 'committed'
+            ? finalAnswer.physicalRequestCount < 1
+              || !finalAnswer.providerTurnId
+              || !finalAnswer.committedAt
+              || !finalAnswer.finalText?.trim()
+            : !finalAnswer.failedAt
+              || !finalAnswer.lastErrorCode
+              || finalAnswer.finalText !== undefined;
+  if (invalidStatusShape) {
+    throw new SessionKernelStateError(
+      'session_kernel_final_answer_state_invalid',
+      'Final-answer control fields conflict with its durable status.'
+    );
+  }
+  if (
+    finalAnswer.finalText !== undefined
+    && new TextEncoder().encode(finalAnswer.finalText).byteLength
+      > 1024 * 1024
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_final_answer_text_invalid',
+      'Committed final-answer text exceeds the durable size boundary.'
+    );
+  }
+}
+
+function validateReviewWorkAuthorityV3(
+  review: SessionKernelReviewV2 | undefined,
+  state: SessionKernelLoopStateV2
+): void {
+  if (!review) return;
+  if (!review.workAuthority) {
+    if (review.status === 'final') {
+      throw new SessionKernelStateError(
+        'session_kernel_review_work_authority_missing',
+        'A final Review requires explicit durable work authority.'
+      );
+    }
+    return;
+  }
+  validateSessionWorkAuthorityShapeV3(review.workAuthority);
+  if (
+    !state.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      review.workAuthority,
+      state.workAuthority
+    )
+    || (
+      review.workAuthority.kind === 'plan'
+      && review.planRevision !== review.workAuthority.planRevision
+    )
+    || (
+      review.workAuthority.kind === 'contextRead'
+      && review.planRevision !== undefined
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_review_work_authority_stale',
+      'Review work authority does not bind the current Session work identity.'
     );
   }
 }

@@ -2,7 +2,7 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) const AGENT_SESSION_SCHEMA_V2: &str = "deepcode.agent.session.v2";
-pub(crate) const SESSION_KERNEL_HISTORY_SCHEMA_V2: &str = "deepcode.session.kernel-persistence.v2";
+pub(crate) const SESSION_KERNEL_HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v3";
 
 pub(crate) async fn host_skills(State(state): State<AppState>) -> Json<ApiResponse> {
     match state.host_services.skill_admin.discover() {
@@ -23,7 +23,7 @@ pub(crate) fn create_agent_session_value(
     json!({
         "id": id,
         "sessionSchemaVersion": AGENT_SESSION_SCHEMA_V2,
-        "historySchema": SESSION_KERNEL_HISTORY_SCHEMA_V2,
+        "historySchema": SESSION_KERNEL_HISTORY_SCHEMA_V3,
         "kernelAbiVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
         "title": title,
         "profileId": profile_id,
@@ -40,7 +40,7 @@ pub(crate) fn create_agent_session_value(
 pub(crate) fn session_schema_is_compatible(session: &Value) -> bool {
     session.get("sessionSchemaVersion").and_then(Value::as_str) == Some(AGENT_SESSION_SCHEMA_V2)
         && session.get("historySchema").and_then(Value::as_str)
-            == Some(SESSION_KERNEL_HISTORY_SCHEMA_V2)
+            == Some(SESSION_KERNEL_HISTORY_SCHEMA_V3)
         && session.get("kernelAbiVersion").and_then(Value::as_str)
             == Some(deepcode_kernel_abi::KERNEL_ABI_V2_VERSION)
 }
@@ -51,7 +51,7 @@ pub(crate) fn incompatible_session_response() -> Json<ApiResponse> {
         format!(
             "session history is unsupported: expected sessionSchemaVersion={}, historySchema={} and kernelAbiVersion={}",
             AGENT_SESSION_SCHEMA_V2,
-            SESSION_KERNEL_HISTORY_SCHEMA_V2,
+            SESSION_KERNEL_HISTORY_SCHEMA_V3,
             deepcode_kernel_abi::KERNEL_ABI_V2_VERSION
         ),
     )

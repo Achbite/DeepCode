@@ -1,16 +1,28 @@
 use super::*;
 use deepcode_kernel_abi::{
+    HostProcessIdentityV2, HostShutdownReceiptV2, HostShutdownRequestV2,
     HOST_AUTHORITY_ENTROPY_BYTES_V2, HOST_INSTANCE_ID_ENV_V2, HOST_INSTANCE_ID_PREFIX_V2,
+    HOST_KERNEL_DAEMON_SERVICE_V2, HOST_SHELL_CAPABILITY_HEADER_V2,
     HOST_SHELL_CAPABILITY_PREFIX_V2,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const KERNEL_LISTENER_STARTUP_WAIT: Duration = Duration::from_secs(6);
+// Host operation recovery is bounded at ten minutes. The shell keeps a small
+// observation margin so it sees the Host's durable settlement before deciding
+// that its owned daemon is unavailable.
+const KERNEL_STARTUP_RECOVERY_WAIT: Duration = Duration::from_secs(10 * 60 + 15);
+const KERNEL_STARTUP_PROBE_INTERVAL: Duration = Duration::from_millis(75);
+const KERNEL_OWNED_SHUTDOWN_CONNECT_WAIT: Duration = Duration::from_millis(500);
+const KERNEL_OWNED_SHUTDOWN_IO_WAIT: Duration = Duration::from_secs(10);
+const KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS: usize = 200;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as UnixCommandExt;
@@ -92,7 +104,11 @@ impl KernelBootstrap {
                 reason: "Host admission is restricted to a local Kernel URL".to_string(),
             });
         }
-        match probe_existing_kernel(&config).await? {
+        let initial_probe = match probe_existing_kernel(&config).await? {
+            ExistingKernelProbe::Recovering => wait_for_existing_kernel_recovery(&config).await?,
+            probe => probe,
+        };
+        match initial_probe {
             ExistingKernelProbe::Healthy(client) => {
                 return Ok(Self {
                     client,
@@ -114,6 +130,7 @@ impl KernelBootstrap {
                     reason,
                 });
             }
+            ExistingKernelProbe::Recovering => unreachable!("recovery wait returns a settlement"),
         }
 
         if !kernel_auto_start_enabled(options.auto_start) {
@@ -136,8 +153,15 @@ impl KernelBootstrap {
             if !config.has_host_shell_capability() {
                 return Err(KernelClientError::HostAdmissionCapabilityMissing);
             }
-            for _ in 0..80 {
-                match probe_existing_kernel(&config).await? {
+            let listener_deadline = Instant::now() + KERNEL_LISTENER_STARTUP_WAIT;
+            loop {
+                let probe = match probe_existing_kernel(&config).await? {
+                    ExistingKernelProbe::Recovering => {
+                        wait_for_existing_kernel_recovery(&config).await?
+                    }
+                    probe => probe,
+                };
+                match probe {
                     ExistingKernelProbe::Healthy(client) => {
                         return Ok(Self {
                             client,
@@ -152,16 +176,26 @@ impl KernelBootstrap {
                     ExistingKernelProbe::AdmissionMissing => {
                         return Err(KernelClientError::HostAdmissionCapabilityMissing);
                     }
+                    ExistingKernelProbe::Recovering => {
+                        unreachable!("recovery wait returns a settlement")
+                    }
                     ExistingKernelProbe::NotListening | ExistingKernelProbe::Unavailable(_) => {}
                 }
-                std::thread::sleep(Duration::from_millis(75));
+                if Instant::now() >= listener_deadline {
+                    break;
+                }
+                std::thread::sleep(KERNEL_STARTUP_PROBE_INTERVAL);
             }
             return Err(KernelClientError::DaemonUnavailable {
                 base_url: config.base_url.clone(),
                 reason: "another owner is starting the Kernel, but its authenticated health endpoint did not become ready".to_string(),
             });
         };
-        match probe_existing_kernel(&config).await? {
+        let locked_probe = match probe_existing_kernel(&config).await? {
+            ExistingKernelProbe::Recovering => wait_for_existing_kernel_recovery(&config).await?,
+            probe => probe,
+        };
+        match locked_probe {
             ExistingKernelProbe::Healthy(client) => {
                 return Ok(Self {
                     client,
@@ -183,6 +217,7 @@ impl KernelBootstrap {
                     reason,
                 });
             }
+            ExistingKernelProbe::Recovering => unreachable!("recovery wait returns a settlement"),
         }
         let kernel_bin = find_kernel_binary().ok_or_else(|| {
             KernelClientError::Bootstrap(
@@ -202,7 +237,8 @@ impl KernelBootstrap {
         let owned_config = config.with_host_shell_capability(owned_capability);
         drop(owned_instance_id);
 
-        for _ in 0..80 {
+        let listener_deadline = Instant::now() + KERNEL_LISTENER_STARTUP_WAIT;
+        loop {
             let probe = match probe_existing_kernel(&owned_config).await {
                 Ok(probe) => probe,
                 Err(error) => {
@@ -210,8 +246,27 @@ impl KernelBootstrap {
                     return Err(error);
                 }
             };
+            let probe = match probe {
+                ExistingKernelProbe::Recovering => {
+                    match wait_for_existing_kernel_recovery(&owned_config).await {
+                        Ok(probe) => probe,
+                        Err(error) => {
+                            terminate_owned_kernel_process(&mut process);
+                            return Err(error);
+                        }
+                    }
+                }
+                probe => probe,
+            };
             match probe {
                 ExistingKernelProbe::Healthy(client) => {
+                    if !bind_owned_kernel_shutdown_identity(&mut process.shutdown_authority) {
+                        terminate_owned_kernel_process(&mut process);
+                        return Err(KernelClientError::Bootstrap(
+                            "owned Kernel public identity did not match its startup authority"
+                                .to_string(),
+                        ));
+                    }
                     return Ok(Self {
                         client,
                         _guard: KernelBootstrapGuard::owned(process),
@@ -226,6 +281,9 @@ impl KernelBootstrap {
                 ExistingKernelProbe::AdmissionMissing => {
                     terminate_owned_kernel_process(&mut process);
                     return Err(KernelClientError::HostAdmissionCapabilityMissing);
+                }
+                ExistingKernelProbe::Recovering => {
+                    unreachable!("recovery wait returns a settlement")
                 }
                 ExistingKernelProbe::NotListening | ExistingKernelProbe::Unavailable(_) => {}
             }
@@ -243,7 +301,10 @@ impl KernelBootstrap {
                     )));
                 }
             }
-            std::thread::sleep(Duration::from_millis(75));
+            if Instant::now() >= listener_deadline {
+                break;
+            }
+            std::thread::sleep(KERNEL_STARTUP_PROBE_INTERVAL);
         }
 
         terminate_owned_kernel_process(&mut process);
@@ -286,10 +347,26 @@ impl Drop for KernelBootstrapGuard {
 
 struct OwnedKernelProcess {
     child: Child,
+    shutdown_authority: OwnedKernelShutdownAuthority,
     #[cfg(unix)]
     process_group_id: libc::pid_t,
     #[cfg(windows)]
     job: WindowsKillOnCloseJob,
+}
+
+struct OwnedKernelShutdownAuthority {
+    host: String,
+    port: u16,
+    host_shell_capability: String,
+    expected_instance_id: String,
+    expected_pid: u32,
+    expected_identity: Option<HostProcessIdentityV2>,
+}
+
+#[derive(Deserialize)]
+struct HostApiEnvelopeV2<T> {
+    ok: bool,
+    data: Option<T>,
 }
 
 #[cfg(windows)]
@@ -309,6 +386,7 @@ enum ExistingKernelProbe {
     Healthy(HttpKernelClient),
     AdmissionMissing,
     AdmissionRejected,
+    Recovering,
     Unavailable(String),
 }
 
@@ -324,6 +402,9 @@ async fn probe_existing_kernel(
     let client = HttpKernelClient::new(config.clone())?;
     match client.health().await {
         Ok(status) if status.ok => Ok(ExistingKernelProbe::Healthy(client)),
+        Ok(status) if daemon_startup_recovery_in_progress(&status) => {
+            Ok(ExistingKernelProbe::Recovering)
+        }
         Ok(_) => Ok(ExistingKernelProbe::Unavailable(
             "authenticated health endpoint reported an unhealthy state".to_string(),
         )),
@@ -334,6 +415,35 @@ async fn probe_existing_kernel(
         }
         Err(error) => Ok(ExistingKernelProbe::Unavailable(error.to_string())),
     }
+}
+
+async fn wait_for_existing_kernel_recovery(
+    config: &KernelClientConfig,
+) -> KernelClientResult<ExistingKernelProbe> {
+    let deadline = Instant::now() + KERNEL_STARTUP_RECOVERY_WAIT;
+    loop {
+        match probe_existing_kernel(config).await? {
+            ExistingKernelProbe::Recovering if Instant::now() < deadline => {
+                std::thread::sleep(KERNEL_STARTUP_PROBE_INTERVAL);
+            }
+            ExistingKernelProbe::Recovering => {
+                return Ok(ExistingKernelProbe::Unavailable(format!(
+                    "authenticated Kernel startup recovery did not complete within {} seconds",
+                    KERNEL_STARTUP_RECOVERY_WAIT.as_secs()
+                )));
+            }
+            settlement => return Ok(settlement),
+        }
+    }
+}
+
+fn daemon_startup_recovery_in_progress(status: &DaemonStatus) -> bool {
+    !status.ok
+        && status
+            .raw
+            .pointer("/hostStartupReadinessV2/phase")
+            .and_then(Value::as_str)
+            == Some("recovering")
 }
 
 fn generate_host_authority_value(prefix: &str) -> KernelClientResult<String> {
@@ -607,6 +717,9 @@ fn spawn_kernel_binary(
     host_shell_capability: &str,
     host_instance_id: &str,
 ) -> KernelClientResult<OwnedKernelProcess> {
+    let port_number = port.parse::<u16>().map_err(|_| {
+        KernelClientError::Bootstrap("Kernel port is not a valid TCP port".to_string())
+    })?;
     let kernel_dir = kernel_bin
         .parent()
         .map(Path::to_path_buf)
@@ -645,8 +758,16 @@ fn spawn_kernel_binary(
                 kernel_bin.display()
             )));
         }
+        let shutdown_authority = owned_kernel_shutdown_authority(
+            host,
+            port_number,
+            host_shell_capability,
+            host_instance_id,
+            child.id(),
+        );
         return Ok(OwnedKernelProcess {
             child,
+            shutdown_authority,
             process_group_id,
         });
     }
@@ -673,12 +794,63 @@ fn spawn_kernel_binary(
                 kernel_bin.display()
             )));
         }
-        return Ok(OwnedKernelProcess { child, job });
+        let shutdown_authority = owned_kernel_shutdown_authority(
+            host,
+            port_number,
+            host_shell_capability,
+            host_instance_id,
+            child.id(),
+        );
+        return Ok(OwnedKernelProcess {
+            child,
+            shutdown_authority,
+            job,
+        });
     }
+}
+
+fn owned_kernel_shutdown_authority(
+    host: &str,
+    port: u16,
+    host_shell_capability: &str,
+    host_instance_id: &str,
+    pid: u32,
+) -> OwnedKernelShutdownAuthority {
+    OwnedKernelShutdownAuthority {
+        host: host.to_string(),
+        port,
+        host_shell_capability: host_shell_capability.to_string(),
+        expected_instance_id: host_instance_id.to_string(),
+        expected_pid: pid,
+        expected_identity: None,
+    }
+}
+
+fn bind_owned_kernel_shutdown_identity(authority: &mut OwnedKernelShutdownAuthority) -> bool {
+    let Some(identity) = request_owned_kernel_public_identity(authority) else {
+        return false;
+    };
+    if identity.service != HOST_KERNEL_DAEMON_SERVICE_V2
+        || identity.instance_id != authority.expected_instance_id
+        || identity.pid != authority.expected_pid
+        || !is_local_kernel_url(&identity.address)
+        || parse_kernel_host_port(&identity.address).and_then(|(_, port)| port.parse::<u16>().ok())
+            != Some(authority.port)
+    {
+        return false;
+    }
+    authority.expected_identity = Some(identity);
+    true
 }
 
 fn terminate_owned_kernel_process(process: &mut OwnedKernelProcess) {
     if process.child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    if request_owned_kernel_graceful_shutdown(&process.shutdown_authority)
+        && wait_for_kernel_exit(process, KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS)
+    {
+        let _ = process.child.wait();
         return;
     }
     #[cfg(unix)]
@@ -707,6 +879,84 @@ fn terminate_owned_kernel_process(process: &mut OwnedKernelProcess) {
         }
     }
     let _ = process.child.wait();
+}
+
+fn request_owned_kernel_graceful_shutdown(authority: &OwnedKernelShutdownAuthority) -> bool {
+    let Some(expected_identity) = authority.expected_identity.as_ref() else {
+        return false;
+    };
+    let host_header = if authority.host.contains(':') {
+        format!("[{}]:{}", authority.host, authority.port)
+    } else {
+        format!("{}:{}", authority.host, authority.port)
+    };
+    let body = match serde_json::to_vec(&HostShutdownRequestV2 {
+        expected_identity: expected_identity.clone(),
+    }) {
+        Ok(body) => body,
+        Err(_) => return false,
+    };
+    let request_head = format!(
+        "POST /api/host/shutdown HTTP/1.1\r\nHost: {host_header}\r\n{HOST_SHELL_CAPABILITY_HEADER_V2}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        authority.host_shell_capability,
+        body.len()
+    );
+    let mut request = request_head.into_bytes();
+    request.extend_from_slice(&body);
+    let Some(envelope) = request_owned_kernel_api::<HostShutdownReceiptV2>(authority, &request)
+    else {
+        return false;
+    };
+    envelope
+        .ok
+        .then_some(envelope.data)
+        .flatten()
+        .is_some_and(|receipt| receipt.confirms_shutdown_of(expected_identity))
+}
+
+fn request_owned_kernel_public_identity(
+    authority: &OwnedKernelShutdownAuthority,
+) -> Option<HostProcessIdentityV2> {
+    let host_header = if authority.host.contains(':') {
+        format!("[{}]:{}", authority.host, authority.port)
+    } else {
+        format!("{}:{}", authority.host, authority.port)
+    };
+    let request = format!(
+        "GET /api/host/identity HTTP/1.1\r\nHost: {host_header}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let envelope =
+        request_owned_kernel_api::<HostProcessIdentityV2>(authority, request.as_bytes())?;
+    envelope.ok.then_some(envelope.data).flatten()
+}
+
+fn request_owned_kernel_api<T: for<'de> Deserialize<'de>>(
+    authority: &OwnedKernelShutdownAuthority,
+    request: &[u8],
+) -> Option<HostApiEnvelopeV2<T>> {
+    let mut addresses = (authority.host.as_str(), authority.port)
+        .to_socket_addrs()
+        .ok()?;
+    let mut stream = addresses
+        .find_map(|address| connect_socket(address, KERNEL_OWNED_SHUTDOWN_CONNECT_WAIT).ok())?;
+    stream
+        .set_read_timeout(Some(KERNEL_OWNED_SHUTDOWN_IO_WAIT))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(KERNEL_OWNED_SHUTDOWN_IO_WAIT))
+        .ok()?;
+    stream.write_all(request).ok()?;
+    stream.flush().ok()?;
+    let mut response = Vec::with_capacity(4096);
+    stream.take(64 * 1024).read_to_end(&mut response).ok()?;
+    if !(response.starts_with(b"HTTP/1.1 200 ") || response.starts_with(b"HTTP/1.0 200 ")) {
+        return None;
+    }
+    let body_offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        + 4;
+    serde_json::from_slice(&response[body_offset..]).ok()
 }
 
 fn wait_for_kernel_exit(process: &mut OwnedKernelProcess, attempts: usize) -> bool {

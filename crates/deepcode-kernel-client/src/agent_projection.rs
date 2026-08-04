@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -1065,6 +1065,8 @@ pub struct AgentTimelineWorkspaceProjection {
 pub struct AgentTimelineSnapshot {
     pub schema_version: String,
     pub shape_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_prefix_turn_count: Option<u64>,
     pub session_id: String,
     pub revision: u64,
     pub source_event_version: u64,
@@ -1167,6 +1169,8 @@ pub struct AgentTimelineRootProjectionReplacements {
 pub struct AgentTimelineDelta {
     pub schema_version: String,
     pub shape_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_prefix_turn_count: Option<u64>,
     pub session_id: String,
     pub base_revision: u64,
     pub revision: u64,
@@ -1207,9 +1211,26 @@ impl AgentTimelineSnapshot {
             ));
         }
 
+        let legacy_prefix_len = self.legacy_prefix_turn_count.unwrap_or(0);
+        validate_safe_integer(legacy_prefix_len, "projection.legacyPrefixTurnCount")?;
+        let legacy_prefix_len = usize::try_from(legacy_prefix_len).map_err(|_| {
+            AgentProjectionValidationError::new(
+                "projection.legacyPrefixTurnCount cannot be represented on this platform",
+            )
+        })?;
+        if legacy_prefix_len > self.turns.len() {
+            return Err(AgentProjectionValidationError::new(
+                "projection.legacyPrefixTurnCount exceeds projection.turns",
+            ));
+        }
         let mut identities = ProjectionIdentities::default();
-        for turn in &self.turns {
+        for (index, turn) in self.turns.iter().enumerate() {
             validate_turn(turn, &self.session_id, &mut identities)?;
+            if index < legacy_prefix_len {
+                validate_normalized_legacy_turn_invariants(turn)?;
+            } else {
+                validate_native_turn_invariants(turn, Some(index as u64))?;
+            }
         }
         validate_optional_root_projections(
             self.task_projection.as_ref(),
@@ -1239,6 +1260,17 @@ impl AgentTimelineSnapshot {
                 self.revision, delta.base_revision
             )));
         }
+        let legacy_prefix_len = self.legacy_prefix_turn_count.unwrap_or(0);
+        if legacy_prefix_len != delta.legacy_prefix_turn_count.unwrap_or(0) {
+            return Err(AgentProjectionValidationError::new(
+                "timeline delta cannot change the normalized legacy prefix",
+            ));
+        }
+        let legacy_prefix_len = usize::try_from(legacy_prefix_len).map_err(|_| {
+            AgentProjectionValidationError::new(
+                "projection.legacyPrefixTurnCount cannot be represented on this platform",
+            )
+        })?;
         if delta.source_event_version <= self.source_event_version
             || delta.event_count <= self.event_count
         {
@@ -1265,6 +1297,13 @@ impl AgentTimelineSnapshot {
                 "timeline delta cannot replace and remove the same turn",
             ));
         }
+        if self.turns[..legacy_prefix_len].iter().any(|turn| {
+            removed.contains(turn.id.as_str()) || replacements.contains_key(turn.id.as_str())
+        }) {
+            return Err(AgentProjectionValidationError::new(
+                "timeline delta cannot replace or remove a normalized legacy prefix turn",
+            ));
+        }
 
         let mut turns = Vec::with_capacity(
             self.turns
@@ -1272,7 +1311,8 @@ impl AgentTimelineSnapshot {
                 .saturating_add(delta.turn_replacements.len()),
         );
         let mut known_turn_ids = HashSet::new();
-        for turn in &self.turns {
+        turns.extend(self.turns[..legacy_prefix_len].iter().cloned());
+        for turn in &self.turns[legacy_prefix_len..] {
             if removed.contains(turn.id.as_str()) {
                 continue;
             }
@@ -1289,13 +1329,14 @@ impl AgentTimelineSnapshot {
                 turns.push(replacement.clone());
             }
         }
-        turns.sort_by_key(|turn| turn.sequence.unwrap_or(u64::MAX));
+        turns[legacy_prefix_len..].sort_by_key(|turn| turn.sequence.unwrap_or(u64::MAX));
 
         let mut next = self.clone();
         next.revision = delta.revision;
         next.source_event_version = delta.source_event_version;
         next.generated_at = delta.generated_at.clone();
         next.event_count = delta.event_count;
+        next.legacy_prefix_turn_count = delta.legacy_prefix_turn_count;
         next.turns = turns;
         apply_root_replacements(&mut next, &delta.root_replacements);
         next.validate()?;
@@ -1312,6 +1353,10 @@ impl AgentTimelineDelta {
         validate_safe_integer(self.revision, "delta.revision")?;
         validate_safe_integer(self.source_event_version, "delta.sourceEventVersion")?;
         validate_safe_integer(self.event_count, "delta.eventCount")?;
+        validate_safe_integer(
+            self.legacy_prefix_turn_count.unwrap_or(0),
+            "delta.legacyPrefixTurnCount",
+        )?;
         if self.revision <= self.base_revision {
             return Err(AgentProjectionValidationError::new(
                 "delta.revision must be greater than delta.baseRevision",
@@ -1326,6 +1371,7 @@ impl AgentTimelineDelta {
         let mut identities = ProjectionIdentities::default();
         for turn in &self.turn_replacements {
             validate_turn(turn, &self.session_id, &mut identities)?;
+            validate_native_turn_invariants(turn, None)?;
         }
         let mut removed_turn_ids = HashSet::new();
         for turn_id in &self.removed_turn_ids {
@@ -1440,7 +1486,9 @@ struct ProjectionIdentities<'a> {
     turn_ids: HashSet<&'a str>,
     block_ids: HashSet<&'a str>,
     work_segment_ids: HashSet<&'a str>,
+    work_segment_turn_ids: HashMap<&'a str, &'a str>,
     operation_ids: HashSet<&'a str>,
+    operation_segment_ids: HashMap<&'a str, &'a str>,
 }
 
 fn validate_schema_and_shape(
@@ -1505,6 +1553,9 @@ fn validate_turn<'a>(
                 segment.id
             )));
         }
+        identities
+            .work_segment_turn_ids
+            .insert(segment.id.as_str(), turn.id.as_str());
     }
 
     let mut referenced_blocks = HashSet::new();
@@ -1542,6 +1593,136 @@ fn validate_turn<'a>(
             "turn {} parts do not cover every block and work segment exactly once",
             turn.id
         )));
+    }
+    Ok(())
+}
+
+fn validate_normalized_legacy_turn_invariants(
+    turn: &AgentTimelineTurn,
+) -> Result<(), AgentProjectionValidationError> {
+    if !turn.status.is_terminal() || !turn.work_segments.is_empty() {
+        return Err(AgentProjectionValidationError::new(
+            "normalized legacy turn must be terminal and contain no work segments",
+        ));
+    }
+    if turn.parts.len() != turn.blocks.len() {
+        return Err(AgentProjectionValidationError::new(
+            "normalized legacy turn parts changed the original block order",
+        ));
+    }
+    for (part, block) in turn.parts.iter().zip(&turn.blocks) {
+        if !matches!(
+            part,
+            AgentTimelineTurnPart::Block { block_id } if block_id == &block.id
+        ) {
+            return Err(AgentProjectionValidationError::new(
+                "normalized legacy turn parts changed the original block order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_turn_invariants(
+    turn: &AgentTimelineTurn,
+    expected_sequence: Option<u64>,
+) -> Result<(), AgentProjectionValidationError> {
+    if turn.sequence.is_none()
+        || expected_sequence.is_some_and(|expected| turn.sequence != Some(expected))
+        || (turn.status.is_terminal() && turn.completed_at.is_none())
+        || (!turn.status.is_terminal() && turn.completed_at.is_some())
+    {
+        return Err(AgentProjectionValidationError::new(
+            "native turn has invalid sequence or lifecycle",
+        ));
+    }
+    for (index, block) in turn.blocks.iter().enumerate() {
+        validate_native_block_invariants(block, index as u64)?;
+    }
+    for (index, segment) in turn.work_segments.iter().enumerate() {
+        if segment.sequence != index as u64
+            || (matches!(segment.lifecycle, AgentTimelineWorkSegmentLifecycle::Active)
+                && segment.completed_at.is_some())
+            || (!matches!(segment.lifecycle, AgentTimelineWorkSegmentLifecycle::Active)
+                && segment.completed_at.is_none())
+        {
+            return Err(AgentProjectionValidationError::new(
+                "native work segment has invalid sequence or lifecycle",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_block_invariants(
+    block: &AgentTimelineBlock,
+    expected_sequence: u64,
+) -> Result<(), AgentProjectionValidationError> {
+    if block.sequence != Some(expected_sequence) || block.activity.is_some() {
+        return Err(AgentProjectionValidationError::new(
+            "native block has invalid sequence or legacy activity",
+        ));
+    }
+    let semantics_valid = match block.kind {
+        AgentTimelineBlockKind::User => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::User)
+                && block.entry_role == AgentTimelineEntryRole::UserMessage
+                && block.provider_phase.is_none()
+                && block.provenance.origin == AgentTimelineProvenanceOrigin::User
+                && block.provenance.authority == AgentTimelineProvenanceAuthority::User
+        }
+        AgentTimelineBlockKind::Assistant => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::AssistantText)
+                && block.provenance.origin == AgentTimelineProvenanceOrigin::Provider
+                && block.provenance.authority == AgentTimelineProvenanceAuthority::Session
+                && match block.provider_phase {
+                    Some(AgentTimelineProviderPhase::Commentary) => {
+                        block.entry_role == AgentTimelineEntryRole::AgentUpdate
+                    }
+                    Some(AgentTimelineProviderPhase::FinalAnswer) => {
+                        block.entry_role == AgentTimelineEntryRole::FinalAnswer
+                    }
+                    None => matches!(
+                        block.entry_role,
+                        AgentTimelineEntryRole::AgentUpdate | AgentTimelineEntryRole::FinalAnswer
+                    ),
+                }
+        }
+        AgentTimelineBlockKind::Plan => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::Plan)
+                && block.entry_role == AgentTimelineEntryRole::Interaction
+                && block.provider_phase.is_none()
+        }
+        AgentTimelineBlockKind::Permission => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::Permission)
+                && block.entry_role == AgentTimelineEntryRole::Interaction
+                && block.provider_phase.is_none()
+        }
+        AgentTimelineBlockKind::Review => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::Review)
+                && block.entry_role == AgentTimelineEntryRole::Interaction
+                && block.provider_phase.is_none()
+        }
+        AgentTimelineBlockKind::Error => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::Diagnostic)
+                && block.entry_role == AgentTimelineEntryRole::Diagnostic
+                && block.provider_phase.is_none()
+        }
+        AgentTimelineBlockKind::Thinking
+        | AgentTimelineBlockKind::Stage
+        | AgentTimelineBlockKind::TurnActions => false,
+    };
+    if !semantics_valid
+        || (block.attachments.is_some() && !matches!(block.kind, AgentTimelineBlockKind::User))
+        || ((block.decision_request.is_some() || block.interaction.is_some())
+            && !matches!(
+                block.kind,
+                AgentTimelineBlockKind::Plan | AgentTimelineBlockKind::Permission
+            ))
+    {
+        return Err(AgentProjectionValidationError::new(
+            "native block semantics are inconsistent",
+        ));
     }
     Ok(())
 }
@@ -1587,6 +1768,16 @@ fn validate_work_segment<'a>(
     validate_safe_integer(segment.sequence, "workSegment.sequence")?;
     validate_optional_identity(segment.started_at.as_deref(), "workSegment.startedAt")?;
     validate_optional_identity(segment.completed_at.as_deref(), "workSegment.completedAt")?;
+    if (matches!(segment.lifecycle, AgentTimelineWorkSegmentLifecycle::Active)
+        && segment.completed_at.is_some())
+        || (!matches!(segment.lifecycle, AgentTimelineWorkSegmentLifecycle::Active)
+            && segment.completed_at.is_none())
+    {
+        return Err(AgentProjectionValidationError::new(format!(
+            "work segment {} has an invalid lifecycle timestamp",
+            segment.id
+        )));
+    }
     validate_provenance(&segment.provenance, "workSegment.provenance")?;
     validate_identity_array(&segment.fact_refs, "workSegment.factRefs")?;
 
@@ -1603,6 +1794,9 @@ fn validate_work_segment<'a>(
                 operation.operation_id
             )));
         }
+        identities
+            .operation_segment_ids
+            .insert(operation.operation_id.as_str(), segment.id.as_str());
     }
     if let Some(attention) = &segment.attention.0 {
         validate_identity(&attention.summary, "workSegment.attention.summary")?;
@@ -1640,6 +1834,14 @@ fn validate_work_operation(
                 operation.operation_id, attempt.attempt_id
             )));
         }
+        validate_optional_identity(
+            attempt.started_at.as_deref(),
+            "operation.attempts.startedAt",
+        )?;
+        validate_optional_identity(
+            attempt.completed_at.as_deref(),
+            "operation.attempts.completedAt",
+        )?;
     }
     Ok(())
 }
@@ -1697,11 +1899,41 @@ fn validate_optional_root_projections(
     }
     if let Some(run) = run {
         validate_run_projection(run)?;
-        if let (Some(turn_id), Some(identities)) = (&run.turn_id, identities) {
-            if !identities.turn_ids.contains(turn_id.as_str()) {
-                return Err(AgentProjectionValidationError::new(format!(
-                    "run projection references missing turn {turn_id}"
-                )));
+        if let Some(identities) = identities {
+            if let Some(turn_id) = &run.turn_id {
+                if !identities.turn_ids.contains(turn_id.as_str()) {
+                    return Err(AgentProjectionValidationError::new(format!(
+                        "run projection references missing turn {turn_id}"
+                    )));
+                }
+            }
+            if let Some(activity) = &run.current_activity.0 {
+                if let Some(work_segment_id) = &activity.work_segment_id {
+                    let work_segment_turn_id = identities
+                        .work_segment_turn_ids
+                        .get(work_segment_id.as_str())
+                        .copied();
+                    if work_segment_turn_id.is_none()
+                        || run.turn_id.as_deref() != work_segment_turn_id
+                    {
+                        return Err(AgentProjectionValidationError::new(format!(
+                            "run projection current activity references another turn work segment {work_segment_id}"
+                        )));
+                    }
+                }
+                if let Some(operation_id) = &activity.operation_id {
+                    let operation_segment_id = identities
+                        .operation_segment_ids
+                        .get(operation_id.as_str())
+                        .copied();
+                    if operation_segment_id.is_none()
+                        || activity.work_segment_id.as_deref() != operation_segment_id
+                    {
+                        return Err(AgentProjectionValidationError::new(format!(
+                            "run projection current activity has inconsistent operation {operation_id}"
+                        )));
+                    }
+                }
             }
         }
     }

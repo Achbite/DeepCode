@@ -380,6 +380,9 @@ function memoryEntry(
     return undefined;
   }
   const payload = decodeConversationPayload(event.payload, event.kind);
+  if (payload.projectionKind === 'provider.composing') {
+    return undefined;
+  }
   if (excludeRunId && payload.runId === excludeRunId) {
     return undefined;
   }
@@ -404,6 +407,7 @@ function decodeConversationPayload(
   kind: 'user_msg' | 'assistant_msg'
 ): {
   runId: string;
+  projectionKind: 'input.persisted' | 'provider.composing' | 'provider.completed';
   content: unknown;
   attachments: unknown;
 } {
@@ -414,30 +418,63 @@ function decodeConversationPayload(
     'projectionKind',
     'channel',
     'visibility',
-    'content',
     'controlEpoch',
   ];
+  const projectionKind = (
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+  )
+    ? (value as Record<string, unknown>).projectionKind
+    : undefined;
+  const legacyCompleted = kind === 'assistant_msg'
+    && projectionKind === 'provider.completed'
+    && Object.hasOwn(value as object, 'content');
   const record = exactObject(
     value,
     kind === 'user_msg'
-      ? [...common, 'inputId', 'attachments']
-      : [
-          ...common,
-          'status',
-          'outputKind',
-          'providerTurnId',
-          'providerOutcome',
-        ],
-    kind === 'user_msg'
-      ? []
-      : ['status', 'providerOutcome']
+      ? [...common, 'content', 'inputId', 'attachments']
+      : projectionKind === 'provider.composing'
+        ? [
+            ...common,
+            'content',
+            'status',
+            'providerTurnId',
+            'streamSequence',
+            'textOrdinal',
+          ]
+        : legacyCompleted
+          ? [
+              ...common,
+              'content',
+              'status',
+              'outputKind',
+              'providerTurnId',
+              'providerOutcome',
+            ]
+          : [
+              ...common,
+              'status',
+              'outputKind',
+              'providerTurnId',
+              'terminalScope',
+              'orderedItems',
+              'providerOutcome',
+            ],
+    kind === 'assistant_msg'
+      && projectionKind === 'provider.composing'
+      ? ['providerPhase']
+      : kind === 'user_msg'
+        ? []
+        : ['status', 'providerOutcome']
   );
   if (
     record.schemaVersion !== PUBLIC_PROJECTION_V2_SCHEMA
     || (
       kind === 'user_msg'
         ? record.projectionKind !== 'input.persisted'
-        : record.projectionKind !== 'provider.completed'
+        : record.projectionKind !== 'provider.composing'
+          && record.projectionKind !== 'provider.completed'
     )
   ) {
     throw invalidMemory(
@@ -447,14 +484,176 @@ function decodeConversationPayload(
   }
   if (kind === 'user_msg') {
     decodeAgentInputAttachmentsV2(record.attachments);
+  } else if (record.projectionKind === 'provider.composing') {
+    const composingText = boundedText(
+      record.content,
+      'provider.composing.content',
+      1024 * 1024
+    );
+    if (
+      record.channel !== 'progress'
+      || record.visibility !== 'conversation'
+      || record.status !== 'running'
+      || !Number.isSafeInteger(record.controlEpoch)
+      || Number(record.controlEpoch) <= 0
+      || !Number.isSafeInteger(record.streamSequence)
+      || Number(record.streamSequence) <= 0
+      || !Number.isSafeInteger(record.textOrdinal)
+      || Number(record.textOrdinal) <= 0
+      || (
+        record.providerPhase !== undefined
+        && record.providerPhase !== 'commentary'
+      )
+      || composingText.length === 0
+    ) {
+      throw invalidMemory(
+        'session_prior_event_projection_schema_unsupported',
+        'Prior Provider composing event is not an exact safe text delta.'
+      );
+    }
+    identity(record.providerTurnId, 'providerTurnId');
   }
   return {
     runId: identity(record.runId, 'payload.runId'),
-    content: record.content,
+    projectionKind: record.projectionKind as
+      | 'input.persisted'
+      | 'provider.composing'
+      | 'provider.completed',
+    content: record.projectionKind === 'provider.completed'
+      ? legacyCompleted
+        ? legacyProviderCompletedMemoryText(record)
+        : providerCompletedMemoryText(record)
+      : record.content,
     attachments: kind === 'user_msg'
       ? record.attachments
       : [],
   };
+}
+
+function legacyProviderCompletedMemoryText(
+  record: Record<string, unknown>
+): string {
+  if (
+    record.channel !== 'final'
+    || record.visibility !== 'conversation'
+    || record.status !== 'completed'
+    || record.outputKind !== 'answer'
+    || !Number.isSafeInteger(record.controlEpoch)
+    || Number(record.controlEpoch) <= 0
+  ) {
+    throw invalidMemory(
+      'session_prior_event_projection_schema_unsupported',
+      'Prior legacy Provider completion is not an exact settled answer.'
+    );
+  }
+  identity(record.providerTurnId, 'providerTurnId');
+  return boundedText(
+    record.content,
+    'provider.completed.content',
+    1024 * 1024
+  );
+}
+
+function providerCompletedMemoryText(
+  record: Record<string, unknown>
+): string {
+  if (
+    record.channel !== 'final'
+    || record.visibility !== 'conversation'
+    || record.status !== 'completed'
+    || record.outputKind !== 'answer'
+    || record.terminalScope !== 'turn'
+    || !Number.isSafeInteger(record.controlEpoch)
+    || Number(record.controlEpoch) <= 0
+  ) {
+    throw invalidMemory(
+      'session_prior_event_projection_schema_unsupported',
+      'Prior Provider completion is not an exact committed final answer.'
+    );
+  }
+  identity(record.providerTurnId, 'providerTurnId');
+  const outcome = exactObject(
+    record.providerOutcome,
+    ['providerProfileId', 'provider', 'model'],
+    ['usage']
+  );
+  identity(outcome.providerProfileId, 'providerProfileId');
+  identity(outcome.provider, 'provider');
+  identity(outcome.model, 'model');
+  if (
+    outcome.usage !== undefined
+    && (
+      !outcome.usage
+      || typeof outcome.usage !== 'object'
+      || Array.isArray(outcome.usage)
+    )
+  ) {
+    throw invalidMemory(
+      'session_prior_event_projection_schema_unsupported',
+      'Prior Provider completion has invalid public usage metadata.'
+    );
+  }
+  if (
+    !Array.isArray(record.orderedItems)
+    || record.orderedItems.length === 0
+    || record.orderedItems.length > 96
+  ) {
+    throw invalidMemory(
+      'session_prior_event_projection_schema_unsupported',
+      'Prior Provider completion has no bounded ordered text response.'
+    );
+  }
+  const items = record.orderedItems.map((value, index) => {
+    const item = exactObject(
+      value,
+      ['kind', 'phase', 'text', 'textOrdinal']
+    );
+    if (
+      item.kind !== 'text'
+      || (
+        item.phase !== 'commentary'
+        && item.phase !== 'final_answer'
+        && item.phase !== 'unknown'
+      )
+      || item.textOrdinal !== index + 1
+    ) {
+      throw invalidMemory(
+        'session_prior_event_projection_schema_unsupported',
+        'Prior Provider completion contains invalid ordered text.'
+      );
+    }
+    return {
+      phase: item.phase as 'commentary' | 'final_answer' | 'unknown',
+      text: boundedText(item.text, 'orderedItems.text', 1024 * 1024),
+    };
+  });
+  const firstFinalIndex = items.findIndex(
+    (item) => item.phase === 'final_answer'
+  );
+  const lastCommentaryIndex = items.findLastIndex(
+    (item) => item.phase === 'commentary'
+  );
+  const finalItems = firstFinalIndex >= 0
+    ? items.slice(firstFinalIndex)
+    : items
+      .slice(lastCommentaryIndex + 1)
+      .filter((item) => item.phase === 'unknown');
+  if (
+    finalItems.some((item) => item.phase === 'commentary')
+  ) {
+    throw invalidMemory(
+      'session_prior_event_projection_schema_unsupported',
+      'Prior Provider completion violates the final-answer phase order.'
+    );
+  }
+  const text = finalItems.map((item) => item.text).join('');
+  if (!text.trim() || utf8Bytes(text) > 1024 * 1024) {
+    throw invalidMemory(
+      'session_prior_event_projection_schema_unsupported',
+      'Prior Provider completion has no bounded final answer text.'
+    );
+  }
+  return text;
 }
 
 function eventKind(value: unknown): AgentEventKind {

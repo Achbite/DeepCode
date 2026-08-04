@@ -1,13 +1,19 @@
 use crate::host_kernel_operation_store_v2::{
     HostCallerRequestBindingInputV2, HostCallerRequestBindingReceiptV2,
-    HostCallerRequestDriveStateV2, HostCallerRequestRecoveryEvidenceV2,
-    HostKernelLiveRunForDeletionV2, HostKernelOperationSettlementReceiptV2,
-    HostKernelOperationSettlementV2, HostKernelStoredRunLifecycleV2,
+    HostCallerRequestDriveStateV2, HostCallerRequestRecoveryEvidenceV2, HostKernelFailureCommitV2,
+    HostKernelFailureDispositionV2, HostKernelFailureEffectV2, HostKernelLiveRunForDeletionV2,
+    HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
+    HostKernelStoredRunLifecycleV2, HostRunCallerDriveRecoveryV2,
 };
 use crate::host_kernel_run_v2::{
     HostKernelBridgeOperationV2, HostKernelCapabilityDecisionV2, HostKernelInitialInputV2,
-    HostKernelPlanDecisionV2, HostKernelRunSpawnInputV2, HostKernelRunWorkspaceV2,
-    HostKernelWaitKindV2,
+    HostKernelPlanDecisionV2, HostKernelRunAdmittedV2, HostKernelRunSpawnInputV2,
+    HostKernelRunWorkspaceV2, HostKernelStartupContinuationRunV2, HostKernelWaitKindV2,
+};
+use crate::host_kernel_wake_v2::{
+    HostKernelWakeCancelOutcomeV2, HostKernelWakeHandoffOutcomeV2, HostKernelWakeKeyV2,
+    HostKernelWakeOwnerV2, HostKernelWakeRegisterOutcomeV2, HostKernelWakeRetagOutcomeV2,
+    HostKernelWakeSupervisorErrorV2,
 };
 use crate::host_run_broker_v2::{
     HostActiveRunRecordV2, HostRunSettingsCeilingV2, HostRunWorkspaceKindV2,
@@ -21,6 +27,7 @@ use crate::kernel_v2_transport::{
 };
 use crate::prelude::*;
 use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPriorEventsV2};
+use crate::session_kernel_v2_store::{decode_session_work_authority_v3, SessionWorkAuthorityV3};
 use crate::*;
 use deepcode_kernel_abi::v2::{CommandRequestId, InputId, RunId, UserDecisionRefV2};
 use deepcode_kernel_abi::v2_command::{
@@ -32,14 +39,17 @@ use deepcode_kernel_abi::{
     WorkspaceBindingRefV2,
 };
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 const MAX_AUTOMATIC_SESSION_STEPS_V2: usize = 128;
 const PLAN_ACTION_PROVIDER_CALL_BUDGET_V2: u16 = 32;
+const KERNEL_FACT_WAKE_POLL_INTERVAL_V2: Duration = Duration::from_millis(50);
 const HOST_RUN_OPEN_REQUEST_KIND_V2: &str = "agent.run.open.v2";
 const HOST_USER_INPUT_REQUEST_KIND_V2: &str = "agent.run.user-input.v2";
 const HOST_DECISION_REQUEST_KIND_V2: &str = "agent.run.decision.v2";
 const HOST_AUTHORITY_REVOKE_REQUEST_KIND_V2: &str = "agent.run.authority-revoke.v2";
 const HOST_CANCEL_REQUEST_KIND_V2: &str = "agent.run.cancel.v2";
+const HOST_CALLER_RUN_ADMISSION_SCHEMA_V2: &str = "deepcode.host.agent-run-admission.v2";
 const HOST_CALLER_RUN_OUTCOME_SCHEMA_V2: &str = "deepcode.host.agent-run-outcome.v2";
 const HOST_AUTHORITY_REVOKE_OUTCOME_SCHEMA_V2: &str = "deepcode.host.authority-revoke-outcome.v2";
 
@@ -63,6 +73,48 @@ impl AgentKernelV2Error {
             message: error.message,
         }
     }
+
+    fn from_wake_supervisor(error: HostKernelWakeSupervisorErrorV2) -> Self {
+        Self {
+            code: error.code.to_string(),
+            message: error.message,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentKernelDriveContextV2 {
+    kernel_v2: crate::kernel_v2_transport::KernelV2TransportState,
+    kernel_session_v2: crate::host_kernel_run_v2::HostKernelRunCoordinatorV2,
+    host_services: HostServices,
+    session_runs: Arc<Mutex<HashMap<String, AgentRunState>>>,
+}
+
+impl AgentKernelDriveContextV2 {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            kernel_v2: state.kernel_v2.clone(),
+            kernel_session_v2: state.kernel_session_v2.clone(),
+            host_services: state.host_services.clone(),
+            session_runs: Arc::clone(&state.session_runs),
+        }
+    }
+}
+
+enum AgentKernelDriveBoundaryV2 {
+    Complete,
+    KernelWait(AgentKernelFactWaitV2),
+    Failure {
+        error: AgentKernelV2Error,
+        indeterminate: bool,
+    },
+}
+
+#[derive(Clone)]
+struct AgentKernelFactWaitV2 {
+    active: HostActiveRunRecordV2,
+    predecessor: HostKernelOperationSettlementReceiptV2,
+    observed_high_water: u64,
 }
 
 #[derive(Debug)]
@@ -152,6 +204,14 @@ enum PreparedAgentDecisionV2 {
     },
 }
 
+enum RecoveredCallerDriveActionV2 {
+    Decision(PreparedAgentDecisionV2),
+    UserInput {
+        input: HostKernelInitialInputV2,
+        operation_request_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanPreviewAuthorizationModeV2 {
     UserAllow,
@@ -170,18 +230,28 @@ struct PreparedOpenCallerRequestV2 {
     operation_request_id: String,
 }
 
-pub(crate) fn preadmit_open_agent_kernel_run_v2(
+#[derive(Debug, Clone)]
+pub(crate) struct AgentKernelRunAdmissionV2 {
+    pub(crate) host_run_id: String,
+    pub(crate) kernel_run_id: String,
+}
+
+pub(crate) async fn preadmit_open_agent_kernel_run_v2(
     state: &AppState,
     session_id: &str,
     body: &AgentSessionRunRequest,
-) -> Result<Option<String>, AgentKernelV2Error> {
+) -> Result<Option<AgentKernelRunAdmissionV2>, AgentKernelV2Error> {
     let prepared = prepare_open_caller_request_v2(session_id, body)?;
     let binding = bind_open_caller_request_v2(state, session_id, &prepared)?;
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
-        return Ok(Some(host_run_id));
+        return exact_agent_run_admission_v2(state, session_id, &host_run_id).map(Some);
     }
     if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
-        return recover_driving_caller_request_v2(state, &binding).map(Some);
+        if let Some(admission) = current_owned_open_admission_v2(state, &binding).await? {
+            return Ok(Some(admission));
+        }
+        let host_run_id = recover_driving_caller_request_v2(state, &binding)?;
+        return exact_agent_run_admission_v2(state, session_id, &host_run_id).map(Some);
     }
     Ok(None)
 }
@@ -193,7 +263,7 @@ pub(crate) async fn open_agent_kernel_run_v2(
     profile_id: &str,
     project_context: Option<&Value>,
     start_event_count: usize,
-) -> Result<String, AgentKernelV2Error> {
+) -> Result<AgentKernelRunAdmissionV2, AgentKernelV2Error> {
     let prepared = prepare_open_caller_request_v2(session_id, body)?;
     let binding = bind_open_caller_request_v2(state, session_id, &prepared)?;
     let host_run_id = caller_binding_string_v2(&binding, "hostRunId")?;
@@ -207,10 +277,14 @@ pub(crate) async fn open_agent_kernel_run_v2(
     let run_open_request_id = caller_binding_string_v2(&binding, "runOpenRequestId")?;
     let operation_request_id = caller_binding_string_v2(&binding, "operationRequestId")?;
     if let Some(replayed_host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
-        return Ok(replayed_host_run_id);
+        return exact_agent_run_admission_v2(state, session_id, &replayed_host_run_id);
     }
     if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
-        return recover_driving_caller_request_v2(state, &binding);
+        if let Some(admission) = current_owned_open_admission_v2(state, &binding).await? {
+            return Ok(admission);
+        }
+        let host_run_id = recover_driving_caller_request_v2(state, &binding)?;
+        return exact_agent_run_admission_v2(state, session_id, &host_run_id);
     }
     if let Some(active) = state
         .host_services
@@ -256,9 +330,11 @@ pub(crate) async fn open_agent_kernel_run_v2(
         HostSessionPriorEventsV2::bounded(session_id, events)
             .map_err(AgentKernelV2Error::from_storage)?
     };
-    let binding = match claim_caller_drive_or_restore_v2(state, binding)? {
+    let binding = match claim_caller_drive_or_restore_v2(state, binding).await? {
         CallerDriveAdmissionV2::Acquired(binding) => binding,
-        CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(host_run_id),
+        CallerDriveAdmissionV2::Replayed(host_run_id) => {
+            return exact_agent_run_admission_v2(state, session_id, &host_run_id)
+        }
     };
     let prepared_workspace =
         match prepare_agent_workspace_v2(state, session_id, &host_run_id, body, project_context) {
@@ -305,14 +381,14 @@ pub(crate) async fn open_agent_kernel_run_v2(
     );
     let opened = state
         .kernel_session_v2
-        .open_and_spawn_initial(
+        .open_and_dispatch_initial(
             HostKernelRunSpawnInputV2 {
                 session_id: session_id.to_string(),
                 host_run_id: host_run_id.clone(),
                 caller_request_id: binding.caller_request_id.clone(),
                 caller_request_digest: binding.request_digest.clone(),
                 run_open_request_id,
-                operation_request_id,
+                operation_request_id: operation_request_id.clone(),
                 provider_profile,
                 prior_session_events,
                 workspace: prepared_workspace.workspace(),
@@ -385,14 +461,124 @@ pub(crate) async fn open_agent_kernel_run_v2(
             return Err(final_error);
         }
     };
-    if let Err(error) =
-        drive_agent_kernel_run_v2(state, &opened.active_run, opened.initial_operation).await
-    {
+    if let Err(error) = bind_agent_run_kernel_identity_v2(
+        state,
+        session_id,
+        &host_run_id,
+        &opened.active_run.run_id,
+    ) {
         settle_caller_error_outcome_v2(state, &binding, &error, true)?;
         return Err(error);
     }
-    settle_caller_run_outcome_v2(state, &binding, &host_run_id)?;
-    Ok(host_run_id)
+    let admission = AgentKernelRunAdmissionV2 {
+        host_run_id: host_run_id.clone(),
+        kernel_run_id: opened.active_run.run_id.clone(),
+    };
+    let owner =
+        host_kernel_initial_drive_owner_v2(&opened.active_run, &binding, &operation_request_id)?;
+    let owner_for_cleanup = owner.clone();
+    let owner_for_drive = owner.clone();
+    let context = AgentKernelDriveContextV2::from_state(state);
+    let supervisor_for_drive = state.kernel_wake_v2.clone();
+    let failure_context = context.clone();
+    let failure_binding = binding.clone();
+    let failure_host_run_id = host_run_id.clone();
+    let admission_state = state.clone();
+    let admission_binding = binding.clone();
+    let admission_host_run_id = host_run_id.clone();
+    let (admission_sender, admission_receiver) =
+        tokio::sync::oneshot::channel::<Result<(), AgentKernelV2Error>>();
+    let registered = state
+        .kernel_wake_v2
+        .register_exclusive(owner, async move {
+            match settle_caller_run_outcome_v2(
+                &admission_state,
+                &admission_binding,
+                &admission_host_run_id,
+            ) {
+                Ok(()) => {
+                    let _ = admission_sender.send(Ok(()));
+                }
+                Err(error) => {
+                    let _ = admission_sender.send(Err(error));
+                    return;
+                }
+            }
+            drive_admitted_agent_kernel_run_v2(
+                context,
+                supervisor_for_drive,
+                owner_for_drive,
+                opened,
+            )
+            .await;
+        })
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor);
+    let registered = match registered {
+        Ok(HostKernelWakeRegisterOutcomeV2::Registered) => true,
+        Ok(
+            HostKernelWakeRegisterOutcomeV2::AlreadyExact
+            | HostKernelWakeRegisterOutcomeV2::OwnerConflict,
+        ) => {
+            let error = AgentKernelV2Error::invalid(
+                "host_kernel_initial_drive_owner_exists",
+                "The exact initial Run drive already has a live supervisor owner.",
+            );
+            mark_agent_drive_v2(
+                &failure_context,
+                &failure_host_run_id,
+                "waiting",
+                Some(
+                    "Kernel–Session v2 Run admission found a conflicting live drive owner."
+                        .to_string(),
+                ),
+                None,
+            );
+            settle_caller_error_outcome_v2(state, &failure_binding, &error, true)?;
+            return Err(error);
+        }
+        Err(error) => {
+            mark_agent_drive_v2(
+                &failure_context,
+                &failure_host_run_id,
+                "waiting",
+                Some(format!(
+                    "Kernel–Session v2 Run admission requires recovery: {}",
+                    error.code
+                )),
+                None,
+            );
+            settle_caller_error_outcome_v2(state, &failure_binding, &error, true)?;
+            return Err(error);
+        }
+    };
+    debug_assert!(registered);
+    let admission_result = match admission_receiver.await {
+        Ok(result) => result,
+        Err(_) => Err(AgentKernelV2Error::invalid(
+            "host_kernel_initial_drive_owner_lost_before_admission",
+            "The initial Run drive owner ended before it reported durable caller admission.",
+        )),
+    };
+    if let Err(error) = admission_result {
+        let _ = state
+            .kernel_wake_v2
+            .cancel_owner_exact(owner_for_cleanup)
+            .await;
+        mark_agent_drive_v2(
+            &failure_context,
+            &failure_host_run_id,
+            "waiting",
+            Some(format!(
+                "Kernel–Session v2 caller admission requires recovery: {}",
+                error.code
+            )),
+            None,
+        );
+        let _ = settle_caller_error_outcome_v2(state, &failure_binding, &error, true);
+        return Err(error);
+    }
+    Ok(admission)
 }
 
 pub(crate) async fn resolve_agent_kernel_decision_v2(
@@ -461,6 +647,11 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
         if let Some(replayed_host_run_id) = restore_caller_run_outcome_v2(state, binding)? {
             return Ok(replayed_host_run_id);
         }
+        if let Some(admitted_host_run_id) =
+            current_owned_caller_admission_v2(state, binding).await?
+        {
+            return Ok(admitted_host_run_id);
+        }
         if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
             return recover_driving_caller_request_v2(state, binding);
         }
@@ -484,7 +675,7 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
                     response_identity: prepared_agent_decision_identity_v2(
                         &active, &current, &prepared,
                     ),
-                    recorded_at: now_rfc3339_utc_v2(),
+                    recorded_at: crate::utils::now_rfc3339_text(),
                 })
                 .map_err(AgentKernelV2Error::from_storage)?
         }
@@ -498,24 +689,419 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
         ));
     }
     let prepared = decode_prepared_agent_decision_v2(&binding)?;
-    let binding = match claim_caller_drive_or_restore_v2(state, binding)? {
+    let binding = match claim_caller_drive_or_restore_v2(state, binding).await? {
         CallerDriveAdmissionV2::Acquired(binding) => binding,
         CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(host_run_id),
     };
-    mark_agent_run_v2(
-        state,
-        &active.host_run_id,
-        "running",
-        Some("Applying trusted Kernel–Session v2 decision.".to_string()),
-        None,
-    );
-    if let Err(error) = execute_prepared_agent_decision_v2(state, &active, &binding, prepared).await
+    admit_and_spawn_agent_decision_v2(state, active, binding, prepared).await
+}
+
+async fn admit_and_spawn_agent_decision_v2(
+    state: &AppState,
+    active: HostActiveRunRecordV2,
+    binding: HostCallerRequestBindingReceiptV2,
+    prepared: PreparedAgentDecisionV2,
+) -> Result<String, AgentKernelV2Error> {
+    let owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
+    let owner_for_drive = owner.clone();
+    let background_state = state.clone();
+    let background_active = active.clone();
+    let background_binding = binding.clone();
+    let (admission_sender, admission_receiver) =
+        tokio::sync::oneshot::channel::<Result<(), AgentKernelV2Error>>();
+    let registration = match state
+        .kernel_wake_v2
+        .register_exclusive(owner.clone(), async move {
+            let admitted_binding = match persist_caller_admission_v2(
+                &background_state,
+                &background_active,
+                &background_binding,
+                &owner_for_drive,
+            ) {
+                Ok(admitted_binding) => {
+                    let _ = admission_sender.send(Ok(()));
+                    admitted_binding
+                }
+                Err(error) => {
+                    let _ = admission_sender.send(Err(error));
+                    return;
+                }
+            };
+            mark_agent_run_v2(
+                &background_state,
+                &background_active.host_run_id,
+                "running",
+                Some("Applying trusted Kernel–Session v2 decision.".to_string()),
+                None,
+            );
+            let result = execute_prepared_agent_decision_v2(
+                &background_state,
+                &background_active,
+                &admitted_binding,
+                prepared,
+            )
+            .await;
+            finish_owned_caller_drive_v2(
+                &background_state,
+                &background_active,
+                &admitted_binding,
+                owner_for_drive,
+                result,
+            )
+            .await;
+        })
+        .await
     {
-        settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+        Ok(registration) => registration,
+        Err(supervisor_error) => {
+            drop(admission_receiver);
+            let error = AgentKernelV2Error::from_wake_supervisor(supervisor_error);
+            cleanup_unadmitted_caller_registration_v2(state, &binding, owner, None, &error).await?;
+            return Err(error);
+        }
+    };
+    if registration != HostKernelWakeRegisterOutcomeV2::Registered {
+        drop(admission_receiver);
+        let error = AgentKernelV2Error::invalid(
+            "host_kernel_caller_drive_owner_conflict",
+            "The exact decision caller could not acquire exclusive Run drive ownership.",
+        );
+        cleanup_unadmitted_caller_registration_v2(state, &binding, owner, None, &error).await?;
         return Err(error);
     }
-    settle_caller_run_outcome_v2(state, &binding, &active.host_run_id)?;
-    Ok(active.host_run_id)
+    complete_caller_admission_v2(state, &active, binding, owner, admission_receiver, None).await
+}
+
+async fn admit_and_spawn_user_input_v2(
+    state: &AppState,
+    active: HostActiveRunRecordV2,
+    binding: HostCallerRequestBindingReceiptV2,
+    input: HostKernelInitialInputV2,
+    request_id: String,
+) -> Result<String, AgentKernelV2Error> {
+    let owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
+    let expected_wait = current_kernel_wait_v2(state, &active)?;
+    let owner_for_drive = owner.clone();
+    let background_state = state.clone();
+    let background_active = active.clone();
+    let background_binding = binding.clone();
+    let (admission_sender, admission_receiver) =
+        tokio::sync::oneshot::channel::<Result<(), AgentKernelV2Error>>();
+    let future = async move {
+        let admitted_binding = match persist_caller_admission_v2(
+            &background_state,
+            &background_active,
+            &background_binding,
+            &owner_for_drive,
+        ) {
+            Ok(admitted_binding) => {
+                let _ = admission_sender.send(Ok(()));
+                admitted_binding
+            }
+            Err(error) => {
+                let _ = admission_sender.send(Err(error));
+                return;
+            }
+        };
+        let result =
+            execute_bound_user_input_v2(&background_state, &background_active, input, &request_id)
+                .await;
+        finish_owned_caller_drive_v2(
+            &background_state,
+            &background_active,
+            &admitted_binding,
+            owner_for_drive,
+            result,
+        )
+        .await;
+    };
+    let (registration, replaced_wait, recovery_wait) = match expected_wait {
+        Some((expected_owner, wait)) => {
+            let registration = state
+                .kernel_wake_v2
+                .replace_exact_or_register_missing(expected_owner, owner.clone(), future)
+                .await;
+            match registration {
+                Ok(HostKernelWakeHandoffOutcomeV2::Registered) => (true, None, None),
+                Ok(HostKernelWakeHandoffOutcomeV2::Replaced) => {
+                    (true, Some(wait.clone()), Some(wait))
+                }
+                Ok(HostKernelWakeHandoffOutcomeV2::SupersededByRunCancellation) => {
+                    drop(admission_receiver);
+                    let error = AgentKernelV2Error::invalid(
+                        "host_kernel_caller_drive_superseded_by_run_cancellation",
+                        "Run cancellation superseded this user-input drive before durable admission.",
+                    );
+                    abandon_unadmitted_caller_v2(state, &binding, &error)?;
+                    return Err(error);
+                }
+                Ok(HostKernelWakeHandoffOutcomeV2::PreviousOwnerPanicked) => {
+                    drop(admission_receiver);
+                    let error = AgentKernelV2Error::invalid(
+                        "host_kernel_caller_drive_previous_owner_panicked",
+                        "The previous Run drive owner panicked before user-input handoff completed.",
+                    );
+                    settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+                    return Err(error);
+                }
+                Ok(
+                    HostKernelWakeHandoffOutcomeV2::OwnerConflict
+                    | HostKernelWakeHandoffOutcomeV2::ReplacementKeyMismatch,
+                ) => (false, None, Some(wait)),
+                Err(supervisor_error) => {
+                    drop(admission_receiver);
+                    let error = AgentKernelV2Error::from_wake_supervisor(supervisor_error);
+                    cleanup_unadmitted_caller_registration_v2(
+                        state,
+                        &binding,
+                        owner,
+                        Some(wait),
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+        }
+        None => match state
+            .kernel_wake_v2
+            .register_exclusive(owner.clone(), future)
+            .await
+        {
+            Ok(HostKernelWakeRegisterOutcomeV2::Registered) => (true, None, None),
+            Ok(
+                HostKernelWakeRegisterOutcomeV2::AlreadyExact
+                | HostKernelWakeRegisterOutcomeV2::OwnerConflict,
+            ) => (false, None, None),
+            Err(supervisor_error) => {
+                drop(admission_receiver);
+                let error = AgentKernelV2Error::from_wake_supervisor(supervisor_error);
+                cleanup_unadmitted_caller_registration_v2(state, &binding, owner, None, &error)
+                    .await?;
+                return Err(error);
+            }
+        },
+    };
+    if !registration {
+        drop(admission_receiver);
+        let error = AgentKernelV2Error::invalid(
+            "host_kernel_caller_drive_owner_conflict",
+            "The exact user-input caller could not acquire or replace the expected Run drive owner.",
+        );
+        cleanup_unadmitted_caller_registration_v2(state, &binding, owner, recovery_wait, &error)
+            .await?;
+        return Err(error);
+    }
+    complete_caller_admission_v2(
+        state,
+        &active,
+        binding,
+        owner,
+        admission_receiver,
+        replaced_wait,
+    )
+    .await
+}
+
+async fn complete_caller_admission_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: HostCallerRequestBindingReceiptV2,
+    owner: HostKernelWakeOwnerV2,
+    admission_receiver: tokio::sync::oneshot::Receiver<Result<(), AgentKernelV2Error>>,
+    replaced_wait: Option<AgentKernelFactWaitV2>,
+) -> Result<String, AgentKernelV2Error> {
+    let error = match admission_receiver.await {
+        Ok(Ok(())) => return Ok(active.host_run_id.clone()),
+        Ok(Err(error)) => error,
+        Err(_) => AgentKernelV2Error::invalid(
+            "host_kernel_caller_drive_owner_lost_before_admission",
+            "The caller drive owner ended before it reported durable admission.",
+        ),
+    };
+    let cleanup = state
+        .kernel_wake_v2
+        .cancel_owner_exact(owner)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor);
+    let indeterminate = !matches!(
+        cleanup,
+        Ok(HostKernelWakeCancelOutcomeV2::Cancelled) | Ok(HostKernelWakeCancelOutcomeV2::Missing)
+    );
+    let restored_wait = match replaced_wait {
+        Some(wait) => register_owned_agent_kernel_wait_v2(
+            state,
+            AgentKernelDriveContextV2::from_state(state),
+            wait,
+        )
+        .await
+        .is_ok(),
+        None => true,
+    };
+    if indeterminate || !restored_wait {
+        let _ = settle_caller_error_outcome_v2(state, &binding, &error, true);
+    } else {
+        let _ = abandon_unadmitted_caller_v2(state, &binding, &error);
+    }
+    Err(error)
+}
+
+fn persist_caller_admission_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+    owner: &HostKernelWakeOwnerV2,
+) -> Result<HostCallerRequestBindingReceiptV2, AgentKernelV2Error> {
+    let owner_instance_id = binding.drive_owner_instance_id.as_deref().ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "host_caller_request_owner_missing",
+            "Claimed caller request has no durable owner instance identity.",
+        )
+    })?;
+    let admission = json!({
+        "schemaVersion": HOST_CALLER_RUN_ADMISSION_SCHEMA_V2,
+        "sessionId": binding.session_id,
+        "hostRunId": active.host_run_id,
+        "runId": active.run_id,
+        "callerRequestId": binding.caller_request_id,
+        "requestDigest": binding.request_digest,
+        "ownerDigest": owner.identity_digest,
+    });
+    state
+        .host_services
+        .kernel_operations_v2
+        .admit_caller_request(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+            owner_instance_id,
+            admission,
+            &crate::utils::now_rfc3339_text(),
+        )
+        .map_err(AgentKernelV2Error::from_storage)
+}
+
+async fn cleanup_unadmitted_caller_registration_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    owner: HostKernelWakeOwnerV2,
+    replaced_wait: Option<AgentKernelFactWaitV2>,
+    error: &AgentKernelV2Error,
+) -> Result<(), AgentKernelV2Error> {
+    let cancelled = state
+        .kernel_wake_v2
+        .cancel_owner_exact(owner)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor);
+    let restored_wait = match replaced_wait {
+        Some(wait) => register_owned_agent_kernel_wait_v2(
+            state,
+            AgentKernelDriveContextV2::from_state(state),
+            wait,
+        )
+        .await
+        .is_ok(),
+        None => true,
+    };
+    if matches!(
+        cancelled,
+        Ok(HostKernelWakeCancelOutcomeV2::Cancelled) | Ok(HostKernelWakeCancelOutcomeV2::Missing)
+    ) && restored_wait
+    {
+        abandon_unadmitted_caller_v2(state, binding, error)
+    } else {
+        settle_caller_error_outcome_v2(state, binding, error, true)
+    }
+}
+
+async fn finish_owned_caller_drive_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+    owner: HostKernelWakeOwnerV2,
+    result: Result<AgentKernelDriveBoundaryV2, AgentKernelV2Error>,
+) {
+    match result {
+        Ok(AgentKernelDriveBoundaryV2::Complete) => {
+            if let Err(error) = settle_caller_run_outcome_v2(state, binding, &active.host_run_id) {
+                mark_agent_run_v2(
+                    state,
+                    &active.host_run_id,
+                    "waiting",
+                    Some(format!(
+                        "Caller completion persistence requires recovery: {}",
+                        error.code
+                    )),
+                    None,
+                );
+            }
+        }
+        Ok(AgentKernelDriveBoundaryV2::KernelWait(wait)) => {
+            let wait_owner = match host_kernel_wake_owner_v2(&wait) {
+                Ok(wait_owner) => wait_owner,
+                Err(error) => {
+                    let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                    return;
+                }
+            };
+            let retagged = state
+                .kernel_wake_v2
+                .retag_exact(owner, wait_owner.clone())
+                .await;
+            if !matches!(retagged, Ok(HostKernelWakeRetagOutcomeV2::Retagged)) {
+                let error = AgentKernelV2Error::invalid(
+                    "host_kernel_wake_owner_retag_conflict",
+                    "Caller drive could not transfer exact ownership to its Kernel facts wait.",
+                );
+                let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                return;
+            }
+            if let Err(error) = settle_caller_run_outcome_v2(state, binding, &active.host_run_id) {
+                mark_agent_run_v2(
+                    state,
+                    &active.host_run_id,
+                    "waiting",
+                    Some(format!(
+                        "Caller handoff persistence requires recovery: {}",
+                        error.code
+                    )),
+                    None,
+                );
+                return;
+            }
+            let context = AgentKernelDriveContextV2::from_state(state);
+            if let Err(error) =
+                drive_owned_agent_kernel_wait_v2(&context, &state.kernel_wake_v2, wait_owner, wait)
+                    .await
+            {
+                handle_owned_drive_error_v2(&context, active, &error).await;
+            }
+        }
+        Ok(AgentKernelDriveBoundaryV2::Failure {
+            error,
+            indeterminate,
+        }) => {
+            let _ = settle_caller_error_outcome_v2(state, binding, &error, indeterminate);
+        }
+        Err(error) => {
+            let context = AgentKernelDriveContextV2::from_state(state);
+            let disposition = classify_owned_drive_error_v2(&error);
+            handle_owned_drive_error_v2(&context, active, &error).await;
+            match disposition {
+                OwnedDriveErrorDispositionV2::RecoveryWaiting => {
+                    let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                }
+                OwnedDriveErrorDispositionV2::IndeterminateManual => {
+                    let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                }
+                OwnedDriveErrorDispositionV2::FailedAndRetire
+                | OwnedDriveErrorDispositionV2::StaleStop => {
+                    let _ = settle_caller_error_outcome_v2(state, binding, &error, false);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn revoke_agent_kernel_authority_v2(
@@ -623,7 +1209,7 @@ pub(crate) fn revoke_agent_kernel_authority_v2(
                         "requestId": request_id,
                         "resolved": resolved,
                     }),
-                    recorded_at: now_rfc3339_utc_v2(),
+                    recorded_at: crate::utils::now_rfc3339_text(),
                 })
                 .map_err(AgentKernelV2Error::from_storage)?
         }
@@ -704,7 +1290,7 @@ pub(crate) fn revoke_agent_kernel_authority_v2(
                 "runId": caller_binding_string_v2(&binding, "runId")?,
                 "response": response,
             }),
-            now_rfc3339_utc_v2(),
+            crate::utils::now_rfc3339_text(),
         )
         .map_err(AgentKernelV2Error::from_storage)?;
     Ok(result)
@@ -797,6 +1383,11 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         if let Some(replayed_host_run_id) = restore_caller_run_outcome_v2(state, binding)? {
             return Ok(replayed_host_run_id);
         }
+        if let Some(admitted_host_run_id) =
+            current_owned_caller_admission_v2(state, binding).await?
+        {
+            return Ok(admitted_host_run_id);
+        }
         if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
             return recover_or_resume_driving_user_input_v2(state, binding).await;
         }
@@ -808,7 +1399,7 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         Some(binding) => binding,
         None => {
             let previous = latest_settlement_v2(state, &active)?;
-            let recorded_at = now_rfc3339_utc_v2();
+            let recorded_at = crate::utils::now_rfc3339_text();
             let material = json!({
                 "schemaVersion": "deepcode.host.agent-input.v2",
                 "sessionId": session_id,
@@ -870,16 +1461,15 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         CallerDriveAdmissionV2::Acquired(binding) => binding,
         CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(host_run_id),
     };
-    drive_bound_user_input_v2(state, &active, &binding, input, &request_id).await
+    admit_and_spawn_user_input_v2(state, active, binding, input, request_id).await
 }
 
-async fn drive_bound_user_input_v2(
+async fn execute_bound_user_input_v2(
     state: &AppState,
     active: &HostActiveRunRecordV2,
-    binding: &HostCallerRequestBindingReceiptV2,
     input: HostKernelInitialInputV2,
     request_id: &str,
-) -> Result<String, AgentKernelV2Error> {
+) -> Result<AgentKernelDriveBoundaryV2, AgentKernelV2Error> {
     let operation = HostKernelBridgeOperationV2::UserInput {
         input,
         guidance: Vec::new(),
@@ -891,7 +1481,7 @@ async fn drive_bound_user_input_v2(
         Some("New user input is advancing the control epoch.".to_string()),
         None,
     );
-    let settlement = match state
+    let settlement = state
         .kernel_session_v2
         .submit_operation(
             &active.session_id,
@@ -900,20 +1490,13 @@ async fn drive_bound_user_input_v2(
             operation,
         )
         .await
-        .map_err(AgentKernelV2Error::from_storage)
-    {
-        Ok(settlement) => settlement,
-        Err(error) => {
-            settle_caller_error_outcome_v2(state, binding, &error, true)?;
-            return Err(error);
-        }
-    };
-    if let Err(error) = drive_agent_kernel_run_v2(state, active, settlement).await {
-        settle_caller_error_outcome_v2(state, binding, &error, true)?;
-        return Err(error);
-    }
-    settle_caller_run_outcome_v2(state, binding, &active.host_run_id)?;
-    Ok(active.host_run_id.clone())
+        .map_err(AgentKernelV2Error::from_storage)?;
+    drive_agent_kernel_until_boundary_v2(
+        &AgentKernelDriveContextV2::from_state(state),
+        active,
+        settlement,
+    )
+    .await
 }
 
 fn durable_user_input_from_binding_v2(
@@ -1042,7 +1625,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
                     "operationRequestId": cancel_operation_id,
                     "cancelOperationId": cancel_operation_id,
                 }),
-                recorded_at: now_rfc3339_utc_v2(),
+                recorded_at: crate::utils::now_rfc3339_text(),
             })
             .map_err(AgentKernelV2Error::from_storage)?,
     };
@@ -1060,6 +1643,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
         CallerDriveAdmissionV2::Acquired(binding) => binding,
         CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(Some(host_run_id)),
     };
+    cancel_owned_agent_kernel_wait_v2(state, &active).await?;
     if let Err(error) = state
         .kernel_session_v2
         .cancel_run_for_caller(
@@ -1125,6 +1709,15 @@ pub(crate) async fn retire_agent_kernel_run_v2(
         }
     }
     let host_run_id = host_run_id.to_string();
+    if let HostKernelLiveRunForDeletionV2::Active(active) = &live_run {
+        cancel_owned_agent_kernel_wait_identity_v2(
+            state,
+            &active.session_id,
+            &active.host_run_id,
+            &active.run_id,
+        )
+        .await?;
+    }
     let retired = state
         .kernel_session_v2
         .retire_session_durable_run(session_id)
@@ -1282,7 +1875,7 @@ fn bind_open_caller_request_v2(
                 "runOpenRequestId": prepared.run_open_request_id,
                 "operationRequestId": prepared.operation_request_id,
             }),
-            recorded_at: now_rfc3339_utc_v2(),
+            recorded_at: crate::utils::now_rfc3339_text(),
         })
         .map_err(AgentKernelV2Error::from_storage)
 }
@@ -1309,6 +1902,7 @@ fn prepare_agent_workspace_v2(
         let workspace = HostKernelRunWorkspaceV2 {
             workspace_binding_ref: prepared.workspace_binding_ref.clone(),
             workspace_binding_identity: prepared.workspace_binding_identity.clone(),
+            workspace_canonical_root: prepared.workspace_canonical_root.clone(),
             workspace_kind: HostRunWorkspaceKindV2::Empty,
             active_folder_id: None,
             empty_workspace_key: Some(prepared.empty_workspace_key.clone()),
@@ -1364,6 +1958,7 @@ fn prepare_agent_workspace_v2(
     let workspace = HostKernelRunWorkspaceV2 {
         workspace_binding_ref: prepared.workspace_binding_ref.clone(),
         workspace_binding_identity: prepared.workspace_binding_identity.clone(),
+        workspace_canonical_root: prepared.workspace_canonical_root.clone(),
         workspace_kind: HostRunWorkspaceKindV2::Bound,
         active_folder_id,
         empty_workspace_key: None,
@@ -1660,7 +2255,7 @@ async fn execute_prepared_agent_decision_v2(
     active: &HostActiveRunRecordV2,
     binding: &HostCallerRequestBindingReceiptV2,
     prepared: PreparedAgentDecisionV2,
-) -> Result<(), AgentKernelV2Error> {
+) -> Result<AgentKernelDriveBoundaryV2, AgentKernelV2Error> {
     match prepared {
         PreparedAgentDecisionV2::Plan {
             plan_revision,
@@ -1670,7 +2265,8 @@ async fn execute_prepared_agent_decision_v2(
         } => {
             if matches!(decision, HostKernelPlanDecisionV2::Accept) {
                 approve_exact_plan_previews_v2(
-                    state,
+                    &state.host_services,
+                    &state.kernel_v2,
                     active,
                     &plan_revision,
                     PlanPreviewAuthorizationModeV2::UserAllow,
@@ -1719,7 +2315,12 @@ async fn execute_prepared_agent_decision_v2(
             } else {
                 decided
             };
-            drive_agent_kernel_run_v2(state, active, settlement).await
+            drive_agent_kernel_until_boundary_v2(
+                &AgentKernelDriveContextV2::from_state(state),
+                active,
+                settlement,
+            )
+            .await
         }
         PreparedAgentDecisionV2::Permission {
             wait,
@@ -1739,7 +2340,7 @@ async fn execute_prepared_agent_decision_v2(
                 "guidance": guidance,
             });
             apply_host_scope_decision_v2(
-                state,
+                &state.kernel_v2,
                 &wait.preview_id,
                 host_decision,
                 &guidance,
@@ -1800,7 +2401,12 @@ async fn execute_prepared_agent_decision_v2(
             } else {
                 observed
             };
-            drive_agent_kernel_run_v2(state, active, settlement).await
+            drive_agent_kernel_until_boundary_v2(
+                &AgentKernelDriveContextV2::from_state(state),
+                active,
+                settlement,
+            )
+            .await
         }
     }
 }
@@ -1858,13 +2464,13 @@ fn capability_decision_name_v2(decision: HostCapabilityDecisionKindV2) -> &'stat
 }
 
 async fn approve_exact_plan_previews_v2(
-    state: &AppState,
+    host_services: &HostServices,
+    kernel_v2: &crate::kernel_v2_transport::KernelV2TransportState,
     active: &HostActiveRunRecordV2,
     plan_revision: &str,
     mode: PlanPreviewAuthorizationModeV2,
 ) -> Result<(), AgentKernelV2Error> {
-    let settlements = state
-        .host_services
+    let settlements = host_services
         .kernel_operations_v2
         .settlements_for_run(&active.session_id, &active.host_run_id)
         .map_err(AgentKernelV2Error::from_storage)?;
@@ -1952,7 +2558,7 @@ async fn approve_exact_plan_previews_v2(
                 match mode {
                     PlanPreviewAuthorizationModeV2::UserAllow => {
                         apply_host_scope_decision_v2(
-                            state,
+                            kernel_v2,
                             preview.preview_id.as_str(),
                             HostCapabilityDecisionKindV2::Allow,
                             "",
@@ -1961,7 +2567,7 @@ async fn approve_exact_plan_previews_v2(
                     }
                     PlanPreviewAuthorizationModeV2::AutoPlanTrust => {
                         apply_host_plan_trust_v2(
-                            state,
+                            kernel_v2,
                             preview.preview_id.as_str(),
                             &decision_material,
                         )?;
@@ -2091,7 +2697,7 @@ fn runtime_capability_wait_v2(
 }
 
 fn apply_host_scope_decision_v2(
-    state: &AppState,
+    kernel_v2: &crate::kernel_v2_transport::KernelV2TransportState,
     preview_id: &str,
     decision: HostCapabilityDecisionKindV2,
     guidance: &str,
@@ -2122,8 +2728,7 @@ fn apply_host_scope_decision_v2(
                 "Scope preview identity is not strict Kernel v2.",
             )
         })?;
-    let response = state
-        .kernel_v2
+    let response = kernel_v2
         .apply_host_capability_decision(HostCapabilityDecisionRequestV2 {
             request_id,
             decision_ref,
@@ -2164,7 +2769,7 @@ fn apply_host_scope_decision_v2(
 }
 
 fn apply_host_plan_trust_v2(
-    state: &AppState,
+    kernel_v2: &crate::kernel_v2_transport::KernelV2TransportState,
     preview_id: &str,
     identity_material: &Value,
 ) -> Result<(), AgentKernelV2Error> {
@@ -2202,8 +2807,7 @@ fn apply_host_plan_trust_v2(
                 )
             },
         )?;
-    let response = state
-        .kernel_v2
+    let response = kernel_v2
         .apply_host_trust_grant(HostTrustGrantRequestV2 {
             request_id,
             decision_ref,
@@ -2241,40 +2845,229 @@ fn apply_host_plan_trust_v2(
     }
 }
 
-async fn drive_agent_kernel_run_v2(
-    state: &AppState,
+async fn drive_admitted_agent_kernel_run_v2(
+    context: AgentKernelDriveContextV2,
+    supervisor: crate::host_kernel_wake_v2::HostKernelWakeSupervisorV2,
+    owner: HostKernelWakeOwnerV2,
+    admitted: HostKernelRunAdmittedV2,
+) {
+    let active = admitted.active_run.clone();
+    let settlement = match admitted.await_initial_operation().await {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            let error = AgentKernelV2Error::from_storage(error);
+            handle_owned_drive_error_v2(&context, &active, &error).await;
+            return;
+        }
+    };
+    let boundary = match drive_agent_kernel_until_boundary_v2(&context, &active, settlement).await {
+        Ok(boundary) => boundary,
+        Err(error) => {
+            handle_owned_drive_error_v2(&context, &active, &error).await;
+            return;
+        }
+    };
+    match boundary {
+        AgentKernelDriveBoundaryV2::KernelWait(wait) => {
+            let wait_owner = match host_kernel_wake_owner_v2(&wait) {
+                Ok(wait_owner) => wait_owner,
+                Err(error) => {
+                    handle_owned_drive_error_v2(&context, &active, &error).await;
+                    return;
+                }
+            };
+            if !matches!(
+                supervisor.retag_exact(owner, wait_owner.clone()).await,
+                Ok(HostKernelWakeRetagOutcomeV2::Retagged)
+            ) {
+                let error = AgentKernelV2Error::invalid(
+                    "host_kernel_wake_owner_retag_conflict",
+                    "Initial Run drive could not transfer exact ownership to its Kernel facts wait.",
+                );
+                handle_owned_drive_error_v2(&context, &active, &error).await;
+                return;
+            }
+            if let Err(error) =
+                drive_owned_agent_kernel_wait_v2(&context, &supervisor, wait_owner, wait).await
+            {
+                handle_owned_drive_error_v2(&context, &active, &error).await;
+            }
+        }
+        AgentKernelDriveBoundaryV2::Complete | AgentKernelDriveBoundaryV2::Failure { .. } => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedDriveErrorDispositionV2 {
+    RecoveryWaiting,
+    FailedAndRetire,
+    IndeterminateManual,
+    StaleStop,
+}
+
+fn classify_owned_drive_error_v2(error: &AgentKernelV2Error) -> OwnedDriveErrorDispositionV2 {
+    match error.code.as_str() {
+        "session_permission_decision_stale" | "host_kernel_operation_unexpected_stale" => {
+            OwnedDriveErrorDispositionV2::StaleStop
+        }
+        "host_kernel_wake_supervisor_unavailable"
+        | "host_kernel_retry_recovery_waiting"
+        | "host_kernel_facts_high_water_unavailable"
+        | "host_kernel_run_settings_unavailable"
+        | "session_kernel_automatic_step_budget_exhausted"
+        | "session_kernel_production_operation_receipts_busy" => {
+            OwnedDriveErrorDispositionV2::RecoveryWaiting
+        }
+        "session_kernel_production_operation_request_conflict"
+        | "session_kernel_continuation_invalid"
+        | "session_kernel_continuation_unsupported"
+        | "session_plan_revision_missing"
+        | "session_kernel_facts_high_water_missing"
+        | "session_kernel_wake_continuation_invalid"
+        | "session_kernel_wake_kind_invalid"
+        | "host_kernel_operation_encode_failed"
+        | "host_kernel_live_bridge_bootstrap_conflict"
+        | "host_kernel_final_answer_binding_invalid" => {
+            OwnedDriveErrorDispositionV2::FailedAndRetire
+        }
+        _ => OwnedDriveErrorDispositionV2::IndeterminateManual,
+    }
+}
+
+async fn handle_owned_drive_error_v2(
+    context: &AgentKernelDriveContextV2,
+    active: &HostActiveRunRecordV2,
+    error: &AgentKernelV2Error,
+) {
+    match classify_owned_drive_error_v2(error) {
+        OwnedDriveErrorDispositionV2::StaleStop => {}
+        OwnedDriveErrorDispositionV2::RecoveryWaiting => mark_agent_drive_v2(
+            context,
+            &active.host_run_id,
+            "waiting",
+            Some(format!(
+                "Kernel–Session v2 owned Run drive ended without a live continuation owner and requires explicit recovery: {}",
+                error.code
+            )),
+            None,
+        ),
+        OwnedDriveErrorDispositionV2::IndeterminateManual => mark_agent_drive_v2(
+            context,
+            &active.host_run_id,
+            "waiting",
+            Some(format!(
+                "Kernel–Session v2 owned Run drive is indeterminate and requires explicit manual recovery: {}",
+                error.code
+            )),
+            None,
+        ),
+        OwnedDriveErrorDispositionV2::FailedAndRetire => {
+            let retirement = context
+                .kernel_session_v2
+                .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
+                .await;
+            let (lifecycle, message) = match retirement {
+                Ok(_) => (
+                    "failed",
+                    format!(
+                        "Kernel–Session v2 terminated after a deterministic drive failure: {}",
+                        error.code
+                    ),
+                ),
+                Err(retirement_error) => (
+                    "waiting",
+                    format!(
+                        "Kernel–Session v2 deterministic drive failure requires durable retirement recovery after {}: {}",
+                        error.code, retirement_error.code
+                    ),
+                ),
+            };
+            mark_agent_drive_v2(
+                context,
+                &active.host_run_id,
+                lifecycle,
+                Some(message),
+                None,
+            );
+        }
+    }
+}
+
+async fn drive_agent_kernel_until_boundary_v2(
+    context: &AgentKernelDriveContextV2,
     active: &HostActiveRunRecordV2,
     mut settlement: HostKernelOperationSettlementReceiptV2,
-) -> Result<(), AgentKernelV2Error> {
+) -> Result<AgentKernelDriveBoundaryV2, AgentKernelV2Error> {
     let mut last_facts_wait = None;
     for _ in 0..MAX_AUTOMATIC_SESSION_STEPS_V2 {
         match &settlement.settlement {
-            HostKernelOperationSettlementV2::FailedRecoverable { error_code } => {
-                mark_agent_run_v2(
-                    state,
+            HostKernelOperationSettlementV2::FailedRecoverable {
+                error_code,
+                boundary,
+            } => {
+                let indeterminate = boundary.disposition
+                    == HostKernelFailureDispositionV2::QueryFacts
+                    || boundary.commit != HostKernelFailureCommitV2::None
+                    || boundary.effect != HostKernelFailureEffectV2::None
+                    || !boundary.pending_request_lanes.is_empty();
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "waiting",
-                    Some(format!(
-                        "Kernel–Session v2 operation requires recovery: {error_code}"
-                    )),
+                    Some(if indeterminate {
+                        format!(
+                            "Kernel–Session v2 operation is indeterminate and requires explicit fact recovery: {error_code}"
+                        )
+                    } else {
+                        format!("Kernel–Session v2 operation requires replay-safe recovery: {error_code}")
+                    }),
                     None,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Failure {
+                    error: AgentKernelV2Error::invalid(
+                        error_code.clone(),
+                        if indeterminate {
+                            "Session reported an operation whose commit or effect boundary requires explicit fact recovery."
+                        } else {
+                            "Session reported a replay-safe recoverable operation failure."
+                        },
+                    ),
+                    indeterminate,
+                });
             }
-            HostKernelOperationSettlementV2::FailedTerminal { error_code } => {
-                state
+            HostKernelOperationSettlementV2::FailedTerminal { error_code, .. } => {
+                if let Err(retirement_error) = context
                     .kernel_session_v2
                     .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
                     .await
-                    .map_err(AgentKernelV2Error::from_storage)?;
-                mark_agent_run_v2(
-                    state,
+                {
+                    let retirement_error = AgentKernelV2Error::from_storage(retirement_error);
+                    mark_agent_drive_v2(
+                        context,
+                        &active.host_run_id,
+                        "waiting",
+                        Some(format!(
+                            "Kernel–Session v2 terminal failure requires durable retirement recovery after {}: {}",
+                            error_code, retirement_error.code
+                        )),
+                        None,
+                    );
+                    return Err(retirement_error);
+                }
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "failed",
                     Some(format!("Kernel–Session v2 operation failed: {error_code}")),
                     None,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Failure {
+                    error: AgentKernelV2Error::invalid(
+                        error_code.clone(),
+                        "Session reported a terminal operation failure.",
+                    ),
+                    indeterminate: false,
+                });
             }
             HostKernelOperationSettlementV2::Succeeded { .. } => {}
         }
@@ -2306,11 +3099,20 @@ async fn drive_agent_kernel_run_v2(
                 guidance: Vec::new(),
             },
             "readyToFinalizeReview" => HostKernelBridgeOperationV2::FinalizeReview {
-                expected_plan_revision: required_continuation_field_v2(
+                expected_work_authority: required_continuation_work_authority_v2(
                     &settlement,
-                    "expectedPlanRevision",
-                )?
-                .to_string(),
+                    "workAuthority",
+                )?,
+            },
+            "readyToRequestFinalAnswer" => HostKernelBridgeOperationV2::RequestFinalAnswer {
+                input_id: required_continuation_field_v2(&settlement, "inputId")?.to_string(),
+                control_epoch: continuation_u64_field_v2(&settlement, "controlEpoch")?,
+                work_authority: required_continuation_work_authority_v2(
+                    &settlement,
+                    "workAuthority",
+                )?,
+                review_revision: continuation_u64_field_v2(&settlement, "reviewRevision")?,
+                snapshot_high_water: continuation_u64_field_v2(&settlement, "snapshotHighWater")?,
             },
             "replanRequired" => {
                 let response = success_response_v2(&settlement)?;
@@ -2355,36 +3157,46 @@ async fn drive_agent_kernel_run_v2(
                 let observed_high_water =
                     continuation_u64_field_v2(&settlement, "observedHighWater")?;
                 if last_facts_wait == Some(observed_high_water) {
-                    mark_agent_run_v2(
-                        state,
+                    mark_agent_drive_v2(
+                        context,
                         &active.host_run_id,
                         "waiting",
                         Some("Waiting for new canonical Kernel facts.".to_string()),
                         None,
                     );
-                    return Ok(());
+                    return Ok(AgentKernelDriveBoundaryV2::KernelWait(
+                        AgentKernelFactWaitV2 {
+                            active: active.clone(),
+                            predecessor: settlement,
+                            observed_high_water,
+                        },
+                    ));
                 }
                 last_facts_wait = Some(observed_high_water);
                 HostKernelBridgeOperationV2::ReconcileFacts {
                     observed_high_water,
                 }
             }
-            "terminalProviderAnswer" | "terminalProviderStop" | "terminalReview" => {
+            "terminalProviderAnswer" | "terminalProviderStop" | "terminalFinalAnswer" => {
+                if continuation_kind == "terminalFinalAnswer" {
+                    validate_final_answer_continuation_binding_v2(&settlement)?;
+                }
                 let final_text = success_response_v2(&settlement)
                     .ok()
                     .and_then(extract_terminal_text_v2);
-                state
+                context
                     .kernel_session_v2
                     .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
                     .await
                     .map_err(AgentKernelV2Error::from_storage)?;
-                mark_agent_run_v2(
-                    state,
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "completed",
                     Some(match continuation_kind {
-                        "terminalReview" => {
-                            "Kernel–Session v2 Review finalized from canonical facts.".to_string()
+                        "terminalFinalAnswer" => {
+                            "Kernel–Session v2 final answer committed against the frozen Review."
+                                .to_string()
                         }
                         "terminalProviderAnswer" => {
                             "Kernel–Session v2 provider answer completed.".to_string()
@@ -2393,7 +3205,26 @@ async fn drive_agent_kernel_run_v2(
                     }),
                     final_text,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
+            }
+            "terminalFinalAnswerFailed" => {
+                validate_final_answer_continuation_binding_v2(&settlement)?;
+                let error_code = required_continuation_field_v2(&settlement, "errorCode")?;
+                context
+                    .kernel_session_v2
+                    .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
+                    .await
+                    .map_err(AgentKernelV2Error::from_storage)?;
+                mark_agent_drive_v2(
+                    context,
+                    &active.host_run_id,
+                    "failed",
+                    Some(format!(
+                        "Kernel–Session v2 final answer failed without retry: {error_code}"
+                    )),
+                    None,
+                );
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
             "awaitingUserPlanConfirmation" => {
                 let run_id = RunId::new(active.run_id.clone()).map_err(|_| {
@@ -2402,7 +3233,7 @@ async fn drive_agent_kernel_run_v2(
                         "Durable active Host Run contains an invalid Kernel Run identity.",
                     )
                 })?;
-                let settings = state
+                let settings = context
                     .kernel_v2
                     .service()
                     .run_settings_ceiling_host(&run_id)
@@ -2416,7 +3247,8 @@ async fn drive_agent_kernel_run_v2(
                     let plan_revision =
                         required_continuation_field_v2(&settlement, "planRevision")?.to_string();
                     approve_exact_plan_previews_v2(
-                        state,
+                        &context.host_services,
+                        &context.kernel_v2,
                         active,
                         &plan_revision,
                         PlanPreviewAuthorizationModeV2::AutoPlanTrust,
@@ -2428,8 +3260,8 @@ async fn drive_agent_kernel_run_v2(
                         guidance: None,
                     };
                     let request_id = next_operation_request_id_v2(&settlement, &decide)?;
-                    mark_agent_run_v2(
-                        state,
+                    mark_agent_drive_v2(
+                        context,
                         &active.host_run_id,
                         "running",
                         Some(
@@ -2438,7 +3270,7 @@ async fn drive_agent_kernel_run_v2(
                         ),
                         None,
                     );
-                    let decided = state
+                    let decided = context
                         .kernel_session_v2
                         .submit_operation(
                             &active.session_id,
@@ -2461,7 +3293,7 @@ async fn drive_agent_kernel_run_v2(
                         observed_high_water,
                     };
                     let request_id = next_operation_request_id_v2(&decided, &reconcile)?;
-                    settlement = state
+                    settlement = context
                         .kernel_session_v2
                         .submit_operation(
                             &active.session_id,
@@ -2473,38 +3305,54 @@ async fn drive_agent_kernel_run_v2(
                         .map_err(AgentKernelV2Error::from_storage)?;
                     continue;
                 }
-                mark_agent_run_v2(
-                    state,
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "waiting",
                     Some("Waiting for exact Plan confirmation.".to_string()),
                     None,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
             "awaitingUserScopeDecision" => {
-                mark_agent_run_v2(
-                    state,
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "waiting",
                     Some("Waiting for an exact capability scope decision.".to_string()),
                     None,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
             "awaitingKernelWake" => {
-                mark_agent_run_v2(
-                    state,
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "waiting",
                     Some("Waiting for a canonical Kernel wake fact.".to_string()),
                     None,
                 );
-                return Ok(());
+                let observed_high_water = success_response_v2(&settlement)?
+                    .pointer("/state/factsRunSequenceHighWater")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        AgentKernelV2Error::invalid(
+                            "session_kernel_facts_high_water_missing",
+                            "Kernel wake continuation has no exact facts run-sequence high-water.",
+                        )
+                    })?;
+                kernel_wait_operation_v2(&settlement, observed_high_water)?;
+                return Ok(AgentKernelDriveBoundaryV2::KernelWait(
+                    AgentKernelFactWaitV2 {
+                        active: active.clone(),
+                        predecessor: settlement,
+                        observed_high_water,
+                    },
+                ));
             }
             "manualRecoveryRequired" | "recoveryRequired" | "providerBudgetExhausted" => {
-                mark_agent_run_v2(
-                    state,
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "waiting",
                     Some(format!(
@@ -2512,17 +3360,17 @@ async fn drive_agent_kernel_run_v2(
                     )),
                     None,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
             "providerTurnSuperseded" | "userInputSuperseded" => {
-                mark_agent_run_v2(
-                    state,
+                mark_agent_drive_v2(
+                    context,
                     &active.host_run_id,
                     "waiting",
                     Some("The previous provider turn was superseded by newer input.".to_string()),
                     None,
                 );
-                return Ok(());
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
             _ => {
                 return Err(AgentKernelV2Error::invalid(
@@ -2532,8 +3380,8 @@ async fn drive_agent_kernel_run_v2(
             }
         };
         let request_id = next_operation_request_id_v2(&settlement, &operation)?;
-        mark_agent_run_v2(
-            state,
+        mark_agent_drive_v2(
+            context,
             &active.host_run_id,
             "running",
             Some(format!(
@@ -2541,7 +3389,7 @@ async fn drive_agent_kernel_run_v2(
             )),
             None,
         );
-        settlement = state
+        settlement = context
             .kernel_session_v2
             .submit_operation(
                 &active.session_id,
@@ -2552,8 +3400,8 @@ async fn drive_agent_kernel_run_v2(
             .await
             .map_err(AgentKernelV2Error::from_storage)?;
     }
-    mark_agent_run_v2(
-        state,
+    mark_agent_drive_v2(
+        context,
         &active.host_run_id,
         "waiting",
         Some("Automatic Session continuation budget exhausted.".to_string()),
@@ -2563,6 +3411,700 @@ async fn drive_agent_kernel_run_v2(
         "session_kernel_automatic_step_budget_exhausted",
         "Automatic Kernel–Session v2 continuation exceeded its bounded Host budget.",
     ))
+}
+
+async fn register_owned_agent_kernel_wait_v2(
+    state: &AppState,
+    context: AgentKernelDriveContextV2,
+    wait: AgentKernelFactWaitV2,
+) -> Result<(), AgentKernelV2Error> {
+    let owner = host_kernel_wake_owner_v2(&wait)?;
+    let owner_for_drive = owner.clone();
+    let supervisor = state.kernel_wake_v2.clone();
+    let supervisor_for_drive = supervisor.clone();
+    let failure_context = context.clone();
+    let failure_active = wait.active.clone();
+    let outcome = supervisor
+        .register_exclusive(owner, async move {
+            if let Err(error) = drive_owned_agent_kernel_wait_v2(
+                &context,
+                &supervisor_for_drive,
+                owner_for_drive,
+                wait,
+            )
+            .await
+            {
+                handle_owned_drive_error_v2(&failure_context, &failure_active, &error).await;
+            }
+        })
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+    match outcome {
+        HostKernelWakeRegisterOutcomeV2::Registered
+        | HostKernelWakeRegisterOutcomeV2::AlreadyExact => Ok(()),
+        HostKernelWakeRegisterOutcomeV2::OwnerConflict => Err(AgentKernelV2Error::invalid(
+            "host_kernel_wake_owner_conflict",
+            "A different exact owner is already driving this Run.",
+        )),
+    }
+}
+
+async fn drive_owned_agent_kernel_wait_v2(
+    context: &AgentKernelDriveContextV2,
+    supervisor: &crate::host_kernel_wake_v2::HostKernelWakeSupervisorV2,
+    mut owner: HostKernelWakeOwnerV2,
+    mut wait: AgentKernelFactWaitV2,
+) -> Result<(), AgentKernelV2Error> {
+    loop {
+        if !wait_for_kernel_fact_advance_v2(
+            context,
+            &wait.active,
+            &wait.predecessor,
+            wait.observed_high_water,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let operation = kernel_wait_operation_v2(&wait.predecessor, wait.observed_high_water)?;
+        let request_id = next_operation_request_id_v2(&wait.predecessor, &operation)?;
+        let dispatch_context = context.clone();
+        let dispatch_host_run_id = wait.active.host_run_id.clone();
+        let settlement = context
+            .kernel_session_v2
+            .submit_operation_if_latest_settlement(
+                &wait.active.session_id,
+                &wait.active.host_run_id,
+                &request_id,
+                operation,
+                &wait.active.run_id,
+                &wait.active.bootstrap_digest,
+                &wait.predecessor.settlement_digest,
+                move || {
+                    mark_agent_drive_v2(
+                        &dispatch_context,
+                        &dispatch_host_run_id,
+                        "running",
+                        Some(
+                            "Canonical Kernel facts resumed the owned Session continuation."
+                                .to_string(),
+                        ),
+                        None,
+                    );
+                },
+            )
+            .await
+            .map_err(AgentKernelV2Error::from_storage)?;
+        let Some(settlement) = settlement else {
+            return Ok(());
+        };
+        match drive_agent_kernel_until_boundary_v2(context, &wait.active, settlement).await? {
+            AgentKernelDriveBoundaryV2::Complete => return Ok(()),
+            AgentKernelDriveBoundaryV2::KernelWait(next_wait) => {
+                let next_owner = host_kernel_wake_owner_v2(&next_wait)?;
+                match supervisor
+                    .retag_exact(owner.clone(), next_owner.clone())
+                    .await
+                    .map_err(AgentKernelV2Error::from_wake_supervisor)?
+                {
+                    HostKernelWakeRetagOutcomeV2::Retagged => {
+                        owner = next_owner;
+                        wait = next_wait;
+                    }
+                    HostKernelWakeRetagOutcomeV2::Missing
+                    | HostKernelWakeRetagOutcomeV2::OwnerConflict
+                    | HostKernelWakeRetagOutcomeV2::ReplacementKeyMismatch => {
+                        return Err(AgentKernelV2Error::invalid(
+                            "host_kernel_wake_owner_retag_conflict",
+                            "Kernel facts continuation lost its exact wake owner during handoff.",
+                        ))
+                    }
+                }
+            }
+            AgentKernelDriveBoundaryV2::Failure { .. } => return Ok(()),
+        }
+    }
+}
+
+fn kernel_wait_operation_v2(
+    predecessor: &HostKernelOperationSettlementReceiptV2,
+    observed_high_water: u64,
+) -> Result<HostKernelBridgeOperationV2, AgentKernelV2Error> {
+    match continuation_kind_v2(predecessor) {
+        Some("awaitingKernelFacts") => {
+            if continuation_u64_field_v2(predecessor, "observedHighWater")? != observed_high_water {
+                return Err(AgentKernelV2Error::invalid(
+                    "session_kernel_facts_high_water_conflict",
+                    "Kernel facts wait identity changed before owned continuation registration.",
+                ));
+            }
+            Ok(HostKernelBridgeOperationV2::ReconcileFacts {
+                observed_high_water,
+            })
+        }
+        Some("awaitingKernelWake") => {
+            let wait_kind = match continuation_field_v2(predecessor, "waitKind") {
+                Some("capabilityDecisionFact") => HostKernelWaitKindV2::Capability,
+                Some("invocation") => HostKernelWaitKindV2::Invocation,
+                _ => {
+                    return Err(AgentKernelV2Error::invalid(
+                        "session_kernel_wake_kind_invalid",
+                        "Session returned an unsupported exact wake continuation.",
+                    ))
+                }
+            };
+            Ok(HostKernelBridgeOperationV2::ReconcileWake {
+                wait_kind,
+                operation_id: required_continuation_field_v2(predecessor, "operationId")?
+                    .to_string(),
+                invocation_id: required_continuation_field_v2(predecessor, "invocationId")?
+                    .to_string(),
+                preview_id: continuation_field_v2(predecessor, "previewId").map(str::to_string),
+                plan_action_id: continuation_field_v2(predecessor, "planActionId")
+                    .map(str::to_string),
+                expected_plan_revision: continuation_field_v2(predecessor, "expectedPlanRevision")
+                    .map(str::to_string),
+                guidance: Vec::new(),
+            })
+        }
+        _ => Err(AgentKernelV2Error::invalid(
+            "session_kernel_wake_continuation_invalid",
+            "Owned Kernel wake registration requires an exact Kernel wait continuation.",
+        )),
+    }
+}
+
+fn host_kernel_wake_owner_v2(
+    wait: &AgentKernelFactWaitV2,
+) -> Result<HostKernelWakeOwnerV2, AgentKernelV2Error> {
+    let key = HostKernelWakeKeyV2 {
+        session_id: wait.active.session_id.clone(),
+        host_run_id: wait.active.host_run_id.clone(),
+        run_id: wait.active.run_id.clone(),
+    };
+    let identity_digest = canonical_sha256(&json!({
+        "schemaVersion": "deepcode.host.kernel-wake-owner.v2",
+        "sessionId": key.session_id,
+        "hostRunId": key.host_run_id,
+        "runId": key.run_id,
+        "bootstrapDigest": wait.active.bootstrap_digest,
+        "predecessorSettlementDigest": wait.predecessor.settlement_digest,
+        "observedHighWater": wait.observed_high_water,
+    }))
+    .map_err(AgentKernelV2Error::from_storage)?;
+    Ok(HostKernelWakeOwnerV2 {
+        key,
+        identity_digest,
+    })
+}
+
+fn host_kernel_initial_drive_owner_v2(
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+    operation_request_id: &str,
+) -> Result<HostKernelWakeOwnerV2, AgentKernelV2Error> {
+    if binding.session_id != active.session_id
+        || caller_binding_string_v2(binding, "hostRunId")? != active.host_run_id
+        || binding.request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_kernel_initial_drive_identity_conflict",
+            "Initial Run drive owner does not match its exact durable caller and Run identity.",
+        ));
+    }
+    let key = HostKernelWakeKeyV2 {
+        session_id: active.session_id.clone(),
+        host_run_id: active.host_run_id.clone(),
+        run_id: active.run_id.clone(),
+    };
+    let identity_digest = canonical_sha256(&json!({
+        "schemaVersion": "deepcode.host.kernel-initial-drive-owner.v2",
+        "sessionId": key.session_id,
+        "hostRunId": key.host_run_id,
+        "runId": key.run_id,
+        "bootstrapDigest": active.bootstrap_digest,
+        "callerRequestId": binding.caller_request_id,
+        "callerRequestDigest": binding.request_digest,
+        "operationRequestId": operation_request_id,
+    }))
+    .map_err(AgentKernelV2Error::from_storage)?;
+    Ok(HostKernelWakeOwnerV2 {
+        key,
+        identity_digest,
+    })
+}
+
+fn host_kernel_caller_drive_owner_v2(
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<HostKernelWakeOwnerV2, AgentKernelV2Error> {
+    if binding.session_id != active.session_id
+        || caller_binding_string_v2(binding, "hostRunId")? != active.host_run_id
+        || caller_binding_string_v2(binding, "runId")? != active.run_id
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_kernel_caller_drive_identity_conflict",
+            "Caller drive owner does not match its exact durable caller and Run identity.",
+        ));
+    }
+    let operation_request_id = caller_binding_string_v2(binding, "operationRequestId")?;
+    let predecessor_settlement_digest =
+        caller_binding_string_v2(binding, "predecessorSettlementDigest")?;
+    let key = HostKernelWakeKeyV2 {
+        session_id: active.session_id.clone(),
+        host_run_id: active.host_run_id.clone(),
+        run_id: active.run_id.clone(),
+    };
+    let identity_digest = canonical_sha256(&json!({
+        "schemaVersion": "deepcode.host.kernel-caller-drive-owner.v2",
+        "sessionId": key.session_id,
+        "hostRunId": key.host_run_id,
+        "runId": key.run_id,
+        "bootstrapDigest": active.bootstrap_digest,
+        "callerRequestId": binding.caller_request_id,
+        "requestKind": binding.request_kind,
+        "callerRequestDigest": binding.request_digest,
+        "operationRequestId": operation_request_id,
+        "predecessorSettlementDigest": predecessor_settlement_digest,
+    }))
+    .map_err(AgentKernelV2Error::from_storage)?;
+    if let Some(admission) = binding.admission.as_ref() {
+        if admission.get("ownerDigest").and_then(Value::as_str) != Some(identity_digest.as_str()) {
+            return Err(AgentKernelV2Error::invalid(
+                "host_caller_request_admission_owner_conflict",
+                "Durable caller admission is bound to a different exact wake owner.",
+            ));
+        }
+    }
+    Ok(HostKernelWakeOwnerV2 {
+        key,
+        identity_digest,
+    })
+}
+
+fn current_kernel_wait_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+) -> Result<Option<(HostKernelWakeOwnerV2, AgentKernelFactWaitV2)>, AgentKernelV2Error> {
+    let predecessor = latest_settlement_v2(state, active)?;
+    if !matches!(
+        predecessor.settlement,
+        HostKernelOperationSettlementV2::Succeeded { .. }
+    ) {
+        return Ok(None);
+    }
+    let observed_high_water = match continuation_kind_v2(&predecessor) {
+        Some("awaitingKernelFacts") => {
+            continuation_u64_field_v2(&predecessor, "observedHighWater")?
+        }
+        Some("awaitingKernelWake") => success_response_v2(&predecessor)?
+            .pointer("/state/factsRunSequenceHighWater")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "session_kernel_facts_high_water_missing",
+                    "Current Kernel wake has no exact facts run-sequence high-water.",
+                )
+            })?,
+        _ => return Ok(None),
+    };
+    let wait = AgentKernelFactWaitV2 {
+        active: active.clone(),
+        predecessor,
+        observed_high_water,
+    };
+    kernel_wait_operation_v2(&wait.predecessor, wait.observed_high_water)?;
+    let owner = host_kernel_wake_owner_v2(&wait)?;
+    Ok(Some((owner, wait)))
+}
+
+fn latest_drive_settlement_v2(
+    context: &AgentKernelDriveContextV2,
+    active: &HostActiveRunRecordV2,
+) -> Result<HostKernelOperationSettlementReceiptV2, AgentKernelV2Error> {
+    context
+        .host_services
+        .kernel_operations_v2
+        .latest_settlement(&active.session_id, &active.host_run_id)
+        .map_err(AgentKernelV2Error::from_storage)?
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_kernel_settlement_missing",
+                "Active Kernel–Session v2 Run has no durable Session settlement.",
+            )
+        })
+}
+
+async fn wait_for_kernel_fact_advance_v2(
+    context: &AgentKernelDriveContextV2,
+    active: &HostActiveRunRecordV2,
+    predecessor: &HostKernelOperationSettlementReceiptV2,
+    observed_high_water: u64,
+) -> Result<bool, AgentKernelV2Error> {
+    let run_id = RunId::new(active.run_id.clone()).map_err(|_| {
+        AgentKernelV2Error::invalid(
+            "host_kernel_run_id_invalid",
+            "Durable active Host Run contains an invalid Kernel Run identity.",
+        )
+    })?;
+    loop {
+        let current = context
+            .host_services
+            .active_runs_v2
+            .resolve_session_active_run(&active.session_id)
+            .map_err(AgentKernelV2Error::from_storage)?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if current.host_run_id != active.host_run_id
+            || current.run_id != active.run_id
+            || current.bootstrap_digest != active.bootstrap_digest
+        {
+            return Ok(false);
+        }
+        if latest_drive_settlement_v2(context, &current)?.settlement_digest
+            != predecessor.settlement_digest
+        {
+            return Ok(false);
+        }
+        let kernel_high_water = context
+            .kernel_v2
+            .service()
+            .run_sequence_high_water(&run_id)
+            .map_err(|_| {
+                AgentKernelV2Error::invalid(
+                    "host_kernel_facts_high_water_unavailable",
+                    "Kernel facts high-water is unavailable for the active Run.",
+                )
+            })?;
+        if kernel_high_water < observed_high_water {
+            return Err(AgentKernelV2Error::invalid(
+                "host_kernel_facts_high_water_regressed",
+                "Kernel facts high-water regressed below the Session observation.",
+            ));
+        }
+        if kernel_high_water > observed_high_water {
+            return Ok(true);
+        }
+        tokio::time::sleep(KERNEL_FACT_WAKE_POLL_INTERVAL_V2).await;
+    }
+}
+
+pub(crate) async fn restore_agent_kernel_caller_owners_v2(
+    state: &AppState,
+    recoverable_session_ids: &HashSet<String>,
+) -> Result<HashSet<HostKernelWakeKeyV2>, AgentKernelV2Error> {
+    let mut blocked_runs = HashSet::new();
+    let stranded_run_open_callers = state
+        .host_services
+        .kernel_operations_v2
+        .unadmitted_driving_run_open_callers(recoverable_session_ids)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    for binding in stranded_run_open_callers {
+        let error = AgentKernelV2Error::invalid(
+            "host_run_open_admission_indeterminate",
+            "Daemon restart found a RunOpen caller after execution ownership began but before durable caller admission.",
+        );
+        settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+    }
+    let active_runs = state
+        .host_services
+        .active_runs_v2
+        .active_run_records()
+        .map_err(AgentKernelV2Error::from_storage)?;
+    for active in active_runs {
+        let key = HostKernelWakeKeyV2 {
+            session_id: active.session_id.clone(),
+            host_run_id: active.host_run_id.clone(),
+            run_id: active.run_id.clone(),
+        };
+        let drive = state
+            .host_services
+            .kernel_operations_v2
+            .caller_drive_recovery_for_run(&active.session_id, &active.host_run_id)
+            .map_err(AgentKernelV2Error::from_storage)?;
+        let binding = match drive {
+            HostRunCallerDriveRecoveryV2::NoDrive => continue,
+            HostRunCallerDriveRecoveryV2::Unadmitted(binding) => {
+                let error = AgentKernelV2Error::invalid(
+                    "host_caller_request_admission_incomplete",
+                    "Daemon restart found a caller drive that never obtained durable admission.",
+                );
+                if binding.request_kind == HOST_RUN_OPEN_REQUEST_KIND_V2 {
+                    settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+                    mark_agent_run_v2(
+                        state,
+                        &active.host_run_id,
+                        "waiting",
+                        Some(
+                            "RunOpen crossed a durable execution boundary before caller admission; the exact Run is retained for explicit recovery."
+                                .to_string(),
+                        ),
+                        None,
+                    );
+                    blocked_runs.insert(key);
+                } else if matches!(
+                    binding.request_kind.as_str(),
+                    HOST_DECISION_REQUEST_KIND_V2 | HOST_USER_INPUT_REQUEST_KIND_V2
+                ) {
+                    abandon_unadmitted_caller_v2(state, &binding, &error)?;
+                    mark_agent_run_v2(
+                        state,
+                        &active.host_run_id,
+                        "waiting",
+                        Some(
+                            "An unadmitted zero-effect caller was closed; a new request may continue the Run."
+                                .to_string(),
+                        ),
+                        None,
+                    );
+                } else {
+                    settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+                    mark_agent_run_v2(
+                        state,
+                        &active.host_run_id,
+                        "waiting",
+                        Some(
+                            "An unsupported unadmitted caller is retained for explicit recovery."
+                                .to_string(),
+                        ),
+                        None,
+                    );
+                    blocked_runs.insert(key);
+                }
+                continue;
+            }
+            HostRunCallerDriveRecoveryV2::Indeterminate(binding) => {
+                restore_caller_run_admission_v2(&binding)?;
+                ensure_agent_run_cache_v2(state, &active)?;
+                mark_agent_run_v2(
+                    state,
+                    &active.host_run_id,
+                    "waiting",
+                    Some(
+                        "An indeterminate caller drive is held for explicit manual recovery."
+                            .to_string(),
+                    ),
+                    None,
+                );
+                blocked_runs.insert(key);
+                continue;
+            }
+            HostRunCallerDriveRecoveryV2::Admitted(binding) => binding,
+        };
+        restore_caller_run_admission_v2(&binding)?;
+        ensure_agent_run_cache_v2(state, &active)?;
+        let evidence = state
+            .host_services
+            .kernel_operations_v2
+            .caller_request_recovery_evidence(
+                &binding.session_id,
+                &binding.caller_request_id,
+                &binding.request_kind,
+                &binding.request_digest,
+            )
+            .map_err(AgentKernelV2Error::from_storage)?;
+        if evidence.first_operation_pending {
+            let error = AgentKernelV2Error::invalid(
+                "host_caller_request_indeterminate",
+                "Daemon restart found an admitted caller with an unresolved Session dispatch; automatic replay is unsafe.",
+            );
+            settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+            mark_agent_run_v2(
+                state,
+                &active.host_run_id,
+                "waiting",
+                Some(error.message),
+                None,
+            );
+            blocked_runs.insert(key);
+            continue;
+        }
+        let action = match binding.request_kind.as_str() {
+            HOST_DECISION_REQUEST_KIND_V2 => {
+                RecoveredCallerDriveActionV2::Decision(decode_prepared_agent_decision_v2(&binding)?)
+            }
+            HOST_USER_INPUT_REQUEST_KIND_V2 => RecoveredCallerDriveActionV2::UserInput {
+                input: durable_user_input_from_binding_v2(&binding)?,
+                operation_request_id: caller_binding_string_v2(&binding, "operationRequestId")?,
+            },
+            _ => {
+                let error = AgentKernelV2Error::invalid(
+                    "host_caller_request_kind_conflict",
+                    "Startup caller recovery found an unsupported ordinary request kind.",
+                );
+                settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+                blocked_runs.insert(key);
+                continue;
+            }
+        };
+        if let RecoveredCallerDriveActionV2::UserInput { input, .. } = &action {
+            validate_active_run_attachment_binding_v2(state, &active, &input.attachments)?;
+        }
+        let reclaimed = state
+            .host_services
+            .kernel_operations_v2
+            .reclaim_admitted_caller_request_drive(
+                &binding,
+                &state.host_services.active_runs_v2.owner_instance_id(),
+                &crate::utils::now_rfc3339_text(),
+            )
+            .map_err(AgentKernelV2Error::from_storage)?;
+        let owner = host_kernel_caller_drive_owner_v2(&active, &reclaimed)?;
+        let owner_for_drive = owner.clone();
+        let background_state = state.clone();
+        let background_active = active.clone();
+        let outcome = state
+            .kernel_wake_v2
+            .register_exclusive(owner, async move {
+                let result = match action {
+                    RecoveredCallerDriveActionV2::Decision(prepared) => {
+                        execute_prepared_agent_decision_v2(
+                            &background_state,
+                            &background_active,
+                            &reclaimed,
+                            prepared,
+                        )
+                        .await
+                    }
+                    RecoveredCallerDriveActionV2::UserInput {
+                        input,
+                        operation_request_id,
+                    } => {
+                        execute_bound_user_input_v2(
+                            &background_state,
+                            &background_active,
+                            input,
+                            &operation_request_id,
+                        )
+                        .await
+                    }
+                };
+                finish_owned_caller_drive_v2(
+                    &background_state,
+                    &background_active,
+                    &reclaimed,
+                    owner_for_drive,
+                    result,
+                )
+                .await;
+            })
+            .await
+            .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+        if outcome != HostKernelWakeRegisterOutcomeV2::Registered {
+            return Err(AgentKernelV2Error::invalid(
+                "host_kernel_caller_restore_owner_conflict",
+                "Startup could not restore the exact admitted caller owner.",
+            ));
+        }
+        blocked_runs.insert(key);
+    }
+    Ok(blocked_runs)
+}
+
+pub(crate) async fn restore_agent_kernel_wait_owners_v2(
+    state: &AppState,
+    runs: &[HostKernelStartupContinuationRunV2],
+    caller_owned_runs: &HashSet<HostKernelWakeKeyV2>,
+) -> Result<(), AgentKernelV2Error> {
+    for run in runs {
+        let Some(active) = state
+            .host_services
+            .active_runs_v2
+            .resolve_session_active_run(&run.session_id)
+            .map_err(AgentKernelV2Error::from_storage)?
+        else {
+            continue;
+        };
+        if active.host_run_id != run.host_run_id
+            || active.run_id != run.run_id
+            || active.bootstrap_digest != run.bootstrap_digest
+        {
+            continue;
+        }
+        let key = HostKernelWakeKeyV2 {
+            session_id: active.session_id.clone(),
+            host_run_id: active.host_run_id.clone(),
+            run_id: active.run_id.clone(),
+        };
+        if caller_owned_runs.contains(&key)
+            || !matches!(
+                state
+                    .host_services
+                    .kernel_operations_v2
+                    .caller_drive_recovery_for_run(&active.session_id, &active.host_run_id)
+                    .map_err(AgentKernelV2Error::from_storage)?,
+                HostRunCallerDriveRecoveryV2::NoDrive
+            )
+        {
+            continue;
+        }
+        ensure_agent_run_cache_v2(state, &active)?;
+        let predecessor = latest_settlement_v2(state, &active)?;
+        if !matches!(
+            predecessor.settlement,
+            HostKernelOperationSettlementV2::Succeeded { .. }
+        ) {
+            continue;
+        }
+        let observed_high_water = match continuation_kind_v2(&predecessor) {
+            Some("awaitingKernelFacts") => {
+                continuation_u64_field_v2(&predecessor, "observedHighWater")?
+            }
+            Some("awaitingKernelWake") => success_response_v2(&predecessor)?
+                .pointer("/state/factsRunSequenceHighWater")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    AgentKernelV2Error::invalid(
+                        "session_kernel_facts_high_water_missing",
+                        "Recovered Kernel wake has no exact facts run-sequence high-water.",
+                    )
+                })?,
+            _ => continue,
+        };
+        kernel_wait_operation_v2(&predecessor, observed_high_water)?;
+        register_owned_agent_kernel_wait_v2(
+            state,
+            AgentKernelDriveContextV2::from_state(state),
+            AgentKernelFactWaitV2 {
+                active,
+                predecessor,
+                observed_high_water,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn cancel_owned_agent_kernel_wait_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+) -> Result<bool, AgentKernelV2Error> {
+    cancel_owned_agent_kernel_wait_identity_v2(
+        state,
+        &active.session_id,
+        &active.host_run_id,
+        &active.run_id,
+    )
+    .await
+}
+
+async fn cancel_owned_agent_kernel_wait_identity_v2(
+    state: &AppState,
+    session_id: &str,
+    host_run_id: &str,
+    run_id: &str,
+) -> Result<bool, AgentKernelV2Error> {
+    state
+        .kernel_wake_v2
+        .cancel_exact(HostKernelWakeKeyV2 {
+            session_id: session_id.to_string(),
+            host_run_id: host_run_id.to_string(),
+            run_id: run_id.to_string(),
+        })
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)
 }
 
 fn require_active_agent_kernel_run_v2(
@@ -2623,13 +4165,13 @@ fn success_response_v2(
 ) -> Result<&Value, AgentKernelV2Error> {
     match &settlement.settlement {
         HostKernelOperationSettlementV2::Succeeded { response, .. } => Ok(response),
-        HostKernelOperationSettlementV2::FailedRecoverable { error_code } => {
+        HostKernelOperationSettlementV2::FailedRecoverable { error_code, .. } => {
             Err(AgentKernelV2Error::invalid(
                 "session_kernel_operation_recovery_required",
                 format!("Session operation requires recovery: {error_code}"),
             ))
         }
-        HostKernelOperationSettlementV2::FailedTerminal { error_code } => {
+        HostKernelOperationSettlementV2::FailedTerminal { error_code, .. } => {
             Err(AgentKernelV2Error::invalid(
                 "session_kernel_operation_failed",
                 format!("Session operation failed terminally: {error_code}"),
@@ -2685,6 +4227,51 @@ fn continuation_u64_field_v2(
                 format!("Session continuation is missing numeric {field}."),
             )
         })
+}
+
+fn required_continuation_work_authority_v2(
+    settlement: &HostKernelOperationSettlementReceiptV2,
+    field: &str,
+) -> Result<SessionWorkAuthorityV3, AgentKernelV2Error> {
+    let value = continuation_v2(settlement)
+        .and_then(|continuation| continuation.get(field))
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_kernel_continuation_invalid",
+                format!("Session continuation is missing {field}."),
+            )
+        })?;
+    decode_session_work_authority_v3(value).map_err(|error| {
+        AgentKernelV2Error::invalid(
+            "session_kernel_continuation_invalid",
+            format!(
+                "Session continuation has invalid {field}: {}",
+                error.message
+            ),
+        )
+    })
+}
+
+fn validate_final_answer_continuation_binding_v2(
+    settlement: &HostKernelOperationSettlementReceiptV2,
+) -> Result<(), AgentKernelV2Error> {
+    required_continuation_field_v2(settlement, "inputId")?;
+    let control_epoch = continuation_u64_field_v2(settlement, "controlEpoch")?;
+    let review_revision = continuation_u64_field_v2(settlement, "reviewRevision")?;
+    let snapshot_high_water = continuation_u64_field_v2(settlement, "snapshotHighWater")?;
+    if control_epoch == 0
+        || control_epoch > 9_007_199_254_740_991
+        || review_revision == 0
+        || review_revision > 9_007_199_254_740_991
+        || snapshot_high_water > 9_007_199_254_740_991
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "session_kernel_continuation_invalid",
+            "Final-answer continuation has an invalid epoch, Review revision, or facts high-water.",
+        ));
+    }
+    required_continuation_work_authority_v2(settlement, "workAuthority")?;
+    Ok(())
 }
 
 fn continuation_string_array_v2(
@@ -2929,6 +4516,9 @@ async fn claim_user_input_drive_or_restore_v2(
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
         return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
     }
+    if let Some(host_run_id) = current_owned_caller_admission_v2(state, &binding).await? {
+        return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
+    }
     if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
         return recover_or_resume_driving_user_input_v2(state, &binding)
             .await
@@ -2943,13 +4533,16 @@ async fn claim_user_input_drive_or_restore_v2(
             &binding.request_kind,
             &binding.request_digest,
             &state.host_services.active_runs_v2.owner_instance_id(),
-            &now_rfc3339_utc_v2(),
+            &crate::utils::now_rfc3339_text(),
         )
         .map_err(AgentKernelV2Error::from_storage)?;
     if claim.acquired {
         return Ok(CallerDriveAdmissionV2::Acquired(claim.binding));
     }
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &claim.binding)? {
+        return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
+    }
+    if let Some(host_run_id) = current_owned_caller_admission_v2(state, &claim.binding).await? {
         return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
     }
     recover_or_resume_driving_user_input_v2(state, &claim.binding)
@@ -2978,7 +4571,7 @@ async fn claim_cancel_drive_or_restore_v2(
             &binding.request_kind,
             &binding.request_digest,
             &state.host_services.active_runs_v2.owner_instance_id(),
-            &now_rfc3339_utc_v2(),
+            &crate::utils::now_rfc3339_text(),
         )
         .map_err(AgentKernelV2Error::from_storage)?;
     if claim.acquired {
@@ -2992,11 +4585,14 @@ async fn claim_cancel_drive_or_restore_v2(
         .map(CallerDriveAdmissionV2::Replayed)
 }
 
-fn claim_caller_drive_or_restore_v2(
+async fn claim_caller_drive_or_restore_v2(
     state: &AppState,
     binding: HostCallerRequestBindingReceiptV2,
 ) -> Result<CallerDriveAdmissionV2, AgentKernelV2Error> {
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
+        return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
+    }
+    if let Some(host_run_id) = current_owned_caller_admission_v2(state, &binding).await? {
         return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
     }
     if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
@@ -3012,13 +4608,16 @@ fn claim_caller_drive_or_restore_v2(
             &binding.request_kind,
             &binding.request_digest,
             &state.host_services.active_runs_v2.owner_instance_id(),
-            &now_rfc3339_utc_v2(),
+            &crate::utils::now_rfc3339_text(),
         )
         .map_err(AgentKernelV2Error::from_storage)?;
     if claim.acquired {
         return Ok(CallerDriveAdmissionV2::Acquired(claim.binding));
     }
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &claim.binding)? {
+        return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
+    }
+    if let Some(host_run_id) = current_owned_caller_admission_v2(state, &claim.binding).await? {
         return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
     }
     recover_driving_caller_request_v2(state, &claim.binding).map(CallerDriveAdmissionV2::Replayed)
@@ -3041,6 +4640,12 @@ async fn recover_or_resume_driving_user_input_v2(
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &evidence.binding)? {
         return Ok(host_run_id);
     }
+    if let Some(host_run_id) = current_owned_caller_admission_v2(state, &evidence.binding).await? {
+        return Ok(host_run_id);
+    }
+    if evidence.binding.admission.is_some() {
+        return recover_driving_caller_request_v2(state, &evidence.binding);
+    }
     let current_owner_instance_id = state.host_services.active_runs_v2.owner_instance_id();
     if evidence.binding.drive_owner_instance_id.as_deref()
         == Some(current_owner_instance_id.as_str())
@@ -3050,63 +4655,12 @@ async fn recover_or_resume_driving_user_input_v2(
             "The exact user-input request is still being driven by this Host instance; retry with the same callerRequestId to query its durable outcome.",
         ));
     }
-    if evidence.binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2
-        || evidence.binding.drive_state != HostCallerRequestDriveStateV2::Driving
-        || evidence.run_lifecycle != Some(HostKernelStoredRunLifecycleV2::Active)
-    {
-        return recover_driving_caller_request_v2(state, &evidence.binding);
-    }
-    let input = match durable_user_input_from_binding_v2(&evidence.binding) {
-        Ok(input) => input,
-        Err(_) => return recover_driving_caller_request_v2(state, &evidence.binding),
-    };
-    let host_run_id = caller_binding_string_v2(&evidence.binding, "hostRunId")?;
-    let run_id = caller_binding_string_v2(&evidence.binding, "runId")?;
-    let operation_request_id =
-        match caller_binding_string_v2(&evidence.binding, "operationRequestId") {
-            Ok(operation_request_id) => operation_request_id,
-            Err(_) => return recover_driving_caller_request_v2(state, &evidence.binding),
-        };
-    let active = match require_active_agent_kernel_run_v2(
-        state,
-        &evidence.binding.session_id,
-        Some(&run_id),
-    ) {
-        Ok(active) if active.host_run_id == host_run_id && active.run_id == run_id => active,
-        Ok(_) | Err(_) => return recover_driving_caller_request_v2(state, &evidence.binding),
-    };
-    if let Err(error) =
-        validate_active_run_attachment_binding_v2(state, &active, &input.attachments)
-            .and_then(|_| ensure_agent_run_cache_v2(state, &active))
-    {
-        settle_caller_error_outcome_v2(state, &evidence.binding, &error, false)?;
-        return Err(error);
-    }
-    if evidence.first_operation_present {
-        if evidence.first_operation_pending {
-            return recover_driving_caller_request_v2(state, &evidence.binding);
-        }
-        let Some(settlement) = evidence.latest_settlement else {
-            return recover_driving_caller_request_v2(state, &evidence.binding);
-        };
-        if let Err(error) = drive_agent_kernel_run_v2(state, &active, settlement).await {
-            settle_caller_error_outcome_v2(state, &evidence.binding, &error, true)?;
-            return Err(error);
-        }
-        settle_caller_run_outcome_v2(state, &evidence.binding, &active.host_run_id)?;
-        return Ok(active.host_run_id);
-    }
-    // UserInput has no facts preflight, and submit_operation durably prepares
-    // its exact operation before dispatch. Absence here therefore proves that
-    // no Session bridge request byte was written for this caller operation.
-    drive_bound_user_input_v2(
-        state,
-        &active,
-        &evidence.binding,
-        input,
-        &operation_request_id,
-    )
-    .await
+    let error = AgentKernelV2Error::invalid(
+        "host_caller_request_admission_incomplete",
+        "A prior Host instance ended before this user input obtained durable admission; submit a new caller request.",
+    );
+    settle_caller_error_outcome_v2(state, &evidence.binding, &error, false)?;
+    Err(error)
 }
 
 async fn recover_or_resume_driving_cancel_v2(
@@ -3286,6 +4840,10 @@ async fn recover_or_resume_driving_cancel_v2(
         return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
             .await;
     }
+    if let Err(error) = cancel_owned_agent_kernel_wait_v2(state, &active).await {
+        return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
+            .await;
+    }
     if let Err(error) = state
         .kernel_session_v2
         .cancel_run_for_caller(
@@ -3332,6 +4890,21 @@ fn recover_driving_caller_request_v2(
         .map_err(AgentKernelV2Error::from_storage)?;
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &evidence.binding)? {
         return Ok(host_run_id);
+    }
+    if evidence.binding.admission.is_none()
+        && evidence.binding.drive_owner_instance_id.as_deref()
+            == Some(
+                state
+                    .host_services
+                    .active_runs_v2
+                    .owner_instance_id()
+                    .as_str(),
+            )
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_caller_request_in_progress",
+            "The exact caller request is still establishing durable admission in this Host instance.",
+        ));
     }
     match recovered_run_snapshot_v2(&evidence)? {
         Some(run) => {
@@ -3413,7 +4986,7 @@ fn recovered_run_snapshot_v2(
     ) {
         (
             Some(HostKernelStoredRunLifecycleV2::Active),
-            HostKernelOperationSettlementV2::FailedRecoverable { error_code },
+            HostKernelOperationSettlementV2::FailedRecoverable { error_code, .. },
             _,
         ) => Ok(Some(recovered_agent_run_state_v2(
             evidence,
@@ -3444,7 +5017,7 @@ fn recovered_run_snapshot_v2(
         ))),
         (
             Some(HostKernelStoredRunLifecycleV2::Retired),
-            HostKernelOperationSettlementV2::FailedTerminal { error_code },
+            HostKernelOperationSettlementV2::FailedTerminal { error_code, .. },
             _,
         ) => Ok(Some(recovered_agent_run_state_v2(
             evidence,
@@ -3456,7 +5029,7 @@ fn recovered_run_snapshot_v2(
         (
             Some(HostKernelStoredRunLifecycleV2::Retired),
             HostKernelOperationSettlementV2::Succeeded { .. },
-            Some("terminalProviderAnswer" | "terminalProviderStop" | "terminalReview"),
+            Some("terminalProviderAnswer" | "terminalProviderStop" | "terminalFinalAnswer"),
         ) => Ok(Some(recovered_agent_run_state_v2(
             evidence,
             host_run_id,
@@ -3465,6 +5038,17 @@ fn recovered_run_snapshot_v2(
             success_response_v2(latest)
                 .ok()
                 .and_then(extract_terminal_text_v2),
+        ))),
+        (
+            Some(HostKernelStoredRunLifecycleV2::Retired),
+            HostKernelOperationSettlementV2::Succeeded { .. },
+            Some("terminalFinalAnswerFailed"),
+        ) => Ok(Some(recovered_agent_run_state_v2(
+            evidence,
+            host_run_id,
+            "failed",
+            "Recovered terminal final-answer failure from durable settlement and retirement.",
+            None,
         ))),
         _ => Ok(None),
     }
@@ -3545,6 +5129,12 @@ fn recovered_agent_run_state_v2(
         .unwrap_or_else(|| evidence.binding.recorded_at.clone());
     AgentRunState {
         run_id: host_run_id,
+        kernel_run_id: evidence
+            .binding
+            .response_identity
+            .get("runId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         session_id: evidence.binding.session_id.clone(),
         profile_id: evidence.provider_profile_id.clone(),
         status: status.to_string(),
@@ -3562,6 +5152,176 @@ fn recovery_indeterminate_message_v2(evidence: &HostCallerRequestRecoveryEvidenc
         "The exact {} caller request crossed its durable drive boundary, but its bounded operation/retirement evidence cannot prove a replay-safe response.",
         evidence.binding.request_kind
     )
+}
+
+fn exact_agent_run_admission_v2(
+    state: &AppState,
+    session_id: &str,
+    host_run_id: &str,
+) -> Result<AgentKernelRunAdmissionV2, AgentKernelV2Error> {
+    let kernel_run_id = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(host_run_id)
+            .filter(|run| run.session_id == session_id)
+            .and_then(|run| run.kernel_run_id.clone())
+    };
+    if let Some(kernel_run_id) = kernel_run_id {
+        return Ok(AgentKernelRunAdmissionV2 {
+            host_run_id: host_run_id.to_string(),
+            kernel_run_id,
+        });
+    }
+    let active = state
+        .host_services
+        .active_runs_v2
+        .resolve(session_id, host_run_id)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    ensure_agent_run_cache_v2(state, &active)?;
+    bind_agent_run_kernel_identity_v2(state, session_id, host_run_id, &active.run_id)?;
+    Ok(AgentKernelRunAdmissionV2 {
+        host_run_id: host_run_id.to_string(),
+        kernel_run_id: active.run_id,
+    })
+}
+
+async fn current_owned_open_admission_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<Option<AgentKernelRunAdmissionV2>, AgentKernelV2Error> {
+    let current_owner_instance_id = state.host_services.active_runs_v2.owner_instance_id();
+    if binding.request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2
+        || binding.drive_state != HostCallerRequestDriveStateV2::Driving
+        || binding.drive_owner_instance_id.as_deref() != Some(current_owner_instance_id.as_str())
+    {
+        return Ok(None);
+    }
+    let host_run_id = caller_binding_string_v2(binding, "hostRunId")?;
+    let Some(active) = state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(&binding.session_id)
+        .map_err(AgentKernelV2Error::from_storage)?
+    else {
+        return Ok(None);
+    };
+    if active.host_run_id != host_run_id {
+        return Ok(None);
+    }
+    state
+        .host_services
+        .kernel_operations_v2
+        .live_run_has_supported_history_schema(&binding.session_id, &host_run_id)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let operation_request_id = caller_binding_string_v2(binding, "operationRequestId")?;
+    let owner = host_kernel_initial_drive_owner_v2(&active, binding, &operation_request_id)?;
+    if !state
+        .kernel_wake_v2
+        .owns_exact(owner)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?
+    {
+        return Ok(None);
+    }
+    ensure_agent_run_cache_v2(state, &active)?;
+    bind_agent_run_kernel_identity_v2(state, &binding.session_id, &host_run_id, &active.run_id)?;
+    Ok(Some(AgentKernelRunAdmissionV2 {
+        host_run_id,
+        kernel_run_id: active.run_id,
+    }))
+}
+
+async fn current_owned_caller_admission_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<Option<String>, AgentKernelV2Error> {
+    let Some(host_run_id) = restore_caller_run_admission_v2(binding)? else {
+        return Ok(None);
+    };
+    if !matches!(
+        binding.request_kind.as_str(),
+        HOST_DECISION_REQUEST_KIND_V2 | HOST_USER_INPUT_REQUEST_KIND_V2
+    ) {
+        return Ok(None);
+    }
+    let current_owner_instance_id = state.host_services.active_runs_v2.owner_instance_id();
+    if binding.drive_state != HostCallerRequestDriveStateV2::Driving
+        || binding.drive_owner_instance_id.as_deref() != Some(current_owner_instance_id.as_str())
+    {
+        return Ok(None);
+    }
+    let Some(active) = state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(&binding.session_id)
+        .map_err(AgentKernelV2Error::from_storage)?
+    else {
+        return Ok(None);
+    };
+    if active.host_run_id != host_run_id
+        || active.run_id != caller_binding_string_v2(binding, "runId")?
+    {
+        return Ok(None);
+    }
+    state
+        .host_services
+        .kernel_operations_v2
+        .live_run_has_supported_history_schema(&binding.session_id, &host_run_id)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let owner = host_kernel_caller_drive_owner_v2(&active, binding)?;
+    if !state
+        .kernel_wake_v2
+        .owns_exact(owner)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?
+    {
+        return Ok(None);
+    }
+    ensure_agent_run_cache_v2(state, &active)?;
+    Ok(Some(host_run_id))
+}
+
+fn restore_caller_run_admission_v2(
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<Option<String>, AgentKernelV2Error> {
+    let Some(admission) = binding.admission.as_ref() else {
+        return Ok(None);
+    };
+    if admission.get("schemaVersion").and_then(Value::as_str)
+        != Some(HOST_CALLER_RUN_ADMISSION_SCHEMA_V2)
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_caller_request_admission_invalid",
+            "Durable Host caller request has an unsupported admission schema.",
+        ));
+    }
+    let required = |field: &'static str| {
+        admission
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "host_caller_request_admission_invalid",
+                    format!("Durable Host caller admission is missing exact {field}."),
+                )
+            })
+    };
+    let host_run_id = required("hostRunId")?;
+    required("ownerDigest")?;
+    if required("sessionId")? != binding.session_id
+        || host_run_id != caller_binding_string_v2(binding, "hostRunId")?
+        || required("runId")? != caller_binding_string_v2(binding, "runId")?
+        || required("callerRequestId")? != binding.caller_request_id
+        || required("requestDigest")? != binding.request_digest
+        || binding.admission_digest.is_none()
+        || binding.admitted_at.is_none()
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_caller_request_admission_conflict",
+            "Durable Host caller admission does not match its immutable request identity.",
+        ));
+    }
+    Ok(Some(host_run_id.to_string()))
 }
 
 fn restore_caller_run_outcome_v2(
@@ -3748,29 +5508,22 @@ fn settle_caller_run_snapshot_v2(
     let caller_caused_retirement = evidence.retirement_caller_request_id.as_deref()
         == Some(binding.caller_request_id.as_str())
         && evidence.retirement_request_digest.as_deref() == Some(binding.request_digest.as_str());
-    state
-        .host_services
-        .kernel_operations_v2
-        .settle_caller_request(
-            &binding.session_id,
-            &binding.caller_request_id,
-            &binding.request_kind,
-            &binding.request_digest,
-            json!({
-                "schemaVersion": HOST_CALLER_RUN_OUTCOME_SCHEMA_V2,
-                "disposition": "succeeded",
-                "hostRunId": host_run_id,
-                "run": run,
-                "causation": {
-                    "firstOperation": first_operation,
-                    "terminalOperation": terminal_operation,
-                    "callerCausedRetirement": caller_caused_retirement,
-                    "retiredAt": evidence.retired_at,
-                },
-            }),
-            now_rfc3339_utc_v2(),
-        )
-        .map_err(AgentKernelV2Error::from_storage)?;
+    persist_caller_outcome_v2(
+        state,
+        binding,
+        json!({
+            "schemaVersion": HOST_CALLER_RUN_OUTCOME_SCHEMA_V2,
+            "disposition": "succeeded",
+            "hostRunId": host_run_id,
+            "run": run,
+            "causation": {
+                "firstOperation": first_operation,
+                "terminalOperation": terminal_operation,
+                "callerCausedRetirement": caller_caused_retirement,
+                "retiredAt": evidence.retired_at,
+            },
+        }),
+    )?;
     Ok(())
 }
 
@@ -3780,26 +5533,145 @@ fn settle_caller_error_outcome_v2(
     error: &AgentKernelV2Error,
     indeterminate: bool,
 ) -> Result<(), AgentKernelV2Error> {
+    persist_caller_outcome_v2(
+        state,
+        binding,
+        json!({
+            "schemaVersion": HOST_CALLER_RUN_OUTCOME_SCHEMA_V2,
+            "disposition": if indeterminate { "indeterminate" } else { "failed" },
+            "hostRunId": caller_binding_string_v2(binding, "hostRunId")?,
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            },
+        }),
+    )?;
+    Ok(())
+}
+
+fn abandon_unadmitted_caller_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    error: &AgentKernelV2Error,
+) -> Result<(), AgentKernelV2Error> {
+    let owner_instance_id = binding.drive_owner_instance_id.as_deref().ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "host_caller_request_owner_missing",
+            "Unadmitted caller abandonment requires its exact owner instance.",
+        )
+    })?;
     state
         .host_services
         .kernel_operations_v2
-        .settle_caller_request(
+        .settle_unadmitted_owned_caller_request(
             &binding.session_id,
             &binding.caller_request_id,
             &binding.request_kind,
             &binding.request_digest,
+            owner_instance_id,
             json!({
                 "schemaVersion": HOST_CALLER_RUN_OUTCOME_SCHEMA_V2,
-                "disposition": if indeterminate { "indeterminate" } else { "failed" },
+                "disposition": "failed",
                 "hostRunId": caller_binding_string_v2(binding, "hostRunId")?,
                 "error": {
                     "code": error.code,
                     "message": error.message,
                 },
             }),
-            now_rfc3339_utc_v2(),
+            crate::utils::now_rfc3339_text(),
         )
         .map_err(AgentKernelV2Error::from_storage)?;
+    Ok(())
+}
+
+fn persist_caller_outcome_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    outcome: Value,
+) -> Result<(), AgentKernelV2Error> {
+    let store = &state.host_services.kernel_operations_v2;
+    match (
+        binding.drive_owner_instance_id.as_deref(),
+        binding.admission_digest.as_deref(),
+    ) {
+        (Some(owner_instance_id), Some(admission_digest)) => store.settle_owned_caller_request(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+            owner_instance_id,
+            admission_digest,
+            outcome,
+            crate::utils::now_rfc3339_text(),
+        ),
+        (Some(owner_instance_id), None)
+            if binding.drive_state == HostCallerRequestDriveStateV2::Driving =>
+        {
+            match outcome.get("disposition").and_then(Value::as_str) {
+                Some("indeterminate") if binding.request_kind == HOST_CANCEL_REQUEST_KIND_V2 => {
+                    store.settle_unadmitted_owned_cancel_indeterminate(
+                        &binding.session_id,
+                        &binding.caller_request_id,
+                        &binding.request_kind,
+                        &binding.request_digest,
+                        owner_instance_id,
+                        outcome,
+                        crate::utils::now_rfc3339_text(),
+                    )
+                }
+                Some("indeterminate") => store.settle_unadmitted_owned_caller_indeterminate(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                    owner_instance_id,
+                    outcome,
+                    crate::utils::now_rfc3339_text(),
+                ),
+                Some("succeeded") if binding.request_kind == HOST_CANCEL_REQUEST_KIND_V2 => store
+                    .settle_unadmitted_owned_cancel_success(
+                        &binding.session_id,
+                        &binding.caller_request_id,
+                        &binding.request_kind,
+                        &binding.request_digest,
+                        owner_instance_id,
+                        outcome,
+                        crate::utils::now_rfc3339_text(),
+                    ),
+                Some("succeeded") => store.settle_unadmitted_owned_run_open_success(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                    owner_instance_id,
+                    outcome,
+                    crate::utils::now_rfc3339_text(),
+                ),
+                Some("failed") => store.settle_unadmitted_owned_caller_request(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                    owner_instance_id,
+                    outcome,
+                    crate::utils::now_rfc3339_text(),
+                ),
+                _ => Err(crate::host_v2_storage::HostV2StorageError::invalid(
+                    "host_caller_request_outcome_disposition_invalid",
+                    "Unadmitted caller outcome has no supported disposition",
+                )),
+            }
+        }
+        _ => store.settle_caller_request(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+            outcome,
+            crate::utils::now_rfc3339_text(),
+        ),
+    }
+    .map_err(AgentKernelV2Error::from_storage)?;
     Ok(())
 }
 
@@ -3989,6 +5861,38 @@ fn cache_new_agent_run_v2(
         .insert(host_run_id.to_string(), run);
 }
 
+fn bind_agent_run_kernel_identity_v2(
+    state: &AppState,
+    session_id: &str,
+    host_run_id: &str,
+    kernel_run_id: &str,
+) -> Result<(), AgentKernelV2Error> {
+    let mut runs = state.session_runs.lock().expect("session run state lock");
+    let run = runs.get_mut(host_run_id).ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "agent_run_cache_missing",
+            "Host Run cache disappeared before its Kernel Run identity was bound.",
+        )
+    })?;
+    if run.session_id != session_id {
+        return Err(AgentKernelV2Error::invalid(
+            "agent_run_session_identity_conflict",
+            "Host Run cache belongs to another Session.",
+        ));
+    }
+    match run.kernel_run_id.as_deref() {
+        Some(existing) if existing != kernel_run_id => Err(AgentKernelV2Error::invalid(
+            "agent_run_kernel_identity_conflict",
+            "Host Run cache is already bound to another Kernel Run.",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            run.kernel_run_id = Some(kernel_run_id.to_string());
+            Ok(())
+        }
+    }
+}
+
 fn ensure_agent_run_cache_v2(
     state: &AppState,
     active: &HostActiveRunRecordV2,
@@ -4027,6 +5931,7 @@ fn ensure_agent_run_cache_v2(
         active.host_run_id.clone(),
         AgentRunState {
             run_id: active.host_run_id.clone(),
+            kernel_run_id: Some(active.run_id.clone()),
             session_id: active.session_id.clone(),
             profile_id: Some(bootstrap.provider_profile.provider_profile_id),
             status: "waiting".to_string(),
@@ -4048,7 +5953,39 @@ fn mark_agent_run_v2(
     message: Option<String>,
     final_text: Option<String>,
 ) {
-    let mut runs = state.session_runs.lock().expect("session run state lock");
+    mark_agent_run_state_v2(
+        &state.session_runs,
+        host_run_id,
+        status,
+        message,
+        final_text,
+    );
+}
+
+fn mark_agent_drive_v2(
+    context: &AgentKernelDriveContextV2,
+    host_run_id: &str,
+    status: &str,
+    message: Option<String>,
+    final_text: Option<String>,
+) {
+    mark_agent_run_state_v2(
+        &context.session_runs,
+        host_run_id,
+        status,
+        message,
+        final_text,
+    );
+}
+
+fn mark_agent_run_state_v2(
+    session_runs: &Arc<Mutex<HashMap<String, AgentRunState>>>,
+    host_run_id: &str,
+    status: &str,
+    message: Option<String>,
+    final_text: Option<String>,
+) {
+    let mut runs = session_runs.lock().expect("session run state lock");
     let Some(run) = runs.get_mut(host_run_id) else {
         return;
     };
@@ -4078,35 +6015,4 @@ fn extract_terminal_text_v2(response: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-}
-
-fn now_rfc3339_utc_v2() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    let seconds = (millis / 1_000) as i64;
-    let fractional = (millis % 1_000) as u32;
-    let days = seconds.div_euclid(86_400);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_date_from_unix_days_v2(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    let second = seconds_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fractional:03}Z")
-}
-
-fn civil_date_from_unix_days_v2(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year, month, day)
 }

@@ -5,10 +5,18 @@ import {
   decodeKernelFactProjectionV2, decodeToolContextBundleV2,
 } from '@deepcode/protocol';
 import {
+  SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
+  SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA,
+  SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
+  SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
+  SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
+  SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
+  SessionKernelAppendOnlyPersistenceV3,
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
   canonicalJson,
+  providerWireToolNameV2,
   sha256Hash,
 } from '../../dist/index.js';
 export { assert };
@@ -474,12 +482,16 @@ function createStore() {
     pendingRequests: new Map(),
     settledRequests: [],
     operationResults: new Map(),
+    providerEvidence: new Map(),
+    toolContextSnapshots: new Map(),
     projectionOutbox: [],
     projectionEvents: [],
     projectedIds: new Set(),
+    checkpointHistory: [],
     trace: [],
     requestSequence: 0,
     providerSequence: 0,
+    providerRequestCount: 0,
     clockSequence: 0,
   };
 }
@@ -491,6 +503,15 @@ export function createSessionHarness(options = {}) {
     facts: [],
     snapshotHighWater: 0,
   };
+  store.providerEvidence ??= new Map();
+  store.toolContextSnapshots ??= new Map();
+  store.operationResults ??= new Map();
+  store.checkpointHistory ??= [];
+  store.providerRequestCount ??= 0;
+  store.toolContextSnapshots.set(
+    toolContextSnapshotKey(toolContextRef(initial.toolContext)),
+    clone(initial.toolContext)
+  );
   const scripts = new Map();
   const providerOutputs = [];
   const providerInputs = [];
@@ -543,6 +564,19 @@ export function createSessionHarness(options = {}) {
   };
   const persistence = {
     loadCheckpoint: async () => clone(store.checkpoint),
+    loadProviderTurnEvidence: async (_runId, providerTurnId) =>
+      clone(store.providerEvidence.get(providerTurnId) ?? {}),
+    loadToolContextSnapshot: async (_runId, contextRef) => {
+      const snapshot = store.toolContextSnapshots.get(
+        toolContextSnapshotKey(contextRef)
+      );
+      if (!snapshot) {
+        const error = new Error('UnsupportedHistorySchema');
+        error.code = 'UnsupportedHistorySchema';
+        throw error;
+      }
+      return clone(snapshot);
+    },
     loadLatestPlan: async (runId) => clone(store.plans.get(runId)),
     loadLatestInput: async () => clone(
       store.latestInputId
@@ -596,11 +630,13 @@ export function createSessionHarness(options = {}) {
         store.pendingRequests.delete(request.lane);
       store.settledRequests.push({ request: clone(request), outcomeDigest });
       store.checkpoint = clone(checkpoint);
+      store.checkpointHistory.push(clone(checkpoint));
       store.projectionOutbox.push(...clone(projections));
     },
     async persistCheckpoint(checkpoint) {
       trace(`persistence.persistCheckpoint:${checkpoint.checkpointRevision}`);
       store.checkpoint = clone(checkpoint);
+      store.checkpointHistory.push(clone(checkpoint));
     },
     async persistOperationResult(operationRequestId, result) {
       const record = {
@@ -612,6 +648,15 @@ export function createSessionHarness(options = {}) {
         record: clone(record), result: clone(result),
       });
       return record;
+    },
+    async loadOperationResult(operationRequestId) {
+      const stored = store.operationResults.get(operationRequestId);
+      return stored
+        ? {
+            resultDigest: stored.record.resultDigest,
+            result: clone(stored.result),
+          }
+        : undefined;
     },
   };
   const projection = {
@@ -705,11 +750,23 @@ export function createSessionHarness(options = {}) {
   const provider = {
     async requestTurn(input) {
       trace(`provider.requestTurn:${input.providerTurnId}`);
+      store.providerRequestCount += 1;
       providerInputs.push(input);
       if (!providerOutputs.length) throw new Error('provider output queue is empty');
       const output = providerOutputs.shift();
       if (output instanceof Error) throw output;
-      return clone(typeof output === 'function' ? await output(input) : output);
+      const resolved = clone(
+        typeof output === 'function' ? await output(input) : output
+      );
+      store.providerEvidence.set(
+        input.providerTurnId,
+        createProviderEvidence(input, resolved, {
+          recordedAt: new Date(
+            Date.parse(NOW) + store.clockSequence++
+          ).toISOString(),
+        })
+      );
+      return resolved;
     },
   };
   const harness = {
@@ -753,6 +810,10 @@ export function createSessionHarness(options = {}) {
     nextRunSequence,
     setToolContext(toolContext) {
       kernelState.toolContext = clone(toolContext);
+      store.toolContextSnapshots.set(
+        toolContextSnapshotKey(toolContextRef(toolContext)),
+        clone(toolContext)
+      );
     },
     calls: (method) => kernelCalls[method],
     traceSince: (index) => store.trace.slice(index),
@@ -930,4 +991,340 @@ export function createProviderCompletionReceipt(
       recordCount: overrides.recordCount ?? 4,
     },
   };
+}
+
+function toolContextSnapshotKey(contextRef) {
+  return canonicalJson(contextRef);
+}
+
+function createProviderEvidence(input, output, options = {}) {
+  if (!output?.completion || !Array.isArray(output.items)) return {};
+  const authorityBinding = providerAuthorityBinding(input);
+  const dispatchData = {
+    schemaVersion: SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
+    providerTurnId: input.providerTurnId,
+    purpose: input.purpose,
+    authorityBinding,
+    requestDigest: sha256Hash(canonicalJson({
+      providerTurnId: input.providerTurnId,
+      purpose: input.purpose,
+      authorityBinding,
+      target: input.target,
+      contextRef: input.toolContext.contextRef,
+    })),
+  };
+  const dispatchRef = {
+    recordId:
+      `session-kernel-v3:${input.runId}:provider-turn:${input.providerTurnId}:dispatch`,
+    recordDigest: sha256Hash(canonicalJson(dispatchData)),
+  };
+  const recordedAt = options.recordedAt ?? NOW;
+  const terminalData = {
+    schemaVersion: SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
+    providerTurnId: input.providerTurnId,
+    dispatchRef,
+    authorityBinding,
+    terminalKind: 'completed',
+    responseDigest: output.completion.responseDigest,
+    completion: clone(output.completion),
+    providerResult: clone(output.providerResult),
+    traceRef: {
+      terminalDigest: output.completion.trace.terminalDigest,
+      sealDigest: output.completion.trace.sealDigest,
+      recordCount: output.completion.trace.recordCount,
+    },
+    orderedItems: output.items.map((item, index) =>
+      item.kind === 'text'
+        ? {
+            kind: 'text',
+            phase: item.phase,
+            text: item.text,
+          }
+        : {
+            kind: 'toolCall',
+            index,
+            callId: item.callId,
+            name: providerWireToolNameV2(item.toolId),
+            arguments: canonicalJson(item.arguments),
+          }
+    ),
+  };
+  const terminalRef = {
+    recordId:
+      `session-kernel-v3:${input.runId}:provider-turn:${input.providerTurnId}:terminal`,
+    recordDigest: sha256Hash(canonicalJson(terminalData)),
+  };
+  return {
+    dispatch: {
+      ref: dispatchRef,
+      recordedAt: options.dispatchRecordedAt ?? NOW,
+      data: dispatchData,
+    },
+    terminal: {
+      ref: terminalRef,
+      recordedAt,
+      data: terminalData,
+    },
+  };
+}
+
+export function createFailedProviderEvidence(
+  input,
+  reasonCode = 'provider_retryable_no_mutation',
+  options = {}
+) {
+  const authorityBinding = providerAuthorityBinding(input);
+  const dispatchData = {
+    schemaVersion: SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
+    providerTurnId: input.providerTurnId,
+    purpose: input.purpose,
+    authorityBinding,
+    requestDigest: sha256Hash(canonicalJson({
+      providerTurnId: input.providerTurnId,
+      purpose: input.purpose,
+      authorityBinding,
+      target: input.target,
+      contextRef: input.toolContext.contextRef,
+    })),
+  };
+  const dispatchRef = {
+    recordId:
+      `session-kernel-v3:${input.runId}:provider-turn:${input.providerTurnId}:dispatch`,
+    recordDigest: sha256Hash(canonicalJson(dispatchData)),
+  };
+  const traceRef = {
+    terminalDigest: sha256Hash(
+      `failed-terminal:${input.providerTurnId}:${reasonCode}`
+    ),
+    sealDigest: sha256Hash(
+      `failed-seal:${input.providerTurnId}:${reasonCode}`
+    ),
+    recordCount: 2,
+  };
+  const terminalData = {
+    schemaVersion: SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
+    providerTurnId: input.providerTurnId,
+    dispatchRef,
+    authorityBinding,
+    terminalKind: options.terminalKind ?? 'failed',
+    reasonCode,
+    traceRef,
+    orderedItems: [],
+  };
+  const terminalRef = {
+    recordId:
+      `session-kernel-v3:${input.runId}:provider-turn:${input.providerTurnId}:terminal`,
+    recordDigest: sha256Hash(canonicalJson(terminalData)),
+  };
+  return {
+    dispatch: {
+      ref: dispatchRef,
+      recordedAt: options.dispatchRecordedAt ?? NOW,
+      data: dispatchData,
+    },
+    terminal: {
+      ref: terminalRef,
+      recordedAt: options.recordedAt ?? NOW,
+      data: terminalData,
+    },
+  };
+}
+
+function providerAuthorityBinding(input) {
+  const currentInput = input.contextAssembly?.receipt?.trimming?.sections
+    ?.filter((section) => section.section === 'currentInput') ?? [];
+  assert.equal(
+    currentInput.length,
+    1,
+    'Provider fixture must bind one exact current-input section.'
+  );
+  return {
+    runId: input.runId,
+    inputId: input.currentInput.inputId,
+    controlEpoch: input.controlEpoch,
+    currentInputDigest: currentInput[0].digest,
+    ...(input.plan
+      ? { planRevision: input.plan.planRevision }
+      : {}),
+    ...(input.target.kind === 'finalAnswer'
+      ? {
+          reviewRevision: input.target.reviewRevision,
+          snapshotHighWater: input.target.snapshotHighWater,
+        }
+      : {}),
+    providerProfileId: input.providerProfile.providerProfileId,
+    providerProfileRevisionDigest:
+      input.providerProfile.providerProfileRevisionDigest,
+  };
+}
+
+export function createDurableRecordV3({
+  sessionId,
+  runId,
+  recordKind,
+  logicalId,
+  recordedAt = NOW,
+  data,
+}) {
+  const withoutDigest = {
+    schemaVersion: SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA,
+    recordId: `session-kernel-v3:${runId}:${logicalId}`,
+    sessionId,
+    runId,
+    recordKind,
+    recordedAt,
+    data: clone(data),
+  };
+  return {
+    ...withoutDigest,
+    recordDigest: sha256Hash(canonicalJson(withoutDigest)),
+  };
+}
+
+export function createStoreHeaderRecordV3(
+  sessionId,
+  runId,
+  recordedAt = NOW
+) {
+  return createDurableRecordV3({
+    sessionId,
+    runId,
+    recordKind: 'storeHeader',
+    logicalId: 'store',
+    recordedAt,
+    data: { schemaVersion: SESSION_KERNEL_PERSISTENCE_V3_SCHEMA },
+  });
+}
+
+export function createToolContextSnapshotRecordV3(
+  sessionId,
+  runId,
+  toolContext,
+  recordedAt = NOW
+) {
+  const contextRef = toolContextRef(toolContext);
+  return createDurableRecordV3({
+    sessionId,
+    runId,
+    recordKind: 'toolContextSnapshot',
+    logicalId: `tool-context:${contextRef.contextDigest}`,
+    recordedAt,
+    data: {
+      schemaVersion: SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
+      runId,
+      contextRef,
+      toolContext,
+    },
+  });
+}
+
+export function createTestDurableRecordStoreV3(initialRecords = []) {
+  const records = initialRecords.map(clone);
+  const appended = [];
+  return {
+    records,
+    appended,
+    async list() {
+      return records.map(clone);
+    },
+    async append(record) {
+      assert.equal(
+        ['toolContextSnapshot', 'providerTurnDispatch',
+          'providerTurnTerminal'].includes(record.recordKind),
+        false,
+        'Session generic append must never create Daemon-owned records.'
+      );
+      const existing = records.find(
+        (candidate) => candidate.recordId === record.recordId
+      );
+      if (existing) {
+        assert.equal(existing.recordDigest, record.recordDigest);
+        return;
+      }
+      records.push(clone(record));
+      appended.push(clone(record));
+    },
+    seedDaemonRecord(record) {
+      assert.equal(
+        ['toolContextSnapshot', 'providerTurnDispatch',
+          'providerTurnTerminal'].includes(record.recordKind),
+        true,
+        'Only Daemon-owned durable evidence may use the seed lane.'
+      );
+      const existing = records.find(
+        (candidate) => candidate.recordId === record.recordId
+      );
+      if (existing && existing.recordDigest !== record.recordDigest) {
+        throw new Error('daemon_record_identity_conflict');
+      }
+      if (!existing) records.push(clone(record));
+    },
+  };
+}
+
+export function createDurablePersistenceHarness(options = {}) {
+  const sessionId = options.sessionId ?? 'session-v3-durable-contract';
+  const initial = createInitialState(options.initial);
+  const records = options.records ?? [
+    createStoreHeaderRecordV3(sessionId, initial.runId),
+    createToolContextSnapshotRecordV3(
+      sessionId,
+      initial.runId,
+      initial.toolContext
+    ),
+  ];
+  const store = createTestDurableRecordStoreV3(records);
+  const persistence = new SessionKernelAppendOnlyPersistenceV3(
+    sessionId,
+    initial.runId,
+    options.historySchema ?? SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
+    store
+  );
+  return { sessionId, initial, store, persistence };
+}
+
+export function checkpointFromStateV3(state, savedAt = NOW) {
+  return {
+    schemaVersion: SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
+    checkpointRevision: state.checkpointRevision,
+    savedAt,
+    state: clone(state),
+  };
+}
+
+export function providerEvidenceRecordsV3(
+  sessionId,
+  runId,
+  input,
+  output,
+  recordedAt = NOW
+) {
+  const evidence = createProviderEvidence(input, output, { recordedAt });
+  if (!evidence.dispatch || !evidence.terminal) {
+    throw new Error('completed_provider_evidence_required');
+  }
+  const dispatch = createDurableRecordV3({
+    sessionId,
+    runId,
+    recordKind: 'providerTurnDispatch',
+    logicalId: `provider-turn:${input.providerTurnId}:dispatch`,
+    recordedAt: evidence.dispatch.recordedAt,
+    data: evidence.dispatch.data,
+  });
+  const terminalData = {
+    ...clone(evidence.terminal.data),
+    dispatchRef: {
+      recordId: dispatch.recordId,
+      recordDigest: dispatch.recordDigest,
+    },
+  };
+  const terminal = createDurableRecordV3({
+    sessionId,
+    runId,
+    recordKind: 'providerTurnTerminal',
+    logicalId: `provider-turn:${input.providerTurnId}:terminal`,
+    recordedAt: evidence.terminal.recordedAt,
+    data: terminalData,
+  });
+  return { dispatch, terminal };
 }

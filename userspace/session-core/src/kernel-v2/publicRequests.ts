@@ -16,7 +16,10 @@ import type { SessionKernelLoopPortsV2 } from './ports.js';
 import {
   reconcileSessionKernelFactsPageV2,
 } from './reconcile.js';
-import { buildSessionKernelReviewV2 } from './review.js';
+import {
+  buildSessionKernelReviewV2,
+  staleSessionFinalAnswerForFactsDriftV3,
+} from './review.js';
 import {
   SessionKernelPortError,
   type SessionKernelCapabilityPreviewRequestV2,
@@ -25,7 +28,10 @@ import {
   type SessionKernelInvocationCancelRequestV2,
   type SessionKernelToolIntentRequestV2,
 } from './SessionKernelPortV2.js';
-import type { SessionKernelLoopStateV2 } from './state.js';
+import type {
+  SessionKernelCheckpointV2,
+  SessionKernelLoopStateV2,
+} from './state.js';
 import {
   checkpointSessionKernelStateV2,
   cloneSessionKernelLoopStateV2,
@@ -90,6 +96,23 @@ interface SessionKernelTransportAttemptV2 {
   promise: Promise<SessionKernelPublicRequestOutcomeV2>;
 }
 
+interface SessionKernelPreparedPublicRequestSettlementV2 {
+  request: SessionKernelPublicRequestRecordV2;
+  outcomeDigest: string;
+  checkpoint: SessionKernelCheckpointV2;
+  liveState: SessionKernelLoopStateV2;
+  events: SessionKernelProjectionEventV2[];
+  completion:
+    | {
+        kind: 'outcome';
+        outcome: SessionKernelPublicRequestOutcomeV2;
+      }
+    | {
+        kind: 'deterministicFailure';
+        error: SessionKernelPortError;
+      };
+}
+
 /**
  * Durable request coordinator. At most one request is unresolved in each
  * lane, so a user-input control fence can overtake an effect request whose
@@ -101,6 +124,11 @@ export class SessionKernelPublicRequestsV2 {
     SessionKernelPublicRequestLaneV2,
     SessionKernelTransportAttemptV2
   >();
+  private readonly unconfirmedSettlements = new Map<
+    SessionKernelPublicRequestLaneV2,
+    SessionKernelPreparedPublicRequestSettlementV2
+  >();
+  private settlementMutationChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly ports: SessionKernelLoopPortsV2,
@@ -134,13 +162,23 @@ export class SessionKernelPublicRequestsV2 {
   private supersedeForAuthorityTransition(
     reason: 'userInput' | 'userRequested'
   ): Promise<void> {
-    const barriers = [
-      this.supersedeTransportAttempt('effect', reason),
-      this.supersedeTransportAttempt('query', reason),
-    ].filter(
-      (barrier): barrier is Promise<void> => Boolean(barrier)
+    return Promise.all([
+      this.settleLaneForAuthorityTransition('effect', reason),
+      this.settleLaneForAuthorityTransition('query', reason),
+    ]).then(() => this.withSettlementMutation(
+      () => this.confirmAllPreparedSettlements()
+    ));
+  }
+
+  private async settleLaneForAuthorityTransition(
+    lane: 'effect' | 'query',
+    reason: 'userInput' | 'userRequested'
+  ): Promise<void> {
+    const attemptBarrier = this.supersedeTransportAttempt(
+      lane,
+      reason
     );
-    return Promise.all(barriers).then(() => undefined);
+    if (attemptBarrier) await attemptBarrier;
   }
 
   newRecord(
@@ -213,28 +251,65 @@ export class SessionKernelPublicRequestsV2 {
     requested: SessionKernelPublicRequestRecordV2,
     attempt: SessionKernelTransportAttemptV2
   ): Promise<SessionKernelPublicRequestOutcomeV2> {
-    let record = requested;
-    const existing = this.pending(requested.lane);
-    if (existing) {
-      if (!sameSessionKernelPublicRequestV2(existing, requested)) {
-        throw new SessionKernelPublicRequestError(
-          'session_kernel_public_request_lane_busy',
-          `Kernel ${requested.lane} lane already has a different persisted request.`
-        );
-      }
-      record = {
-        ...existing,
-        attemptCount: existing.attemptCount + 1,
-      };
-    }
-
+    let prepared:
+      | {
+          kind: 'recovered';
+          completion:
+            SessionKernelPreparedPublicRequestSettlementV2['completion'];
+        }
+      | {
+          kind: 'request';
+          record: SessionKernelPublicRequestRecordV2;
+        };
     try {
-      await this.ports.persistence.persistPublicRequest(record);
-      this.host.readState().publicRequests[record.lane] = record;
-      await this.host.saveCheckpoint();
-    } finally {
+      prepared = await this.withSettlementMutation(async () => {
+        const matching = [...this.unconfirmedSettlements.values()]
+          .find((settlement) =>
+            sameSessionKernelPublicRequestV2(
+              settlement.request,
+              requested
+            )
+          );
+        await this.confirmAllPreparedSettlements();
+        if (matching) {
+          return {
+            kind: 'recovered' as const,
+            completion: matching.completion,
+          };
+        }
+
+        let record = requested;
+        const existing = this.pending(requested.lane);
+        if (existing) {
+          if (!sameSessionKernelPublicRequestV2(existing, requested)) {
+            throw new SessionKernelPublicRequestError(
+              'session_kernel_public_request_lane_busy',
+              `Kernel ${requested.lane} lane already has a different persisted request.`
+            );
+          }
+          record = {
+            ...existing,
+            attemptCount: existing.attemptCount + 1,
+          };
+        }
+        await this.ports.persistence.persistPublicRequest(record);
+        this.host.readState().publicRequests[record.lane] = record;
+        await this.host.saveCheckpoint();
+        return { kind: 'request' as const, record };
+      });
+    } catch (error) {
       attempt.resolvePreparing();
+      throw error;
     }
+    attempt.resolvePreparing();
+    if (prepared.kind === 'recovered') {
+      attempt.phase = 'applying';
+      if (prepared.completion.kind === 'deterministicFailure') {
+        throw prepared.completion.error;
+      }
+      return prepared.completion.outcome;
+    }
+    const { record } = prepared;
     if (attempt.superseded) {
       throw new SessionKernelTransportAttemptSupersededError(record);
     }
@@ -285,36 +360,42 @@ export class SessionKernelPublicRequestsV2 {
     }
     attempt.phase = 'applying';
 
-    const previous = cloneSessionKernelLoopStateV2(
-      this.host.readState()
-    );
-    let events: SessionKernelProjectionEventV2[];
-    try {
-      events = applyPublicRequestOutcome(
-        this.host,
-        record,
-        outcome,
-        this.ports.clock.now(),
-        this.retryDelayMs
+    await this.withSettlementMutation(async () => {
+      await this.confirmAllPreparedSettlements();
+      const previous = cloneSessionKernelLoopStateV2(
+        this.host.readState()
       );
-      this.removePending(record);
-      const checkpoint = checkpointSessionKernelStateV2(
-        this.host.readState(),
-        this.ports.clock.now()
-      );
-      await this.ports.persistence.settlePublicRequest(
-        record,
-        digestOutcome(outcome),
-        checkpoint,
-        events
-      );
-      this.host.readState().checkpointRevision =
-        checkpoint.checkpointRevision;
-    } catch (error) {
-      this.host.replaceState(previous);
-      throw error;
-    }
-    await this.flushProjectionOutbox();
+      let events: SessionKernelProjectionEventV2[];
+      try {
+        events = applyPublicRequestOutcome(
+          this.host,
+          record,
+          outcome,
+          this.ports.clock.now(),
+          this.retryDelayMs
+        );
+        this.removePending(record);
+        const checkpoint = checkpointSessionKernelStateV2(
+          this.host.readState(),
+          this.ports.clock.now()
+        );
+        const liveState = cloneSessionKernelLoopStateV2(
+          this.host.readState()
+        );
+        liveState.checkpointRevision = checkpoint.checkpointRevision;
+        await this.confirmPreparedSettlement({
+          request: record,
+          outcomeDigest: digestOutcome(outcome),
+          checkpoint,
+          liveState,
+          events,
+          completion: { kind: 'outcome', outcome },
+        });
+      } catch (error) {
+        this.host.replaceState(previous);
+        throw error;
+      }
+    });
     return outcome;
   }
 
@@ -362,38 +443,103 @@ export class SessionKernelPublicRequestsV2 {
     record: SessionKernelPublicRequestRecordV2,
     error: SessionKernelPortError
   ): Promise<void> {
-    const previous = cloneSessionKernelLoopStateV2(
-      this.host.readState()
-    );
-    try {
-      this.removePending(record);
-      if (record.intent.kind === 'toolIntentSubmit') {
-        abortSessionProviderToolCallQueueV2(
+    await this.withSettlementMutation(async () => {
+      await this.confirmAllPreparedSettlements();
+      const previous = cloneSessionKernelLoopStateV2(
+        this.host.readState()
+      );
+      try {
+        this.removePending(record);
+        if (record.intent.kind === 'toolIntentSubmit') {
+          abortSessionProviderToolCallQueueV2(
+            this.host.readState(),
+            'submissionFailed',
+            this.ports.clock.now(),
+            record.intent.payload.intent.operationId
+          );
+        }
+        const checkpoint = checkpointSessionKernelStateV2(
           this.host.readState(),
-          'submissionFailed',
-          this.ports.clock.now(),
-          record.intent.payload.intent.operationId
+          this.ports.clock.now()
         );
+        const liveState = cloneSessionKernelLoopStateV2(
+          this.host.readState()
+        );
+        liveState.checkpointRevision = checkpoint.checkpointRevision;
+        await this.confirmPreparedSettlement({
+          request: record,
+          outcomeDigest: digestOutcome({
+            kind: 'deterministicFailure',
+            code: error.code,
+            disposition: error.disposition,
+          }),
+          checkpoint,
+          liveState,
+          events: [],
+          completion: { kind: 'deterministicFailure', error },
+        });
+      } catch (settlementError) {
+        this.host.replaceState(previous);
+        throw settlementError;
       }
-      const checkpoint = checkpointSessionKernelStateV2(
-        this.host.readState(),
-        this.ports.clock.now()
+    });
+  }
+
+  private async confirmPreparedSettlement(
+    settlement: SessionKernelPreparedPublicRequestSettlementV2
+  ): Promise<void> {
+    const existing = this.unconfirmedSettlements.get(
+      settlement.request.lane
+    );
+    if (
+      existing
+      && existing !== settlement
+      && !samePreparedSettlement(existing, settlement)
+    ) {
+      throw new SessionKernelPublicRequestError(
+        'session_kernel_public_request_settlement_conflict',
+        `Kernel ${settlement.request.lane} lane has a different unconfirmed settlement.`
       );
-      await this.ports.persistence.settlePublicRequest(
-        record,
-        digestOutcome({
-          kind: 'deterministicFailure',
-          code: error.code,
-          disposition: error.disposition,
-        }),
-        checkpoint,
-        []
-      );
-      this.host.replaceState(checkpoint.state);
-    } catch (settlementError) {
-      this.host.replaceState(previous);
-      throw settlementError;
     }
+    this.unconfirmedSettlements.set(
+      settlement.request.lane,
+      settlement
+    );
+    await this.ports.persistence.settlePublicRequest(
+      settlement.request,
+      settlement.outcomeDigest,
+      settlement.checkpoint,
+      settlement.events
+    );
+    if (
+      this.unconfirmedSettlements.get(settlement.request.lane)
+        === settlement
+    ) {
+      this.unconfirmedSettlements.delete(settlement.request.lane);
+    }
+    this.host.replaceState(
+      cloneSessionKernelLoopStateV2(settlement.liveState)
+    );
+    await this.flushProjectionOutbox();
+  }
+
+  private async confirmAllPreparedSettlements(): Promise<void> {
+    for (const settlement of [...this.unconfirmedSettlements.values()]) {
+      await this.confirmPreparedSettlement(settlement);
+    }
+  }
+
+  private withSettlementMutation<T>(
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const result = this.settlementMutationChain
+      .catch(() => undefined)
+      .then(operation);
+    this.settlementMutationChain = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   }
 
   private removePending(
@@ -415,6 +561,16 @@ export class SessionKernelPublicRequestsV2 {
       // projection transport failure must not redispatch the Kernel request.
     }
   }
+}
+
+function samePreparedSettlement(
+  left: SessionKernelPreparedPublicRequestSettlementV2,
+  right: SessionKernelPreparedPublicRequestSettlementV2
+): boolean {
+  return sameSessionKernelPublicRequestV2(left.request, right.request)
+    && left.outcomeDigest === right.outcomeDigest
+    && canonicalJson(left.checkpoint) === canonicalJson(right.checkpoint)
+    && canonicalJson(left.events) === canonicalJson(right.events);
 }
 
 export function sessionKernelPublicRequestLaneV2(
@@ -594,6 +750,7 @@ function applyPublicRequestOutcome(
         ? JSON.stringify(state.review)
         : undefined;
       const result = reconcileSessionKernelFactsPageV2(state, outcome.reply);
+      staleSessionFinalAnswerForFactsDriftV3(result.state, now);
       host.replaceState(result.state);
       const reviewReady =
         result.caughtUp
@@ -640,6 +797,7 @@ function applyPublicRequestOutcome(
         ) {
           continue;
         }
+        const authorizationDetails = factDetailData(fact.details);
         events.push(host.event(
           `authorization:${fact.factId}`,
           'authorization.decided',
@@ -652,13 +810,13 @@ function applyPublicRequestOutcome(
             planActionIds: fact.lineage.planActionIds,
             operationId: fact.lineage.operationId,
             toolId:
-              typeof fact.details.toolId === 'string'
-                ? fact.details.toolId
+              typeof authorizationDetails.toolId === 'string'
+                ? authorizationDetails.toolId
                 : undefined,
             capabilityLease: fact.lineage.capabilityLease,
             resourceIds: fact.lineage.resourceIds,
-            guidance: typeof fact.details.guidance === 'string'
-              ? fact.details.guidance
+            guidance: typeof authorizationDetails.guidance === 'string'
+              ? authorizationDetails.guidance
               : undefined,
             scopeDelta: authorizationScopeDelta(
               fact.factKind,
@@ -957,10 +1115,7 @@ function applyToolIntentReply(
 function authorizationDecisionPreviewId(
   details: unknown
 ): string | undefined {
-  if (!details || typeof details !== 'object' || Array.isArray(details)) {
-    return undefined;
-  }
-  const record = details as Record<string, unknown>;
+  const record = factDetailData(details);
   if (typeof record.previewId === 'string') {
     return record.previewId;
   }
@@ -979,12 +1134,13 @@ function authorizationDecisionPreviewId(
 function publicWorkFactProjection(
   fact: KernelFactProjectionV2
 ): Record<string, unknown> {
+  const details = factDetailData(fact.details);
   const toolId =
-    typeof fact.details.toolId === 'string'
-      ? fact.details.toolId
+    typeof details.toolId === 'string'
+      ? details.toolId
       : undefined;
   const resourceIds = [...fact.lineage.resourceIds];
-  const targets = publicCanonicalWorkspaceTargets(fact.details);
+  const targets = publicCanonicalWorkspaceTargets(details);
   return {
     factId: fact.factId,
     domain: fact.domain,
@@ -998,6 +1154,7 @@ function publicWorkFactProjection(
     ...(toolId
       ? {
           toolId,
+          canonicalAction: toolId,
         }
       : {}),
     ...(targets.length > 0 ? { targets } : {}),
@@ -1046,28 +1203,34 @@ function objectValue(
       : undefined;
 }
 
+function factDetailData(value: unknown): Record<string, unknown> {
+  const details = objectValue(value) ?? {};
+  return objectValue(details.data) ?? details;
+}
+
 function authorizationScopeDelta(
   factKind: string,
   details: Record<string, unknown>
 ): Record<string, string> | undefined {
+  const data = factDetailData(details);
   if (
     factKind
       === SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed
-    && typeof details.previousScopeDigest === 'string'
-    && typeof details.expandedScopeDigest === 'string'
+    && typeof data.previousScopeDigest === 'string'
+    && typeof data.expandedScopeDigest === 'string'
   ) {
     return {
-      previousScopeDigest: details.previousScopeDigest,
-      expandedScopeDigest: details.expandedScopeDigest,
+      previousScopeDigest: data.previousScopeDigest,
+      expandedScopeDigest: data.expandedScopeDigest,
     };
   }
   if (
     factKind
       === SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied
-    && typeof details.requestedScopeDigest === 'string'
+    && typeof data.requestedScopeDigest === 'string'
   ) {
     return {
-      requestedScopeDigest: details.requestedScopeDigest,
+      requestedScopeDigest: data.requestedScopeDigest,
     };
   }
   return undefined;

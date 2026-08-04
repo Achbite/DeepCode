@@ -132,6 +132,42 @@ underfills tokenizers whose tokens cover multiple bytes; it does not claim to
 reproduce a provider's private tokenizer. Authoritative token usage is recorded
 only from validated provider usage metadata.
 
+### Structured planning result
+
+A Provider planning turn may first return provider-native read-only tool
+calls. When it returns no tool call, its entire sealed text response is one
+private, exact JSON envelope:
+
+```text
+deepcode.session.planning-result.v2
+  kind = answer { text }
+       | plan   { plan { title, objective, narrative, actions } }
+```
+
+Every object uses exact keys. Plan actions contain only `toolId`,
+`requestedResources`, `previewArguments`, and an optional `deadline`.
+Resources and deadlines use the tagged Kernel ABI shapes. Markdown fences,
+surrounding prose, the former `deepcode.session.plan-draft.v2` frame, unknown
+fields, empty answers, and malformed nested resources fail the whole Provider
+turn before Plan persistence or tool admission; they are never reinterpreted
+as narration or an answer.
+
+For an OpenAI-compatible Profile, identified by the frozen
+`openaiPlaintext` reasoning transport, Session sends the existing
+`responseFormat: {type: "json_object"}` on planning requests. Anthropic and
+Ollama receive no new transport promise in this batch and remain strict
+fail-closed at the sealed decoder.
+
+Planning does not install the incremental public-text observer. The Daemon
+still archives the exact outbound request, raw upstream envelopes, normalized
+ordered items, native completion, and seal in the private Trace/terminal
+chain. Session deterministically decodes that private evidence into either a
+semantic answer or a structured Plan. Only the semantic answer or the normal
+`plan.persisted` projection may enter the shared conversation projection; the
+JSON envelope itself never becomes commentary, final-answer text, memory, or
+model-visible history. Recovery runs the same sealed decoder and binds the
+same terminal evidence without issuing another Provider request.
+
 ## Run and trust boundary
 
 Host resolves an opaque `workspaceBindingRef`. A Host-only `RunOpen` binds one
@@ -366,6 +402,13 @@ tool, path, permission, or effect semantics are invented. Historical bytes
 are not rewritten. An active v2 checkpoint or queue without the work-segment,
 provider trace, and final-answer state returns `UnsupportedHistorySchema`.
 
+The timeline transport envelope carries a nonnegative
+`legacyPrefixTurnCount`. The first N turns are the only turns eligible for the
+neutral settled flat-v2 normalization above; every later turn is validated as
+native work-segment shape. Absence of this field means strict-native and never
+triggers validator-failure fallback. This transport metadata is not copied
+into a public turn or used to invent a legacy grouping field.
+
 ## Provider streaming and private trace
 
 OpenAI-compatible, Anthropic, and Ollama provider transports use one streaming
@@ -407,6 +450,142 @@ request each have an independent 16 MiB hard limit. Trace directories use mode
 Archived Sessions retain traces. Explicit Session deletion uses visible,
 retryable two-stage deletion. It does not claim cryptographic erasure or
 removal from filesystem snapshots or backups.
+
+## ProviderTurn authority and active persistence
+
+Every Provider turn has one explicit authority binding:
+
+```text
+runId
+inputId
+controlEpoch
+currentInputDigest
+planRevision?
+reviewRevision?
+snapshotHighWater?
+providerProfileId
+providerProfileRevisionDigest
+```
+
+Optional Plan/Review fields must match the turn target. The explicit fields are
+the audit and recovery identity; an opaque aggregate digest or a copy of the
+complete Prompt is not a substitute.
+
+The Daemon is the only writer of two immutable safe ProviderTurn records. A
+dispatch record exists only after current authority, exact Profile availability,
+and the private Trace request boundary have committed and before the network
+request can be sent. A terminal record exists only after a provider-native
+terminal, the reasoning and phase gates, normalized response validation, and a
+Trace seal. The terminal safe record may retain ordered text/tool items and
+private JSON tool arguments needed for recovery. It never retains a capability,
+lease, credential, reasoning body, or raw upstream envelope. Deterministic
+record identity and Daemon reconciliation close a crash between Trace seal and
+safe terminal append; Session never reads raw Trace to infer a response.
+
+Final-answer physical request count is derived only from matching durable
+dispatch records. A pre-dispatch stale or unavailable request does not consume
+the three-request budget. The budget is stable for the same Run, user input,
+control epoch, and exact Provider Profile revision; changing Review revision,
+facts high-water, or Plan binding does not reset it. Exact replay of the current
+provider turn still requires the complete Plan/Review/high-water identity.
+
+Active Session persistence uses the v3 discriminator and `kernel-v3` stream.
+Its checkpoint is a compact recovery-control record: it references immutable
+input/Plan/Review/Provider/operation/projection facts, carries only active
+Provider or queue control, projection delivery position, final-answer control,
+and checkpoint lineage/high-water, and never embeds complete replayable
+history. A public-request settlement references an immutable checkpoint and
+projection records rather than embedding copies. Until the field-level compact
+wire and cross-record invariants are frozen and implemented, the v3 path stays
+dark and must not create active user history.
+
+The frozen field-level v3 rule is:
+
+- `toolContextSnapshot`, `providerTurnDispatch`, and `providerTurnTerminal` are
+  Daemon-only record kinds; the Session append endpoint rejects them.
+- a ToolContext snapshot uses the strict
+  `deepcode.session.tool-context-snapshot.v3` wrapper containing exact
+  `runId/contextRef/toolContext`, with deterministic identity
+  `session-kernel-v3:<runId>:tool-context:<contextDigest>`. RunOpen initializes
+  the store header and initial snapshot before Session starts. An updated
+  ToolContext is persisted before its reply is exposed; a current reply must
+  resolve an existing snapshot. Exact identity replay is allowed, while a
+  changed digest or payload fails closed. The bundle is provider-safe and
+  contains no capability, lease, credential, secret, or workspace root.
+- terminal kind is exactly `completed | failed | cancelled | limitExceeded`.
+- a dispatch without terminal is counted as a physical request. Daemon may
+  deterministically reconstruct its terminal from a valid sealed Trace;
+  otherwise it remains unresolved, fails closed, and is never auto-retried.
+- immutable `review` and `planActionSettlement` records carry those settled
+  values. Draft-to-final Review transition advances the immutable Review
+  revision. Final-answer admission accepts only an exact v2 Review with
+  `status=final`, non-empty `finalizedAt`, and matching Plan, Run, control epoch,
+  and facts high-water. A checkpoint inlines only current authority/cursors, active wait and
+  guidance, active Provider/queue refs and progress, fact barriers,
+  cancellation, and final-answer control.
+- checkpoint lineage uses a parent record reference and commit scope
+  `standalone | publicRequestSettlement`. A public-request settlement is the
+  sole commit marker for its checkpoint and projection references. Orphan
+  records are retained for audit but ignored by recovery and delivery.
+- final-answer physical count is reconstructed from matching dispatch records,
+  never accepted as a checkpoint authority value.
+
+The compact checkpoint has the exact top-level fields
+`schemaVersion/checkpointRevision/savedAt/parentRef/commitScope/authority/cursor/active/refs/finalAnswer?`.
+Current-Plan canonical previews and operation-to-PlanAction bindings are
+bounded current authority state. Historical inputs, completed Provider turns,
+Review, settlements, and projections are referenced by immutable record
+identity and high-water instead of copied into the checkpoint.
+
+A completed Provider terminal reuses the sealed stream's safe ordered text and
+tool-item wire. Its result metadata contains required profile/provider/model
+identity and optional usage only; native finish remains solely in
+`completion.nativeCompletion`. Session Provider outcomes are deterministically
+rebuilt from matching terminals plus immutable Plan and settlement records.
+Recovery resolves the exact historical ToolContext snapshot named by the
+reservation context reference and runs the same sealed decoder and adapter; it
+never substitutes the current bundle after a revoke or refresh. Missing,
+conflicting, or digest-invalid snapshot evidence fails with
+`UnsupportedHistorySchema`.
+
+The only retryable durable terminal reason is
+`provider_retryable_no_mutation`, produced for network send/read failures and
+HTTP 500-599. HTTP 408/425/429, cancellation, missing reasoning, protocol
+conflicts, limit excess, and unresolved dispatches never auto-retry.
+
+Every projection record wraps its event with
+`deepcode.session.projection-record.v3` and the same exact commit-scope union as
+the checkpoint. A standalone wrapper commits itself. A public-request wrapper
+is visible to recovery and delivery only after the matching settlement marker
+references its record identity and digest. A delivery receipt never commits an
+orphan projection.
+
+## Safe live commentary
+
+The only incremental public Provider content event is
+`provider.composing`, containing:
+
+```text
+providerTurnId
+controlEpoch
+streamSequence
+textOrdinal
+providerPhase?
+textDelta
+```
+
+The event follows Trace archive-before-publication. It never contains reasoning,
+tool identity or arguments, or raw envelopes. Explicit commentary may stream;
+`final_answer` waits for the completed sealed response. Unknown text whose first
+non-whitespace character is `{` is buffered through terminal validation so a
+text-framed ToolIntent cannot leak. `provider.completed` reconciles the final
+safe ordered response in place.
+
+Run-capability timeline SSE is pinned at open to
+`sessionId + pinnedRunId + runCapability`. It never follows a later Run in the
+same Session. After the pinned Run has a canonical terminal projection and is
+retired, an already-authorized stream may deliver one terminal snapshot for
+that Run and then closes.
 
 Private trace contents have no Session/model, CLI, TUI, public projection,
 Copy, Memory, GoalProjection, or cache ingress. A GUI Session-menu user action

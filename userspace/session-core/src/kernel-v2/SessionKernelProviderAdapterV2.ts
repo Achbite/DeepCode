@@ -94,6 +94,17 @@ export interface SessionKernelProviderBackendV2 {
 export interface SessionKernelProviderAdapterV2
   extends SessionKernelProviderPortV2 {}
 
+export type SessionKernelProviderAdapterInputV2 = Pick<
+  SessionProviderTurnInputV2,
+  | 'providerTurnId'
+  | 'purpose'
+  | 'runId'
+  | 'currentInput'
+  | 'providerProfile'
+  | 'target'
+  | 'toolContext'
+>;
+
 /**
  * Only provider-native tool calls or one exact standalone ToolIntent frame
  * enter the executable lane. The complete response is reduced to a safe
@@ -111,6 +122,33 @@ implements SessionKernelProviderAdapterV2 {
     input: SessionProviderTurnInputV2
   ): Promise<SessionProviderTurnOutputV2> {
     const output = await this.backend.requestTurn(input);
+    return adaptSessionKernelProviderBackendOutputV2(
+      input,
+      output,
+      this.clock.now()
+    );
+  }
+}
+
+/**
+ * Pure strict adapter shared by live Provider requests and daemon-terminal
+ * recovery. `recordedAt` is supplied by the durable boundary so replay never
+ * invents a new Plan or tool-call receipt timestamp.
+ */
+export function adaptSessionKernelProviderBackendOutputV2(
+  input: SessionKernelProviderAdapterInputV2,
+  output: SessionKernelProviderBackendOutputV2,
+  recordedAt: string
+): SessionProviderTurnOutputV2 {
+    if (
+      (input.target.kind === 'finalAnswer')
+        !== (input.purpose === 'finalAnswer')
+    ) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_final_answer_purpose_mismatch',
+        'Final-answer purpose and target must be bound together.'
+      );
+    }
     assertCompletedProviderBackendOutputV2(input, output);
     const completionFields = {
       items: cloneJson(output.items),
@@ -130,7 +168,7 @@ implements SessionKernelProviderAdapterV2 {
           plan: materializeProviderPlanV2(
             input,
             output.plan,
-            this.clock.now()
+            recordedAt
           ),
           providerResult: output.providerResult,
         };
@@ -158,7 +196,7 @@ implements SessionKernelProviderAdapterV2 {
               toolId: call.toolId,
               arguments: call.arguments,
             })),
-            this.clock.now()
+            recordedAt
           ),
           providerResult: output.providerResult,
         };
@@ -182,7 +220,15 @@ implements SessionKernelProviderAdapterV2 {
               .slice('sha256:'.length)}`;
           return {
             kind: 'toolIntent',
-            items: cloneJson(output.items),
+            items: [{
+              kind: 'toolCall',
+              source: 'textFrame',
+              ordinal: 1,
+              callId: textCallId,
+              toolName: frame.toolId,
+              toolId: frame.toolId,
+              arguments: cloneJson(frame.arguments),
+            }],
             completion: cloneJson(output.completion),
             sources: [{
               source: 'textFrame',
@@ -197,7 +243,7 @@ implements SessionKernelProviderAdapterV2 {
                 toolId: frame.toolId,
                 arguments: frame.arguments,
               }],
-              this.clock.now()
+              recordedAt
             ),
             providerResult: output.providerResult,
           };
@@ -209,6 +255,12 @@ implements SessionKernelProviderAdapterV2 {
           providerResult: output.providerResult,
         };
       case 'noTool':
+        if (input.target.kind === 'finalAnswer') {
+          throw new SessionKernelProviderAdapterError(
+            'session_kernel_provider_final_answer_missing',
+            'A final-answer Provider turn must return non-empty answer text.'
+          );
+        }
         return {
           kind: 'noTool',
           ...completionFields,
@@ -218,11 +270,10 @@ implements SessionKernelProviderAdapterV2 {
           providerResult: output.providerResult,
         };
     }
-  }
 }
 
 function assertSealedTextFrameSource(
-  input: SessionProviderTurnInputV2,
+  input: SessionKernelProviderAdapterInputV2,
   output: SessionKernelProviderBackendOutputV2 & { kind: 'text' }
 ): void {
   const item = output.items[0];
@@ -241,7 +292,7 @@ function assertSealedTextFrameSource(
 }
 
 function assertCompletedProviderBackendOutputV2(
-  input: SessionProviderTurnInputV2,
+  input: SessionKernelProviderAdapterInputV2,
   output: SessionKernelProviderBackendOutputV2
 ): void {
   const completion = output.completion;
@@ -342,7 +393,7 @@ function assertCompletedProviderBackendOutputV2(
     orderedTools.push(item);
   }
   if (
-    String((input.target as { kind: string }).kind) === 'finalAnswer'
+    input.target.kind === 'finalAnswer'
     && orderedTools.length > 0
   ) {
     throw new SessionKernelProviderAdapterError(
@@ -475,7 +526,7 @@ function requiredDigest(value: string, field: string): string {
 }
 
 function requirePermittedTool(
-  input: SessionProviderTurnInputV2,
+  input: SessionKernelProviderAdapterInputV2,
   toolId: string
 ): void {
   const descriptor = input.toolContext.tools.find(
@@ -507,16 +558,22 @@ export function materializeProviderPlanV2(
   recordedAt: string
 ): SessionNaturalLanguagePlanV2 {
   const normalized = normalizePlanDraft(draft);
-  const readyToolIds = new Set(
-    input.toolContext.tools.map((tool) => tool.toolId)
+  const readyTools = new Map(
+    input.toolContext.tools.map((tool) => [tool.toolId, tool])
   );
   for (const action of normalized.actions) {
-    if (!readyToolIds.has(action.toolId)) {
+    const descriptor = readyTools.get(action.toolId);
+    if (!descriptor || descriptor.availability !== 'ready') {
       throw new SessionKernelProviderAdapterError(
         'session_kernel_provider_plan_tool_unavailable',
         `Provider plan requested a tool outside the current ready ToolContext: ${action.toolId}.`
       );
     }
+    assertToolArgumentsMatchSchemaV2(
+      action.previewArguments,
+      descriptor.inputSchema,
+      action.toolId
+    );
   }
   const digest = sha256Hash(canonicalJson({
     providerTurnId: input.providerTurnId,
@@ -599,6 +656,214 @@ function normalizePlanDraft(
       };
     }),
   };
+}
+
+const SUPPORTED_TOOL_SCHEMA_KEYWORDS_V2 = new Set([
+  'type',
+  'required',
+  'properties',
+  'additionalProperties',
+  'items',
+  'enum',
+  'minimum',
+  'const',
+  'oneOf',
+]);
+
+class UnsupportedToolSchemaV2 extends Error {}
+
+function assertToolArgumentsMatchSchemaV2(
+  argumentsValue: unknown,
+  schema: unknown,
+  toolId: string
+): void {
+  let mismatch: string | undefined;
+  try {
+    mismatch = validateToolSchemaValueV2(
+      argumentsValue,
+      schema,
+      'previewArguments'
+    );
+  } catch (error) {
+    if (error instanceof UnsupportedToolSchemaV2) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_tool_schema_unsupported',
+        `Kernel ToolContext schema for ${toolId} cannot be validated: ${error.message}`
+      );
+    }
+    throw error;
+  }
+  if (mismatch) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_arguments_invalid',
+      `Provider Plan previewArguments for ${toolId} do not match the immutable ToolContext JSON Schema: ${mismatch}`
+    );
+  }
+}
+
+function validateToolSchemaValueV2(
+  value: unknown,
+  schemaValue: unknown,
+  path: string
+): string | undefined {
+  const schema = requireToolSchemaRecordV2(schemaValue, path);
+  for (const keyword of Object.keys(schema)) {
+    if (!SUPPORTED_TOOL_SCHEMA_KEYWORDS_V2.has(keyword)) {
+      throw new UnsupportedToolSchemaV2(
+        `${path} uses unsupported keyword ${keyword}`
+      );
+    }
+  }
+
+  if ('const' in schema && canonicalJson(value) !== canonicalJson(schema.const)) {
+    return `${path} does not equal its required constant`;
+  }
+  if ('enum' in schema) {
+    if (!Array.isArray(schema.enum) || schema.enum.length === 0) {
+      throw new UnsupportedToolSchemaV2(`${path}.enum must be non-empty`);
+    }
+    if (!schema.enum.some((candidate) =>
+      canonicalJson(candidate) === canonicalJson(value)
+    )) {
+      return `${path} is outside the permitted enum`;
+    }
+  }
+  if ('oneOf' in schema) {
+    if (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0) {
+      throw new UnsupportedToolSchemaV2(`${path}.oneOf must be non-empty`);
+    }
+    let matches = 0;
+    for (const candidate of schema.oneOf) {
+      if (validateToolSchemaValueV2(value, candidate, path) === undefined) {
+        matches += 1;
+      }
+    }
+    if (matches !== 1) {
+      return `${path} must match exactly one schema variant`;
+    }
+  }
+
+  if (!('type' in schema)) return undefined;
+  if (typeof schema.type !== 'string') {
+    throw new UnsupportedToolSchemaV2(`${path}.type must be a string`);
+  }
+  switch (schema.type) {
+    case 'object':
+      return validateToolSchemaObjectV2(value, schema, path);
+    case 'array':
+      if (!Array.isArray(value)) return `${path} must be an array`;
+      if (!('items' in schema)) return undefined;
+      return firstSchemaMismatchV2(
+        value.map((item, index) =>
+          validateToolSchemaValueV2(item, schema.items, `${path}[${index}]`)
+        )
+      );
+    case 'string':
+      return typeof value === 'string'
+        ? undefined
+        : `${path} must be a string`;
+    case 'integer':
+      if (!Number.isSafeInteger(value)) {
+        return `${path} must be a cross-language safe integer`;
+      }
+      if ('minimum' in schema) {
+        if (!Number.isSafeInteger(schema.minimum)) {
+          throw new UnsupportedToolSchemaV2(
+            `${path}.minimum must be a safe integer`
+          );
+        }
+        if (Number(value) < Number(schema.minimum)) {
+          return `${path} must be at least ${String(schema.minimum)}`;
+        }
+      }
+      return undefined;
+    case 'boolean':
+      return typeof value === 'boolean'
+        ? undefined
+        : `${path} must be a boolean`;
+    default:
+      throw new UnsupportedToolSchemaV2(
+        `${path} uses unsupported type ${schema.type}`
+      );
+  }
+}
+
+function validateToolSchemaObjectV2(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path: string
+): string | undefined {
+  if (!isJsonRecordV2(value)) return `${path} must be an object`;
+  const properties = 'properties' in schema
+    ? requireToolSchemaRecordV2(schema.properties, `${path}.properties`)
+    : {};
+  const required = schema.required ?? [];
+  if (
+    !Array.isArray(required)
+    || required.some((key) => typeof key !== 'string')
+    || new Set(required).size !== required.length
+  ) {
+    throw new UnsupportedToolSchemaV2(
+      `${path}.required must contain unique strings`
+    );
+  }
+  for (const key of required as string[]) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      return `${path}.${key} is required`;
+    }
+  }
+  for (const [key, fieldValue] of Object.entries(value)) {
+    if (Object.prototype.hasOwnProperty.call(properties, key)) {
+      const mismatch = validateToolSchemaValueV2(
+        fieldValue,
+        properties[key],
+        `${path}.${key}`
+      );
+      if (mismatch) return mismatch;
+      continue;
+    }
+    const additional = schema.additionalProperties;
+    if (additional === false) {
+      return `${path}.${key} is not permitted`;
+    }
+    if (isJsonRecordV2(additional)) {
+      const mismatch = validateToolSchemaValueV2(
+        fieldValue,
+        additional,
+        `${path}.${key}`
+      );
+      if (mismatch) return mismatch;
+    } else if (additional !== undefined && additional !== true) {
+      throw new UnsupportedToolSchemaV2(
+        `${path}.additionalProperties must be boolean or a schema`
+      );
+    }
+  }
+  return undefined;
+}
+
+function requireToolSchemaRecordV2(
+  value: unknown,
+  path: string
+): Record<string, unknown> {
+  if (!isJsonRecordV2(value)) {
+    throw new UnsupportedToolSchemaV2(`${path} must be a schema object`);
+  }
+  return value;
+}
+
+function isJsonRecordV2(
+  value: unknown
+): value is Record<string, unknown> {
+  return typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value);
+}
+
+function firstSchemaMismatchV2(
+  mismatches: Array<string | undefined>
+): string | undefined {
+  return mismatches.find((mismatch) => mismatch !== undefined);
 }
 
 function claimsToolIntentFrame(text: string): boolean {

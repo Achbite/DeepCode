@@ -127,13 +127,15 @@ impl KernelV2IpcDispatcher {
                 Some(request_id),
             );
         }
-        encode_or_service_error(
-            &self
-                .state
-                .service()
-                .handle_session_command(envelope, transport_run_capability),
-            Some(request_id),
-        )
+        match self
+            .state
+            .handle_session_command(envelope, transport_run_capability)
+        {
+            Ok(response) => encode_or_service_error(&response, Some(request_id)),
+            Err(_) => {
+                encode_transport_error(KernelV2HttpErrorCode::ServiceUnavailable, Some(request_id))
+            }
+        }
     }
 
     fn dispatch_user_decision(&self, body: &[u8]) -> Vec<u8> {

@@ -11,6 +11,7 @@ mod host_admission_v2;
 mod host_inspection;
 mod host_kernel_operation_store_v2;
 mod host_kernel_run_v2;
+mod host_kernel_wake_v2;
 mod host_run_broker_v2;
 mod host_services;
 mod host_shutdown_v2;
@@ -33,6 +34,7 @@ mod session_metadata_v2;
 mod session_public_projection_v2;
 mod settings_api;
 mod skill_api;
+mod startup_readiness_v2;
 mod state;
 mod terminal_api;
 mod terminal_runtime;
@@ -107,6 +109,111 @@ fn persist_startup_tombstone_outcomes(
     Ok(())
 }
 
+struct HostStartupFailureV2 {
+    code: String,
+    message: String,
+}
+
+async fn recover_host_startup_v2(
+    state: &AppState,
+    recoverable_session_ids: &std::collections::HashSet<String>,
+    deletion_tombstones: &std::collections::HashSet<String>,
+) -> Result<(), HostStartupFailureV2> {
+    let reconciliation = match state
+        .kernel_session_v2
+        .reconcile_startup(recoverable_session_ids, deletion_tombstones)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state
+                .host_services
+                .active_runs_v2
+                .record_startup_error(error.code);
+            let failures = deletion_tombstones
+                .iter()
+                .map(
+                    |session_id| crate::host_kernel_run_v2::HostKernelStartupTombstoneFailureV2 {
+                        session_id: session_id.clone(),
+                        code: error.code,
+                        message: error.message.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            if let Err(persist_error) =
+                persist_startup_tombstone_outcomes(&state.gui, deletion_tombstones, &failures)
+            {
+                state
+                    .host_services
+                    .active_runs_v2
+                    .record_startup_error("agent_session_deletion_startup_failure_persist_failed");
+                state
+                    .gui
+                    .lock()
+                    .expect("gui state lock")
+                    .session_metadata_error = Some(format!(
+                    "Session deletion startup failure state could not be persisted: {persist_error}"
+                ));
+            }
+            return Err(HostStartupFailureV2 {
+                code: error.code.to_string(),
+                message: error.message,
+            });
+        }
+    };
+    if let Err(error) = persist_startup_tombstone_outcomes(
+        &state.gui,
+        deletion_tombstones,
+        &reconciliation.tombstone_failures,
+    ) {
+        let code = "agent_session_deletion_startup_failure_persist_failed";
+        state
+            .host_services
+            .active_runs_v2
+            .record_startup_error(code);
+        state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .session_metadata_error = Some(format!(
+            "Session deletion startup failure state could not be persisted: {error}"
+        ));
+        return Err(HostStartupFailureV2 {
+            code: code.to_string(),
+            message: error,
+        });
+    }
+    let caller_owned_runs = restore_agent_kernel_caller_owners_v2(state, recoverable_session_ids)
+        .await
+        .map_err(|error| {
+            state
+                .host_services
+                .active_runs_v2
+                .record_startup_error(&error.code);
+            HostStartupFailureV2 {
+                code: error.code,
+                message: error.message,
+            }
+        })?;
+    restore_agent_kernel_wait_owners_v2(
+        state,
+        &reconciliation.continuation_ready_runs,
+        &caller_owned_runs,
+    )
+    .await
+    .map_err(|error| {
+        state
+            .host_services
+            .active_runs_v2
+            .record_startup_error(&error.code);
+        HostStartupFailureV2 {
+            code: error.code,
+            message: error.message,
+        }
+    })?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -156,83 +263,15 @@ async fn main() {
     )
     .expect("initialize Host services with operating-system authority entropy");
     let gui = Arc::new(Mutex::new(gui_state));
-    let host_shell_authority =
-        HostShellAuthorityV2::from_environment().expect("initialize Host shell admission");
-    configure_host_process_identity_v2(addr).expect("initialize Host process identity");
     let kernel_v2 = crate::kernel_v2_transport::KernelV2TransportState::new(
         kernel_v2_service,
         host_services.workspace.resolver_v2(),
         Arc::new(GuiRunSettingsResolverV2 {
             gui: Arc::clone(&gui),
         }),
+        host_services.session_kernel_v2.clone(),
     )
     .expect("initialize Kernel v2 transport");
-    let kernel_v2_bridge_assets =
-        crate::host_kernel_run_v2::HostKernelBridgeAssetsV2::resolve_at_daemon_start()
-            .expect("resolve trusted Session Kernel v2 bridge assets");
-    let kernel_session_v2 = crate::host_kernel_run_v2::HostKernelRunCoordinatorV2::new(
-        host_services.clone(),
-        kernel_v2.clone(),
-        kernel_v2_bridge_assets,
-        format!("http://{addr}"),
-    )
-    .expect("initialize Host-owned Session Kernel v2 coordinator");
-    match kernel_session_v2
-        .reconcile_startup(&recoverable_session_ids, &deletion_tombstones)
-        .await
-    {
-        Ok(outcome) => {
-            if let Err(error) = persist_startup_tombstone_outcomes(
-                &gui,
-                &deletion_tombstones,
-                &outcome.tombstone_failures,
-            ) {
-                host_services
-                    .active_runs_v2
-                    .record_startup_error("agent_session_deletion_startup_failure_persist_failed");
-                gui.lock().expect("gui state lock").session_metadata_error = Some(format!(
-                    "Session deletion startup failure state could not be persisted: {error}"
-                ));
-            }
-        }
-        Err(error) => {
-            host_services
-                .active_runs_v2
-                .record_startup_error(error.code);
-            let failures = deletion_tombstones
-                .iter()
-                .map(
-                    |session_id| crate::host_kernel_run_v2::HostKernelStartupTombstoneFailureV2 {
-                        session_id: session_id.clone(),
-                        code: error.code,
-                        message: error.message.clone(),
-                    },
-                )
-                .collect::<Vec<_>>();
-            if let Err(persist_error) =
-                persist_startup_tombstone_outcomes(&gui, &deletion_tombstones, &failures)
-            {
-                host_services
-                    .active_runs_v2
-                    .record_startup_error("agent_session_deletion_startup_failure_persist_failed");
-                gui.lock().expect("gui state lock").session_metadata_error = Some(format!(
-                    "Session deletion startup failure state could not be persisted: {persist_error}"
-                ));
-            }
-        }
-    }
-    let state = AppState {
-        kernel_v2,
-        kernel_session_v2,
-        host_shell_authority,
-        gui,
-        host_services,
-        provider_trace_v1,
-        provider_trace_export_limiter_v1:
-            crate::provider_trace_api::ProviderTraceExportLimiterV1::default(),
-        terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
-        session_runs: Arc::new(Mutex::new(HashMap::new())),
-    };
     if let Ok(port_kind) = std::env::var("DEEPCODE_DAEMON_IPC_V2_PORT") {
         let port = match port_kind.as_str() {
             "session-command" => {
@@ -247,20 +286,119 @@ async fn main() {
             "user-decision" => crate::kernel_v2_ipc::KernelV2IpcPortV2::UserDecision,
             _ => panic!("DEEPCODE_DAEMON_IPC_V2_PORT must be session-command or user-decision"),
         };
-        crate::kernel_v2_ipc::KernelV2IpcDispatcher::new(state.kernel_v2.clone())
+        crate::kernel_v2_ipc::KernelV2IpcDispatcher::new(kernel_v2)
             .serve_length_prefixed(&port, &mut io::stdin().lock(), &mut io::stdout().lock())
             .expect("serve framed Kernel v2 IPC");
         return;
     }
-    let app = routes::build_app(state);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind deepcode web host");
+    let host_shell_authority =
+        HostShellAuthorityV2::from_environment().expect("initialize Host shell admission");
+    configure_host_process_identity_v2(addr).expect("initialize Host process identity");
+    let kernel_v2_bridge_assets =
+        crate::host_kernel_run_v2::HostKernelBridgeAssetsV2::resolve_at_daemon_start()
+            .expect("resolve trusted Session Kernel v2 bridge assets");
+    let kernel_session_v2 = crate::host_kernel_run_v2::HostKernelRunCoordinatorV2::new(
+        host_services.clone(),
+        kernel_v2.clone(),
+        kernel_v2_bridge_assets,
+        format!("http://{addr}"),
+    )
+    .expect("initialize Host-owned Session Kernel v2 coordinator");
+    let kernel_wake_v2 = crate::host_kernel_wake_v2::HostKernelWakeSupervisorV2::new();
+    let startup_readiness_v2 = crate::startup_readiness_v2::HostStartupReadinessV2::recovering();
+    let state = AppState {
+        kernel_v2,
+        kernel_session_v2,
+        kernel_wake_v2,
+        startup_readiness_v2,
+        host_shell_authority,
+        gui,
+        host_services,
+        provider_trace_v1,
+        provider_trace_export_limiter_v1:
+            crate::provider_trace_api::ProviderTraceExportLimiterV1::default(),
+        terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
+        session_runs: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            state
+                .startup_readiness_v2
+                .mark_failed("host_http_listener_bind_failed");
+            let _ = shutdown_owned_host_resources_v2(&state).await;
+            panic!("bind deepcode web host: {error}");
+        }
+    };
+    let app = routes::build_app(state.clone());
     println!("DeepCode Kernel daemon listening on http://{addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_host_shutdown_v2())
-        .await
-        .expect("serve kernel daemon");
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_host_shutdown_v2())
+            .await
+    });
+    tokio::task::yield_now().await;
+    let startup = tokio::select! {
+        startup = recover_host_startup_v2(
+            &state,
+            &recoverable_session_ids,
+            &deletion_tombstones,
+        ) => Some(startup),
+        server_result = &mut server => {
+            state
+                .startup_readiness_v2
+                .mark_failed("host_http_server_ended_during_startup");
+            let _ = shutdown_owned_host_resources_v2(&state).await;
+            if host_shutdown_requested_v2() {
+                return;
+            }
+            panic!("Kernel daemon server ended during startup recovery: {server_result:?}");
+        }
+    };
+    if host_shutdown_requested_v2() {
+        let _ = server.await;
+        return;
+    }
+    match startup.expect("startup branch returns a result") {
+        Ok(()) => {
+            if let Err(message) = state.startup_readiness_v2.mark_ready() {
+                state
+                    .startup_readiness_v2
+                    .mark_failed("host_startup_readiness_transition_failed");
+                let _ = shutdown_owned_host_resources_v2(&state).await;
+                request_host_shutdown_v2();
+                let _ = server.await;
+                panic!("Host startup readiness transition failed: {message}");
+            }
+        }
+        Err(failure) => {
+            state.startup_readiness_v2.mark_failed(failure.code.clone());
+            let _ = shutdown_owned_host_resources_v2(&state).await;
+            request_host_shutdown_v2();
+            if tokio::time::timeout(Duration::from_secs(5), &mut server)
+                .await
+                .is_err()
+            {
+                server.abort();
+                let _ = server.await;
+            }
+            panic!(
+                "Host startup recovery failed [{}]: {}",
+                failure.code, failure.message
+            );
+        }
+    }
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = shutdown_owned_host_resources_v2(&state).await;
+            panic!("serve kernel daemon: {error}");
+        }
+        Err(error) => {
+            let _ = shutdown_owned_host_resources_v2(&state).await;
+            panic!("Kernel daemon server owner failed: {error}");
+        }
+    }
 }
 
 #[derive(Debug)]

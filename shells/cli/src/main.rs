@@ -1,7 +1,8 @@
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
-    TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentRunResult, AgentTimelineDurability, AgentTimelineEntryRole,
+    AgentTimelineRunStatus, AgentTimelineSnapshot, AgentTimelineStatus, AgentTimelineTurnPart,
+    CreateAgentSessionRequest, HttpKernelClient, KernelBootstrap, KernelBootstrapOptions,
+    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
@@ -10,8 +11,15 @@ use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
+const EXIT_ACTION_REQUIRED: i32 = 5;
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_RUN_TIMEOUT_ENV: &str = "DEEPCODE_CLI_RUN_TIMEOUT_MS";
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum CliCommandOutcome {
+    Completed,
+    ActionRequired(String),
+}
 
 #[tokio::main]
 async fn main() {
@@ -24,17 +32,24 @@ async fn main() {
         }
     };
 
-    if let Err(error) = run(command).await {
-        eprintln!("{error}");
-        std::process::exit(EXIT_DAEMON_UNAVAILABLE);
+    match run(command).await {
+        Ok(CliCommandOutcome::Completed) => {}
+        Ok(CliCommandOutcome::ActionRequired(message)) => {
+            eprintln!("{message}");
+            std::process::exit(EXIT_ACTION_REQUIRED);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(EXIT_DAEMON_UNAVAILABLE);
+        }
     }
 }
 
-pub(crate) async fn run(command: Command) -> Result<(), String> {
+pub(crate) async fn run(command: Command) -> Result<CliCommandOutcome, String> {
     match command {
         Command::Help => {
             print_help();
-            Ok(())
+            Ok(CliCommandOutcome::Completed)
         }
         Command::Interactive {
             api,
@@ -42,14 +57,18 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            run_interactive(bootstrap.client().clone(), host).await
+            run_interactive(bootstrap.client().clone(), host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::DaemonStatus {
             api,
             no_auto_start_kernel,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_daemon_status(bootstrap.client()).await
+            print_daemon_status(bootstrap.client())
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsList {
             api,
@@ -58,7 +77,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_sessions(bootstrap.client(), include_archived, &host).await
+            print_sessions(bootstrap.client(), include_archived, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsNew {
             api,
@@ -67,7 +88,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            create_session(bootstrap.client(), title, &host).await
+            create_session(bootstrap.client(), title, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsResume {
             api,
@@ -75,7 +98,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            activate_and_print_timeline(bootstrap.client(), &session_id).await
+            activate_and_print_timeline(bootstrap.client(), &session_id)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsRename {
             api,
@@ -84,7 +109,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             title,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            rename_session(bootstrap.client(), &session_id, &title).await
+            rename_session(bootstrap.client(), &session_id, &title)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsProfile {
             api,
@@ -95,6 +122,7 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
             print_or_update_session_profile(bootstrap.client(), &session_id, profile_id.as_deref())
                 .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsDelete {
             api,
@@ -102,7 +130,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            delete_or_archive_session(bootstrap.client(), &session_id, false).await
+            delete_or_archive_session(bootstrap.client(), &session_id, false)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsArchive {
             api,
@@ -110,7 +140,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            delete_or_archive_session(bootstrap.client(), &session_id, true).await
+            delete_or_archive_session(bootstrap.client(), &session_id, true)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::Timeline {
             api,
@@ -119,7 +151,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_timeline(bootstrap.client(), session_id, &host).await
+            print_timeline(bootstrap.client(), session_id, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::Permission {
             api,

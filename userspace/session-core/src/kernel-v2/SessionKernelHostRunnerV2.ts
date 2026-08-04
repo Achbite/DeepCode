@@ -16,6 +16,7 @@ import type {
 import type { SessionKernelLoopStateV2 } from './state.js';
 import type {
   SessionActiveWaitV2,
+  SessionFinalAnswerBindingV3,
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
   SessionProviderTurnTargetV2,
@@ -23,7 +24,11 @@ import type {
   SessionProviderProfileBootstrapV2,
   SessionPlanDecisionV2,
   SessionUserInputRecordV2,
+  SessionWorkAuthorityV3,
 } from './types.js';
+import {
+  sameSessionFinalAnswerAuthorityV3,
+} from './review.js';
 import type {
   SessionContextMemoryV2,
 } from './sessionMemory.js';
@@ -628,9 +633,51 @@ export class SessionKernelHostRunnerV2 {
   }
 
   async finalizeReview(
-    expectedPlanRevision: string
+    expectedWorkAuthority: SessionWorkAuthorityV3
   ): Promise<SessionKernelReviewV2> {
-    return this.loop.finalizeReview(expectedPlanRevision);
+    return this.loop.finalizeReview(expectedWorkAuthority);
+  }
+
+  async requestFinalAnswer(
+    binding: SessionFinalAnswerBindingV3
+  ): Promise<Extract<
+    SessionKernelLoopResultV2,
+    {
+      kind:
+        | 'answer'
+        | 'finalAnswerFailed'
+        | 'staleProviderResult';
+    }
+  >> {
+    const finalAnswer = this.loop.snapshot().finalAnswer;
+    if (
+      !finalAnswer
+      || finalAnswer.status === 'requesting'
+      || !sameSessionFinalAnswerAuthorityV3(
+        finalAnswer.binding,
+        binding
+      )
+    ) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_final_answer_binding_stale',
+        'Final-answer request does not bind the pending frozen Review.'
+      );
+    }
+    const result = await this.loop.runProviderTurn({
+      reason: 'finalAnswer',
+      target: { kind: 'finalAnswer', ...binding },
+    });
+    if (
+      result.kind !== 'answer'
+      && result.kind !== 'finalAnswerFailed'
+      && result.kind !== 'staleProviderResult'
+    ) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_final_answer_result_invalid',
+        'Final-answer Provider turn returned an invalid Session result.'
+      );
+    }
+    return result;
   }
 
   private requireProviderPlanRecorded(

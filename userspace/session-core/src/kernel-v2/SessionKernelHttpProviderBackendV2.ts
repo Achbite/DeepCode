@@ -13,6 +13,7 @@ import {
 import {
   providerCallableToolsV2,
   providerWireToolNameV2,
+  sessionPlanningResponseContractReminderV2,
 } from './providerContext.js';
 import type {
   SessionKernelProviderBackendOutputV2,
@@ -23,12 +24,16 @@ import type {
 } from './SessionKernelProviderAdapterV2.js';
 import type {
   SessionProviderResultMetadataV2,
+  SessionProviderTurnTerminalRecordV3,
   SessionProviderTurnInputV2,
 } from './types.js';
 import {
   boundedProviderUsageRecordV2,
   SessionKernelProviderTransportError,
 } from './providerStreamV1.js';
+import {
+  isExactSessionProviderOutcomeRecordV2,
+} from './providerToolCallQueue.js';
 import type {
   SessionKernelLlmStreamResultV2,
   SessionKernelLlmStreamToolItemV2,
@@ -43,8 +48,23 @@ export type {
   SessionKernelLlmTransportV2,
 } from './providerStreamV1.js';
 
-export const SESSION_PROVIDER_PLAN_DRAFT_V2_SCHEMA =
-  'deepcode.session.plan-draft.v2' as const;
+export const SESSION_PROVIDER_PLANNING_RESULT_V2_SCHEMA =
+  'deepcode.session.planning-result.v2' as const;
+
+export type SessionProviderPlanningResultV2 =
+  | {
+      kind: 'answer';
+      text: string;
+    }
+  | {
+      kind: 'plan';
+      plan: SessionProviderPlanDraftV2;
+    };
+
+export type SessionKernelProviderDecodeInputV2 = Pick<
+  SessionProviderTurnInputV2,
+  'providerTurnId' | 'target' | 'plan' | 'toolContext'
+>;
 
 /**
  * Provider-specific wire adapter. Kernel ToolIds are reversibly encoded only
@@ -66,17 +86,20 @@ implements SessionKernelProviderBackendV2 {
     const exposed = purpose === 'finalAnswer'
       ? []
       : providerCallableToolsV2(input);
-    const encodedNames = new Map(
-      exposed.map((tool) => [
-        providerWireToolNameV2(tool.toolId),
-        tool.toolId,
-      ])
+    const parentRequestId = providerContinuationParentIdV2(
+      input,
+      this.profileId
     );
     const request: LlmChatRequest = {
       requestId: input.providerTurnId,
+      ...(parentRequestId ? { parentRequestId } : {}),
       profileId: this.profileId,
       stream: true,
       messages: cloneJson(input.contextAssembly.messages),
+      ...(input.target.kind === 'planning'
+        && input.providerProfile.reasoningTransport === 'openaiPlaintext'
+        ? { responseFormat: { type: 'json_object' as const } }
+        : {}),
       tools: exposed.map((tool): ProviderWireToolDefinition => ({
         name: providerWireToolNameV2(tool.toolId),
         description: tool.description,
@@ -107,7 +130,56 @@ implements SessionKernelProviderBackendV2 {
         },
       },
     };
-    const response = await this.transport.request(request, input.signal);
+    const response = await this.transport.request(
+      request,
+      input.signal,
+      input.target.kind === 'planning'
+        ? undefined
+        : input.publicTextObserver
+    );
+    return decodeSessionKernelLlmStreamResultV2(
+      input,
+      response,
+      this.profileId
+    );
+  }
+}
+
+function providerContinuationParentIdV2(
+  input: SessionProviderTurnInputV2,
+  expectedProfileId: string
+): string | undefined {
+  if (input.purpose !== 'continuation') return undefined;
+  const previous = input.providerOutcomes.at(-1);
+  if (
+    input.providerProfile.providerProfileId !== expectedProfileId
+    || !isExactSessionProviderOutcomeRecordV2(
+      previous,
+      expectedProfileId
+    )
+    || previous.outputKind !== 'toolIntent'
+    || previous.toolSettlement.status !== 'completed'
+    || previous.providerResult.providerProfileId
+      !== input.providerProfile.providerProfileId
+    || previous.toolCallReceipt.providerTurnId
+      !== previous.providerTurnId
+    || previous.toolCallReceipt.callCount <= 0
+  ) {
+    return undefined;
+  }
+  return previous.providerTurnId;
+}
+
+/**
+ * Pure sealed-response decoder shared by the live transport and deterministic
+ * recovery. It performs the same ToolContext name mapping and semantic text,
+ * Plan, and tool classification without issuing a Provider request.
+ */
+export function decodeSessionKernelLlmStreamResultV2(
+  input: SessionKernelProviderDecodeInputV2,
+  response: SessionKernelLlmStreamResultV2,
+  expectedProfileId: string
+): SessionKernelProviderBackendOutputV2 {
     if (response.requestId !== input.providerTurnId) {
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_identity_mismatch',
@@ -116,7 +188,16 @@ implements SessionKernelProviderBackendV2 {
     }
     const providerResult = providerResultMetadataV2(
       response,
-      this.profileId
+      expectedProfileId
+    );
+    const exposed = input.target.kind === 'finalAnswer'
+      ? []
+      : providerCallableToolsV2(input);
+    const encodedNames = new Map(
+      exposed.map((tool) => [
+        providerWireToolNameV2(tool.toolId),
+        tool.toolId,
+      ])
     );
     const streamCalls = response.items.filter(
       (item): item is SessionKernelLlmStreamToolItemV2 =>
@@ -179,6 +260,37 @@ implements SessionKernelProviderBackendV2 {
         { kind: 'text' }
       > => item.kind === 'text'
     );
+    if (input.target.kind === 'planning') {
+      const planningResult = decodeProviderPlanningResultEnvelopeV2(
+        textItems.map((item) => item.text).join('')
+      );
+      if (planningResult.kind === 'plan') {
+        return {
+          kind: 'plan',
+          plan: planningResult.plan,
+          items: [],
+          completion: response.completion,
+          providerResult,
+          responseDigest,
+        };
+      }
+      return {
+        kind: 'text',
+        text: planningResult.text,
+        items: [{
+          kind: 'text',
+          phase: textItems.some(
+            (item) => item.phase === 'final_answer'
+          )
+            ? 'final_answer'
+            : 'unknown',
+          text: planningResult.text,
+        }],
+        completion: response.completion,
+        providerResult,
+        responseDigest,
+      };
+    }
     const firstFinalIndex = textItems.findIndex(
       (item) => item.phase === 'final_answer'
     );
@@ -206,19 +318,6 @@ implements SessionKernelProviderBackendV2 {
         responseDigest,
       };
     }
-    if (input.target.kind === 'planning') {
-      const plan = decodeProviderPlanDraftFrame(text);
-      if (plan) {
-        return {
-          kind: 'plan',
-          plan,
-          items: decodedItems,
-          completion: response.completion,
-          providerResult,
-          responseDigest,
-        };
-      }
-    }
     return {
       kind: 'text',
       text,
@@ -227,7 +326,50 @@ implements SessionKernelProviderBackendV2 {
       providerResult,
       responseDigest,
     };
+}
+
+/**
+ * Rehydrates one daemon-written completed terminal into the exact live stream
+ * result shape, then routes it through the shared sealed-response decoder.
+ */
+export function decodeCompletedProviderTerminalV3(
+  input: SessionKernelProviderDecodeInputV2,
+  terminal: SessionProviderTurnTerminalRecordV3,
+  expectedProfileId: string
+): SessionKernelProviderBackendOutputV2 {
+  const data = terminal.data;
+  if (
+    data.terminalKind !== 'completed'
+    || data.providerTurnId !== input.providerTurnId
+    || !data.completion
+    || !data.providerResult
+    || !data.responseDigest
+    || data.completion.responseDigest !== data.responseDigest
+    || data.completion.trace.terminalDigest
+      !== data.traceRef.terminalDigest
+    || data.completion.trace.sealDigest !== data.traceRef.sealDigest
+    || data.completion.trace.recordCount !== data.traceRef.recordCount
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_terminal_evidence_invalid',
+      'Completed Provider terminal cannot be reconstructed as one sealed response.'
+    );
   }
+  return decodeSessionKernelLlmStreamResultV2(
+    input,
+    {
+      requestId: data.providerTurnId,
+      items: cloneJson(data.orderedItems),
+      ...(data.providerResult.usage
+        ? { usage: cloneJson(data.providerResult.usage) }
+        : {}),
+      providerProfileId: data.providerResult.providerProfileId,
+      provider: data.providerResult.provider,
+      model: data.providerResult.model,
+      completion: cloneJson(data.completion),
+    },
+    expectedProfileId
+  );
 }
 
 function decodeProviderNativeArguments(
@@ -251,6 +393,7 @@ function assertProviderToolContextBindingV2(
 ): void {
   const bundle = input.toolContext.bundle;
   const contextRef = input.toolContext.contextRef;
+  const planningTarget = input.target.kind === 'planning';
   if (
     input.toolContext.fixedPrompt !== bundle.fixedPrompt
     || canonicalJson(input.toolContext.tools)
@@ -259,10 +402,18 @@ function assertProviderToolContextBindingV2(
     || contextRef.catalogDigest !== bundle.catalogDigest
     || contextRef.contextDigest !== bundle.contextDigest
     || bundle.tools.some((tool) => tool.availability !== 'ready')
-    || input.contextAssembly.messages.length !== 7
+    || input.contextAssembly.messages.length !== (planningTarget ? 9 : 8)
     || input.contextAssembly.messages[0]?.role !== 'system'
     || input.contextAssembly.messages[0]?.content
       !== bundle.fixedPrompt
+    || (
+      planningTarget
+      && (
+        input.contextAssembly.messages.at(-1)?.role !== 'system'
+        || input.contextAssembly.messages.at(-1)?.content
+          !== sessionPlanningResponseContractReminderV2()
+      )
+    )
     || input.contextAssembly.receipt.providerProfile
       .providerProfileId
       !== input.providerProfile.providerProfileId
@@ -280,32 +431,53 @@ function assertProviderToolContextBindingV2(
   }
 }
 
-function decodeProviderPlanDraftFrame(
+export function decodeProviderPlanningResultEnvelopeV2(
   text: string
-): SessionProviderPlanDraftV2 | undefined {
+): SessionProviderPlanningResultV2 {
   const trimmed = text.trim();
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
-    return undefined;
+    throw invalidPlanningResult();
   }
   let value: unknown;
   try {
     value = JSON.parse(trimmed) as unknown;
   } catch {
-    return undefined;
+    throw invalidPlanningResult();
   }
   const record = objectRecord(value);
-  if (record?.schemaVersion !== SESSION_PROVIDER_PLAN_DRAFT_V2_SCHEMA) {
-    return undefined;
+  if (
+    record?.schemaVersion
+      !== SESSION_PROVIDER_PLANNING_RESULT_V2_SCHEMA
+  ) {
+    throw invalidPlanningResult();
   }
-  exactKeys(record, [
-    'schemaVersion',
-    'title',
-    'objective',
-    'narrative',
-    'actions',
-  ]);
+  if (record.kind === 'answer') {
+    exactKeys(record, ['schemaVersion', 'kind', 'text']);
+    const answer = requiredText(record.text, 'text');
+    if (!answer.trim()) throw invalidPlanningResult();
+    return { kind: 'answer', text: answer };
+  }
+  if (record.kind !== 'plan') {
+    throw invalidPlanningResult();
+  }
+  exactKeys(record, ['schemaVersion', 'kind', 'plan']);
+  return {
+    kind: 'plan',
+    plan: decodeProviderPlanDraft(record.plan),
+  };
+}
+
+function decodeProviderPlanDraft(
+  value: unknown
+): SessionProviderPlanDraftV2 {
+  const record = objectRecord(value);
+  if (!record) throw invalidPlanningResult();
+  exactKeys(
+    record,
+    ['title', 'objective', 'narrative', 'actions']
+  );
   if (!Array.isArray(record.actions)) {
-    throw invalidPlanFrame();
+    throw invalidPlanningResult();
   }
   return {
     title: requiredText(record.title, 'title'),
@@ -319,19 +491,18 @@ function decodePlanAction(
   value: unknown
 ): SessionProviderPlanActionDraftV2 {
   const record = objectRecord(value);
-  if (!record) throw invalidPlanFrame();
+  if (!record) throw invalidPlanningResult();
   exactKeys(
     record,
     [
       'toolId',
       'requestedResources',
       'previewArguments',
-      'deadline',
     ],
     ['deadline']
   );
   if (!Array.isArray(record.requestedResources)) {
-    throw invalidPlanFrame();
+    throw invalidPlanningResult();
   }
   return {
     toolId: requiredIdentity(record.toolId, 'toolId'),
@@ -347,15 +518,15 @@ function decodePlanAction(
 
 function decodeRequestedResource(value: unknown): RequestedResourceV2 {
   const tagged = objectRecord(value);
-  if (!tagged) throw invalidPlanFrame();
+  if (!tagged) throw invalidPlanningResult();
   exactKeys(tagged, ['kind', 'data']);
   const data = objectRecord(tagged.data);
-  if (!data) throw invalidPlanFrame();
+  if (!data) throw invalidPlanningResult();
   switch (tagged.kind) {
     case 'workspacePath':
       exactKeys(data, ['path', 'access']);
       if (data.access !== 'read' && data.access !== 'write') {
-        throw invalidPlanFrame();
+        throw invalidPlanningResult();
       }
       return {
         kind: tagged.kind,
@@ -371,7 +542,7 @@ function decodeRequestedResource(value: unknown): RequestedResourceV2 {
         && data.area !== 'index'
         && data.area !== 'history'
       ) {
-        throw invalidPlanFrame();
+        throw invalidPlanningResult();
       }
       return { kind: tagged.kind, data: { area: data.area } };
     case 'networkUrl':
@@ -398,16 +569,16 @@ function decodeRequestedResource(value: unknown): RequestedResourceV2 {
         },
       };
     default:
-      throw invalidPlanFrame();
+      throw invalidPlanningResult();
   }
 }
 
 function decodeDeadline(value: unknown): DeadlineRequestV2 {
   const tagged = objectRecord(value);
-  if (!tagged) throw invalidPlanFrame();
+  if (!tagged) throw invalidPlanningResult();
   exactKeys(tagged, ['kind', 'data']);
   const data = objectRecord(tagged.data);
-  if (!data) throw invalidPlanFrame();
+  if (!data) throw invalidPlanningResult();
   if (tagged.kind === 'contractDefault') {
     exactKeys(data, []);
     return { kind: tagged.kind, data: {} };
@@ -423,7 +594,7 @@ function decodeDeadline(value: unknown): DeadlineRequestV2 {
       data: { value: Number(data.value) },
     };
   }
-  throw invalidPlanFrame();
+  throw invalidPlanningResult();
 }
 
 function exactKeys(
@@ -438,7 +609,7 @@ function exactKeys(
     )
     || Object.keys(record).some((key) => !permitted.has(key))
   ) {
-    throw invalidPlanFrame();
+    throw invalidPlanningResult();
   }
 }
 
@@ -455,27 +626,26 @@ function providerResultMetadataV2(
       'Provider result profile does not match the immutable Run bootstrap.'
     );
   }
-  const provider = optionalMetadataIdentity(
+  const provider = requiredMetadataIdentity(
     result.provider,
     'provider'
   );
-  const model = optionalMetadataIdentity(result.model, 'model');
+  const model = requiredMetadataIdentity(result.model, 'model');
   const usage = result.usage === undefined
     ? undefined
     : boundedProviderUsageRecordV2(result.usage);
   return {
     providerProfileId: expectedProfileId,
-    ...(provider ? { provider } : {}),
-    ...(model ? { model } : {}),
+    provider,
+    model,
     ...(usage ? { usage } : {}),
   };
 }
 
-function optionalMetadataIdentity(
+function requiredMetadataIdentity(
   value: unknown,
-  _field: string
-): string | undefined {
-  if (value === undefined) return undefined;
+  field: string
+): string {
   if (
     typeof value !== 'string'
     || !value
@@ -483,7 +653,10 @@ function optionalMetadataIdentity(
     || new TextEncoder().encode(value).byteLength > 1024
     || /[\u0000-\u001f\u007f-\u009f]/u.test(value)
   ) {
-    return undefined;
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_result_metadata_invalid',
+      `Provider result ${field} is missing or invalid.`
+    );
   }
   return value;
 }
@@ -506,7 +679,7 @@ function requiredIdentity(value: unknown, field: string): string {
     text.trim() !== text
     || /[\u0000-\u001f\u007f-\u009f]/u.test(text)
   ) {
-    throw invalidPlanFrame();
+    throw invalidPlanningResult();
   }
   return text;
 }
@@ -517,14 +690,14 @@ function requiredText(value: unknown, _field: string): string {
     || !value
     || new TextEncoder().encode(value).byteLength > 64 * 1024
   ) {
-    throw invalidPlanFrame();
+    throw invalidPlanningResult();
   }
   return value;
 }
 
-function invalidPlanFrame(): SessionKernelProviderTransportError {
+function invalidPlanningResult(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
-    'session_kernel_provider_plan_frame_invalid',
-    'Provider plan frame is invalid.'
+    'session_kernel_provider_planning_result_invalid',
+    'Planning response must be one exact deepcode.session.planning-result.v2 envelope.'
   );
 }

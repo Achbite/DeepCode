@@ -1,11 +1,19 @@
 import type { SessionKernelPortV2 } from './SessionKernelPortV2.js';
-import type { SessionKernelCheckpointV2 } from './state.js';
+import type {
+  ToolContextBundleV2,
+  ToolContextRefV2,
+} from '@deepcode/protocol';
+import type {
+  SessionKernelCheckpointRecoveryInputV3,
+  SessionKernelCheckpointV2,
+} from './state.js';
 import type {
   SessionKernelProjectionEventV2,
   SessionKernelPublicRequestRecordV2,
   SessionNaturalLanguagePlanV2,
   SessionPlanDecisionV2,
   SessionProviderTurnInputV2,
+  SessionProviderTurnDurableEvidenceV3,
   SessionProviderTurnOutputV2,
   SessionUserInputRecordV2,
 } from './types.js';
@@ -28,7 +36,28 @@ export interface SessionKernelProjectionReceiptV2 {
 }
 
 export interface SessionKernelPersistencePortV2 {
-  loadCheckpoint(runId: string): Promise<SessionKernelCheckpointV2 | undefined>;
+  loadCheckpoint(
+    runId: string,
+    recovery: SessionKernelCheckpointRecoveryInputV3
+  ): Promise<SessionKernelCheckpointV2 | undefined>;
+
+  /**
+   * Forces a durable-store refresh because the Daemon, not Session, appends
+   * these two records while a Provider request is in flight.
+   */
+  loadProviderTurnEvidence(
+    runId: string,
+    providerTurnId: string
+  ): Promise<SessionProviderTurnDurableEvidenceV3>;
+
+  /**
+   * Resolves the immutable Kernel-owned ToolContext that was bound to a
+   * durable Provider reservation. Session cannot create these snapshots.
+   */
+  loadToolContextSnapshot(
+    runId: string,
+    contextRef: ToolContextRefV2
+  ): Promise<ToolContextBundleV2>;
 
   loadLatestPlan(
     runId: string

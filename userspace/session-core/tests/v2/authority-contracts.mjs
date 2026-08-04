@@ -2,6 +2,7 @@ import {
   StrictSessionKernelProviderAdapterV2,
   normalizeProviderKernelToolIntentV2,
   providerCallableToolsV2,
+  providerWireToolNameV2,
   recordSessionToolIntentSubmissionV2,
   sha256Hash,
   canonicalJson,
@@ -182,16 +183,17 @@ async function providerNativeCallBecomesOneStrictContextReadIntent() {
 
 async function providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission() {
   const harness = await openSessionHarness();
+  const providerToolName = providerWireToolNameV2('fs.read');
   const backendCalls = [
     {
       callId: 'provider-call-ordered-read-1',
-      toolName: 'read_file',
+      toolName: providerToolName,
       toolId: 'fs.read',
       arguments: { path: 'README.md' },
     },
     {
       callId: 'provider-call-ordered-read-2',
-      toolName: 'read_file_again',
+      toolName: providerToolName,
       toolId: 'fs.read',
       arguments: { path: 'README.md' },
     },
@@ -264,13 +266,13 @@ async function providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission()
       {
         ordinal: 1,
         callId: 'provider-call-ordered-read-1',
-        toolName: 'read_file',
+        toolName: providerToolName,
         toolId: 'fs.read',
       },
       {
         ordinal: 2,
         callId: 'provider-call-ordered-read-2',
-        toolName: 'read_file_again',
+        toolName: providerToolName,
         toolId: 'fs.read',
       },
     ]

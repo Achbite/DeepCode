@@ -114,6 +114,7 @@ function factMatcherForTarget(
   target: SessionProviderTurnTargetV2
 ): (fact: KernelFactProjectionV2) => boolean {
   if (target.kind === 'planning') return () => false;
+  if (target.kind === 'finalAnswer') return () => true;
   if (target.kind === 'contextRead') {
     return (fact) => fact.lineage.operationId === target.operationId;
   }

@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
-import http.server
+import hashlib
 import http.client
+import http.server
+import ctypes
+import errno
+import functools
 import json
 import os
 import pathlib
@@ -13,6 +17,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -41,7 +46,10 @@ PROVIDER_REASONING = (
 CLI_PROMPT = "Return the controlled Host integration response through the CLI."
 TEST_API_KEY = "host-v2-integration-key"
 EXEC_DAEMON_ARGUMENT = "--exec-owned-daemon"
+CLEANUP_OWNERS_ARGUMENT = "--cleanup-owned-resources"
 EXEC_SIGNAL_MASK_ENV = "DEEPCODE_HOST_V2_EXEC_SIGNAL_MASK"
+EXEC_RELEASE_FD_ENV = "DEEPCODE_HOST_V2_EXEC_RELEASE_FD"
+OWNER_RECORD_SCHEMA = "deepcode.test.owner-process-group.v1"
 CONTROL_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
 BRIDGE = (ROOT / "userspace/session-core/dist/hostBridgeV2.js").resolve()
 NODE_TEXT = shutil.which("node")
@@ -442,54 +450,972 @@ def assert_provider_received_current_input(
 
 
 @dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    process_group: int
+    session_id: int
+    start_identity: str
+    effective_uid: int
+    pid_namespace: str
+    executable: str
+    state: str
+
+
+@dataclass(frozen=True)
+class OwnerRecord:
+    owner_id: str
+    leader_pid: int
+    process_group: int
+    process_session_id: int
+    start_identity: str
+    effective_uid: int
+    pid_namespace: str
+    allowed_executables: tuple[str, ...]
+    run_root: str
+    config_root: str
+    daemon_instance_id: str
+    listen_host: str
+    port: int
+
+    def material(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": OWNER_RECORD_SCHEMA,
+            "leaderPid": self.leader_pid,
+            "processGroupId": self.process_group,
+            "processSessionId": self.process_session_id,
+            "startIdentity": self.start_identity,
+            "effectiveUid": self.effective_uid,
+            "pidNamespace": self.pid_namespace,
+            "allowedExecutables": list(self.allowed_executables),
+            "runRoot": self.run_root,
+            "configRoot": self.config_root,
+            "daemonInstanceId": self.daemon_instance_id,
+            "listenHost": self.listen_host,
+            "port": self.port,
+        }
+
+    def to_json(self) -> dict[str, Any]:
+        return {**self.material(), "ownerId": self.owner_id}
+
+    @classmethod
+    def create(
+        cls,
+        identity: ProcessIdentity,
+        *,
+        allowed_executables: tuple[str, ...],
+        run_root: pathlib.Path,
+        config_root: pathlib.Path,
+        daemon_instance_id: str,
+        port: int,
+    ) -> "OwnerRecord":
+        provisional = cls(
+            owner_id="",
+            leader_pid=identity.pid,
+            process_group=identity.process_group,
+            process_session_id=identity.session_id,
+            start_identity=identity.start_identity,
+            effective_uid=identity.effective_uid,
+            pid_namespace=identity.pid_namespace,
+            allowed_executables=allowed_executables,
+            run_root=str(run_root),
+            config_root=str(config_root),
+            daemon_instance_id=daemon_instance_id,
+            listen_host="127.0.0.1",
+            port=port,
+        )
+        owner_id = "sha256:" + hashlib.sha256(
+            json.dumps(
+                provisional.material(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        return cls(**{**provisional.__dict__, "owner_id": owner_id})
+
+    @classmethod
+    def decode(cls, value: Any) -> "OwnerRecord":
+        require(isinstance(value, dict), "owner registry record must be an object")
+        allowed_keys = {
+            "schemaVersion",
+            "ownerId",
+            "leaderPid",
+            "processGroupId",
+            "processSessionId",
+            "startIdentity",
+            "effectiveUid",
+            "pidNamespace",
+            "allowedExecutables",
+            "runRoot",
+            "configRoot",
+            "daemonInstanceId",
+            "listenHost",
+            "port",
+        }
+        require(set(value) == allowed_keys, "owner registry record fields are invalid")
+        require(value.get("schemaVersion") == OWNER_RECORD_SCHEMA, "owner registry schema is unsupported")
+        executables = value.get("allowedExecutables")
+        require(
+            isinstance(executables, list)
+            and executables
+            and all(isinstance(item, str) and item for item in executables),
+            "owner executable identity is invalid",
+        )
+        record = cls(
+            owner_id=str(value.get("ownerId", "")),
+            leader_pid=value.get("leaderPid"),
+            process_group=value.get("processGroupId"),
+            process_session_id=value.get("processSessionId"),
+            start_identity=str(value.get("startIdentity", "")),
+            effective_uid=value.get("effectiveUid"),
+            pid_namespace=str(value.get("pidNamespace", "")),
+            allowed_executables=tuple(executables),
+            run_root=str(value.get("runRoot", "")),
+            config_root=str(value.get("configRoot", "")),
+            daemon_instance_id=str(value.get("daemonInstanceId", "")),
+            listen_host=str(value.get("listenHost", "")),
+            port=value.get("port"),
+        )
+        require(
+            isinstance(record.leader_pid, int)
+            and record.leader_pid > 1
+            and record.process_group == record.leader_pid
+            and record.process_session_id == record.leader_pid,
+            "owner leader/process-group identity is invalid",
+        )
+        require(
+            isinstance(record.effective_uid, int)
+            and record.effective_uid >= 0
+            and record.start_identity
+            and record.pid_namespace,
+            "owner process identity is incomplete",
+        )
+        require(
+            record.listen_host == "127.0.0.1"
+            and isinstance(record.port, int)
+            and 0 < record.port < 65_536,
+            "owner listener identity is invalid",
+        )
+        run_root = pathlib.Path(record.run_root)
+        config_root = pathlib.Path(record.config_root)
+        require(
+            run_root.is_absolute()
+            and config_root.is_absolute()
+            and config_root.is_relative_to(run_root),
+            "owner root identity is invalid",
+        )
+        expected = OwnerRecord.create(
+            ProcessIdentity(
+                pid=record.leader_pid,
+                process_group=record.process_group,
+                session_id=record.process_session_id,
+                start_identity=record.start_identity,
+                effective_uid=record.effective_uid,
+                pid_namespace=record.pid_namespace,
+                executable=record.allowed_executables[0],
+                state="?",
+            ),
+            allowed_executables=record.allowed_executables,
+            run_root=run_root,
+            config_root=config_root,
+            daemon_instance_id=record.daemon_instance_id,
+            port=record.port,
+        )
+        require(record.owner_id == expected.owner_id, "owner registry digest is invalid")
+        return record
+
+
+@dataclass(frozen=True)
+class OwnerObservation:
+    state: str
+    detail: str
+    member_pids: tuple[int, ...] = ()
+
+
+@functools.lru_cache(maxsize=1)
+def _host_boot_identity() -> str:
+    boot_id_path = pathlib.Path("/proc/sys/kernel/random/boot_id")
+    if boot_id_path.is_file():
+        return "linux:" + boot_id_path.read_text(encoding="ascii").strip()
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise IntegrationFailure(f"host boot identity is unavailable: {safe_diagnostic(error)}") from error
+    return "host:" + completed.stdout.strip()
+
+
+def _linux_process_stat(pid: int) -> tuple[str, int, int, str]:
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError as error:
+        raise ProcessLookupError(pid) from error
+    except PermissionError:
+        raise
+    except OSError as error:
+        raise IntegrationFailure(f"process stat is unavailable for pid {pid}: {safe_diagnostic(error)}") from error
+    close = raw.rfind(")")
+    require(close > 0, f"process stat is invalid for pid {pid}")
+    fields = raw[close + 2 :].split()
+    require(len(fields) > 19, f"process stat is truncated for pid {pid}")
+    return fields[0], int(fields[2]), int(fields[3]), fields[19]
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _darwin_libraries() -> tuple[Any, Any]:
+    require(os.uname().sysname == "Darwin", "Darwin process APIs are unavailable")
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    except OSError as error:
+        raise IntegrationFailure(
+            f"Darwin process libraries are unavailable: {safe_diagnostic(error)}"
+        ) from error
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    libproc.proc_pidpath.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    libproc.proc_pidpath.restype = ctypes.c_int
+    libc.sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    libc.sysctl.restype = ctypes.c_int
+    return libproc, libc
+
+
+def _raise_process_api_error(pid: int, context: str) -> None:
+    error_number = ctypes.get_errno()
+    if error_number in (errno.ESRCH, errno.ENOENT):
+        raise ProcessLookupError(pid)
+    if error_number in (errno.EPERM, errno.EACCES):
+        raise PermissionError(error_number, os.strerror(error_number), pid)
+    raise IntegrationFailure(
+        f"{context} failed for pid {pid}: "
+        f"{safe_diagnostic(os.strerror(error_number) if error_number else 'unknown error')}"
+    )
+
+
+def _darwin_process_info(pid: int) -> _DarwinProcBsdInfo:
+    libproc, _ = _darwin_libraries()
+    info = _DarwinProcBsdInfo()
+    ctypes.set_errno(0)
+    read = libproc.proc_pidinfo(
+        pid,
+        3,  # PROC_PIDTBSDINFO
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if read == 0:
+        _raise_process_api_error(pid, "proc_pidinfo")
+    require(read == ctypes.sizeof(info), f"proc_pidinfo was truncated for pid {pid}")
+    require(info.pbi_pid == pid, f"proc_pidinfo changed identity for pid {pid}")
+    return info
+
+
+def _darwin_process_path(pid: int, *, zombie: bool) -> str:
+    libproc, _ = _darwin_libraries()
+    buffer = ctypes.create_string_buffer(4096)
+    ctypes.set_errno(0)
+    read = libproc.proc_pidpath(pid, buffer, len(buffer))
+    if read <= 0:
+        if zombie and ctypes.get_errno() in (0, errno.ESRCH, errno.ENOENT):
+            return ""
+        _raise_process_api_error(pid, "proc_pidpath")
+    try:
+        path = os.fsdecode(buffer.raw[:read].split(b"\0", 1)[0])
+        return str(pathlib.Path(path).resolve(strict=True))
+    except (OSError, UnicodeError) as error:
+        raise IntegrationFailure(
+            f"Darwin executable identity is invalid for pid {pid}: {safe_diagnostic(error)}"
+        ) from error
+
+
+def _darwin_process_arguments(pid: int) -> bytes:
+    _, libc = _darwin_libraries()
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    size = ctypes.c_size_t(0)
+    ctypes.set_errno(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        _raise_process_api_error(pid, "KERN_PROCARGS2 size query")
+    require(0 < size.value <= 16 * 1024 * 1024, "Darwin process arguments are unbounded")
+    buffer = ctypes.create_string_buffer(size.value)
+    ctypes.set_errno(0)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        _raise_process_api_error(pid, "KERN_PROCARGS2 read")
+    return bytes(buffer.raw[: size.value])
+
+
+def _ps_field(pid: int, field: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", f"{field}=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise IntegrationFailure(f"process identity query failed for pid {pid}: {safe_diagnostic(error)}") from error
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise ProcessLookupError(pid)
+    return completed.stdout.strip()
+
+
+def capture_process_identity(pid: int) -> ProcessIdentity:
+    proc_dir = pathlib.Path(f"/proc/{pid}")
+    if proc_dir.is_dir():
+        state, process_group, session_id, start_ticks = _linux_process_stat(pid)
+        try:
+            executable = str((proc_dir / "exe").resolve(strict=True))
+            pid_namespace = os.readlink(proc_dir / "ns/pid")
+            status_lines = (proc_dir / "status").read_text(encoding="ascii").splitlines()
+            uid_line = next(
+                (line for line in status_lines if line.startswith("Uid:")),
+                "",
+            )
+            uid_fields = uid_line.split()
+            require(len(uid_fields) >= 3, f"process effective UID is invalid for pid {pid}")
+            effective_uid = int(uid_fields[2])
+        except FileNotFoundError as error:
+            if state == "Z":
+                executable = ""
+                pid_namespace = os.readlink(proc_dir / "ns/pid")
+                effective_uid = proc_dir.stat().st_uid
+            else:
+                raise ProcessLookupError(pid) from error
+        except PermissionError:
+            raise
+        verified_state, verified_group, verified_session, verified_start = (
+            _linux_process_stat(pid)
+        )
+        require(
+            (verified_group, verified_session, verified_start)
+            == (process_group, session_id, start_ticks),
+            f"process identity changed during observation for pid {pid}",
+        )
+        return ProcessIdentity(
+            pid=pid,
+            process_group=process_group,
+            session_id=session_id,
+            start_identity=f"{_host_boot_identity()}:{start_ticks}",
+            effective_uid=effective_uid,
+            pid_namespace=pid_namespace,
+            executable=executable,
+            state=verified_state,
+        )
+
+    require(os.uname().sysname == "Darwin", "unsupported process identity platform")
+    info = _darwin_process_info(pid)
+    zombie = info.pbi_status == 5  # SZOMB
+    try:
+        session_id = os.getsid(pid)
+    except ProcessLookupError:
+        raise
+    except PermissionError:
+        raise
+    verified = _darwin_process_info(pid)
+    require(
+        (
+            int(verified.pbi_pgid),
+            int(verified.pbi_uid),
+            int(verified.pbi_start_tvsec),
+            int(verified.pbi_start_tvusec),
+        )
+        == (
+            int(info.pbi_pgid),
+            int(info.pbi_uid),
+            int(info.pbi_start_tvsec),
+            int(info.pbi_start_tvusec),
+        ),
+        f"Darwin process identity changed during observation for pid {pid}",
+    )
+    return ProcessIdentity(
+        pid=pid,
+        process_group=int(info.pbi_pgid),
+        session_id=session_id,
+        start_identity=(
+            f"{_host_boot_identity()}:{int(info.pbi_start_tvsec)}:"
+            f"{int(info.pbi_start_tvusec)}"
+        ),
+        effective_uid=int(info.pbi_uid),
+        pid_namespace=f"host:{os.uname().sysname}:{_host_boot_identity()}",
+        executable=_darwin_process_path(pid, zombie=zombie),
+        state="Z" if zombie else str(int(info.pbi_status)),
+    )
+
+
+def process_group_member_pids(process_group: int) -> tuple[int, ...]:
+    proc_root = pathlib.Path("/proc")
+    members: list[int] = []
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                if os.getpgid(pid) == process_group:
+                    members.append(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError as error:
+                raise IntegrationFailure(
+                    f"process-group membership is not readable for pid {pid}: "
+                    f"{safe_diagnostic(error)}"
+                ) from error
+        return tuple(sorted(members))
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,pgid="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise IntegrationFailure(f"process-group enumeration failed: {safe_diagnostic(error)}") from error
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            if int(fields[1]) == process_group:
+                members.append(int(fields[0]))
+    return tuple(sorted(members))
+
+
+def _current_pid_namespace() -> str:
+    namespace = pathlib.Path("/proc/self/ns/pid")
+    if namespace.exists():
+        try:
+            return os.readlink(namespace)
+        except PermissionError as error:
+            raise IntegrationFailure(
+                f"cleanup PID namespace is not readable: {safe_diagnostic(error)}"
+            ) from error
+    return f"host:{os.uname().sysname}:{_host_boot_identity()}"
+
+
+def _all_process_pids() -> tuple[int, ...]:
+    proc_root = pathlib.Path("/proc")
+    if proc_root.is_dir():
+        return tuple(
+            sorted(int(entry.name) for entry in proc_root.iterdir() if entry.name.isdigit())
+        )
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise IntegrationFailure(
+            f"process enumeration failed: {safe_diagnostic(error)}"
+        ) from error
+    return tuple(
+        sorted(
+            int(line.strip())
+            for line in completed.stdout.splitlines()
+            if line.strip().isdigit()
+        )
+    )
+
+
+def _process_arguments_and_environment(pid: int) -> bytes:
+    proc_dir = pathlib.Path(f"/proc/{pid}")
+    if proc_dir.is_dir():
+        try:
+            return (proc_dir / "cmdline").read_bytes() + (proc_dir / "environ").read_bytes()
+        except FileNotFoundError as error:
+            raise ProcessLookupError(pid) from error
+        except PermissionError:
+            raise
+        except OSError as error:
+            if error.errno in (errno.ESRCH, errno.ENOENT):
+                raise ProcessLookupError(pid) from error
+            raise IntegrationFailure(
+                f"process arguments are unavailable for pid {pid}: {safe_diagnostic(error)}"
+            ) from error
+    return _darwin_process_arguments(pid)
+
+
+def process_owner_binding(pid: int, record: OwnerRecord) -> bool | None:
+    try:
+        material = _process_arguments_and_environment(pid).split(b"\0")
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    expected = {
+        f"DEEPCODE_CONFIG_DIR={record.config_root}".encode("utf-8"),
+        f"DEEPCODE_HOST_INSTANCE_ID_V2={record.daemon_instance_id}".encode("utf-8"),
+    }
+    return expected.issubset(set(material))
+
+
+def _normalized_absolute_path_reference(value: str) -> pathlib.Path | None:
+    deleted_suffix = " (deleted)"
+    if value.endswith(deleted_suffix):
+        value = value[: -len(deleted_suffix)]
+    if not value or not os.path.isabs(value):
+        return None
+    return pathlib.Path(os.path.normpath(value))
+
+
+def _path_reference_is_within_owner_roots(
+    value: str,
+    roots: tuple[pathlib.Path, ...],
+) -> bool:
+    candidates = [value]
+    if "=" in value:
+        candidates.append(value.split("=", 1)[1])
+    for candidate in candidates:
+        path = _normalized_absolute_path_reference(candidate)
+        if path is None:
+            continue
+        if any(path == root or path.is_relative_to(root) for root in roots):
+            return True
+    return False
+
+
+def process_references_owner_roots(pid: int, record: OwnerRecord) -> bool | None:
+    proc_dir = pathlib.Path(f"/proc/{pid}")
+    roots = (pathlib.Path(record.run_root), pathlib.Path(record.config_root))
+    try:
+        tokens = [
+            token.decode("utf-8", errors="ignore")
+            for token in _process_arguments_and_environment(pid).split(b"\0")
+            if token
+        ]
+        links: list[str] = []
+        if proc_dir.is_dir():
+            for link in (proc_dir / "cwd",):
+                try:
+                    links.append(os.readlink(link))
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    return None
+            fd_dir = proc_dir / "fd"
+            if fd_dir.is_dir():
+                for entry in fd_dir.iterdir():
+                    try:
+                        links.append(os.readlink(entry))
+                    except FileNotFoundError:
+                        continue
+                    except PermissionError:
+                        return None
+                    except OSError:
+                        continue
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return any(
+        _path_reference_is_within_owner_roots(value, roots)
+        for value in (*tokens, *links)
+    )
+
+
+def leader_binding_matches(record: OwnerRecord) -> bool | None:
+    environment_binding = process_owner_binding(record.leader_pid, record)
+    if environment_binding is not True:
+        return environment_binding
+    try:
+        status, body = request_json(
+            f"http://{record.listen_host}:{record.port}",
+            "GET",
+            "/api/host/identity",
+            timeout=0.3,
+        )
+    except IntegrationFailure:
+        return True
+    identity = body.get("data") if status == 200 and isinstance(body, dict) else None
+    http_binding = (
+        isinstance(identity, dict)
+        and identity.get("instanceId") == record.daemon_instance_id
+        and identity.get("pid") == record.leader_pid
+    )
+    return http_binding
+
+
+def _identity_matches_record(identity: ProcessIdentity, record: OwnerRecord) -> bool:
+    executable_matches = identity.executable in record.allowed_executables
+    if identity.state.startswith("Z") and not identity.executable:
+        executable_matches = True
+    return (
+        identity.pid == record.leader_pid
+        and identity.process_group == record.process_group
+        and identity.session_id == record.process_session_id
+        and identity.start_identity == record.start_identity
+        and identity.effective_uid == record.effective_uid
+        and identity.pid_namespace == record.pid_namespace
+        and executable_matches
+    )
+
+
+def _member_is_owned(
+    pid: int,
+    identity: ProcessIdentity,
+    record: OwnerRecord,
+) -> bool | None:
+    if (
+        identity.process_group != record.process_group
+        or identity.session_id != record.process_session_id
+        or identity.effective_uid != record.effective_uid
+        or identity.pid_namespace != record.pid_namespace
+    ):
+        return False
+    binding = process_owner_binding(pid, record)
+    if binding is True:
+        return True
+    roots = process_references_owner_roots(pid, record)
+    if binding is None or roots is None:
+        return None
+    return roots
+
+
+def observe_owner(record: OwnerRecord) -> OwnerObservation:
+    if os.geteuid() != record.effective_uid:
+        return OwnerObservation(
+            "permissionDenied",
+            "cleanup EUID does not match the owner record",
+        )
+    try:
+        if _current_pid_namespace() != record.pid_namespace:
+            return OwnerObservation(
+                "unverifiable",
+                "cleanup PID namespace does not match the owner record",
+            )
+        members = process_group_member_pids(record.process_group)
+    except IntegrationFailure as error:
+        return OwnerObservation("unverifiable", safe_diagnostic(error))
+    if not members:
+        return OwnerObservation("absent", "process group has no members")
+
+    if record.leader_pid in members:
+        for _ in range(3):
+            try:
+                current = capture_process_identity(record.leader_pid)
+                break
+            except ProcessLookupError:
+                current = None
+                time.sleep(0)
+            except PermissionError:
+                return OwnerObservation(
+                    "permissionDenied",
+                    "leader identity is not readable",
+                    members,
+                )
+            except IntegrationFailure as error:
+                return OwnerObservation("unverifiable", safe_diagnostic(error), members)
+        else:
+            current = None
+        if current is None:
+            return OwnerObservation(
+                "unverifiable",
+                "leader disappeared during exact identity observation",
+                members,
+            )
+        if not _identity_matches_record(current, record):
+            return OwnerObservation("identityMismatch", "leader identity changed", members)
+        if not current.state.startswith("Z"):
+            binding = leader_binding_matches(record)
+            if binding is None:
+                return OwnerObservation(
+                    "unverifiable",
+                    "leader root/instance binding is unverifiable",
+                    members,
+                )
+            if not binding:
+                return OwnerObservation(
+                    "identityMismatch",
+                    "leader root/instance binding changed",
+                    members,
+                )
+        for pid in members:
+            if pid == record.leader_pid:
+                continue
+            try:
+                member = capture_process_identity(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                return OwnerObservation(
+                    "permissionDenied",
+                    "group member identity is not readable",
+                    members,
+                )
+            except IntegrationFailure as error:
+                return OwnerObservation("unverifiable", safe_diagnostic(error), members)
+            if (
+                member.process_group != record.process_group
+                or member.session_id != record.process_session_id
+                or member.effective_uid != record.effective_uid
+                or member.pid_namespace != record.pid_namespace
+            ):
+                return OwnerObservation(
+                    "identityMismatch",
+                    "exact leader group contains an unrelated member",
+                    members,
+                )
+        return OwnerObservation(
+            "exactOwnedSignalable",
+            "exact leader identity and group members are live",
+            members,
+        )
+
+    owned_members = 0
+    unrelated_members = 0
+    for pid in members:
+        try:
+            member = capture_process_identity(pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return OwnerObservation(
+                "permissionDenied",
+                "orphan group member is not readable",
+                members,
+            )
+        except IntegrationFailure as error:
+            return OwnerObservation("unverifiable", safe_diagnostic(error), members)
+        owned = _member_is_owned(pid, member, record)
+        if owned is None:
+            return OwnerObservation(
+                "unverifiable",
+                "orphan group ownership is unverifiable",
+                members,
+            )
+        if owned:
+            owned_members += 1
+        else:
+            unrelated_members += 1
+    if owned_members and unrelated_members:
+        return OwnerObservation(
+            "identityMismatch",
+            "owned and unrelated processes share the numeric PGID",
+            members,
+        )
+    if owned_members:
+        return OwnerObservation(
+            "exactOwnedSignalable",
+            "leader exited but exact owned group members remain",
+            members,
+        )
+    return OwnerObservation(
+        "absent",
+        "leader disappeared and numeric PGID belongs only to unrelated processes",
+        members,
+    )
+
+
+def _darwin_process_references_owner(pid: int, record: OwnerRecord) -> bool | None:
+    try:
+        info = _darwin_process_info(pid)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    if int(info.pbi_uid) != record.effective_uid:
+        return False
+    try:
+        session_id = os.getsid(pid)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+
+    binding = process_owner_binding(pid, record)
+    roots = process_references_owner_roots(pid, record)
+    try:
+        verified = _darwin_process_info(pid)
+        verified_session_id = os.getsid(pid)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    if (
+        int(verified.pbi_uid),
+        int(verified.pbi_pgid),
+        verified_session_id,
+        int(verified.pbi_start_tvsec),
+        int(verified.pbi_start_tvusec),
+    ) != (
+        int(info.pbi_uid),
+        int(info.pbi_pgid),
+        session_id,
+        int(info.pbi_start_tvsec),
+        int(info.pbi_start_tvusec),
+    ):
+        return None
+    if binding is None or roots is None:
+        return None
+    return binding or roots
+
+
+def owned_member_pids(record: OwnerRecord) -> tuple[int, ...] | None:
+    owned: list[int] = []
+    darwin = not pathlib.Path("/proc").is_dir() and os.uname().sysname == "Darwin"
+    for pid in _all_process_pids():
+        if darwin:
+            referenced = _darwin_process_references_owner(pid, record)
+            if referenced is None:
+                return None
+            if referenced:
+                owned.append(pid)
+            continue
+        try:
+            identity = capture_process_identity(pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return None
+        except IntegrationFailure:
+            if pid in (record.leader_pid, *process_group_member_pids(record.process_group)):
+                return None
+            continue
+        if (
+            identity.effective_uid != record.effective_uid
+            or identity.pid_namespace != record.pid_namespace
+        ):
+            continue
+        binding = process_owner_binding(pid, record)
+        if binding is True:
+            owned.append(pid)
+        elif binding is None and (
+            identity.process_group == record.process_group
+            or identity.session_id == record.process_session_id
+        ):
+            return None
+    return tuple(sorted(set(owned)))
+
+
+@dataclass(frozen=True)
 class OwnerRegistry:
     path: pathlib.Path
 
-    def _read(self) -> list[int]:
+    def _read(self) -> list[OwnerRecord]:
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()
         except OSError as error:
             raise IntegrationFailure(
-                f"owner PGID registry is unavailable: {safe_diagnostic(error)}"
+                f"owner identity registry is unavailable: {safe_diagnostic(error)}"
             ) from error
-        groups: list[int] = []
+        records: list[OwnerRecord] = []
         for line in lines:
-            require(line.isascii() and line.isdigit(), "owner PGID registry is invalid")
-            process_group = int(line)
-            require(process_group > 1, "owner PGID registry contains an unsafe group")
-            groups.append(process_group)
-        require(len(groups) == len(set(groups)), "owner PGID registry contains duplicates")
-        return groups
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise IntegrationFailure("owner identity registry contains invalid JSON") from error
+            records.append(OwnerRecord.decode(value))
+        identities = [record.owner_id for record in records]
+        groups = [record.process_group for record in records]
+        require(len(identities) == len(set(identities)), "owner registry contains duplicate identities")
+        require(len(groups) == len(set(groups)), "owner registry contains duplicate process groups")
+        return records
 
-    def _replace(self, groups: list[int]) -> None:
+    def _replace(self, records: list[OwnerRecord]) -> None:
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         try:
             with temporary.open("x", encoding="utf-8") as handle:
                 os.fchmod(handle.fileno(), 0o600)
-                for process_group in groups:
-                    handle.write(f"{process_group}\n")
+                for record in records:
+                    handle.write(json.dumps(record.to_json(), sort_keys=True, separators=(",", ":")))
+                    handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         except OSError as error:
             try:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
             raise IntegrationFailure(
-                f"owner PGID registry update failed: {safe_diagnostic(error)}"
+                f"owner identity registry update failed: {safe_diagnostic(error)}"
             ) from error
 
-    def register(self, process_group: int) -> None:
-        require(process_group > 1, "refusing to register an unsafe process group")
-        groups = self._read()
-        require(process_group not in groups, "owned process group is already registered")
-        self._replace([*groups, process_group])
+    def register(self, record: OwnerRecord) -> None:
+        records = self._read()
+        require(
+            all(existing.owner_id != record.owner_id for existing in records),
+            "owner identity is already registered",
+        )
+        require(
+            all(existing.process_group != record.process_group for existing in records),
+            "owner process group is already registered",
+        )
+        self._replace([*records, record])
 
-    def unregister(self, process_group: int) -> None:
-        groups = self._read()
-        require(process_group in groups, "owned process group was not registered")
-        self._replace([group for group in groups if group != process_group])
+    def unregister(self, record: OwnerRecord) -> None:
+        records = self._read()
+        require(record in records, "exact owner identity was not registered")
+        self._replace([existing for existing in records if existing != record])
+
+    def contains_process_group(self, process_group: int) -> bool:
+        return any(record.process_group == process_group for record in self._read())
+
+    def contains(self, record: OwnerRecord) -> bool:
+        return record in self._read()
 
 
 @dataclass
@@ -501,6 +1427,7 @@ class OwnedDaemon:
     host_capability: str
     instance_id: str
     owner_registry: OwnerRegistry
+    owner_record: OwnerRecord
     owner_registered: bool = False
 
     @property
@@ -509,7 +1436,7 @@ class OwnedDaemon:
 
     @property
     def process_group(self) -> int:
-        return self.process.pid
+        return self.owner_record.process_group
 
     def diagnostics(self) -> str:
         self.log_handle.flush()
@@ -580,16 +1507,32 @@ def minimal_child_environment() -> dict[str, str]:
 
 def exec_owned_daemon_wrapper(daemon_path_text: str) -> None:
     encoded_mask = os.environ.pop(EXEC_SIGNAL_MASK_ENV, "")
+    encoded_release_fd = os.environ.pop(EXEC_RELEASE_FD_ENV, "")
     require(
         encoded_mask == ""
         or all(part.isascii() and part.isdigit() for part in encoded_mask.split(",")),
         "owned daemon signal mask is invalid",
+    )
+    require(
+        encoded_release_fd.isascii()
+        and encoded_release_fd.isdigit()
+        and int(encoded_release_fd) > 2,
+        "owned daemon release descriptor is invalid",
     )
     previous_mask = {
         signal.Signals(int(part))
         for part in encoded_mask.split(",")
         if part
     }
+    release_fd = int(encoded_release_fd)
+    try:
+        release = os.read(release_fd, 1)
+    finally:
+        os.close(release_fd)
+    require(
+        release == b"\x01",
+        "owned daemon exec was not released by a durable owner registration",
+    )
     daemon_path = pathlib.Path(daemon_path_text)
     require(
         daemon_path.is_absolute()
@@ -625,13 +1568,18 @@ def start_daemon(
         }
     )
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CONTROL_SIGNALS)
+    release_read_fd = -1
+    release_write_fd = -1
     environment[EXEC_SIGNAL_MASK_ENV] = ",".join(
         str(int(signal_number))
         for signal_number in sorted(previous_mask, key=int)
     )
     owned: OwnedDaemon | None = None
+    process: subprocess.Popen[bytes] | None = None
 
     try:
+        release_read_fd, release_write_fd = os.pipe()
+        environment[EXEC_RELEASE_FD_ENV] = str(release_read_fd)
         process = subprocess.Popen(
             [
                 sys.executable,
@@ -648,6 +1596,36 @@ def start_daemon(
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            pass_fds=(release_read_fd,),
+        )
+        os.close(release_read_fd)
+        release_read_fd = -1
+        identity = capture_process_identity(process.pid)
+        require(
+            identity.process_group == process.pid
+            and identity.session_id == process.pid
+            and identity.process_group != os.getpgrp(),
+            "daemon launcher did not enter its private process group",
+        )
+        allowed_executables = tuple(
+            dict.fromkeys(
+                (
+                    str(pathlib.Path(sys.executable).resolve(strict=True)),
+                    str(DAEMON.resolve(strict=True)),
+                )
+            )
+        )
+        require(
+            identity.executable in allowed_executables,
+            "daemon launcher executable identity is invalid",
+        )
+        owner_record = OwnerRecord.create(
+            identity,
+            allowed_executables=allowed_executables,
+            run_root=owner_registry.path.parent.resolve(strict=True),
+            config_root=config_root.resolve(strict=True),
+            daemon_instance_id=instance_id,
+            port=port,
         )
         owned = OwnedDaemon(
             process=process,
@@ -657,11 +1635,26 @@ def start_daemon(
             host_capability=host_capability,
             instance_id=instance_id,
             owner_registry=owner_registry,
+            owner_record=owner_record,
         )
-        owner_registry.register(owned.process_group)
+        owner_registry.register(owner_record)
         owned.owner_registered = True
+        require(
+            os.write(release_write_fd, b"\x01") == 1,
+            "daemon exec release was incomplete",
+        )
+        os.close(release_write_fd)
+        release_write_fd = -1
     except BaseException as error:
-        if owned is None:
+        if release_write_fd >= 0:
+            os.close(release_write_fd)
+            release_write_fd = -1
+        if release_read_fd >= 0:
+            os.close(release_read_fd)
+            release_read_fd = -1
+        if owned is None or not owned.owner_registered:
+            if process is not None:
+                process.wait()
             log_handle.close()
         else:
             try:
@@ -673,8 +1666,13 @@ def start_daemon(
                 ) from error
         raise
     finally:
+        if release_write_fd >= 0:
+            os.close(release_write_fd)
+        if release_read_fd >= 0:
+            os.close(release_read_fd)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
+    require(process is not None and owned is not None, "owned daemon registration is incomplete")
     try:
         if process.poll() is None:
             require(
@@ -723,91 +1721,225 @@ def start_daemon(
         raise
 
 
-def process_group_exists(process_group: int) -> bool:
+def _unsafe_owner_observation(
+    record: OwnerRecord,
+    observation: OwnerObservation,
+    action: str,
+) -> IntegrationFailure:
+    return IntegrationFailure(
+        f"{action} refused for owner {record.owner_id}: "
+        f"{observation.state}: {observation.detail}"
+    )
+
+
+def _maybe_reap_exact_zombie(
+    record: OwnerRecord,
+    observation: OwnerObservation,
+    process: subprocess.Popen[bytes] | None,
+) -> bool:
+    if (
+        process is None
+        or observation.state != "exactOwnedSignalable"
+        or observation.member_pids != (record.leader_pid,)
+    ):
+        return False
     try:
-        os.killpg(process_group, 0)
+        identity = capture_process_identity(record.leader_pid)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
+    except (PermissionError, IntegrationFailure):
+        return False
+    if not identity.state.startswith("Z") or not _identity_matches_record(identity, record):
+        return False
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        return False
     return True
 
 
-def signal_process_group(process_group: int, signal_number: int) -> None:
-    try:
-        os.killpg(process_group, signal_number)
-    except ProcessLookupError:
-        pass
-
-
-def wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
+def wait_for_owner_change(
+    record: OwnerRecord,
+    timeout: float,
+    *,
+    process: subprocess.Popen[bytes] | None,
+) -> OwnerObservation:
     deadline = time.monotonic() + timeout
-    while process_group_exists(process_group) and time.monotonic() < deadline:
+    while True:
+        observation = observe_owner(record)
+        if observation.state != "exactOwnedSignalable":
+            return observation
+        if _maybe_reap_exact_zombie(record, observation, process):
+            continue
+        if time.monotonic() >= deadline:
+            return observation
         time.sleep(0.05)
-    return not process_group_exists(process_group)
+
+
+def signal_exact_owner(record: OwnerRecord, signal_number: int) -> OwnerObservation:
+    observation = observe_owner(record)
+    if observation.state == "absent":
+        return observation
+    if observation.state != "exactOwnedSignalable":
+        raise _unsafe_owner_observation(
+            record,
+            observation,
+            f"signal {signal.Signals(signal_number).name}",
+        )
+    try:
+        os.killpg(record.process_group, signal_number)
+    except ProcessLookupError:
+        after = observe_owner(record)
+        if after.state != "absent":
+            raise _unsafe_owner_observation(
+                record,
+                after,
+                f"post-ESRCH {signal.Signals(signal_number).name}",
+            )
+        return after
+    except PermissionError as error:
+        raise IntegrationFailure(
+            f"signal {signal.Signals(signal_number).name} was denied for exact owner "
+            f"{record.owner_id}; owner evidence was retained: {safe_diagnostic(error)}"
+        ) from error
+    except OSError as error:
+        raise IntegrationFailure(
+            f"signal {signal.Signals(signal_number).name} failed for exact owner "
+            f"{record.owner_id}; owner evidence was retained: {safe_diagnostic(error)}"
+        ) from error
+    return observe_owner(record)
+
+
+def require_owner_absence(record: OwnerRecord) -> None:
+    remaining = owned_member_pids(record)
+    if remaining is None:
+        raise IntegrationFailure(
+            f"owner {record.owner_id} absence is unverifiable; owner evidence was retained"
+        )
+    require(
+        not remaining,
+        f"owner {record.owner_id} still has root/instance-bound processes: "
+        + ",".join(str(pid) for pid in remaining),
+    )
+
+
+def require_listener_rebindable(record: OwnerRecord) -> None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((record.listen_host, record.port))
+    except OSError as error:
+        raise IntegrationFailure(
+            f"owner {record.owner_id} listener {record.listen_host}:{record.port} "
+            f"is not rebindable; owner evidence was retained: {safe_diagnostic(error)}"
+        ) from error
+
+
+def _host_identity_response_matches(record: OwnerRecord, body: Any) -> bool:
+    identity = body.get("data") if isinstance(body, dict) and body.get("ok") is True else None
+    return (
+        isinstance(identity, dict)
+        and identity.get("instanceId") == record.daemon_instance_id
+        and identity.get("pid") == record.leader_pid
+    )
+
+
+def request_owned_host_shutdown(owned: OwnedDaemon) -> None:
+    status, identity_body = request_json(
+        owned.base_url,
+        "GET",
+        "/api/host/identity",
+        timeout=0.5,
+    )
+    require(
+        status == 200 and _host_identity_response_matches(owned.owner_record, identity_body),
+        "Host shutdown preflight returned a different daemon identity",
+    )
+    status, body = request_json(
+        owned.base_url,
+        "POST",
+        "/api/host/shutdown",
+        payload={},
+        host_capability=owned.host_capability,
+    )
+    data = require_api_ok(status, body, "Host shutdown")
+    identity = data.get("identity") if isinstance(data, dict) else None
+    require(
+        isinstance(data, dict)
+        and data.get("accepted") is True
+        and data.get("cleanupComplete") is True
+        and isinstance(identity, dict)
+        and identity.get("instanceId") == owned.instance_id
+        and identity.get("pid") == owned.owner_record.leader_pid,
+        "Host shutdown response returned a different daemon identity or incomplete cleanup",
+    )
+
+
+def cleanup_owner_record(
+    registry: OwnerRegistry,
+    record: OwnerRecord,
+    *,
+    process: subprocess.Popen[bytes] | None,
+    graceful_owner: OwnedDaemon | None,
+) -> None:
+    failures: list[str] = []
+    observation = observe_owner(record)
+    if observation.state not in ("absent", "exactOwnedSignalable"):
+        raise _unsafe_owner_observation(record, observation, "owner cleanup")
+
+    if graceful_owner is not None and observation.state == "exactOwnedSignalable":
+        try:
+            request_owned_host_shutdown(graceful_owner)
+        except IntegrationFailure as error:
+            message = safe_diagnostic(error, graceful_owner.host_capability)
+            if "different daemon identity" in message:
+                raise IntegrationFailure(
+                    f"{message}; no signal was sent and owner evidence was retained"
+                ) from error
+            failures.append(message)
+        observation = wait_for_owner_change(record, 15.0, process=process)
+        if observation.state == "exactOwnedSignalable":
+            failures.append("owned daemon did not exit through the Host shutdown boundary")
+        elif observation.state != "absent":
+            raise _unsafe_owner_observation(record, observation, "post-shutdown cleanup")
+
+    observation = observe_owner(record)
+    if observation.state == "exactOwnedSignalable":
+        signal_exact_owner(record, signal.SIGTERM)
+        observation = wait_for_owner_change(record, 5.0, process=process)
+    if observation.state == "exactOwnedSignalable":
+        signal_exact_owner(record, signal.SIGKILL)
+        observation = wait_for_owner_change(record, 5.0, process=process)
+    if observation.state != "absent":
+        raise _unsafe_owner_observation(record, observation, "final owner cleanup")
+
+    require_owner_absence(record)
+    if process is not None:
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired as error:
+            raise IntegrationFailure(
+                f"owner {record.owner_id} leader remained unreaped; owner evidence was retained"
+            ) from error
+    require_listener_rebindable(record)
+    registry.unregister(record)
+    if failures:
+        raise IntegrationFailure("; ".join(failures))
 
 
 def stop_owned_process_group(owned: OwnedDaemon, *, graceful: bool) -> None:
-    process = owned.process
-    failures: list[str] = []
-    if process.poll() is None and graceful:
-        try:
-            status, body = request_json(
-                owned.base_url,
-                "POST",
-                "/api/host/shutdown",
-                payload={},
-                host_capability=owned.host_capability,
-            )
-            data = require_api_ok(status, body, "Host shutdown")
-            require(
-                isinstance(data, dict)
-                and data.get("accepted") is True
-                and data.get("cleanupComplete") is True
-                and data.get("identity", {}).get("instanceId") == owned.instance_id,
-                "Host shutdown did not confirm owned-resource cleanup",
-            )
-        except IntegrationFailure as error:
-            failures.append(safe_diagnostic(error, owned.host_capability))
     try:
-        process.wait(timeout=15.0 if graceful else 1.0)
-    except subprocess.TimeoutExpired:
-        if graceful:
-            failures.append("owned daemon did not exit through the Host shutdown boundary")
-    if process_group_exists(owned.process_group):
-        if graceful and process.poll() is not None:
-            failures.append("Host shutdown left a daemon-owned child process")
-        signal_process_group(owned.process_group, signal.SIGTERM)
-        wait_for_process_group_exit(owned.process_group, 5.0)
-    if process_group_exists(owned.process_group):
-        signal_process_group(owned.process_group, signal.SIGKILL)
-        wait_for_process_group_exit(owned.process_group, 5.0)
-    try:
-        process.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        failures.append("daemon leader remained unreaped after process-group cleanup")
-    if not owned.log_handle.closed:
-        owned.log_handle.close()
-    if process_group_exists(owned.process_group):
-        failures.append("daemon-owned process group still exists after cleanup")
-    else:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                probe.bind(("127.0.0.1", owned.port))
-        except OSError as error:
-            failures.append(
-                f"daemon listener port remained owned after shutdown: "
-                f"{safe_diagnostic(error)}"
-            )
-    if owned.owner_registered and not process_group_exists(owned.process_group):
-        try:
-            owned.owner_registry.unregister(owned.process_group)
+        cleanup_owner_record(
+            owned.owner_registry,
+            owned.owner_record,
+            process=owned.process,
+            graceful_owner=owned if graceful else None,
+        )
+    finally:
+        if owned.owner_registered and not owned.owner_registry.contains(owned.owner_record):
             owned.owner_registered = False
-        except IntegrationFailure as error:
-            failures.append(safe_diagnostic(error))
-    if failures:
-        raise IntegrationFailure("; ".join(failures))
+        if not owned.log_handle.closed:
+            owned.log_handle.close()
 
 
 def run_cli(
@@ -1182,9 +2314,56 @@ def canonical_run_snapshot(
     )
 
 
-def validate_provider_trace_export(
-    daemon: OwnedDaemon,
+def read_stable_kernel_v3_run_store(
     config_root: pathlib.Path,
+    session_id: str,
+    run_id: str,
+) -> tuple[bytes, list[dict[str, Any]]]:
+    run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    path = config_root / "sessions" / session_id / "kernel-v3" / f"{run_digest}.jsonl"
+    try:
+        before = path.stat()
+        raw = path.read_bytes()
+        after = path.stat()
+        records = [json.loads(line.decode("utf-8")) for line in raw.splitlines()]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrationFailure(
+            f"kernel-v3 Run store is unavailable: {safe_diagnostic(error)}"
+        ) from error
+    require(
+        before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+        and raw.endswith(b"\n"),
+        "retired kernel-v3 Run store changed during its read-only snapshot",
+    )
+    require(
+        records and all(isinstance(record, dict) for record in records),
+        "kernel-v3 Run store contains a non-object record",
+    )
+    return raw, records
+
+
+def exact_tool_context_ref(value: Any) -> tuple[int, str, str]:
+    require(
+        isinstance(value, dict)
+        and set(value) == {"contextVersion", "catalogDigest", "contextDigest"}
+        and isinstance(value.get("contextVersion"), int)
+        and value["contextVersion"] > 0
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("catalogDigest")))
+        is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("contextDigest")))
+        is not None,
+        "kernel-v3 record contains an invalid ToolContext reference",
+    )
+    return (
+        value["contextVersion"],
+        value["catalogDigest"],
+        value["contextDigest"],
+    )
+
+
+def provider_trace_metadata_for_run(
+    daemon: OwnedDaemon,
     session_id: str,
     run_id: str,
 ) -> dict[str, Any]:
@@ -1208,8 +2387,232 @@ def validate_provider_trace_export(
         for trace in data["traces"]
         if isinstance(trace, dict) and trace.get("runId") == run_id
     ]
-    require(len(matching) == 1, "CLI Run did not produce one sealed Provider trace")
-    metadata = matching[0]
+    require(len(matching) == 1, "Host Run did not produce one exact sealed Provider trace")
+    return matching[0]
+
+
+def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_and_cleanup(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+    canonical_snapshot: CanonicalRunSnapshot,
+) -> bytes:
+    raw, records = read_stable_kernel_v3_run_store(
+        config_root,
+        session_id,
+        canonical_snapshot.run_id,
+    )
+    require(
+        TEST_API_KEY.encode("utf-8") not in raw
+        and daemon.host_capability.encode("utf-8") not in raw,
+        "kernel-v3 Run store leaked Provider or Host authority material",
+    )
+    for record in records:
+        require(
+            record.get("schemaVersion") == "deepcode.session.kernel-persistence-record.v3"
+            and record.get("sessionId") == session_id
+            and record.get("runId") == canonical_snapshot.run_id
+            and isinstance(record.get("recordId"), str)
+            and isinstance(record.get("recordKind"), str)
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(record.get("recordDigest"))
+            )
+            is not None,
+            "kernel-v3 Run store contains an invalid record envelope",
+        )
+    require(
+        len(records) == len({record["recordId"] for record in records}),
+        "kernel-v3 Run store contains a duplicate immutable record identity",
+    )
+    require(
+        len(records) >= 5
+        and records[0]["recordKind"] == "storeHeader"
+        and records[0]["recordId"]
+        == f"session-kernel-v3:{canonical_snapshot.run_id}:store"
+        and records[0]["data"]
+        == {"schemaVersion": "deepcode.session.kernel-persistence.v3"}
+        and records[1]["recordKind"] == "toolContextSnapshot",
+        "RunOpen did not durably write storeHeader and initial ToolContext snapshot first",
+    )
+    tool_context_records = [
+        (index, record)
+        for index, record in enumerate(records)
+        if record["recordKind"] == "toolContextSnapshot"
+    ]
+    require(
+        tool_context_records and tool_context_records[0][0] == 1,
+        "RunOpen initial ToolContext snapshot was missing or appended late",
+    )
+    snapshots_by_ref: dict[tuple[int, str, str], int] = {}
+    for index, snapshot_record in tool_context_records:
+        snapshot_data = snapshot_record.get("data")
+        require(
+            isinstance(snapshot_data, dict)
+            and snapshot_data.get("schemaVersion")
+            == "deepcode.session.tool-context-snapshot.v3"
+            and snapshot_data.get("runId") == canonical_snapshot.run_id
+            and isinstance(snapshot_data.get("toolContext"), dict),
+            "ToolContext snapshot did not use the exact strict v3 envelope",
+        )
+        context_ref = snapshot_data.get("contextRef")
+        context_identity = exact_tool_context_ref(context_ref)
+        tool_context = snapshot_data["toolContext"]
+        require(
+            tool_context.get("formatVersion") == "deepcode.kernel.tool-context.v2"
+            and exact_tool_context_ref(
+                {
+                    key: tool_context.get(key)
+                    for key in ("contextVersion", "catalogDigest", "contextDigest")
+                }
+            )
+            == context_identity
+            and snapshot_record["recordId"]
+            == (
+                f"session-kernel-v3:{canonical_snapshot.run_id}:tool-context:"
+                f"{context_identity[2]}"
+            )
+            and context_identity not in snapshots_by_ref,
+            "ToolContext snapshot changed its exact bundle or immutable identity",
+        )
+        snapshots_by_ref[context_identity] = index
+
+    checkpoint_indices = [
+        index
+        for index, record in enumerate(records)
+        if record["recordKind"] == "checkpoint"
+    ]
+    dispatch_indices = [
+        index
+        for index, record in enumerate(records)
+        if record["recordKind"] == "providerTurnDispatch"
+    ]
+    terminal_indices = [
+        index
+        for index, record in enumerate(records)
+        if record["recordKind"] == "providerTurnTerminal"
+    ]
+    require(
+        checkpoint_indices
+        and len(dispatch_indices) == 1
+        and len(terminal_indices) == 1
+        and min(checkpoint_indices) > 1
+        and 1 < dispatch_indices[0] < terminal_indices[0],
+        "checkpoint, Provider dispatch, and terminal did not follow the initial snapshot",
+    )
+    checkpoint_contexts: dict[int, tuple[int, str, str]] = {}
+    for index in checkpoint_indices:
+        checkpoint = records[index].get("data")
+        checkpoint_context = (
+            checkpoint.get("authority", {}).get("toolContext", {}).get("currentRef")
+            if isinstance(checkpoint, dict)
+            else None
+        )
+        checkpoint_identity = exact_tool_context_ref(checkpoint_context)
+        snapshot_index = snapshots_by_ref.get(checkpoint_identity)
+        require(
+            snapshot_index is not None and snapshot_index < index,
+            "durable checkpoint did not bind a previously persisted ToolContext snapshot",
+        )
+        checkpoint_contexts[index] = checkpoint_identity
+
+    dispatch_record = records[dispatch_indices[0]]
+    terminal_record = records[terminal_indices[0]]
+    dispatch = dispatch_record.get("data")
+    terminal = terminal_record.get("data")
+    require(
+        isinstance(dispatch, dict)
+        and dispatch.get("schemaVersion") == "deepcode.session.provider-turn-dispatch.v3"
+        and isinstance(dispatch.get("providerTurnId"), str)
+        and dispatch["providerTurnId"]
+        and isinstance(dispatch.get("authorityBinding"), dict)
+        and dispatch["authorityBinding"].get("runId") == canonical_snapshot.run_id
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(dispatch.get("requestDigest")))
+        is not None,
+        "Provider dispatch did not durably bind its exact Run authority and request",
+    )
+    provider_turn_id = dispatch["providerTurnId"]
+    require(
+        dispatch_record["recordId"]
+        == (
+            f"session-kernel-v3:{canonical_snapshot.run_id}:provider-turn:"
+            f"{provider_turn_id}:dispatch"
+        )
+        and isinstance(terminal, dict)
+        and terminal.get("schemaVersion") == "deepcode.session.provider-turn-terminal.v3"
+        and terminal.get("providerTurnId") == provider_turn_id
+        and terminal.get("authorityBinding") == dispatch["authorityBinding"]
+        and terminal.get("dispatchRef")
+        == {
+            "recordId": dispatch_record["recordId"],
+            "recordDigest": dispatch_record["recordDigest"],
+        }
+        and terminal.get("terminalKind") == "completed"
+        and terminal_record["recordId"]
+        == (
+            f"session-kernel-v3:{canonical_snapshot.run_id}:provider-turn:"
+            f"{provider_turn_id}:terminal"
+        ),
+        "Provider terminal did not bind its exact dispatch and completed identity",
+    )
+    trace_ref = terminal.get("traceRef")
+    require(
+        isinstance(trace_ref, dict)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(trace_ref.get("sealDigest")))
+        is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(trace_ref.get("terminalDigest")))
+        is not None
+        and isinstance(trace_ref.get("recordCount"), int)
+        and trace_ref["recordCount"] >= 3,
+        "completed Provider terminal lost its sealed Trace reference",
+    )
+    matching_reservations: list[tuple[int, tuple[int, str, str]]] = []
+    for index in checkpoint_indices:
+        checkpoint = records[index]["data"]
+        reservation = checkpoint.get("active", {}).get("providerReservation")
+        if (
+            isinstance(reservation, dict)
+            and reservation.get("providerTurnId") == provider_turn_id
+        ):
+            reservation_identity = exact_tool_context_ref(reservation.get("contextRef"))
+            require(
+                reservation_identity == checkpoint_contexts[index],
+                "Provider reservation changed its checkpoint ToolContext identity",
+            )
+            matching_reservations.append((index, reservation_identity))
+    require(
+        matching_reservations
+        and any(
+            snapshots_by_ref[context_identity] < index < dispatch_indices[0]
+            for index, context_identity in matching_reservations
+        ),
+        "Provider admission lacked a prior durable reservation and ToolContext snapshot",
+    )
+
+    metadata = provider_trace_metadata_for_run(
+        daemon,
+        session_id,
+        canonical_snapshot.run_id,
+    )
+    require(
+        metadata.get("providerTurnId") == provider_turn_id
+        and metadata.get("terminalKind") == "completed"
+        and metadata.get("requestDigest") == dispatch.get("requestDigest")
+        and metadata.get("sealDigest") == trace_ref.get("sealDigest")
+        and metadata.get("terminalDigest") == trace_ref.get("terminalDigest")
+        and metadata.get("recordCount") == trace_ref.get("recordCount"),
+        "Provider Trace metadata does not prove the durable dispatch/terminal pair",
+    )
+    return raw
+
+
+def validate_provider_trace_export(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    session_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    metadata = provider_trace_metadata_for_run(daemon, session_id, run_id)
     provider_turn_id = metadata.get("providerTurnId")
     trace_digest = metadata.get("sealDigest")
     require(
@@ -2486,6 +3889,115 @@ def inspect_workspace_public_path(daemon: OwnedDaemon, workspace: pathlib.Path) 
     )
 
 
+def validated_owner_paths(
+    run_root_argument: str | None = None,
+    registry_argument: str | None = None,
+) -> tuple[pathlib.Path, OwnerRegistry]:
+    run_root_text = os.environ.get("DEEPCODE_HOST_V2_RUN_ROOT", "")
+    registry_text = os.environ.get("DEEPCODE_HOST_V2_OWNER_PGIDS", "")
+    require(run_root_text and registry_text, "shell owner guard is missing")
+    if run_root_argument is not None or registry_argument is not None:
+        require(
+            run_root_argument is not None
+            and registry_argument is not None
+            and pathlib.Path(run_root_argument).resolve(strict=True)
+            == pathlib.Path(run_root_text).resolve(strict=True)
+            and pathlib.Path(registry_argument).resolve(strict=True)
+            == pathlib.Path(registry_text).resolve(strict=True),
+            "cleanup arguments do not match the exact shell owner guard",
+        )
+    raw_run_root = pathlib.Path(run_root_text)
+    raw_registry = pathlib.Path(registry_text)
+    try:
+        run_lstat = raw_run_root.lstat()
+        registry_lstat = raw_registry.lstat()
+        run_root = raw_run_root.resolve(strict=True)
+        registry_path = raw_registry.resolve(strict=True)
+    except OSError as error:
+        raise IntegrationFailure(
+            f"shell owner guard paths are unavailable: {safe_diagnostic(error)}"
+        ) from error
+    require(
+        stat.S_ISDIR(run_lstat.st_mode)
+        and not raw_run_root.is_symlink()
+        and run_lstat.st_uid == os.geteuid()
+        and stat.S_IMODE(run_lstat.st_mode) == 0o700
+        and run_root.name.startswith("deepcode-host-v2-run."),
+        "shell owner run root identity, owner, or permissions are invalid",
+    )
+    require(
+        stat.S_ISREG(registry_lstat.st_mode)
+        and not raw_registry.is_symlink()
+        and registry_lstat.st_uid == os.geteuid()
+        and stat.S_IMODE(registry_lstat.st_mode) == 0o600
+        and registry_path.parent == run_root
+        and registry_path.name == "owned-pgids",
+        "shell owner registry identity, owner, or permissions are invalid",
+    )
+    registry = OwnerRegistry(registry_path)
+    for record in registry._read():
+        require(
+            pathlib.Path(record.run_root) == run_root
+            and pathlib.Path(record.config_root).is_relative_to(run_root),
+            "owner record is not bound to the exact cleanup root",
+        )
+    return run_root, registry
+
+
+def remove_exact_run_root(run_root: pathlib.Path, registry: OwnerRegistry) -> None:
+    require(not registry._read(), "owner registry is not empty; run root was retained")
+    try:
+        before = run_root.lstat()
+    except FileNotFoundError:
+        return
+    require(
+        stat.S_ISDIR(before.st_mode)
+        and not run_root.is_symlink()
+        and before.st_uid == os.geteuid()
+        and stat.S_IMODE(before.st_mode) == 0o700,
+        "run root changed identity before deletion",
+    )
+    shutil.rmtree(run_root, ignore_errors=False)
+    require(not run_root.exists(), "exact run root remained after cleanup")
+
+
+def cleanup_registered_owners(
+    run_root: pathlib.Path,
+    registry: OwnerRegistry,
+    *,
+    delete_run_root: bool,
+) -> None:
+    failures: list[str] = []
+    for record in registry._read():
+        try:
+            cleanup_owner_record(
+                registry,
+                record,
+                process=None,
+                graceful_owner=None,
+            )
+        except BaseException as error:
+            failures.append(safe_diagnostic(error))
+    if failures:
+        raise IntegrationFailure(
+            "owner cleanup failed; registry and run root were retained: "
+            + "; ".join(failures)
+        )
+    require(not registry._read(), "owner registry retained records after cleanup")
+    if delete_run_root:
+        remove_exact_run_root(run_root, registry)
+
+
+def cleanup_owned_resources_mode(run_root_text: str, registry_text: str) -> None:
+    require(
+        os.environ.get("DEEPCODE_TEST_CONTROLLER") == "1"
+        and os.environ.get("DEEPCODE_TEST_SUITE_ID") == "host.v2.integration",
+        "owner cleanup mode must run through the exact Host integration suite",
+    )
+    run_root, registry = validated_owner_paths(run_root_text, registry_text)
+    cleanup_registered_owners(run_root, registry, delete_run_root=True)
+
+
 def assert_no_open_test_resources(test_root: pathlib.Path) -> None:
     proc_root = pathlib.Path("/proc")
     if proc_root.is_dir():
@@ -2519,19 +4031,7 @@ def run() -> None:
     require(BRIDGE.is_file(), "Session Host bridge production asset is missing")
     require(NODE is not None and NODE.is_file(), "trusted Node runtime is missing")
 
-    run_root_text = os.environ.get("DEEPCODE_HOST_V2_RUN_ROOT", "")
-    owner_registry_text = os.environ.get("DEEPCODE_HOST_V2_OWNER_PGIDS", "")
-    require(run_root_text and owner_registry_text, "shell owner guard is missing")
-    run_root = pathlib.Path(run_root_text).resolve()
-    owner_registry_path = pathlib.Path(owner_registry_text).resolve()
-    require(
-        run_root.is_dir()
-        and owner_registry_path.is_file()
-        and owner_registry_path.parent == run_root
-        and owner_registry_path.name == "owned-pgids",
-        "shell owner guard paths are invalid",
-    )
-    owner_registry = OwnerRegistry(owner_registry_path)
+    run_root, owner_registry = validated_owner_paths()
 
     test_root: pathlib.Path | None = None
     provider: ProviderServer | None = None
@@ -2620,7 +4120,9 @@ def run() -> None:
         )
         require(
             cli_ask.stdout.strip() == FINAL_TEXT,
-            "CLI ask did not print the controlled Provider response",
+            "CLI ask did not print the controlled Provider response: "
+            f"stdout={safe_diagnostic(cli_ask.stdout, owned.host_capability)!r}; "
+            f"stderr={safe_diagnostic(cli_ask.stderr, owned.host_capability)!r}",
         )
         provider_count_after_cli_ask = provider.request_count()
         require(
@@ -2680,17 +4182,27 @@ def run() -> None:
             "initial Host Run did not call Provider once",
         )
         first_snapshot = canonical_run_snapshot(config_root, session_id, host_run_id)
+        first_kernel_v3_snapshot = (
+            host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_and_cleanup(
+                owned,
+                config_root,
+                session_id,
+                first_snapshot,
+            )
+        )
         provider.require_healthy()
         passed("Host-owned workspace-bound RunOpen")
+        passed("RunOpen v3 ToolContext, dispatch, terminal, and Trace ordering")
         passed("Canonical Run retirement facts and authority cleanup")
 
         first_host_capability = owned.host_capability
-        first_process_group = owned.process_group
+        first_owner_record = owned.owner_record
         stop_owned_process_group(owned, graceful=True)
         owned = None
         require(
-            not process_group_exists(first_process_group),
-            "first Host generation retained an owned child",
+            observe_owner(first_owner_record).state == "absent"
+            and not owner_registry.contains(first_owner_record),
+            "first Host generation retained an owned child or owner registration",
         )
 
         owned = start_daemon(config_root, port, owner_registry, generation=2)
@@ -2717,6 +4229,15 @@ def run() -> None:
             replayed_snapshot == first_snapshot,
             "exact restart replay changed canonical facts or their high-water",
         )
+        replayed_kernel_v3_snapshot, _ = read_stable_kernel_v3_run_store(
+            config_root,
+            session_id,
+            replayed_snapshot.run_id,
+        )
+        require(
+            replayed_kernel_v3_snapshot == first_kernel_v3_snapshot,
+            "daemon restart or exact caller replay rewrote the immutable kernel-v3 Run store",
+        )
         provider.require_healthy()
         passed("Provider trace export capability invalidated by daemon restart")
         run_cli(
@@ -2726,6 +4247,7 @@ def run() -> None:
             expect_success=True,
         )
         passed("Daemon restart and exact caller replay")
+        passed("Run v3 replay and prior owner cleanup")
 
         resource_session_id = create_session(owned)
         provider_count_before_resource_run = provider.request_count()
@@ -2790,11 +4312,12 @@ def run() -> None:
         provider.require_healthy()
         passed("Provider trace export deadline, concurrency, audit, and resource release")
 
-        second_process_group = owned.process_group
+        second_owner_record = owned.owner_record
         stop_owned_process_group(owned, graceful=True)
         owned = None
         require(
-            not process_group_exists(second_process_group),
+            observe_owner(second_owner_record).state == "absent"
+            and not owner_registry.contains(second_owner_record),
             "second Host generation retained an owned child",
         )
         assert_no_open_test_resources(test_root)
@@ -2826,30 +4349,18 @@ def run() -> None:
             provider_thread.join(timeout=5.0)
             if provider_thread.is_alive():
                 cleanup_errors.append("provider thread remained after shutdown")
-        if test_root is not None and test_root.exists():
-            try:
-                assert_no_open_test_resources(test_root)
-            except BaseException as error:
-                cleanup_errors.append(
-                    f"owned process audit: {safe_diagnostic(error)}"
-                )
-            try:
-                shutil.rmtree(test_root, ignore_errors=False)
-            except BaseException as error:
-                cleanup_errors.append(
-                    f"temporary directory cleanup: {safe_diagnostic(error)}"
-                )
-        if test_root is not None and test_root.exists():
-            cleanup_errors.append("test-owned temporary directory remained")
         try:
-            residual_groups = owner_registry._read()
-            if residual_groups:
-                cleanup_errors.append(
-                    "shell owner registry retained daemon process groups"
-                )
+            cleanup_registered_owners(
+                run_root,
+                owner_registry,
+                delete_run_root=False,
+            )
+            if test_root is not None and test_root.exists():
+                assert_no_open_test_resources(test_root)
+                shutil.rmtree(test_root, ignore_errors=False)
         except BaseException as error:
             cleanup_errors.append(
-                f"owner registry audit: {safe_diagnostic(error)}"
+                f"owner cleanup: {safe_diagnostic(error)}"
             )
     if primary_error is not None:
         if cleanup_errors:
@@ -2867,6 +4378,8 @@ def main() -> int:
     try:
         if len(sys.argv) == 3 and sys.argv[1] == EXEC_DAEMON_ARGUMENT:
             exec_owned_daemon_wrapper(sys.argv[2])
+        elif len(sys.argv) == 4 and sys.argv[1] == CLEANUP_OWNERS_ARGUMENT:
+            cleanup_owned_resources_mode(sys.argv[2], sys.argv[3])
         else:
             require(not sys.argv[1:], "unexpected host integration arguments")
             run()

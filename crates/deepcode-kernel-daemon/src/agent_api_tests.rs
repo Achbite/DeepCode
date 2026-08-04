@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn session_schema_accepts_only_current_v2_discriminators() {
+fn session_schema_accepts_only_current_v3_history() {
     let current = create_agent_session_value(
         "session-v2",
         "2026-07-29T00:00:00Z",
@@ -11,10 +11,15 @@ fn session_schema_accepts_only_current_v2_discriminators() {
         Some("workspace-hash-v2"),
     );
     assert!(session_schema_is_compatible(&current));
+    assert_eq!(
+        current.get("historySchema").and_then(Value::as_str),
+        Some(SESSION_KERNEL_HISTORY_SCHEMA_V3)
+    );
 
     for (field, legacy_value) in [
         ("sessionSchemaVersion", "deepcode.agent.session.v1"),
         ("historySchema", "deepcode.session.kernel-persistence.v1"),
+        ("historySchema", "deepcode.session.kernel-persistence.v2"),
         ("kernelAbiVersion", "deepcode.kernel.abi.v1"),
     ] {
         let mut legacy = current.clone();

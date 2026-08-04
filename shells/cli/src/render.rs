@@ -1,85 +1,209 @@
 use crate::*;
 
-pub(crate) fn render_timeline(timeline: &Value) {
-    let timeline = timeline_payload(timeline);
-    let is_v2 = timeline.get("schemaVersion").and_then(Value::as_str)
-        == Some("deepcode.shared-conversation-projection.v2");
-    let turns = timeline
-        .get("turns")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for turn in turns {
-        let status = turn
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        println!("turn: {status}");
-        for block in turn
-            .get("blocks")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+pub(crate) fn render_timeline(timeline: &AgentTimelineSnapshot) -> Result<(), String> {
+    for turn in &timeline.turns {
+        println!("turn: {}", timeline_status_label(turn.status));
+        let blocks = turn
+            .blocks
+            .iter()
+            .map(|block| (block.id.as_str(), block))
+            .collect::<std::collections::HashMap<_, _>>();
+        let segments = turn
+            .work_segments
+            .iter()
+            .map(|segment| (segment.id.as_str(), segment))
+            .collect::<std::collections::HashMap<_, _>>();
+        for part in &turn.parts {
+            match part {
+                AgentTimelineTurnPart::Block { block_id } => {
+                    let block = blocks.get(block_id.as_str()).ok_or_else(|| {
+                        format!("typed Shared Projection references missing block {block_id}")
+                    })?;
+                    render_timeline_block(block)?;
+                }
+                AgentTimelineTurnPart::WorkSegment { work_segment_id } => {
+                    let segment = segments.get(work_segment_id.as_str()).ok_or_else(|| {
+                        format!(
+                            "typed Shared Projection references missing work segment {work_segment_id}"
+                        )
+                    })?;
+                    render_timeline_work_segment(segment);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_timeline_block(block: &deepcode_kernel_client::AgentTimelineBlock) -> Result<(), String> {
+    if block.kind == deepcode_kernel_client::AgentTimelineBlockKind::Thinking
+        || (block.entry_role == AgentTimelineEntryRole::FinalAnswer
+            && block.durability != AgentTimelineDurability::Committed)
+    {
+        return Ok(());
+    }
+    let kind = timeline_block_kind_label(block);
+    let title = (!block.title.trim().is_empty())
+        .then_some(block.title.as_str())
+        .unwrap_or(kind);
+    let body = timeline_block_text(block)?;
+    println!("  {kind}: {title}");
+    for line in body.lines().take(24) {
+        println!("    {line}");
+    }
+    Ok(())
+}
+
+fn timeline_block_text(
+    block: &deepcode_kernel_client::AgentTimelineBlock,
+) -> Result<String, String> {
+    if matches!(
+        block.kind,
+        deepcode_kernel_client::AgentTimelineBlockKind::Plan
+            | deepcode_kernel_client::AgentTimelineBlockKind::Review
+    ) {
+        if let Some(readable) = block.structured_projection.as_ref() {
+            let readable = serde_json::to_value(readable).map_err(|error| {
+                format!("failed to render typed structured projection: {error}")
+            })?;
+            let text = render_readable_projection(&readable);
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+        }
+    }
+    Ok(block
+        .body_markdown
+        .as_deref()
+        .or_else(|| {
+            block
+                .localized_content
+                .as_ref()
+                .and_then(|content| content.text.as_deref())
+        })
+        .unwrap_or(block.summary.as_str())
+        .to_string())
+}
+
+fn render_timeline_work_segment(segment: &deepcode_kernel_client::AgentTimelineWorkSegment) {
+    println!(
+        "  work: {} ({} operation{})",
+        work_segment_lifecycle_label(segment.lifecycle),
+        segment.operations.len(),
+        if segment.operations.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    if let Some(attention) = segment.attention.0.as_ref() {
+        println!(
+            "    attention [{}]: {}",
+            work_attention_status_label(attention.status),
+            attention.summary
+        );
+    }
+    for operation in &segment.operations {
+        let name = operation
+            .display_name
+            .as_deref()
+            .unwrap_or(operation.tool_id.as_str());
+        println!(
+            "    {name}: {}",
+            work_operation_status_label(operation.status)
+        );
+        if let Some(action) = operation
+            .canonical_action
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
         {
-            let entry_role = block
-                .get("entryRole")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let kind = block
-                .get("narrativeKind")
-                .or_else(|| block.get("kind"))
-                .and_then(Value::as_str)
-                .unwrap_or("stage");
-            if kind == "thinking"
-                || (is_v2
-                    && entry_role == "finalAnswer"
-                    && block.get("durability").and_then(Value::as_str) != Some("committed"))
-            {
-                continue;
-            }
-            let title = block
-                .get("title")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(kind);
-            let body = timeline_block_text(block, kind);
-            println!("  {kind}: {title}");
-            for line in body.lines().take(12) {
-                println!("    {line}");
-            }
+            println!("      action: {action}");
+        }
+        if let Some(targets) = operation
+            .targets
+            .as_ref()
+            .filter(|targets| !targets.is_empty())
+        {
+            println!("      targets: {}", targets.join(", "));
+        }
+        if let Some(effect) = operation
+            .effect_summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            println!("      effect: {effect}");
         }
     }
 }
 
-pub(crate) fn render_decision_result(timeline: &Value) {
-    if let Some(text) = extract_decision_result_text(timeline) {
-        println!("{text}");
-        return;
+fn timeline_status_label(status: AgentTimelineStatus) -> &'static str {
+    use AgentTimelineStatus::*;
+    match status {
+        Queued => "queued",
+        Running => "running",
+        Waiting => "waiting",
+        Blocked => "blocked",
+        Completed => "completed",
+        Cancelled => "cancelled",
+        Failed => "failed",
     }
-    render_timeline(timeline);
 }
 
-fn extract_decision_result_text(timeline: &Value) -> Option<String> {
-    extract_plain_text(timeline)
+fn timeline_block_kind_label(block: &deepcode_kernel_client::AgentTimelineBlock) -> &'static str {
+    use deepcode_kernel_client::AgentTimelineBlockKind::*;
+    match block.kind {
+        User => "user",
+        Assistant => "assistant",
+        Thinking => "thinking",
+        Stage => "stage",
+        Permission => "permission",
+        Plan => "plan",
+        Review => "review",
+        Error => "error",
+        TurnActions => "turnActions",
+    }
 }
 
-fn timeline_block_text(block: &Value, kind: &str) -> String {
-    if matches!(kind, "plan" | "review") {
-        if let Some(text) = block
-            .get("structuredProjection")
-            .map(render_readable_projection)
-            .filter(|text| !text.trim().is_empty())
-        {
-            return text;
-        }
+fn work_segment_lifecycle_label(
+    lifecycle: deepcode_kernel_client::AgentTimelineWorkSegmentLifecycle,
+) -> &'static str {
+    use deepcode_kernel_client::AgentTimelineWorkSegmentLifecycle::*;
+    match lifecycle {
+        Active => "active",
+        Completed => "completed",
+        Cancelled => "cancelled",
+        Failed => "failed",
     }
-    block
-        .get("bodyMarkdown")
-        .or_else(|| block.pointer("/localizedContent/text"))
-        .or_else(|| block.get("summary"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_default()
+}
+
+fn work_attention_status_label(
+    status: deepcode_kernel_client::AgentTimelineWorkAttentionStatus,
+) -> &'static str {
+    use deepcode_kernel_client::AgentTimelineWorkAttentionStatus::*;
+    match status {
+        Unresolved => "unresolved",
+        Resolved => "resolved",
+    }
+}
+
+fn work_operation_status_label(
+    status: deepcode_kernel_client::AgentTimelineWorkOperationStatus,
+) -> &'static str {
+    use deepcode_kernel_client::AgentTimelineWorkOperationStatus::*;
+    match status {
+        Preparing => "preparing",
+        Queued => "queued",
+        Running => "running",
+        AwaitingCapability => "awaiting capability",
+        Completed => "completed",
+        Denied => "denied",
+        Failed => "failed",
+        FailedAfterObservedEffect => "failed after observed effect",
+        Indeterminate => "indeterminate",
+        Cancelled => "cancelled",
+        Stale => "stale",
+        Unexecuted => "unexecuted",
+    }
 }
 
 fn render_readable_projection(readable: &Value) -> String {
@@ -373,190 +497,88 @@ fn readable_empty_message(key: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn find_pending_session_decision(
-    timeline: &Value,
+    timeline: &AgentTimelineSnapshot,
     requested_kind: &str,
     run_filter: Option<&str>,
 ) -> Option<PendingSessionDecision> {
     if !matches!(requested_kind, "plan" | "permission") {
         return None;
     }
-    let timeline = timeline_payload(timeline);
-    if timeline.get("schemaVersion").and_then(Value::as_str)
-        != Some("deepcode.shared-conversation-projection.v2")
-    {
-        return None;
-    }
-    let pending = timeline.get("interactionProjection")?.get("pending")?;
-    let kind = pending.get("kind").and_then(Value::as_str)?;
-    if kind != requested_kind {
-        return None;
-    }
-    let run_id = if kind == "permission" {
-        let request = pending.get("request")?;
-        let request_id = request
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())?;
-        let pending_request_id = pending
-            .get("requestId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())?;
-        let target_id = pending
-            .get("targetId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())?;
-        if request_id != pending_request_id || request_id != target_id {
-            return None;
+    let pending = timeline.interaction_projection.as_ref()?.pending.as_ref()?;
+    let (run_id, target_id) = match (requested_kind, pending) {
+        ("plan", deepcode_kernel_client::AgentTimelinePendingInteraction::Plan(pending)) => {
+            (pending.run_id.clone(), pending.target_id.clone())
         }
-        request
-            .get("runId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())?
-            .to_string()
-    } else {
-        pending
-            .get("runId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())?
-            .to_string()
+        (
+            "permission",
+            deepcode_kernel_client::AgentTimelinePendingInteraction::Permission(pending),
+        ) => {
+            let request_id = pending.request.id.trim();
+            let pending_request_id = pending.request_id.trim();
+            let target_id = pending.target_id.trim();
+            if request_id.is_empty() || request_id != pending_request_id || request_id != target_id
+            {
+                return None;
+            }
+            let run_id = pending
+                .request
+                .run_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            (run_id.to_string(), pending.target_id.clone())
+        }
+        _ => return None,
     };
     if run_filter.is_some_and(|expected| expected != run_id) {
         return None;
     }
-    let target_id = pending
-        .get("targetId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
+    if run_id.trim().is_empty() || target_id.trim().is_empty() {
+        return None;
+    }
     Some(PendingSessionDecision { run_id, target_id })
 }
 
-fn extract_final_text(timeline: &Value) -> Option<String> {
-    let is_v2 = timeline.get("schemaVersion").and_then(Value::as_str)
-        == Some("deepcode.shared-conversation-projection.v2");
-    let turns = timeline.get("turns").and_then(Value::as_array)?;
-    for turn in turns.iter().rev() {
-        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
+pub(crate) fn extract_committed_final_text_v2(timeline: &AgentTimelineSnapshot) -> Option<String> {
+    let projection = timeline.run_projection.as_ref()?;
+    if projection.status != AgentTimelineRunStatus::Succeeded {
+        return None;
+    }
+    let turn_id = projection.turn_id.as_deref()?;
+    let turn = timeline
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id && turn.status == AgentTimelineStatus::Completed)?;
+    let blocks_by_id = turn
+        .blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut text = String::new();
+    for part in &turn.parts {
+        let AgentTimelineTurnPart::Block { block_id } = part else {
             continue;
         };
-        for block in blocks.iter().rev() {
-            if is_v2 {
-                if block.get("entryRole").and_then(Value::as_str) != Some("finalAnswer")
-                    || block.get("durability").and_then(Value::as_str) != Some("committed")
-                {
-                    continue;
-                }
-            }
-            let narrative = block
-                .get("narrativeKind")
-                .or_else(|| block.get("kind"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !is_v2 && narrative != "assistantText" && narrative != "assistant" {
-                continue;
-            }
-            let text = block
-                .get("bodyMarkdown")
-                .or_else(|| block.pointer("/localizedContent/text"))
-                .or_else(|| block.get("summary"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !text.is_empty() {
-                return Some(text);
-            }
+        let block = blocks_by_id.get(block_id.as_str())?;
+        if block.entry_role != AgentTimelineEntryRole::FinalAnswer
+            || block.durability != AgentTimelineDurability::Committed
+        {
+            continue;
         }
+        let fragment = block
+            .body_markdown
+            .as_deref()
+            .or_else(|| {
+                block
+                    .localized_content
+                    .as_ref()
+                    .and_then(|content| content.text.as_deref())
+            })
+            .unwrap_or(block.summary.as_str());
+        text.push_str(fragment);
     }
-    None
-}
-
-pub(crate) fn extract_plain_text(timeline: &Value) -> Option<String> {
-    extract_final_text(timeline).or_else(|| extract_pending_decision_text(timeline))
-}
-
-fn extract_pending_decision_text(timeline: &Value) -> Option<String> {
-    let timeline = timeline_payload(timeline);
-    let pending_value = timeline.get("interactionProjection")?.get("pending")?;
-    let decision_kind = pending_value.get("kind").and_then(Value::as_str)?;
-    let pending = find_pending_session_decision(timeline, decision_kind, None)?;
-    let heading = match decision_kind {
-        "plan" => "Pending plan decision",
-        "permission" => "Pending permission decision",
-        _ => "Pending decision",
-    };
-    let block = pending_value
-        .get("blockId")
-        .and_then(Value::as_str)
-        .and_then(|block_id| timeline_block_by_id(timeline, block_id));
-    Some(render_pending_decision_text(
-        timeline.get("sessionId").and_then(Value::as_str),
-        decision_kind,
-        heading,
-        pending_value,
-        block,
-        pending,
-    ))
-}
-
-fn render_pending_decision_text(
-    session_id: Option<&str>,
-    decision_kind: &str,
-    heading: &str,
-    pending_value: &Value,
-    block: Option<&Value>,
-    pending: PendingSessionDecision,
-) -> String {
-    let mut lines = vec![heading.to_string()];
-    if let Some(title) = pending_value
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    {
-        lines.push(title.to_string());
-    }
-    if let Some(readable) = block.and_then(|item| item.get("structuredProjection")) {
-        let rendered = render_readable_projection(readable);
-        if !rendered.trim().is_empty() {
-            lines.push(rendered);
-        }
-    } else if let Some(summary) = pending_value
-        .get("summary")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    {
-        lines.push(summary.to_string());
-    }
-    lines.push(format!(
-        "Decision target: {decision_kind} run={} target={}",
-        pending.run_id, pending.target_id
-    ));
-    if let Some(session_id) = session_id {
-        lines.push(format!(
-            "Accept: DeepCode-CLI --session {session_id} decision {decision_kind} accept"
-        ));
-        if decision_kind == "permission" {
-            lines.push(format!(
-                "Reject: DeepCode-CLI --session {session_id} decision permission reject"
-            ));
-        } else {
-            lines.push(format!(
-                "Revise: DeepCode-CLI --session {session_id} decision {decision_kind} revise <guidance>"
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-fn timeline_block_by_id<'a>(timeline: &'a Value, block_id: &str) -> Option<&'a Value> {
-    for turn in timeline.get("turns")?.as_array()? {
-        for block in turn.get("blocks")?.as_array()? {
-            if block.get("id").and_then(Value::as_str) == Some(block_id) {
-                return Some(block);
-            }
-        }
-    }
-    None
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn normalize_render_text(value: &str) -> String {
@@ -565,10 +587,6 @@ fn normalize_render_text(value: &str) -> String {
 
 pub(crate) fn session_id(session: &Value) -> Option<&str> {
     session.get("id").and_then(Value::as_str)
-}
-
-pub(crate) fn timeline_payload(timeline: &Value) -> &Value {
-    timeline.get("data").unwrap_or(timeline)
 }
 
 pub(crate) fn session_title(session: &Value) -> &str {

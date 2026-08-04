@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-const ACTIVE_RUN_SCHEMA_V2: &str = "deepcode.host.kernel-run-lifecycle.v2";
+const ACTIVE_RUN_SCHEMA_V2: &str = "deepcode.host.kernel-run-lifecycle.v3";
 const MAX_ACTIVE_RUN_RECORDS: usize = 16_384;
 static HOST_BRIDGE_GENERATION_V2: AtomicU64 = AtomicU64::new(1);
 
@@ -131,6 +131,8 @@ pub(crate) struct HostActiveRunRecordV2 {
     pub(crate) workspace_binding_ref: String,
     pub(crate) workspace_binding_digest: String,
     pub(crate) workspace_binding_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_canonical_root: Option<PathBuf>,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) active_folder_id: Option<String>,
@@ -322,6 +324,42 @@ impl HostActiveRunBrokerV2 {
         let active = self.resolve(&binding.session_id, &binding.host_run_id)?;
         if active.run_id == binding.run_id {
             Ok(())
+        } else {
+            Err(invalid_run_transport_capability())
+        }
+    }
+
+    /// Resolves the durable Host binding for a process-private Run capability.
+    /// The returned identity is advisory only: callers that perform storage or
+    /// effects must re-authorize under their coordinated resource lock.
+    pub(crate) fn resolve_session_run_transport(
+        &self,
+        run_id: &str,
+        capability: &RunCapabilityV2,
+    ) -> Result<HostActiveRunRecordV2, HostV2StorageError> {
+        validate_bounded_identity(run_id, "runId", 512)?;
+        let submitted: [u8; 32] =
+            Sha256::digest(capability.expose_to_transport().as_bytes()).into();
+        let binding = self
+            .run_transport_capabilities
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_run_transport_authority_unavailable",
+                    "Host Run transport authority is unavailable",
+                )
+            })?
+            .iter()
+            .find(|(binding, expected)| {
+                binding.run_id == run_id && constant_time_digest_eq(&expected.digest, &submitted)
+            })
+            .map(|(binding, _)| binding.clone())
+            .ok_or_else(invalid_run_transport_capability)?;
+        let active = self
+            .resolve(&binding.session_id, &binding.host_run_id)
+            .map_err(|_| invalid_run_transport_capability())?;
+        if active.lifecycle == HostRunLifecycleV2::Active && active.run_id == binding.run_id {
+            Ok(active)
         } else {
             Err(invalid_run_transport_capability())
         }
@@ -821,6 +859,7 @@ impl HostActiveRunBrokerV2 {
         &self,
         turn: &HostSessionTurnGuardV2,
         input: HostActiveRunRegistrationV2,
+        workspace_canonical_root: Option<&Path>,
     ) -> Result<HostActiveRunRegistrationReceiptV2, HostV2StorageError> {
         validate_registration(&input)?;
         if turn.session_id != input.session_id {
@@ -837,7 +876,7 @@ impl HostActiveRunBrokerV2 {
                 ));
             }
         }
-        let record = active_run_record(input)?;
+        let record = active_run_record(input, workspace_canonical_root)?;
         let path = self.active_run_path(&record.session_id, &record.host_run_id)?;
         with_storage_path_lock(&path, || {
             let retired_path = self.retired_run_path(&record.session_id, &record.host_run_id)?;
@@ -851,6 +890,7 @@ impl HostActiveRunBrokerV2 {
                 let existing = decode_active_run_record(existing)?;
                 if existing.lifecycle == HostRunLifecycleV2::Active
                     && existing.registration_digest == record.registration_digest
+                    && existing.workspace_canonical_root == record.workspace_canonical_root
                 {
                     return Ok(HostActiveRunRegistrationReceiptV2 {
                         record: existing,
@@ -1444,19 +1484,23 @@ impl HostActiveRunBrokerV2 {
                     "Host retiring Run is missing retirement progress",
                 )
             })?;
+            let clear_workspace_root = matches!(&step, HostRetirementStepV2::WorkspaceUnregistered);
             match step {
                 HostRetirementStepV2::TransportUnbound => {
                     progress.transport_capability_unbound = true
                 }
                 HostRetirementStepV2::BridgeChildReaped => progress.bridge_child_reaped = true,
                 HostRetirementStepV2::WorkspaceUnregistered => {
-                    progress.workspace_binding_unregistered = true
+                    progress.workspace_binding_unregistered = true;
                 }
                 HostRetirementStepV2::EmptyWorkspaceRemoved => {
                     progress.empty_workspace_removed = true
                 }
             }
             progress.last_error_code = None;
+            if clear_workspace_root {
+                record.workspace_canonical_root = None;
+            }
             write_active_run_record(&path, &mut record)?;
             Ok(record)
         })
@@ -1806,24 +1850,56 @@ impl HostActiveRunBrokerV2 {
                 if unadmitted {
                     errors.push("host_session_recovery_not_admitted".to_string());
                 }
-                self.replace_startup_errors(errors);
-                records
+                let rehydrate = records
                     .into_iter()
                     .filter(|record| recoverable_session_ids.contains(&record.session_id))
                     .filter(|record| record.lifecycle == HostRunLifecycleV2::Active)
-                    .filter(|record| record.workspace_kind == HostRunWorkspaceKindV2::Empty)
-                    .filter_map(|record| {
-                        let key = record.empty_workspace_key.as_deref()?;
-                        let root = self.empty_workspace_root(key).ok()?;
-                        let reference =
-                            WorkspaceBindingRefV2::new(record.workspace_binding_ref).ok()?;
-                        Some(HostWorkspaceRehydrateRecordV2::new(
+                    .map(|record| {
+                        let root = match record.workspace_kind {
+                            HostRunWorkspaceKindV2::Bound => record
+                                .workspace_canonical_root
+                                .clone()
+                                .ok_or_else(|| {
+                                    HostV2StorageError::conflict(
+                                        "host_active_run_workspace_recovery_material_missing",
+                                        "UnsupportedHistorySchema: bound active Host Run has no Host-only workspace recovery root",
+                                    )
+                                })?,
+                            HostRunWorkspaceKindV2::Empty => {
+                                let key = record.empty_workspace_key.as_deref().ok_or_else(|| {
+                                    HostV2StorageError::conflict(
+                                        "host_active_run_workspace_invalid",
+                                        "Managed empty Host Run has no exact workspace key",
+                                    )
+                                })?;
+                                self.empty_workspace_root(key)?
+                            }
+                        };
+                        let reference = WorkspaceBindingRefV2::new(record.workspace_binding_ref)
+                            .map_err(|_| {
+                                HostV2StorageError::conflict(
+                                    "host_active_run_workspace_binding_invalid",
+                                    "Durable Host Run contains an invalid workspace binding reference",
+                                )
+                            })?;
+                        Ok(HostWorkspaceRehydrateRecordV2::new(
                             reference,
                             root,
                             Some(record.workspace_binding_identity),
                         ))
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, HostV2StorageError>>();
+                match rehydrate {
+                    Ok(records) => {
+                        self.replace_startup_errors(errors);
+                        records
+                    }
+                    Err(error) => {
+                        errors.push(error.code.to_string());
+                        self.replace_startup_errors(errors);
+                        Vec::new()
+                    }
+                }
             }
             Err(error) => {
                 self.replace_startup_errors(vec![error.code.to_string()]);
@@ -2396,9 +2472,71 @@ fn validate_empty_workspace_key(key: &str) -> Result<(), HostV2StorageError> {
     Ok(())
 }
 
+fn validate_workspace_recovery_root(
+    workspace_kind: HostRunWorkspaceKindV2,
+    root: Option<&Path>,
+) -> Result<Option<String>, HostV2StorageError> {
+    match workspace_kind {
+        HostRunWorkspaceKindV2::Empty if root.is_some() => {
+            return Err(HostV2StorageError::invalid(
+                "host_active_run_workspace_root_invalid",
+                "Managed empty Host Runs cannot persist a bound-workspace recovery root",
+            ))
+        }
+        HostRunWorkspaceKindV2::Empty => return Ok(None),
+        HostRunWorkspaceKindV2::Bound => {}
+    }
+    let root = root.ok_or_else(|| {
+        HostV2StorageError::conflict(
+            "host_active_run_workspace_recovery_material_missing",
+            "UnsupportedHistorySchema: bound active Host Run has no Host-only workspace recovery root",
+        )
+    })?;
+    if !root.is_absolute() {
+        return Err(HostV2StorageError::invalid(
+            "host_active_run_workspace_root_invalid",
+            "Bound active Host Run recovery root must be absolute",
+        ));
+    }
+    let canonical = fs::canonicalize(root).map_err(|error| {
+        HostV2StorageError::io(
+            "host_active_run_workspace_root_unavailable",
+            format!("validate bound active Host Run recovery root: {error}"),
+        )
+    })?;
+    if canonical != root || !canonical.is_dir() {
+        return Err(HostV2StorageError::conflict(
+            "host_active_run_workspace_root_stale",
+            "Bound active Host Run recovery root is no longer the exact canonical directory",
+        ));
+    }
+    fs::read_dir(&canonical).map_err(|error| {
+        HostV2StorageError::io(
+            "host_active_run_workspace_root_unavailable",
+            format!("read bound active Host Run recovery root: {error}"),
+        )
+    })?;
+    let text = canonical.to_str().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "host_active_run_workspace_root_encoding_unsupported",
+            "Bound active Host Run recovery root must be valid UTF-8",
+        )
+    })?;
+    if text.is_empty() || text.len() > 64 * 1024 {
+        return Err(HostV2StorageError::invalid(
+            "host_active_run_workspace_root_invalid",
+            "Bound active Host Run recovery root exceeds its bounded storage shape",
+        ));
+    }
+    Ok(Some(text.to_string()))
+}
+
 fn active_run_record(
     input: HostActiveRunRegistrationV2,
+    workspace_canonical_root: Option<&Path>,
 ) -> Result<HostActiveRunRecordV2, HostV2StorageError> {
+    let workspace_canonical_root =
+        validate_workspace_recovery_root(input.workspace_kind, workspace_canonical_root)?;
     let registration_digest = active_run_registration_digest(&input)?;
     let mut value = json!({
         "schemaVersion": ACTIVE_RUN_SCHEMA_V2,
@@ -2423,6 +2561,9 @@ fn active_run_record(
     }
     if let Some(folder_id) = input.active_folder_id {
         value["activeFolderId"] = Value::String(folder_id);
+    }
+    if let Some(root) = workspace_canonical_root {
+        value["workspaceCanonicalRoot"] = Value::String(root);
     }
     reject_transport_capabilities(&value)?;
     let digest = canonical_sha256(&value)?;
@@ -2711,6 +2852,37 @@ fn require_same_retiring_run(
 
 fn validate_run_lifecycle(record: &HostActiveRunRecordV2) -> Result<(), HostV2StorageError> {
     validate_bridge_ownership(&record.bridge_ownership)?;
+    match record.workspace_kind {
+        HostRunWorkspaceKindV2::Empty => {
+            if record.workspace_canonical_root.is_some() {
+                return Err(HostV2StorageError::conflict(
+                    "host_active_run_workspace_root_invalid",
+                    "Managed empty Host Run retained a bound-workspace recovery root",
+                ));
+            }
+        }
+        HostRunWorkspaceKindV2::Bound => {
+            let must_retain_root = match record.lifecycle {
+                HostRunLifecycleV2::Active => true,
+                HostRunLifecycleV2::Retiring => record
+                    .retirement
+                    .as_ref()
+                    .map_or(true, |progress| !progress.workspace_binding_unregistered),
+                HostRunLifecycleV2::Retired => false,
+            };
+            if must_retain_root {
+                validate_workspace_recovery_root(
+                    HostRunWorkspaceKindV2::Bound,
+                    record.workspace_canonical_root.as_deref(),
+                )?;
+            } else if record.workspace_canonical_root.is_some() {
+                return Err(HostV2StorageError::conflict(
+                    "host_active_run_workspace_root_retained",
+                    "Retired or unregistered Host Run retained a recoverable workspace root",
+                ));
+            }
+        }
+    }
     match (record.lifecycle, record.retirement.as_ref()) {
         (HostRunLifecycleV2::Active, None) => Ok(()),
         (HostRunLifecycleV2::Active, Some(_)) => Err(HostV2StorageError::conflict(

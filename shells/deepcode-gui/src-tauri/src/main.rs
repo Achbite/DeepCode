@@ -2,10 +2,11 @@
 
 use deepcode_kernel_abi::{
     is_valid_host_instance_id_v2, is_valid_host_shell_capability_v2,
-    is_valid_host_ui_capability_v2, HOST_AUTHORITY_ENTROPY_BYTES_V2, HOST_INSTANCE_ID_ENV_V2,
-    HOST_INSTANCE_ID_PREFIX_V2, HOST_SHELL_CAPABILITY_ENV_V2, HOST_SHELL_CAPABILITY_HEADER_V2,
-    HOST_SHELL_CAPABILITY_PREFIX_V2, HOST_UI_CAPABILITY_ENV_V2, HOST_UI_CAPABILITY_HEADER_V2,
-    HOST_UI_CAPABILITY_PREFIX_V2,
+    is_valid_host_ui_capability_v2, HostProcessIdentityV2, HostShutdownReceiptV2,
+    HostShutdownRequestV2, HOST_AUTHORITY_ENTROPY_BYTES_V2, HOST_INSTANCE_ID_ENV_V2,
+    HOST_INSTANCE_ID_PREFIX_V2, HOST_KERNEL_DAEMON_SERVICE_V2, HOST_SHELL_CAPABILITY_ENV_V2,
+    HOST_SHELL_CAPABILITY_HEADER_V2, HOST_SHELL_CAPABILITY_PREFIX_V2, HOST_UI_CAPABILITY_ENV_V2,
+    HOST_UI_CAPABILITY_HEADER_V2, HOST_UI_CAPABILITY_PREFIX_V2,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ struct OwnedHostChildren {
     daemon_host: String,
     daemon_port: String,
     daemon_capability: String,
-    instance_id: String,
+    daemon_identity: HostProcessIdentityV2,
 }
 
 struct OwnedHostProcess {
@@ -95,8 +96,7 @@ impl OwnedHostChildren {
             &self.daemon_host,
             &self.daemon_port,
             &self.daemon_capability,
-            &self.instance_id,
-            self.daemon.child.id(),
+            &self.daemon_identity,
         );
         terminate_owned_process_tree(&mut self.proxy);
         if !requested || !wait_for_child_exit(&mut self.daemon, 80) {
@@ -248,23 +248,6 @@ fn generate_local_identity(
             "generated Host authority value does not satisfy the v2 format",
         ))
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HostIdentityV2 {
-    service: String,
-    instance_id: String,
-    pid: u32,
-    address: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HostShutdownReceiptV2 {
-    accepted: bool,
-    identity: HostIdentityV2,
-    cleanup_complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,14 +579,18 @@ fn spawn_host_processes_if_available(
         .stderr(Stdio::null());
 
     let mut daemon = spawn_owned_host_process(&mut daemon_command).ok()?;
-    if !wait_for_public_identity(
+    let Some(daemon_identity) = wait_for_public_identity(
         &mut daemon,
         &target.host,
         &target.daemon_port,
-        "deepcode-kernel-daemon",
+        HOST_KERNEL_DAEMON_SERVICE_V2,
         host_admission.instance_id(),
         40,
-    ) || !wait_for_authenticated_health(
+    ) else {
+        terminate_owned_process_tree(&mut daemon);
+        return None;
+    };
+    if !wait_for_authenticated_health(
         &mut daemon,
         &target.host,
         &target.daemon_port,
@@ -642,33 +629,36 @@ fn spawn_host_processes_if_available(
                 &target.host,
                 &target.daemon_port,
                 host_admission.daemon_capability(),
-                host_admission.instance_id(),
+                &daemon_identity,
             );
             return None;
         }
     };
-    if !wait_for_public_identity(
+    if wait_for_public_identity(
         &mut proxy,
         &target.host,
         &target.port,
         "deepcode-host-web",
         host_admission.instance_id(),
         40,
-    ) || !wait_for_authenticated_health(
-        &mut proxy,
-        &target.host,
-        &target.port,
-        HOST_UI_CAPABILITY_HEADER_V2,
-        host_admission.proxy_capability(),
-        40,
-    ) {
+    )
+    .is_none()
+        || !wait_for_authenticated_health(
+            &mut proxy,
+            &target.host,
+            &target.port,
+            HOST_UI_CAPABILITY_HEADER_V2,
+            host_admission.proxy_capability(),
+            40,
+        )
+    {
         terminate_owned_process_tree(&mut proxy);
         shutdown_daemon_process(
             &mut daemon,
             &target.host,
             &target.daemon_port,
             host_admission.daemon_capability(),
-            host_admission.instance_id(),
+            &daemon_identity,
         );
         return None;
     }
@@ -678,7 +668,7 @@ fn spawn_host_processes_if_available(
         daemon_host: target.host.clone(),
         daemon_port: target.daemon_port.clone(),
         daemon_capability: host_admission.daemon_capability().to_string(),
-        instance_id: host_admission.instance_id().to_string(),
+        daemon_identity,
     })
 }
 
@@ -790,47 +780,47 @@ fn wait_for_public_identity(
     expected_service: &str,
     expected_instance_id: &str,
     attempts: usize,
-) -> bool {
+) -> Option<HostProcessIdentityV2> {
     let expected_pid = process.child.id();
     for _ in 0..attempts {
         match process.child.try_wait() {
-            Ok(Some(_)) | Err(_) => return false,
+            Ok(Some(_)) | Err(_) => return None,
             Ok(None) => {}
         }
-        if public_identity_matches(
+        if let Some(identity) = matching_public_identity(
             host,
             port,
             expected_service,
             expected_instance_id,
             expected_pid,
         ) {
-            return true;
+            return Some(identity);
         }
         std::thread::sleep(Duration::from_millis(75));
     }
-    false
+    None
 }
 
-fn public_identity_matches(
+fn matching_public_identity(
     host: &str,
     port: &str,
     expected_service: &str,
     expected_instance_id: &str,
     expected_pid: u32,
-) -> bool {
+) -> Option<HostProcessIdentityV2> {
     let request = http_request(host, port, "GET", "/api/host/identity", &[]);
-    let Some(envelope) =
-        request_loopback_json::<HostApiEnvelopeV2<HostIdentityV2>>(host, port, &request, 300)
-    else {
-        return false;
+    let Some(envelope) = request_loopback_json::<HostApiEnvelopeV2<HostProcessIdentityV2>>(
+        host, port, &request, 300,
+    ) else {
+        return None;
     };
     let Some(identity) = envelope.ok.then_some(envelope.data).flatten() else {
-        return false;
+        return None;
     };
-    identity.service == expected_service
+    (identity.service == expected_service
         && identity.instance_id == expected_instance_id
-        && identity.pid == expected_pid
-        && identity.address == loopback_http_address(host, port)
+        && identity.pid == expected_pid)
+        .then_some(identity)
 }
 
 fn authenticated_health_ready(
@@ -874,15 +864,20 @@ fn request_daemon_shutdown(
     host: &str,
     port: &str,
     capability: &str,
-    instance_id: &str,
-    pid: u32,
+    expected_identity: &HostProcessIdentityV2,
 ) -> bool {
-    let request = http_request(
+    let Ok(body) = serde_json::to_string(&HostShutdownRequestV2 {
+        expected_identity: expected_identity.clone(),
+    }) else {
+        return false;
+    };
+    let request = http_request_with_json_body(
         host,
         port,
         "POST",
         "/api/host/shutdown",
         &[(HOST_SHELL_CAPABILITY_HEADER_V2, capability)],
+        &body,
     );
     let Some(envelope) = request_loopback_json::<HostApiEnvelopeV2<HostShutdownReceiptV2>>(
         host, port, &request, 600,
@@ -892,12 +887,7 @@ fn request_daemon_shutdown(
     let Some(receipt) = envelope.ok.then_some(envelope.data).flatten() else {
         return false;
     };
-    receipt.accepted
-        && receipt.cleanup_complete
-        && receipt.identity.service == "deepcode-kernel-daemon"
-        && receipt.identity.instance_id == instance_id
-        && receipt.identity.pid == pid
-        && receipt.identity.address == loopback_http_address(host, port)
+    receipt.confirms_shutdown_of(expected_identity)
 }
 
 fn shutdown_daemon_process(
@@ -905,9 +895,9 @@ fn shutdown_daemon_process(
     host: &str,
     port: &str,
     capability: &str,
-    instance_id: &str,
+    expected_identity: &HostProcessIdentityV2,
 ) {
-    if !request_daemon_shutdown(host, port, capability, instance_id, process.child.id())
+    if !request_daemon_shutdown(host, port, capability, expected_identity)
         || !wait_for_child_exit(process, 80)
     {
         terminate_owned_process_tree(process);
@@ -1058,6 +1048,33 @@ fn http_request(
     request
 }
 
+fn http_request_with_json_body(
+    host: &str,
+    port: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("Content-Type: application/json\r\n");
+    request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    request.push_str("Connection: close\r\n\r\n");
+    request.push_str(body);
+    request
+}
+
 fn request_loopback_json<T: DeserializeOwned>(
     host: &str,
     port: &str,
@@ -1086,14 +1103,6 @@ fn request_loopback_json<T: DeserializeOwned>(
             .map(|offset| offset + 4)?;
         serde_json::from_slice(&response[body_offset..]).ok()
     })
-}
-
-fn loopback_http_address(host: &str, port: &str) -> String {
-    if host.contains(':') {
-        format!("http://[{host}]:{port}")
-    } else {
-        format!("http://{host}:{port}")
-    }
 }
 
 fn local_port_has_listener(host: &str, port: &str) -> bool {

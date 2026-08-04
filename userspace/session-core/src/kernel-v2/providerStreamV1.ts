@@ -36,9 +36,40 @@ interface SessionKernelLlmStreamToolPositionV2 {
   nativeIndex: number;
 }
 
+interface SessionKernelLlmStreamPendingTextItemV2
+  extends SessionKernelLlmStreamTextItemV2 {
+  /** One-based position in the eventual sealed ordered-items array. */
+  textOrdinal: number;
+  publication:
+    | 'bufferingUnknown'
+    | 'streaming'
+    | 'withheld';
+  publicationBuffer: string;
+  publicationStarted: boolean;
+}
+
+interface SessionKernelLlmPendingPublicTextBatchV2 {
+  textOrdinal: number;
+  providerPhase?: 'commentary';
+  textDelta: string;
+  utf8ByteLength: number;
+}
+
 type SessionKernelLlmStreamPendingItemV2 =
-  | SessionKernelLlmStreamTextItemV2
+  | SessionKernelLlmStreamPendingTextItemV2
   | SessionKernelLlmStreamToolPositionV2;
+
+export interface SessionKernelLlmPublicTextDeltaV2 {
+  providerTurnId: string;
+  streamSequence: number;
+  textOrdinal: number;
+  providerPhase?: 'commentary';
+  textDelta: string;
+}
+
+export type SessionKernelLlmPublicTextObserverV2 = (
+  delta: SessionKernelLlmPublicTextDeltaV2
+) => Promise<void>;
 
 export interface SessionKernelLlmStreamResultV2 {
   requestId: string;
@@ -56,13 +87,16 @@ export interface SessionKernelLlmStreamResultV2 {
 export interface SessionKernelLlmTransportV2 {
   request(
     request: LlmChatRequest,
-    signal: AbortSignal
+    signal: AbortSignal,
+    publicTextObserver?: SessionKernelLlmPublicTextObserverV2
   ): Promise<SessionKernelLlmStreamResultV2>;
 }
 
 const MAX_SSE_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 1024 * 1024;
+const MAX_PUBLIC_TEXT_BATCH_BYTES = 16 * 1024;
+const MAX_PUBLIC_TEXT_BATCH_DELAY_MS = 250;
 
 export class HttpSessionKernelLlmTransportV2
 implements SessionKernelLlmTransportV2 {
@@ -80,7 +114,8 @@ implements SessionKernelLlmTransportV2 {
 
   async request(
     request: LlmChatRequest,
-    signal: AbortSignal
+    signal: AbortSignal,
+    publicTextObserver?: SessionKernelLlmPublicTextObserverV2
   ): Promise<SessionKernelLlmStreamResultV2> {
     let response: Response;
     try {
@@ -117,7 +152,8 @@ implements SessionKernelLlmTransportV2 {
       await cancelBody(response.body);
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_http_failed',
-        `Provider transport failed with HTTP ${response.status}.`
+        `Provider transport failed with HTTP ${response.status}.`,
+        response.status
       );
     }
     const contentType = response.headers.get('content-type') ?? '';
@@ -137,7 +173,8 @@ implements SessionKernelLlmTransportV2 {
     return await consumeProviderSseV1(
       response.body,
       request.requestId,
-      signal
+      signal,
+      publicTextObserver
     );
   }
 }
@@ -145,7 +182,8 @@ implements SessionKernelLlmTransportV2 {
 export async function consumeProviderSseV1(
   body: ReadableStream<Uint8Array>,
   expectedRequestId: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  publicTextObserver?: SessionKernelLlmPublicTextObserverV2
 ): Promise<SessionKernelLlmStreamResultV2> {
   const decoder = new TextDecoder('utf-8', { fatal: true });
   const reader = body.getReader();
@@ -163,10 +201,195 @@ export async function consumeProviderSseV1(
   let sealedItems: SessionKernelLlmStreamResultV2['items'] | undefined;
   let totalTextBytes = 0;
   let finalStarted = false;
+  let publicStreamSequence = 0;
+  let pendingPublicTextBatch:
+    | SessionKernelLlmPendingPublicTextBatchV2
+    | undefined;
+  let publicTextFlushTimer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
+  let publicTextPublicationTail = Promise.resolve();
+  let publicTextPublicationFailed = false;
+  let publicTextPublicationFailure: unknown;
   const pendingItems: SessionKernelLlmStreamPendingItemV2[] = [];
   const toolItems = new Map<number, SessionKernelLlmStreamToolItemV2>();
 
-  const accept = (frame: string): void => {
+  const clearPublicTextFlushTimer = (): void => {
+    if (publicTextFlushTimer === undefined) return;
+    clearTimeout(publicTextFlushTimer);
+    publicTextFlushTimer = undefined;
+  };
+
+  const enqueuePublicTextPublication = (
+    batch: SessionKernelLlmPendingPublicTextBatchV2
+  ): void => {
+    const observer = publicTextObserver;
+    if (!observer || !batch.textDelta) return;
+    publicStreamSequence += 1;
+    const delta: SessionKernelLlmPublicTextDeltaV2 = {
+      providerTurnId: expectedRequestId,
+      streamSequence: publicStreamSequence,
+      textOrdinal: batch.textOrdinal,
+      ...(batch.providerPhase
+        ? { providerPhase: batch.providerPhase }
+        : {}),
+      textDelta: batch.textDelta,
+    };
+    publicTextPublicationTail = publicTextPublicationTail.then(
+      async () => {
+        if (publicTextPublicationFailed) return;
+        try {
+          await observer(delta);
+        } catch (error) {
+          publicTextPublicationFailed = true;
+          publicTextPublicationFailure = error;
+          void reader.cancel().catch(() => {
+            // The projection failure remains authoritative.
+          });
+        }
+      }
+    );
+  };
+
+  const enqueuePendingPublicText = (): void => {
+    clearPublicTextFlushTimer();
+    const batch = pendingPublicTextBatch;
+    pendingPublicTextBatch = undefined;
+    if (batch) enqueuePublicTextPublication(batch);
+  };
+
+  const schedulePublicTextFlush = (): void => {
+    if (
+      publicTextFlushTimer !== undefined
+      || !pendingPublicTextBatch
+    ) {
+      return;
+    }
+    publicTextFlushTimer = setTimeout(() => {
+      publicTextFlushTimer = undefined;
+      const batch = pendingPublicTextBatch;
+      pendingPublicTextBatch = undefined;
+      if (batch) enqueuePublicTextPublication(batch);
+    }, MAX_PUBLIC_TEXT_BATCH_DELAY_MS);
+  };
+
+  const awaitPublicTextPublications = async (): Promise<void> => {
+    await publicTextPublicationTail;
+    if (publicTextPublicationFailed) {
+      throw publicTextPublicationFailure;
+    }
+  };
+
+  const flushPendingPublicText = async (): Promise<void> => {
+    enqueuePendingPublicText();
+    await awaitPublicTextPublications();
+  };
+
+  const publishPublicTextImmediately = async (
+    item: SessionKernelLlmStreamPendingTextItemV2,
+    textDelta: string
+  ): Promise<void> => {
+    enqueuePublicTextPublication({
+      textOrdinal: item.textOrdinal,
+      ...(item.phase === 'commentary'
+        ? { providerPhase: 'commentary' as const }
+        : {}),
+      textDelta,
+      utf8ByteLength: utf8Bytes(textDelta),
+    });
+    await awaitPublicTextPublications();
+  };
+
+  const bufferPublicText = async (
+    item: SessionKernelLlmStreamPendingTextItemV2,
+    textDelta: string
+  ): Promise<void> => {
+    const providerPhase = item.phase === 'commentary'
+      ? 'commentary' as const
+      : undefined;
+    let remaining = textDelta;
+    while (remaining) {
+      if (
+        pendingPublicTextBatch
+        && (
+          pendingPublicTextBatch.textOrdinal !== item.textOrdinal
+          || pendingPublicTextBatch.providerPhase !== providerPhase
+        )
+      ) {
+        await flushPendingPublicText();
+      }
+      if (!pendingPublicTextBatch) {
+        pendingPublicTextBatch = {
+          textOrdinal: item.textOrdinal,
+          ...(providerPhase ? { providerPhase } : {}),
+          textDelta: '',
+          utf8ByteLength: 0,
+        };
+        schedulePublicTextFlush();
+      }
+      const available = MAX_PUBLIC_TEXT_BATCH_BYTES
+        - pendingPublicTextBatch.utf8ByteLength;
+      const prefixLength = utf8PrefixLength(remaining, available);
+      if (prefixLength === 0) {
+        await flushPendingPublicText();
+        continue;
+      }
+      const prefix = remaining.slice(0, prefixLength);
+      pendingPublicTextBatch.textDelta += prefix;
+      pendingPublicTextBatch.utf8ByteLength += utf8Bytes(prefix);
+      remaining = remaining.slice(prefixLength);
+      if (
+        pendingPublicTextBatch.utf8ByteLength
+          >= MAX_PUBLIC_TEXT_BATCH_BYTES
+      ) {
+        await flushPendingPublicText();
+      }
+    }
+  };
+
+  const publishSafeText = async (
+    item: SessionKernelLlmStreamPendingTextItemV2,
+    content: string
+  ): Promise<void> => {
+    if (!publicTextObserver || !content) return;
+    if (item.phase === 'final_answer' || item.publication === 'withheld') {
+      return;
+    }
+    let textDelta = content;
+    if (item.phase === 'unknown') {
+      if (item.publication === 'streaming') {
+        // The first non-whitespace character already proved this is not a
+        // text-framed ToolIntent candidate.
+      } else {
+        item.publicationBuffer += content;
+        const firstNonWhitespace = item.text.match(/\S/u)?.[0];
+        if (!firstNonWhitespace) return;
+        if (firstNonWhitespace === '{') {
+          item.publication = 'withheld';
+          item.publicationBuffer = '';
+          return;
+        }
+        item.publication = 'streaming';
+        textDelta = item.publicationBuffer;
+        item.publicationBuffer = '';
+      }
+    }
+    if (!item.publicationStarted) {
+      item.publicationStarted = true;
+      const prefixLength = utf8PrefixLength(
+        textDelta,
+        MAX_PUBLIC_TEXT_BATCH_BYTES
+      );
+      await publishPublicTextImmediately(
+        item,
+        textDelta.slice(0, prefixLength)
+      );
+      textDelta = textDelta.slice(prefixLength);
+    }
+    if (textDelta) await bufferPublicText(item, textDelta);
+  };
+
+  const accept = async (frame: string): Promise<void> => {
     const event = decodeSseFrame(frame, expectedRequestId);
     if (completion) {
       throw protocolViolation(
@@ -241,17 +464,35 @@ export async function consumeProviderSseV1(
           );
         }
         const previous = pendingItems.at(-1);
+        let pendingText: SessionKernelLlmStreamPendingTextItemV2;
         if (
           previous?.kind === 'text'
           && previous.phase === phase
         ) {
           previous.text += content;
+          pendingText = previous;
         } else {
-          pendingItems.push({ kind: 'text', phase, text: content });
+          await flushPendingPublicText();
+          pendingText = {
+            kind: 'text',
+            phase,
+            text: content,
+            textOrdinal: pendingItems.length + 1,
+            publication: phase === 'commentary'
+              ? 'streaming'
+              : phase === 'final_answer' || finalStarted
+                ? 'withheld'
+                : 'bufferingUnknown',
+            publicationBuffer: '',
+            publicationStarted: false,
+          };
+          pendingItems.push(pendingText);
         }
+        await publishSafeText(pendingText, content);
         return;
       }
       case 'provider_tool_call_delta': {
+        await flushPendingPublicText();
         requireMetadata(metadata);
         if (finalStarted) {
           throw protocolViolation(
@@ -351,6 +592,7 @@ export async function consumeProviderSseV1(
         requireMetadata(metadata);
         exactKeys(event.data, ['type', 'requestId', 'receipt']);
         {
+          await flushPendingPublicText();
           const decodedCompletion = decodeCompletionReceipt(
             event.data.receipt
           );
@@ -363,6 +605,7 @@ export async function consumeProviderSseV1(
         }
         return;
       case 'provider_error':
+        await flushPendingPublicText();
         exactKeys(
           event.data,
           ['type', 'requestId', 'error'],
@@ -406,6 +649,7 @@ export async function consumeProviderSseV1(
       if (chunk.done) {
         streamExhausted = true;
         buffer += finishUtf8(decoder);
+        await flushPendingPublicText();
         if (buffer.trim()) {
           throw new SessionKernelProviderTransportError(
             'session_kernel_provider_stream_truncated',
@@ -445,7 +689,7 @@ export async function consumeProviderSseV1(
         if (!boundary) break;
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary.length);
-        if (frame.trim()) accept(frame);
+        if (frame.trim()) await accept(frame);
       }
       if (utf8Bytes(buffer) > MAX_SSE_FRAME_BYTES) {
         throw new SessionKernelProviderTransportError(
@@ -454,7 +698,15 @@ export async function consumeProviderSseV1(
         );
       }
     }
+  } catch (error) {
+    try {
+      await flushPendingPublicText();
+    } catch (publicationError) {
+      throw publicationError;
+    }
+    throw error;
   } finally {
+    clearPublicTextFlushTimer();
     if (!streamExhausted) {
       try {
         await reader.cancel();
@@ -767,7 +1019,11 @@ function materializeCompletedItems(
       }
       materialized.push({ ...tool, index: ordinal });
     } else {
-      materialized.push(item);
+      materialized.push({
+        kind: 'text',
+        phase: item.phase,
+        text: item.text,
+      });
     }
   }
   return materialized;
@@ -1157,10 +1413,30 @@ function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
+function utf8PrefixLength(value: string, maximumBytes: number): number {
+  let prefixLength = 0;
+  let byteLength = 0;
+  for (const scalar of value) {
+    const codePoint = scalar.codePointAt(0)!;
+    const scalarBytes = codePoint <= 0x7f
+      ? 1
+      : codePoint <= 0x7ff
+        ? 2
+        : codePoint <= 0xffff
+          ? 3
+          : 4;
+    if (byteLength + scalarBytes > maximumBytes) break;
+    byteLength += scalarBytes;
+    prefixLength += scalar.length;
+  }
+  return prefixLength;
+}
+
 export class SessionKernelProviderTransportError extends Error {
   constructor(
     readonly code: string,
-    message: string
+    message: string,
+    readonly httpStatus?: number
   ) {
     super(message);
     this.name = 'SessionKernelProviderTransportError';

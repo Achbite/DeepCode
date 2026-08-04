@@ -44,72 +44,30 @@ export DEEPCODE_HOST_V2_OWNER_PGIDS="$OWNER_PGIDS"
 
 cleanup_started=0
 
-owned_group_alive() {
-  local pgid="$1"
-  kill -0 -- "-$pgid" >/dev/null 2>&1
-}
-
-signal_owned_groups() {
-  local signal_name="$1"
-  local pgid
-  [ -f "$OWNER_PGIDS" ] || return 0
-  while IFS= read -r pgid; do
-    case "$pgid" in
-      ''|*[!0-9]*) continue ;;
-    esac
-    [ "$pgid" -gt 1 ] || continue
-    if owned_group_alive "$pgid"; then
-      kill "-$signal_name" -- "-$pgid" >/dev/null 2>&1 || true
-    fi
-  done <"$OWNER_PGIDS"
-}
-
-owned_groups_alive() {
-  local pgid
-  [ -f "$OWNER_PGIDS" ] || return 1
-  while IFS= read -r pgid; do
-    case "$pgid" in
-      ''|*[!0-9]*) continue ;;
-    esac
-    [ "$pgid" -gt 1 ] || continue
-    if owned_group_alive "$pgid"; then
-      return 0
-    fi
-  done <"$OWNER_PGIDS"
-  return 1
-}
-
-cleanup_owned_resources() {
-  local unused
-  if [ "$cleanup_started" -eq 1 ]; then
-    return 0
-  fi
-  cleanup_started=1
-  trap - INT TERM
-  signal_owned_groups TERM
-  for unused in {1..20}; do
-    owned_groups_alive || break
-    sleep 0.1
-  done
-  signal_owned_groups KILL
-  for unused in {1..20}; do
-    owned_groups_alive || break
-    sleep 0.05
-  done
-  if owned_groups_alive; then
-    printf '%s\n' \
-      "[FAIL] test-owned process groups remain; owner registry retained at $OWNER_PGIDS" >&2
-    return 1
-  fi
-  rm -rf -- "$RUN_ROOT"
-}
-
 finish_with_cleanup() {
   local status="$?"
-  if ! cleanup_owned_resources; then
-    status=1
+  local cleanup_status=0
+  if [ "$cleanup_started" -eq 1 ]; then
+    trap - EXIT
+    exit "$status"
   fi
+  cleanup_started=1
   trap - EXIT
+  trap '' INT TERM
+  if python3 -B -I -S \
+    "$ROOT_DIR/scripts/tests/host-v2-integration.py" \
+    --cleanup-owned-resources "$RUN_ROOT" "$OWNER_PGIDS"; then
+    cleanup_status=0
+  else
+    cleanup_status="$?"
+  fi
+  if [ "$cleanup_status" -ne 0 ]; then
+    printf '%s\n' \
+      "[FAIL] owner cleanup exit=$cleanup_status; evidence retained at $RUN_ROOT" >&2
+    if [ "$status" -eq 0 ]; then
+      status=1
+    fi
+  fi
   exit "$status"
 }
 

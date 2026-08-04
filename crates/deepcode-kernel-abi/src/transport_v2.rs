@@ -12,6 +12,9 @@ pub const HOST_SHELL_CAPABILITY_PREFIX_V2: &str = "dchostv2_";
 pub const HOST_UI_CAPABILITY_PREFIX_V2: &str = "dchostuiv2_";
 pub const HOST_INSTANCE_ID_PREFIX_V2: &str = "dcinstancev2_";
 pub const HOST_AUTHORITY_ENTROPY_BYTES_V2: usize = 32;
+pub const HOST_KERNEL_DAEMON_SERVICE_V2: &str = "deepcode-kernel-daemon";
+pub const HOST_SHUTDOWN_OWNER_HOST_SHELL_V2: &str = "hostShell";
+pub const HOST_SHUTDOWN_IDENTITY_CONFLICT_V2: &str = "host_shutdown_identity_conflict";
 
 pub fn is_valid_host_shell_capability_v2(value: &str) -> bool {
     is_valid_host_authority_value_v2(value, HOST_SHELL_CAPABILITY_PREFIX_V2)
@@ -33,6 +36,39 @@ fn is_valid_host_authority_value_v2(value: &str, prefix: &str) -> bool {
         && encoded
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostProcessIdentityV2 {
+    pub service: String,
+    pub instance_id: String,
+    pub pid: u32,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostShutdownRequestV2 {
+    pub expected_identity: HostProcessIdentityV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostShutdownReceiptV2 {
+    pub accepted: bool,
+    pub owner: String,
+    pub identity: HostProcessIdentityV2,
+    pub cleanup_complete: bool,
+}
+
+impl HostShutdownReceiptV2 {
+    pub fn confirms_shutdown_of(&self, expected_identity: &HostProcessIdentityV2) -> bool {
+        self.accepted
+            && self.owner == HOST_SHUTDOWN_OWNER_HOST_SHELL_V2
+            && self.cleanup_complete
+            && &self.identity == expected_identity
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

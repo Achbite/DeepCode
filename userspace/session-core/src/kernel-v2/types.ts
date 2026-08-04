@@ -8,6 +8,7 @@ import type {
   KernelFactProjectionV2,
   RawToolArgumentsV2,
   ScopeManifestV2,
+  ToolContextBundleV2,
   ToolContextRefV2,
   ToolDescriptorV2,
   ToolIntentV2,
@@ -25,9 +26,9 @@ import type {
 import type { ProviderKernelToolSourceV2 } from './toolIntent.js';
 
 export const SESSION_KERNEL_LOOP_V2_SCHEMA =
-  'deepcode.session.kernel-loop.v2' as const;
+  'deepcode.session.kernel-loop.v3' as const;
 export const SESSION_KERNEL_CHECKPOINT_V2_SCHEMA =
-  'deepcode.session.kernel-checkpoint.v2' as const;
+  'deepcode.session.kernel-checkpoint.v3' as const;
 export const SESSION_KERNEL_REVIEW_PROJECTION_V2 =
   'deepcode.session.kernel-review-projection.v2' as const;
 export const SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA =
@@ -38,6 +39,113 @@ export const SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA =
   'deepcode.session.provider-tool-call-receipt.v2' as const;
 export const SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA =
   'deepcode.provider-stream-terminal.v1' as const;
+export const SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA =
+  'deepcode.session.provider-turn-dispatch.v3' as const;
+export const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA =
+  'deepcode.session.provider-turn-terminal.v3' as const;
+export const SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA =
+  'deepcode.session.tool-context-snapshot.v3' as const;
+
+export type SessionWorkAuthorityV3 =
+  | {
+      kind: 'plan';
+      planRevision: string;
+    }
+  | {
+      kind: 'contextRead';
+      operationIds: string[];
+      digest: string;
+    };
+
+export interface SessionKernelPersistenceRecordRefV3 {
+  recordId: string;
+  recordDigest: string;
+}
+
+export interface SessionProviderAuthorityBindingV3 {
+  runId: string;
+  inputId: string;
+  controlEpoch: number;
+  currentInputDigest: string;
+  planRevision?: string;
+  reviewRevision?: number;
+  snapshotHighWater?: number;
+  providerProfileId: string;
+  providerProfileRevisionDigest: string;
+}
+
+export interface SessionProviderTurnDispatchRecordV3 {
+  ref: SessionKernelPersistenceRecordRefV3;
+  recordedAt: string;
+  data: {
+    schemaVersion: typeof SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA;
+    providerTurnId: string;
+    purpose: 'primary' | 'continuation' | 'finalAnswer';
+    authorityBinding: SessionProviderAuthorityBindingV3;
+    requestDigest: string;
+  };
+}
+
+export type SessionProviderTerminalOrderedItemV3 =
+  | {
+      kind: 'text';
+      phase: 'commentary' | 'final_answer' | 'unknown';
+      text: string;
+    }
+  | {
+      kind: 'toolCall';
+      index: number;
+      callId: string;
+      name: string;
+      arguments: string;
+    };
+
+export interface SessionProviderTurnTerminalRecordV3 {
+  ref: SessionKernelPersistenceRecordRefV3;
+  recordedAt: string;
+  data: {
+    schemaVersion: typeof SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA;
+    providerTurnId: string;
+    dispatchRef: SessionKernelPersistenceRecordRefV3;
+    authorityBinding: SessionProviderAuthorityBindingV3;
+    terminalKind:
+      | 'completed'
+      | 'failed'
+      | 'cancelled'
+      | 'limitExceeded';
+    reasonCode?: string;
+    responseDigest?: string;
+    completion?: SessionProviderCompletionReceiptV1;
+    providerResult?: {
+      providerProfileId: string;
+      provider: string;
+      model: string;
+      usage?: Record<string, unknown>;
+    };
+    traceRef: {
+      terminalDigest: string;
+      sealDigest: string;
+      recordCount: number;
+    };
+    orderedItems: SessionProviderTerminalOrderedItemV3[];
+  };
+}
+
+export interface SessionToolContextSnapshotRecordV3 {
+  ref: SessionKernelPersistenceRecordRefV3;
+  recordedAt: string;
+  data: {
+    schemaVersion: typeof SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA;
+    runId: string;
+    contextRef: ToolContextRefV2;
+    toolContext: ToolContextBundleV2;
+  };
+}
+
+export interface SessionProviderTurnDurableEvidenceV3 {
+  dispatch?: SessionProviderTurnDispatchRecordV3;
+  terminal?: SessionProviderTurnTerminalRecordV3;
+}
 
 export type SessionProviderNativeCompletionV1 =
   | {
@@ -86,7 +194,7 @@ export type SessionProviderOrderedItemV2 =
     }
   | {
       kind: 'toolCall';
-      source: 'providerNative';
+      source: 'providerNative' | 'textFrame';
       ordinal: number;
       callId: string;
       toolName: string;
@@ -109,6 +217,7 @@ export type SessionProviderContextSectionV2 =
   | 'currentInput'
   | 'priorSessionMemory'
   | 'planDecision'
+  | 'review'
   | 'providerOutcomes'
   | 'canonicalFacts';
 
@@ -145,9 +254,9 @@ export interface SessionProviderContextAssemblyV2 {
 }
 
 export interface SessionProviderResultMetadataV2 {
-  providerProfileId?: string;
-  provider?: string;
-  model?: string;
+  providerProfileId: string;
+  provider: string;
+  model: string;
   usage?: Record<string, unknown>;
 }
 
@@ -224,7 +333,36 @@ export type SessionProviderTurnTargetV2 =
       purpose: string;
       idempotencyKey: string;
       deadline?: DeadlineRequestV2;
-    };
+    }
+  | ({
+      kind: 'finalAnswer';
+    } & SessionFinalAnswerBindingV3);
+
+export interface SessionFinalAnswerBindingV3 {
+  inputId: string;
+  controlEpoch: number;
+  workAuthority: SessionWorkAuthorityV3;
+  reviewRevision: number;
+  snapshotHighWater: number;
+}
+
+export interface SessionFinalAnswerStateV3 {
+  status:
+    | 'pending'
+    | 'requesting'
+    | 'stale'
+    | 'committed'
+    | 'finalAnswerFailed';
+  binding: SessionFinalAnswerBindingV3;
+  physicalRequestCount: number;
+  providerTurnId?: string;
+  startedAt?: string;
+  staleAt?: string;
+  committedAt?: string;
+  failedAt?: string;
+  finalText?: string;
+  lastErrorCode?: string;
+}
 
 export interface SessionProviderTurnRequestV2 {
   reason:
@@ -232,7 +370,8 @@ export interface SessionProviderTurnRequestV2 {
     | 'userInput'
     | 'capabilityDenied'
     | 'retryGuidance'
-    | 'recovery';
+    | 'recovery'
+    | 'finalAnswer';
   target: SessionProviderTurnTargetV2;
   guidance?: string[];
   /**
@@ -272,6 +411,7 @@ export interface SessionProviderTurnInputV2 {
   providerProfile: SessionProviderProfileBootstrapV2;
   plan?: SessionNaturalLanguagePlanV2;
   planDecision?: SessionPlanDecisionV2;
+  review?: SessionKernelReviewV2;
   kernelFacts: SessionProviderKernelFactsProjectionV2;
   target: SessionProviderTurnTargetV2;
   guidance: string[];
@@ -282,17 +422,47 @@ export interface SessionProviderTurnInputV2 {
     tools: readonly ToolDescriptorV2[];
   };
   contextAssembly: SessionProviderContextAssemblyV2;
+  /**
+   * Ephemeral safe-publication hook for Provider text deltas. The callback is
+   * transport-only state and must never be persisted in a checkpoint, trace,
+   * or Provider request.
+   */
+  publicTextObserver?: (delta: {
+    providerTurnId: string;
+    streamSequence: number;
+    textOrdinal: number;
+    providerPhase?: 'commentary';
+    textDelta: string;
+  }) => Promise<void>;
   signal: AbortSignal;
 }
 
-export interface SessionProviderOutcomeRecordV2 {
+interface SessionProviderOutcomeRecordBaseV2 {
   providerTurnId: string;
-  outputKind: SessionProviderTurnOutputV2['kind'];
   recordedAt: string;
   summary?: string;
-  toolCallReceipt?: SessionProviderToolCallReceiptV2;
   providerResult: SessionProviderResultMetadataV2;
 }
+
+export interface SessionProviderToolSettlementV2 {
+  status: 'completed' | 'aborted';
+  settledAt: string;
+}
+
+export type SessionProviderOutcomeRecordV2 =
+  | (SessionProviderOutcomeRecordBaseV2 & {
+      outputKind: 'toolIntent';
+      toolCallReceipt: SessionProviderToolCallReceiptV2;
+      toolSettlement: SessionProviderToolSettlementV2;
+    })
+  | (SessionProviderOutcomeRecordBaseV2 & {
+      outputKind: Exclude<
+        SessionProviderTurnOutputV2['kind'],
+        'toolIntent'
+      >;
+      toolCallReceipt?: never;
+      toolSettlement?: never;
+    });
 
 export type SessionProviderTurnOutputV2 = (
   | {
@@ -414,6 +584,16 @@ export interface SessionOperationPlanActionBindingV2 {
 
 export interface SessionProviderTurnRecordV2 {
   providerTurnId: string;
+  purpose: 'primary' | 'continuation' | 'finalAnswer';
+  target: SessionProviderTurnTargetV2;
+  /** Plan revision present in the Provider request context, if any. */
+  planRevision?: string;
+  /**
+   * Exact remaining admission budget captured before dispatch. It is required
+   * only for a PlanAction turn so a sealed multi-call response can be
+   * deterministically admitted after Session restart.
+   */
+  remainingToolCallBudget?: number;
   controlEpoch: number;
   contextRef: ToolContextRefV2;
   factProjection: SessionProviderFactProjectionReceiptV2;
@@ -432,6 +612,8 @@ export interface SessionProviderTurnRecordV2 {
     | 'runCancelled'
     | 'superseded'
     | 'shutdown';
+  dispatchRef?: SessionKernelPersistenceRecordRefV3;
+  terminalRef?: SessionKernelPersistenceRecordRefV3;
   response?: {
     items: SessionProviderOrderedItemV2[];
     completion: SessionProviderCompletionReceiptV1;
@@ -527,6 +709,7 @@ export interface SessionKernelReviewV2 {
   projectionVersion: typeof SESSION_KERNEL_REVIEW_PROJECTION_V2;
   revision: number;
   status: 'draft' | 'final';
+  workAuthority?: SessionWorkAuthorityV3;
   planRevision?: string;
   planDecision?: SessionPlanDecisionV2;
   plan?: {
@@ -595,6 +778,7 @@ export interface SessionKernelProjectionEventV2 {
     | 'input.persisted'
     | 'scope.previewed'
     | 'provider.started'
+    | 'provider.composing'
     | 'provider.completed'
     | 'provider.stale'
     | 'toolIntent.submitted'
@@ -638,5 +822,10 @@ export type SessionKernelLoopResultV2 =
       kind: 'manualRecovery';
       operationId: string;
       invocationId?: string;
+    }
+  | {
+      kind: 'finalAnswerFailed';
+      errorCode: string;
+      physicalRequestCount: number;
     }
   | { kind: 'staleProviderResult'; providerTurnId: string };

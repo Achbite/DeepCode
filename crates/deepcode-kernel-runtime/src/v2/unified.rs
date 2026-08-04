@@ -25,9 +25,9 @@ use deepcode_kernel_abi::v2::{
 };
 use deepcode_kernel_abi::v2_command::{
     CapabilityApprovalViewV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
-    CapabilityScopePreviewReplyV2, CapabilityScopePreviewV2, CommandHandlingV2,
-    ControlEpochAdvanceV2, DeadlineRequestV2, EpochPreconditionV2, InvalidFieldViolationV2,
-    InvalidRelationV2, InvalidRequestReasonV2, KernelCommandEnvelopeV2,
+    CapabilityScopePreviewReplyV2, CapabilityScopePreviewV2, CapabilityScopeRejectionReasonV2,
+    CommandHandlingV2, ControlEpochAdvanceV2, DeadlineRequestV2, EpochPreconditionV2,
+    InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2, KernelCommandEnvelopeV2,
     KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelFactProjectionPageV2,
     KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2, MutationCommandKindV2,
     RunOpenReplyV2, RunOpenV2, ToolContextGetReplyV2, ToolContextGetV2,
@@ -1309,6 +1309,49 @@ fn classify_tool_intent_rejection(
         } if field_path == "authority" => (
             ToolIntentRejectionReasonV2::PlanActionRequired,
             "Persist and confirm a PlanAction before invoking this mutation tool.",
+        ),
+        _ => return None,
+    };
+    Some((classified.0, classified.1.to_owned()))
+}
+
+fn classify_scope_preview_rejection(
+    error: &KernelErrorV2,
+) -> Option<(CapabilityScopeRejectionReasonV2, String)> {
+    let classified = match error {
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::DeadlineOutOfContract { .. },
+        } => (
+            CapabilityScopeRejectionReasonV2::InvalidArguments,
+            "Use a deadline within the current tool contract.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason:
+                InvalidRequestReasonV2::InvalidField {
+                    field_path,
+                    violation: InvalidFieldViolationV2::PathEscapesWorkspace,
+                },
+        } if field_path.starts_with("rawArguments") => (
+            CapabilityScopeRejectionReasonV2::InvalidArguments,
+            "Use workspace-relative tool arguments that resolve inside the bound workspace.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::InvalidField { field_path, .. },
+        } if field_path.starts_with("rawArguments") => (
+            CapabilityScopeRejectionReasonV2::InvalidArguments,
+            "Use previewArguments accepted by the immutable Kernel ToolContext schema.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::InvalidField { field_path, .. },
+        } if field_path == "requestedResources" => (
+            CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
+            "Use requested resources that exactly cover the canonical tool invocation.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::InvalidRelation { .. },
+        } => (
+            CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
+            "Use requested resources that are valid for this tool and workspace.",
         ),
         _ => return None,
     };
@@ -4067,7 +4110,8 @@ impl KernelSessionServiceV2 {
                 }, false));
             }
         };
-        let prepared = self.prepare_preview(
+        let rejected_tool_id = command.tool_id.clone();
+        let prepared = match self.prepare_preview(
             &command.run_id,
             command.expected_control_epoch,
             command.plan_revision,
@@ -4083,7 +4127,22 @@ impl KernelSessionServiceV2 {
             command.tool_context_ref,
             descriptor,
             public_command.as_ref(),
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let Some((reason, guidance)) = classify_scope_preview_rejection(&error) else {
+                    return Err(error);
+                };
+                return Ok((
+                    CapabilityScopePreviewReplyV2::Rejected {
+                        tool_id: rejected_tool_id,
+                        reason,
+                        guidance,
+                    },
+                    false,
+                ));
+            }
+        };
         let reply = CapabilityScopePreviewReplyV2::Previewed {
             preview: prepared.record.clone(),
         };

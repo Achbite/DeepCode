@@ -381,7 +381,12 @@ async fn proxy_api(
     {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
-    match request.timeout(Duration::from_secs(60)).send().await {
+    let request = if method == Method::GET && uri.path().ends_with("/stream") {
+        request
+    } else {
+        request.timeout(Duration::from_secs(60))
+    };
+    match request.send().await {
         Ok(response) => proxy_response(response).await,
         Err(error) => {
             ApiResponse::error("kernel_daemon_proxy_failed", error.to_string()).into_response()
@@ -463,7 +468,8 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "cancel"])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "guidance"])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "authority", "revoke"])
-        | ("GET", ["api", "agent", "sessions", _, "runs", _, "stream"]) => true,
+        | ("GET", ["api", "agent", "sessions", _, "runs", _, "stream"])
+        | ("GET", ["api", "agent", "sessions", _, "timeline", "stream"]) => true,
         _ => false,
     }
 }
@@ -535,6 +541,36 @@ async fn proxy_response(response: reqwest::Response) -> Response {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let cache_control = response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let content_type_options = response
+        .headers()
+        .get("x-content-type-options")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if content_type
+        .as_deref()
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        let mut builder = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        if let Some(cache_control) = cache_control {
+            builder = builder.header(header::CACHE_CONTROL, cache_control);
+        }
+        if let Some(content_type_options) = content_type_options {
+            builder = builder.header("x-content-type-options", content_type_options);
+        }
+        return builder
+            .body(Body::from_stream(response.bytes_stream()))
+            .unwrap_or_else(|error| {
+                ApiResponse::error("proxy_response_build_failed", error.to_string()).into_response()
+            });
+    }
     match response.bytes().await {
         Ok(bytes) => {
             let mut builder = Response::builder().status(status);

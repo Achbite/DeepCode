@@ -1322,6 +1322,43 @@ pub(crate) async fn llm_chat_stream(
         "messages": messages,
         "tools": body.get("tools").cloned().unwrap_or_else(|| json!([]))
     });
+    if body.get("parent_request_id").is_some() {
+        return llm_stream_error_response(json!({
+            "type": "provider_error",
+            "requestId": request_id,
+            "error": "provider_continuation_invalid",
+            "message": "Provider continuation accepts only the canonical parentRequestId field.",
+        }));
+    }
+    if let Some(parent_request_id) = body.get("parentRequestId") {
+        let Some(parent_request_id) = parent_request_id
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "requestId": request_id,
+                "error": "provider_continuation_invalid",
+                "message": "Provider continuation parentRequestId must be a non-empty identity.",
+            }));
+        };
+        if crate::host_v2_storage::validate_bounded_identity(
+            parent_request_id,
+            "parentRequestId",
+            512,
+        )
+        .is_err()
+        {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "requestId": request_id,
+                "error": "provider_continuation_invalid",
+                "message": "Provider continuation parentRequestId is invalid.",
+            }));
+        }
+        request_envelope["parentRequestId"] = json!(parent_request_id);
+    }
     if let Some(response_format) = body
         .get("responseFormat")
         .or_else(|| body.get("response_format"))
@@ -1500,7 +1537,10 @@ fn provider_trace_identity_from_request(
         run_id,
         user_turn_id: admission.current_input_id.clone(),
         provider_turn_id: request_id.to_string(),
-        provider_kind: profile.kind.clone(),
+        provider_kind: profile
+            .provider_flavor
+            .clone()
+            .unwrap_or_else(|| profile.kind.clone()),
         model: profile.model.clone(),
         profile_id: profile.id.clone(),
         profile_revision: profile_revision.to_string(),
@@ -1511,6 +1551,7 @@ fn provider_trace_identity_from_request(
         identity,
         ProviderStreamDispatchAuthorityV1 {
             session_store: state.host_services.session_kernel_v2.clone(),
+            kernel_service: state.kernel_v2.service(),
             run_capability: capability,
             admission,
         },

@@ -34,17 +34,20 @@ import {
   checkpointSessionKernelStateV2,
   cloneSessionKernelLoopStateV2,
   createSessionKernelLoopStateV2,
+  currentSessionWorkAuthorityV3,
   recordSessionProviderOutcomeV2,
   recordSessionPlanDecisionV2,
   recordSessionPlanV2,
   recordSessionUserInputV2,
   restoreSessionKernelLoopStateV2,
+  sameSessionWorkAuthorityV3,
   sessionPlanActionV2,
   type SessionKernelInitialStateV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
 import {
   markSessionProviderToolCallQueueOutcomeRecordedV2,
+  publicSessionProviderToolCallQueueItemsV2,
   reconcileSessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
@@ -61,6 +64,7 @@ import type {
   SessionPlanDecisionV2,
   SessionProviderTurnRequestV2,
   SessionUserInputRecordV2,
+  SessionWorkAuthorityV3,
 } from './types.js';
 
 export interface SessionKernelRunCancelInputV2 {
@@ -162,11 +166,13 @@ export class SessionKernelLoopV2 {
         settlePlanActionCompleted: (
           planActionId,
           completionKind,
-          providerTurnId
+          providerTurnId,
+          recordedAt
         ) => this.settlePlanActionCompleted(
           planActionId,
           completionKind,
-          providerTurnId
+          providerTurnId,
+          recordedAt
         ),
         transitionBlocked: () =>
           this.authorityTransitionActive
@@ -201,7 +207,12 @@ export class SessionKernelLoopV2 {
       persistedInput,
       pendingRequests,
     ] = await Promise.all([
-      ports.persistence.loadCheckpoint(initial.runId),
+      ports.persistence.loadCheckpoint(initial.runId, {
+        workspaceBindingDigest: initial.workspaceBindingDigest,
+        sessionMemory: initial.sessionMemory,
+        providerProfile: initial.providerProfile,
+        toolContext: initial.toolContext,
+      }),
       ports.persistence.loadLatestPlan(initial.runId),
       ports.persistence.loadLatestInput(initial.runId),
       ports.persistence.loadPendingPublicRequests(initial.runId),
@@ -1051,13 +1062,28 @@ export class SessionKernelLoopV2 {
   }
 
   async finalizeReview(
-    expectedPlanRevision: string
+    expectedWorkAuthority: SessionWorkAuthorityV3
   ): Promise<SessionKernelReviewV2> {
     this.beginMaintenance('finalizeReview');
     try {
       this.requireNoPendingRequests();
-      this.requireCurrentPlanRevision(expectedPlanRevision);
-      this.requireAcceptedPlan();
+      const workAuthority = currentSessionWorkAuthorityV3(this.state);
+      if (
+        !workAuthority
+        || !sameSessionWorkAuthorityV3(
+          workAuthority,
+          expectedWorkAuthority
+        )
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_work_authority_stale',
+          'Review finalization does not bind the current durable work authority.'
+        );
+      }
+      if (workAuthority.kind === 'plan') {
+        this.requireCurrentPlanRevision(workAuthority.planRevision);
+        this.requireAcceptedPlan();
+      }
       await this.reconcileFactsInternal();
       const review = finalizeSessionKernelReviewV2(
         this.state,
@@ -1086,6 +1112,8 @@ export class SessionKernelLoopV2 {
 
   async recover(): Promise<void> {
     let recovered = false;
+    const recoverySnapshotHighWater =
+      this.state.lineage.cursor.snapshotHighWater;
     this.beginMaintenance('recover', true);
     try {
       if (this.state.runCancellation?.status === 'projected') {
@@ -1107,6 +1135,24 @@ export class SessionKernelLoopV2 {
         await this.requests.replay('effect');
       }
       await this.reconcileFactsInternal();
+      if (
+        this.state.lineage.cursor.snapshotHighWater
+          < recoverySnapshotHighWater
+        || this.state.lineage.cursor.afterLedgerSequence
+          < recoverySnapshotHighWater
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_recovery_fact_replay_incomplete',
+          'Canonical Kernel fact replay did not cover the restored checkpoint high-water.'
+        );
+      }
+      await this.ensurePlanProjected();
+      await this.ensurePlanDecisionProjected();
+      await this.ensurePlanActionSettlementsProjected();
+      await this.providers.recoverCompletedProviderTurn();
+      // Recovery may have materialized a new Plan or PlanAction settlement
+      // from the sealed terminal. Re-run the idempotent projection gates over
+      // that newly admitted state before delivery flush.
       await this.ensurePlanProjected();
       await this.ensurePlanDecisionProjected();
       await this.ensurePlanActionSettlementsProjected();
@@ -1228,6 +1274,12 @@ export class SessionKernelLoopV2 {
       await this.saveCheckpoint();
     }
     if (queue.status === 'active' || queue.outcomeRecorded) return;
+    if (!queue.settledAt) {
+      throw new SessionKernelLoopError(
+        'session_kernel_provider_tool_settlement_missing',
+        'A settled Provider tool-call queue requires its durable settlement time.'
+      );
+    }
 
     if (
       queue.status === 'aborted'
@@ -1249,7 +1301,7 @@ export class SessionKernelLoopV2 {
     const outcome = {
       providerTurnId: queue.providerTurnId,
       outputKind: 'toolIntent',
-      recordedAt: queue.settledAt ?? this.ports.clock.now(),
+      recordedAt: queue.settledAt,
       summary: queue.status === 'completed'
         ? `Completed ${queue.calls.length} ordered Provider tool call(s).`
         : [
@@ -1260,6 +1312,10 @@ export class SessionKernelLoopV2 {
             ).length}`,
           ].join(' '),
       toolCallReceipt: cloneJson(queue.receipt),
+      toolSettlement: {
+        status: queue.status,
+        settledAt: queue.settledAt,
+      },
       providerResult: cloneJson(queue.providerResult),
     } as const;
     if (queue.status === 'completed') {
@@ -1270,10 +1326,13 @@ export class SessionKernelLoopV2 {
           providerTurnId: queue.providerTurnId,
           controlEpoch: queue.controlEpoch,
           outputKind: 'toolIntent',
+          terminalScope: 'providerTurn',
           result: {
             kind: 'orderedToolCallsCompleted',
             callCount: queue.calls.length,
           },
+          orderedItems:
+            publicSessionProviderToolCallQueueItemsV2(queue),
           toolCallReceipt: queue.receipt,
           providerOutcome: queue.providerResult,
         },
@@ -1289,6 +1348,8 @@ export class SessionKernelLoopV2 {
           code: 'session_kernel_provider_tool_calls_aborted',
           stage: 'provider.toolCallQueue',
           reason: queue.abortReason,
+          orderedItems:
+            publicSessionProviderToolCallQueueItemsV2(queue),
           unexecutedOrdinals: queue.calls
             .filter((call) => call.status === 'unexecuted')
             .map((call) => call.ordinal),
@@ -1380,7 +1441,8 @@ export class SessionKernelLoopV2 {
   private settlePlanActionCompleted(
     planActionId: string,
     completionKind: 'answer' | 'noTool',
-    providerTurnId: string
+    providerTurnId: string,
+    recordedAt: string
   ): SessionPlanActionSettlementV2 {
     this.requireAcceptedPlan();
     sessionPlanActionV2(this.state, planActionId);
@@ -1403,7 +1465,7 @@ export class SessionKernelLoopV2 {
       planActionId,
       completionKind,
       providerTurnId,
-      recordedAt: this.ports.clock.now(),
+      recordedAt,
     };
     this.state.planActionSettlements[planActionId] = settlement;
     return cloneJson(settlement);

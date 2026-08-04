@@ -15,15 +15,30 @@ import type { SessionKernelLoopStateV2 } from './state.js';
 import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   type SessionProviderCompletionReceiptV1,
+  type SessionProviderOutcomeRecordV2,
   type SessionProviderOrderedItemV2,
   type SessionProviderResultMetadataV2,
   type SessionProviderToolCallReceiptV2,
   type SessionProviderTurnTargetV2,
 } from './types.js';
-import { decodeProviderToolIntentTextFrameV2 } from './toolIntent.js';
 
 const MAX_PROVIDER_TOOL_CALLS_PER_TURN = 32;
 const MAX_PROVIDER_TOOL_CALL_QUEUE_BYTES = 4 * 1024 * 1024;
+
+export function isExactSessionProviderOutcomeRecordV2(
+  value: unknown,
+  expectedProfileId: string
+): value is SessionProviderOutcomeRecordV2 {
+  try {
+    validateExactSessionProviderOutcomeRecordV2(
+      value,
+      expectedProfileId
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export type SessionProviderToolCallQueueItemStatusV2 =
   | 'pending'
@@ -64,6 +79,87 @@ export interface SessionProviderToolCallQueueV2 {
 export interface SessionProviderToolCallQueueReconcileResultV2 {
   changed: boolean;
   settlement?: 'completed' | 'aborted';
+}
+
+/**
+ * Produces the public, execution-free view of the Provider response. Raw tool
+ * arguments stay in the private queue/trace; the shared projection receives
+ * only validated tool identity and ordered prose.
+ */
+export function publicSessionProviderOrderedItemsV2(
+  items: readonly SessionProviderOrderedItemV2[]
+): Array<Record<string, unknown>> {
+  return items.map((item) =>
+    item.kind === 'text'
+      ? {
+          kind: 'text',
+          phase: item.phase,
+          text: item.text,
+        }
+      : {
+          kind: 'toolCall',
+          ordinal: item.ordinal,
+          callId: item.callId,
+          toolName: item.toolName,
+          toolId: item.toolId,
+        }
+  );
+}
+
+/**
+ * Extends the safe ordered response with durable Session/Kernel identities so
+ * a reducer can settle each existing operation in place. This deliberately
+ * carries neither raw nor canonical arguments.
+ */
+export function publicSessionProviderToolCallQueueItemsV2(
+  queue: SessionProviderToolCallQueueV2,
+  mode: 'response' | 'settlement' = 'settlement'
+): Array<Record<string, unknown>> {
+  validateSessionProviderToolCallQueueV2(queue, {
+    runId: queue.calls[0]?.intent.runId,
+    controlEpoch: queue.controlEpoch,
+  });
+  return queue.orderedItems.map((item) => {
+    if (item.kind === 'text') {
+      return {
+        kind: 'text',
+        phase: item.phase,
+        text: item.text,
+      };
+    }
+    const call = queue.calls[item.ordinal - 1];
+    const receipt = queue.receipt.calls[item.ordinal - 1];
+    if (
+      !call
+      || !receipt
+      || receipt.callId !== item.callId
+      || receipt.toolId !== item.toolId
+      || call.intent.toolId !== item.toolId
+    ) {
+      throw invalidQueue();
+    }
+    return {
+      kind: 'toolCall',
+      ordinal: item.ordinal,
+      callId: item.callId,
+      toolName: item.toolName,
+      toolId: item.toolId,
+      operationId: call.intent.operationId,
+      status: mode === 'response' ? 'pending' : call.status,
+      ...(mode === 'settlement' && call.invocationId
+        ? { invocationId: call.invocationId }
+        : {}),
+      ...(mode === 'settlement' && call.terminalFactId
+        ? { terminalFactId: call.terminalFactId }
+        : {}),
+      ...(mode === 'settlement' && call.terminalFactKind
+        ? { terminalFactKind: call.terminalFactKind }
+        : {}),
+      ...(mode === 'settlement' && call.settlementReason
+        ? { settlementReason: call.settlementReason }
+        : {}),
+    };
+  });
 }
 
 export function createSessionProviderToolCallQueueV2(input: {
@@ -777,7 +873,10 @@ function validateQueueOrderedProviderResponseV2(
       item.kind !== 'toolCall'
       || finalStarted
       || item.ordinal !== orderedCalls.length + 1
-      || item.source !== 'providerNative'
+      || (
+        item.source !== 'providerNative'
+        && item.source !== 'textFrame'
+      )
     ) {
       throw invalidQueue();
     }
@@ -789,7 +888,25 @@ function validateQueueOrderedProviderResponseV2(
   if (!receiptMatchesSealedProviderItems(queue, orderedCalls)) {
     throw invalidQueue();
   }
-  const providerNativeCalls = orderedCalls.length > 0;
+  const providerNativeCalls = orderedCalls.filter(
+    (item) => item.source === 'providerNative'
+  ).length;
+  const textFrameCalls = orderedCalls.filter(
+    (item) => item.source === 'textFrame'
+  ).length;
+  if (
+    (providerNativeCalls > 0 && textFrameCalls > 0)
+    || textFrameCalls > 1
+    || (
+      textFrameCalls === 1
+      && (
+        orderedCalls.length !== 1
+        || queue.orderedItems.length !== 1
+      )
+    )
+  ) {
+    throw invalidQueue();
+  }
   const native = completion.nativeCompletion;
   const expectedReasoningTransport =
     native.providerKind === 'openaiCompatible'
@@ -805,7 +922,7 @@ function validateQueueOrderedProviderResponseV2(
       native.providerKind === 'openaiCompatible'
       ? native.terminalSignal !== '[DONE]'
         || native.finishReason
-          !== (providerNativeCalls ? 'tool_calls' : 'stop')
+          !== (providerNativeCalls > 0 ? 'tool_calls' : 'stop')
       : native.providerKind === 'anthropic'
         ? native.terminalSignal !== 'message_stop'
         : native.providerKind === 'ollama'
@@ -823,43 +940,192 @@ function receiptMatchesSealedProviderItems(
     Extract<SessionProviderOrderedItemV2, { kind: 'toolCall' }>
   >
 ): boolean {
-  if (orderedCalls.length > 0) {
-    return orderedCalls.length === queue.receipt.calls.length
-      && orderedCalls.every((call, index) => {
-        const receipt = queue.receipt.calls[index];
-        return Boolean(receipt)
-          && call.ordinal === receipt!.ordinal
-          && call.callId === receipt!.callId
-          && call.toolName === receipt!.toolName
-          && call.toolId === receipt!.toolId
-          && sha256Hash(canonicalJson(call.arguments))
-            === receipt!.argumentsDigest;
-      });
+  return orderedCalls.length === queue.receipt.calls.length
+    && orderedCalls.every((call, index) => {
+      const receipt = queue.receipt.calls[index];
+      return Boolean(receipt)
+        && call.ordinal === receipt!.ordinal
+        && call.callId === receipt!.callId
+        && call.toolName === receipt!.toolName
+        && call.toolId === receipt!.toolId
+        && sha256Hash(canonicalJson(call.arguments))
+          === receipt!.argumentsDigest;
+    });
+}
+
+function validateExactSessionProviderOutcomeRecordV2(
+  value: unknown,
+  expectedProfileId: string
+): void {
+  const record = exactOutcomeObject(
+    value,
+    [
+      'providerTurnId',
+      'outputKind',
+      'recordedAt',
+      'providerResult',
+    ],
+    ['summary', 'toolCallReceipt', 'toolSettlement']
+  );
+  const providerTurnId = requiredIdentity(
+    record.providerTurnId,
+    'providerOutcome.providerTurnId'
+  );
+  const recordedAt = requiredInstant(
+    record.recordedAt,
+    'providerOutcome.recordedAt'
+  );
+  if (
+    record.summary !== undefined
+    && (
+      typeof record.summary !== 'string'
+      || new TextEncoder().encode(record.summary).byteLength > 8_192
+    )
+  ) {
+    throw invalidQueue();
+  }
+  const providerResult = exactOutcomeObject(
+    record.providerResult,
+    ['providerProfileId', 'provider', 'model'],
+    ['usage']
+  );
+  if (
+    requiredIdentity(
+      providerResult.providerProfileId,
+      'providerOutcome.providerProfileId'
+    ) !== expectedProfileId
+  ) {
+    throw invalidQueue();
+  }
+  requiredIdentity(providerResult.provider, 'providerOutcome.provider');
+  requiredIdentity(providerResult.model, 'providerOutcome.model');
+  if (
+    providerResult.usage !== undefined
+    && (
+      !providerResult.usage
+      || typeof providerResult.usage !== 'object'
+      || Array.isArray(providerResult.usage)
+      || jsonByteLength(providerResult.usage) > 64 * 1024
+    )
+  ) {
+    throw invalidQueue();
+  }
+
+  if (record.outputKind === 'toolIntent') {
+    const receipt = exactOutcomeObject(
+      record.toolCallReceipt,
+      [
+        'schemaVersion',
+        'providerTurnId',
+        'responseDigest',
+        'callCount',
+        'calls',
+        'recordedAt',
+      ]
+    );
+    if (
+      receipt.schemaVersion !== SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA
+      || receipt.providerTurnId !== providerTurnId
+      || !Number.isSafeInteger(receipt.callCount)
+      || Number(receipt.callCount) <= 0
+      || Number(receipt.callCount) > MAX_PROVIDER_TOOL_CALLS_PER_TURN
+      || !Array.isArray(receipt.calls)
+      || receipt.calls.length !== receipt.callCount
+    ) {
+      throw invalidQueue();
+    }
+    requiredDigest(
+      receipt.responseDigest,
+      'providerOutcome.responseDigest'
+    );
+    requiredInstant(
+      receipt.recordedAt,
+      'providerOutcome.receipt.recordedAt'
+    );
+    const callIds = new Set<string>();
+    receipt.calls.forEach((candidate, index) => {
+      const call = exactOutcomeObject(candidate, [
+        'ordinal',
+        'callId',
+        'toolName',
+        'toolId',
+        'argumentsDigest',
+      ]);
+      const callId = requiredIdentity(
+        call.callId,
+        'providerOutcome.receipt.callId'
+      );
+      if (
+        call.ordinal !== index + 1
+        || callIds.has(callId)
+      ) {
+        throw invalidQueue();
+      }
+      callIds.add(callId);
+      requiredIdentity(
+        call.toolName,
+        'providerOutcome.receipt.toolName'
+      );
+      requiredIdentity(
+        call.toolId,
+        'providerOutcome.receipt.toolId'
+      );
+      requiredDigest(
+        call.argumentsDigest,
+        'providerOutcome.receipt.argumentsDigest'
+      );
+    });
+    const settlement = exactOutcomeObject(
+      record.toolSettlement,
+      ['status', 'settledAt']
+    );
+    if (
+      (
+        settlement.status !== 'completed'
+        && settlement.status !== 'aborted'
+      )
+      || requiredInstant(
+        settlement.settledAt,
+        'providerOutcome.toolSettlement.settledAt'
+      ) !== recordedAt
+    ) {
+      throw invalidQueue();
+    }
+    return;
+  }
+
+  if (
+    record.outputKind !== 'plan'
+    && record.outputKind !== 'answer'
+    && record.outputKind !== 'noTool'
+  ) {
+    throw invalidQueue();
   }
   if (
-    queue.orderedItems.length !== 1
-    || queue.receipt.calls.length !== 1
+    Object.prototype.hasOwnProperty.call(record, 'toolCallReceipt')
+    || Object.prototype.hasOwnProperty.call(record, 'toolSettlement')
   ) {
-    return false;
+    throw invalidQueue();
   }
-  const item = queue.orderedItems[0];
-  if (item?.kind !== 'text' || item.phase !== 'unknown') {
-    return false;
+}
+
+function exactOutcomeObject(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = []
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw invalidQueue();
   }
-  try {
-    const frame = decodeProviderToolIntentTextFrameV2(item.text);
-    const call = queue.receipt.calls[0]!;
-    const callId = `text-${sha256Hash(item.text.trim())
-      .slice('sha256:'.length)}`;
-    return call.ordinal === 1
-      && call.callId === callId
-      && call.toolName === frame.toolId
-      && call.toolId === frame.toolId
-      && call.argumentsDigest
-        === sha256Hash(canonicalJson(frame.arguments));
-  } catch {
-    return false;
+  const record = value as Record<string, unknown>;
+  const permitted = new Set([...required, ...optional]);
+  if (
+    required.some((key) => !Object.prototype.hasOwnProperty.call(record, key))
+    || Object.keys(record).some((key) => !permitted.has(key))
+  ) {
+    throw invalidQueue();
   }
+  return record;
 }
 
 function requiredIdentity(value: unknown, field: string): string {

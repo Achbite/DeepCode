@@ -200,6 +200,7 @@
         "userspace/session-core/tests/v2/recovery-contracts.mjs",
         "userspace/session-core/tests/v2/review-contracts.mjs",
         "userspace/session-core/tests/v2/provider-lifecycle-contracts.mjs",
+        "userspace/session-core/tests/v2/projection-contracts.mjs",
         "userspace/gui/tests/agent-session-store-contracts.mjs"
       ]
     },

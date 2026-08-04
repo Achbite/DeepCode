@@ -1,10 +1,12 @@
 use crate::host_kernel_operation_store_v2::{
     HostKernelBootstrapActivationV2, HostKernelBootstrapInitialInputV2,
     HostKernelBootstrapRecordV2, HostKernelDispatchAttemptStateV2, HostKernelDispatchPrepareV2,
-    HostKernelDispatchRecoveryV2, HostKernelLiveRunForDeletionV2,
-    HostKernelOperationCallerCorrelationV2, HostKernelOperationPreparedV2,
-    HostKernelOperationRefV2, HostKernelOperationSettlementReceiptV2,
-    HostKernelOperationSettlementV2, HostKernelOperationStoreV2, HostKernelPendingOperationV2,
+    HostKernelDispatchRecoveryV2, HostKernelFailureCommitV2, HostKernelFailureDispositionV2,
+    HostKernelFailureEffectV2, HostKernelLiveRunForDeletionV2,
+    HostKernelOperationCallerCorrelationV2, HostKernelOperationFailureBoundaryV2,
+    HostKernelOperationPreparedV2, HostKernelOperationRefV2,
+    HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
+    HostKernelOperationStoreV2, HostKernelPendingOperationV2, HostKernelPendingRequestLaneV2,
     HostKernelRunOpeningInputV2, HostKernelRunOpeningRecordV2, HostKernelStartupCancelRecoveryV2,
     HostKernelStoredRunLifecycleV2,
 };
@@ -18,7 +20,9 @@ use crate::host_v2_storage::{canonical_sha256, reject_transport_capabilities, Ho
 use crate::host_workspace_registry_v2::HostWorkspaceResolveErrorV2;
 use crate::kernel_v2_transport::KernelV2TransportState;
 use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPriorEventsV2};
-use crate::session_kernel_v2_store::SessionKernelV2Store;
+use crate::session_kernel_v2_store::{
+    validate_session_work_authority_v3, SessionKernelV2Store, SessionWorkAuthorityV3,
+};
 use crate::AgentInputAttachmentV2;
 use deepcode_kernel_abi::v2::{
     CancellationReasonCodeV2, CancellationSourceV2, CommandRequestId, ControlFactV2, FactId,
@@ -50,7 +54,7 @@ const SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-request.v2";
 const SESSION_KERNEL_PRODUCTION_REQUEST_FRAME_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-request-frame.v2";
-const SESSION_KERNEL_PERSISTENCE_V2_SCHEMA: &str = "deepcode.session.kernel-persistence.v2";
+const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v3";
 const SESSION_KERNEL_PREFETCHED_RUN_V2_SCHEMA: &str = "deepcode.session.prefetched-kernel-run.v2";
 const SESSION_KERNEL_PRODUCTION_RESPONSE_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-response.v2";
@@ -60,6 +64,8 @@ const SESSION_KERNEL_RUN_CAPABILITY_ENV_V2: &str = "DEEPCODE_SESSION_RUN_CAPABIL
 const SESSION_KERNEL_API_BASE_ENV_V2: &str = "DEEPCODE_SESSION_API_BASE_V2";
 const MAX_SESSION_KERNEL_RESPONSE_FRAME_BYTES_V2: usize = 4 * 1024 * 1024;
 const SESSION_KERNEL_RESPONSE_TIMEOUT_V2: Duration = Duration::from_secs(10 * 60);
+const RETRY_SAME_REQUEST_BACKOFF_V2: Duration = Duration::from_millis(25);
+const RETRY_SAME_REQUEST_MAX_BACKOFF_V2: Duration = Duration::from_secs(1);
 const HOST_KERNEL_STARTUP_RECOVERY_STATUS_SCHEMA_V2: &str =
     "deepcode.host.kernel-startup-recovery-status.v2";
 
@@ -67,6 +73,7 @@ const HOST_KERNEL_STARTUP_RECOVERY_STATUS_SCHEMA_V2: &str =
 pub(crate) struct HostKernelRunWorkspaceV2 {
     pub(crate) workspace_binding_ref: WorkspaceBindingRefV2,
     pub(crate) workspace_binding_identity: String,
+    pub(crate) workspace_canonical_root: PathBuf,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
     pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
@@ -84,7 +91,12 @@ pub(crate) struct HostKernelInitialInputV2 {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum HostKernelBridgeOperationV2 {
     InitialTurn {
         guidance: Vec<String>,
@@ -157,7 +169,14 @@ pub(crate) enum HostKernelBridgeOperationV2 {
         cancel_operation_id: String,
     },
     FinalizeReview {
-        expected_plan_revision: String,
+        expected_work_authority: SessionWorkAuthorityV3,
+    },
+    RequestFinalAnswer {
+        input_id: String,
+        control_epoch: u64,
+        work_authority: SessionWorkAuthorityV3,
+        review_revision: u64,
+        snapshot_high_water: u64,
     },
 }
 
@@ -183,10 +202,25 @@ pub(crate) enum HostKernelWaitKindV2 {
     Invocation,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct HostKernelRunOpenedV2 {
+pub(crate) struct HostKernelRunAdmittedV2 {
     pub(crate) active_run: HostActiveRunRecordV2,
-    pub(crate) initial_operation: HostKernelOperationSettlementReceiptV2,
+    coordinator: HostKernelRunCoordinatorV2,
+    initial_operation: HostKernelOperationCompletionReceiverV2,
+}
+
+impl HostKernelRunAdmittedV2 {
+    pub(crate) async fn await_initial_operation(
+        self,
+    ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
+        let key = HostKernelLiveRunKeyV2 {
+            session_id: self.active_run.session_id.clone(),
+            host_run_id: self.active_run.host_run_id.clone(),
+            run_id: self.active_run.run_id.clone(),
+        };
+        self.coordinator
+            .await_operation_completion(key, self.initial_operation)
+            .await
+    }
 }
 
 struct HostKernelRunStartedV2 {
@@ -210,6 +244,7 @@ pub(crate) enum HostKernelStartupRecoveryPhaseV2 {
 pub(crate) enum HostKernelOperationRecoveryStateV2 {
     FirstDispatchResumed,
     LostDispatchResumed,
+    RetrySameRequestResumed,
     RecoveredDispatchSettled,
     ObservedResponseSettled,
     CancellationEvidenceRecoveredAndRetired,
@@ -257,6 +292,15 @@ pub(crate) struct HostKernelStartupTombstoneFailureV2 {
 
 pub(crate) struct HostKernelStartupReconciliationOutcomeV2 {
     pub(crate) tombstone_failures: Vec<HostKernelStartupTombstoneFailureV2>,
+    pub(crate) continuation_ready_runs: Vec<HostKernelStartupContinuationRunV2>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostKernelStartupContinuationRunV2 {
+    pub(crate) session_id: String,
+    pub(crate) host_run_id: String,
+    pub(crate) run_id: String,
+    pub(crate) bootstrap_digest: String,
 }
 
 impl HostKernelStartupRecoveryStatusV2 {
@@ -327,11 +371,22 @@ struct HostKernelPendingResponseV2 {
     operation: HostKernelOperationRefV2,
     attempt_id: String,
     owner_instance_id: String,
-    completion: oneshot::Sender<Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError>>,
+    production_frame: Value,
+    completion: oneshot::Sender<Result<HostKernelOperationCompletionV2, HostV2StorageError>>,
+}
+
+enum HostKernelOperationCompletionV2 {
+    Settled(HostKernelOperationSettlementReceiptV2),
+    RetrySameRequest {
+        operation: HostKernelOperationRefV2,
+        previous_attempt_id: String,
+        production_frame: Value,
+        retry_settlement: HostKernelOperationSettlementV2,
+    },
 }
 
 type HostKernelOperationCompletionReceiverV2 =
-    oneshot::Receiver<Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError>>;
+    oneshot::Receiver<Result<HostKernelOperationCompletionV2, HostV2StorageError>>;
 
 struct HostKernelLiveBridgeV2 {
     bootstrap_digest: String,
@@ -668,6 +723,7 @@ impl HostKernelRunCoordinatorV2 {
                     run_open_request_id: input.run_open_request_id.clone(),
                     run_open_envelope: run_open_envelope.clone(),
                     workspace_binding_identity: input.workspace.workspace_binding_identity.clone(),
+                    workspace_canonical_root: input.workspace.workspace_canonical_root.clone(),
                     workspace_kind: input.workspace.workspace_kind,
                     active_folder_id: input.workspace.active_folder_id.clone(),
                     empty_workspace_key: input.workspace.empty_workspace_key.clone(),
@@ -698,6 +754,14 @@ impl HostKernelRunCoordinatorV2 {
                             "Durable Host Run has no current Host transport capability",
                         )
                     })?;
+                self.host_services
+                    .session_kernel_v2
+                    .persist_tool_context_snapshot(
+                        &bootstrap.session_id,
+                        &bootstrap.run_id,
+                        &run_capability,
+                        &bootstrap.run_open_reply.tool_context,
+                    )?;
                 if let Some(initial_operation) =
                     self.host_services.kernel_operations_v2.settlement(
                         &input.session_id,
@@ -804,6 +868,12 @@ impl HostKernelRunCoordinatorV2 {
                 run_settings: input.workspace.run_settings.clone(),
                 recorded_at: input.initial_input.recorded_at.clone(),
             },
+            match input.workspace.workspace_kind {
+                HostRunWorkspaceKindV2::Bound => {
+                    Some(input.workspace.workspace_canonical_root.as_path())
+                }
+                HostRunWorkspaceKindV2::Empty => None,
+            },
         );
         let receipt = match receipt {
             Ok(receipt) => receipt,
@@ -811,6 +881,32 @@ impl HostKernelRunCoordinatorV2 {
                 return Err(self.rollback_activated_without_registration(&bootstrap.record, error))
             }
         };
+        let snapshot = self
+            .host_services
+            .active_runs_v2
+            .bind_run_transport_capability(
+                &turn,
+                &bootstrap.record.host_run_id,
+                &bootstrap.record.run_id,
+                &run_capability,
+            )
+            .and_then(|_| {
+                self.host_services
+                    .session_kernel_v2
+                    .persist_tool_context_snapshot(
+                        &bootstrap.record.session_id,
+                        &bootstrap.record.run_id,
+                        &run_capability,
+                        &bootstrap.record.run_open_reply.tool_context,
+                    )
+                    .map(|_| ())
+            });
+        if let Err(error) = snapshot {
+            if receipt.replayed {
+                return Err(error);
+            }
+            return Err(self.rollback_registered_run(&turn, &bootstrap.record, error));
+        }
         let started = self.prepare_initial_dispatch(
             &turn,
             &bootstrap.record,
@@ -834,17 +930,17 @@ impl HostKernelRunCoordinatorV2 {
 
     /// Invokes `registered` after the active Run and first dispatch are
     /// durable, but before waiting on Session/Provider completion.
-    pub(crate) async fn open_and_spawn_initial(
+    pub(crate) async fn open_and_dispatch_initial(
         &self,
         input: HostKernelRunSpawnInputV2,
         registered: impl FnOnce(),
-    ) -> Result<HostKernelRunOpenedV2, HostV2StorageError> {
+    ) -> Result<HostKernelRunAdmittedV2, HostV2StorageError> {
         let started = self.open_and_start_initial(input).await?;
         registered();
-        let initial_operation = await_operation_completion(started.initial_operation).await?;
-        Ok(HostKernelRunOpenedV2 {
+        Ok(HostKernelRunAdmittedV2 {
             active_run: started.active_run,
-            initial_operation,
+            coordinator: self.clone(),
+            initial_operation: started.initial_operation,
         })
     }
 
@@ -855,15 +951,101 @@ impl HostKernelRunCoordinatorV2 {
         operation_request_id: &str,
         operation: HostKernelBridgeOperationV2,
     ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
+        self.submit_operation_guarded(
+            session_id,
+            host_run_id,
+            operation_request_id,
+            operation,
+            None,
+            || {},
+        )
+        .await?
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_kernel_operation_unexpected_stale",
+                "Unguarded Host Kernel operation became stale",
+            )
+        })
+    }
+
+    pub(crate) async fn submit_operation_if_latest_settlement(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        operation_request_id: &str,
+        operation: HostKernelBridgeOperationV2,
+        expected_run_id: &str,
+        expected_bootstrap_digest: &str,
+        expected_settlement_digest: &str,
+        dispatched: impl FnOnce(),
+    ) -> Result<Option<HostKernelOperationSettlementReceiptV2>, HostV2StorageError> {
+        self.submit_operation_guarded(
+            session_id,
+            host_run_id,
+            operation_request_id,
+            operation,
+            Some((
+                expected_run_id,
+                expected_bootstrap_digest,
+                expected_settlement_digest,
+            )),
+            dispatched,
+        )
+        .await
+    }
+
+    async fn submit_operation_guarded(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        operation_request_id: &str,
+        operation: HostKernelBridgeOperationV2,
+        expected_predecessor: Option<(&str, &str, &str)>,
+        dispatched: impl FnOnce(),
+    ) -> Result<Option<HostKernelOperationSettlementReceiptV2>, HostV2StorageError> {
         let turn = self
             .host_services
             .active_runs_v2
             .begin_session_turn(session_id)
             .await?;
+        if let Some((expected_run_id, expected_bootstrap_digest, expected_settlement_digest)) =
+            expected_predecessor
+        {
+            let Some(active) = self
+                .host_services
+                .active_runs_v2
+                .resolve_session_active_run(session_id)?
+            else {
+                return Ok(None);
+            };
+            if active.host_run_id != host_run_id
+                || active.run_id != expected_run_id
+                || active.bootstrap_digest != expected_bootstrap_digest
+            {
+                return Ok(None);
+            }
+            let Some(latest) = self
+                .host_services
+                .kernel_operations_v2
+                .latest_settlement(session_id, host_run_id)?
+            else {
+                return Ok(None);
+            };
+            if latest.settlement_digest != expected_settlement_digest {
+                return Ok(None);
+            }
+        }
         let bootstrap = self
             .host_services
             .kernel_operations_v2
             .get_bootstrap(session_id, host_run_id)?;
+        if let Some((expected_run_id, expected_bootstrap_digest, _)) = expected_predecessor {
+            if bootstrap.run_id != expected_run_id
+                || bootstrap.bootstrap_digest != expected_bootstrap_digest
+            {
+                return Ok(None);
+            }
+        }
         let key = HostKernelLiveRunKeyV2 {
             session_id: session_id.to_string(),
             host_run_id: host_run_id.to_string(),
@@ -913,7 +1095,7 @@ impl HostKernelRunCoordinatorV2 {
             host_run_id,
             operation_request_id,
         )? {
-            return Ok(settlement);
+            return Ok(Some(settlement));
         }
         if existing.is_none() && operation.requires_facts_preflight() {
             self.reconcile_kernel_facts_before_operation(&bootstrap, &live)
@@ -924,8 +1106,15 @@ impl HostKernelRunCoordinatorV2 {
             .prepare_operation(prepared_input())?;
         let operation_ref = operation_ref(&bootstrap, operation_request_id);
         let completion = self.prepare_and_dispatch(&live, operation_ref, frame)?;
+        // The exact operation is now durable and accepted by the live bridge.
+        // Publish caller-visible drive state before awaiting a potentially long
+        // Session/Provider completion, while stale guarded submissions remain
+        // side-effect free and do not invoke this callback.
+        dispatched();
         drop(turn);
-        await_operation_completion(completion).await
+        self.await_operation_completion(key, completion)
+            .await
+            .map(Some)
     }
 
     pub(crate) async fn cancel_run_for_caller(
@@ -1021,7 +1210,7 @@ impl HostKernelRunCoordinatorV2 {
                     operation_ref(&bootstrap, cancel_operation_id),
                     frame,
                 )?;
-                await_operation_completion(completion).await?
+                self.await_operation_completion(key, completion).await?
             }
         };
         let acknowledgement = self.validate_cancel_run_settlement_against_kernel(
@@ -1166,7 +1355,12 @@ impl HostKernelRunCoordinatorV2 {
                 None => {
                     let operation_ref = operation_ref(bootstrap, &operation_request_id);
                     let completion = self.prepare_and_dispatch(live, operation_ref, frame)?;
-                    await_operation_completion(completion).await?
+                    let key = HostKernelLiveRunKeyV2 {
+                        session_id: bootstrap.session_id.clone(),
+                        host_run_id: bootstrap.host_run_id.clone(),
+                        run_id: bootstrap.run_id.clone(),
+                    };
+                    self.await_operation_completion(key, completion).await?
                 }
             };
             require_successful_session_facts_high_water(&settlement)?;
@@ -1314,6 +1508,113 @@ impl HostKernelRunCoordinatorV2 {
         })
     }
 
+    fn prepare_response_retry_dispatch_attempt(
+        &self,
+        operation: HostKernelOperationRefV2,
+        previous_attempt_id: String,
+        retry_settlement: &HostKernelOperationSettlementV2,
+    ) -> Result<PreparedHostDispatchV2, HostV2StorageError> {
+        let owner_instance_id = self.host_services.active_runs_v2.owner_instance_id();
+        let attempt_id = self
+            .host_services
+            .kernel_operations_v2
+            .issue_dispatch_attempt_id(&owner_instance_id)?;
+        self.host_services
+            .kernel_operations_v2
+            .prepare_response_retry_dispatch(
+                HostKernelDispatchRecoveryV2 {
+                    operation,
+                    previous_attempt_id,
+                    attempt_id: attempt_id.clone(),
+                    owner_instance_id: owner_instance_id.clone(),
+                    prepared_at: crate::utils::now_text(),
+                },
+                retry_settlement,
+            )?;
+        Ok(PreparedHostDispatchV2 {
+            attempt_id,
+            owner_instance_id,
+        })
+    }
+
+    async fn await_operation_completion(
+        &self,
+        key: HostKernelLiveRunKeyV2,
+        mut completion: HostKernelOperationCompletionReceiverV2,
+    ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
+        let deadline = tokio::time::Instant::now() + SESSION_KERNEL_RESPONSE_TIMEOUT_V2;
+        let mut retry_backoff = RETRY_SAME_REQUEST_BACKOFF_V2;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| {
+                    HostV2StorageError::io(
+                        "host_kernel_bridge_response_timeout",
+                        "Session bridge response remains pending after the bounded Host wait",
+                    )
+                })?;
+            let outcome = match tokio::time::timeout(remaining, completion).await {
+                Ok(Ok(result)) => result?,
+                Ok(Err(_)) => {
+                    return Err(HostV2StorageError::io(
+                        "host_kernel_bridge_response_worker_stopped",
+                        "Session bridge response worker stopped before settling the operation",
+                    ))
+                }
+                Err(_) => {
+                    return Err(HostV2StorageError::io(
+                        "host_kernel_bridge_response_timeout",
+                        "Session bridge response remains pending after the bounded Host wait",
+                    ))
+                }
+            };
+            match outcome {
+                HostKernelOperationCompletionV2::Settled(settlement) => return Ok(settlement),
+                HostKernelOperationCompletionV2::RetrySameRequest {
+                    operation,
+                    previous_attempt_id,
+                    production_frame,
+                    retry_settlement,
+                } => {
+                    if operation.session_id != key.session_id
+                        || operation.host_run_id != key.host_run_id
+                        || operation.run_id != key.run_id
+                    {
+                        return Err(HostV2StorageError::conflict(
+                            "host_kernel_dispatch_retry_run_conflict",
+                            "Response-bound retry changed its exact Run identity",
+                        ));
+                    }
+                    let sleep_for = std::cmp::min(retry_backoff, remaining);
+                    tokio::time::sleep(sleep_for).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(HostV2StorageError::io(
+                            "host_kernel_retry_recovery_waiting",
+                            "The exact retrySameRequest directive remains replay-safe but exhausted the current Host operation deadline",
+                        ));
+                    }
+                    let live = self.live_bridge(&key)?;
+                    let prepared = self.prepare_response_retry_dispatch_attempt(
+                        operation.clone(),
+                        previous_attempt_id,
+                        &retry_settlement,
+                    )?;
+                    completion = self.dispatch_prepared_operation(
+                        &live,
+                        operation,
+                        prepared.attempt_id,
+                        prepared.owner_instance_id,
+                        production_frame,
+                    )?;
+                    retry_backoff = std::cmp::min(
+                        retry_backoff.saturating_mul(2),
+                        RETRY_SAME_REQUEST_MAX_BACKOFF_V2,
+                    );
+                }
+            }
+        }
+    }
+
     fn dispatch_prepared_operation(
         &self,
         live: &Arc<HostKernelLiveBridgeV2>,
@@ -1436,6 +1737,7 @@ impl HostKernelRunCoordinatorV2 {
                 operation: operation.clone(),
                 attempt_id: attempt_id.clone(),
                 owner_instance_id: owner_instance_id.clone(),
+                production_frame: frame,
                 completion,
             },
         );
@@ -2078,6 +2380,8 @@ impl HostKernelRunCoordinatorV2 {
                 .or_default()
                 .push(operation);
         }
+        let mut continuation_ready_runs =
+            HashMap::<(String, String), HostKernelStartupContinuationRunV2>::new();
         let mut recovered_dispatches = Vec::<(
             String,
             String,
@@ -2123,6 +2427,14 @@ impl HostKernelRunCoordinatorV2 {
                 if operation.latest_attempt.as_ref().is_some_and(|attempt| {
                     attempt.state == HostKernelDispatchAttemptStateV2::ResponseObserved
                 }) {
+                    let observed_settlement = self.observed_operation_settlement(&operation);
+                    if observed_settlement
+                        .as_ref()
+                        .is_ok_and(is_retry_same_request_settlement)
+                    {
+                        unresolved.push(operation);
+                        continue;
+                    }
                     match self.settle_observed_operation(&operation) {
                         Ok(_) => recovery_status.operations.push(startup_operation_status(
                             &operation,
@@ -2227,6 +2539,15 @@ impl HostKernelRunCoordinatorV2 {
                     }));
                 continue;
             }
+            continuation_ready_runs.insert(
+                run_key.clone(),
+                HostKernelStartupContinuationRunV2 {
+                    session_id: bootstrap.session_id.clone(),
+                    host_run_id: bootstrap.host_run_id.clone(),
+                    run_id: bootstrap.run_id.clone(),
+                    bootstrap_digest: bootstrap.bootstrap_digest.clone(),
+                },
+            );
             if dispatchable.is_empty() {
                 continue;
             }
@@ -2238,6 +2559,7 @@ impl HostKernelRunCoordinatorV2 {
             let live = match self.live_bridge(&live_key) {
                 Ok(live) => live,
                 Err(error) => {
+                    continuation_ready_runs.remove(&run_key);
                     recovery_status.record_error(error.code);
                     self.host_services
                         .active_runs_v2
@@ -2277,7 +2599,23 @@ impl HostKernelRunCoordinatorV2 {
                         ),
                         HostKernelOperationRecoveryStateV2::LostDispatchResumed,
                     ),
+                    Some(attempt)
+                        if attempt.state == HostKernelDispatchAttemptStateV2::ResponseObserved =>
+                    {
+                        let settlement = self.observed_operation_settlement(&operation);
+                        (
+                            settlement.and_then(|settlement| {
+                                self.prepare_response_retry_dispatch_attempt(
+                                    operation_ref.clone(),
+                                    attempt.attempt_id.clone(),
+                                    &settlement,
+                                )
+                            }),
+                            HostKernelOperationRecoveryStateV2::RetrySameRequestResumed,
+                        )
+                    }
                     Some(_) => {
+                        continuation_ready_runs.remove(&run_key);
                         let error_code = "host_kernel_pending_attempt_state_invalid";
                         recovery_status.record_error(error_code);
                         self.host_services
@@ -2295,6 +2633,7 @@ impl HostKernelRunCoordinatorV2 {
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
+                        continuation_ready_runs.remove(&run_key);
                         recovery_status.record_error(error.code);
                         self.host_services
                             .active_runs_v2
@@ -2329,6 +2668,7 @@ impl HostKernelRunCoordinatorV2 {
                         ));
                     }
                     Err(error) => {
+                        continuation_ready_runs.remove(&run_key);
                         recovery_status.record_error(error.code);
                         self.host_services
                             .active_runs_v2
@@ -2340,6 +2680,14 @@ impl HostKernelRunCoordinatorV2 {
                         ));
                         blocked_after_failure = Some(error.code);
                     }
+                }
+            }
+            if blocked_after_failure.is_some() {
+                if let Err(cleanup_error) = self.remove_live_bridge(&live_key) {
+                    recovery_status.record_error(cleanup_error.code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(cleanup_error.code);
                 }
             }
         }
@@ -2366,13 +2714,16 @@ impl HostKernelRunCoordinatorV2 {
         for (session_id, host_run_id, run_id, operation_request_id, completion) in
             recovered_dispatches
         {
-            let result = await_operation_completion(completion).await;
+            let key = HostKernelLiveRunKeyV2 {
+                session_id: session_id.clone(),
+                host_run_id: host_run_id.clone(),
+                run_id: run_id.clone(),
+            };
+            let result = self
+                .await_operation_completion(key.clone(), completion)
+                .await;
             if result.is_err() {
-                let key = HostKernelLiveRunKeyV2 {
-                    session_id: session_id.clone(),
-                    host_run_id: host_run_id.clone(),
-                    run_id,
-                };
+                continuation_ready_runs.remove(&(session_id.clone(), host_run_id.clone()));
                 if let Err(cleanup_error) = self.remove_live_bridge(&key) {
                     self.host_services
                         .active_runs_v2
@@ -2388,7 +2739,10 @@ impl HostKernelRunCoordinatorV2 {
                 result.as_ref().err().map(|error| error.code),
             );
         }
-        Ok(HostKernelStartupReconciliationOutcomeV2 { tombstone_failures })
+        Ok(HostKernelStartupReconciliationOutcomeV2 {
+            tombstone_failures,
+            continuation_ready_runs: continuation_ready_runs.into_values().collect(),
+        })
     }
 
     async fn retire_tombstoned_opening_run(
@@ -2623,6 +2977,32 @@ impl HostKernelRunCoordinatorV2 {
                 "Only a ResponseObserved attempt can be settled without dispatch",
             ));
         }
+        let settlement = self.observed_operation_settlement(operation)?;
+        self.host_services.kernel_operations_v2.settle_operation(
+            &pending_operation_ref(operation),
+            &attempt.attempt_id,
+            &attempt.owner_instance_id,
+            settlement,
+            &crate::utils::now_text(),
+        )
+    }
+
+    fn observed_operation_settlement(
+        &self,
+        operation: &HostKernelPendingOperationV2,
+    ) -> Result<HostKernelOperationSettlementV2, HostV2StorageError> {
+        let attempt = operation.latest_attempt.as_ref().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_kernel_observed_response_attempt_missing",
+                "Observed response recovery has no durable dispatch attempt",
+            )
+        })?;
+        if attempt.state != HostKernelDispatchAttemptStateV2::ResponseObserved {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_observed_response_state_invalid",
+                "Only a ResponseObserved attempt has a durable retry or settlement boundary",
+            ));
+        }
         let response = attempt.observed_response.as_ref().ok_or_else(|| {
             HostV2StorageError::conflict(
                 "host_kernel_observed_response_missing",
@@ -2634,14 +3014,7 @@ impl HostKernelRunCoordinatorV2 {
             host_run_id: operation.host_run_id.clone(),
             run_id: operation.run_id.clone(),
         };
-        let settlement = settlement_from_observed_response(&live_key, response)?;
-        self.host_services.kernel_operations_v2.settle_operation(
-            &pending_operation_ref(operation),
-            &attempt.attempt_id,
-            &attempt.owner_instance_id,
-            settlement,
-            &crate::utils::now_text(),
-        )
+        settlement_from_observed_response(&live_key, response)
     }
 
     async fn recover_opening_run(
@@ -2675,10 +3048,11 @@ impl HostKernelRunCoordinatorV2 {
                 activated_at: crate::utils::now_text(),
             })?
             .record;
-        let registration = self
-            .host_services
-            .active_runs_v2
-            .register(&turn, active_registration_from_bootstrap(&bootstrap))?;
+        let registration = self.host_services.active_runs_v2.register(
+            &turn,
+            active_registration_from_bootstrap(&bootstrap),
+            active_workspace_root_for_registration(&bootstrap)?,
+        )?;
         require_cold_bridge_ownership(&registration.record)?;
         let capability = match capability {
             Some(capability) => capability,
@@ -2691,6 +3065,14 @@ impl HostKernelRunCoordinatorV2 {
                 &bootstrap.host_run_id,
                 &bootstrap.run_id,
                 &capability,
+            )?;
+        self.host_services
+            .session_kernel_v2
+            .persist_tool_context_snapshot(
+                &bootstrap.session_id,
+                &bootstrap.run_id,
+                &capability,
+                &bootstrap.run_open_reply.tool_context,
             )?;
         self.ensure_live_bridge(&turn, &bootstrap, &capability)?;
         Ok(())
@@ -2705,10 +3087,11 @@ impl HostKernelRunCoordinatorV2 {
             .active_runs_v2
             .begin_session_turn(&bootstrap.session_id)
             .await?;
-        let registration = self
-            .host_services
-            .active_runs_v2
-            .register(&turn, active_registration_from_bootstrap(bootstrap))?;
+        let registration = self.host_services.active_runs_v2.register(
+            &turn,
+            active_registration_from_bootstrap(bootstrap),
+            active_workspace_root_for_registration(bootstrap)?,
+        )?;
         require_cold_bridge_ownership(&registration.record)?;
         let capability = self.resume_run_capability(bootstrap)?;
         self.host_services
@@ -2718,6 +3101,14 @@ impl HostKernelRunCoordinatorV2 {
                 &bootstrap.host_run_id,
                 &bootstrap.run_id,
                 &capability,
+            )?;
+        self.host_services
+            .session_kernel_v2
+            .persist_tool_context_snapshot(
+                &bootstrap.session_id,
+                &bootstrap.run_id,
+                &capability,
+                &bootstrap.run_open_reply.tool_context,
             )?;
         self.ensure_live_bridge(&turn, bootstrap, &capability)?;
         Ok(())
@@ -2915,7 +3306,7 @@ fn production_request_frame_from_bootstrap(
         "sessionId": bootstrap.session_id,
         "hostRunId": bootstrap.host_run_id,
         "runId": bootstrap.run_id,
-        "historySchema": SESSION_KERNEL_PERSISTENCE_V2_SCHEMA,
+        "historySchema": SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
         "providerProfile": bootstrap.provider_profile,
         "priorSessionEvents": bootstrap.prior_session_events,
         "prefetchedRun": {
@@ -2992,6 +3383,33 @@ fn validate_bridge_operation(
             "host_kernel_bridge_plan_binding_incomplete",
             "Session bridge operation planActionId and expectedPlanRevision must be present together",
         ));
+    }
+    match operation {
+        HostKernelBridgeOperationV2::FinalizeReview {
+            expected_work_authority,
+        } => validate_session_work_authority_v3(expected_work_authority)?,
+        HostKernelBridgeOperationV2::RequestFinalAnswer {
+            input_id,
+            control_epoch,
+            work_authority,
+            review_revision,
+            snapshot_high_water,
+        } => {
+            crate::host_v2_storage::validate_bounded_identity(input_id, "inputId", 512)?;
+            if *control_epoch == 0
+                || *control_epoch > 9_007_199_254_740_991
+                || *review_revision == 0
+                || *review_revision > 9_007_199_254_740_991
+                || *snapshot_high_water > 9_007_199_254_740_991
+            {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_final_answer_binding_invalid",
+                    "Final-answer operation contains an invalid epoch, Review revision, or facts high-water",
+                ));
+            }
+            validate_session_work_authority_v3(work_authority)?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3114,6 +3532,24 @@ fn active_registration_from_bootstrap(
     }
 }
 
+fn active_workspace_root_for_registration(
+    bootstrap: &HostKernelBootstrapRecordV2,
+) -> Result<Option<&Path>, HostV2StorageError> {
+    match bootstrap.workspace_kind {
+        HostRunWorkspaceKindV2::Bound => bootstrap
+            .workspace_canonical_root
+            .as_deref()
+            .map(Some)
+            .ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "host_kernel_workspace_recovery_material_missing",
+                    "UnsupportedHistorySchema: bound active Host Run has no Host-only workspace recovery root",
+                )
+            }),
+        HostRunWorkspaceKindV2::Empty => Ok(None),
+    }
+}
+
 fn require_cold_bridge_ownership(
     active_run: &HostActiveRunRecordV2,
 ) -> Result<(), HostV2StorageError> {
@@ -3158,24 +3594,8 @@ fn completed_operation(
     settlement: HostKernelOperationSettlementReceiptV2,
 ) -> HostKernelOperationCompletionReceiverV2 {
     let (sender, receiver) = oneshot::channel();
-    let _ = sender.send(Ok(settlement));
+    let _ = sender.send(Ok(HostKernelOperationCompletionV2::Settled(settlement)));
     receiver
-}
-
-async fn await_operation_completion(
-    completion: HostKernelOperationCompletionReceiverV2,
-) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
-    match tokio::time::timeout(SESSION_KERNEL_RESPONSE_TIMEOUT_V2, completion).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(HostV2StorageError::io(
-            "host_kernel_bridge_response_worker_stopped",
-            "Session bridge response worker stopped before settling the operation",
-        )),
-        Err(_) => Err(HostV2StorageError::io(
-            "host_kernel_bridge_response_timeout",
-            "Session bridge response remains pending after the bounded Host wait",
-        )),
-    }
 }
 
 impl HostKernelBridgeOperationV2 {
@@ -3189,6 +3609,7 @@ impl HostKernelBridgeOperationV2 {
                 | Self::PreviewPlanAction { .. }
                 | Self::DecidePlan { .. }
                 | Self::FinalizeReview { .. }
+                | Self::RequestFinalAnswer { .. }
         )
     }
 }
@@ -3311,14 +3732,42 @@ fn run_response_worker(
             response,
             &crate::utils::now_text(),
         );
+        if observed.is_ok() && is_retry_same_request_settlement(&settlement) {
+            if pending_response
+                .completion
+                .send(Ok(HostKernelOperationCompletionV2::RetrySameRequest {
+                    operation: pending_response.operation,
+                    previous_attempt_id: pending_response.attempt_id,
+                    production_frame: pending_response.production_frame,
+                    retry_settlement: settlement,
+                }))
+                .is_err()
+            {
+                fail_live_bridge(
+                    &operation_store,
+                    &pending,
+                    &stdin,
+                    &failed,
+                    HostV2StorageError::io(
+                        "host_kernel_retry_owner_missing",
+                        "Session requested retrySameRequest after its exact Host operation owner ended",
+                    ),
+                    "bridge_retry_owner_missing",
+                );
+                return;
+            }
+            continue;
+        }
         let result = match observed {
-            Ok(_) => operation_store.settle_operation(
-                &pending_response.operation,
-                &pending_response.attempt_id,
-                &pending_response.owner_instance_id,
-                settlement,
-                &crate::utils::now_text(),
-            ),
+            Ok(_) => operation_store
+                .settle_operation(
+                    &pending_response.operation,
+                    &pending_response.attempt_id,
+                    &pending_response.owner_instance_id,
+                    settlement,
+                    &crate::utils::now_text(),
+                )
+                .map(HostKernelOperationCompletionV2::Settled),
             Err(error) => {
                 let cleanup = operation_store.mark_dispatch_indeterminate(
                     &pending_response.operation,
@@ -3353,6 +3802,21 @@ fn run_response_worker(
             return;
         }
     }
+}
+
+fn is_retry_same_request_settlement(settlement: &HostKernelOperationSettlementV2) -> bool {
+    matches!(
+        settlement,
+        HostKernelOperationSettlementV2::FailedRecoverable {
+            boundary: HostKernelOperationFailureBoundaryV2 {
+                disposition: HostKernelFailureDispositionV2::RetrySameRequest,
+                commit: HostKernelFailureCommitV2::None,
+                effect: HostKernelFailureEffectV2::None,
+                pending_request_lanes,
+            },
+            ..
+        } if pending_request_lanes.is_empty()
+    )
 }
 
 struct HostKernelResponseWorkerRegistryGuardV2 {
@@ -3551,16 +4015,100 @@ fn settlement_from_observed_response(
         })?
         .to_string();
     crate::host_v2_storage::validate_bounded_identity(&error_code, "errorCode", 512)?;
-    match error_object.get("disposition").and_then(Value::as_str) {
-        Some("retrySameRequest" | "queryFacts") => {
-            Ok(HostKernelOperationSettlementV2::FailedRecoverable { error_code })
+    let boundary = HostKernelOperationFailureBoundaryV2 {
+        disposition: match error_object.get("disposition").and_then(Value::as_str) {
+            Some("correctRequest") => HostKernelFailureDispositionV2::CorrectRequest,
+            Some("retrySameRequest") => HostKernelFailureDispositionV2::RetrySameRequest,
+            Some("queryFacts") => HostKernelFailureDispositionV2::QueryFacts,
+            Some("doNotRetry") => HostKernelFailureDispositionV2::DoNotRetry,
+            _ => {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_bridge_response_disposition_invalid",
+                    "Session bridge failure disposition is invalid",
+                ))
+            }
+        },
+        commit: match error_object.get("commit").and_then(Value::as_str) {
+            Some("none") => HostKernelFailureCommitV2::None,
+            Some("committed") => HostKernelFailureCommitV2::Committed,
+            Some("unknown") => HostKernelFailureCommitV2::Unknown,
+            _ => {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_bridge_response_commit_invalid",
+                    "Session bridge failure commit boundary is invalid",
+                ))
+            }
+        },
+        effect: match error_object.get("effect").and_then(Value::as_str) {
+            Some("none") => HostKernelFailureEffectV2::None,
+            Some("possible") => HostKernelFailureEffectV2::Possible,
+            Some("observed") => HostKernelFailureEffectV2::Observed,
+            _ => {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_bridge_response_effect_invalid",
+                    "Session bridge failure effect boundary is invalid",
+                ))
+            }
+        },
+        pending_request_lanes: error_object
+            .get("pendingRequestLanes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                HostV2StorageError::invalid(
+                    "host_kernel_bridge_response_pending_lanes_invalid",
+                    "Session bridge failure pending request lanes are invalid",
+                )
+            })?
+            .iter()
+            .map(|lane| match lane.as_str() {
+                Some("control") => Ok(HostKernelPendingRequestLaneV2::Control),
+                Some("effect") => Ok(HostKernelPendingRequestLaneV2::Effect),
+                Some("query") => Ok(HostKernelPendingRequestLaneV2::Query),
+                _ => Err(HostV2StorageError::invalid(
+                    "host_kernel_bridge_response_pending_lanes_invalid",
+                    "Session bridge failure contains an unsupported pending request lane",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    if boundary
+        .pending_request_lanes
+        .windows(2)
+        .any(|lanes| lanes[0] >= lanes[1])
+    {
+        return Err(HostV2StorageError::invalid(
+            "host_kernel_bridge_response_pending_lanes_invalid",
+            "Session bridge failure pending request lanes must be unique and ordered",
+        ));
+    }
+    let no_effect_retry = boundary.commit == HostKernelFailureCommitV2::None
+        && boundary.effect == HostKernelFailureEffectV2::None
+        && boundary.pending_request_lanes.is_empty();
+    match boundary.disposition {
+        HostKernelFailureDispositionV2::RetrySameRequest if no_effect_retry => {
+            Ok(HostKernelOperationSettlementV2::FailedRecoverable {
+                error_code,
+                boundary,
+            })
         }
-        Some("correctRequest" | "doNotRetry") => {
-            Ok(HostKernelOperationSettlementV2::FailedTerminal { error_code })
+        HostKernelFailureDispositionV2::CorrectRequest
+        | HostKernelFailureDispositionV2::DoNotRetry
+            if no_effect_retry =>
+        {
+            Ok(HostKernelOperationSettlementV2::FailedTerminal {
+                error_code,
+                boundary,
+            })
+        }
+        HostKernelFailureDispositionV2::QueryFacts => {
+            Ok(HostKernelOperationSettlementV2::FailedRecoverable {
+                error_code,
+                boundary,
+            })
         }
         _ => Err(HostV2StorageError::invalid(
-            "host_kernel_bridge_response_disposition_invalid",
-            "Session bridge failure disposition is invalid",
+            "host_kernel_bridge_response_failure_boundary_invalid",
+            "Session bridge failure boundary is internally inconsistent",
         )),
     }
 }

@@ -238,6 +238,17 @@ impl HttpKernelClient {
         &self,
         session_id: &str,
     ) -> KernelClientResult<AgentTimelineSnapshot> {
+        self.agent_timeline_v2_optional(session_id)
+            .await?
+            .ok_or_else(|| {
+                KernelClientError::Api("Session v2 public timeline is not available".to_string())
+            })
+    }
+
+    pub async fn agent_timeline_v2_optional(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<Option<AgentTimelineSnapshot>> {
         let value = self
             .http
             .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline")))
@@ -246,6 +257,11 @@ impl HttpKernelClient {
             .error_for_status()?
             .json::<Value>()
             .await?;
+        if value.get("ok").and_then(Value::as_bool) == Some(false)
+            && value.get("error").and_then(Value::as_str) == Some("agent_timeline_unavailable")
+        {
+            return Ok(None);
+        }
         let value = api_data(value)?;
         agent_projection::reject_private_projection_fields(&value)
             .map_err(|error| KernelClientError::Api(error.to_string()))?;
@@ -253,7 +269,7 @@ impl HttpKernelClient {
         timeline
             .validate()
             .map_err(|error| KernelClientError::Api(error.to_string()))?;
-        Ok(timeline)
+        Ok(Some(timeline))
     }
 
     pub async fn list_agent_sessions(

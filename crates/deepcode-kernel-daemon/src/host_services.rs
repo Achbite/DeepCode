@@ -646,10 +646,14 @@ impl HostServices {
         deletion_tombstone_ids: &HashSet<String>,
     ) -> Result<Self, HostV2StorageError> {
         let active_runs_v2 = HostActiveRunBrokerV2::new(sessions_dir.clone())?;
-        let workspace = HostWorkspaceService::from_projects(
-            projects,
-            active_runs_v2.workspace_rehydrate_records(recoverable_session_ids),
-        );
+        let kernel_operations_v2 = HostKernelOperationStoreV2::new(sessions_dir.clone());
+        let mut workspace_rehydrate_records =
+            active_runs_v2.workspace_rehydrate_records(recoverable_session_ids);
+        match kernel_operations_v2.workspace_rehydrate_records(recoverable_session_ids) {
+            Ok(mut records) => workspace_rehydrate_records.append(&mut records),
+            Err(error) => active_runs_v2.record_startup_error(error.code),
+        }
+        let workspace = HostWorkspaceService::from_projects(projects, workspace_rehydrate_records);
         let mut retirement_session_ids = recoverable_session_ids.clone();
         retirement_session_ids.extend(deletion_tombstone_ids.iter().cloned());
         let recovery_kernel_v2_service = kernel_v2_service.clone();
@@ -680,7 +684,7 @@ impl HostServices {
                 sessions_dir.clone(),
                 active_runs_v2.clone(),
             ),
-            kernel_operations_v2: HostKernelOperationStoreV2::new(sessions_dir),
+            kernel_operations_v2,
             active_runs_v2,
             kernel_v2_service,
         })
@@ -743,6 +747,7 @@ impl HostServices {
         Ok(HostPreparedEmptyWorkspaceV2 {
             workspace_binding_ref: registered.workspace_binding_ref,
             workspace_binding_identity: registered.workspace_identity,
+            workspace_canonical_root: empty.root,
             empty_workspace_key: empty.key,
             run_settings: empty.settings,
         })
@@ -758,6 +763,7 @@ impl HostServices {
         Ok(HostPreparedBoundWorkspaceV2 {
             workspace_binding_ref: registered.workspace_binding_ref,
             workspace_binding_identity: registered.workspace_identity,
+            workspace_canonical_root: resolved.root,
         })
     }
 
@@ -806,6 +812,7 @@ impl HostServices {
 pub(crate) struct HostPreparedEmptyWorkspaceV2 {
     pub(crate) workspace_binding_ref: WorkspaceBindingRefV2,
     pub(crate) workspace_binding_identity: String,
+    pub(crate) workspace_canonical_root: PathBuf,
     pub(crate) empty_workspace_key: String,
     pub(crate) run_settings: HostRunSettingsCeilingV2,
 }
@@ -814,6 +821,7 @@ pub(crate) struct HostPreparedEmptyWorkspaceV2 {
 pub(crate) struct HostPreparedBoundWorkspaceV2 {
     pub(crate) workspace_binding_ref: WorkspaceBindingRefV2,
     pub(crate) workspace_binding_identity: String,
+    pub(crate) workspace_canonical_root: PathBuf,
 }
 
 struct ResolvedWorkspaceRoot {

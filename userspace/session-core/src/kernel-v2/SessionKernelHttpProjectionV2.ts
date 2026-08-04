@@ -34,6 +34,9 @@ import type {
 import {
   decodeSessionPriorAgentEventV2,
 } from './sessionMemory.js';
+import {
+  boundedProviderUsageRecordV2,
+} from './providerStreamV1.js';
 
 export const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA =
   'deepcode.session.kernel-host-projection-request.v2' as const;
@@ -569,16 +572,19 @@ function appendCurrentRunProjection(
   const timeline: AgentTimelineResult = {
     schemaVersion: current.schemaVersion,
     shapeVersion: current.shapeVersion,
+    legacyPrefixTurnCount:
+      history.legacyPrefixTurnCount ?? 0,
     sessionId: current.sessionId,
     revision: sourceEventVersion,
     sourceEventVersion,
     generatedAt,
-    turns: [...history.turns, ...current.turns].map(
-      (turn, sequence) => ({
+    turns: [
+      ...history.turns,
+      ...current.turns.map((turn, sequence) => ({
         ...turn,
-        sequence,
-      })
-    ),
+        sequence: history.turns.length + sequence,
+      })),
+    ],
     eventCount: sourceEventVersion,
     ...(current.taskProjection
       ? { taskProjection: current.taskProjection }
@@ -905,8 +911,8 @@ function publicPresentation(
             ?? textField(data, 'narrative')
             ?? 'Plan is ready for review.',
           userPlan: textField(data, 'narrative'),
-          status: 'awaitingUserApproval',
-          confirmable: true,
+          status: 'running',
+          confirmable: false,
           tasks: Array.isArray(data?.actions)
             ? cloneJson(data.actions)
             : [],
@@ -1051,23 +1057,75 @@ function publicPresentation(
           summary: 'Plan action completed by the Session provider loop.',
         },
       };
+    case 'provider.composing':
+      return providerComposingPresentation(data);
     case 'provider.completed': {
       const result = objectRecord(data?.result);
+      const outputKind = textField(data, 'outputKind');
+      const providerTurnId = requiredIdentity(
+        data?.providerTurnId,
+        'providerTurnId'
+      );
+      const controlEpoch = positiveSafeInteger(
+        data?.controlEpoch,
+        'controlEpoch'
+      );
+      const decodedOrderedItems = publicOrderedProviderItems(
+        data?.orderedItems
+      );
+      const orderedItems = outputKind === 'plan'
+        ? decodedOrderedItems.filter(
+            (item) =>
+              item.kind === 'text'
+              && item.phase === 'commentary'
+          )
+        : decodedOrderedItems;
+      const terminalScope = publicTerminalScope(data);
+      if (terminalScope === undefined) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_terminal_scope_missing',
+          'Session Provider completion requires an explicit terminal scope.'
+        );
+      }
+      if (
+        terminalScope === 'turn'
+        && (outputKind !== 'answer' || result?.kind !== 'answer')
+      ) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_terminal_scope_conflict',
+          'Only a Provider answer may terminate the public user turn.'
+        );
+      }
+      if (terminalScope === 'providerTurn' && outputKind === undefined) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_terminal_scope_conflict',
+          'A Provider-turn completion requires an explicit output kind.'
+        );
+      }
+      const terminalAnswer = result?.kind === 'answer'
+        && terminalScope === 'turn';
+      const terminalAnswerText = terminalAnswer
+        ? exactTerminalAnswerText(result, decodedOrderedItems)
+        : undefined;
       return {
-        kind: result?.kind === 'answer'
+        kind: terminalAnswer
           ? 'assistant_msg'
           : 'workflow_stage',
-        channel: result?.kind === 'answer' ? 'final' : 'progress',
+        channel: terminalAnswer
+          ? 'final'
+          : 'progress',
         visibility: 'conversation',
         fields: {
           status: 'completed',
-          content: textField(result, 'text'),
-          outputKind: data?.outputKind,
-          providerTurnId: data?.providerTurnId,
-          controlEpoch: data?.controlEpoch,
-          providerOutcome: data?.providerOutcome === undefined
-            ? undefined
-            : cloneJson(data.providerOutcome),
+          ...(orderedItems.length === 0 && terminalAnswer
+            ? { content: terminalAnswerText }
+            : {}),
+          ...(orderedItems.length > 0 ? { orderedItems } : {}),
+          ...(terminalScope ? { terminalScope } : {}),
+          outputKind,
+          providerTurnId,
+          controlEpoch,
+          providerOutcome: publicProviderOutcome(data?.providerOutcome),
         },
       };
     }
@@ -1140,7 +1198,26 @@ function publicPresentation(
             },
       };
     }
-    case 'diagnostic':
+    case 'diagnostic': {
+      const stage = textField(data, 'stage');
+      if (stage === 'provider.toolCallQueue') {
+        const orderedItems = publicOrderedProviderItems(
+          data?.orderedItems
+        );
+        return {
+          kind: 'workflow_stage',
+          channel: 'progress',
+          visibility: 'trace',
+          fields: {
+            status: textField(data, 'status') ?? 'blocked',
+            code: textField(data, 'code')
+              ?? 'session_kernel_provider_tool_calls_aborted',
+            providerTurnId: textField(data, 'providerTurnId'),
+            reason: textField(data, 'reason'),
+            ...(orderedItems.length > 0 ? { orderedItems } : {}),
+          },
+        };
+      }
       return {
         kind: 'error',
         channel: 'error',
@@ -1149,11 +1226,13 @@ function publicPresentation(
           status: textField(data, 'status') ?? 'failed',
           code: textField(data, 'code') ?? 'session_kernel_diagnostic',
           providerTurnId: textField(data, 'providerTurnId'),
+          terminalScope: publicTerminalScope(data),
           message: textField(data, 'message')
-            ?? textField(data, 'stage')
+            ?? stage
             ?? 'Session Kernel diagnostic.',
         },
       };
+    }
     default:
       return {
         kind: 'workflow_stage',
@@ -1165,6 +1244,64 @@ function publicPresentation(
         },
       };
   }
+}
+
+function providerComposingPresentation(
+  data: Record<string, unknown> | undefined
+): ReturnType<typeof publicPresentation> {
+  const permitted = new Set([
+    'providerTurnId',
+    'controlEpoch',
+    'streamSequence',
+    'textOrdinal',
+    'providerPhase',
+    'textDelta',
+  ]);
+  const providerTurnId = requiredIdentity(
+    data?.providerTurnId,
+    'providerTurnId'
+  );
+  const controlEpoch = data?.controlEpoch;
+  const streamSequence = data?.streamSequence;
+  const textOrdinal = data?.textOrdinal;
+  const providerPhase = textField(data, 'providerPhase');
+  const textDelta = data?.textDelta;
+  if (
+    !data
+    || Object.keys(data).some((key) => !permitted.has(key))
+    || !Number.isSafeInteger(controlEpoch)
+    || Number(controlEpoch) <= 0
+    || !Number.isSafeInteger(streamSequence)
+    || Number(streamSequence) <= 0
+    || !Number.isSafeInteger(textOrdinal)
+    || Number(textOrdinal) <= 0
+    || (
+      providerPhase !== undefined
+      && providerPhase !== 'commentary'
+    )
+    || typeof textDelta !== 'string'
+    || textDelta.length === 0
+    || new TextEncoder().encode(textDelta).byteLength > 1024 * 1024
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_provider_composing_invalid',
+      'Provider composing projection is not an exact safe text delta.'
+    );
+  }
+  return {
+    kind: 'assistant_msg',
+    channel: 'progress',
+    visibility: 'conversation',
+    fields: {
+      status: 'running',
+      providerTurnId,
+      controlEpoch,
+      streamSequence,
+      textOrdinal,
+      ...(providerPhase ? { providerPhase } : {}),
+      content: textDelta,
+    },
+  };
 }
 
 function planScopePreviewPresentation(
@@ -1182,6 +1319,7 @@ function planScopePreviewPresentation(
   const objective = textField(plan, 'objective')
     ?? textField(plan, 'narrative')
     ?? 'Plan is ready for review.';
+  const confirmable = planScopePreviewsComplete(plan, previews);
   return {
     kind: 'plan_card',
     channel: 'task',
@@ -1192,8 +1330,8 @@ function planScopePreviewPresentation(
       title,
       summary: objective,
       userPlan: textField(plan, 'narrative'),
-      status: 'awaitingUserApproval',
-      confirmable: true,
+      status: confirmable ? 'awaitingUserApproval' : 'running',
+      confirmable,
       tasks: planTasksWithScopePreviews(plan, previews),
       scopePreviews: cloneJson(previews),
       scopeApprovalView: {
@@ -1219,6 +1357,37 @@ function planScopePreviewPresentation(
       ),
     },
   };
+}
+
+function planScopePreviewsComplete(
+  plan: Record<string, unknown> | undefined,
+  previews: Record<string, unknown>[]
+): boolean {
+  if (!Array.isArray(plan?.actions) || plan.actions.length === 0) {
+    return false;
+  }
+  const planRevision = textField(plan, 'planRevision');
+  if (!planRevision) return false;
+  return plan.actions.every((value) => {
+    const action = objectRecord(value);
+    const manifest = objectRecord(action?.manifest);
+    const planActionId = textField(manifest, 'planActionId');
+    const operationId = textField(manifest, 'operationId');
+    const toolId = textField(manifest, 'toolId');
+    if (!planActionId || !operationId || !toolId) return false;
+    return previews.some((preview) => {
+      const approvalView = objectRecord(preview.approvalView);
+      const scopeDigest = textField(preview, 'scopeDigest');
+      return textField(preview, 'previewId') !== undefined
+        && textField(preview, 'planRevision') === planRevision
+        && textField(preview, 'planActionId') === planActionId
+        && textField(preview, 'operationId') === operationId
+        && textField(preview, 'toolId') === toolId
+        && scopeDigest !== undefined
+        && textField(preview, 'authorizationDigest') !== undefined
+        && textField(approvalView, 'scopeDigest') === scopeDigest;
+    });
+  });
 }
 
 function rejectedPlanScopePresentation(
@@ -1467,6 +1636,268 @@ function permissionRequestPresentation(
       status: 'awaitingUserDecision',
     },
   };
+}
+
+function publicOrderedProviderItems(
+  value: unknown
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  if (value.length > 96) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_provider_items_invalid',
+      'Provider projection contains too many ordered items.'
+    );
+  }
+  return value.map((entry, index) => {
+    const item = objectRecord(entry);
+    if (item?.kind === 'text') {
+      const permitted = new Set(['kind', 'phase', 'text']);
+      const phase = textField(item, 'phase');
+      const text = textField(item, 'text');
+      if (
+        Object.keys(item).some((key) => !permitted.has(key))
+        ||
+        !text
+        || (
+          phase !== 'commentary'
+          && phase !== 'final_answer'
+          && phase !== 'unknown'
+        )
+      ) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_provider_items_invalid',
+          `Provider text item ${index + 1} is invalid.`
+        );
+      }
+      return {
+        kind: 'text',
+        phase,
+        text,
+        textOrdinal: index + 1,
+      };
+    }
+    if (item?.kind !== 'toolCall') {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_provider_items_invalid',
+        `Provider ordered item ${index + 1} is invalid.`
+      );
+    }
+    const permitted = new Set([
+      'kind',
+      'ordinal',
+      'callId',
+      'toolName',
+      'toolId',
+      'operationId',
+      'status',
+      'invocationId',
+      'terminalFactId',
+      'terminalFactKind',
+      'settlementReason',
+    ]);
+    const ordinal = item.ordinal;
+    const status = textField(item, 'status');
+    if (
+      Object.keys(item).some((key) => !permitted.has(key))
+      || !Number.isSafeInteger(ordinal)
+      || Number(ordinal) <= 0
+      || (
+        status !== undefined
+        && status !== 'pending'
+        && status !== 'submitting'
+        && status !== 'awaitingCapability'
+        && status !== 'awaitingInvocation'
+        && status !== 'completed'
+        && status !== 'aborted'
+        && status !== 'unexecuted'
+      )
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_provider_items_invalid',
+        `Provider tool item ${index + 1} is invalid.`
+      );
+    }
+    return {
+      kind: 'toolCall',
+      ordinal,
+      callId: requiredIdentity(item.callId, 'callId'),
+      toolName: requiredIdentity(item.toolName, 'toolName'),
+      toolId: requiredIdentity(item.toolId, 'toolId'),
+      ...(item.operationId === undefined
+        ? {}
+        : {
+            operationId: requiredIdentity(
+              item.operationId,
+              'operationId'
+            ),
+          }),
+      ...(status ? { status } : {}),
+      ...(item.invocationId === undefined
+        ? {}
+        : {
+            invocationId: requiredIdentity(
+              item.invocationId,
+              'invocationId'
+            ),
+          }),
+      ...(item.terminalFactId === undefined
+        ? {}
+        : {
+            terminalFactId: requiredIdentity(
+              item.terminalFactId,
+              'terminalFactId'
+            ),
+          }),
+      ...(item.terminalFactKind === undefined
+        ? {}
+        : {
+            terminalFactKind: requiredIdentity(
+              item.terminalFactKind,
+              'terminalFactKind'
+            ),
+          }),
+      ...(item.settlementReason === undefined
+        ? {}
+        : {
+            settlementReason: requiredIdentity(
+              item.settlementReason,
+              'settlementReason'
+            ),
+          }),
+    };
+  });
+}
+
+function exactTerminalAnswerText(
+  result: Record<string, unknown> | undefined,
+  orderedItems: Array<Record<string, unknown>>
+): string {
+  if (
+    !result
+    || Object.keys(result).length !== 2
+    || !Object.prototype.hasOwnProperty.call(result, 'kind')
+    || !Object.prototype.hasOwnProperty.call(result, 'text')
+    || result.kind !== 'answer'
+    || typeof result.text !== 'string'
+    || !result.text.trim()
+    || new TextEncoder().encode(result.text).byteLength > 1024 * 1024
+    || orderedItems.length === 0
+    || orderedItems.some((item) => item.kind !== 'text')
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_terminal_answer_invalid',
+      'A terminal Provider answer requires one exact non-empty sealed text response.'
+    );
+  }
+  const textItems = orderedItems as Array<{
+    kind: 'text';
+    phase: 'commentary' | 'final_answer' | 'unknown';
+    text: string;
+  }>;
+  const firstFinalIndex = textItems.findIndex(
+    (item) => item.phase === 'final_answer'
+  );
+  const lastCommentaryIndex = textItems.findLastIndex(
+    (item) => item.phase === 'commentary'
+  );
+  const finalItems = firstFinalIndex >= 0
+    ? textItems.slice(firstFinalIndex)
+    : textItems
+      .slice(lastCommentaryIndex + 1)
+      .filter((item) => item.phase === 'unknown');
+  const sealedText = finalItems.map((item) => item.text).join('');
+  if (!sealedText.trim() || sealedText !== result.text) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_terminal_answer_mismatch',
+      'The public terminal answer differs from the sealed ordered Provider text.'
+    );
+  }
+  return sealedText;
+}
+
+function publicProviderOutcome(
+  value: unknown
+): Record<string, unknown> {
+  const outcome = objectRecord(value);
+  const permitted = new Set([
+    'providerProfileId',
+    'provider',
+    'model',
+    'usage',
+  ]);
+  if (
+    !outcome
+    || Object.keys(outcome).some((key) => !permitted.has(key))
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_provider_outcome_invalid',
+      'Provider outcome is not an exact safe public metadata record.'
+    );
+  }
+  const providerProfileId = requiredIdentity(
+    outcome.providerProfileId,
+    'providerProfileId'
+  );
+  const provider = requiredIdentity(outcome.provider, 'provider');
+  const model = requiredIdentity(outcome.model, 'model');
+  if (
+    outcome.usage !== undefined
+    && !objectRecord(outcome.usage)
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_provider_outcome_invalid',
+      'Provider usage is not a bounded public counter record.'
+    );
+  }
+  const usage = outcome.usage === undefined
+    ? undefined
+    : boundedProviderUsageRecordV2(outcome.usage);
+  if (
+    usage !== undefined
+    && canonicalJson(usage) !== canonicalJson(outcome.usage)
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_provider_outcome_invalid',
+      'Provider usage is not an exact bounded public counter record.'
+    );
+  }
+  return {
+    providerProfileId,
+    provider,
+    model,
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function publicTerminalScope(
+  data: Record<string, unknown> | undefined
+): 'turn' | 'providerTurn' | undefined {
+  const value = textField(data, 'terminalScope');
+  if (
+    value !== undefined
+    && value !== 'turn'
+    && value !== 'providerTurn'
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_terminal_scope_invalid',
+      'Session projection terminal scope is invalid.'
+    );
+  }
+  return value;
+}
+
+function positiveSafeInteger(value: unknown, field: string): number {
+  if (
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value <= 0
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_count_invalid',
+      `${field} is not a positive safe integer.`
+    );
+  }
+  return value;
 }
 
 function nestedText(

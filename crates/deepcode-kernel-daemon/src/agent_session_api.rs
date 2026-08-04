@@ -378,10 +378,8 @@ pub(crate) async fn agent_session_delete(
             "Session deletion requires a non-empty canonical path-safe Session id",
         );
     }
-    let run_start_lock = session_run_start_admission_lock(&session_id);
-    let _run_start_guard = run_start_lock.lock_owned().await;
-    let run_cancel_lock = session_run_cancel_admission_lock(&session_id);
-    let _run_cancel_guard = run_cancel_lock.lock_owned().await;
+    let run_admission_lock = session_run_admission_lock(&session_id);
+    let _run_admission_guard = run_admission_lock.lock_owned().await;
     let safe_session_id = safe_path_segment(&session_id);
     let (sessions_dir, response_scope_key) = {
         let mut gui = state.gui.lock().expect("gui state lock");
@@ -524,10 +522,8 @@ pub(crate) async fn agent_session_archive(
     {
         return response;
     }
-    let run_start_lock = session_run_start_admission_lock(&session_id);
-    let _run_start_guard = run_start_lock.lock_owned().await;
-    let run_cancel_lock = session_run_cancel_admission_lock(&session_id);
-    let _run_cancel_guard = run_cancel_lock.lock_owned().await;
+    let run_admission_lock = session_run_admission_lock(&session_id);
+    let _run_admission_guard = run_admission_lock.lock_owned().await;
     let should_archive = body
         .get("archived")
         .and_then(Value::as_bool)

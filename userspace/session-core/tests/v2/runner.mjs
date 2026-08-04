@@ -8,6 +8,9 @@ import {
   contractCases as providerLifecycleCases,
 } from './provider-lifecycle-contracts.mjs';
 import {
+  contractCases as projectionCases,
+} from './projection-contracts.mjs';
+import {
   contractCases as recoveryCases,
 } from './recovery-contracts.mjs';
 import {
@@ -19,6 +22,7 @@ const cases = [
   ...authorityCases,
   ...loopCases,
   ...providerLifecycleCases,
+  ...projectionCases,
   ...recoveryCases,
   ...reviewCases,
 ];
@@ -34,7 +38,7 @@ async function main() {
   }
   assertUniqueCaseIds(cases);
   console.log(
-    `[INFO] ${SUITE_ID}: ${cases.length} authoritative contracts`
+    `[INFO] ${SUITE_ID}: ${cases.length} supporting-evidence contracts`
   );
   for (const contractCase of cases) {
     try {

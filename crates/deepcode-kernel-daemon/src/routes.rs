@@ -22,14 +22,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(kernel_v2_user_decisions).layer(DefaultBodyLimit::max(MAX_USER_DECISION_BYTES_V2)),
         )
         .route(
-            "/api/session-store/:session_id/kernel-v2/:run_id",
-            get(session_kernel_v2_store_get)
-                .post(session_kernel_v2_store_append)
-                .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
+            "/api/session-store/:session_id/kernel-v3/:run_id",
+            get(session_kernel_v3_store_get)
+                .post(session_kernel_v3_store_append)
+                .layer(DefaultBodyLimit::max(
+                    SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,
+                )),
         )
         .route(
-            "/api/session-store/:session_id/kernel-v2/:run_id/records/:record_id",
-            get(session_kernel_v2_store_record_get),
+            "/api/session-store/:session_id/kernel-v3/:run_id/records/:record_id",
+            get(session_kernel_v3_store_record_get),
         )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
@@ -136,8 +138,9 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route(
             "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projections",
-            post(session_kernel_v2_projection_append)
-                .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
+            post(session_kernel_v2_projection_append).layer(DefaultBodyLimit::max(
+                SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/prior-events",
@@ -168,6 +171,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(agent_session_timeline),
         )
         .route(
+            "/api/agent/sessions/:session_id/timeline/stream",
+            get(agent_session_timeline_stream),
+        )
+        .route(
             "/api/agent/sessions/:session_id",
             patch(agent_session_rename).delete(agent_session_delete),
         )
@@ -177,7 +184,11 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/api/browser/reload", post(browser_reload))
         .route("/api/browser/inspect-mode", post(browser_inspect_mode))
         .route("/api/*path", any(api_route_not_found))
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::startup_readiness_v2::host_startup_readiness_gate,
+        ))
         .layer(localhost_cors_layer())
         .layer(axum::middleware::from_fn_with_state(
             host_shell_authority,

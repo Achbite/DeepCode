@@ -1,40 +1,35 @@
 use crate::api_response::ApiResponse;
 use crate::prelude::*;
 use crate::AppState;
-use deepcode_kernel_abi::{is_valid_host_instance_id_v2, HOST_INSTANCE_ID_ENV_V2};
+use deepcode_kernel_abi::{
+    is_valid_host_instance_id_v2, HostProcessIdentityV2, HostShutdownReceiptV2,
+    HostShutdownRequestV2, HOST_INSTANCE_ID_ENV_V2, HOST_KERNEL_DAEMON_SERVICE_V2,
+    HOST_SHUTDOWN_IDENTITY_CONFLICT_V2, HOST_SHUTDOWN_OWNER_HOST_SHELL_V2,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static HOST_SHUTDOWN_REQUESTED_V2: AtomicBool = AtomicBool::new(false);
 static HOST_PROCESS_IDENTITY_V2: OnceLock<HostProcessIdentityV2> = OnceLock::new();
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct HostProcessIdentityV2 {
-    service: &'static str,
-    instance_id: String,
-    pid: u32,
-    address: String,
-}
-
-impl HostProcessIdentityV2 {
-    fn daemon_from_environment(address: SocketAddr) -> Result<Self, &'static str> {
-        let instance_id = std::env::var(HOST_INSTANCE_ID_ENV_V2)
-            .map_err(|_| "Host instance identity is not configured")?;
-        if !is_valid_host_instance_id_v2(&instance_id) {
-            return Err("Host instance identity must use the v2 format with 256 bits of entropy");
-        }
-        Ok(Self {
-            service: "deepcode-kernel-daemon",
-            instance_id,
-            pid: std::process::id(),
-            address: format!("http://{address}"),
-        })
+fn daemon_identity_from_environment(
+    address: SocketAddr,
+) -> Result<HostProcessIdentityV2, &'static str> {
+    let instance_id = std::env::var(HOST_INSTANCE_ID_ENV_V2)
+        .map_err(|_| "Host instance identity is not configured")?;
+    if !is_valid_host_instance_id_v2(&instance_id) {
+        return Err("Host instance identity must use the v2 format with 256 bits of entropy");
     }
+    Ok(HostProcessIdentityV2 {
+        service: HOST_KERNEL_DAEMON_SERVICE_V2.to_string(),
+        instance_id,
+        pid: std::process::id(),
+        address: format!("http://{address}"),
+    })
 }
 
 pub(crate) fn configure_host_process_identity_v2(address: SocketAddr) -> Result<(), &'static str> {
-    let identity = HostProcessIdentityV2::daemon_from_environment(address)?;
+    let identity = daemon_identity_from_environment(address)?;
     HOST_PROCESS_IDENTITY_V2
         .set(identity)
         .map_err(|_| "Host process identity is already configured")
@@ -53,7 +48,40 @@ pub(crate) async fn host_identity_v2() -> Json<ApiResponse> {
     )
 }
 
-pub(crate) async fn host_shutdown_v2(State(state): State<AppState>) -> Json<ApiResponse> {
+pub(crate) async fn host_shutdown_v2(
+    State(state): State<AppState>,
+    Json(request): Json<HostShutdownRequestV2>,
+) -> Response {
+    let identity = host_process_identity_v2();
+    if request.expected_identity != *identity {
+        return (
+            StatusCode::CONFLICT,
+            ApiResponse::error(
+                HOST_SHUTDOWN_IDENTITY_CONFLICT_V2,
+                "Host shutdown authority does not match the running process identity",
+            ),
+        )
+            .into_response();
+    }
+    let cleanup_complete = shutdown_owned_host_resources_v2(&state).await;
+    request_host_shutdown_v2();
+    let receipt = HostShutdownReceiptV2 {
+        accepted: true,
+        owner: HOST_SHUTDOWN_OWNER_HOST_SHELL_V2.to_string(),
+        identity: identity.clone(),
+        cleanup_complete,
+    };
+    (
+        StatusCode::OK,
+        ApiResponse::ok(
+            serde_json::to_value(receipt).expect("Host shutdown receipt must serialize"),
+        ),
+    )
+        .into_response()
+}
+
+pub(crate) async fn shutdown_owned_host_resources_v2(state: &AppState) -> bool {
+    let wake_cleanup_ok = state.kernel_wake_v2.shutdown().await.is_ok();
     let bridge_cleanup_ok = state.kernel_session_v2.shutdown_all_owned_bridges().is_ok();
     let terminal_cleanup_ok = state
         .terminal_runtime
@@ -63,14 +91,15 @@ pub(crate) async fn host_shutdown_v2(State(state): State<AppState>) -> Json<ApiR
             true
         })
         .unwrap_or(false);
-    let cleanup_complete = bridge_cleanup_ok && terminal_cleanup_ok;
+    wake_cleanup_ok && bridge_cleanup_ok && terminal_cleanup_ok
+}
+
+pub(crate) fn request_host_shutdown_v2() {
     HOST_SHUTDOWN_REQUESTED_V2.store(true, Ordering::SeqCst);
-    ApiResponse::ok(json!({
-        "accepted": true,
-        "owner": "hostShell",
-        "identity": host_process_identity_v2(),
-        "cleanupComplete": cleanup_complete
-    }))
+}
+
+pub(crate) fn host_shutdown_requested_v2() -> bool {
+    HOST_SHUTDOWN_REQUESTED_V2.load(Ordering::SeqCst)
 }
 
 pub(crate) async fn wait_for_host_shutdown_v2() {

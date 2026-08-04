@@ -178,6 +178,18 @@ export function createAgentTimelineDelta(
   if (current.sessionId !== next.sessionId) {
     throw new Error('timeline_delta_session_mismatch');
   }
+  const legacyPrefixTurnCount = next.legacyPrefixTurnCount ?? 0;
+  if (
+    (current.legacyPrefixTurnCount ?? 0)
+      !== legacyPrefixTurnCount
+  ) {
+    throw new Error('timeline_delta_legacy_prefix_changed');
+  }
+  for (let index = 0; index < legacyPrefixTurnCount; index += 1) {
+    if (!jsonEqual(current.turns[index], next.turns[index])) {
+      throw new Error('timeline_delta_legacy_prefix_changed');
+    }
+  }
   if (next.revision <= current.revision) {
     throw new Error('timeline_delta_revision_not_advancing');
   }
@@ -203,6 +215,7 @@ export function createAgentTimelineDelta(
   return {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
     shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+    legacyPrefixTurnCount,
     sessionId: next.sessionId,
     baseRevision: current.revision,
     revision: next.revision,
@@ -230,6 +243,15 @@ export function applyAgentTimelineDelta(
       delta.baseRevision
     );
   }
+  const currentLegacyPrefixTurnCount =
+    current.legacyPrefixTurnCount ?? 0;
+  const deltaLegacyPrefixTurnCount =
+    delta.legacyPrefixTurnCount ?? 0;
+  if (
+    currentLegacyPrefixTurnCount !== deltaLegacyPrefixTurnCount
+  ) {
+    throw new Error('timeline_delta_legacy_prefix_changed');
+  }
   if (delta.revision <= delta.baseRevision) {
     throw new Error('timeline_delta_revision_not_advancing');
   }
@@ -244,15 +266,31 @@ export function applyAgentTimelineDelta(
   const replacements = new Map(
     delta.turnReplacements.map((turn) => [turn.id, turn])
   );
+  const legacyTurnIds = new Set(
+    current.turns
+      .slice(0, currentLegacyPrefixTurnCount)
+      .map((turn) => turn.id)
+  );
+  if (
+    [...legacyTurnIds].some((turnId) =>
+      removed.has(turnId) || replacements.has(turnId)
+    )
+  ) {
+    throw new Error('timeline_delta_legacy_prefix_changed');
+  }
   for (const turnId of removed) {
     if (replacements.has(turnId)) {
       throw new Error('timeline_delta_turn_conflict');
     }
   }
 
+  const legacyTurns = current.turns.slice(
+    0,
+    currentLegacyPrefixTurnCount
+  );
   const turns: AgentTimelineTurn[] = [];
   const knownTurnIds = new Set<string>();
-  for (const turn of current.turns) {
+  for (const turn of current.turns.slice(currentLegacyPrefixTurnCount)) {
     if (removed.has(turn.id)) continue;
     const replacement = replacements.get(turn.id);
     turns.push(replacement ?? turn);
@@ -272,11 +310,12 @@ export function applyAgentTimelineDelta(
     ...current,
     schemaVersion: delta.schemaVersion,
     shapeVersion: delta.shapeVersion,
+    legacyPrefixTurnCount: deltaLegacyPrefixTurnCount,
     revision: delta.revision,
     sourceEventVersion: delta.sourceEventVersion,
     generatedAt: delta.generatedAt,
     eventCount: delta.eventCount,
-    turns,
+    turns: [...legacyTurns, ...turns],
   };
   applyRootProjectionReplacements(result, delta.rootReplacements);
   assertNativeTimeline(result);
@@ -373,6 +412,7 @@ export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   return {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
     shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+    legacyPrefixTurnCount: 0,
     sessionId,
     revision: 0,
     sourceEventVersion: 0,
@@ -420,6 +460,7 @@ function normalizeSettledLegacyFlatV2(
   const result: AgentTimelineResult = {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
     shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+    legacyPrefixTurnCount: turns.length,
     sessionId: snapshot.sessionId as string,
     revision: snapshot.revision as number,
     sourceEventVersion: snapshot.sourceEventVersion as number,
@@ -533,6 +574,13 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
       !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
     || delta.shapeVersion
       !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1
+    || (
+      delta.legacyPrefixTurnCount !== undefined
+      && (
+        !Number.isSafeInteger(delta.legacyPrefixTurnCount)
+        || delta.legacyPrefixTurnCount < 0
+      )
+    )
     || typeof delta.sessionId !== 'string'
     || !Number.isSafeInteger(delta.baseRevision)
     || !Number.isSafeInteger(delta.revision)

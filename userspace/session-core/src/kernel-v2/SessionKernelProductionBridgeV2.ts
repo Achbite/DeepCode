@@ -19,9 +19,9 @@ import {
 } from './PrefetchedSessionKernelHostRunAdapterV2.js';
 import {
   DurableSessionKernelProjectionV2,
-  HttpSessionKernelAppendOnlyRecordStoreV2,
-  SESSION_KERNEL_PERSISTENCE_V2_SCHEMA,
-  SessionKernelAppendOnlyPersistenceV2,
+  HttpSessionKernelAppendOnlyRecordStoreV3,
+  SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
+  SessionKernelAppendOnlyPersistenceV3,
 } from './SessionKernelHttpPersistenceV2.js';
 import {
   HttpSessionKernelHostProjectionSinkV2,
@@ -61,14 +61,20 @@ import type {
   SessionKernelClockPortV2,
   SessionKernelIdFactoryPortV2,
 } from './ports.js';
-import type { SessionKernelLoopStateV2 } from './state.js';
+import {
+  currentSessionWorkAuthorityV3,
+  sameSessionWorkAuthorityV3,
+  type SessionKernelLoopStateV2,
+} from './state.js';
 import type {
   SessionActiveWaitV2,
+  SessionFinalAnswerBindingV3,
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
   SessionPlanDecisionV2,
   SessionProviderProfileBootstrapV2,
   SessionUserInputRecordV2,
+  SessionWorkAuthorityV3,
 } from './types.js';
 import {
   SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA,
@@ -197,8 +203,13 @@ export interface SessionKernelProductionReconcileFactsV2 {
 export interface SessionKernelProductionFinalizeReviewV2 {
   kind: 'finalizeReview';
   data: {
-    expectedPlanRevision: string;
+    expectedWorkAuthority: SessionWorkAuthorityV3;
   };
+}
+
+export interface SessionKernelProductionRequestFinalAnswerV2 {
+  kind: 'requestFinalAnswer';
+  data: SessionFinalAnswerBindingV3;
 }
 
 export interface SessionKernelProductionCancelRunV2 {
@@ -223,6 +234,7 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionReconcileWakeV2
   | SessionKernelProductionReconcileFactsV2
   | SessionKernelProductionFinalizeReviewV2
+  | SessionKernelProductionRequestFinalAnswerV2
   | SessionKernelProductionCancelRunV2;
 
 /**
@@ -235,7 +247,7 @@ export interface SessionKernelProductionRequestV2 {
   sessionId: string;
   hostRunId: string;
   runId: string;
-  historySchema: typeof SESSION_KERNEL_PERSISTENCE_V2_SCHEMA;
+  historySchema: typeof SESSION_KERNEL_PERSISTENCE_V3_SCHEMA;
   providerProfile: SessionProviderProfileBootstrapV2;
   priorSessionEvents: SessionPriorEventsSourceV2;
   prefetchedRun: SessionKernelPrefetchedRunDescriptorV2;
@@ -263,6 +275,18 @@ export interface SessionKernelProductionStateSummaryV2 {
   factsRunSequenceHighWater: number;
   pendingRequestLanes: Array<'control' | 'effect' | 'query'>;
   reviewRevision?: number;
+  finalAnswer?: {
+    status:
+      | 'pending'
+      | 'requesting'
+      | 'stale'
+      | 'committed'
+      | 'finalAnswerFailed';
+    binding: SessionFinalAnswerBindingV3;
+    physicalRequestCount: number;
+    providerTurnId?: string;
+    lastErrorCode?: string;
+  };
 }
 
 export type SessionKernelProductionOutcomeV2 =
@@ -320,6 +344,18 @@ export type SessionKernelProductionOutcomeV2 =
       review: SessionKernelReviewV2;
     }
   | {
+      kind: 'finalAnswerResult';
+      result: Extract<
+        SessionKernelLoopResultV2,
+        {
+          kind:
+            | 'answer'
+            | 'finalAnswerFailed'
+            | 'staleProviderResult';
+        }
+      >;
+    }
+  | {
       kind: 'runCancelled';
       callerRequestId: string;
       callerRequestDigest: string;
@@ -364,7 +400,16 @@ export type SessionKernelProductionContinuationV2 =
     }
   | {
       kind: 'awaitingKernelWake';
-      waitKind: 'capabilityDecisionFact' | 'invocation';
+      waitKind: 'capabilityDecisionFact';
+      operationId: string;
+      invocationId: string;
+      previewId: string;
+      planActionId?: string;
+      expectedPlanRevision?: string;
+    }
+  | {
+      kind: 'awaitingKernelWake';
+      waitKind: 'invocation';
       operationId: string;
       invocationId: string;
       planActionId?: string;
@@ -409,8 +454,11 @@ export type SessionKernelProductionContinuationV2 =
     }
   | {
       kind: 'readyToFinalizeReview';
-      expectedPlanRevision: string;
+      workAuthority: SessionWorkAuthorityV3;
     }
+  | ({
+      kind: 'readyToRequestFinalAnswer';
+    } & SessionFinalAnswerBindingV3)
   | {
       kind: 'recoveryRequired';
       pendingRequestLanes: Array<'control' | 'effect' | 'query'>;
@@ -437,11 +485,15 @@ export type SessionKernelProductionContinuationV2 =
   | {
       kind: 'terminalProviderStop';
     }
-  | {
-      kind: 'terminalReview';
-      reviewRevision: number;
-      snapshotHighWater: number;
-    }
+  | ({
+      kind: 'terminalFinalAnswer';
+      providerTurnId: string;
+    } & SessionFinalAnswerBindingV3)
+  | ({
+      kind: 'terminalFinalAnswerFailed';
+      errorCode: string;
+      physicalRequestCount: number;
+    } & SessionFinalAnswerBindingV3)
   | {
       kind: 'terminalRunCancelled';
       cancelOperationId: string;
@@ -1286,14 +1338,14 @@ async function createProductionRunner(
     privateAuth,
     transport
   );
-  const recordStore = new HttpSessionKernelAppendOnlyRecordStoreV2(
+  const recordStore = new HttpSessionKernelAppendOnlyRecordStoreV3(
     request.sessionId,
     request.runId,
     trustedApiBase,
     privateAuth,
     fetchImpl
   );
-  const persistence = new SessionKernelAppendOnlyPersistenceV2(
+  const persistence = new SessionKernelAppendOnlyPersistenceV3(
     request.sessionId,
     request.runId,
     request.historySchema,
@@ -1562,15 +1614,20 @@ async function executeProductionOperation(
       );
       return { kind: 'factsReconciled' };
     case 'finalizeReview':
-      requireProductionPlanRevision(
+      requireProductionWorkAuthority(
         runner.snapshot(),
-        operation.data.expectedPlanRevision
+        operation.data.expectedWorkAuthority
       );
       return {
         kind: 'reviewFinalized',
         review: await runner.finalizeReview(
-          operation.data.expectedPlanRevision
+          operation.data.expectedWorkAuthority
         ),
+      };
+    case 'requestFinalAnswer':
+      return {
+        kind: 'finalAnswerResult',
+        result: await runner.requestFinalAnswer(operation.data),
       };
   }
 }
@@ -1653,7 +1710,7 @@ export function decodeSessionKernelProductionRequestV2(
   );
   if (
     record.schemaVersion !== SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA
-    || record.historySchema !== SESSION_KERNEL_PERSISTENCE_V2_SCHEMA
+    || record.historySchema !== SESSION_KERNEL_PERSISTENCE_V3_SCHEMA
   ) {
     throw invalidProductionRequest(
       'session_kernel_production_schema_unsupported'
@@ -1689,7 +1746,7 @@ export function decodeSessionKernelProductionRequestV2(
     sessionId,
     hostRunId,
     runId,
-    historySchema: SESSION_KERNEL_PERSISTENCE_V2_SCHEMA,
+    historySchema: SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
     providerProfile,
     priorSessionEvents,
     prefetchedRun,
@@ -2106,15 +2163,20 @@ function decodeOperation(
     };
   }
   if (tagged.kind === 'finalizeReview') {
-    const body = exactObject(data, ['expectedPlanRevision']);
+    const body = exactObject(data, ['expectedWorkAuthority']);
     return {
       kind: tagged.kind,
       data: {
-        expectedPlanRevision: identity(
-          body.expectedPlanRevision,
-          'expectedPlanRevision'
+        expectedWorkAuthority: decodeWorkAuthority(
+          body.expectedWorkAuthority
         ),
       },
+    };
+  }
+  if (tagged.kind === 'requestFinalAnswer') {
+    return {
+      kind: tagged.kind,
+      data: decodeFinalAnswerBinding(data),
     };
   }
   if (tagged.kind === 'cancelRun') {
@@ -2147,6 +2209,100 @@ function decodeOperation(
   throw invalidProductionRequest(
     'session_kernel_production_operation_unsupported'
   );
+}
+
+function decodeFinalAnswerBinding(
+  value: unknown
+): SessionFinalAnswerBindingV3 {
+  const body = exactObject(
+    value,
+    [
+      'inputId',
+      'controlEpoch',
+      'workAuthority',
+      'reviewRevision',
+      'snapshotHighWater',
+    ]
+  );
+  const controlEpoch = safeNonnegativeInteger(
+    body.controlEpoch,
+    'controlEpoch'
+  );
+  const reviewRevision = safeNonnegativeInteger(
+    body.reviewRevision,
+    'reviewRevision'
+  );
+  const snapshotHighWater = safeNonnegativeInteger(
+    body.snapshotHighWater,
+    'snapshotHighWater'
+  );
+  if (controlEpoch < 1 || reviewRevision < 1) {
+    throw invalidProductionRequest(
+      'session_kernel_production_final_answer_binding_invalid'
+    );
+  }
+  return {
+    inputId: identity(body.inputId, 'inputId'),
+    controlEpoch,
+    workAuthority: decodeWorkAuthority(body.workAuthority),
+    reviewRevision,
+    snapshotHighWater,
+  };
+}
+
+function decodeWorkAuthority(
+  value: unknown
+): SessionWorkAuthorityV3 {
+  const tagged = exactObject(value, ['kind'], [
+    'planRevision',
+    'operationIds',
+    'digest',
+  ]);
+  if (tagged.kind === 'plan') {
+    const body = exactObject(value, ['kind', 'planRevision']);
+    return {
+      kind: 'plan',
+      planRevision: identity(body.planRevision, 'planRevision'),
+    };
+  }
+  if (tagged.kind !== 'contextRead') {
+    throw invalidProductionRequest(
+      'session_kernel_production_work_authority_invalid'
+    );
+  }
+  const body = exactObject(
+    value,
+    ['kind', 'operationIds', 'digest']
+  );
+  if (
+    !Array.isArray(body.operationIds)
+    || body.operationIds.length === 0
+    || body.operationIds.length > 8_192
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_production_work_authority_invalid'
+    );
+  }
+  const operationIds = body.operationIds.map((operationId) =>
+    identity(operationId, 'operationId')
+  );
+  const normalized = [...new Set(operationIds)].sort();
+  const digest = sha256Digest(body.digest, 'digest');
+  if (
+    normalized.length !== operationIds.length
+    || normalized.some((operationId, index) =>
+      operationId !== operationIds[index]
+    )
+    || digest !== sha256Hash(canonicalJson({
+      kind: 'contextRead',
+      operationIds,
+    }))
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_production_work_authority_invalid'
+    );
+  }
+  return { kind: 'contextRead', operationIds, digest };
 }
 
 function decodeStoredRunCancellationSuccess(
@@ -2366,6 +2522,18 @@ function storedHighWater(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+function safeNonnegativeInteger(
+  value: unknown,
+  _field: string
+): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw invalidProductionRequest(
+      'session_kernel_production_final_answer_binding_invalid'
+    );
+  }
+  return Number(value);
+}
+
 function decodeGuidance(value: unknown): string[] {
   if (!Array.isArray(value) || value.length > 64) {
     throw invalidProductionRequest(
@@ -2432,6 +2600,28 @@ function summarizeState(
     ).sort(),
     ...(state.review
       ? { reviewRevision: state.review.revision }
+      : {}),
+    ...(state.finalAnswer
+      ? {
+          finalAnswer: {
+            status: state.finalAnswer.status,
+            binding: cloneJson(state.finalAnswer.binding),
+            physicalRequestCount:
+              state.finalAnswer.physicalRequestCount,
+            ...(state.finalAnswer.providerTurnId
+              ? {
+                  providerTurnId:
+                    state.finalAnswer.providerTurnId,
+                }
+              : {}),
+            ...(state.finalAnswer.lastErrorCode
+              ? {
+                  lastErrorCode:
+                    state.finalAnswer.lastErrorCode,
+                }
+              : {}),
+          },
+        }
       : {}),
   };
 }
@@ -2621,12 +2811,55 @@ function productionContinuation(
           )
         : readyToDriveOrFinalize(state, planAction);
     case 'reviewFinalized':
-      return {
-        kind: 'terminalReview',
-        reviewRevision: outcome.review.revision,
-        snapshotHighWater: outcome.review.snapshotHighWater,
-      };
+      return continuationForFinalAnswerState(state);
+    case 'finalAnswerResult':
+      return continuationForFinalAnswerState(state);
   }
+}
+
+function continuationForFinalAnswerState(
+  state: SessionKernelLoopStateV2
+): SessionKernelProductionContinuationV2 {
+  const finalAnswer = state.finalAnswer;
+  if (!finalAnswer) {
+    throw new SessionKernelProductionBridgeError(
+      'session_kernel_production_final_answer_state_missing'
+    );
+  }
+  if (finalAnswer.status === 'committed') {
+    if (!finalAnswer.providerTurnId) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_final_answer_commit_invalid'
+      );
+    }
+    return {
+      kind: 'terminalFinalAnswer',
+      ...cloneJson(finalAnswer.binding),
+      providerTurnId: finalAnswer.providerTurnId,
+    };
+  }
+  if (finalAnswer.status === 'finalAnswerFailed') {
+    if (!finalAnswer.lastErrorCode) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_final_answer_failure_invalid'
+      );
+    }
+    return {
+      kind: 'terminalFinalAnswerFailed',
+      ...cloneJson(finalAnswer.binding),
+      errorCode: finalAnswer.lastErrorCode,
+      physicalRequestCount: finalAnswer.physicalRequestCount,
+    };
+  }
+  if (finalAnswer.status !== 'pending') {
+    throw new SessionKernelProductionBridgeError(
+      'session_kernel_production_final_answer_not_settled'
+    );
+  }
+  return {
+    kind: 'readyToRequestFinalAnswer',
+    ...cloneJson(finalAnswer.binding),
+  };
 }
 
 function summarizePlanConfirmation(
@@ -2669,6 +2902,7 @@ function continuationForWait(
           waitKind: 'capabilityDecisionFact',
           operationId: wait.operationId,
           invocationId: wait.invocationId,
+          previewId: wait.previewId,
           ...planActionFields(planAction),
         };
       }
@@ -2722,9 +2956,15 @@ function continuationForLoopResult(
         planRevision: result.plan.planRevision,
       };
     case 'answer':
-      return { kind: 'terminalProviderAnswer' };
+      return currentSessionWorkAuthorityV3(state)
+        ? readyToDriveOrFinalize(state, planAction)
+        : { kind: 'terminalProviderAnswer' };
     case 'noTool':
-      return { kind: 'terminalProviderStop' };
+      return currentSessionWorkAuthorityV3(state)
+        ? readyToDriveOrFinalize(state, planAction)
+        : { kind: 'terminalProviderStop' };
+    case 'finalAnswerFailed':
+      return continuationForFinalAnswerState(state);
     case 'admitted':
       {
         const context =
@@ -2836,6 +3076,7 @@ function continuationForStandaloneWait(
           waitKind: 'capabilityDecisionFact',
           operationId: wait.operationId,
           invocationId: wait.invocationId,
+          previewId: wait.previewId,
           ...planActionFields(planAction),
         }
       : {
@@ -3133,24 +3374,30 @@ function readyToDriveOrFinalize(
     return awaitingKernelFacts(state);
   }
   const plan = state.plan;
+  const workAuthority = currentSessionWorkAuthorityV3(state);
   const everyPlanActionSettled = plan?.actions.every((action) =>
     sessionKernelPlanActionSettledV2(
       state,
       action.manifest.planActionId
     )
   ) ?? false;
+  const workSettled = workAuthority?.kind === 'contextRead'
+    || (
+      workAuthority?.kind === 'plan'
+      && everyPlanActionSettled
+    );
   if (
-    plan
-    && everyPlanActionSettled
+    workAuthority
+    && workSettled
     && canFinalizeSessionKernelReviewV2(state)
   ) {
     return {
       kind: 'readyToFinalizeReview',
-      expectedPlanRevision: plan.planRevision,
+      workAuthority: cloneJson(workAuthority),
     };
   }
   if (context) return readyForPlanAction(state, context);
-  if (plan && everyPlanActionSettled) {
+  if (workAuthority && workSettled) {
     return {
       kind: 'awaitingKernelFacts',
       observedHighWater:
@@ -3371,7 +3618,7 @@ async function settleResponseFrameDurably(
   const readPath = [
     '/api/session-store',
     encodeURIComponent(response.sessionId),
-    'kernel-v2',
+    'kernel-v3',
     encodeURIComponent(response.runId),
     'records',
     encodeURIComponent(stored.recordId),
@@ -3513,6 +3760,24 @@ function productionBootstrapFingerprint(
     prefetchedRun: request.prefetchedRun,
     initialInput: request.initialInput,
   });
+}
+
+function requireProductionWorkAuthority(
+  state: SessionKernelLoopStateV2,
+  expectedWorkAuthority: SessionWorkAuthorityV3
+): void {
+  const current = currentSessionWorkAuthorityV3(state);
+  if (
+    !current
+    || !sameSessionWorkAuthorityV3(
+      current,
+      expectedWorkAuthority
+    )
+  ) {
+    throw new SessionKernelProductionBridgeError(
+      'session_kernel_production_work_authority_stale'
+    );
+  }
 }
 
 function requireProductionPlanRevision(

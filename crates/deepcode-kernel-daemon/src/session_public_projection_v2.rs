@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const PROJECTION_SCHEMA_V2: &str = "deepcode.shared-conversation-projection.v2";
 const WORK_SEGMENTS_SHAPE_V1: &str = "deepcode.shared-conversation.work-segments.v1";
@@ -48,6 +48,7 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<usize, String> 
     let allowed_root = HashSet::from([
         "schemaVersion",
         "shapeVersion",
+        "legacyPrefixTurnCount",
         "sessionId",
         "revision",
         "sourceEventVersion",
@@ -79,23 +80,27 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<usize, String> 
         .get("turns")
         .and_then(Value::as_array)
         .ok_or_else(|| "Session v2 public projection requires turns".to_string())?;
-    let legacy_prefix_len = turns
-        .iter()
-        .enumerate()
-        .filter_map(|(index, turn)| {
-            let mut probe = NativeProjectionIdentities::default();
-            validate_native_turn(turn, session_id, &mut probe)
-                .is_err()
-                .then_some(index + 1)
-        })
-        .last()
-        .unwrap_or(0);
+    let legacy_prefix_len = match object.get("legacyPrefixTurnCount") {
+        Some(value) => usize::try_from(required_safe_integer(
+            Some(value),
+            "projection.legacyPrefixTurnCount",
+        )?)
+        .map_err(|_| {
+            "Session v2 public projection legacy prefix exceeds this platform".to_string()
+        })?,
+        None => 0,
+    };
+    if legacy_prefix_len > turns.len() {
+        return Err(
+            "Session v2 public projection legacy prefix exceeds its turn count".to_string(),
+        );
+    }
     let mut identities = NativeProjectionIdentities::default();
     for (index, turn) in turns.iter().enumerate() {
         if index < legacy_prefix_len {
             validate_normalized_legacy_turn(turn, session_id, &mut identities)?;
         } else {
-            validate_native_turn(turn, session_id, &mut identities)?;
+            validate_native_turn(turn, session_id, index as u64, &mut identities)?;
         }
     }
     if let Some(task_projection) = object.get("taskProjection") {
@@ -105,7 +110,7 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<usize, String> 
         validate_interaction_projection(interaction_projection, &identities.block_ids)?;
     }
     if let Some(run_projection) = object.get("runProjection") {
-        validate_run_projection(run_projection, &identities.turn_ids)?;
+        validate_run_projection(run_projection, &identities)?;
     }
     if let Some(token_usage_projection) = object.get("tokenUsageProjection") {
         validate_token_usage_projection(token_usage_projection)?;
@@ -121,7 +126,9 @@ struct NativeProjectionIdentities<'a> {
     turn_ids: HashSet<&'a str>,
     block_ids: HashSet<&'a str>,
     work_segment_ids: HashSet<&'a str>,
+    work_segment_turn_ids: HashMap<&'a str, &'a str>,
     operation_ids: HashSet<&'a str>,
+    operation_segment_ids: HashMap<&'a str, &'a str>,
 }
 
 fn validate_normalized_legacy_turn<'a>(
@@ -224,6 +231,7 @@ fn validate_projection_identity(object: &Map<String, Value>) -> Result<(), Strin
 fn validate_native_turn<'a>(
     turn: &'a Value,
     session_id: &str,
+    expected_sequence: u64,
     identities: &mut NativeProjectionIdentities<'a>,
 ) -> Result<(), String> {
     let object = turn
@@ -250,7 +258,7 @@ fn validate_native_turn<'a>(
     if object.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Err("Session v2 public projection turn crosses Session identity".to_string());
     }
-    validate_optional_safe_integer(object.get("sequence"), "turn.sequence")?;
+    validate_native_turn_invariants(turn, expected_sequence)?;
     validate_timeline_status(object.get("status"), "turn.status")?;
     validate_optional_strings(object, &["startedAt", "completedAt"], "turn")?;
 
@@ -259,7 +267,12 @@ fn validate_native_turn<'a>(
         .and_then(Value::as_array)
         .ok_or_else(|| "Session v2 public projection turn requires blocks".to_string())?;
     let mut local_block_ids = HashSet::new();
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
+        if required_safe_integer(block.get("sequence"), "block.sequence")? != index as u64 {
+            return Err(
+                "Session v2 public projection native block sequence is inconsistent".to_string(),
+            );
+        }
         let block_id = validate_native_block(block)?;
         if !identities.block_ids.insert(block_id) || !local_block_ids.insert(block_id) {
             return Err(format!(
@@ -273,7 +286,13 @@ fn validate_native_turn<'a>(
         .and_then(Value::as_array)
         .ok_or_else(|| "Session v2 public projection turn requires workSegments".to_string())?;
     let mut local_work_segment_ids = HashSet::new();
-    for segment in work_segments {
+    for (index, segment) in work_segments.iter().enumerate() {
+        if required_safe_integer(segment.get("sequence"), "workSegment.sequence")? != index as u64 {
+            return Err(
+                "Session v2 public projection native work segment sequence is inconsistent"
+                    .to_string(),
+            );
+        }
         let segment_id = validate_work_segment(segment, identities)?;
         if !identities.work_segment_ids.insert(segment_id)
             || !local_work_segment_ids.insert(segment_id)
@@ -282,6 +301,7 @@ fn validate_native_turn<'a>(
                 "Session v2 public projection repeats work segment {segment_id}"
             ));
         }
+        identities.work_segment_turn_ids.insert(segment_id, turn_id);
     }
 
     validate_turn_parts(
@@ -289,6 +309,64 @@ fn validate_native_turn<'a>(
         &local_block_ids,
         &local_work_segment_ids,
     )
+}
+
+fn validate_native_turn_invariants(turn: &Value, expected_sequence: u64) -> Result<(), String> {
+    let object = turn
+        .as_object()
+        .ok_or_else(|| "Session v2 public projection turn must be an object".to_string())?;
+    if required_safe_integer(object.get("sequence"), "turn.sequence")? != expected_sequence {
+        return Err(
+            "Session v2 public projection native turn sequence is inconsistent".to_string(),
+        );
+    }
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let terminal = matches!(status, "completed" | "cancelled" | "failed");
+    let completed = object.get("completedAt").and_then(Value::as_str).is_some();
+    if terminal != completed {
+        return Err(
+            "Session v2 public projection native turn lifecycle is inconsistent".to_string(),
+        );
+    }
+    let blocks = object
+        .get("blocks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Session v2 public projection turn requires blocks".to_string())?;
+    for (index, block) in blocks.iter().enumerate() {
+        if required_safe_integer(block.get("sequence"), "block.sequence")? != index as u64 {
+            return Err(
+                "Session v2 public projection native block sequence is inconsistent".to_string(),
+            );
+        }
+    }
+    let work_segments = object
+        .get("workSegments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Session v2 public projection turn requires workSegments".to_string())?;
+    for (index, segment) in work_segments.iter().enumerate() {
+        if required_safe_integer(segment.get("sequence"), "workSegment.sequence")? != index as u64 {
+            return Err(
+                "Session v2 public projection native work segment sequence is inconsistent"
+                    .to_string(),
+            );
+        }
+        let lifecycle = segment
+            .get("lifecycle")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let active = lifecycle == "active";
+        let completed = segment.get("completedAt").and_then(Value::as_str).is_some();
+        if active == completed {
+            return Err(
+                "Session v2 public projection native work segment lifecycle is inconsistent"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_native_block(block: &Value) -> Result<&str, String> {
@@ -432,29 +510,57 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
         .get("entryRole")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let narrative_kind = object
+        .get("narrativeKind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let provider_phase = object.get("providerPhase").and_then(Value::as_str);
-    let role_is_valid = match kind {
-        "user" => entry_role == "userMessage",
-        "assistant" => matches!(entry_role, "agentUpdate" | "finalAnswer"),
-        "permission" | "plan" | "review" => entry_role == "interaction",
-        "error" => entry_role == "diagnostic",
+    let provenance = object.get("provenance").and_then(Value::as_object);
+    let provenance_origin = provenance
+        .and_then(|value| value.get("origin"))
+        .and_then(Value::as_str);
+    let provenance_authority = provenance
+        .and_then(|value| value.get("authority"))
+        .and_then(Value::as_str);
+    let semantics_are_valid = match kind {
+        "user" => {
+            narrative_kind == "user"
+                && entry_role == "userMessage"
+                && provider_phase.is_none()
+                && provenance_origin == Some("user")
+                && provenance_authority == Some("user")
+        }
+        "assistant" => {
+            narrative_kind == "assistantText"
+                && provenance_origin == Some("provider")
+                && provenance_authority == Some("session")
+                && match provider_phase {
+                    Some("commentary") => entry_role == "agentUpdate",
+                    Some("final_answer") => entry_role == "finalAnswer",
+                    None => matches!(entry_role, "agentUpdate" | "finalAnswer"),
+                    Some(_) => false,
+                }
+        }
+        "permission" => {
+            narrative_kind == "permission"
+                && entry_role == "interaction"
+                && provider_phase.is_none()
+        }
+        "plan" => {
+            narrative_kind == "plan" && entry_role == "interaction" && provider_phase.is_none()
+        }
+        "review" => {
+            narrative_kind == "review" && entry_role == "interaction" && provider_phase.is_none()
+        }
+        "error" => {
+            narrative_kind == "diagnostic" && entry_role == "diagnostic" && provider_phase.is_none()
+        }
         _ => false,
     };
-    if !role_is_valid {
+    if !semantics_are_valid {
         return Err(
-            "Session v2 public projection block kind and entryRole are inconsistent".to_string(),
+            "Session v2 public projection native block semantics are inconsistent".to_string(),
         );
-    }
-    match provider_phase {
-        Some("commentary") if kind == "assistant" && entry_role == "agentUpdate" => {}
-        Some("final_answer") if kind == "assistant" && entry_role == "finalAnswer" => {}
-        Some(_) => {
-            return Err(
-                "Session v2 public projection providerPhase conflicts with block semantics"
-                    .to_string(),
-            )
-        }
-        None => {}
     }
     if object.contains_key("attachments") && kind != "user" {
         return Err(
@@ -887,6 +993,9 @@ fn validate_work_segment<'a>(
                 "Session v2 public projection repeats operation {operation_id}"
             ));
         }
+        identities
+            .operation_segment_ids
+            .insert(operation_id, segment_id);
     }
     match object.get("attention") {
         Some(Value::Null) => {}
@@ -1449,7 +1558,10 @@ fn validate_workspace_projection(value: &Value) -> Result<(), String> {
     )
 }
 
-fn validate_run_projection(value: &Value, turn_ids: &HashSet<&str>) -> Result<(), String> {
+fn validate_run_projection(
+    value: &Value,
+    identities: &NativeProjectionIdentities<'_>,
+) -> Result<(), String> {
     let object = value
         .as_object()
         .ok_or_else(|| "Session v2 public runProjection must be an object".to_string())?;
@@ -1493,8 +1605,9 @@ fn validate_run_projection(value: &Value, turn_ids: &HashSet<&str>) -> Result<()
         "runProjection.phase",
     )?;
     validate_optional_strings(object, &["turnId", "taskId"], "runProjection")?;
-    if let Some(turn_id) = object.get("turnId").and_then(Value::as_str) {
-        if !turn_ids.contains(turn_id) {
+    let turn_id = object.get("turnId").and_then(Value::as_str);
+    if let Some(turn_id) = turn_id {
+        if !identities.turn_ids.contains(turn_id) {
             return Err(
                 "Session v2 public projection runProjection references a missing turn".to_string(),
             );
@@ -1506,7 +1619,36 @@ fn validate_run_projection(value: &Value, turn_ids: &HashSet<&str>) -> Result<()
     )?;
     match object.get("currentActivity") {
         Some(Value::Null) => {}
-        Some(activity) => validate_current_activity(activity)?,
+        Some(activity) => {
+            validate_current_activity(activity)?;
+            let activity = activity.as_object().expect("validated currentActivity");
+            let work_segment_id = activity.get("workSegmentId").and_then(Value::as_str);
+            if let Some(work_segment_id) = work_segment_id {
+                if turn_id.is_none()
+                    || identities
+                        .work_segment_turn_ids
+                        .get(work_segment_id)
+                        .copied()
+                        != turn_id
+                {
+                    return Err(
+                        "Session v2 public projection currentActivity references another turn work segment"
+                            .to_string(),
+                    );
+                }
+            }
+            if let Some(operation_id) = activity.get("operationId").and_then(Value::as_str) {
+                if work_segment_id.is_none()
+                    || identities.operation_segment_ids.get(operation_id).copied()
+                        != work_segment_id
+                {
+                    return Err(
+                        "Session v2 public projection currentActivity operation does not belong to its work segment"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         None => {
             return Err(
                 "Session v2 public projection runProjection requires currentActivity".to_string(),
@@ -1546,7 +1688,7 @@ fn validate_run_projection_semantics(object: &Map<String, Value>) -> Result<(), 
             }
         }
         "waitingUser" => {
-            if phase != "waiting" || wait_kind != Some("user") {
+            if phase != "waiting" || !activity_is_null || wait_kind != Some("user") {
                 return Err(
                     "Session v2 public projection waitingUser run state is inconsistent"
                         .to_string(),
@@ -1554,7 +1696,7 @@ fn validate_run_projection_semantics(object: &Map<String, Value>) -> Result<(), 
             }
         }
         "waitingExternal" => {
-            if phase != "waiting" || wait_kind != Some("external") {
+            if phase != "waiting" || !activity_is_null || wait_kind != Some("external") {
                 return Err(
                     "Session v2 public projection waitingExternal run state is inconsistent"
                         .to_string(),
@@ -1562,7 +1704,7 @@ fn validate_run_projection_semantics(object: &Map<String, Value>) -> Result<(), 
             }
         }
         "paused" => {
-            if phase != "waiting" || wait_kind != Some("paused") {
+            if phase != "waiting" || !activity_is_null || wait_kind != Some("paused") {
                 return Err(
                     "Session v2 public projection paused run state is inconsistent".to_string(),
                 );

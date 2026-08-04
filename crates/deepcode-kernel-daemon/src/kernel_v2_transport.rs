@@ -3,9 +3,11 @@ use crate::decision_capability_v2::{
     DecisionCapabilityGrantV2, DecisionCapabilityIssueErrorV2, DecisionCapabilityPermitV2,
     DecisionCapabilitySubjectV2,
 };
+use crate::host_v2_storage::HostV2StorageError;
 pub(crate) use crate::host_workspace_registry_v2::{
     HostWorkspaceBindingResolverV2, HostWorkspaceResolveErrorV2,
 };
+use crate::session_kernel_v2_store::SessionKernelV2Store;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
@@ -16,7 +18,8 @@ use deepcode_kernel_abi::v2::{
 };
 use deepcode_kernel_abi::v2_command::{
     decode_kernel_command_v2, CommandHandlingV2, KernelCommandEnvelopeV2,
-    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
+    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelReplyV2,
+    ToolContextGetReplyV2,
 };
 use deepcode_kernel_abi::{
     decode_user_decision_v2, CapabilityScopePreviewIdV2, KernelV2HttpErrorCode,
@@ -94,6 +97,7 @@ pub(crate) struct KernelV2TransportState {
     workspace_resolver: Arc<dyn HostWorkspaceBindingResolverV2>,
     settings_resolver: Arc<dyn HostRunSettingsResolverV2>,
     decision_authority: DecisionCapabilityAuthorityV2,
+    session_store: SessionKernelV2Store,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +110,7 @@ impl KernelV2TransportState {
         service: KernelSessionServiceV2,
         workspace_resolver: Arc<dyn HostWorkspaceBindingResolverV2>,
         settings_resolver: Arc<dyn HostRunSettingsResolverV2>,
+        session_store: SessionKernelV2Store,
     ) -> Result<Self, KernelV2TransportStartupError> {
         let decision_authority = DecisionCapabilityAuthorityV2::new()
             .map_err(|_| KernelV2TransportStartupError::DecisionCapabilityEntropyUnavailable)?;
@@ -114,6 +119,7 @@ impl KernelV2TransportState {
             workspace_resolver,
             settings_resolver,
             decision_authority,
+            session_store,
         })
     }
 
@@ -321,6 +327,48 @@ impl KernelV2TransportState {
         self.service.clone()
     }
 
+    pub(crate) fn handle_session_command(
+        &self,
+        envelope: KernelCommandEnvelopeV2,
+        transport_run_capability: &RunCapabilityV2,
+    ) -> Result<KernelCommandResponseEnvelopeV2, HostV2StorageError> {
+        let tool_context_run_id = match &envelope.command {
+            KernelCommandV2::ToolContextGet(command) => Some(command.run_id.to_string()),
+            _ => None,
+        };
+        let response = self
+            .service
+            .handle_session_command(envelope, transport_run_capability);
+        if let (
+            Some(run_id),
+            KernelCommandResponseEnvelopeV2::Correlated {
+                reply: KernelReplyV2::ToolContext(reply),
+                ..
+            },
+        ) = (&tool_context_run_id, &response)
+        {
+            match reply {
+                ToolContextGetReplyV2::Updated { tool_context } => {
+                    self.session_store
+                        .persist_tool_context_snapshot_for_capability(
+                            run_id,
+                            transport_run_capability,
+                            tool_context,
+                        )?;
+                }
+                ToolContextGetReplyV2::Current { context_ref } => {
+                    self.session_store
+                        .require_tool_context_snapshot_for_capability(
+                            run_id,
+                            transport_run_capability,
+                            context_ref,
+                        )?;
+                }
+            }
+        }
+        Ok(response)
+    }
+
     pub(crate) fn workspace_resolver(&self) -> Arc<dyn HostWorkspaceBindingResolverV2> {
         Arc::clone(&self.workspace_resolver)
     }
@@ -367,13 +415,18 @@ pub(crate) async fn kernel_v2_commands(
                     return http_error_response(StatusCode::UNAUTHORIZED, code, Some(request_id))
                 }
             };
-            let service = state.service.clone();
+            let transport = state.clone();
             let handled = tokio::task::spawn_blocking(move || {
-                service.handle_session_command(envelope, &transport_run_capability)
+                transport.handle_session_command(envelope, &transport_run_capability)
             })
             .await;
             match handled {
-                Ok(response) => no_store_json(StatusCode::OK, response, Some(request_id)),
+                Ok(Ok(response)) => no_store_json(StatusCode::OK, response, Some(request_id)),
+                Ok(Err(_)) => http_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KernelV2HttpErrorCode::ServiceUnavailable,
+                    Some(request_id),
+                ),
                 Err(_) => http_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     KernelV2HttpErrorCode::ServiceUnavailable,

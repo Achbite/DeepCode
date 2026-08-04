@@ -1,0 +1,642 @@
+import {
+  assertSharedConversationProjectionV2,
+  buildNarrativeTimelineProjection,
+  normalizeAgentTimelineSnapshot,
+  sessionKernelAgentEventV2,
+} from '../../dist/index.js';
+import {
+  consumeProviderSseV1,
+} from '../../dist/kernel-v2/providerStreamV1.js';
+
+import {
+  admittedReply,
+  assert,
+  createProviderCompletionReceipt,
+  openSessionHarness,
+  providerToolIntent,
+} from './harness.mjs';
+
+export const contractCases = [
+  {
+    id: 'shared_projection_native_and_legacy_shapes_are_explicit_and_ordered',
+    run: sharedProjectionNativeAndLegacyShapesAreExplicitAndOrdered,
+  },
+  {
+    id: 'work_segment_orders_commentary_tools_and_canonical_effects_without_lifecycle_cards',
+    run: workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecycleCards,
+  },
+  {
+    id: 'provider_composing_archives_before_publish_and_admits_zero_tools_on_stale_or_projection_failure',
+    run: providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOrProjectionFailure,
+  },
+];
+
+async function sharedProjectionNativeAndLegacyShapesAreExplicitAndOrdered() {
+  const sessionId = 'session-projection-shape-contract';
+  const runId = 'run-projection-shape-contract';
+  const events = [
+    publicProjectionEvent(sessionId, runId, 1, 'input.persisted', {
+      inputId: 'input-projection-shape',
+      text: 'Inspect the workspace.',
+      attachments: [],
+      controlEpoch: 1,
+    }),
+    publicProjectionEvent(sessionId, runId, 2, 'provider.completed', {
+      providerTurnId: 'provider-turn-projection-shape',
+      controlEpoch: 1,
+      outputKind: 'answer',
+      terminalScope: 'turn',
+      orderedItems: [
+        { kind: 'text', phase: 'final_answer', text: 'Inspection complete.' },
+      ],
+      result: { kind: 'answer', text: 'Inspection complete.' },
+      providerOutcome: providerOutcome(),
+    }),
+  ];
+  const native = buildNarrativeTimelineProjection({ sessionId, events });
+  assertSharedConversationProjectionV2(native);
+  assert.equal(native.legacyPrefixTurnCount, 0);
+  assert.equal(native.turns.length, 1);
+  assert.equal(native.turns[0].status, 'completed');
+  assert.deepEqual(
+    native.turns[0].parts,
+    native.turns[0].blocks.map((block) => ({
+      kind: 'block',
+      blockId: block.id,
+    }))
+  );
+
+  const flatV2 = clone(native);
+  delete flatV2.shapeVersion;
+  delete flatV2.legacyPrefixTurnCount;
+  for (const turn of flatV2.turns) {
+    delete turn.workSegments;
+    delete turn.parts;
+    turn.blocks.reverse();
+  }
+  assert.deepEqual(
+    flatV2.turns[0].blocks.map((block) => block.id),
+    [...native.turns[0].blocks].reverse().map((block) => block.id),
+    'legacy fixture must make array order differ from native sequence order'
+  );
+  const normalized = normalizeAgentTimelineSnapshot(flatV2);
+  assert.equal(normalized.compatibility, 'legacySettledNeutral');
+  assert.equal(
+    normalized.timeline.legacyPrefixTurnCount,
+    flatV2.turns.length
+  );
+  for (const [index, turn] of normalized.timeline.turns.entries()) {
+    assert.deepEqual(
+      turn.blocks,
+      flatV2.turns[index].blocks,
+      'settled flat-v2 blocks must retain their original array order and content'
+    );
+    assert.deepEqual(turn.workSegments, []);
+    assert.deepEqual(
+      turn.parts,
+      flatV2.turns[index].blocks.map((block) => ({
+        kind: 'block',
+        blockId: block.id,
+      }))
+    );
+    assert.equal(Object.hasOwn(turn, 'legacyGroup'), false);
+    assert.equal(Object.hasOwn(turn, 'legacy'), false);
+  }
+
+  const activeFlatV2 = clone(flatV2);
+  activeFlatV2.turns[0].status = 'running';
+  activeFlatV2.turns[0].completedAt = undefined;
+  activeFlatV2.runProjection.status = 'active';
+  activeFlatV2.runProjection.phase = 'executing';
+  assert.throws(
+    () => normalizeAgentTimelineSnapshot(activeFlatV2),
+    (error) => error?.code === 'UnsupportedHistorySchema'
+  );
+
+  const duplicatePart = clone(native);
+  duplicatePart.turns[0].parts.push(clone(duplicatePart.turns[0].parts[0]));
+  assert.throws(
+    () => assertSharedConversationProjectionV2(duplicatePart),
+    /session_projection_v2_part_invalid/u
+  );
+
+  const danglingPart = clone(native);
+  danglingPart.turns[0].parts[0] = {
+    kind: 'block',
+    blockId: 'missing-block-reference',
+  };
+  assert.throws(
+    () => assertSharedConversationProjectionV2(danglingPart),
+    /session_projection_v2_part_invalid/u
+  );
+
+  const missingPart = clone(native);
+  missingPart.turns[0].parts.pop();
+  assert.throws(
+    () => assertSharedConversationProjectionV2(missingPart),
+    /session_projection_v2_part_reference_incomplete/u
+  );
+}
+
+async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecycleCards() {
+  const sessionId = 'session-work-segment-contract';
+  const runId = 'run-work-segment-contract';
+  const providerTurnId = 'provider-turn-work-segment';
+  const events = [
+    publicProjectionEvent(sessionId, runId, 1, 'input.persisted', {
+      inputId: 'input-work-segment',
+      text: 'Read and update the workspace.',
+      attachments: [],
+      controlEpoch: 1,
+    }),
+    publicProjectionEvent(sessionId, runId, 2, 'provider.started', {
+      providerTurnId,
+      controlEpoch: 1,
+    }),
+    publicProjectionEvent(sessionId, runId, 3, 'wait.changed', null),
+    publicProjectionEvent(sessionId, runId, 4, 'provider.completed', {
+      providerTurnId,
+      controlEpoch: 1,
+      outputKind: 'toolIntent',
+      terminalScope: 'providerTurn',
+      orderedItems: [
+        { kind: 'text', phase: 'commentary', text: 'I will inspect the file.' },
+        {
+          kind: 'toolCall',
+          ordinal: 2,
+          callId: 'call-read',
+          toolName: 'fs.read',
+          toolId: 'fs.read',
+          operationId: 'operation-read',
+          status: 'completed',
+          invocationId: 'invocation-read',
+          terminalFactId: 'fact-read-completed',
+          terminalFactKind: 'toolCompleted',
+        },
+        { kind: 'text', phase: 'commentary', text: 'I will now update the file.' },
+        {
+          kind: 'toolCall',
+          ordinal: 4,
+          callId: 'call-write',
+          toolName: 'fs.write',
+          toolId: 'fs.write',
+          operationId: 'operation-write',
+          status: 'completed',
+          invocationId: 'invocation-write',
+          terminalFactId: 'fact-write-completed',
+          terminalFactKind: 'toolCompleted',
+        },
+      ],
+      providerOutcome: providerOutcome(),
+    }),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      5,
+      'kernelFacts.reconciled',
+      {
+        pageFactIds: [
+          'fact-read-completed',
+          'fact-write-completed',
+        ],
+        snapshotHighWater: 2,
+        operationFacts: [
+          canonicalOperationFact({
+            operationId: 'operation-read',
+            invocationId: 'invocation-read',
+            attemptId: 'attempt-read',
+            toolId: 'fs.read',
+            factId: 'fact-read-completed',
+            resourceId: 'resource-readme',
+            target: 'README.md',
+            effectId: 'effect-read',
+            canonicalAction: 'Read workspace file README.md',
+            effectSummary: 'Read one canonical workspace resource.',
+          }),
+          canonicalOperationFact({
+            operationId: 'operation-write',
+            invocationId: 'invocation-write',
+            attemptId: 'attempt-write',
+            toolId: 'fs.write',
+            factId: 'fact-write-completed',
+            resourceId: 'resource-output',
+            target: 'output.txt',
+            effectId: 'effect-write',
+            canonicalAction: 'Write workspace file output.txt',
+            effectSummary: 'Updated one canonical workspace resource.',
+          }),
+        ],
+      }
+    ),
+  ];
+  assert.throws(
+    () => publicProjectionEvent(
+      sessionId,
+      runId,
+      6,
+      'provider.completed',
+      {
+        providerTurnId: 'provider-turn-raw-arguments-rejected',
+        controlEpoch: 1,
+        outputKind: 'toolIntent',
+        terminalScope: 'providerTurn',
+        orderedItems: [{
+          kind: 'toolCall',
+          ordinal: 1,
+          callId: 'call-raw-arguments-rejected',
+          toolName: 'fs.read',
+          toolId: 'fs.read',
+          operationId: 'operation-raw-arguments-rejected',
+          status: 'pending',
+          rawArguments: { path: 'must-not-publish-provider-arguments.txt' },
+        }],
+        providerOutcome: providerOutcome(),
+      }
+    ),
+    (error) =>
+      error?.code === 'session_kernel_projection_provider_items_invalid'
+  );
+
+  const rawArgumentsSentinel =
+    'must-not-publish-tool-intent-arguments.txt';
+  const rawIntentEvent = publicProjectionEvent(
+    sessionId,
+    runId,
+    6,
+    'toolIntent.submitted',
+    {
+      requestId: 'request-raw-arguments-omitted',
+      operationId: 'operation-raw-arguments-omitted',
+      toolId: 'fs.read',
+      expectedControlEpoch: 1,
+      authorityKind: 'contextRead',
+      replyKind: 'admitted',
+      invocationId: 'invocation-raw-arguments-omitted',
+      rawArguments: { path: rawArgumentsSentinel },
+      target: rawArgumentsSentinel,
+      effectSummary: rawArgumentsSentinel,
+    }
+  );
+  const rawOmissionProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [events[0], rawIntentEvent],
+  });
+  assertSharedConversationProjectionV2(rawOmissionProjection);
+  const rawOmissionJson = JSON.stringify(rawOmissionProjection);
+  assert.equal(rawOmissionJson.includes('rawArguments'), false);
+  assert.equal(rawOmissionJson.includes(rawArgumentsSentinel), false);
+
+  const beforeFacts = buildNarrativeTimelineProjection({
+    sessionId,
+    events: events.slice(0, -1),
+  });
+  assertSharedConversationProjectionV2(beforeFacts);
+  const beforeFactOperations = Object.fromEntries(
+    beforeFacts.turns[0].workSegments.flatMap((segment) =>
+      segment.operations.map((operation) => [operation.operationId, operation])
+    )
+  );
+  for (const operationId of ['operation-read', 'operation-write']) {
+    const operation = beforeFactOperations[operationId];
+    assert.ok(operation, `missing pre-facts operation ${operationId}`);
+    assert.equal(Object.hasOwn(operation, 'canonicalAction'), false);
+    assert.equal(Object.hasOwn(operation, 'targets'), false);
+    assert.equal(Object.hasOwn(operation, 'effectSummary'), false);
+    assert.deepEqual(operation.resourceRefs, []);
+    assert.deepEqual(operation.effectRefs, []);
+  }
+
+  const projection = buildNarrativeTimelineProjection({ sessionId, events });
+  assertSharedConversationProjectionV2(projection);
+  const turn = projection.turns[0];
+  assert.equal(turn.workSegments.length, 2);
+  assert.deepEqual(
+    turn.parts,
+    [
+      { kind: 'block', blockId: turn.blocks[0].id },
+      { kind: 'block', blockId: turn.blocks[1].id },
+      {
+        kind: 'workSegment',
+        workSegmentId: turn.workSegments[0].id,
+      },
+      { kind: 'block', blockId: turn.blocks[2].id },
+      {
+        kind: 'workSegment',
+        workSegmentId: turn.workSegments[1].id,
+      },
+    ]
+  );
+  assert.deepEqual(
+    turn.workSegments.flatMap((segment) =>
+      segment.operations.map((operation) => operation.operationId)
+    ),
+    ['operation-read', 'operation-write']
+  );
+  const operations = Object.fromEntries(
+    turn.workSegments.flatMap((segment) =>
+      segment.operations.map((operation) => [operation.operationId, operation])
+    )
+  );
+  assert.equal(operations['operation-read'].canonicalAction,
+    'Read workspace file README.md');
+  assert.deepEqual(operations['operation-read'].targets, ['README.md']);
+  assert.deepEqual(operations['operation-read'].attempts, [{
+    attemptId: 'attempt-read',
+    status: 'completed',
+    startedAt: timestamp(5),
+    completedAt: timestamp(5),
+  }]);
+  assert.equal(operations['operation-write'].effectSummary,
+    'Updated one canonical workspace resource.');
+  assert.deepEqual(operations['operation-write'].effectRefs, ['effect-write']);
+  assert.equal(
+    turn.blocks.some((block) =>
+      block.provenance.sourceEventRefs.some((eventId) =>
+        eventId.includes('provider.started')
+        || eventId.includes('wait.changed')
+        || eventId.includes('kernelFacts.reconciled')
+      )
+    ),
+    false,
+    'replaceable lifecycle state and fact wakeups must not become history cards'
+  );
+  assert.equal(
+    JSON.stringify(projection).includes('rawArguments'),
+    false
+  );
+}
+
+async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOrProjectionFailure() {
+  const sessionId = 'session-provider-composing-contract';
+  const runId = 'run-provider-composing-contract';
+  const requestId = 'provider-turn-safe-publication';
+  const published = [];
+  const streamResult = await consumeProviderSseV1(
+    providerSseStream([
+      providerSseEvent('provider_metadata', {
+        type: 'provider_metadata',
+        requestId,
+        providerProfileId: 'provider-profile-v2-contract',
+        provider: 'contract-provider',
+        model: 'contract-model',
+      }),
+      providerSseEvent('provider_commentary_delta', {
+        type: 'provider_commentary_delta',
+        requestId,
+        chunk: {
+          type: 'delta',
+          content: 'Archived commentary.',
+          providerPhase: 'commentary',
+        },
+      }),
+      providerSseEvent('provider_delta', {
+        type: 'provider_delta',
+        requestId,
+        chunk: {
+          type: 'delta',
+          content: '  {"toolId":"fs.read"}',
+        },
+      }),
+      providerSseEvent('provider_final_delta', {
+        type: 'provider_final_delta',
+        requestId,
+        chunk: {
+          type: 'delta',
+          content: 'Final answer.',
+          providerPhase: 'final_answer',
+        },
+      }),
+      providerSseEvent('provider_terminal', {
+        type: 'provider_terminal',
+        requestId,
+        receipt: createProviderCompletionReceipt(
+          `sha256:${'a'.repeat(64)}`
+        ),
+      }),
+    ]),
+    requestId,
+    new AbortController().signal,
+    async (delta) => published.push(delta)
+  );
+  assert.deepEqual(published, [{
+    providerTurnId: requestId,
+    streamSequence: 1,
+    textOrdinal: 1,
+    providerPhase: 'commentary',
+    textDelta: 'Archived commentary.',
+  }]);
+  assert.deepEqual(
+    streamResult.items.map((item) => item.kind === 'text'
+      ? { phase: item.phase, text: item.text }
+      : { kind: item.kind }),
+    [
+      { phase: 'commentary', text: 'Archived commentary.' },
+      { phase: 'unknown', text: '  {"toolId":"fs.read"}' },
+      { phase: 'final_answer', text: 'Final answer.' },
+    ],
+    'final and tool-shaped unknown text stay private until the sealed terminal'
+  );
+  const input = publicProjectionEvent(
+    sessionId,
+    runId,
+    1,
+    'input.persisted',
+    {
+      inputId: 'input-provider-composing',
+      text: 'Explain before using tools.',
+      attachments: [],
+      controlEpoch: 1,
+    }
+  );
+  const first = publicProjectionEvent(
+    sessionId,
+    runId,
+    2,
+    'provider.composing',
+    {
+      providerTurnId: 'provider-turn-composing',
+      controlEpoch: 1,
+      streamSequence: 1,
+      textOrdinal: 1,
+      providerPhase: 'commentary',
+      textDelta: 'Inspecting ',
+    }
+  );
+  const second = publicProjectionEvent(
+    sessionId,
+    runId,
+    3,
+    'provider.composing',
+    {
+      providerTurnId: 'provider-turn-composing',
+      controlEpoch: 1,
+      streamSequence: 2,
+      textOrdinal: 1,
+      providerPhase: 'commentary',
+      textDelta: 'the workspace.',
+    }
+  );
+  assert.deepEqual(
+    Object.keys(first.payload).sort(),
+    [
+      'channel',
+      'content',
+      'controlEpoch',
+      'providerPhase',
+      'providerTurnId',
+      'projectionId',
+      'projectionKind',
+      'runId',
+      'schemaVersion',
+      'status',
+      'streamSequence',
+      'textOrdinal',
+      'visibility',
+    ].sort()
+  );
+  const composing = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [input, first, second],
+  });
+  assert.equal(composing.turns[0].blocks.length, 2);
+  assert.equal(
+    composing.turns[0].blocks[1].bodyMarkdown,
+    'Inspecting the workspace.'
+  );
+  assert.equal(composing.turns[0].blocks[1].entryRole, 'agentUpdate');
+  assert.equal(JSON.stringify(composing).includes('reasoning'), false);
+  assert.equal(JSON.stringify(composing).includes('rawProvider'), false);
+
+  const skippedSequence = publicProjectionEvent(
+    sessionId,
+    runId,
+    4,
+    'provider.composing',
+    {
+      providerTurnId: 'provider-turn-composing',
+      controlEpoch: 1,
+      streamSequence: 4,
+      textOrdinal: 1,
+      providerPhase: 'commentary',
+      textDelta: 'must fail',
+    }
+  );
+  assert.throws(
+    () => buildNarrativeTimelineProjection({
+      sessionId,
+      events: [input, first, skippedSequence],
+    }),
+    /session_projection_provider_composing_sequence_invalid/u
+  );
+
+  const stale = publicProjectionEvent(
+    sessionId,
+    runId,
+    5,
+    'provider.stale',
+    {
+      providerTurnId: 'provider-turn-composing',
+      controlEpoch: 1,
+    }
+  );
+  const staleProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [input, first, stale],
+  });
+  assert.equal(staleProjection.turns[0].workSegments.length, 0);
+
+  const harness = await openSessionHarness();
+  harness.enqueueProvider(providerToolIntent(
+    'fs.read',
+    { path: 'README.md' },
+    'provider-call-projection-failure'
+  ));
+  harness.enqueueKernel('submitToolIntent', (request) =>
+    admittedReply(harness, request));
+  const project = harness.ports.projection.project.bind(
+    harness.ports.projection
+  );
+  harness.ports.projection.project = async (event) => {
+    if (event.kind === 'provider.completed') {
+      throw new Error('controlled_projection_failure');
+    }
+    return project(event);
+  };
+  await assert.rejects(
+    harness.loop.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+    }),
+    /controlled_projection_failure/u
+  );
+  assert.equal(
+    harness.calls('submitToolIntent').length,
+    0,
+    'projection failure must stop before any Kernel tool admission'
+  );
+}
+
+function publicProjectionEvent(
+  sessionId,
+  runId,
+  sequence,
+  kind,
+  data
+) {
+  return sessionKernelAgentEventV2(sessionId, {
+    projectionId: `projection-${sequence}-${kind}`,
+    runId,
+    recordedAt: timestamp(sequence),
+    kind,
+    data,
+  });
+}
+
+function canonicalOperationFact(options) {
+  return {
+    operationId: options.operationId,
+    invocationId: options.invocationId,
+    attemptId: options.attemptId,
+    toolId: options.toolId,
+    factId: options.factId,
+    factKind: 'toolCompleted',
+    resourceIds: [options.resourceId],
+    targets: [options.target],
+    effectId: options.effectId,
+    canonicalAction: options.canonicalAction,
+    effectSummary: options.effectSummary,
+    recordedAt: timestamp(5),
+  };
+}
+
+function providerOutcome() {
+  return {
+    providerProfileId: 'provider-profile-v2-contract',
+    provider: 'contract-provider',
+    model: 'contract-model',
+  };
+}
+
+function providerSseEvent(name, data) {
+  return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function providerSseStream(frames) {
+  const bytes = new TextEncoder().encode(frames.join(''));
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+function timestamp(sequence) {
+  return new Date(
+    Date.parse('2026-07-29T01:00:00.000Z') + sequence * 1_000
+  ).toISOString();
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}

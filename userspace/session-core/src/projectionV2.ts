@@ -59,6 +59,8 @@ interface MutableTurn {
   workSegments: AgentTimelineWorkSegment[];
   parts: AgentTimelineTurnPart[];
   activeWorkSegmentId?: string;
+  providerStreamSequences: Map<string, number>;
+  terminalEvent?: AgentEvent;
 }
 
 interface ProjectionContext {
@@ -100,18 +102,26 @@ export function buildNarrativeTimelineProjection(
     const payload = recordValue(event.payload);
     const runId = stringValue(payload?.runId);
     const turn = projectionTurn(context, event, payload, runId);
+    const providerOutputProjected = projectProviderOutputIntoTurn(
+      turn,
+      event,
+      payload,
+      committedEventIds.has(event.id)
+    );
     projectWorkEventIntoTurn(
       turn,
       event,
       payload,
       committedEventIds.has(event.id)
     );
-    const block = projectionBlock(
-      event,
-      payload,
-      turn.blocks.length,
-      committedEventIds.has(event.id)
-    );
+    const block = providerOutputProjected
+      ? null
+      : projectionBlock(
+          event,
+          payload,
+          turn.blocks.length,
+          committedEventIds.has(event.id)
+        );
     if (block) {
       upsertTurnBlock(turn, block);
       updateTurnStatus(turn, event, payload, block);
@@ -121,10 +131,11 @@ export function buildNarrativeTimelineProjection(
     } else {
       updateTurnStatusFromEvent(turn, event, payload);
     }
+    settleProjectionLifecycle(turn, event, payload);
   }
 
   const interactionProjection = buildInteractionProjection(currentRunEvents);
-  const turns = convergeTerminalTurnBlocks(settleInteractionBlocks(
+  const turns = settleInteractionBlocks(
     context.turns
       .filter(
         (turn) =>
@@ -152,11 +163,12 @@ export function buildNarrativeTimelineProjection(
       })),
     input.events,
     interactionProjection?.pending
-  ));
+  );
   const events = [...input.events, ...auxiliaryEvents];
   const projection: AgentTimelineResult = {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
     shapeVersion: NARRATIVE_TIMELINE_SHAPE_VERSION,
+    legacyPrefixTurnCount: 0,
     sessionId: input.sessionId,
     revision: input.events.length,
     sourceEventVersion: input.events.length,
@@ -167,7 +179,11 @@ export function buildNarrativeTimelineProjection(
     eventCount: input.events.length,
     taskProjection: buildTaskProjection(currentRunEvents),
     interactionProjection,
-    runProjection: buildRunProjection(input.events),
+    runProjection: buildRunProjection(
+      input.events,
+      turns,
+      interactionProjection?.pending
+    ),
     tokenUsageProjection:
       buildTokenUsageProjection(input.events),
   };
@@ -227,40 +243,6 @@ function settleInteractionBlocks(
       };
     }),
   }));
-}
-
-function convergeTerminalTurnBlocks(
-  turns: AgentTimelineTurn[]
-): AgentTimelineTurn[] {
-  return turns.map((turn) => {
-    if (!terminalTimelineStatus(turn.status)) return turn;
-    return {
-      ...turn,
-      blocks: turn.blocks.map((block) => {
-        if (
-          terminalTimelineStatus(block.status)
-          || block.status === 'blocked'
-          || block.interaction?.state === 'open'
-        ) {
-          return block;
-        }
-        const status: AgentTimelineStatus =
-          block.kind === 'user' ? 'completed' : turn.status;
-        return {
-          ...block,
-          status,
-          ...(block.activity
-            ? {
-                activity: {
-                  ...block.activity,
-                  status,
-                },
-              }
-            : {}),
-        };
-      }),
-    };
-  });
 }
 
 function terminalTimelineStatus(status: AgentTimelineStatus): boolean {
@@ -394,6 +376,10 @@ function assertSharedConversationProjection(
     !recordValue(value)
     || value.schemaVersion !== NARRATIVE_TIMELINE_SCHEMA_VERSION
     || value.shapeVersion !== NARRATIVE_TIMELINE_SHAPE_VERSION
+    || (
+      value.legacyPrefixTurnCount !== undefined
+      && !nonnegativeInteger(value.legacyPrefixTurnCount)
+    )
     || !nonemptyString(value.sessionId)
     || !nonnegativeInteger(value.revision)
     || !nonnegativeInteger(value.sourceEventVersion)
@@ -427,6 +413,7 @@ function assertSharedConversationProjection(
   const rootKeys = new Set([
     'schemaVersion',
     'shapeVersion',
+    'legacyPrefixTurnCount',
     'sessionId',
     'revision',
     'sourceEventVersion',
@@ -442,11 +429,25 @@ function assertSharedConversationProjection(
   if (Object.keys(value).some((key) => !rootKeys.has(key))) {
     throw new Error('session_projection_v2_root_field_invalid');
   }
+  const legacyPrefixTurnCount = value.legacyPrefixTurnCount ?? 0;
+  if (
+    legacyPrefixTurnCount > value.turns.length
+    || (
+      validationMode === 'nativeWriter'
+      && legacyPrefixTurnCount !== 0
+    )
+  ) {
+    throw new Error('session_projection_v2_legacy_prefix_invalid');
+  }
   const turnIds = new Set<string>();
   const blockIds = new Set<string>();
   const workSegmentIds = new Set<string>();
   const operationIds = new Set<string>();
+  const workSegmentTurnIds = new Map<string, string>();
+  const operationSegmentIds = new Map<string, string>();
   for (const [turnIndex, turn] of value.turns.entries()) {
+    const normalizedLegacy = turnIndex < legacyPrefixTurnCount;
+    const strictNative = !normalizedLegacy;
     if (
       !recordValue(turn)
       || !nonemptyString(turn.id)
@@ -482,11 +483,15 @@ function assertSharedConversationProjection(
       )
       || containsPrivateProjectionData(turn)
       || (
-        validationMode === 'nativeWriter'
+        strictNative
         && (
           turn.sequence !== turnIndex
           || !validNativeTurnLifecycle(turn)
         )
+      )
+      || (
+        normalizedLegacy
+        && !validNormalizedLegacyTurnShape(turn)
       )
     ) {
       throw new Error('session_projection_v2_turn_invalid');
@@ -497,11 +502,11 @@ function assertSharedConversationProjection(
       if (
         !isSharedConversationBlockV2(
           block,
-          validationMode === 'nativeWriter'
+          strictNative
         )
         || blockIds.has(block.id)
         || (
-          validationMode === 'nativeWriter'
+          strictNative
           && block.sequence !== blockIndex
         )
       ) {
@@ -516,7 +521,7 @@ function assertSharedConversationProjection(
         !isSharedConversationWorkSegmentV1(segment)
         || workSegmentIds.has(segment.id)
         || (
-          validationMode === 'nativeWriter'
+          strictNative
           && segment.sequence !== segmentIndex
         )
       ) {
@@ -524,11 +529,13 @@ function assertSharedConversationProjection(
       }
       workSegmentIds.add(segment.id);
       localWorkSegmentIds.add(segment.id);
+      workSegmentTurnIds.set(segment.id, turn.id);
       for (const operation of segment.operations) {
         if (operationIds.has(operation.operationId)) {
           throw new Error('session_projection_v2_operation_duplicate');
         }
         operationIds.add(operation.operationId);
+        operationSegmentIds.set(operation.operationId, segment.id);
       }
     }
     const referencedBlocks = new Set<string>();
@@ -596,22 +603,48 @@ function assertSharedConversationProjection(
   ) {
     throw new Error('session_projection_v2_run_turn_reference_invalid');
   }
-  if (
-    value.runProjection?.currentActivity?.workSegmentId !== undefined
-    && !workSegmentIds.has(
-      value.runProjection.currentActivity.workSegmentId
-    )
-  ) {
-    throw new Error('session_projection_v2_activity_segment_reference_invalid');
+  const currentActivity = value.runProjection?.currentActivity;
+  if (currentActivity !== undefined && currentActivity !== null) {
+    const turnId = value.runProjection?.turnId;
+    const workSegmentId = currentActivity.workSegmentId;
+    const operationId = currentActivity.operationId;
+    if (
+      workSegmentId !== undefined
+      && (
+        turnId === undefined
+        || workSegmentTurnIds.get(workSegmentId) !== turnId
+      )
+    ) {
+      throw new Error('session_projection_v2_activity_segment_reference_invalid');
+    }
+    if (
+      operationId !== undefined
+      && (
+        workSegmentId === undefined
+        || operationSegmentIds.get(operationId) !== workSegmentId
+      )
+    ) {
+      throw new Error('session_projection_v2_activity_operation_reference_invalid');
+    }
   }
+}
+
+function validNormalizedLegacyTurnShape(
+  turn: AgentTimelineTurn
+): boolean {
   if (
-    value.runProjection?.currentActivity?.operationId !== undefined
-    && !operationIds.has(
-      value.runProjection.currentActivity.operationId
-    )
+    !terminalTimelineStatus(turn.status)
+    || !Array.isArray(turn.workSegments)
+    || turn.workSegments.length !== 0
+    || !Array.isArray(turn.parts)
+    || turn.parts.length !== turn.blocks.length
   ) {
-    throw new Error('session_projection_v2_activity_operation_reference_invalid');
+    return false;
   }
+  return turn.parts.every((part, index) =>
+    part.kind === 'block'
+    && part.blockId === turn.blocks[index]?.id
+  );
 }
 
 export function isSharedConversationProjectionV2(
@@ -1808,9 +1841,10 @@ function validTokenUsageProjection(value: unknown): boolean {
   ) {
     return false;
   }
+  const requestIds = new Set<string>();
   return requests.every((value) => {
     const request = recordValue(value);
-    return Boolean(
+    const valid = Boolean(
       request
       && Object.keys(request).every((key) => new Set([
         'requestId',
@@ -1844,6 +1878,11 @@ function validTokenUsageProjection(value: unknown): boolean {
       && stringArray(request.stages)
       && validTokenUsageTotals(request)
     );
+    if (!valid || !request) return false;
+    const requestId = request.requestId as string;
+    if (requestIds.has(requestId)) return false;
+    requestIds.add(requestId);
+    return true;
   });
 }
 
@@ -1983,6 +2022,8 @@ function createProjectionTurn(
       previousRunTurn.startedAt,
       event.ts
     );
+    previousRunTurn.terminalEvent = event;
+    settleTerminalTurnArtifacts(previousRunTurn, event);
   }
   const id = inputId
     ? `turn:${runKey}:input:${inputId}`
@@ -2001,6 +2042,7 @@ function createProjectionTurn(
     blocks: [],
     workSegments: [],
     parts: [],
+    providerStreamSequences: new Map(),
   };
   context.turns.push(turn);
   if (runId) context.turnsByRunId.set(runId, turn);
@@ -2035,6 +2077,478 @@ function upsertTurnBlock(
       turn.blocks[existingIndex]?.sequence
       ?? block.sequence,
   };
+}
+
+function projectProviderOutputIntoTurn(
+  turn: MutableTurn,
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined,
+  committed: boolean
+): boolean {
+  const projectionKind = stringValue(payload?.projectionKind);
+  const providerTurnId = stringValue(payload?.providerTurnId);
+  if (projectionKind === 'provider.composing') {
+    return projectProviderComposingIntoTurn(
+      turn,
+      event,
+      payload,
+      committed
+    );
+  }
+  const items = arrayRecords(payload?.orderedItems);
+  if (
+    !providerTurnId
+    || items.length === 0
+    || (
+      projectionKind !== 'provider.completed'
+      && projectionKind !== 'diagnostic'
+    )
+  ) {
+    return false;
+  }
+
+  const hasTools = items.some((item) => item.kind === 'toolCall');
+  const terminalScope = stringValue(payload?.terminalScope);
+  const textRoles = providerTextSettledRoles(
+    items,
+    hasTools,
+    stringValue(payload?.outputKind),
+    terminalScope
+  );
+  const desiredParts: AgentTimelineTurnPart[] = [];
+  const relatedBlockIds = new Set<string>();
+  const relatedSegmentIds = new Set<string>();
+  let providerGroupIndex = 0;
+  let activeProviderSegment: AgentTimelineWorkSegment | undefined;
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]!;
+    if (item.kind === 'text') {
+      const phase = stringValue(item.phase);
+      const text = textContentValue(item.text);
+      if (
+        !text
+        || (
+          phase !== 'commentary'
+          && phase !== 'final_answer'
+          && phase !== 'unknown'
+        )
+      ) {
+        continue;
+      }
+      const settledRole = textRoles.get(index) ?? 'commentary';
+      let combinedText = text;
+      let lastIndex = index;
+      let explicitPhase: 'commentary' | 'final_answer' | undefined =
+        phase === 'commentary'
+          ? 'commentary'
+          : phase === 'final_answer' && settledRole === 'finalAnswer'
+            ? 'final_answer'
+            : undefined;
+      if (settledRole === 'finalAnswer') {
+        while (lastIndex + 1 < items.length) {
+          const next = items[lastIndex + 1]!;
+          const nextPhase = stringValue(next.phase);
+          const nextText = textContentValue(next.text);
+          if (
+            next.kind !== 'text'
+            || !nextText
+            || textRoles.get(lastIndex + 1) !== 'finalAnswer'
+          ) {
+            break;
+          }
+          combinedText += nextText;
+          lastIndex += 1;
+          if (nextPhase !== explicitPhase) explicitPhase = undefined;
+        }
+      }
+      const textOrdinal = nonnegativeIntegerValue(item.textOrdinal)
+        ?? index + 1;
+      const blockId = [
+        'provider',
+        stringValue(payload?.runId) ?? 'run',
+        providerTurnId,
+        'text',
+        textOrdinal,
+      ].join(':');
+      const syntheticPayload: Record<string, unknown> = {
+        runId: payload?.runId,
+        providerTurnId,
+        projectionKind: 'provider.outputText',
+        outputKind: payload?.outputKind,
+        status: 'completed',
+        content: combinedText,
+        ...(terminalScope ? { terminalScope } : {}),
+        ...(explicitPhase ? { providerPhase: explicitPhase } : {}),
+      };
+      const syntheticEvent: AgentEvent = {
+        id: event.id,
+        sessionId: event.sessionId,
+        ts: event.ts,
+        kind: 'assistant_msg',
+        payload: syntheticPayload,
+      };
+      const block = projectionBlock(
+        syntheticEvent,
+        syntheticPayload,
+        turn.blocks.length,
+        committed
+      );
+      if (block) {
+        const existing = turn.blocks.find(
+          (candidate) => candidate.id === blockId
+        );
+        block.id = blockId;
+        block.revision = (existing?.revision ?? 0) + 1;
+        block.entryRole = settledRole === 'commentary'
+          ? 'agentUpdate'
+          : 'finalAnswer';
+        block.bodyMarkdown = combinedText;
+        block.summary = combinedText;
+        block.provenance.sourceEventRefs = appendUniqueStrings(
+          existing?.provenance.sourceEventRefs ?? [],
+          [event.id]
+        );
+        upsertTurnBlock(turn, block);
+        updateTurnStatus(
+          turn,
+          syntheticEvent,
+          syntheticPayload,
+          block
+        );
+        relatedBlockIds.add(blockId);
+        desiredParts.push({ kind: 'block', blockId });
+      }
+      if (settledRole === 'commentary') {
+        activeProviderSegment = undefined;
+        turn.activeWorkSegmentId = undefined;
+      }
+      index = lastIndex;
+      continue;
+    }
+
+    if (item.kind !== 'toolCall') continue;
+    const operationId = stringValue(item.operationId);
+    const toolId = stringValue(item.toolId);
+    if (!operationId || !toolId) continue;
+    if (!activeProviderSegment) {
+      providerGroupIndex += 1;
+      activeProviderSegment = providerWorkSegment(
+        turn,
+        providerTurnId,
+        providerGroupIndex,
+        event
+      );
+      relatedSegmentIds.add(activeProviderSegment.id);
+      desiredParts.push({
+        kind: 'workSegment',
+        workSegmentId: activeProviderSegment.id,
+      });
+    }
+    const operation = moveOrEnsureProviderOperation(
+      turn,
+      activeProviderSegment,
+      operationId,
+      toolId,
+      event.ts
+    );
+    const status = providerQueueOperationStatus(item);
+    if (
+      !terminalWorkOperationStatus(operation.status)
+      || operation.status === status
+    ) {
+      operation.status = status;
+    }
+    const invocationId = stringValue(item.invocationId);
+    if (invocationId) operation.invocationId = invocationId;
+    const terminalFactId = stringValue(item.terminalFactId);
+    if (terminalFactId) {
+      operation.factRefs = appendUniqueStrings(
+        operation.factRefs,
+        [terminalFactId]
+      );
+    }
+    if (terminalWorkOperationStatus(operation.status)) {
+      operation.completedAt = event.ts;
+    }
+    touchWorkSegment(
+      activeProviderSegment,
+      event,
+      terminalFactId ? [terminalFactId] : []
+    );
+    turn.activeWorkSegmentId = activeProviderSegment.id;
+  }
+
+  pruneEmptyWorkSegments(turn);
+  reorderProviderParts(
+    turn,
+    desiredParts,
+    relatedBlockIds,
+    relatedSegmentIds
+  );
+  return true;
+}
+
+function projectProviderComposingIntoTurn(
+  turn: MutableTurn,
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined,
+  committed: boolean
+): boolean {
+  const runId = stringValue(payload?.runId);
+  const providerTurnId = stringValue(payload?.providerTurnId);
+  const textOrdinal = nonnegativeIntegerValue(payload?.textOrdinal);
+  const streamSequence = nonnegativeIntegerValue(payload?.streamSequence);
+  const textDelta = textContentValue(payload?.content);
+  const providerPhase = stringValue(payload?.providerPhase);
+  const controlEpoch = nonnegativeIntegerValue(payload?.controlEpoch);
+  if (
+    !runId
+    || !providerTurnId
+    || textOrdinal === undefined
+    || textOrdinal === 0
+    || streamSequence === undefined
+    || streamSequence === 0
+    || controlEpoch === undefined
+    || controlEpoch === 0
+    || (
+      turn.controlEpoch !== undefined
+      && turn.controlEpoch !== controlEpoch
+    )
+    || textDelta === undefined
+    || (providerPhase !== undefined && providerPhase !== 'commentary')
+  ) {
+    throw new Error('session_projection_provider_composing_invalid');
+  }
+  const lastStreamSequence = turn.providerStreamSequences.get(
+    providerTurnId
+  );
+  if (
+    (lastStreamSequence === undefined && streamSequence !== 1)
+    || (
+      lastStreamSequence !== undefined
+      && streamSequence !== lastStreamSequence + 1
+    )
+  ) {
+    throw new Error('session_projection_provider_composing_sequence_invalid');
+  }
+  turn.providerStreamSequences.set(providerTurnId, streamSequence);
+  const blockId = [
+    'provider',
+    runId,
+    providerTurnId,
+    'text',
+    textOrdinal,
+  ].join(':');
+  const existing = turn.blocks.find(
+    (candidate) => candidate.id === blockId
+  );
+  const block = projectionBlock(
+    event,
+    payload,
+    turn.blocks.length,
+    committed
+  );
+  if (!block) {
+    throw new Error('session_projection_provider_composing_invalid');
+  }
+  block.id = blockId;
+  block.revision = (existing?.revision ?? 0) + 1;
+  block.entryRole = 'agentUpdate';
+  block.status = 'running';
+  block.bodyMarkdown = `${existing?.bodyMarkdown ?? ''}${textDelta}`;
+  block.summary = block.bodyMarkdown;
+  block.provenance.sourceEventRefs = appendUniqueStrings(
+    existing?.provenance.sourceEventRefs ?? [],
+    [event.id]
+  );
+  upsertTurnBlock(turn, block);
+  turn.status = 'running';
+  turn.completedAt = undefined;
+  turn.activeWorkSegmentId = undefined;
+  return true;
+}
+
+function providerTextSettledRoles(
+  items: Array<Record<string, unknown>>,
+  hasTools: boolean,
+  outputKind: string | undefined,
+  terminalScope: string | undefined
+): Map<number, 'commentary' | 'finalAnswer'> {
+  const roles = new Map<number, 'commentary' | 'finalAnswer'>();
+  items.forEach((item, index) => {
+    if (item.kind === 'text') roles.set(index, 'commentary');
+  });
+  if (
+    hasTools
+    || terminalScope !== 'turn'
+    || outputKind !== 'answer'
+  ) {
+    return roles;
+  }
+  const firstFinalIndex = items.findIndex(
+    (item) => item.kind === 'text' && item.phase === 'final_answer'
+  );
+  const lastCommentaryIndex = items.findLastIndex(
+    (item) => item.kind === 'text' && item.phase === 'commentary'
+  );
+  items.forEach((item, index) => {
+    if (
+      item.kind === 'text'
+      && (
+        firstFinalIndex >= 0
+          ? index >= firstFinalIndex
+          : index > lastCommentaryIndex && item.phase === 'unknown'
+      )
+    ) {
+      roles.set(index, 'finalAnswer');
+    }
+  });
+  return roles;
+}
+
+function providerWorkSegment(
+  turn: MutableTurn,
+  providerTurnId: string,
+  groupIndex: number,
+  event: AgentEvent
+): AgentTimelineWorkSegment {
+  const id = `work:${turn.id}:provider:${providerTurnId}:${groupIndex}`;
+  const existing = turn.workSegments.find((segment) => segment.id === id);
+  if (existing) return existing;
+  const segment: AgentTimelineWorkSegment = {
+    id,
+    revision: 1,
+    sequence: turn.workSegments.length,
+    lifecycle: 'active',
+    attention: null,
+    operations: [],
+    startedAt: event.ts,
+    provenance: {
+      origin: 'session',
+      authority: 'kernel',
+      sourceEventRefs: [event.id],
+      factRefs: [],
+      evidenceRefs: [],
+    },
+    factRefs: [],
+  };
+  turn.workSegments.push(segment);
+  turn.parts.push({ kind: 'workSegment', workSegmentId: id });
+  return segment;
+}
+
+function moveOrEnsureProviderOperation(
+  turn: MutableTurn,
+  target: AgentTimelineWorkSegment,
+  operationId: string,
+  toolId: string,
+  startedAt: string
+): AgentTimelineWorkOperation {
+  const source = turn.workSegments.find((segment) =>
+    segment.operations.some((operation) =>
+      operation.operationId === operationId
+    )
+  );
+  const existing = source?.operations.find((operation) =>
+    operation.operationId === operationId
+  );
+  if (!source || !existing || source === target) {
+    return ensureWorkOperation(
+      target,
+      operationId,
+      toolId,
+      startedAt,
+      'preparing'
+    );
+  }
+  source.operations = source.operations.filter((operation) =>
+    operation.operationId !== operationId
+  );
+  if (source.attention?.operationId === operationId) {
+    target.attention = source.attention;
+    source.attention = null;
+  }
+  target.operations.push(existing);
+  target.provenance.sourceEventRefs = appendUniqueStrings(
+    target.provenance.sourceEventRefs,
+    source.provenance.sourceEventRefs
+  );
+  target.provenance.factRefs = appendUniqueStrings(
+    target.provenance.factRefs,
+    existing.factRefs
+  );
+  target.factRefs = appendUniqueStrings(
+    target.factRefs,
+    existing.factRefs
+  );
+  return existing;
+}
+
+function providerQueueOperationStatus(
+  item: Record<string, unknown>
+): AgentTimelineWorkOperationStatus {
+  const status = stringValue(item.status);
+  if (status === 'pending') return 'preparing';
+  if (status === 'submitting') return 'queued';
+  if (status === 'awaitingCapability') return 'awaitingCapability';
+  if (status === 'awaitingInvocation') return 'running';
+  if (status === 'completed') return 'completed';
+  if (status === 'unexecuted') return 'unexecuted';
+  if (status !== 'aborted') return 'preparing';
+  const terminalFactKind = stringValue(item.terminalFactKind);
+  if (terminalFactKind) return workStatusForFactKind(terminalFactKind);
+  const reason = stringValue(item.settlementReason);
+  if (
+    reason === 'userInput'
+    || reason === 'runCancelled'
+    || reason === 'userRequested'
+  ) {
+    return 'cancelled';
+  }
+  if (reason === 'controlEpochSuperseded') return 'stale';
+  if (reason === 'indeterminate') return 'indeterminate';
+  return 'failed';
+}
+
+function pruneEmptyWorkSegments(turn: MutableTurn): void {
+  const removed = new Set(
+    turn.workSegments
+      .filter((segment) => segment.operations.length === 0)
+      .map((segment) => segment.id)
+  );
+  if (removed.size === 0) return;
+  turn.workSegments = turn.workSegments.filter(
+    (segment) => !removed.has(segment.id)
+  );
+  turn.parts = turn.parts.filter(
+    (part) =>
+      part.kind !== 'workSegment'
+      || !removed.has(part.workSegmentId)
+  );
+  if (
+    turn.activeWorkSegmentId
+    && removed.has(turn.activeWorkSegmentId)
+  ) {
+    turn.activeWorkSegmentId = undefined;
+  }
+}
+
+function reorderProviderParts(
+  turn: MutableTurn,
+  desired: AgentTimelineTurnPart[],
+  blockIds: Set<string>,
+  segmentIds: Set<string>
+): void {
+  if (desired.length === 0) return;
+  const related = (part: AgentTimelineTurnPart): boolean =>
+    part.kind === 'block'
+      ? blockIds.has(part.blockId)
+      : segmentIds.has(part.workSegmentId);
+  const anchor = turn.parts.findIndex(related);
+  const retained = turn.parts.filter((part) => !related(part));
+  retained.splice(anchor < 0 ? retained.length : anchor, 0, ...desired);
+  turn.parts = retained;
 }
 
 function projectWorkEventIntoTurn(
@@ -2279,28 +2793,26 @@ function applyAuthorizationDecisionToWork(
   payload: Record<string, unknown> | undefined
 ): void {
   const operationId = stringValue(payload?.operationId);
-  if (!operationId) return;
-  const segment = segmentForOperation(turn, operationId, event);
-  const operation = ensureWorkOperation(
-    segment,
-    operationId,
-    stringValue(payload?.toolId)
-      ?? stringValue(payload?.toolName)
-      ?? 'kernel.tool',
-    event.ts,
-    'awaitingCapability'
-  );
-  const factRefs = [
-    ...stringArrayValue(payload?.factIds),
-    ...(stringValue(payload?.factId)
-      ? [stringValue(payload?.factId)!]
-      : []),
-  ];
+  const factId = stringValue(payload?.factId);
+  const factKind = stringValue(payload?.factKind);
   const allowed =
-    stringValue(payload?.status) === 'allowed'
-    || stringValue(payload?.decision) === 'allow';
+    factKind === 'capabilityIssued'
+    || factKind === 'expansionAllowed';
+  const denied =
+    factKind === 'capabilityDenied'
+    || factKind === 'expansionDenied';
+  if (!operationId || !factId || (!allowed && !denied)) return;
+  const segment = turn.workSegments.find((candidate) =>
+    candidate.operations.some((operation) =>
+      operation.operationId === operationId
+    )
+  );
+  const operation = segment?.operations.find((candidate) =>
+    candidate.operationId === operationId
+  );
+  if (!segment || !operation) return;
+  const factRefs = [factId];
   if (allowed) {
-    operation.status = 'queued';
     if (segment.attention?.operationId === operationId) {
       segment.attention = {
         ...segment.attention,
@@ -2311,9 +2823,7 @@ function applyAuthorizationDecisionToWork(
         ),
       };
     }
-  } else {
-    operation.status = 'denied';
-    operation.completedAt = event.ts;
+  } else if (operation.status === 'denied') {
     segment.attention = workAttention(
       'denial',
       'resolved',
@@ -2519,20 +3029,16 @@ function rejectedOperationStatus(
   reason: string | undefined
 ): AgentTimelineWorkOperationStatus {
   if (
-    reason === 'capabilityDenied'
-    || reason === 'scopeDenied'
-    || reason === 'toolDisabled'
-  ) {
-    return 'denied';
-  }
-  if (
     reason === 'runBusy'
     || reason === 'capacityExceeded'
   ) {
     return 'queued';
   }
   if (reason === 'staleControlEpoch') return 'stale';
-  return 'failed';
+  if (reason === 'indeterminateRecoveryRequired') {
+    return 'indeterminate';
+  }
+  return 'unexecuted';
 }
 
 function workStatusForFactKind(
@@ -2541,6 +3047,8 @@ function workStatusForFactKind(
   if (
     factKind === 'toolIntentAdmitted'
     || factKind === 'toolAttemptPrepared'
+    || factKind === 'capabilityIssued'
+    || factKind === 'expansionAllowed'
   ) {
     return 'queued';
   }
@@ -2611,7 +3119,9 @@ function finalizeTurnWorkSegments(
         terminalWorkOperationStatus(operation.status)
       );
     let lifecycle: AgentTimelineWorkSegment['lifecycle'] =
-      allTerminal ? 'completed' : 'active';
+      segment.lifecycle === 'active'
+        ? allTerminal ? 'completed' : 'active'
+        : segment.lifecycle;
     if (
       allTerminal
       && operations.every((operation) =>
@@ -2814,19 +3324,18 @@ function updateTurnStatus(
   block: AgentTimelineBlock
 ): void {
   if (block.status === 'failed') {
-    if (
-      stringValue(payload?.operationId)
-      && payload?.terminalScope !== 'turn'
-    ) {
+    if (event.kind === 'error' && !wholeTurnErrorEvent(event, payload)) {
       return;
     }
     turn.status = 'failed';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
+    turn.terminalEvent = event;
     return;
   }
   if (block.status === 'cancelled') {
     turn.status = 'cancelled';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
+    turn.terminalEvent = event;
     return;
   }
   if (
@@ -2835,6 +3344,7 @@ function updateTurnStatus(
       payload?.providerPhase === 'final_answer'
       || (
         payload?.providerPhase !== 'commentary'
+        && stringValue(payload?.terminalScope) === 'turn'
         && stringValue(payload?.outputKind) === 'answer'
         && stringValue(payload?.status) === 'completed'
       )
@@ -2842,6 +3352,7 @@ function updateTurnStatus(
   ) {
     turn.status = 'completed';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
+    turn.terminalEvent = event;
     return;
   }
   if (
@@ -2865,15 +3376,10 @@ function updateTurnStatusFromEvent(
   event: AgentEvent,
   payload: Record<string, unknown> | undefined
 ): void {
-  if (event.kind === 'error' && eventStatus(event, payload) === 'failed') {
-    if (
-      stringValue(payload?.operationId)
-      && payload?.terminalScope !== 'turn'
-    ) {
-      return;
-    }
+  if (wholeTurnErrorEvent(event, payload)) {
     turn.status = 'failed';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
+    turn.terminalEvent = event;
     return;
   }
   if (event.kind !== 'session_run_state') return;
@@ -2882,11 +3388,13 @@ function updateTurnStatusFromEvent(
   if (projectionKind === 'run.cancelled' || status === 'cancelled') {
     turn.status = 'cancelled';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
+    turn.terminalEvent = event;
     return;
   }
   if (status === 'failed') {
     turn.status = 'failed';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
+    turn.terminalEvent = event;
     return;
   }
   if (status === 'waiting') {
@@ -2900,6 +3408,104 @@ function updateTurnStatusFromEvent(
   ) {
     turn.status = 'running';
     turn.completedAt = undefined;
+  }
+}
+
+function settleProjectionLifecycle(
+  turn: MutableTurn,
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): void {
+  if (stringValue(payload?.projectionKind) === 'provider.stale') {
+    const providerTurnId = stringValue(payload?.providerTurnId);
+    if (providerTurnId) {
+      settleProviderTurnArtifacts(turn, event, providerTurnId);
+    }
+  }
+  if (
+    terminalTimelineStatus(turn.status)
+    && turn.terminalEvent?.id === event.id
+  ) {
+    settleTerminalTurnArtifacts(turn, event);
+  }
+}
+
+function settleProviderTurnArtifacts(
+  turn: MutableTurn,
+  event: AgentEvent,
+  providerTurnId: string
+): void {
+  const runId = turn.runId ?? 'run';
+  const blockPrefix = `provider:${runId}:${providerTurnId}:text:`;
+  for (const block of turn.blocks) {
+    if (
+      !block.id.startsWith(blockPrefix)
+      || terminalTimelineStatus(block.status)
+    ) {
+      continue;
+    }
+    settleTimelineBlock(block, event, 'cancelled');
+  }
+  const segmentMarker = `:provider:${providerTurnId}:`;
+  for (const segment of turn.workSegments) {
+    if (
+      segment.lifecycle !== 'active'
+      || !segment.id.includes(segmentMarker)
+    ) {
+      continue;
+    }
+    segment.lifecycle = 'cancelled';
+    segment.completedAt = event.ts;
+    touchWorkSegment(segment, event, []);
+  }
+}
+
+function settleTerminalTurnArtifacts(
+  turn: MutableTurn,
+  event: AgentEvent
+): void {
+  if (!terminalTimelineStatus(turn.status)) return;
+  for (const block of turn.blocks) {
+    if (
+      terminalTimelineStatus(block.status)
+      || block.status === 'blocked'
+      || block.interaction?.state === 'open'
+    ) {
+      continue;
+    }
+    settleTimelineBlock(
+      block,
+      event,
+      block.kind === 'user' ? 'completed' : turn.status
+    );
+  }
+  if (turn.status === 'completed') return;
+  for (const segment of turn.workSegments) {
+    if (segment.lifecycle !== 'active') continue;
+    segment.lifecycle = turn.status === 'cancelled'
+      ? 'cancelled'
+      : 'failed';
+    segment.completedAt = event.ts;
+    touchWorkSegment(segment, event, []);
+  }
+}
+
+function settleTimelineBlock(
+  block: AgentTimelineBlock,
+  event: AgentEvent,
+  status: AgentTimelineStatus
+): void {
+  block.revision = (block.revision ?? 0) + 1;
+  block.status = status;
+  block.provenance.sourceEventRefs = appendUniqueStrings(
+    block.provenance.sourceEventRefs,
+    [event.id]
+  );
+  if (block.activity) {
+    block.activity = {
+      ...block.activity,
+      status,
+    };
   }
 }
 
@@ -2965,11 +3571,35 @@ function buildInteractionProjection(
   events: AgentEvent[]
 ): AgentTimelineInteractionProjection | undefined {
   let pending: NonNullable<AgentTimelineInteractionProjection['pending']> | undefined;
+  const terminalRunIds = new Set<string>();
   for (const event of events) {
     const payload = recordValue(event.payload);
-    const runId = stringValue(payload?.runId) ?? 'run';
-    if (event.kind === 'plan_card' && payload?.confirmable !== false) {
+    const explicitRunId = stringValue(payload?.runId);
+    const runId = explicitRunId ?? 'run';
+    if (
+      explicitRunId
+      && canonicalTerminalRunEvent(event, payload)
+    ) {
+      terminalRunIds.add(explicitRunId);
+      if (pendingInteractionRunId(pending) === explicitRunId) {
+        pending = undefined;
+      }
+      continue;
+    }
+    if (explicitRunId && terminalRunIds.has(explicitRunId)) {
+      continue;
+    }
+    if (event.kind === 'plan_card') {
       const planId = stringValue(payload?.planId) ?? event.id;
+      if (payload?.confirmable === false) {
+        if (
+          pending?.kind === 'plan'
+          && pending.runId === runId
+        ) {
+          pending = undefined;
+        }
+        continue;
+      }
       pending = {
         kind: 'plan',
         interactionId: `plan:${planId}`,
@@ -3013,7 +3643,52 @@ function buildInteractionProjection(
   return pending ? { pending } : undefined;
 }
 
-function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | undefined {
+function pendingInteractionRunId(
+  pending:
+    | NonNullable<AgentTimelineInteractionProjection['pending']>
+    | undefined
+): string | undefined {
+  return pending?.kind === 'plan'
+    ? pending.runId
+    : pending?.request.runId;
+}
+
+function canonicalTerminalRunEvent(
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): boolean {
+  if (wholeTurnErrorEvent(event, payload)) return true;
+  if (
+    event.kind === 'assistant_msg'
+    && (
+      payload?.providerPhase === 'final_answer'
+      || (
+        payload?.providerPhase !== 'commentary'
+        && stringValue(payload?.terminalScope) === 'turn'
+        && stringValue(payload?.outputKind) === 'answer'
+        && stringValue(payload?.status) === 'completed'
+      )
+    )
+  ) {
+    return true;
+  }
+  if (event.kind !== 'session_run_state') return false;
+  const status = stringValue(payload?.status);
+  return status === 'cancelled'
+    || status === 'failed'
+    || (
+      status === 'completed'
+      && stringValue(payload?.reason) !== 'waitCleared'
+    );
+}
+
+function buildRunProjection(
+  events: AgentEvent[],
+  turns: AgentTimelineTurn[],
+  pendingInteraction:
+    | NonNullable<AgentTimelineInteractionProjection['pending']>
+    | undefined
+): AgentTimelineRunProjection | undefined {
   const runId = latestExplicitRunId(events);
   if (!runId) return undefined;
 
@@ -3040,24 +3715,53 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
       wait = null;
     }
     const activityCode = activityCodeForEvent(event, payload);
-    if (activityCode) {
+    if (
+      activityCode
+      && status !== 'waitingUser'
+      && status !== 'waitingExternal'
+      && status !== 'paused'
+    ) {
       const summary = stringValue(payload?.summary);
       const operationId = stringValue(payload?.operationId);
+      const workSegmentId = stringValue(payload?.workSegmentId);
       currentActivity = {
         code: activityCode,
         ...(summary ? { summary } : {}),
         ...(operationId ? { operationId } : {}),
+        ...(workSegmentId ? { workSegmentId } : {}),
         updatedAt: event.ts,
       };
     }
-    if (event.kind === 'tool_call') phase = 'executing';
-    if (event.kind === 'tool_result') phase = 'validating';
+    const projectionKind = stringValue(payload?.projectionKind);
+    if (
+      projectionKind === 'provider.completed'
+      || projectionKind === 'provider.stale'
+    ) {
+      currentActivity = null;
+      if (
+        projectionKind === 'provider.completed'
+        && status !== 'waitingUser'
+        && status !== 'waitingExternal'
+        && status !== 'paused'
+      ) {
+        phase = 'validating';
+      }
+    }
+    if (
+      status !== 'waitingUser'
+      && status !== 'waitingExternal'
+      && status !== 'paused'
+    ) {
+      if (event.kind === 'tool_call') phase = 'executing';
+      if (event.kind === 'tool_result') phase = 'validating';
+    }
     if (
       event.kind === 'assistant_msg'
       && (
         payload?.providerPhase === 'final_answer'
         || (
-          payload?.providerPhase !== 'commentary'
+        payload?.providerPhase !== 'commentary'
+          && stringValue(payload?.terminalScope) === 'turn'
           && stringValue(payload?.outputKind) === 'answer'
           && stringValue(payload?.status) === 'completed'
         )
@@ -3069,8 +3773,7 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
       wait = null;
     }
     if (
-      event.kind === 'error'
-      && eventStatus(event, payload) === 'failed'
+      wholeTurnErrorEvent(event, payload)
     ) {
       status = 'failed';
       phase = 'settled';
@@ -3139,8 +3842,60 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
       }
     }
   }
+  const turn = turns.findLast((candidate) =>
+    candidate.id.startsWith(`turn:${runId}:`)
+  ) ?? turns.at(-1);
+  if (currentActivity?.operationId) {
+    const segment = turn?.workSegments.find((candidate) =>
+      candidate.operations.some((operation) =>
+        operation.operationId === currentActivity?.operationId
+      )
+    );
+    if (segment) {
+      currentActivity = {
+        ...currentActivity,
+        workSegmentId: segment.id,
+      };
+    } else {
+      const { operationId: _operationId, ...withoutOperation } =
+        currentActivity;
+      currentActivity = withoutOperation;
+    }
+  }
+  if (
+    currentActivity?.workSegmentId
+    && !turn?.workSegments.some((segment) =>
+      segment.id === currentActivity?.workSegmentId
+    )
+  ) {
+    const { workSegmentId: _workSegmentId, ...withoutSegment } =
+      currentActivity;
+    currentActivity = withoutSegment;
+  }
+  const pendingRunId = pendingInteraction?.kind === 'plan'
+    ? pendingInteraction.runId
+    : pendingInteraction?.request.runId;
+  if (
+    pendingInteraction
+    && pendingRunId === runId
+    && status !== 'succeeded'
+    && status !== 'failed'
+    && status !== 'cancelled'
+  ) {
+    status = 'waitingUser';
+    phase = 'waiting';
+    currentActivity = null;
+    wait = {
+      kind: 'user',
+      reason: pendingInteraction.kind === 'plan'
+        ? 'plan'
+        : 'scopeExpansion',
+      interactionId: pendingInteraction.interactionId,
+    };
+  }
   return {
     runId,
+    ...(turn ? { turnId: turn.id } : {}),
     revision: events.length,
     status,
     phase,
@@ -3151,6 +3906,18 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
       status: 'unavailable',
     },
   };
+}
+
+function wholeTurnErrorEvent(
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): boolean {
+  return event.kind === 'error'
+    && eventStatus(event, payload) === 'failed'
+    && (
+      !stringValue(payload?.operationId)
+      || payload?.terminalScope === 'turn'
+    );
 }
 
 function activityCodeForEvent(
@@ -3168,13 +3935,7 @@ function activityCodeForEvent(
   if (projectionKind === 'provider.reasoning') {
     return 'provider.reasoning';
   }
-  if (
-    projectionKind === 'provider.composing'
-    || (
-      projectionKind === 'provider.completed'
-      && event.kind !== 'assistant_msg'
-    )
-  ) {
+  if (projectionKind === 'provider.composing') {
     return 'provider.composing';
   }
   if (projectionKind === 'toolIntent.submitted') {
@@ -3227,6 +3988,13 @@ interface ProviderUsageCountersV2 {
   totalTokens: number;
 }
 
+interface ProviderUsageOutcomeV2 {
+  providerProfileId: string;
+  provider?: string;
+  model?: string;
+  usage: ProviderUsageCountersV2;
+}
+
 function buildTokenUsageProjection(
   events: AgentEvent[]
 ): AgentTimelineTokenUsageProjection | undefined {
@@ -3234,6 +4002,10 @@ function buildTokenUsageProjection(
   const providerStartByTurn = new Map<
     string,
     { event: AgentEvent; runId: string }
+  >();
+  const completedOutcomeByTurn = new Map<
+    string,
+    ProviderUsageOutcomeV2
   >();
   const requests: AgentTimelineTokenUsageProjection['requests'] = [];
 
@@ -3280,6 +4052,26 @@ function buildTokenUsageProjection(
       'model'
     );
     const usage = providerUsageCountersV2(outcome.usage);
+    const turnKey = providerUsageTurnKey(runId, providerTurnId);
+    const completedOutcome: ProviderUsageOutcomeV2 = {
+      providerProfileId,
+      provider,
+      model,
+      usage,
+    };
+    const previousOutcome = completedOutcomeByTurn.get(turnKey);
+    if (previousOutcome) {
+      if (!sameProviderUsageOutcomeV2(
+        previousOutcome,
+        completedOutcome
+      )) {
+        throw new Error(
+          'session_projection_v2_provider_outcome_conflict'
+        );
+      }
+      continue;
+    }
+    completedOutcomeByTurn.set(turnKey, completedOutcome);
     const providers = provider
       ? [provider]
       : [providerProfileId];
@@ -3350,6 +4142,23 @@ function buildTokenUsageProjection(
       )].sort(),
     },
   };
+}
+
+function sameProviderUsageOutcomeV2(
+  left: ProviderUsageOutcomeV2,
+  right: ProviderUsageOutcomeV2
+): boolean {
+  return left.providerProfileId === right.providerProfileId
+    && left.provider === right.provider
+    && left.model === right.model
+    && left.usage.promptCacheHitTokens
+      === right.usage.promptCacheHitTokens
+    && left.usage.promptCacheMissTokens
+      === right.usage.promptCacheMissTokens
+    && left.usage.cachedTokens === right.usage.cachedTokens
+    && left.usage.promptTokens === right.usage.promptTokens
+    && left.usage.completionTokens === right.usage.completionTokens
+    && left.usage.totalTokens === right.usage.totalTokens;
 }
 
 function providerUsageCountersV2(value: unknown): ProviderUsageCountersV2 {
@@ -4314,6 +5123,12 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0
     ? value.trim()
+    : undefined;
+}
+
+function textContentValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0
+    ? value
     : undefined;
 }
 

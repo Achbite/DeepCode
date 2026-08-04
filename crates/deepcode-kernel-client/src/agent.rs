@@ -245,6 +245,8 @@ fn validate_agent_input_attachments_v2(
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunStatus {
     pub run_id: String,
+    #[serde(default)]
+    pub kernel_run_id: Option<String>,
     pub session_id: String,
     pub profile_id: Option<String>,
     pub status: String,

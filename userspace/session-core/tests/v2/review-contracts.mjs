@@ -228,13 +228,39 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     (error) =>
       error?.code === 'session_kernel_review_not_finalizable'
   );
+  const responseAcceptedEvents = harness.store.projectionEvents.filter(
+    (event) =>
+      event.kind === 'provider.completed'
+      && event.data?.outputKind === 'toolIntent'
+      && event.data?.status === 'responseAccepted'
+  );
+  assert.equal(responseAcceptedEvents.length, 1);
+  assert.equal(responseAcceptedEvents[0].data.terminalScope,
+    'providerTurn');
   assert.equal(
-    harness.store.projectionEvents.some(
+    JSON.stringify(responseAcceptedEvents[0]).includes('"arguments"'),
+    false,
+    'the safe Provider response projection must omit raw arguments'
+  );
+  assert.equal(
+    JSON.stringify(responseAcceptedEvents[0]).includes('output.txt'),
+    false,
+    'the safe Provider response projection must not infer canonical targets'
+  );
+  assert.equal(
+    JSON.stringify(responseAcceptedEvents[0]).includes('terminalFactId'),
+    false,
+    'the safe Provider response projection must not manufacture terminal facts'
+  );
+  const completedQueueEvents = () =>
+    harness.store.projectionEvents.filter(
       (event) =>
         event.kind === 'provider.completed'
-        && event.data?.outputKind === 'toolIntent'
-    ),
-    false,
+        && event.data?.result?.kind === 'orderedToolCallsCompleted'
+    );
+  assert.equal(
+    completedQueueEvents().length,
+    0,
     'a submission reply cannot manufacture the queue outcome'
   );
 
@@ -261,6 +287,11 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   assert.equal(
     betweenCalls.providerToolCallQueue.calls[0].terminalFactId,
     firstCompleted.factId
+  );
+  assert.equal(
+    completedQueueEvents().length,
+    0,
+    'one canonical terminal fact cannot complete a two-call queue'
   );
   await assert.rejects(
     harness.loop.runProviderTurn({
@@ -312,15 +343,8 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     settled.providerToolCallQueue.calls[1].terminalFactId,
     secondCompleted.factId
   );
-  assert.equal(
-    harness.store.projectionEvents.some(
-      (event) =>
-        event.kind === 'provider.completed'
-        && event.data?.result?.kind === 'orderedToolCallsCompleted'
-        && event.data?.result?.callCount === 2
-    ),
-    true
-  );
+  assert.equal(completedQueueEvents().length, 1);
+  assert.equal(completedQueueEvents()[0].data.result.callCount, 2);
   harness.enqueueProvider(providerAnswer('continued after queue settlement'));
   const continued = await harness.loop.runProviderTurn({
     reason: 'planExecution',
@@ -685,13 +709,39 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
     loopPlan.planRevision
   );
   assert.equal(loopSecond.status, 'final');
-  assert.equal(loopSecond.revision, loopFirst.revision + 1);
+  assert.equal(loopSecond.revision, loopFirst.revision + 2);
   assert.equal(
     loopSecond.snapshotHighWater,
     harness.kernelState.snapshotHighWater,
     'finalizeReview must reconcile late facts before reusing a final Review'
   );
   assert.equal(loopSecond.cleanup.length, 1);
+  assert.deepEqual(
+    harness.store.projectionEvents
+      .filter((event) =>
+        event.kind === 'review.revised'
+        && event.data.snapshotHighWater === loopSecond.snapshotHighWater
+        && event.data.revision > loopFirst.revision
+      )
+      .map((event) => ({
+        revision: event.data.revision,
+        status: event.data.status,
+        snapshotHighWater: event.data.snapshotHighWater,
+      })),
+    [
+      {
+        revision: loopFirst.revision + 1,
+        status: 'draft',
+        snapshotHighWater: loopSecond.snapshotHighWater,
+      },
+      {
+        revision: loopFirst.revision + 2,
+        status: 'final',
+        snapshotHighWater: loopSecond.snapshotHighWater,
+      },
+    ],
+    'late facts must persist distinct draft and final Review revisions at one high-water'
+  );
 }
 
 async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {

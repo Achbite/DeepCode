@@ -4,8 +4,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::v2::{
-    field_too_large, invalid_value, typed_digest, validate_cross_language_safe_json_value_v2,
-    validate_cross_language_safe_u64_v2, validate_identity, ResourceAccessV2, V2ValidationError,
+    canonical_json_bytes_v2, field_too_large, invalid_value, typed_digest,
+    validate_cross_language_safe_json_value_v2, validate_cross_language_safe_u64_v2,
+    validate_identity, ResourceAccessV2, V2ValidationError,
 };
 
 pub const KERNEL_TOOL_REGISTRY_VERSION_V2: &str = "deepcode.kernel.tools.v2";
@@ -28,8 +29,10 @@ active capability and current tool availability, and records execution facts. \
 Never claim that a tool ran from narration alone. Treat an awaiting-capability, \
 denied, stale-context, failed, cancelled, or indeterminate result as non-success.";
 const KERNEL_TOOL_PROMPT_SECTION_V2: &str = "\n\n\
-Kernel-owned per-tool instructions follow in ascending ToolId order. Each \
-instruction is bound only to the ToolId shown.";
+Kernel-owned tool contracts follow in ascending ToolId order. Each canonical \
+InputSchema is available for planning, but only tools separately exposed by the \
+current Provider callable-tool channel may be invoked. A planning-only schema \
+does not grant authority or make its tool callable.";
 
 macro_rules! identity_type {
     ($name:ident, $field:literal) => {
@@ -529,6 +532,14 @@ pub fn render_kernel_tool_prompt_v2(
     for tool in tools {
         prompt.push_str("\n\nToolId: ");
         prompt.push_str(tool.tool_id.as_str());
+        prompt.push_str("\nDescription: ");
+        prompt.push_str(&tool.description);
+        prompt.push_str("\nInputSchema: ");
+        let schema = canonical_json_bytes_v2(tool.input_schema.as_value())?;
+        prompt.push_str(
+            std::str::from_utf8(&schema)
+                .map_err(|_| invalid_value("tool.inputSchema", "must encode as UTF-8"))?,
+        );
         prompt.push_str("\nInstruction: ");
         prompt.push_str(&tool.prompt_template);
     }

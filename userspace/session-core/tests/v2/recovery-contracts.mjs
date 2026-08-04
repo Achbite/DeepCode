@@ -8,25 +8,56 @@ import {
 } from '../../dist/index.js';
 
 import {
+  NOW,
   admittedReply,
   assert,
   awaitingCapabilityReply,
+  checkpointFromStateV3,
   createFactsPage,
   createCorpusToolContext,
+  createDurablePersistenceHarness,
+  createDurableRecordV3,
   createExpandedPreview,
+  createFailedProviderEvidence,
   createInitialState,
   createPlan,
   createSessionHarness,
+  createToolContextSnapshotRecordV3,
   corpusFact,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
   providerAnswer,
+  providerEvidenceRecordsV3,
   providerToolIntent,
   providerToolIntents,
   toolContextRef,
 } from './harness.mjs';
 
 export const contractCases = [
+  {
+    id: 'session_schema_accepts_only_current_v3_history',
+    run: sessionSchemaAcceptsOnlyCurrentV3History,
+  },
+  {
+    id: 'active_v3_compact_checkpoint_and_public_settlement_restore_only_committed_refs',
+    run: activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs,
+  },
+  {
+    id: 'completed_and_noncompleted_provider_terminal_recovery_never_reissues_unresolved_request',
+    run: completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnresolvedRequest,
+  },
+  {
+    id: 'historical_tool_context_snapshot_recovers_outcomes_across_refresh',
+    run: historicalToolContextSnapshotRecoversOutcomesAcrossRefresh,
+  },
+  {
+    id: 'missing_or_conflicting_tool_context_snapshot_fails_closed_without_current_bundle_fallback',
+    run: missingOrConflictingToolContextSnapshotFailsClosedWithoutCurrentBundleFallback,
+  },
+  {
+    id: 'frozen_review_final_answer_binding_budget_and_stale_reconciliation',
+    run: frozenReviewFinalAnswerBindingBudgetAndStaleReconciliation,
+  },
   {
     id: 'unknown_effect_outcome_replays_the_exact_identity_after_restart',
     run: unknownEffectOutcomeReplaysTheExactIdentityAfterRestart,
@@ -72,6 +103,624 @@ export const contractCases = [
     run: unsupportedCheckpointSchemaFailsClosed,
   },
 ];
+
+async function sessionSchemaAcceptsOnlyCurrentV3History() {
+  const current = createDurablePersistenceHarness();
+  assert.equal(
+    await current.persistence.loadCheckpoint(
+      current.initial.runId,
+      recoveryAuthority(current.initial)
+    ),
+    undefined
+  );
+  for (const historySchema of [
+    'deepcode.session.kernel-persistence.v2',
+    'deepcode.session.kernel-checkpoint.v2',
+    'deepcode.session.kernel-persistence.v1',
+  ]) {
+    assert.throws(
+      () => createDurablePersistenceHarness({ historySchema }),
+      (error) =>
+        error?.code === 'UnsupportedHistorySchema'
+        && error.observedSchema === historySchema
+    );
+  }
+
+  const invalidHeaderRecords = current.store.records.map((record) => {
+    if (record.recordKind !== 'storeHeader') return clone(record);
+    const invalid = clone(record);
+    invalid.data.schemaVersion = 'deepcode.session.kernel-persistence.v2';
+    return rehashDurableRecord(invalid);
+  });
+  const invalidHeader = createDurablePersistenceHarness({
+    sessionId: current.sessionId,
+    initial: current.initial,
+    records: invalidHeaderRecords,
+  });
+  await assert.rejects(
+    invalidHeader.persistence.loadCheckpoint(
+      current.initial.runId,
+      recoveryAuthority(current.initial)
+    ),
+    (error) => error?.code === 'UnsupportedHistorySchema'
+  );
+}
+
+async function activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs() {
+  const durable = createDurablePersistenceHarness({
+    sessionId: 'session-compact-settlement-contract',
+  });
+  const { initial, persistence, store } = durable;
+  await persistence.persistInput(initial.initialInput);
+  const request = {
+    requestId: 'request-compact-settlement',
+    lane: 'query',
+    intent: {
+      kind: 'toolContextGet',
+      payload: { knownContext: toolContextRef(initial.toolContext) },
+    },
+    startedAt: NOW,
+    attemptCount: 1,
+  };
+  await persistence.persistPublicRequest(request);
+  const state = createSessionKernelLoopStateV2(initial);
+  state.checkpointRevision = 1;
+  const checkpoint = checkpointFromStateV3(state);
+  const projection = {
+    projectionId: 'projection-compact-settlement-input',
+    runId: initial.runId,
+    recordedAt: NOW,
+    kind: 'input.persisted',
+    data: {
+      inputId: initial.initialInput.inputId,
+      text: initial.initialInput.text,
+      attachments: initial.initialInput.attachments,
+      controlEpoch: initial.controlEpoch,
+    },
+  };
+  await persistence.settlePublicRequest(
+    request,
+    sha256Hash(canonicalJson({ kind: 'currentToolContext' })),
+    checkpoint,
+    [projection]
+  );
+
+  const checkpointRecord = store.records.find(
+    (record) => record.recordKind === 'checkpoint'
+  );
+  const settlementRecord = store.records.find(
+    (record) => record.recordKind === 'publicRequestSettled'
+  );
+  assert(checkpointRecord);
+  assert(settlementRecord);
+  assert.equal(Object.hasOwn(checkpointRecord.data, 'state'), false);
+  assert.deepEqual(checkpointRecord.data.commitScope, {
+    kind: 'publicRequestSettlement',
+    requestId: request.requestId,
+    requestDigest: sha256Hash(canonicalJson({
+      requestId: request.requestId,
+      lane: request.lane,
+      intent: request.intent,
+    })),
+    outcomeDigest: sha256Hash(canonicalJson({
+      kind: 'currentToolContext',
+    })),
+  });
+  assert.equal(
+    containsObjectKey(checkpointRecord.data, 'providerOutcomes'),
+    false
+  );
+  assert.equal(
+    containsObjectKey(checkpointRecord.data, 'physicalRequestCount'),
+    false
+  );
+  assert.equal(containsObjectKey(checkpointRecord.data, 'finalText'), false);
+  assert.deepEqual(
+    settlementRecord.data.checkpointRef,
+    {
+      recordId: checkpointRecord.recordId,
+      recordDigest: checkpointRecord.recordDigest,
+    }
+  );
+  assert.equal(settlementRecord.data.projectionRefs.length, 1);
+  const projectionRecord = store.records.find(
+    (record) => record.recordKind === 'projection'
+  );
+  assert(projectionRecord);
+  assert.deepEqual(settlementRecord.data.projectionRefs, [{
+    recordId: projectionRecord.recordId,
+    recordDigest: projectionRecord.recordDigest,
+  }]);
+
+  const recovered = await persistence.loadCheckpoint(
+    initial.runId,
+    recoveryAuthority(initial)
+  );
+  assert.equal(recovered.checkpointRevision, 1);
+  assert.equal(recovered.state.currentInputId, initial.initialInput.inputId);
+  assert.deepEqual(
+    await persistence.loadPendingPublicRequests(initial.runId),
+    []
+  );
+
+  const withoutCommitMarker = createDurablePersistenceHarness({
+    sessionId: durable.sessionId,
+    initial,
+    records: store.records.filter(
+      (record) => record.recordKind !== 'publicRequestSettled'
+    ),
+  });
+  assert.equal(
+    await withoutCommitMarker.persistence.loadCheckpoint(
+      initial.runId,
+      recoveryAuthority(initial)
+    ),
+    undefined,
+    'orphan settlement checkpoint refs must not become committed state'
+  );
+}
+
+async function completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnresolvedRequest() {
+  const completed = await createCompletedProviderDurableHistory(
+    'session-completed-terminal-recovery'
+  );
+  const beforeCompletedRecovery = completed.store.records.length;
+  const restoredCompleted = await completed.persistence.loadCheckpoint(
+    completed.initial.runId,
+    recoveryAuthority(completed.initial)
+  );
+  assert.equal(restoredCompleted.state.providerOutcomes.length, 1);
+  assert.equal(
+    restoredCompleted.state.providerOutcomes[0].summary,
+    'durably recovered answer'
+  );
+  assert.equal(
+    completed.store.records.length,
+    beforeCompletedRecovery,
+    'completed terminal recovery must be read-only and never reissue Provider'
+  );
+
+  const completedTool = await createCompletedToolProviderDurableHistory(
+    'session-completed-tool-terminal-recovery'
+  );
+  const restartedTool = createSessionHarness({
+    initial: completedTool.initial,
+    kernelState: completedTool.live.kernelState,
+  });
+  restartedTool.ports.persistence = completedTool.persistence;
+  await restartedTool.open();
+  assert.equal(restartedTool.loop.snapshot().plan.planRevision,
+    'plan-revision-1');
+  assert.equal(restartedTool.loop.snapshot().providerToolCallQueue.status,
+    'completed');
+  assert.equal(restartedTool.loop.snapshot().providerOutcomes[0].outputKind,
+    'toolIntent');
+  assert.equal(restartedTool.store.providerRequestCount, 0);
+  assert.equal(restartedTool.calls('submitToolIntent').length, 0);
+
+  for (const terminal of [
+    {
+      terminalKind: 'failed',
+      reasonCode: 'provider_permanent_no_mutation',
+      expectedStatus: 'failed',
+    },
+    {
+      terminalKind: 'cancelled',
+      reasonCode: 'provider_cancelled',
+      expectedStatus: 'cancelled',
+    },
+    {
+      terminalKind: 'limitExceeded',
+      reasonCode: 'provider_trace_raw_limit_exceeded',
+      expectedStatus: 'failed',
+    },
+  ]) {
+    const noncompleted = await createNoncompletedProviderHistory(terminal);
+    const restarted = createSessionHarness({ initial: noncompleted.initial });
+    restarted.ports.persistence = noncompleted.persistence;
+    await restarted.open();
+    assert.equal(
+      restarted.loop.snapshot().providerTurn.status,
+      terminal.expectedStatus
+    );
+    assert.equal(restarted.loop.snapshot().providerOutcomes.length, 0);
+    assert.equal(restarted.store.providerRequestCount, 0);
+    assert.equal(restarted.calls('submitToolIntent').length, 0);
+  }
+
+  const unresolved = await createUnresolvedProviderHistory();
+  const restartedUnresolved = createSessionHarness({
+    initial: unresolved.initial,
+  });
+  restartedUnresolved.ports.persistence = unresolved.persistence;
+  await assert.rejects(
+    restartedUnresolved.open(),
+    (error) =>
+      error?.code === 'session_kernel_provider_dispatch_unresolved'
+  );
+  assert.equal(
+    unresolved.store.appended.length,
+    0,
+    'unresolved dispatch recovery must not append or resend anything'
+  );
+  assert.equal(restartedUnresolved.store.providerRequestCount, 0);
+  assert.equal(restartedUnresolved.calls('submitToolIntent').length, 0);
+}
+
+async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
+  const durable = await createCompletedToolProviderDurableHistory(
+    'session-historical-context-recovery'
+  );
+  const refreshed = createCorpusToolContext();
+  durable.store.seedDaemonRecord(
+    createToolContextSnapshotRecordV3(
+      durable.sessionId,
+      durable.initial.runId,
+      refreshed,
+      '2026-07-29T00:00:10.000Z'
+    )
+  );
+  const state = clone(durable.completedState);
+  state.checkpointRevision = 2;
+  state.toolContext = {
+    bundle: refreshed,
+    refreshRequired: false,
+  };
+  state.providerTurn = undefined;
+  state.providerToolCallQueue = undefined;
+  await durable.persistence.persistCheckpoint(
+    checkpointFromStateV3(state, '2026-07-29T00:00:11.000Z')
+  );
+
+  const restored = await durable.persistence.loadCheckpoint(
+    durable.initial.runId,
+    recoveryAuthority(durable.initial)
+  );
+  assert.deepEqual(
+    toolContextRef(restored.state.toolContext.bundle),
+    toolContextRef(refreshed)
+  );
+  assert.equal(restored.state.providerOutcomes.length, 1);
+  assert.equal(restored.state.providerOutcomes[0].outputKind, 'toolIntent');
+  assert.equal(
+    restored.state.providerOutcomes[0].toolCallReceipt.calls[0].toolId,
+    'fs.write'
+  );
+  assert.equal(
+    refreshed.tools.some((tool) => tool.toolId === 'fs.write'),
+    false,
+    'the current refreshed ToolContext intentionally cannot decode old fs.write'
+  );
+  assert.equal(
+    restored.state.providerOutcomes[0].summary,
+    'Completed 1 ordered Provider tool call(s).'
+  );
+  const originalReservation = durable.store.records
+    .find((record) =>
+      record.recordKind === 'checkpoint'
+      && record.data.checkpointRevision === 1
+    ).data.active.providerReservation;
+  assert.deepEqual(
+    originalReservation.contextRef,
+    toolContextRef(durable.initial.toolContext),
+    'historical outcome must retain the ToolContext bound at dispatch'
+  );
+}
+
+async function missingOrConflictingToolContextSnapshotFailsClosedWithoutCurrentBundleFallback() {
+  const durable = await createCompletedToolProviderDurableHistory(
+    'session-missing-context-recovery'
+  );
+  const refreshed = createCorpusToolContext();
+  durable.store.seedDaemonRecord(
+    createToolContextSnapshotRecordV3(
+      durable.sessionId,
+      durable.initial.runId,
+      refreshed,
+      '2026-07-29T00:00:20.000Z'
+    )
+  );
+  const state = clone(durable.completedState);
+  state.checkpointRevision = 2;
+  state.toolContext = { bundle: refreshed, refreshRequired: false };
+  state.providerTurn = undefined;
+  state.providerToolCallQueue = undefined;
+  await durable.persistence.persistCheckpoint(
+    checkpointFromStateV3(state, '2026-07-29T00:00:21.000Z')
+  );
+  const originalRef = toolContextRef(durable.initial.toolContext);
+  const refreshedRef = toolContextRef(refreshed);
+  const originalSnapshotId =
+    `session-kernel-v3:${durable.initial.runId}:tool-context:${originalRef.contextDigest}`;
+  const refreshedSnapshotId =
+    `session-kernel-v3:${durable.initial.runId}:tool-context:${refreshedRef.contextDigest}`;
+  const scenarios = [
+    {
+      label: 'missing RunOpen snapshot',
+      records: durable.store.records.filter(
+        (record) => record.recordId !== originalSnapshotId
+      ),
+    },
+    {
+      label: 'missing current snapshot',
+      records: durable.store.records.filter(
+        (record) => record.recordId !== refreshedSnapshotId
+      ),
+    },
+    {
+      label: 'snapshot record digest mismatch',
+      records: durable.store.records.map((record) => {
+        if (record.recordId !== refreshedSnapshotId) return clone(record);
+        const conflicting = clone(record);
+        conflicting.data.toolContext.tools[0].description =
+          'conflicting historical descriptor';
+        return conflicting;
+      }),
+    },
+    {
+      label: 'snapshot schema mismatch',
+      records: mutateDurableRecord(
+        durable.store.records,
+        refreshedSnapshotId,
+        (record) => {
+          record.data.schemaVersion =
+            'deepcode.session.tool-context-snapshot.v2';
+        }
+      ),
+    },
+    {
+      label: 'snapshot context digest ref mismatch',
+      records: mutateDurableRecord(
+        durable.store.records,
+        refreshedSnapshotId,
+        (record) => {
+          record.data.contextRef.contextDigest = `sha256:${'1'.repeat(64)}`;
+        }
+      ),
+    },
+    {
+      label: 'snapshot catalog ref mismatch',
+      records: mutateDurableRecord(
+        durable.store.records,
+        refreshedSnapshotId,
+        (record) => {
+          record.data.contextRef.catalogDigest = `sha256:${'2'.repeat(64)}`;
+        }
+      ),
+    },
+    {
+      label: 'snapshot context version ref mismatch',
+      records: mutateDurableRecord(
+        durable.store.records,
+        refreshedSnapshotId,
+        (record) => {
+          record.data.contextRef.contextVersion += 1;
+        }
+      ),
+    },
+    {
+      label: 'snapshot bundle digest mismatch',
+      records: mutateDurableRecord(
+        durable.store.records,
+        refreshedSnapshotId,
+        (record) => {
+          record.data.toolContext.tools[0].description =
+            'conflicting historical descriptor';
+        }
+      ),
+    },
+  ];
+  for (const scenario of scenarios) {
+    const rejected = createDurablePersistenceHarness({
+      sessionId: durable.sessionId,
+      initial: durable.initial,
+      records: scenario.records,
+    });
+    await assert.rejects(
+      rejected.persistence.loadCheckpoint(
+        durable.initial.runId,
+        recoveryAuthority(durable.initial)
+      ),
+      (error) => error?.code === 'UnsupportedHistorySchema',
+      scenario.label
+    );
+    assert.equal(rejected.store.appended.length, 0);
+    const recovery = createSessionHarness({ initial: durable.initial });
+    recovery.ports.persistence = rejected.persistence;
+    await assert.rejects(
+      recovery.open(),
+      (error) => error?.code === 'UnsupportedHistorySchema',
+      `${scenario.label} must fail before Session starts Provider or tools`
+    );
+    assert.equal(recovery.store.providerRequestCount, 0);
+    assert.equal(recovery.calls('submitToolIntent').length, 0);
+  }
+}
+
+async function frozenReviewFinalAnswerBindingBudgetAndStaleReconciliation() {
+  const committed = await prepareFinalAnswerHarness();
+  const binding = clone(committed.loop.snapshot().finalAnswer.binding);
+  const toolSubmissions = committed.calls('submitToolIntent').length;
+  committed.enqueueProvider(providerAnswer('Frozen Review final answer.'));
+  const final = await committed.loop.runProviderTurn({
+    reason: 'finalAnswer',
+    target: { kind: 'finalAnswer', ...binding },
+  });
+  assert.deepEqual(final, {
+    kind: 'answer',
+    text: 'Frozen Review final answer.',
+  });
+  assert.equal(committed.loop.snapshot().finalAnswer.status, 'committed');
+  assert.equal(committed.loop.snapshot().finalAnswer.physicalRequestCount, 1);
+  assert.deepEqual(
+    committed.loop.snapshot().finalAnswer.binding,
+    binding
+  );
+
+  const drifting = await prepareFinalAnswerHarness();
+  const staleBinding = clone(drifting.loop.snapshot().finalAnswer.binding);
+  const driftToolSubmissions = drifting.calls('submitToolIntent').length;
+  drifting.enqueueProvider(async () => {
+    drifting.appendFacts(corpusFact('cleanupCompleted', {
+      factId: 'fact-final-answer-inflight-drift',
+      ledgerSequence: drifting.nextFactSequence(),
+      runSequence: drifting.nextRunSequence(),
+      identities: {
+        runId: drifting.initial.runId,
+        operationId: drifting.loop.snapshot().plan.actions[0]
+          .manifest.operationId,
+      },
+    }));
+    return providerAnswer('Stale final answer must not commit.');
+  });
+  drifting.enqueueProvider(providerAnswer('Reconciled final answer.'));
+  const reconciledFinal = await drifting.loop.runProviderTurn({
+    reason: 'finalAnswer',
+    target: { kind: 'finalAnswer', ...staleBinding },
+  });
+  assert.deepEqual(reconciledFinal, {
+    kind: 'answer',
+    text: 'Reconciled final answer.',
+  });
+  assert.equal(
+    drifting.loop.snapshot().finalAnswer.binding.snapshotHighWater
+      > staleBinding.snapshotHighWater,
+    true
+  );
+  assert.equal(
+    drifting.loop.snapshot().finalAnswer.finalText,
+    'Reconciled final answer.'
+  );
+  assert.equal(
+    drifting.calls('submitToolIntent').length,
+    driftToolSubmissions,
+    'in-flight facts drift must not rerun the already completed tool'
+  );
+
+  committed.appendFacts(corpusFact('cleanupCompleted', {
+    factId: 'fact-final-answer-postcommit-drift',
+    ledgerSequence: committed.nextFactSequence(),
+    runSequence: committed.nextRunSequence(),
+    identities: {
+      runId: committed.initial.runId,
+      operationId: committed.loop.snapshot().plan.actions[0]
+        .manifest.operationId,
+    },
+  }));
+  await committed.loop.reconcileFacts(binding.snapshotHighWater);
+  assert.equal(committed.loop.snapshot().finalAnswer.status, 'stale');
+  assert.equal(
+    committed.calls('submitToolIntent').length,
+    toolSubmissions,
+    'facts drift must stale only final-answer authority and never rerun tools'
+  );
+
+  const exhausted = await prepareFinalAnswerHarness();
+  const exhaustedBinding = clone(
+    exhausted.loop.snapshot().finalAnswer.binding
+  );
+  const requestsBeforeFinalAnswer = exhausted.store.providerRequestCount;
+  const exhaustedToolSubmissions = exhausted.calls('submitToolIntent').length;
+  for (let index = 0; index < 3; index += 1) {
+    exhausted.enqueueProvider((input) => {
+      exhausted.store.providerEvidence.set(
+        input.providerTurnId,
+        createFailedProviderEvidence(
+          input,
+          'provider_retryable_no_mutation',
+          { recordedAt: `2026-07-29T00:01:0${index}.000Z` }
+        )
+      );
+      const error = new Error('controlled retryable transport failure');
+      error.code = 'session_kernel_provider_transport_failed';
+      throw error;
+    });
+  }
+  const failed = await exhausted.loop.runProviderTurn({
+    reason: 'finalAnswer',
+    target: { kind: 'finalAnswer', ...exhaustedBinding },
+  });
+  assert.deepEqual(failed, {
+    kind: 'finalAnswerFailed',
+    errorCode: 'session_kernel_provider_transport_failed',
+    physicalRequestCount: 3,
+  });
+  assert.equal(
+    exhausted.store.providerRequestCount,
+    requestsBeforeFinalAnswer + 3
+  );
+  assert.equal(exhausted.loop.snapshot().finalAnswer.status,
+    'finalAnswerFailed');
+  assert.equal(
+    exhausted.calls('submitToolIntent').length,
+    exhaustedToolSubmissions
+  );
+
+  const durable = createDurablePersistenceHarness({
+    sessionId: 'session-final-answer-durable-budget',
+    initial: exhausted.initial,
+  });
+  await durable.persistence.persistInput(durable.initial.initialInput);
+  await durable.persistence.persistPlan(exhausted.loop.snapshot().plan);
+  await durable.persistence.persistPlanDecision(
+    exhausted.loop.snapshot().planDecision
+  );
+  for (const [requestId, stored] of exhausted.store.operationResults) {
+    await durable.persistence.persistOperationResult(requestId, stored.result);
+  }
+  for (const evidence of exhausted.store.providerEvidence.values()) {
+    seedProviderEvidenceRecordsV3(durable, evidence);
+  }
+  let durableCheckpointRevision = 0;
+  for (const outcome of exhausted.loop.snapshot().providerOutcomes) {
+    const source = exhausted.store.checkpointHistory
+      .filter((checkpoint) =>
+        checkpoint.state.providerTurn?.providerTurnId
+          === outcome.providerTurnId
+        && checkpoint.state.providerOutcomes.some(
+          (candidate) =>
+            candidate.providerTurnId === outcome.providerTurnId
+        )
+      )
+      .at(-1);
+    assert(
+      source,
+      `Missing durable reservation checkpoint for ${outcome.providerTurnId}.`
+    );
+    const sourceState = clone(source.state);
+    sourceState.checkpointRevision = ++durableCheckpointRevision;
+    delete sourceState.providerTurn.dispatchRef;
+    delete sourceState.providerTurn.terminalRef;
+    await durable.persistence.persistCheckpoint(
+      checkpointFromStateV3(sourceState, source.savedAt)
+    );
+  }
+  const durableState = clone(exhausted.loop.snapshot());
+  durableState.checkpointRevision = ++durableCheckpointRevision;
+  if (durableState.providerTurn) {
+    delete durableState.providerTurn.dispatchRef;
+    delete durableState.providerTurn.terminalRef;
+  }
+  await durable.persistence.persistCheckpoint(
+    checkpointFromStateV3(durableState, '2026-07-29T00:02:00.000Z')
+  );
+  const restarted = createSessionHarness({
+    initial: exhausted.initial,
+    kernelState: exhausted.kernelState,
+  });
+  restarted.ports.persistence = durable.persistence;
+  await restarted.open();
+  assert.equal(restarted.loop.snapshot().finalAnswer.status,
+    'finalAnswerFailed');
+  assert.equal(restarted.loop.snapshot().finalAnswer.physicalRequestCount, 3);
+  const recoveredFailure = await restarted.loop.runProviderTurn({
+    reason: 'finalAnswer',
+    target: { kind: 'finalAnswer', ...exhaustedBinding },
+  });
+  assert.equal(recoveredFailure.kind, 'finalAnswerFailed');
+  assert.equal(restarted.store.providerRequestCount, 0);
+  assert.equal(restarted.calls('submitToolIntent').length, 0);
+}
 
 async function unknownEffectOutcomeReplaysTheExactIdentityAfterRestart() {
   const first = await openSessionHarness();
@@ -379,6 +1028,46 @@ function appendContextReadCompletion(
       contextReadInvocationId: result.invocationId,
       contextReadAttemptId: attemptId,
       contextReadEffectId: effectId,
+    },
+  });
+  harness.appendFacts(observed, completed);
+}
+
+function appendMutationCompletion(
+  harness,
+  plan,
+  result,
+  attemptId,
+  label
+) {
+  const effectId = `effect-${label}`;
+  const observed = corpusFact('effectToolObserved', {
+    factId: `fact-${label}-observed`,
+    ledgerSequence: harness.nextFactSequence(),
+    runSequence: harness.nextRunSequence(),
+    identities: {
+      runId: harness.initial.runId,
+      planRevision: plan.planRevision,
+      planActionId: plan.actions[0].manifest.planActionId,
+      operationId: result.operationId,
+      invocationId: result.invocationId,
+      attemptId,
+      effectId,
+    },
+  });
+  const completed = corpusFact('invocationToolCompleted', {
+    factId: `fact-${label}-completed`,
+    ledgerSequence: harness.nextFactSequence() + 1,
+    runSequence: harness.nextRunSequence() + 1,
+    identities: {
+      runId: harness.initial.runId,
+      planRevision: plan.planRevision,
+      planActionId: plan.actions[0].manifest.planActionId,
+      operationId: result.operationId,
+      invocationId: result.invocationId,
+      attemptId,
+      effectId,
+      observedFactId: observed.factId,
     },
   });
   harness.appendFacts(observed, completed);
@@ -1149,4 +1838,345 @@ async function unsupportedCheckpointSchemaFailsClosed() {
     (error) =>
       error?.code === 'session_kernel_checkpoint_schema_unsupported'
   );
+}
+
+async function createCompletedProviderDurableHistory(sessionId) {
+  const live = await openSessionHarness();
+  live.enqueueProvider(providerAnswer('durably recovered answer'));
+  await live.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
+  const completedState = clone(live.loop.snapshot());
+  const providerTurn = completedState.providerTurn;
+  const providerOutcome = completedState.providerOutcomes.find(
+    (candidate) => candidate.providerTurnId === providerTurn.providerTurnId
+  );
+  assert(providerOutcome);
+  const durable = createDurablePersistenceHarness({
+    sessionId,
+    initial: live.initial,
+  });
+  await durable.persistence.persistInput(durable.initial.initialInput);
+  const evidence = providerEvidenceRecordsV3(
+    sessionId,
+    durable.initial.runId,
+    live.providerInputs[0],
+    {
+      items: providerTurn.response.items,
+      completion: providerTurn.response.completion,
+      providerResult: providerOutcome.providerResult,
+    },
+    providerOutcome.recordedAt
+  );
+  durable.store.seedDaemonRecord(evidence.dispatch);
+  durable.store.seedDaemonRecord(evidence.terminal);
+  completedState.checkpointRevision = 1;
+  delete completedState.providerTurn.dispatchRef;
+  delete completedState.providerTurn.terminalRef;
+  await durable.persistence.persistCheckpoint(
+    checkpointFromStateV3(completedState)
+  );
+  return {
+    ...durable,
+    live,
+    completedState,
+    evidence,
+  };
+}
+
+async function createCompletedToolProviderDurableHistory(sessionId) {
+  const live = await openSessionHarness();
+  const plan = createPlan();
+  await persistPreviewAndAcceptPlan(live, plan);
+  live.enqueueProvider(providerToolIntent(
+    'fs.write',
+    { path: 'output.txt', content: 'contract output' },
+    'provider-call-durable-tool-history'
+  ));
+  live.enqueueKernel('submitToolIntent', (request) =>
+    admittedReply(live, request, {
+      invocationId: 'invocation-durable-tool-history',
+      attemptId: 'attempt-durable-tool-history',
+    }));
+  const admitted = await live.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: plan.actions[0].manifest.planActionId,
+    },
+    remainingToolCallBudget: 32,
+  });
+  assert.equal(admitted.kind, 'admitted');
+  appendMutationCompletion(
+    live,
+    plan,
+    admitted,
+    'attempt-durable-tool-history',
+    'durable-tool-history'
+  );
+  await live.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: admitted.operationId,
+    invocationId: admitted.invocationId,
+    planActionId: plan.actions[0].manifest.planActionId,
+    expectedPlanRevision: plan.planRevision,
+  });
+  const completedState = clone(live.loop.snapshot());
+  assert.equal(completedState.providerToolCallQueue.status, 'completed');
+  const providerTurn = completedState.providerTurn;
+  const providerOutcome = completedState.providerOutcomes.find(
+    (candidate) => candidate.providerTurnId === providerTurn.providerTurnId
+  );
+  assert.equal(providerOutcome?.outputKind, 'toolIntent');
+
+  const durable = createDurablePersistenceHarness({
+    sessionId,
+    initial: live.initial,
+  });
+  await durable.persistence.persistInput(durable.initial.initialInput);
+  await durable.persistence.persistPlan(plan);
+  await durable.persistence.persistPlanDecision(
+    live.store.planDecisions.get(plan.planRevision)
+  );
+  for (const [requestId, stored] of live.store.operationResults) {
+    await durable.persistence.persistOperationResult(requestId, stored.result);
+  }
+  const evidence = providerEvidenceRecordsV3(
+    sessionId,
+    durable.initial.runId,
+    live.providerInputs[0],
+    {
+      items: providerTurn.response.items,
+      completion: providerTurn.response.completion,
+      providerResult: providerOutcome.providerResult,
+    },
+    providerOutcome.recordedAt
+  );
+  durable.store.seedDaemonRecord(evidence.dispatch);
+  durable.store.seedDaemonRecord(evidence.terminal);
+  completedState.checkpointRevision = 1;
+  delete completedState.providerTurn.dispatchRef;
+  delete completedState.providerTurn.terminalRef;
+  await durable.persistence.persistCheckpoint(
+    checkpointFromStateV3(completedState)
+  );
+  return {
+    ...durable,
+    live,
+    completedState,
+    evidence,
+  };
+}
+
+async function createNoncompletedProviderHistory(options) {
+  const source = await createCompletedProviderDurableHistory(
+    `session-${options.terminalKind}-terminal-source`
+  );
+  const records = source.store.records.filter(
+    (record) =>
+      record.recordKind !== 'checkpoint'
+      && record.recordKind !== 'providerTurnTerminal'
+  );
+  const failedTerminal = createDurableRecordV3({
+    sessionId: source.sessionId,
+    runId: source.initial.runId,
+    recordKind: 'providerTurnTerminal',
+    logicalId:
+      `provider-turn:${source.completedState.providerTurn.providerTurnId}:terminal`,
+    recordedAt: '2026-07-29T00:00:30.000Z',
+    data: {
+      schemaVersion: 'deepcode.session.provider-turn-terminal.v3',
+      providerTurnId: source.completedState.providerTurn.providerTurnId,
+      dispatchRef: {
+        recordId: source.evidence.dispatch.recordId,
+        recordDigest: source.evidence.dispatch.recordDigest,
+      },
+      authorityBinding: clone(source.evidence.dispatch.data.authorityBinding),
+      terminalKind: options.terminalKind,
+      reasonCode: options.reasonCode,
+      traceRef: {
+        terminalDigest: sha256Hash('failed-terminal-contract'),
+        sealDigest: sha256Hash('failed-seal-contract'),
+        recordCount: 2,
+      },
+      orderedItems: [],
+    },
+  });
+  records.push(failedTerminal);
+  const failed = createDurablePersistenceHarness({
+    sessionId: source.sessionId,
+    initial: source.initial,
+    records,
+  });
+  const state = clone(source.completedState);
+  state.checkpointRevision = 1;
+  state.providerTurn.status = options.expectedStatus;
+  delete state.providerTurn.response;
+  delete state.providerTurn.dispatchRef;
+  delete state.providerTurn.terminalRef;
+  state.providerOutcomes = [];
+  await failed.persistence.persistCheckpoint(checkpointFromStateV3(state));
+  return failed;
+}
+
+async function createUnresolvedProviderHistory() {
+  const source = await createCompletedProviderDurableHistory(
+    'session-unresolved-terminal-source'
+  );
+  const records = source.store.records.filter(
+    (record) =>
+      record.recordKind !== 'checkpoint'
+      && record.recordKind !== 'providerTurnDispatch'
+      && record.recordKind !== 'providerTurnTerminal'
+  );
+  const preparing = createDurablePersistenceHarness({
+    sessionId: source.sessionId,
+    initial: source.initial,
+    records,
+  });
+  const state = clone(source.completedState);
+  state.checkpointRevision = 1;
+  state.providerTurn.status = 'active';
+  delete state.providerTurn.response;
+  delete state.providerTurn.dispatchRef;
+  delete state.providerTurn.terminalRef;
+  state.providerOutcomes = [];
+  await preparing.persistence.persistCheckpoint(
+    checkpointFromStateV3(state)
+  );
+  preparing.store.seedDaemonRecord(source.evidence.dispatch);
+  return createDurablePersistenceHarness({
+    sessionId: source.sessionId,
+    initial: source.initial,
+    records: preparing.store.records,
+  });
+}
+
+async function prepareFinalAnswerHarness() {
+  const harness = await openSessionHarness();
+  const plan = createPlan();
+  await persistPreviewAndAcceptPlan(harness, plan);
+  harness.enqueueProvider(providerToolIntent(
+    'fs.write',
+    { path: 'output.txt', content: 'contract output' },
+    'provider-call-final-answer-tool'
+  ));
+  harness.enqueueKernel('submitToolIntent', (request) =>
+    admittedReply(harness, request, {
+      invocationId: 'invocation-final-answer-tool',
+      attemptId: 'attempt-final-answer-tool',
+    }));
+  const admitted = await harness.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: plan.actions[0].manifest.planActionId,
+    },
+    remainingToolCallBudget: 32,
+  });
+  assert.equal(admitted.kind, 'admitted');
+  appendMutationCompletion(
+    harness,
+    plan,
+    admitted,
+    'attempt-final-answer-tool',
+    'final-answer-tool'
+  );
+  await harness.loop.notifyKernelWakeHint({
+    waitKind: 'invocation',
+    operationId: admitted.operationId,
+    invocationId: admitted.invocationId,
+    planActionId: plan.actions[0].manifest.planActionId,
+    expectedPlanRevision: plan.planRevision,
+  });
+  harness.enqueueProvider(providerAnswer('Plan action settled.'));
+  await harness.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: plan.actions[0].manifest.planActionId,
+    },
+    remainingToolCallBudget: 31,
+  });
+  const review = await harness.loop.finalizeReview(plan.planRevision);
+  assert.equal(review.status, 'final');
+  assert.equal(harness.loop.snapshot().finalAnswer.status, 'pending');
+  assert.deepEqual(harness.loop.snapshot().finalAnswer.binding, {
+    inputId: harness.loop.snapshot().currentInputId,
+    controlEpoch: harness.loop.snapshot().controlEpoch,
+    planRevision: plan.planRevision,
+    reviewRevision: review.revision,
+    snapshotHighWater: review.snapshotHighWater,
+  });
+  return harness;
+}
+
+function recoveryAuthority(initial) {
+  return {
+    workspaceBindingDigest: initial.workspaceBindingDigest,
+    sessionMemory: clone(initial.sessionMemory),
+    providerProfile: clone(initial.providerProfile),
+    toolContext: clone(initial.toolContext),
+  };
+}
+
+function containsObjectKey(value, key) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) {
+    return value.some((entry) => containsObjectKey(entry, key));
+  }
+  return Object.prototype.hasOwnProperty.call(value, key)
+    || Object.values(value).some((entry) => containsObjectKey(entry, key));
+}
+
+function rehashDurableRecord(record) {
+  const { recordDigest: _oldDigest, ...withoutDigest } = clone(record);
+  return {
+    ...withoutDigest,
+    recordDigest: sha256Hash(canonicalJson(withoutDigest)),
+  };
+}
+
+function mutateDurableRecord(records, recordId, mutate) {
+  return records.map((record) => {
+    if (record.recordId !== recordId) return clone(record);
+    const changed = clone(record);
+    mutate(changed);
+    return rehashDurableRecord(changed);
+  });
+}
+
+function seedProviderEvidenceRecordsV3(durable, evidence) {
+  const providerTurnId = evidence.dispatch.data.providerTurnId;
+  const dispatch = createDurableRecordV3({
+    sessionId: durable.sessionId,
+    runId: durable.initial.runId,
+    recordKind: 'providerTurnDispatch',
+    logicalId: `provider-turn:${providerTurnId}:dispatch`,
+    recordedAt: evidence.dispatch.recordedAt,
+    data: evidence.dispatch.data,
+  });
+  const terminal = createDurableRecordV3({
+    sessionId: durable.sessionId,
+    runId: durable.initial.runId,
+    recordKind: 'providerTurnTerminal',
+    logicalId: `provider-turn:${providerTurnId}:terminal`,
+    recordedAt: evidence.terminal.recordedAt,
+    data: {
+      ...clone(evidence.terminal.data),
+      dispatchRef: {
+        recordId: dispatch.recordId,
+        recordDigest: dispatch.recordDigest,
+      },
+    },
+  });
+  durable.store.seedDaemonRecord(dispatch);
+  durable.store.seedDaemonRecord(terminal);
+}
+
+function clone(value) {
+  return value === undefined
+    ? undefined
+    : JSON.parse(JSON.stringify(value));
 }

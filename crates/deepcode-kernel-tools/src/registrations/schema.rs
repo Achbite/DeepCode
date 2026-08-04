@@ -97,11 +97,101 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
         }),
         KernelToolKind::FsEdit => serde_json::json!({
             "type": "object",
-            "required": ["path", "patchSpec", "replacementBlockId"],
+            "required": ["path", "matcher", "replacement"],
             "properties": {
                 "path": { "type": "string" },
-                "patchSpec": { "type": "object" },
-                "replacementBlockId": { "type": "string" }
+                "matcher": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["kind", "data"],
+                            "properties": {
+                                "kind": { "const": "exactBlock" },
+                                "data": {
+                                    "type": "object",
+                                    "required": ["text"],
+                                    "properties": {
+                                        "text": { "type": "string" }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "data"],
+                            "properties": {
+                                "kind": { "const": "contextBlock" },
+                                "data": {
+                                    "type": "object",
+                                    "required": ["before", "target", "after"],
+                                    "properties": {
+                                        "before": { "type": "string" },
+                                        "target": { "type": "string" },
+                                        "after": { "type": "string" }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "data"],
+                            "properties": {
+                                "kind": { "const": "lineRange" },
+                                "data": {
+                                    "type": "object",
+                                    "required": ["startLine", "endLine", "precondition"],
+                                    "properties": {
+                                        "startLine": { "type": "integer", "minimum": 1 },
+                                        "endLine": { "type": "integer", "minimum": 1 },
+                                        "precondition": {
+                                            "oneOf": [
+                                                {
+                                                    "type": "object",
+                                                    "required": ["kind", "data"],
+                                                    "properties": {
+                                                        "kind": { "const": "expectedFileDigest" },
+                                                        "data": {
+                                                            "type": "object",
+                                                            "required": ["digest"],
+                                                            "properties": {
+                                                                "digest": { "type": "string" }
+                                                            },
+                                                            "additionalProperties": false
+                                                        }
+                                                    },
+                                                    "additionalProperties": false
+                                                },
+                                                {
+                                                    "type": "object",
+                                                    "required": ["kind", "data"],
+                                                    "properties": {
+                                                        "kind": { "const": "expectedBeforeBlock" },
+                                                        "data": {
+                                                            "type": "object",
+                                                            "required": ["text"],
+                                                            "properties": {
+                                                                "text": { "type": "string" }
+                                                            },
+                                                            "additionalProperties": false
+                                                        }
+                                                    },
+                                                    "additionalProperties": false
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    ]
+                },
+                "replacement": { "type": "string" }
             },
             "additionalProperties": false
         }),

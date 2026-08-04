@@ -87,6 +87,27 @@ fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiRes
     }))
 }
 
+fn run_admission_response(
+    state: &AppState,
+    session_id: &str,
+    admission: AgentKernelRunAdmissionV2,
+) -> Json<ApiResponse> {
+    let identity_matches = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(&admission.host_run_id).is_some_and(|run| {
+            run.session_id == session_id
+                && run.kernel_run_id.as_deref() == Some(admission.kernel_run_id.as_str())
+        })
+    };
+    if !identity_matches {
+        return ApiResponse::error(
+            "agent_run_admission_identity_conflict",
+            "Durable Run admission does not match its exact Host and Kernel Run identity.",
+        );
+    }
+    run_response(state, session_id, &admission.host_run_id)
+}
+
 fn require_verified_selectable_session(
     state: &AppState,
     session_id: &str,
@@ -208,31 +229,14 @@ fn authoritative_project_run_context(
     })))
 }
 
-pub(crate) fn session_run_start_admission_lock(
+pub(crate) fn session_run_admission_lock(
     session_id: &str,
 ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     use std::sync::{Arc, Mutex, OnceLock, Weak};
 
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().expect("Session run start lock registry");
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
-    lock
-}
-
-pub(crate) fn session_run_cancel_admission_lock(
-    session_id: &str,
-) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
-
-    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().expect("Session run cancel lock registry");
+    let mut locks = locks.lock().expect("Session run admission lock registry");
     locks.retain(|_, lock| lock.strong_count() > 0);
     if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
         return lock;
@@ -252,8 +256,6 @@ pub(crate) async fn agent_session_run_start(
     {
         return response;
     }
-    let run_start_lock = session_run_start_admission_lock(&session_id);
-    let _run_start_guard = run_start_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response;
     }
@@ -265,6 +267,11 @@ pub(crate) async fn agent_session_run_start(
     }
     match body.op.as_str() {
         "resolveDecision" => {
+            let mutation_lock = session_run_admission_lock(&session_id);
+            let _mutation_guard = mutation_lock.lock_owned().await;
+            if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+                return response;
+            }
             if body.content.is_some()
                 || body.workspace_path.is_some()
                 || body.no_workspace.is_some()
@@ -281,6 +288,17 @@ pub(crate) async fn agent_session_run_start(
             };
         }
         "ask" => {
+            let run_start_lock = session_run_admission_lock(&session_id);
+            let _run_start_guard = run_start_lock.lock_owned().await;
+            if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+                return response;
+            }
+            let Some((session, _events)) = session_payload(&state, &session_id) else {
+                return ApiResponse::error("agent_session_not_found", "agent session not found");
+            };
+            if !session_schema_is_compatible(&session) {
+                return incompatible_session_response();
+            }
             if body.decision_kind.is_some()
                 || body.decision.is_some()
                 || body.guidance.is_some()
@@ -292,6 +310,7 @@ pub(crate) async fn agent_session_run_start(
                     "A new ask cannot carry decision or active Run identity.",
                 );
             }
+            return agent_session_run_open_admitted(&state, &session_id, &body, &session).await;
         }
         _ => {
             return ApiResponse::error(
@@ -300,12 +319,20 @@ pub(crate) async fn agent_session_run_start(
             )
         }
     }
-    match preadmit_open_agent_kernel_run_v2(&state, &session_id, &body) {
-        Ok(Some(host_run_id)) => return run_response(&state, &session_id, &host_run_id),
+}
+
+async fn agent_session_run_open_admitted(
+    state: &AppState,
+    session_id: &str,
+    body: &AgentSessionRunRequest,
+    session: &Value,
+) -> Json<ApiResponse> {
+    match preadmit_open_agent_kernel_run_v2(state, session_id, body).await {
+        Ok(Some(admission)) => return run_admission_response(state, session_id, admission),
         Ok(None) => {}
         Err(error) => return ApiResponse::error(error.code, error.message),
     }
-    let project_context = match authoritative_project_run_context(&state, &session, false) {
+    let project_context = match authoritative_project_run_context(state, session, false) {
         Ok(context) => context,
         Err(error) => return ApiResponse::error(error.code, error.message),
     };
@@ -315,7 +342,7 @@ pub(crate) async fn agent_session_run_start(
         .filter(|value| value.is_object())
     {
         let mut gui = state.gui.lock().expect("gui state lock");
-        if let Some(stored_session) = session_mut(&mut gui, &session_id) {
+        if let Some(stored_session) = session_mut(&mut gui, session_id) {
             stored_session["workspaceBinding"] = binding.clone();
             apply_workspace_binding_to_session(stored_session, binding);
             stored_session["updatedAt"] = json!(now_text());
@@ -327,7 +354,7 @@ pub(crate) async fn agent_session_run_start(
     let profile_id = {
         let mut gui = state.gui.lock().expect("gui state lock");
         let llm_profiles = gui.llm_profiles.clone();
-        let Some(stored_session) = session_mut(&mut gui, &session_id) else {
+        let Some(stored_session) = session_mut(&mut gui, session_id) else {
             return ApiResponse::error("agent_session_not_found", "agent session not found");
         };
         let stored_profile_id = stored_session
@@ -376,20 +403,20 @@ pub(crate) async fn agent_session_run_start(
         }
         profile_id
     };
-    let start_event_count = session_payload(&state, &session_id)
+    let start_event_count = session_payload(state, session_id)
         .map(|(_, events)| events.len())
         .unwrap_or_default();
     match open_agent_kernel_run_v2(
-        &state,
-        &session_id,
-        &body,
+        state,
+        session_id,
+        body,
         &profile_id,
         project_context.as_ref(),
         start_event_count,
     )
     .await
     {
-        Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
+        Ok(admission) => run_admission_response(state, session_id, admission),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
@@ -403,8 +430,6 @@ pub(crate) async fn agent_session_run_get(
     {
         return response;
     }
-    let admission_lock = session_run_start_admission_lock(&session_id);
-    let _admission_guard = admission_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response;
     }
@@ -427,7 +452,7 @@ pub(crate) async fn agent_session_run_cancel(
     {
         return response;
     }
-    let mutation_lock = session_run_cancel_admission_lock(&session_id);
+    let mutation_lock = session_run_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response;
@@ -449,7 +474,7 @@ pub(crate) async fn agent_session_run_guidance(
     {
         return response;
     }
-    let mutation_lock = session_run_start_admission_lock(&session_id);
+    let mutation_lock = session_run_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response;
@@ -479,7 +504,7 @@ pub(crate) async fn agent_session_run_authority_revoke(
     {
         return response;
     }
-    let mutation_lock = session_run_start_admission_lock(&session_id);
+    let mutation_lock = session_run_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response;
@@ -500,8 +525,6 @@ pub(crate) async fn agent_session_run_stream(
     {
         return response.into_response();
     }
-    let admission_lock = session_run_start_admission_lock(&session_id);
-    let _admission_guard = admission_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response.into_response();
     }

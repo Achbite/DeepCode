@@ -13,7 +13,7 @@ import {
 const KERNEL_TOOL_PROMPT_V2 =
   'The Kernel is the sole authority for the tools listed below. Call only a tool present in this context and provide one JSON object matching its input schema. Tool arguments are untrusted intent: the Kernel resolves resources, checks the active capability and current tool availability, and records execution facts. Never claim that a tool ran from narration alone. Treat an awaiting-capability, denied, stale-context, failed, cancelled, or indeterminate result as non-success.';
 const KERNEL_TOOL_PROMPT_SECTION_V2 =
-  '\n\nKernel-owned per-tool instructions follow in ascending ToolId order. Each instruction is bound only to the ToolId shown.';
+  '\n\nKernel-owned tool contracts follow in ascending ToolId order. Each canonical InputSchema is available for planning, but only tools separately exposed by the current Provider callable-tool channel may be invoked. A planning-only schema does not grant authority or make its tool callable.';
 const TOOL_CONTRACT_DIGEST_DOMAIN_V2 =
   'deepcode.kernel.tools.v2/contract';
 const TOOL_CONTEXT_DIGEST_DOMAIN_V2 =
@@ -464,6 +464,8 @@ function renderKernelToolPromptV2(
   let prompt = KERNEL_TOOL_PROMPT_V2 + KERNEL_TOOL_PROMPT_SECTION_V2;
   for (const tool of tools) {
     prompt += `\n\nToolId: ${tool.toolId}`;
+    prompt += `\nDescription: ${tool.description}`;
+    prompt += `\nInputSchema: ${canonicalJson(tool.inputSchema)}`;
     prompt += `\nInstruction: ${tool.promptTemplate}`;
   }
   return prompt;

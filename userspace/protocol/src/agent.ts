@@ -544,6 +544,11 @@ export interface AgentTimelineTurn {
 export interface AgentTimelineResult {
   schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
   shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
+  /**
+   * Immutable count of neutral settled flat-v2 turns at the start of this
+   * snapshot. Absence means a strict-native snapshot with no legacy prefix.
+   */
+  legacyPrefixTurnCount?: number;
   sessionId: string;
   revision: number;
   sourceEventVersion: number;
@@ -570,6 +575,11 @@ export interface AgentTimelineRootProjectionReplacements {
 export interface AgentTimelineDelta {
   schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
   shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
+  /**
+   * Exact immutable legacy-prefix boundary for the resulting snapshot.
+   * Absence means strict-native and therefore cannot extend a legacy prefix.
+   */
+  legacyPrefixTurnCount?: number;
   sessionId: string;
   baseRevision: number;
   revision: number;
