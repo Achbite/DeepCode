@@ -256,6 +256,7 @@
     "settings.llm.addProfile": "添加 Profile",
     "settings.llm.defaultProfile": "默认 profile",
     "settings.llm.empty": "尚未配置 LLM profile。可以添加通用 OpenAI 兼容 profile，或使用 DeepSeek 预设。",
+    "settings.llm.replaceInvalidStore": "现有 Profile 文件不符合当前 schema。这里已加载当前版本的预设草稿，但尚未读取、迁移或改写旧配置，也不会自动关联旧密钥；请为启用的远程 Profile 重新输入 API Key，点击“保存”后才会用这些当前配置替换它。",
     "settings.llm.profileName": "Profile 名称",
     "settings.llm.baseUrl": "Base URL",
     "settings.llm.model": "模型",

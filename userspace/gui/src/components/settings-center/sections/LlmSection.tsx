@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  DEFAULT_LLM_PROVIDER_PROFILES,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
@@ -41,6 +42,9 @@ const REASONING_TRANSPORT_LABELS: Record<LlmReasoningTransport, string> = {
   anthropicPlaintext: 'Anthropic plaintext thinking',
   ollamaPlaintext: 'Ollama plaintext reasoning',
 };
+
+const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
+const DEFAULT_REPLACEMENT_PROFILE_ID = 'deepseek-v4-pro-openai';
 
 type ProfileWithoutId<T> = T extends unknown ? Omit<T, 'id'> : never;
 type NewProfile = ProfileWithoutId<LlmProviderProfile>;
@@ -125,6 +129,13 @@ function createProfile(
   };
 }
 
+function currentProfileReplacementDrafts(): LlmProviderProfile[] {
+  return DEFAULT_LLM_PROVIDER_PROFILES.map((profile) => ({
+    ...profile,
+    enabled: profile.id === DEFAULT_REPLACEMENT_PROFILE_ID,
+  }));
+}
+
 function profileWithProviderKind(
   profile: LlmProviderProfile,
   kind: LlmProviderKind,
@@ -163,8 +174,10 @@ const LlmSection: React.FC = () => {
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [storePath, setStorePath] = useState<string | undefined>();
+  const [storeReplacementRequired, setStoreReplacementRequired] = useState(false);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [messageTone, setMessageTone] = useState<'error' | 'success'>('error');
   const [probeState, setProbeState] = useState<Record<string, string>>({});
   const reenableProfileIdsRef = useRef<Set<string>>(new Set());
   const language = normalizeUiLanguage(
@@ -181,8 +194,23 @@ const LlmSection: React.FC = () => {
       setProfiles(result.data.profiles);
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
+      setStoreReplacementRequired(false);
       reenableProfileIdsRef.current.clear();
+    } else if (result.error === INVALID_PROFILE_STORE_SCHEMA) {
+      const replacementDrafts = currentProfileReplacementDrafts();
+      setProfiles(replacementDrafts);
+      setDefaultProfileId(
+        replacementDrafts.find((profile) => (
+          profile.id === DEFAULT_REPLACEMENT_PROFILE_ID && profile.enabled
+        ))?.id ?? replacementDrafts.find((profile) => profile.enabled)?.id
+      );
+      setStorePath(undefined);
+      setSecrets({});
+      setProbeState({});
+      setStoreReplacementRequired(true);
+      setMessageTone('error');
     } else {
+      setMessageTone('error');
       setMessage(result.message ?? t(language, 'settings.llm.loadFailed'));
     }
     setLoading(false);
@@ -251,6 +279,7 @@ const LlmSection: React.FC = () => {
     setMessage(null);
     const savableProfiles = profiles.filter(hasCompatibleReasoningTransport);
     if (savableProfiles.length !== profiles.length) {
+      setMessageTone('error');
       setMessage(
         language === 'zh-CN'
           ? '存在未配置或与 Provider 不匹配的 reasoning transport；请先完成配置。'
@@ -263,10 +292,29 @@ const LlmSection: React.FC = () => {
       (profile) => profile.enabled && profile.thinking !== 'enabled'
     );
     if (enabledWithoutThinking) {
+      setMessageTone('error');
       setMessage(
         language === 'zh-CN'
           ? `已启用的 Profile“${enabledWithoutThinking.name}”必须开启 thinking。`
           : `Enabled profile "${enabledWithoutThinking.name}" must have thinking enabled.`
+      );
+      setLoading(false);
+      return;
+    }
+    const replacementProfileMissingApiKey = storeReplacementRequired
+      ? savableProfiles.find((profile) => (
+        profile.enabled
+        && profile.kind !== 'ollama'
+        && !profile.secretRef
+        && !secrets[profile.id]?.trim()
+      ))
+      : undefined;
+    if (replacementProfileMissingApiKey) {
+      setMessageTone('error');
+      setMessage(
+        language === 'zh-CN'
+          ? `当前 schema 的恢复不会自动关联旧密钥；请为已启用的 Profile“${replacementProfileMissingApiKey.name}”重新输入 API Key。`
+          : `Current-schema recovery does not automatically reconnect old secrets. Re-enter the API key for enabled profile "${replacementProfileMissingApiKey.name}".`
       );
       setLoading(false);
       return;
@@ -282,10 +330,13 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
       setSecrets({});
+      setStoreReplacementRequired(false);
       reenableProfileIdsRef.current.clear();
+      setMessageTone('success');
       setMessage(t(language, 'settings.llm.saved'));
       window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
     } else {
+      setMessageTone('error');
       setMessage(result.message ?? t(language, 'settings.llm.saveFailed'));
     }
     setLoading(false);
@@ -329,6 +380,12 @@ const LlmSection: React.FC = () => {
         <p className="settings-card__body">
           {t(language, 'settings.llm.body')}
         </p>
+
+        {storeReplacementRequired && (
+          <div className="settings-recovery-notice" role="alert">
+            {t(language, 'settings.llm.replaceInvalidStore')}
+          </div>
+        )}
 
         <div className="settings-toolbar-row">
           <button
@@ -631,7 +688,14 @@ const LlmSection: React.FC = () => {
             {t(language, 'settings.llm.profileStore', { path: storePath })}
           </div>
         )}
-        {message && <div className="settings-error">{message}</div>}
+        {message && (
+          <div
+            className={messageTone === 'success' ? 'settings-save-message' : 'settings-error'}
+            role={messageTone === 'success' ? 'status' : 'alert'}
+          >
+            {message}
+          </div>
+        )}
       </div>
     </div>
   );

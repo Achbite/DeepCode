@@ -824,10 +824,35 @@
   color: var(--text-strong, #fff);
 }
 
+.settings-field__reset:disabled,
+.settings-action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.settings-field__reset:disabled:hover,
+.settings-action-button:disabled:hover {
+  border-color: var(--line, rgba(255, 255, 255, 0.08));
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-main, #ededed);
+}
+
 .settings-error {
-  margin-top: 10px;
+  margin: 10px 16px 14px;
   color: var(--danger, #ff3b30);
   font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.settings-recovery-notice {
+  margin: 0 16px;
+  border: 1px solid color-mix(in srgb, var(--warn, #ff9f0a) 35%, transparent);
+  border-radius: var(--radius-md, 6px);
+  background: color-mix(in srgb, var(--warn, #ff9f0a) 9%, transparent);
+  color: var(--text-main, #ededed);
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .settings-workspace-fields,
@@ -854,7 +879,7 @@
 
 .settings-toolbar-row {
   flex-wrap: wrap;
-  margin: 14px 0;
+  margin: 14px 16px;
 }
 
 .settings-action-row {
@@ -872,7 +897,7 @@
 
 .settings-status,
 .settings-save-message {
-  margin-top: 10px;
+  margin: 10px 16px 14px;
   color: var(--ok, #34c759);
   font-size: 12px;
   overflow-wrap: anywhere;
@@ -883,7 +908,7 @@
 }
 
 .llm-default-row {
-  margin: 12px 0 16px;
+  margin: 12px 16px 16px;
 }
 
 .llm-profile-list,
@@ -892,6 +917,11 @@
   flex-direction: column;
   gap: 10px;
   margin-top: 12px;
+}
+
+.settings-card > .llm-profile-list {
+  margin-right: 16px;
+  margin-left: 16px;
 }
 
 .llm-profile,
@@ -912,7 +942,22 @@
 }
 
 .llm-profile__header {
+  flex-wrap: wrap;
   margin-bottom: 10px;
+}
+
+.llm-profile__header > .settings-field__input {
+  min-width: 180px;
+  flex: 1 1 240px;
+}
+
+.llm-profile__header > .settings-field__select {
+  min-width: 170px;
+  flex: 0 1 220px;
+}
+
+.llm-profile__enabled {
+  margin-left: auto;
 }
 
 .llm-profile__grid {
@@ -1209,6 +1254,12 @@
   }
 }
 
+@container (max-width: 760px) {
+  .llm-profile__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @container (max-width: 540px) {
   .settings-body {
     padding: 22px 18px 32px;
@@ -1231,6 +1282,13 @@
   .settings-field__input,
   .settings-field__select {
     width: 100%;
+  }
+
+  .llm-profile__header > .settings-field__input,
+  .llm-profile__header > .settings-field__select,
+  .llm-profile__enabled {
+    width: 100%;
+    margin-left: 0;
   }
 
   .settings-token-overview {
