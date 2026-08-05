@@ -47,6 +47,7 @@ import {
 } from './state.js';
 import {
   markSessionProviderToolCallQueueOutcomeRecordedV2,
+  publicSessionProviderOrderedItemsV2,
   publicSessionProviderToolCallQueueItemsV2,
   reconcileSessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
@@ -90,6 +91,14 @@ export interface SessionKernelRunCancelResultV2 {
     projectionId: string;
     projectionDigest: string;
   };
+}
+
+export interface SessionPlanConfirmationReadyResultV2 {
+  planRevision: string;
+  providerTurnId: string;
+  recordedAt: string;
+  commentaryProjection?: SessionKernelProjectionReceiptV2;
+  confirmationProjection: SessionKernelProjectionReceiptV2;
 }
 
 export interface SessionKernelLoopV2Options {
@@ -513,6 +522,101 @@ export class SessionKernelLoopV2 {
         );
       }
       return reply;
+    } finally {
+      this.endMaintenance();
+    }
+  }
+
+  async publishPlanConfirmationReady(
+    expectedPlanRevision: string
+  ): Promise<SessionPlanConfirmationReadyResultV2> {
+    this.beginMaintenance('publishPlanConfirmationReady');
+    try {
+      this.requireNoPendingRequests();
+      this.requirePlanProjected();
+      this.requireCurrentPlanRevision(expectedPlanRevision);
+      if (this.state.planDecision) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_confirmation_ready_stale',
+          'Plan confirmation publication cannot follow a durable Plan decision.'
+        );
+      }
+      const plan = this.state.plan!;
+      const scopePreviews = plan.actions.map((action) => {
+        const preview =
+          this.state.previews[action.manifest.operationId];
+        if (
+          !preview
+          || preview.planRevision !== expectedPlanRevision
+          || preview.planActionId !== action.manifest.planActionId
+          || preview.operationId !== action.manifest.operationId
+          || preview.toolId !== action.manifest.toolId
+        ) {
+          throw new SessionKernelLoopError(
+            'session_kernel_plan_confirmation_preview_incomplete',
+            'Every current PlanAction requires one matching canonical scope preview before confirmation publication.'
+          );
+        }
+        return preview;
+      });
+      const providerTurn = this.state.providerTurn;
+      const providerOutcome = [...this.state.providerOutcomes]
+        .reverse()
+        .find((candidate) =>
+          candidate.providerTurnId === providerTurn?.providerTurnId
+          && candidate.outputKind === 'plan'
+        );
+      if (
+        !providerTurn
+        || providerTurn.target.kind !== 'planning'
+        || providerTurn.status !== 'completed'
+        || !providerTurn.response
+        || !providerOutcome
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_confirmation_provider_evidence_missing',
+          'Confirmation publication requires the current sealed planning Provider response.'
+        );
+      }
+      const orderedItems = publicSessionProviderOrderedItemsV2(
+        providerTurn.response.items
+      ).filter((item) =>
+        item.kind === 'text' && item.phase === 'commentary'
+      );
+      const recordedAt = this.ports.clock.now();
+      const commentaryProjection = orderedItems.length === 0
+        ? undefined
+        : await this.project(
+            `plan:${expectedPlanRevision}:commentary-ready`,
+            'plan.commentaryReleased',
+            {
+              planRevision: expectedPlanRevision,
+              providerTurnId: providerTurn.providerTurnId,
+              controlEpoch: providerTurn.controlEpoch,
+              orderedItems,
+              recordedAt,
+            },
+            recordedAt
+          );
+      const confirmationProjection = await this.project(
+        `plan:${expectedPlanRevision}:confirmation-ready`,
+        'plan.confirmationReady',
+        {
+          planRevision: expectedPlanRevision,
+          providerTurnId: providerTurn.providerTurnId,
+          plan,
+          scopePreviews,
+          recordedAt,
+        },
+        recordedAt
+      );
+      return {
+        planRevision: expectedPlanRevision,
+        providerTurnId: providerTurn.providerTurnId,
+        recordedAt,
+        ...(commentaryProjection ? { commentaryProjection } : {}),
+        confirmationProjection,
+      };
     } finally {
       this.endMaintenance();
     }

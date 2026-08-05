@@ -1,5 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { AgentInputAttachmentV2 } from '@deepcode/protocol';
+import type {
+  AgentInputAttachmentV2,
+  AgentWorkspaceBinding,
+} from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -34,6 +37,8 @@ function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
 interface AgentComposerProps {
   messageAttachments: AgentInputAttachmentV2[];
   sessionAttachments: AgentInputAttachmentV2[];
+  attachmentWorkspaceBinding?: AgentWorkspaceBinding;
+  allowGlobalAttachmentWorkspaceFallback: boolean;
   language: UiLanguage;
   loading: boolean;
   onSend: (content: string) => void | Promise<void>;
@@ -217,6 +222,8 @@ async function copyText(text: string): Promise<void> {
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
+  attachmentWorkspaceBinding,
+  allowGlobalAttachmentWorkspaceFallback,
   language,
   loading,
   onSend,
@@ -638,6 +645,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       <UserAttachmentDialog
         visible={attachmentDialogOpen}
         language={language}
+        workspaceBinding={attachmentWorkspaceBinding}
+        allowGlobalWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         onClose={() => setAttachmentDialogOpen(false)}
         onPick={pickAttachment}
       />

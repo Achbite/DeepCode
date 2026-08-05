@@ -228,11 +228,22 @@ export interface AgentTimelineTaskProjectionItem {
   id: string;
   title: string;
   summary: string;
-  status: AgentTimelineStatus;
+  status: AgentTimelineTaskStatus;
   blockId: string;
   narrativeKind: AgentTimelineNarrativeKind;
   settlementKind?: 'sessionEvidenceSatisfied';
 }
+
+export type AgentTimelineTaskStatus =
+  | 'planned'
+  | 'previewing'
+  | 'needsRevision'
+  | 'awaitingApproval'
+  | 'authorized'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'unexecuted';
 
 export interface AgentTimelineTaskProjection {
   title: string;

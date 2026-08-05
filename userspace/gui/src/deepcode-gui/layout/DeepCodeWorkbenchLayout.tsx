@@ -923,6 +923,10 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           timeline={liveTimelineProjection}
           forceHome={projectDraftActive}
           projectTitle={draftProject?.title ?? activeProject?.title ?? null}
+          projectWorkspaceBinding={
+            draftProject?.workspaceBinding ?? activeProject?.workspaceBinding
+          }
+          projectContext={Boolean(draftProject ?? activeProject)}
           onBeforeSend={prepareProjectDraftSession}
           onAfterSend={commitDraftProjectSession}
         />

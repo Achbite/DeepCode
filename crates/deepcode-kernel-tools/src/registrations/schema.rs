@@ -43,6 +43,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "additionalProperties": false
         }),
         KernelToolKind::FsDelete => serde_json::json!({
+            "type": "object",
             "oneOf": [
                 {
                     "type": "object",

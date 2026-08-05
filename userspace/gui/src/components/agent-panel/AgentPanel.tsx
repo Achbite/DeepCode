@@ -65,15 +65,32 @@ const AgentPanel: React.FC = () => {
   const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
+  const attachmentWorkspaceBinding = session?.workspaceBinding;
+  const allowGlobalAttachmentWorkspaceFallback = !session?.projectId;
 
   useEffect(() => {
+    if (session?.projectId) return;
     void loadOrCreate();
     void refreshSessions();
-  }, [loadOrCreate, refreshSessions, workspaceScopeKey]);
+  }, [loadOrCreate, refreshSessions, session?.projectId, workspaceScopeKey]);
 
   useEffect(() => {
-    synchronizeAttachmentRoot(activeFolderId);
-  }, [activeFolderId, synchronizeAttachmentRoot]);
+    if (
+      attachmentWorkspaceBinding
+      && !attachmentWorkspaceBinding.activeFolderId
+    ) {
+      return;
+    }
+    synchronizeAttachmentRoot(
+      attachmentWorkspaceBinding?.activeFolderId
+        ?? (allowGlobalAttachmentWorkspaceFallback ? activeFolderId : null)
+    );
+  }, [
+    activeFolderId,
+    allowGlobalAttachmentWorkspaceFallback,
+    attachmentWorkspaceBinding,
+    synchronizeAttachmentRoot,
+  ]);
 
   return (
     <div className="agent-panel-shell">
@@ -120,6 +137,8 @@ const AgentPanel: React.FC = () => {
       <AgentComposer
         messageAttachments={messageAttachments}
         sessionAttachments={sessionAttachments}
+        attachmentWorkspaceBinding={attachmentWorkspaceBinding}
+        allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         language={language}
         loading={agentBusy}
         onSend={(content) => void sendMessage(content)}

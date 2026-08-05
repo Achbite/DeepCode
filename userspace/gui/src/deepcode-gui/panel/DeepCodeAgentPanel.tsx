@@ -1,5 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import type { AgentTimelineResult } from '@deepcode/protocol';
+import type {
+  AgentTimelineResult,
+  AgentWorkspaceBinding,
+} from '@deepcode/protocol';
 import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -18,6 +21,8 @@ interface DeepCodeAgentPanelProps {
   timeline: AgentTimelineResult;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
+  projectWorkspaceBinding?: AgentWorkspaceBinding;
+  projectContext?: boolean;
   suppressPendingDecision?: boolean;
   onBeforeSend?: () => Promise<boolean | void> | boolean | void;
   onAfterSend?: () => Promise<void> | void;
@@ -36,6 +41,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   timeline,
   forceHome = false,
   homeProjectTitle,
+  projectWorkspaceBinding,
+  projectContext = false,
   suppressPendingDecision = false,
   onBeforeSend,
   onAfterSend,
@@ -63,6 +70,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const activeFolderId = useWorkspaceStore((s) => (
     s.activeFolderId ?? s.getActiveFolder()?.id ?? null
   ));
+  const attachmentWorkspaceBinding =
+    session?.workspaceBinding ?? projectWorkspaceBinding;
+  const allowGlobalAttachmentWorkspaceFallback =
+    !session?.projectId && !projectContext;
   const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
@@ -78,13 +89,34 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   );
 
   useEffect(() => {
+    if (forceHome || session?.projectId) return;
     void refreshSessions();
-    if (!forceHome) void loadOrCreate();
-  }, [forceHome, loadOrCreate, refreshSessions, workspaceScopeKey]);
+    void loadOrCreate();
+  }, [
+    forceHome,
+    loadOrCreate,
+    refreshSessions,
+    session?.projectId,
+    workspaceScopeKey,
+  ]);
 
   useEffect(() => {
-    synchronizeAttachmentRoot(activeFolderId);
-  }, [activeFolderId, synchronizeAttachmentRoot]);
+    if (
+      attachmentWorkspaceBinding
+      && !attachmentWorkspaceBinding.activeFolderId
+    ) {
+      return;
+    }
+    synchronizeAttachmentRoot(
+      attachmentWorkspaceBinding?.activeFolderId
+        ?? (allowGlobalAttachmentWorkspaceFallback ? activeFolderId : null)
+    );
+  }, [
+    activeFolderId,
+    allowGlobalAttachmentWorkspaceFallback,
+    attachmentWorkspaceBinding,
+    synchronizeAttachmentRoot,
+  ]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;
@@ -135,6 +167,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     <AgentComposer
       messageAttachments={messageAttachments}
       sessionAttachments={sessionAttachments}
+      attachmentWorkspaceBinding={attachmentWorkspaceBinding}
+      allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
       language={language}
       loading={composerRunning}
       onSend={async (content) => {

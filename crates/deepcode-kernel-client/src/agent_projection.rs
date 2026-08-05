@@ -817,11 +817,33 @@ pub struct AgentTimelineTaskProjectionItem {
     pub id: String,
     pub title: String,
     pub summary: String,
-    pub status: AgentTimelineStatus,
+    pub status: AgentTimelineTaskStatus,
     pub block_id: String,
     pub narrative_kind: AgentTimelineNarrativeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_kind: Option<AgentTimelineTaskSettlementKind>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineTaskStatus {
+    #[serde(rename = "planned")]
+    Planned,
+    #[serde(rename = "previewing")]
+    Previewing,
+    #[serde(rename = "needsRevision")]
+    NeedsRevision,
+    #[serde(rename = "awaitingApproval")]
+    AwaitingApproval,
+    #[serde(rename = "authorized")]
+    Authorized,
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "unexecuted")]
+    Unexecuted,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]

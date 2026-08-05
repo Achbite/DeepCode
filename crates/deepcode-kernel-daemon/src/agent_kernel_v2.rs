@@ -713,10 +713,7 @@ async fn admit_and_spawn_agent_decision_v2(
                 &background_binding,
                 &owner_for_drive,
             ) {
-                Ok(admitted_binding) => {
-                    let _ = admission_sender.send(Ok(()));
-                    admitted_binding
-                }
+                Ok(admitted_binding) => admitted_binding,
                 Err(error) => {
                     let _ = admission_sender.send(Err(error));
                     return;
@@ -728,6 +725,7 @@ async fn admit_and_spawn_agent_decision_v2(
                 "running",
                 Some("Applying trusted Kernel–Session v2 decision.".to_string()),
             );
+            let _ = admission_sender.send(Ok(()));
             let result = execute_prepared_agent_decision_v2(
                 &background_state,
                 &background_active,
@@ -3204,6 +3202,33 @@ async fn drive_agent_kernel_until_boundary_v2(
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
             "awaitingUserPlanConfirmation" => {
+                let plan_revision =
+                    required_continuation_field_v2(&settlement, "planRevision")?.to_string();
+                if !continuation_bool_field_v2(&settlement, "confirmationReady")? {
+                    let publish =
+                        HostKernelBridgeOperationV2::PublishPlanConfirmationReady { plan_revision };
+                    let request_id = next_operation_request_id_v2(&settlement, &publish)?;
+                    mark_agent_drive_v2(
+                        context,
+                        &active.host_run_id,
+                        "running",
+                        Some(
+                            "Publishing the post-settlement Plan confirmation boundary."
+                                .to_string(),
+                        ),
+                    );
+                    settlement = context
+                        .kernel_session_v2
+                        .submit_operation(
+                            &active.session_id,
+                            &active.host_run_id,
+                            &request_id,
+                            publish,
+                        )
+                        .await
+                        .map_err(AgentKernelV2Error::from_storage)?;
+                    continue;
+                }
                 let run_id = RunId::new(active.run_id.clone()).map_err(|_| {
                     AgentKernelV2Error::invalid(
                         "host_kernel_run_id_invalid",
@@ -3221,8 +3246,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                         )
                     })?;
                 if settings.auto_approve_plans {
-                    let plan_revision =
-                        required_continuation_field_v2(&settlement, "planRevision")?.to_string();
                     approve_exact_plan_previews_v2(
                         &context.host_services,
                         &context.kernel_v2,
@@ -4183,6 +4206,21 @@ fn continuation_u64_field_v2(
             AgentKernelV2Error::invalid(
                 "session_kernel_continuation_invalid",
                 format!("Session continuation is missing numeric {field}."),
+            )
+        })
+}
+
+fn continuation_bool_field_v2(
+    settlement: &HostKernelOperationSettlementReceiptV2,
+    field: &str,
+) -> Result<bool, AgentKernelV2Error> {
+    continuation_v2(settlement)
+        .and_then(|continuation| continuation.get(field))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_kernel_continuation_invalid",
+                format!("Session continuation is missing boolean {field}."),
             )
         })
 }

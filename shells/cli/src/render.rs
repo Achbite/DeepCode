@@ -212,9 +212,8 @@ fn render_readable_projection(
             lines.push(summary.to_string());
         } else if let Some(summary_key) = readable.summary_key.as_deref() {
             lines.push(
-                readable_summary_key_text(summary_key)
-                    .unwrap_or(summary_key)
-                    .to_string(),
+                readable_summary_text(summary_key, readable)
+                    .unwrap_or_else(|| summary_key.to_string()),
             );
         }
     }
@@ -287,6 +286,32 @@ fn readable_summary_key_text(key: &str) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+fn readable_summary_text(
+    key: &str,
+    readable: &deepcode_kernel_client::AgentTimelineStructuredProjection,
+) -> Option<String> {
+    if key == "session.projection.review.summary.counts" {
+        let arg = |name: &str| {
+            readable
+                .message_args
+                .as_ref()
+                .and_then(|args| args.get(name))
+                .cloned()
+                .unwrap_or_else(|| "0".to_string())
+        };
+        return Some(format!(
+            "{} planned; {} effects; {} unexecuted; {} rejected; {} cleanup; {} indeterminate.",
+            arg("planned"),
+            arg("effects"),
+            arg("unexecuted"),
+            arg("rejected"),
+            arg("cleanup"),
+            arg("indeterminate")
+        ));
+    }
+    readable_summary_key_text(key).map(str::to_string)
 }
 
 fn readable_item_text(
@@ -396,6 +421,27 @@ fn readable_message_text(
         "session.projection.review.next.noContinuation" => {
             Some("The current plan did not record continuation batches.".to_string())
         }
+        "session.projection.review.item.scopeExpansion" => {
+            Some(format!("{}: scope expansion recorded", arg("tool")))
+        }
+        "session.projection.review.item.actualEffect" => {
+            Some(format!("{}: {}", arg("tool"), arg("fact")))
+        }
+        "session.projection.review.item.unexecuted" => {
+            Some(format!("{}: not executed", arg("tool")))
+        }
+        "session.projection.review.item.denied" => {
+            Some(format!("{}: denied by user ({})", arg("tool"), arg("detail")))
+        }
+        "session.projection.review.item.rejection" => {
+            Some(format!("{}: rejected by Kernel ({})", arg("tool"), arg("detail")))
+        }
+        "session.projection.review.item.cleanup" => {
+            Some(format!("Cleanup: {}", arg("fact")))
+        }
+        "session.projection.review.item.indeterminate" => {
+            Some(format!("Indeterminate outcome: {}", arg("detail")))
+        }
         _ => None,
     }
 }
@@ -442,6 +488,15 @@ fn readable_section_title(
         }
         "nextDecision" | "session.projection.review.section.nextDecision" => "Next decision",
         "audit" | "session.projection.review.section.audit" => "Audit",
+        "scopeExpansions" | "session.projection.review.section.scopeExpansions" => {
+            "Scope expansions"
+        }
+        "actualEffects" | "session.projection.review.section.actualEffects" => "Actual effects",
+        "unexecuted" | "session.projection.review.section.unexecuted" => "Unexecuted",
+        "denied" | "session.projection.review.section.denied" => "Denied",
+        "rejections" | "session.projection.review.section.rejections" => "Rejections",
+        "cleanup" | "session.projection.review.section.cleanup" => "Cleanup",
+        "indeterminate" | "session.projection.review.section.indeterminate" => "Indeterminate",
         _ => key,
     }
     .to_string()

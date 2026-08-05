@@ -43,7 +43,7 @@ pub use agent_projection::{
     AgentTimelineStreamEvent, AgentTimelineStreamReduction, AgentTimelineStructuredProjection,
     AgentTimelineStructuredProjectionItem, AgentTimelineStructuredProjectionKind,
     AgentTimelineStructuredProjectionSection, AgentTimelineTaskProjection,
-    AgentTimelineTaskProjectionItem, AgentTimelineTaskSettlementKind,
+    AgentTimelineTaskProjectionItem, AgentTimelineTaskSettlementKind, AgentTimelineTaskStatus,
     AgentTimelineTokenUsageProjection, AgentTimelineTokenUsageRequest,
     AgentTimelineTokenUsageTotals, AgentTimelineTurn, AgentTimelineTurnPart, AgentTimelineWait,
     AgentTimelineWaitKind, AgentTimelineWorkAttention, AgentTimelineWorkAttentionKind,

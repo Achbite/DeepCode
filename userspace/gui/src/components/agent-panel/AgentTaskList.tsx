@@ -51,10 +51,23 @@ function compactTasks(tasks: AgentTaskView[]): AgentTaskView[] {
 }
 
 function normalizeProjectionTaskStatus(status: string): AgentTaskView['status'] {
-  if (status === 'running') return 'running';
+  if (status === 'running' || status === 'previewing') return 'running';
   if (status === 'completed') return 'completed';
-  if (status === 'failed' || status === 'error') return 'error';
-  if (status === 'waiting' || status === 'queued') return 'waiting';
+  if (
+    status === 'failed'
+    || status === 'error'
+    || status === 'needsRevision'
+  ) {
+    return 'error';
+  }
+  if (
+    status === 'waiting'
+    || status === 'queued'
+    || status === 'awaitingApproval'
+    || status === 'authorized'
+  ) {
+    return 'waiting';
+  }
   return 'planned';
 }
 

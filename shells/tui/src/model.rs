@@ -288,27 +288,104 @@ fn render_readable_projection(readable: &AgentTimelineStructuredProjection) -> S
     if let Some(summary) = readable.summary.as_deref() {
         lines.push(summary.to_string());
     } else if let Some(summary_key) = readable.summary_key.as_deref() {
-        lines.push(summary_key.to_string());
+        lines.push(
+            readable_projection_summary(summary_key, readable)
+                .unwrap_or_else(|| summary_key.to_string()),
+        );
     }
     for section in &readable.sections {
-        lines.push(format!("## {}", section.title_key));
+        lines.push(format!("## {}", readable_section_title(section)));
         if section.items.is_empty() {
             if let Some(empty) = section.empty_message_key.as_deref() {
                 lines.push(format!("- {empty}"));
             }
         }
         for item in &section.items {
-            let text = item
-                .text
-                .as_deref()
-                .or(item.message_key.as_deref())
-                .unwrap_or("");
-            if !text.is_empty() {
+            let text = item.text.clone().or_else(|| {
+                item.message_key
+                    .as_deref()
+                    .and_then(|key| readable_item_message(key, item))
+            });
+            if let Some(text) = text.filter(|value| !value.is_empty()) {
                 lines.push(format!("- {text}"));
             }
         }
     }
     lines.join("\n")
+}
+
+fn readable_projection_summary(
+    key: &str,
+    readable: &AgentTimelineStructuredProjection,
+) -> Option<String> {
+    if key != "session.projection.review.summary.counts" {
+        return None;
+    }
+    let arg = |name: &str| {
+        readable
+            .message_args
+            .as_ref()
+            .and_then(|args| args.get(name))
+            .cloned()
+            .unwrap_or_else(|| "0".to_string())
+    };
+    Some(format!(
+        "计划 {} 项；实际效果 {} 项；未执行 {} 项；拒绝 {} 项；清理 {} 项；不确定 {} 项。",
+        arg("planned"),
+        arg("effects"),
+        arg("unexecuted"),
+        arg("rejected"),
+        arg("cleanup"),
+        arg("indeterminate")
+    ))
+}
+
+fn readable_item_message(
+    key: &str,
+    item: &deepcode_kernel_client::AgentTimelineStructuredProjectionItem,
+) -> Option<String> {
+    let arg = |name: &str| {
+        item.message_args
+            .as_ref()
+            .and_then(|args| args.get(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    match key {
+        "session.projection.review.item.scopeExpansion" => {
+            Some(format!("{}：已记录范围扩展", arg("tool")))
+        }
+        "session.projection.review.item.actualEffect" => {
+            Some(format!("{}：{}", arg("tool"), arg("fact")))
+        }
+        "session.projection.review.item.unexecuted" => Some(format!("{}：未执行", arg("tool"))),
+        "session.projection.review.item.denied" => {
+            Some(format!("{}：用户拒绝（{}）", arg("tool"), arg("detail")))
+        }
+        "session.projection.review.item.rejection" => {
+            Some(format!("{}：Kernel 拒绝（{}）", arg("tool"), arg("detail")))
+        }
+        "session.projection.review.item.cleanup" => Some(format!("清理：{}", arg("fact"))),
+        "session.projection.review.item.indeterminate" => {
+            Some(format!("结果不确定：{}", arg("detail")))
+        }
+        _ => None,
+    }
+}
+
+fn readable_section_title(
+    section: &deepcode_kernel_client::AgentTimelineStructuredProjectionSection,
+) -> &str {
+    match section.section_id.as_str() {
+        "scopeExpansions" => "范围扩展",
+        "actualEffects" => "实际效果",
+        "unexecuted" => "未执行",
+        "denied" => "用户拒绝",
+        "rejections" => "Kernel 拒绝",
+        "cleanup" => "清理",
+        "indeterminate" => "不确定项",
+        _ => section.title_key.as_str(),
+    }
 }
 
 fn folded_operation_summary(operations: &[AgentTimelineWorkOperation]) -> String {

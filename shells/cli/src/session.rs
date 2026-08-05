@@ -1032,6 +1032,8 @@ enum LiveProjectionExpectation {
 
 struct LiveProjectionCursor {
     last_revision: u64,
+    action_required_after_revision: u64,
+    ignored_action_interaction_id: Option<String>,
     snapshot: Option<AgentTimelineSnapshot>,
     expectation: LiveProjectionExpectation,
     live_run_id: Option<String>,
@@ -1091,8 +1093,23 @@ impl LiveProjectionCursor {
                     .unwrap_or_default(),
             }
         };
+        let ignored_action_interaction_id = match &expectation {
+            LiveProjectionExpectation::ExistingRun { .. } => Some(
+                snapshot
+                    .and_then(|snapshot| snapshot.run_projection.as_ref())
+                    .and_then(|projection| projection.wait.0.as_ref())
+                    .and_then(|wait| wait.interaction_id.clone())
+                    .ok_or_else(|| {
+                        "resolveDecision live projection requires the exact baseline interaction identity"
+                            .to_string()
+                    })?,
+            ),
+            LiveProjectionExpectation::NewTurn { .. } => None,
+        };
         let mut cursor = Self {
             last_revision: snapshot.map(|snapshot| snapshot.revision).unwrap_or(0),
+            action_required_after_revision: snapshot.map(|snapshot| snapshot.revision).unwrap_or(0),
+            ignored_action_interaction_id,
             snapshot: snapshot.cloned(),
             expectation,
             live_run_id: None,
@@ -1295,6 +1312,9 @@ impl LiveProjectionCursor {
     }
 
     fn bound_action_required(&self, host_run_id: &str) -> Option<String> {
+        if self.last_revision <= self.action_required_after_revision {
+            return None;
+        }
         let run = self.snapshot.as_ref()?.run_projection.as_ref()?;
         if self.live_run_id.as_deref() != Some(run.run_id.as_str())
             || !matches!(
@@ -1304,11 +1324,13 @@ impl LiveProjectionCursor {
         {
             return None;
         }
-        let reason = run
-            .wait
-            .0
-            .as_ref()
-            .and_then(|wait| wait.reason.as_deref())
+        let wait = run.wait.0.as_ref()?;
+        if wait.interaction_id.as_deref() == self.ignored_action_interaction_id.as_deref() {
+            return None;
+        }
+        let reason = wait
+            .reason
+            .as_deref()
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or("the Session requires an explicit user action");
         Some(format!(

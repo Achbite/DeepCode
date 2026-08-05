@@ -103,12 +103,32 @@ export function reconcileSessionKernelFactsPageV2(
       && fact.factKind
         === SESSION_KERNEL_FACT_KINDS_V2.authorization.contextInvalidated
     ) {
-      next.toolContext = recordSessionToolContextInvalidationV2(
+      const previousExpectedContextRef =
+        next.toolContext.expectedContextRef;
+      const previousRefreshRequired =
+        next.toolContext.refreshRequired;
+      const updatedToolContext = recordSessionToolContextInvalidationV2(
         next.toolContext,
         fact.details
       );
-      next.lineage = clearSessionCapabilityLeasesV2(next.lineage);
-      next.previews = {};
+      const invalidationAdvanced =
+        updatedToolContext.refreshRequired
+        && (
+          !previousRefreshRequired
+          || !previousExpectedContextRef
+          || !updatedToolContext.expectedContextRef
+          || previousExpectedContextRef.contextVersion
+            !== updatedToolContext.expectedContextRef.contextVersion
+          || previousExpectedContextRef.catalogDigest
+            !== updatedToolContext.expectedContextRef.catalogDigest
+          || previousExpectedContextRef.contextDigest
+            !== updatedToolContext.expectedContextRef.contextDigest
+        );
+      next.toolContext = updatedToolContext;
+      if (invalidationAdvanced) {
+        next.lineage = clearSessionCapabilityLeasesV2(next.lineage);
+        next.previews = {};
+      }
     }
     if (
       fact.domain === 'authorization'

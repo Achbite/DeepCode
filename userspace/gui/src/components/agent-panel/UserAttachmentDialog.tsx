@@ -1,5 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { AgentInputAttachmentV2, FileTreeNode } from '@deepcode/protocol';
+import type {
+  AgentInputAttachmentV2,
+  AgentWorkspaceBinding,
+  FileTreeNode,
+  WorkspaceSpec,
+} from '@deepcode/protocol';
+import { createWorkspaceScope } from '@deepcode/session-core';
 import { getFileTree } from '../../services/runtimeAdapter';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
@@ -8,6 +14,8 @@ import '../workspace-open-dialog/workspaceOpenDialog.css';
 interface UserAttachmentDialogProps {
   visible: boolean;
   language: UiLanguage;
+  workspaceBinding?: AgentWorkspaceBinding;
+  allowGlobalWorkspaceFallback: boolean;
   onClose: () => void;
   onPick: (attachment: AgentInputAttachmentV2) => void;
 }
@@ -73,14 +81,46 @@ function parentPath(path: string): string {
   return segments.join('/') || '.';
 }
 
+function normalizeAbsolutePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+$/g, '');
+}
+
+function workspaceMatchesBinding(
+  workspace: WorkspaceSpec | null,
+  binding: AgentWorkspaceBinding
+): boolean {
+  if (!workspace) return false;
+  if (binding.workspaceHash) {
+    return createWorkspaceScope(workspace).workspaceHash
+      === binding.workspaceHash;
+  }
+  if (binding.workspaceId) {
+    return workspace.id === binding.workspaceId;
+  }
+  const openPath = binding.openPath
+    ? normalizeAbsolutePath(binding.openPath)
+    : undefined;
+  if (!openPath) return false;
+  return [
+    workspace.sourcePath,
+    ...workspace.folders.flatMap((folder) => [
+      folder.absolutePath,
+      folder.originalPath,
+    ]),
+  ].some((path) => path && normalizeAbsolutePath(path) === openPath);
+}
+
 const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
   visible,
   language,
+  workspaceBinding,
+  allowGlobalWorkspaceFallback,
   onClose,
   onPick,
 }) => {
   const workspace = useWorkspaceStore((state) => state.current);
   const activeFolderId = useWorkspaceStore((state) => state.activeFolderId);
+  const openWorkspace = useWorkspaceStore((state) => state.openWorkspace);
   const [folderId, setFolderId] = useState('');
   const [directory, setDirectory] = useState('.');
   const [entries, setEntries] = useState<AttachmentEntry[]>([]);
@@ -134,11 +174,45 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
       setDirectory('.');
       return;
     }
-    const initialFolderId = (
-      activeFolderId && workspace?.folders.some((folder) => folder.id === activeFolderId)
-    )
-      ? activeFolderId
-      : workspace?.folders[0]?.id;
+    if (workspaceBinding && !workspaceMatchesBinding(workspace, workspaceBinding)) {
+      const openPath = workspaceBinding.openPath;
+      if (!openPath) {
+        setError(t(language, 'agent.attachment.noWorkspace'));
+        return;
+      }
+      const generation = loadGenerationRef.current + 1;
+      loadGenerationRef.current = generation;
+      setLoading(true);
+      setError(null);
+      void openWorkspace(openPath).then((result) => {
+        if (loadGenerationRef.current !== generation) return;
+        if (!result.ok) {
+          setError(result.message ?? t(language, 'agent.attachment.loadFailed'));
+          setLoading(false);
+        }
+      });
+      return () => {
+        loadGenerationRef.current += 1;
+      };
+    }
+    if (!workspaceBinding && !allowGlobalWorkspaceFallback) {
+      setError(t(language, 'agent.attachment.noWorkspace'));
+      return;
+    }
+    const boundFolderId = workspaceBinding?.activeFolderId;
+    const initialFolderId = workspaceBinding
+      ? (
+          boundFolderId
+          && workspace?.folders.some((folder) => folder.id === boundFolderId)
+        )
+        ? boundFolderId
+        : workspace?.folders[0]?.id
+      : (
+          activeFolderId
+          && workspace?.folders.some((folder) => folder.id === activeFolderId)
+        )
+        ? activeFolderId
+        : workspace?.folders[0]?.id;
     if (!initialFolderId) {
       setError(t(language, 'agent.attachment.noWorkspace'));
       return;
@@ -147,7 +221,15 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
     return () => {
       loadGenerationRef.current += 1;
     };
-  }, [activeFolderId, language, visible, workspace]);
+  }, [
+    activeFolderId,
+    allowGlobalWorkspaceFallback,
+    language,
+    openWorkspace,
+    visible,
+    workspace,
+    workspaceBinding,
+  ]);
 
   useEffect(() => {
     if (!visible) return;

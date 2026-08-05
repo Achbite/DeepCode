@@ -1612,6 +1612,8 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
 >([
   'plan.persisted',
   'plan.decided',
+  'plan.commentaryReleased',
+  'plan.confirmationReady',
   'input.persisted',
   'scope.previewed',
   'provider.started',

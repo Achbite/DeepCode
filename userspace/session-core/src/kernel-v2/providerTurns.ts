@@ -508,15 +508,21 @@ export class SessionKernelProviderTurnsV2 {
       let output: SessionProviderTurnOutputV2;
       let completedTerminalRecordedAt: string | undefined;
       try {
+        const deferPublicTextUntilTerminalValidation =
+          request.target.kind === 'planning';
         const liveOutput = await this.ports.provider.requestTurn({
           ...providerInput,
           contextAssembly,
-          publicTextObserver: this.publicTextObserverForTurn(
-            reservation,
-            generation,
-            providerTurnId,
-            state.controlEpoch
-          ),
+          ...(deferPublicTextUntilTerminalValidation
+            ? {}
+            : {
+                publicTextObserver: this.publicTextObserverForTurn(
+                  reservation,
+                  generation,
+                  providerTurnId,
+                  state.controlEpoch
+                ),
+              }),
           publicActivityObserver: this.publicActivityObserverForTurn(
             reservation,
             generation,
@@ -801,7 +807,6 @@ export class SessionKernelProviderTurnsV2 {
     queuedToolIntents: boolean;
   }> {
     const acceptingState = this.host.readState();
-    acceptingState.pendingGuidance = [];
     if (
       acceptingState.providerTurn?.providerTurnId !== providerTurnId
       || acceptingState.providerTurn.status !== 'active'

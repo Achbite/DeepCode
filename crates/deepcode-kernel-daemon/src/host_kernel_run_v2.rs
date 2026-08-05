@@ -131,6 +131,9 @@ pub(crate) enum HostKernelBridgeOperationV2 {
         plan_action_id: String,
         expected_plan_revision: String,
     },
+    PublishPlanConfirmationReady {
+        plan_revision: String,
+    },
     DecidePlan {
         plan_revision: String,
         decision: HostKernelPlanDecisionV2,
@@ -3385,6 +3388,9 @@ fn validate_bridge_operation(
         ));
     }
     match operation {
+        HostKernelBridgeOperationV2::PublishPlanConfirmationReady { plan_revision } => {
+            crate::host_v2_storage::validate_bounded_identity(plan_revision, "planRevision", 512)?;
+        }
         HostKernelBridgeOperationV2::FinalizeReview {
             expected_work_authority,
         } => validate_session_work_authority_v3(expected_work_authority)?,

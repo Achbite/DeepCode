@@ -434,6 +434,7 @@ export function recordSessionPlanV2(
   }
   let next = cloneSessionKernelLoopStateV2(state);
   if (next.plan?.planRevision !== plan.planRevision) {
+    next.pendingGuidance = [];
     next.planActionSettlements = {};
     next.operationPlanActionBindings = {};
     next.previews = {};
@@ -1559,11 +1560,22 @@ function validateProviderTurnResponse(
     providerNativeToolCount += 1;
   }
   const native = completion.nativeCompletion;
-  const nativeInvalid =
-    native.providerKind === 'openaiCompatible'
+  const sessionControlToolCount = turn.target.kind === 'planning'
+    ? 1
+    : 0;
+  const planningInvalid = (
+    turn.target.kind === 'planning'
+    && (
+      providerNativeToolCount !== 0
+      || response.items.some((item) =>
+        item.kind !== 'text' || item.phase !== 'commentary'
+      )
+    )
+  );
+  const nativeCompletionInvalid = native.providerKind === 'openaiCompatible'
       ? native.terminalSignal !== '[DONE]'
         || (
-          providerNativeToolCount > 0
+          providerNativeToolCount + sessionControlToolCount > 0
             ? native.finishReason !== 'tool_calls'
             : native.finishReason !== 'stop'
         )
@@ -1575,7 +1587,7 @@ function validateProviderTurnResponse(
           ? native.terminalSignal !== 'done:true'
             || completion.reasoningTransport !== 'ollamaPlaintext'
           : true;
-  if (nativeInvalid) {
+  if (planningInvalid || nativeCompletionInvalid) {
     throw new SessionKernelStateError(
       'session_kernel_provider_response_invalid',
       'Provider turn native completion conflicts with ordered response.'

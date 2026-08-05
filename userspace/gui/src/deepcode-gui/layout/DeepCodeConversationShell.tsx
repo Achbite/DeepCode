@@ -1,5 +1,8 @@
 import React from 'react';
-import type { AgentTimelineResult } from '@deepcode/protocol';
+import type {
+  AgentTimelineResult,
+  AgentWorkspaceBinding,
+} from '@deepcode/protocol';
 import type { UiLanguage } from '../../i18n';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 
@@ -8,6 +11,8 @@ interface DeepCodeConversationShellProps {
   timeline: AgentTimelineResult;
   forceHome: boolean;
   projectTitle: string | null;
+  projectWorkspaceBinding?: AgentWorkspaceBinding;
+  projectContext: boolean;
   onBeforeSend: () => boolean | Promise<boolean>;
   onAfterSend: () => void | Promise<void>;
 }
@@ -17,6 +22,8 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
   timeline,
   forceHome,
   projectTitle,
+  projectWorkspaceBinding,
+  projectContext,
   onBeforeSend,
   onAfterSend,
 }) => (
@@ -26,6 +33,8 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
       timeline={timeline}
       forceHome={forceHome}
       homeProjectTitle={projectTitle}
+      projectWorkspaceBinding={projectWorkspaceBinding}
+      projectContext={projectContext}
       suppressPendingDecision={forceHome}
       onBeforeSend={onBeforeSend}
       onAfterSend={onAfterSend}

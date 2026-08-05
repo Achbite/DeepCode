@@ -60,6 +60,7 @@ import {
 import type {
   SessionKernelClockPortV2,
   SessionKernelIdFactoryPortV2,
+  SessionKernelProjectionReceiptV2,
 } from './ports.js';
 import {
   currentSessionWorkAuthorityV3,
@@ -158,6 +159,13 @@ export interface SessionKernelProductionPreviewPlanActionV2 {
   };
 }
 
+export interface SessionKernelProductionPublishPlanConfirmationReadyV2 {
+  kind: 'publishPlanConfirmationReady';
+  data: {
+    planRevision: string;
+  };
+}
+
 export interface SessionKernelProductionDecidePlanV2 {
   kind: 'decidePlan';
   data: {
@@ -229,6 +237,7 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionResumePlanningV2
   | SessionKernelProductionResumeAfterBackpressureV2
   | SessionKernelProductionPreviewPlanActionV2
+  | SessionKernelProductionPublishPlanConfirmationReadyV2
   | SessionKernelProductionDecidePlanV2
   | SessionKernelProductionObserveCapabilityDecisionV2
   | SessionKernelProductionReconcileWakeV2
@@ -327,6 +336,14 @@ export type SessionKernelProductionOutcomeV2 =
       preview: CapabilityScopePreviewReplyV2;
     }
   | {
+      kind: 'planConfirmationReadyPublished';
+      planRevision: string;
+      providerTurnId: string;
+      recordedAt: string;
+      commentaryProjection?: SessionKernelProjectionReceiptV2;
+      confirmationProjection: SessionKernelProjectionReceiptV2;
+    }
+  | {
       kind: 'planDecisionRecorded';
       decision: SessionPlanDecisionV2;
     }
@@ -390,6 +407,7 @@ export type SessionKernelProductionContinuationV2 =
   | {
       kind: 'awaitingUserPlanConfirmation';
       planRevision: string;
+      confirmationReady: boolean;
     }
   | {
       kind: 'awaitingUserScopeDecision';
@@ -1548,6 +1566,17 @@ async function executeProductionOperation(
           operation.data.expectedPlanRevision
         ),
       };
+    case 'publishPlanConfirmationReady':
+      requireProductionPlanRevision(
+        runner.snapshot(),
+        operation.data.planRevision
+      );
+      return {
+        kind: 'planConfirmationReadyPublished',
+        ...await runner.publishPlanConfirmationReady(
+          operation.data.planRevision
+        ),
+      };
     case 'decidePlan':
       return {
         kind: 'planDecisionRecorded',
@@ -2000,6 +2029,18 @@ function decodeOperation(
         expectedPlanRevision: identity(
           body.expectedPlanRevision,
           'expectedPlanRevision'
+        ),
+      },
+    };
+  }
+  if (tagged.kind === 'publishPlanConfirmationReady') {
+    const body = exactObject(data, ['planRevision']);
+    return {
+      kind: tagged.kind,
+      data: {
+        planRevision: identity(
+          body.planRevision,
+          'planRevision'
         ),
       },
     };
@@ -2718,6 +2759,9 @@ function productionContinuation(
     return {
       kind: 'awaitingUserPlanConfirmation',
       planRevision: state.plan.planRevision,
+      confirmationReady:
+        outcome.kind === 'planConfirmationReadyPublished'
+        && outcome.planRevision === state.plan.planRevision,
     };
   }
   if (
@@ -2780,10 +2824,17 @@ function productionContinuation(
           return {
             kind: 'awaitingUserPlanConfirmation',
             planRevision: requiredCurrentPlanRevision(state),
+            confirmationReady: false,
           };
         }
         return readyForPlanAction(state, planAction);
       }
+    case 'planConfirmationReadyPublished':
+      return {
+        kind: 'awaitingUserPlanConfirmation',
+        planRevision: outcome.planRevision,
+        confirmationReady: true,
+      };
     case 'planDecisionRecorded':
       return outcome.decision.decision === 'accept'
         ? readyForPlanAction(state, planAction)
@@ -2954,6 +3005,7 @@ function continuationForLoopResult(
       return {
         kind: 'awaitingUserPlanConfirmation',
         planRevision: result.plan.planRevision,
+        confirmationReady: false,
       };
     case 'answer':
       return currentSessionWorkAuthorityV3(state)

@@ -1079,7 +1079,7 @@ fn validate_task_projection(value: &Value, block_ids: &HashSet<&str>) -> Result<
                 "Session v2 public projection taskProjection item.summary is invalid".to_string(),
             );
         }
-        validate_timeline_status(item.get("status"), "taskProjection item.status")?;
+        validate_task_projection_status(item.get("status"), "taskProjection item.status")?;
         let block_id = required_identity(item.get("blockId"), "taskProjection item.blockId")?;
         if !block_ids.contains(block_id) {
             return Err(
@@ -1712,6 +1712,24 @@ fn validate_timeline_status(value: Option<&Value>, field: &str) -> Result<(), St
             "completed",
             "cancelled",
             "failed",
+        ],
+        field,
+    )
+}
+
+fn validate_task_projection_status(value: Option<&Value>, field: &str) -> Result<(), String> {
+    validate_required_enum(
+        value,
+        &[
+            "planned",
+            "previewing",
+            "needsRevision",
+            "awaitingApproval",
+            "authorized",
+            "running",
+            "completed",
+            "failed",
+            "unexecuted",
         ],
         field,
     )

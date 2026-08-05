@@ -747,12 +747,18 @@ async function projectionHttpFailure(
   projectionId: string
 ): Promise<{ code: string; message: string }> {
   try {
-    const envelope = objectRecord(await response.json());
-    const error = objectRecord(envelope?.error);
-    const code = error?.code;
-    const message = error?.message;
+    const envelope = exactObject(
+      await response.json(),
+      ['ok', 'error']
+    );
+    const error = exactObject(
+      envelope.error,
+      ['code', 'message']
+    );
+    const code = error.code;
+    const message = error.message;
     if (
-      envelope?.ok === false
+      envelope.ok === false
       && typeof code === 'string'
       && /^[a-z][a-z0-9_]{0,127}$/u.test(code)
       && typeof message === 'string'
@@ -762,7 +768,7 @@ async function projectionHttpFailure(
       return { code, message };
     }
   } catch {
-    // Preserve a typed local transport failure when Host returned no JSON.
+    // Preserve a typed local transport failure for non-v2 Host responses.
   }
   return response.status === 409
     ? {
@@ -1020,6 +1026,36 @@ function publicPresentation(
         },
       };
     }
+    case 'plan.commentaryReleased': {
+      const orderedItems = publicOrderedProviderItems(
+        data?.orderedItems
+      );
+      if (
+        orderedItems.length === 0
+        || orderedItems.some((item) =>
+          item.kind !== 'text' || item.phase !== 'commentary'
+        )
+      ) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_plan_commentary_invalid',
+          'Released Plan commentary must contain only sealed commentary text.'
+        );
+      }
+      return {
+        kind: 'assistant_msg',
+        channel: 'progress',
+        visibility: 'conversation',
+        fields: {
+          status: 'completed',
+          planRevision: textField(data, 'planRevision'),
+          providerTurnId: textField(data, 'providerTurnId'),
+          controlEpoch: data?.controlEpoch,
+          orderedItems,
+        },
+      };
+    }
+    case 'plan.confirmationReady':
+      return planConfirmationReadyPresentation(event, data);
     case 'scope.previewed':
       if (data?.kind === 'rejected') {
         return rejectedPlanScopePresentation(data);
@@ -1109,14 +1145,10 @@ function publicPresentation(
         visibility: 'both',
         fields: {
           reviewId: `kernel-v2-review:${String(data?.revision ?? 'unknown')}`,
-          status: data?.status === 'final'
-            ? 'completed'
-            : 'waitingUserReview',
+          status: 'completed',
           revision: data?.revision,
           snapshotHighWater: data?.snapshotHighWater,
-          summary: data?.status === 'final'
-            ? 'Review finalized from canonical Kernel facts.'
-            : 'Review updated from canonical Kernel facts.',
+          summary: 'Review finalized from canonical Kernel facts.',
           review: cloneJson(event.data),
         },
       };
@@ -1150,11 +1182,7 @@ function publicPresentation(
         data?.orderedItems
       );
       const orderedItems = outputKind === 'plan'
-        ? decodedOrderedItems.filter(
-            (item) =>
-              item.kind === 'text'
-              && item.phase === 'commentary'
-          )
+        ? []
         : decodedOrderedItems;
       const terminalScope = publicTerminalScope(data);
       if (terminalScope === undefined) {
@@ -1444,6 +1472,59 @@ function currentProjectionData(
       projectionEnum(data, 'decision', ['accept', 'reject', 'revise']);
       return data;
     }
+    case 'plan.commentaryReleased': {
+      const data = exactCurrentProjectionRecord(event, {
+        planRevision: 'identity',
+        providerTurnId: 'identity',
+        controlEpoch: 'positiveInteger',
+        orderedItems: 'array',
+        recordedAt: 'identity',
+      });
+      const orderedItems = publicOrderedProviderItems(data.orderedItems);
+      if (
+        orderedItems.length === 0
+        || orderedItems.some((item) =>
+          item.kind !== 'text' || item.phase !== 'commentary'
+        )
+      ) {
+        throw invalidCurrentProjectionData(
+          event.kind,
+          'orderedItems must contain only non-empty commentary text'
+        );
+      }
+      return data;
+    }
+    case 'plan.confirmationReady': {
+      const data = exactCurrentProjectionRecord(event, {
+        planRevision: 'identity',
+        providerTurnId: 'identity',
+        plan: 'object',
+        scopePreviews: 'array',
+        recordedAt: 'identity',
+      });
+      const plan = projectionObject(data, 'plan');
+      validateCurrentPlan(plan);
+      const planRevision = textField(plan, 'planRevision');
+      const previews = projectionArray(data, 'scopePreviews');
+      previews.forEach((preview, index) =>
+        validateCurrentScopePreview(
+          preview,
+          'scopePreviews[' + String(index) + ']'
+        )
+      );
+      if (
+        planRevision !== data.planRevision
+        || !planScopePreviewsComplete(plan, previews.map((preview) =>
+          projectionObject({ preview }, 'preview')
+        ))
+      ) {
+        throw invalidCurrentProjectionData(
+          event.kind,
+          'Plan and canonical previews are not fully settled for confirmation'
+        );
+      }
+      return data;
+    }
     case 'scope.previewed':
       return currentScopePreviewProjectionData(event);
     case 'provider.started':
@@ -1551,7 +1632,7 @@ function currentProjectionData(
           finalizedAt: 'identity',
         }
       );
-      projectionEnum(data, 'status', ['draft', 'final']);
+      projectionEnum(data, 'status', ['final']);
       return data;
     }
     case 'planAction.completed': {
@@ -2170,7 +2251,6 @@ function planScopePreviewPresentation(
   const objective = textField(plan, 'objective')
     ?? textField(plan, 'narrative')
     ?? 'Plan is ready for review.';
-  const confirmable = planScopePreviewsComplete(plan, previews);
   return {
     kind: 'plan_card',
     channel: 'task',
@@ -2181,8 +2261,66 @@ function planScopePreviewPresentation(
       title,
       summary: objective,
       userPlan: textField(plan, 'narrative'),
-      status: confirmable ? 'awaitingUserApproval' : 'running',
-      confirmable,
+      status: 'running',
+      confirmable: false,
+      tasks: planTasksWithScopePreviews(plan, previews),
+      scopePreviews: cloneJson(previews),
+      scopeApprovalView: {
+        planRevision,
+        previews: previews.map((preview) => ({
+          previewId: textField(preview, 'previewId'),
+          planActionId: textField(preview, 'planActionId'),
+          operationId: textField(preview, 'operationId'),
+          toolId: textField(preview, 'toolId'),
+          authorizationDigest:
+            textField(preview, 'authorizationDigest'),
+          approvalView: preview.approvalView === undefined
+            ? undefined
+            : cloneJson(preview.approvalView),
+        })),
+      },
+      readablePlan: readablePlanScopeApproval(
+        plan,
+        planId,
+        title,
+        objective,
+        previews
+      ),
+    },
+  };
+}
+
+function planConfirmationReadyPresentation(
+  event: SessionKernelProjectionEventV2,
+  data: Record<string, unknown> | undefined
+): ReturnType<typeof publicPresentation> {
+  const plan = objectRecord(data?.plan);
+  const previews = scopePreviewRecords(data);
+  const planRevision = textField(plan, 'planRevision')
+    ?? textField(data, 'planRevision');
+  const planId = planRevision ?? event.projectionId;
+  const title = textField(plan, 'title') ?? 'Plan';
+  const objective = textField(plan, 'objective')
+    ?? textField(plan, 'narrative')
+    ?? 'Plan is ready for review.';
+  if (!planScopePreviewsComplete(plan, previews)) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_plan_confirmation_incomplete',
+      'Plan confirmation requires one canonical scope preview for every PlanAction.'
+    );
+  }
+  return {
+    kind: 'plan_card',
+    channel: 'task',
+    visibility: 'both',
+    fields: {
+      planId,
+      planRevision,
+      title,
+      summary: objective,
+      userPlan: textField(plan, 'narrative'),
+      status: 'awaitingUserApproval',
+      confirmable: true,
       tasks: planTasksWithScopePreviews(plan, previews),
       scopePreviews: cloneJson(previews),
       scopeApprovalView: {

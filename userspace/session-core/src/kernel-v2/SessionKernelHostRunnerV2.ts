@@ -4,6 +4,7 @@ import {
   type SessionKernelLoopV2Options,
   type SessionKernelRunCancelInputV2,
   type SessionKernelRunCancelResultV2,
+  type SessionPlanConfirmationReadyResultV2,
 } from './SessionKernelLoopV2.js';
 import {
   sessionKernelLoopPortsFromHostV2,
@@ -234,6 +235,14 @@ export class SessionKernelHostRunnerV2 {
     );
   }
 
+  publishPlanConfirmationReady(
+    expectedPlanRevision: string
+  ): Promise<SessionPlanConfirmationReadyResultV2> {
+    return this.loop.publishPlanConfirmationReady(
+      expectedPlanRevision
+    );
+  }
+
   async decidePlan(input: {
     planRevision: string;
     decision: SessionPlanDecisionV2['decision'];
@@ -249,6 +258,7 @@ export class SessionKernelHostRunnerV2 {
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2> {
     const state = this.loop.snapshot();
+    requireAcceptedPlanRevision(state);
     requireExactPlanRevision(state, expectedPlanRevision);
     requirePlanActionUnsettled(state, planActionId);
     return this.runProviderTurn({

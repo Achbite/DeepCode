@@ -5144,6 +5144,8 @@ fn validate_projection_request(
         request.event.kind.as_str(),
         "plan.persisted"
             | "plan.decided"
+            | "plan.commentaryReleased"
+            | "plan.confirmationReady"
             | "input.persisted"
             | "scope.previewed"
             | "provider.started"
@@ -5547,6 +5549,8 @@ fn validate_private_projection_event_data(
             )?;
             require_private_enum(data, "decision", &["accept", "reject", "revise"])?;
         }
+        "plan.commentaryReleased" => validate_private_plan_commentary_released(data)?,
+        "plan.confirmationReady" => validate_private_plan_confirmation_ready(data)?,
         "scope.previewed" => validate_private_scope_projection(data)?,
         "provider.started" => {
             if data.contains_key("currentActivityCode") {
@@ -5777,7 +5781,7 @@ fn validate_private_projection_event_data(
                     "Review projectionVersion is not current",
                 ));
             }
-            require_private_enum(data, "status", &["draft", "final"])?;
+            require_private_enum(data, "status", &["final"])?;
         }
         "planAction.completed" => {
             validate_private_projection_fields(
@@ -6085,6 +6089,155 @@ fn validate_private_scope_projection(
             return Err(private_projection_data_invalid(
                 "Session private scope reply kind is not current",
             ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_plan_commentary_released(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        data,
+        &[
+            "planRevision",
+            "providerTurnId",
+            "controlEpoch",
+            "orderedItems",
+            "recordedAt",
+        ],
+        &[],
+        &["planRevision", "providerTurnId", "recordedAt"],
+        &[],
+        &["orderedItems"],
+        &[],
+        &["controlEpoch"],
+        &[],
+    )?;
+    let items = data
+        .get("orderedItems")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= 96)
+        .ok_or_else(|| {
+            private_projection_data_invalid(
+                "Released Plan commentary must contain a bounded non-empty item list",
+            )
+        })?;
+    for item in items {
+        let item = item.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Released Plan commentary item is not an object")
+        })?;
+        if item.len() != 3
+            || item.get("kind").and_then(Value::as_str) != Some("text")
+            || item.get("phase").and_then(Value::as_str) != Some("commentary")
+            || item
+                .get("text")
+                .and_then(Value::as_str)
+                .is_none_or(|text| text.is_empty() || text.len() > 1024 * 1024)
+        {
+            return Err(private_projection_data_invalid(
+                "Released Plan commentary item is not exact sealed commentary text",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_plan_confirmation_ready(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        data,
+        &[
+            "planRevision",
+            "providerTurnId",
+            "plan",
+            "scopePreviews",
+            "recordedAt",
+        ],
+        &[],
+        &["planRevision", "providerTurnId", "recordedAt"],
+        &[],
+        &["scopePreviews"],
+        &["plan"],
+        &[],
+        &[],
+    )?;
+    let plan = data
+        .get("plan")
+        .and_then(Value::as_object)
+        .expect("required Plan object");
+    validate_private_plan(plan)?;
+    let plan_revision = data
+        .get("planRevision")
+        .and_then(Value::as_str)
+        .expect("required Plan revision");
+    if plan.get("planRevision").and_then(Value::as_str) != Some(plan_revision) {
+        return Err(private_projection_data_invalid(
+            "Confirmation-ready Plan revision does not match its projection binding",
+        ));
+    }
+    let actions = plan
+        .get("actions")
+        .and_then(Value::as_array)
+        .expect("validated Plan actions");
+    let preview_values = data
+        .get("scopePreviews")
+        .and_then(Value::as_array)
+        .expect("required scope previews");
+    if actions.is_empty() || preview_values.len() != actions.len() {
+        return Err(private_projection_data_invalid(
+            "Confirmation-ready Plan requires one preview for every PlanAction",
+        ));
+    }
+    let mut preview_ids = HashSet::new();
+    let mut preview_operations = HashSet::new();
+    let mut previews = Vec::with_capacity(preview_values.len());
+    for preview in preview_values {
+        let preview = decode_private_scope_preview(preview, "scopePreviews")?;
+        if preview.plan_revision.as_str() != plan_revision
+            || !preview_ids.insert(preview.preview_id.as_str().to_string())
+            || !preview_operations.insert(preview.operation_id.as_str().to_string())
+        {
+            return Err(private_projection_data_invalid(
+                "Confirmation-ready scope previews are not uniquely bound to the Plan",
+            ));
+        }
+        previews.push(preview);
+    }
+    for action in actions {
+        let manifest = action
+            .get("manifest")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                private_projection_data_invalid("Confirmation-ready PlanAction manifest is missing")
+            })?;
+        let plan_action_id = manifest
+            .get("planActionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid("Confirmation-ready PlanAction identity is missing")
+            })?;
+        let operation_id = manifest
+            .get("operationId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid("Confirmation-ready operation identity is missing")
+            })?;
+        let tool_id = manifest
+            .get("toolId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid("Confirmation-ready tool identity is missing")
+            })?;
+        if !previews.iter().any(|preview| {
+            preview.plan_action_id.as_str() == plan_action_id
+                && preview.operation_id.as_str() == operation_id
+                && preview.tool_id.as_str() == tool_id
+        }) {
+            return Err(private_projection_data_invalid(
+                "Confirmation-ready PlanAction has no matching canonical scope preview",
+            ));
         }
     }
     Ok(())
@@ -6876,6 +7029,50 @@ fn validate_public_agent_event_payload(
                 "summary",
             ],
         ),
+        "plan.commentaryReleased" => (
+            &[
+                "status",
+                "planRevision",
+                "providerTurnId",
+                "controlEpoch",
+                "orderedItems",
+            ],
+            &[
+                "status",
+                "planRevision",
+                "providerTurnId",
+                "controlEpoch",
+                "orderedItems",
+            ],
+        ),
+        "plan.confirmationReady" => (
+            &[
+                "planId",
+                "planRevision",
+                "title",
+                "summary",
+                "userPlan",
+                "status",
+                "confirmable",
+                "tasks",
+                "scopePreviews",
+                "scopeApprovalView",
+                "readablePlan",
+            ],
+            &[
+                "planId",
+                "planRevision",
+                "title",
+                "summary",
+                "userPlan",
+                "status",
+                "confirmable",
+                "tasks",
+                "scopePreviews",
+                "scopeApprovalView",
+                "readablePlan",
+            ],
+        ),
         "scope.previewed" if event_kind == "plan_review" => (
             &[
                 "planId",
@@ -7229,12 +7426,23 @@ fn validate_public_agent_event_payload(
                         | (Some("revise"), Some("needsRevision"), "task")
                 )
         }
+        "plan.commentaryReleased" => {
+            event_kind == "assistant_msg"
+                && channel == "progress"
+                && visibility == "conversation"
+                && status == Some("completed")
+        }
+        "plan.confirmationReady" => {
+            event_kind == "plan_card"
+                && channel == "task"
+                && visibility == "both"
+                && status == Some("awaitingUserApproval")
+                && decision.is_none()
+        }
         "scope.previewed" => {
             visibility == "both"
                 && channel == "task"
-                && ((event_kind == "plan_card"
-                    && matches!(status, Some("running" | "awaitingUserApproval"))
-                    && decision.is_none())
+                && ((event_kind == "plan_card" && status == Some("running") && decision.is_none())
                     || (event_kind == "plan_review"
                         && status == Some("needsRevision")
                         && decision == Some("revise")))
@@ -7464,6 +7672,62 @@ fn validate_public_projection_payload_types(
                 ));
             }
         }
+        "plan.commentaryReleased" => {
+            for field in ["planRevision", "providerTurnId"] {
+                public_string(payload, field, true)?;
+            }
+            public_string(payload, "status", false)?;
+            public_integer(payload, "controlEpoch", true)?;
+            let ordered_items = payload
+                .get("orderedItems")
+                .expect("required released commentary items");
+            validate_public_ordered_items(ordered_items)?;
+            let items = ordered_items
+                .as_array()
+                .expect("validated released commentary items");
+            if items.is_empty()
+                || items.iter().any(|item| {
+                    item.get("kind").and_then(Value::as_str) != Some("text")
+                        || item.get("phase").and_then(Value::as_str) != Some("commentary")
+                })
+            {
+                return Err(public_projection_shape_invalid(
+                    "Released Plan commentary contains non-commentary Provider items",
+                ));
+            }
+        }
+        "plan.confirmationReady" => {
+            public_plan_fields(payload, true)?;
+            if !public_boolean(payload, "confirmable")? {
+                return Err(public_projection_shape_invalid(
+                    "Confirmation-ready Plan must be confirmable",
+                ));
+            }
+            let scope_previews = public_array(payload, "scopePreviews")?;
+            for preview in scope_previews {
+                validate_private_scope_preview(preview, "public.scopePreviews").map_err(|_| {
+                    public_projection_shape_invalid("Public scope preview is invalid")
+                })?;
+            }
+            if scope_previews.len() != public_array(payload, "tasks")?.len() {
+                return Err(public_projection_shape_invalid(
+                    "Confirmation-ready Plan requires one preview for every PlanAction",
+                ));
+            }
+            validate_public_scope_preview_bindings(payload, scope_previews)?;
+            validate_public_scope_approval_view(
+                payload
+                    .get("scopeApprovalView")
+                    .expect("required scope approval view"),
+                public_string(payload, "planRevision", true)?,
+                scope_previews,
+            )?;
+            validate_public_readable_plan(
+                payload.get("readablePlan").expect("required readable Plan"),
+                payload,
+                scope_previews,
+            )?;
+        }
         "scope.previewed" if event_kind == "plan_review" => {
             for field in ["planId", "planRevision", "operationId", "planActionId"] {
                 public_string(payload, field, true)?;
@@ -7480,6 +7744,11 @@ fn validate_public_projection_payload_types(
         }
         "scope.previewed" => {
             public_plan_fields(payload, true)?;
+            if public_boolean(payload, "confirmable")? {
+                return Err(public_projection_shape_invalid(
+                    "Scope preview cannot become confirmable before Host settlement",
+                ));
+            }
             let scope_previews = public_array(payload, "scopePreviews")?;
             for preview in scope_previews {
                 validate_private_scope_preview(preview, "public.scopePreviews").map_err(|_| {
@@ -7640,6 +7909,11 @@ fn validate_public_projection_payload_types(
             }
             public_integer(payload, "controlEpoch", true)?;
             if payload.contains_key("orderedItems") {
+                if payload.get("outputKind").and_then(Value::as_str) == Some("plan") {
+                    return Err(public_projection_shape_invalid(
+                        "Planning completion cannot publish Provider text before confirmation settlement",
+                    ));
+                }
                 validate_public_ordered_items(
                     payload.get("orderedItems").expect("present ordered items"),
                 )?;

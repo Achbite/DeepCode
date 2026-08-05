@@ -746,9 +746,6 @@ function applyPublicRequestOutcome(
       );
       break;
     case 'factsQuery': {
-      const previousReview = state.review
-        ? JSON.stringify(state.review)
-        : undefined;
       const result = reconcileSessionKernelFactsPageV2(state, outcome.reply);
       staleSessionFinalAnswerForFactsDriftV3(result.state, now);
       host.replaceState(result.state);
@@ -763,9 +760,6 @@ function applyPublicRequestOutcome(
       if (reviewReady) {
         result.state.review = buildSessionKernelReviewV2(result.state, now);
       }
-      const reviewChanged =
-        result.state.review !== undefined
-        && JSON.stringify(result.state.review) !== previousReview;
       events.push(host.event(
         `${record.requestId}:facts`,
         'kernelFacts.reconciled',
@@ -825,18 +819,6 @@ function applyPublicRequestOutcome(
             details: fact.details,
           },
           fact.recordedAt
-        ));
-      }
-      if (
-        reviewReady
-        && reviewChanged
-        && result.state.review
-      ) {
-        events.push(host.event(
-          `${record.requestId}:review:${result.state.review.revision}`,
-          'review.revised',
-          result.state.review,
-          record.startedAt
         ));
       }
       if (result.waitChanged) {

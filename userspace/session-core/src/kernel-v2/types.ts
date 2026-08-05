@@ -784,6 +784,8 @@ export interface SessionKernelProjectionEventV2 {
   kind:
     | 'plan.persisted'
     | 'plan.decided'
+    | 'plan.commentaryReleased'
+    | 'plan.confirmationReady'
     | 'input.persisted'
     | 'scope.previewed'
     | 'provider.started'
