@@ -56,6 +56,10 @@ const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-request.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-reply.v2";
+const SESSION_KERNEL_HOST_PROJECTION_BATCH_REQUEST_V2_SCHEMA: &str =
+    "deepcode.session.kernel-host-projection-batch-request.v2";
+const SESSION_KERNEL_HOST_PROJECTION_BATCH_REPLY_V2_SCHEMA: &str =
+    "deepcode.session.kernel-host-projection-batch-reply.v2";
 const HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA: &str = "deepcode.host.session-prior-events-page.v2";
 const HOST_SESSION_PUBLIC_AGENT_EVENT_V2_SCHEMA: &str =
     "deepcode.host.session-public-agent-event.v2";
@@ -422,6 +426,30 @@ struct SessionKernelCompactToolContextV3 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionPlanConfirmationProjectionRefV2 {
+    projection_id: String,
+    projection_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionPlanConfirmationAuthorityV2 {
+    plan_revision: String,
+    provider_turn_id: String,
+    provider_response_digest: String,
+    control_epoch: u64,
+    tool_context_ref: ToolContextRefV2,
+    plan_digest: String,
+    scope_previews_digest: String,
+    authority_digest: String,
+    recorded_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commentary_projection: Option<SessionPlanConfirmationProjectionRefV2>,
+    confirmation_projection: SessionPlanConfirmationProjectionRefV2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionKernelCompactAuthorityV3 {
     run_id: String,
     workspace_binding_digest: String,
@@ -435,6 +463,8 @@ struct SessionKernelCompactAuthorityV3 {
     work_authority: Option<SessionWorkAuthorityV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_ref: Option<SessionProviderTurnRecordRefV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_confirmation: Option<SessionPlanConfirmationAuthorityV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_decision_ref: Option<SessionProviderTurnRecordRefV3>,
     previews: Value,
@@ -2909,8 +2939,20 @@ fn decode_compact_checkpoint_record(
         (Some(SessionWorkAuthorityV3::ContextRead { .. }), None, None) => {}
         _ => return Err(compact_checkpoint_authority_invalid()),
     }
+    if authority.plan_confirmation.is_some() && authority.plan_ref.is_none()
+        || authority.plan_decision_ref.is_some() && authority.plan_confirmation.is_none()
+    {
+        return Err(compact_checkpoint_authority_invalid());
+    }
     if let Some(plan_ref) = &authority.plan_ref {
         validate_record_ref(plan_ref, "planRef")?;
+    }
+    if let Some(plan_confirmation) = &authority.plan_confirmation {
+        validate_plan_confirmation_authority_v2(
+            plan_confirmation,
+            &authority.run_id,
+            authority.control_epoch,
+        )?;
     }
     if let Some(plan_decision_ref) = &authority.plan_decision_ref {
         validate_record_ref(plan_decision_ref, "planDecisionRef")?;
@@ -2963,6 +3005,83 @@ fn decode_compact_checkpoint_record(
         validate_compact_final_answer(final_answer, authority)?;
     }
     Ok(checkpoint)
+}
+
+fn validate_plan_confirmation_authority_v2(
+    authority: &SessionPlanConfirmationAuthorityV2,
+    run_id: &str,
+    control_epoch: u64,
+) -> Result<(), HostV2StorageError> {
+    for (field, value) in [
+        ("planRevision", authority.plan_revision.as_str()),
+        ("providerTurnId", authority.provider_turn_id.as_str()),
+        ("recordedAt", authority.recorded_at.as_str()),
+    ] {
+        validate_bounded_identity(value, field, 64 * 1024)?;
+    }
+    for (field, value) in [
+        (
+            "providerResponseDigest",
+            authority.provider_response_digest.as_str(),
+        ),
+        ("planDigest", authority.plan_digest.as_str()),
+        (
+            "scopePreviewsDigest",
+            authority.scope_previews_digest.as_str(),
+        ),
+        ("authorityDigest", authority.authority_digest.as_str()),
+        (
+            "toolContext.catalogDigest",
+            authority.tool_context_ref.catalog_digest.as_str(),
+        ),
+        (
+            "toolContext.contextDigest",
+            authority.tool_context_ref.context_digest.as_str(),
+        ),
+    ] {
+        validate_sha256_digest(value, field)?;
+    }
+    if authority.control_epoch != control_epoch
+        || authority.control_epoch == 0
+        || authority.control_epoch > MAX_SAFE_INTEGER_V3
+        || authority.tool_context_ref.context_version.get() == 0
+        || authority.tool_context_ref.context_version.get() > MAX_SAFE_INTEGER_V3
+    {
+        return Err(compact_checkpoint_authority_invalid());
+    }
+    let prefix = format!("run:{run_id}:plan:{}", authority.plan_revision);
+    validate_plan_confirmation_projection_ref_v2(
+        &authority.confirmation_projection,
+        &format!("{prefix}:confirmation-ready"),
+    )?;
+    if let Some(commentary) = &authority.commentary_projection {
+        validate_plan_confirmation_projection_ref_v2(
+            commentary,
+            &format!("{prefix}:commentary-ready"),
+        )?;
+    }
+    let mut value =
+        serde_json::to_value(authority).map_err(|_| compact_checkpoint_authority_invalid())?;
+    value
+        .as_object_mut()
+        .ok_or_else(compact_checkpoint_authority_invalid)?
+        .remove("authorityDigest");
+    if canonical_sha256(&value)? != authority.authority_digest {
+        return Err(compact_checkpoint_authority_invalid());
+    }
+    Ok(())
+}
+
+fn validate_plan_confirmation_projection_ref_v2(
+    projection: &SessionPlanConfirmationProjectionRefV2,
+    expected_projection_id: &str,
+) -> Result<(), HostV2StorageError> {
+    validate_bounded_identity(&projection.projection_id, "projectionId", 64 * 1024)?;
+    validate_sha256_digest(&projection.projection_digest, "projectionDigest")?;
+    if projection.projection_id != expected_projection_id {
+        return Err(compact_checkpoint_authority_invalid());
+    }
+    Ok(())
 }
 
 fn validate_compact_final_answer(
@@ -4176,6 +4295,22 @@ struct SessionKernelHostProjectionReplyV2 {
     replayed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionKernelHostProjectionBatchRequestV2 {
+    schema_version: String,
+    session_id: String,
+    host_run_id: String,
+    requests: Vec<SessionKernelHostProjectionRequestV2>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionKernelHostProjectionBatchReplyV2 {
+    schema_version: &'static str,
+    receipts: Vec<SessionKernelHostProjectionReplyV2>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct HostSessionPriorEventsPageQueryV2 {
@@ -4307,6 +4442,121 @@ impl SessionKernelProjectionSinkV2 {
             projection_id: request.projection_id,
             projection_digest: request.projection_digest,
             replayed,
+        })
+    }
+
+    fn publish_batch(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        capability: &RunCapabilityV2,
+        request: SessionKernelHostProjectionBatchRequestV2,
+    ) -> Result<SessionKernelHostProjectionBatchReplyV2, HostV2StorageError> {
+        if request.schema_version != SESSION_KERNEL_HOST_PROJECTION_BATCH_REQUEST_V2_SCHEMA
+            || request.session_id != session_id
+            || request.host_run_id != host_run_id
+            || request.requests.is_empty()
+            || request.requests.len() > 2
+            || request.requests.last().map(|item| item.event.kind.as_str())
+                != Some("plan.confirmationReady")
+            || (request.requests.len() == 2
+                && request.requests[0].event.kind != "plan.commentaryReleased")
+        {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_projection_batch_invalid",
+                "Atomic projection batches are limited to one ordered Plan confirmation boundary",
+            ));
+        }
+        let commentary_projection_id = request
+            .requests
+            .last()
+            .and_then(|item| item.event.data.get("commentaryProjectionId"))
+            .and_then(Value::as_str);
+        if (request.requests.len() == 2
+            && commentary_projection_id != Some(request.requests[0].projection_id.as_str()))
+            || (request.requests.len() == 1 && commentary_projection_id.is_some())
+        {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_projection_batch_invalid",
+                "Plan confirmation does not bind its exact preceding commentary projection",
+            ));
+        }
+        let mut projection_ids = HashSet::new();
+        for item in &request.requests {
+            validate_projection_request(item, session_id, host_run_id)?;
+            if !projection_ids.insert(item.projection_id.as_str()) {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_projection_batch_invalid",
+                    "Atomic projection batch identities must be unique",
+                ));
+            }
+        }
+        let run_id = request.requests[0].event.run_id.as_str();
+        if request
+            .requests
+            .iter()
+            .any(|item| item.event.run_id != run_id)
+        {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_projection_batch_invalid",
+                "Atomic projection batch events must belong to one Kernel Run",
+            ));
+        }
+        let active = self.active_runs.resolve(session_id, host_run_id)?;
+        if active.run_id != run_id {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_projection_run_mismatch",
+                "Session Kernel projection batch belongs to another Kernel Run",
+            ));
+        }
+        self.active_runs.authorize_host_run_transport(
+            session_id,
+            host_run_id,
+            run_id,
+            capability,
+        )?;
+        let path = self.projection_path(session_id, host_run_id)?;
+        let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
+        let (replayed, final_timeline) = with_storage_path_lock(&guard_path, || {
+            let (replayed, final_timeline) =
+                self.preflight_public_projection_batch(session_id, host_run_id, &request.requests)?;
+            for (item, was_replayed) in request.requests.iter().zip(&replayed) {
+                if !was_replayed {
+                    append_json_line_durable(
+                        &path,
+                        &serde_json::to_value(item).map_err(|error| {
+                            HostV2StorageError::invalid(
+                                "session_kernel_projection_record_invalid",
+                                format!("encode Host projection batch record: {error}"),
+                            )
+                        })?,
+                    )?;
+                }
+            }
+            for item in &request.requests {
+                self.publish_agent_event_locked(session_id, item)?;
+            }
+            self.publish_timeline_locked(
+                session_id,
+                request.requests.last().expect("validated non-empty batch"),
+                &final_timeline,
+            )?;
+            Ok((replayed, final_timeline))
+        })?;
+        let mut receipts = Vec::with_capacity(request.requests.len());
+        for (item, was_replayed) in request.requests.iter().zip(replayed) {
+            self.remember_projection(session_id, host_run_id, item)?;
+            receipts.push(SessionKernelHostProjectionReplyV2 {
+                schema_version: SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA,
+                projection_id: item.projection_id.clone(),
+                projection_digest: item.projection_digest.clone(),
+                replayed: was_replayed,
+            });
+        }
+        let _ = final_timeline;
+        Ok(SessionKernelHostProjectionBatchReplyV2 {
+            schema_version: SESSION_KERNEL_HOST_PROJECTION_BATCH_REPLY_V2_SCHEMA,
+            receipts,
         })
     }
 
@@ -4747,6 +4997,159 @@ impl SessionKernelProjectionSinkV2 {
             }
         }
         Ok(timeline)
+    }
+
+    fn preflight_public_projection_batch(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        requests: &[SessionKernelHostProjectionRequestV2],
+    ) -> Result<(Vec<bool>, Value), HostV2StorageError> {
+        let projection_path = self.projection_path(session_id, host_run_id)?;
+        let projection_values = read_bounded_json_lines(&projection_path)?;
+        let mut replayed = Vec::with_capacity(requests.len());
+        let mut projection_append_count = 0usize;
+        for request in requests {
+            let was_replayed =
+                projection_request_replayed(&projection_path, session_id, host_run_id, request)?;
+            if !was_replayed {
+                let value = serde_json::to_value(request).map_err(|error| {
+                    HostV2StorageError::invalid(
+                        "session_kernel_projection_record_invalid",
+                        format!("encode Host projection batch record: {error}"),
+                    )
+                })?;
+                preflight_projection_store_append(
+                    &projection_path,
+                    projection_values.len() + projection_append_count,
+                    &value,
+                )?;
+                projection_append_count += 1;
+            }
+            replayed.push(was_replayed);
+        }
+
+        let agent_path = public_agent_event_path(self.sessions_dir.as_ref(), session_id)?;
+        let agent_values = read_bounded_json_lines(&agent_path)?;
+        let mut agent_records = Vec::with_capacity(agent_values.len());
+        for value in agent_values {
+            agent_records.push(decode_public_agent_event_record(value, session_id)?);
+        }
+        let mut existing_batch_event_count = 0usize;
+        let mut agent_append_count = 0usize;
+        for request in requests {
+            let record = HostSessionPublicAgentEventRecordV2 {
+                schema_version: HOST_SESSION_PUBLIC_AGENT_EVENT_V2_SCHEMA.to_string(),
+                projection_id: request.projection_id.clone(),
+                projection_digest: request.projection_digest.clone(),
+                agent_event_digest: canonical_sha256(&request.agent_event)?,
+                agent_event: request.agent_event.clone(),
+            };
+            let event_id = public_agent_event_id(&record.agent_event)?;
+            let existing = agent_records.iter().find(|candidate| {
+                public_agent_event_id(&candidate.agent_event).ok() == Some(event_id)
+            });
+            if let Some(existing) = existing {
+                if existing != &record {
+                    return Err(HostV2StorageError::conflict(
+                        "session_kernel_public_event_identity_conflict",
+                        "Atomic Session public AgentEvent id has different durable content",
+                    ));
+                }
+                existing_batch_event_count += 1;
+            } else {
+                let value = serde_json::to_value(&record).map_err(|error| {
+                    HostV2StorageError::invalid(
+                        "session_kernel_public_event_invalid",
+                        format!("encode Session public AgentEvent batch record: {error}"),
+                    )
+                })?;
+                preflight_projection_store_append(
+                    &agent_path,
+                    agent_records.len() + agent_append_count,
+                    &value,
+                )?;
+                agent_append_count += 1;
+            }
+        }
+        let base_event_count = agent_records
+            .len()
+            .checked_sub(existing_batch_event_count)
+            .ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_public_event_history_corrupt",
+                    "Atomic Session public event prefix is inconsistent",
+                )
+            })? as u64;
+
+        let timeline_path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
+        let timeline_records = read_public_timeline_records(&timeline_path, session_id)?;
+        let batch_ids = requests
+            .iter()
+            .map(|request| request.projection_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut current = timeline_records
+            .iter()
+            .rev()
+            .find(|record| !batch_ids.contains(record.projection_id.as_str()))
+            .map(|record| record.timeline.clone());
+        for (index, request) in requests.iter().enumerate() {
+            let timeline = resolve_projection_timeline(session_id, request, current.as_ref())?;
+            validate_resolved_projection_digest(request, &timeline)?;
+            let expected_source_event_version = base_event_count
+                .checked_add(index as u64 + 1)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "session_kernel_public_event_limit",
+                        "Atomic Session public event version is exhausted",
+                    )
+                })?;
+            if timeline_u64(&timeline, "sourceEventVersion")? != expected_source_event_version
+                || timeline_u64(&timeline, "eventCount")? != expected_source_event_version
+            {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_event_gap",
+                    "Atomic Session public timeline does not cover the exact event prefix",
+                ));
+            }
+            if let Some(previous) = current.as_ref() {
+                if timeline_u64(&timeline, "revision")? <= timeline_u64(previous, "revision")? {
+                    return Err(HostV2StorageError::conflict(
+                        "session_kernel_public_timeline_stale",
+                        "Atomic Session public timeline cannot replace a newer snapshot",
+                    ));
+                }
+            }
+            current = Some(timeline);
+        }
+        let final_timeline = current.ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_projection_batch_invalid",
+                "Atomic projection batch did not produce a final timeline",
+            )
+        })?;
+        let final_request = requests.last().expect("validated non-empty batch");
+        let final_record = public_timeline_record(final_request, &final_timeline)?;
+        if let Some(existing) = timeline_records
+            .iter()
+            .find(|record| record.projection_id == final_request.projection_id)
+        {
+            if existing != &final_record {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_identity_conflict",
+                    "Atomic Session public timeline has different durable content",
+                ));
+            }
+        } else {
+            let value = serde_json::to_value(&final_record).map_err(|error| {
+                HostV2StorageError::invalid(
+                    "session_kernel_public_timeline_invalid",
+                    format!("encode Session public timeline batch record: {error}"),
+                )
+            })?;
+            preflight_projection_store_append(&timeline_path, timeline_records.len(), &value)?;
+        }
+        Ok((replayed, final_timeline))
     }
 
     fn preflight_public_projection_appends(
@@ -6155,8 +6558,13 @@ fn validate_private_plan_confirmation_ready(
             "scopePreviews",
             "recordedAt",
         ],
-        &[],
-        &["planRevision", "providerTurnId", "recordedAt"],
+        &["commentaryProjectionId"],
+        &[
+            "planRevision",
+            "providerTurnId",
+            "recordedAt",
+            "commentaryProjectionId",
+        ],
         &[],
         &["scopePreviews"],
         &["plan"],
@@ -9341,6 +9749,63 @@ pub(crate) async fn session_kernel_v2_projection_append(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session_kernel_projection_task_failed",
             "Session Kernel projection task failed",
+        ),
+    }
+}
+
+pub(crate) async fn session_kernel_v2_projection_batch_append(
+    State(state): State<AppState>,
+    Path((session_id, host_run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<SessionKernelHostProjectionBatchRequestV2>, JsonRejection>,
+) -> Response {
+    if !crate::session_metadata_v2::trusted_private_storage_origin(&headers) {
+        return v2_error_response(
+            StatusCode::FORBIDDEN,
+            "session_kernel_projection_origin_forbidden",
+            "Session Kernel v2 projection batches accept only trusted local clients",
+        );
+    }
+    let io_guard = crate::session_private_io_lock(&session_id)
+        .read_owned()
+        .await;
+    if let Some(response) = session_private_write_unavailable_response(&state, &session_id) {
+        return response;
+    }
+    let capability = match run_transport_capability(&headers) {
+        Ok(capability) => capability,
+        Err(error) => return storage_error_response(error),
+    };
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            let code = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                "session_kernel_projection_limit_exceeded"
+            } else {
+                "session_kernel_projection_batch_request_invalid"
+            };
+            return v2_error_response(
+                rejection.status(),
+                code,
+                "Session Kernel projection batch request body is invalid",
+            );
+        }
+    };
+    let sink = state.host_services.projection_v2.clone();
+    let write_session_id = session_id.clone();
+    let write_host_run_id = host_run_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _io_guard = io_guard;
+        sink.publish_batch(&write_session_id, &write_host_run_id, &capability, request)
+    })
+    .await
+    {
+        Ok(Ok(reply)) => v2_success_response(StatusCode::OK, &reply),
+        Ok(Err(error)) => storage_error_response(error),
+        Err(_) => v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_kernel_projection_batch_task_failed",
+            "Session Kernel projection batch task failed",
         ),
     }
 }

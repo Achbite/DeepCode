@@ -387,6 +387,9 @@ export class SessionKernelProviderTurnsV2 {
         ...state.pendingGuidance,
         ...(request.guidance ?? []),
       ]);
+      const pendingGuidanceAtDispatch = [
+        ...state.pendingGuidance,
+      ];
       const factProjection = projectSessionProviderFactsV2(
         state,
         request.target
@@ -652,7 +655,8 @@ export class SessionKernelProviderTurnsV2 {
           const admission = await this.admitProviderOutput(
             request,
             output,
-            providerTurnId
+            providerTurnId,
+            pendingGuidanceAtDispatch
           );
           result = admission.result;
           queuedToolIntents = admission.queuedToolIntents;
@@ -801,7 +805,8 @@ export class SessionKernelProviderTurnsV2 {
   private async admitProviderOutput(
     request: SessionProviderTurnRequestV2,
     output: SessionProviderTurnOutputV2,
-    providerTurnId: string
+    providerTurnId: string,
+    pendingGuidanceAtDispatch: readonly string[]
   ): Promise<{
     result: SessionKernelLoopResultV2;
     queuedToolIntents: boolean;
@@ -830,6 +835,13 @@ export class SessionKernelProviderTurnsV2 {
         'Recovered Provider response differs from the durable active reservation.'
       );
     }
+    const acknowledgedGuidance = new Set(
+      pendingGuidanceAtDispatch
+    );
+    acceptingState.pendingGuidance =
+      acceptingState.pendingGuidance.filter(
+        (guidance) => !acknowledgedGuidance.has(guidance)
+      );
     acceptingState.providerTurn.response = response;
     await this.host.saveCheckpoint();
 
@@ -1232,7 +1244,8 @@ export class SessionKernelProviderTurnsV2 {
     const admission = await this.admitProviderOutput(
       request,
       output,
-      turn.providerTurnId
+      turn.providerTurnId,
+      this.host.readState().pendingGuidance
     );
     if (admission.queuedToolIntents) return;
     if (output.kind === 'toolIntent') {

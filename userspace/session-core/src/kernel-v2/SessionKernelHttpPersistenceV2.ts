@@ -246,6 +246,7 @@ interface SessionKernelCompactCheckpointV3 {
     };
     workAuthority?: SessionWorkAuthorityV3;
     planRef?: SessionKernelPersistenceRecordRefV3;
+    planConfirmation?: import('./types.js').SessionPlanConfirmationAuthorityV2;
     planDecisionRef?: SessionKernelPersistenceRecordRefV3;
     previews: SessionKernelLoopStateV2['previews'];
     operationPlanActionBindings: Record<
@@ -1544,6 +1545,11 @@ export interface SessionKernelHostProjectionSinkV2 {
     event: SessionKernelProjectionEventV2,
     projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
   ): Promise<SessionKernelProjectionReceiptV2>;
+
+  publishBatch(
+    events: readonly SessionKernelProjectionEventV2[],
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+  ): Promise<SessionKernelProjectionReceiptV2[]>;
 }
 
 export class DurableSessionKernelProjectionV2
@@ -1573,17 +1579,61 @@ implements SessionKernelProjectionPortV2 {
     };
   }
 
+  async projectBatch(
+    events: readonly SessionKernelProjectionEventV2[]
+  ): Promise<SessionKernelProjectionReceiptV2[]> {
+    const batch = exactPlanConfirmationProjectionBatchV2(events);
+    for (const event of batch) {
+      await this.persistence.persistProjection(event);
+    }
+    if (!this.sink) {
+      return batch.map((event) => ({
+        projectionId: event.projectionId,
+        projectionDigest: sha256Hash(canonicalJson(event)),
+        delivered: false,
+      }));
+    }
+    const receipts = await this.sink.publishBatch(
+      batch.map(cloneJson),
+      () => this.projectionHistoryThrough(
+        batch[batch.length - 1]!.projectionId
+      )
+    );
+    for (const event of batch) {
+      await this.persistence.persistProjectionDelivered(event);
+    }
+    return receipts;
+  }
+
   async flushPending(runId: string): Promise<void> {
     if (!this.sink) return;
-    for (
-      const event
-      of await this.persistence.loadUndeliveredProjections(runId)
-    ) {
+    const pending = await this.persistence
+      .loadUndeliveredProjections(runId);
+    const consumed = new Set<string>();
+    for (const event of pending) {
+      if (consumed.has(event.projectionId)) continue;
+      const confirmation = event.kind === 'plan.commentaryReleased'
+        ? pending.find((candidate) =>
+            candidate.kind === 'plan.confirmationReady'
+            && objectRecord(candidate.data)?.commentaryProjectionId
+              === event.projectionId
+          )
+        : undefined;
+      if (confirmation) {
+        await this.projectBatch([event, confirmation]);
+        consumed.add(event.projectionId);
+        consumed.add(confirmation.projectionId);
+        continue;
+      }
+      if (event.kind === 'plan.commentaryReleased') {
+        continue;
+      }
       await this.sink.publish(
         cloneJson(event),
         () => this.projectionHistoryThrough(event.projectionId)
       );
       await this.persistence.persistProjectionDelivered(event);
+      consumed.add(event.projectionId);
     }
   }
 
@@ -1605,6 +1655,40 @@ implements SessionKernelProjectionPortV2 {
     return history.slice(0, index + 1);
   }
 
+}
+
+function exactPlanConfirmationProjectionBatchV2(
+  events: readonly SessionKernelProjectionEventV2[]
+): SessionKernelProjectionEventV2[] {
+  if (events.length < 1 || events.length > 2) {
+    throw new SessionKernelPersistenceError(
+      'session_kernel_projection_batch_invalid',
+      'Plan confirmation publication requires one confirmation event and at most one preceding commentary event.'
+    );
+  }
+  const batch = events.map(cloneJson);
+  const confirmation = batch[batch.length - 1]!;
+  const commentary = batch.length === 2 ? batch[0] : undefined;
+  const confirmationData = objectRecord(confirmation.data);
+  if (
+    confirmation.kind !== 'plan.confirmationReady'
+    || (commentary !== undefined
+      && commentary.kind !== 'plan.commentaryReleased')
+    || (commentary === undefined
+      && confirmationData?.commentaryProjectionId !== undefined)
+    || (commentary !== undefined
+      && confirmationData?.commentaryProjectionId
+        !== commentary.projectionId)
+    || new Set(batch.map((event) => event.projectionId)).size
+      !== batch.length
+  ) {
+    throw new SessionKernelPersistenceError(
+      'session_kernel_projection_batch_invalid',
+      'Plan commentary and confirmation events do not form one exact ordered authority boundary.'
+    );
+  }
+  batch.forEach(validateCurrentSessionKernelProjectionEventV2);
+  return batch;
 }
 
 const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
@@ -2686,7 +2770,12 @@ function decodeCompactCheckpointV3(
       'previews',
       'operationPlanActionBindings',
     ],
-    ['workAuthority', 'planRef', 'planDecisionRef'],
+    [
+      'workAuthority',
+      'planRef',
+      'planConfirmation',
+      'planDecisionRef',
+    ],
     'session_kernel_checkpoint_authority_invalid'
   );
   if (authority.runId !== runId) {
@@ -2863,6 +2952,13 @@ function decodeCompactCheckpointV3(
             planDecisionRef: decodeRecordRefV3(
               authority.planDecisionRef
             ),
+          }),
+      ...(authority.planConfirmation === undefined
+        ? {}
+        : {
+            planConfirmation: cloneJson(
+              authority.planConfirmation
+            ) as import('./types.js').SessionPlanConfirmationAuthorityV2,
           }),
       previews: cloneJson(authority.previews) as
         SessionKernelLoopStateV2['previews'],
@@ -3955,6 +4051,9 @@ function compactCheckpointFromStateV3(input: {
         ? { workAuthority: cloneJson(state.workAuthority) }
         : {}),
       ...(planRef ? { planRef } : {}),
+      ...(state.planConfirmation
+        ? { planConfirmation: cloneJson(state.planConfirmation) }
+        : {}),
       ...(planDecisionRef ? { planDecisionRef } : {}),
       previews: cloneJson(state.previews),
       operationPlanActionBindings: cloneJson(
@@ -4197,6 +4296,9 @@ function materializeCompactCheckpointV3(input: {
   state.checkpointRevision = checkpoint.checkpointRevision;
   state.workAuthority = cloneJson(
     checkpoint.authority.workAuthority
+  );
+  state.planConfirmation = cloneJson(
+    checkpoint.authority.planConfirmation
   );
   state.previews = cloneJson(checkpoint.authority.previews);
   state.operationPlanActionBindings = cloneJson(

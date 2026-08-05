@@ -63,6 +63,7 @@ import type {
   SessionKernelProjectionReceiptV2,
 } from './ports.js';
 import {
+  currentSessionPlanConfirmationAuthorityV2,
   currentSessionWorkAuthorityV3,
   sameSessionWorkAuthorityV3,
   type SessionKernelLoopStateV2,
@@ -273,6 +274,7 @@ export interface SessionKernelProductionStateSummaryV2 {
     status:
       | 'none'
       | 'pending'
+      | 'ready'
       | 'accepted'
       | 'rejected'
       | 'revisionRequested';
@@ -2736,6 +2738,13 @@ function productionContinuation(
       : readyToResumePlanning(state.pendingGuidance);
   }
   if (
+    state.finalAnswer?.status === 'pending'
+    || state.finalAnswer?.status === 'committed'
+    || state.finalAnswer?.status === 'finalAnswerFailed'
+  ) {
+    return continuationForFinalAnswerState(state);
+  }
+  if (
     outcome.kind === 'replanResult'
     && outcome.result.kind !== 'plan'
   ) {
@@ -2744,6 +2753,13 @@ function productionContinuation(
       state,
       planAction
     );
+  }
+  if (
+    state.plan
+    && state.planDecision?.planRevision === state.plan.planRevision
+    && state.planDecision.decision === 'reject'
+  ) {
+    return readyToDriveOrFinalize(state, undefined);
   }
   if (
     state.plan
@@ -2760,8 +2776,11 @@ function productionContinuation(
       kind: 'awaitingUserPlanConfirmation',
       planRevision: state.plan.planRevision,
       confirmationReady:
-        outcome.kind === 'planConfirmationReadyPublished'
-        && outcome.planRevision === state.plan.planRevision,
+        Boolean(currentSessionPlanConfirmationAuthorityV2(state))
+        || (
+          outcome.kind === 'planConfirmationReadyPublished'
+          && outcome.planRevision === state.plan.planRevision
+        ),
     };
   }
   if (
@@ -2922,7 +2941,9 @@ function summarizePlanConfirmation(
     || state.planDecision.planRevision !== state.plan.planRevision
   ) {
     return {
-      status: 'pending',
+      status: currentSessionPlanConfirmationAuthorityV2(state)
+        ? 'ready'
+        : 'pending',
       planRevision: state.plan.planRevision,
     };
   }
@@ -3436,7 +3457,13 @@ function readyToDriveOrFinalize(
   const workSettled = workAuthority?.kind === 'contextRead'
     || (
       workAuthority?.kind === 'plan'
-      && everyPlanActionSettled
+      && (
+        everyPlanActionSettled
+        || (
+          state.planDecision?.planRevision === plan?.planRevision
+          && state.planDecision?.decision === 'reject'
+        )
+      )
     );
   if (
     workAuthority

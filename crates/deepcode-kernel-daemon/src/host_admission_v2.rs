@@ -57,6 +57,7 @@ pub(crate) fn route_uses_specialized_transport(method: &Method, path: &str) -> b
     }
     path.starts_with("/api/agent/sessions/")
         && (path.ends_with("/kernel-v2/projections")
+            || path.ends_with("/kernel-v2/projection-batches")
             || path.ends_with("/kernel-v2/prior-events")
             || path.ends_with("/timeline")
             || path.ends_with("/timeline/stream"))

@@ -16,6 +16,7 @@ import {
 } from './lineage.js';
 import {
   createSessionToolContextStateV2,
+  toolContextRefV2,
   type SessionToolContextStateV2,
   validateSessionToolContextStateV2,
 } from './toolContext.js';
@@ -43,6 +44,8 @@ import {
   type SessionKernelReviewV2,
   type SessionRunCancellationV2,
   type SessionNaturalLanguagePlanV2,
+  type SessionPlanConfirmationAuthorityV2,
+  type SessionPlanConfirmationProjectionRefV2,
   type SessionPlanDecisionV2,
   type SessionProviderTurnRecordV2,
   type SessionProviderOutcomeRecordV2,
@@ -81,6 +84,7 @@ export interface SessionKernelLoopStateV2 {
   toolContext: SessionToolContextStateV2;
   workAuthority?: SessionWorkAuthorityV3;
   plan?: SessionNaturalLanguagePlanV2;
+  planConfirmation?: SessionPlanConfirmationAuthorityV2;
   planDecision?: SessionPlanDecisionV2;
   projectedPlanRevision?: string;
   projectedPlanDecisionKey?: string;
@@ -248,6 +252,18 @@ export function restoreSessionKernelLoopStateV2(
         'Checkpoint Plan decision does not bind the current Plan revision.'
       );
     }
+  }
+  if (state.planConfirmation) {
+    validateSessionPlanConfirmationAuthorityV2(
+      state.planConfirmation,
+      state
+    );
+  }
+  if (state.planDecision && !state.planConfirmation) {
+    throw new SessionKernelStateError(
+      'session_kernel_checkpoint_plan_confirmation_missing',
+      'A durable Plan decision requires its exact published confirmation authority.'
+    );
   }
   validateSessionWorkAuthorityV3(state.workAuthority, state);
   validateReviewWorkAuthorityV3(state.review, state);
@@ -439,6 +455,7 @@ export function recordSessionPlanV2(
     next.operationPlanActionBindings = {};
     next.previews = {};
     next.planDecision = undefined;
+    next.planConfirmation = undefined;
     next.projectedPlanDecisionKey = undefined;
     next.lineage.taskPlanActions = {};
     next.lineage.planActions = {};
@@ -491,23 +508,120 @@ export function recordSessionPlanDecisionV2(
     );
   }
   const next = cloneSessionKernelLoopStateV2(state);
-  if (
-    next.planDecision
-    && JSON.stringify(next.planDecision) !== JSON.stringify(decision)
-  ) {
+  if (next.planDecision) {
+    if (JSON.stringify(next.planDecision) !== JSON.stringify(decision)) {
+      throw new SessionKernelStateError(
+        'session_kernel_plan_decision_conflict',
+        `Plan revision ${decision.planRevision} already has a different durable decision.`
+      );
+    }
+    return next;
+  }
+  if (!currentSessionPlanConfirmationAuthorityV2(state)) {
     throw new SessionKernelStateError(
-      'session_kernel_plan_decision_conflict',
-      `Plan revision ${decision.planRevision} already has a different durable decision.`
+      'session_kernel_plan_confirmation_required',
+      'A trusted Plan decision requires the exact durable confirmation authority.'
     );
   }
   next.planDecision = cloneJson(decision);
   next.projectedPlanDecisionKey = undefined;
-  if (decision.decision !== 'accept' && decision.guidance) {
+  if (decision.decision === 'reject') {
+    next.pendingGuidance = [];
+  } else if (decision.decision === 'revise' && decision.guidance) {
     if (!next.pendingGuidance.includes(decision.guidance)) {
       next.pendingGuidance.push(decision.guidance);
     }
   }
   return next;
+}
+
+export function recordSessionPlanConfirmationAuthorityV2(
+  state: SessionKernelLoopStateV2,
+  authority: SessionPlanConfirmationAuthorityV2
+): SessionKernelLoopStateV2 {
+  validateSessionPlanConfirmationAuthorityV2(authority, state);
+  const next = cloneSessionKernelLoopStateV2(state);
+  if (
+    next.planConfirmation
+    && canonicalJson(next.planConfirmation) !== canonicalJson(authority)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_confirmation_conflict',
+      `Plan revision ${authority.planRevision} already has different confirmation authority.`
+    );
+  }
+  next.planConfirmation = cloneJson(authority);
+  return next;
+}
+
+export function buildSessionPlanConfirmationAuthorityV2(
+  state: SessionKernelLoopStateV2,
+  input: {
+    providerTurnId: string;
+    providerResponseDigest: string;
+    recordedAt: string;
+    commentaryProjection?: SessionPlanConfirmationProjectionRefV2;
+    confirmationProjection: SessionPlanConfirmationProjectionRefV2;
+  }
+): SessionPlanConfirmationAuthorityV2 {
+  const plan = state.plan;
+  if (!plan) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_confirmation_plan_missing',
+      'Plan confirmation authority requires the current persisted Plan.'
+    );
+  }
+  const scopePreviews = currentPlanScopePreviewsV2(state, plan);
+  const authorityWithoutDigest = {
+    planRevision: plan.planRevision,
+    providerTurnId: requiredIdentity(
+      input.providerTurnId,
+      'providerTurnId'
+    ),
+    providerResponseDigest: requiredDigestV2(
+      input.providerResponseDigest,
+      'providerResponseDigest'
+    ),
+    controlEpoch: state.controlEpoch,
+    toolContextRef: toolContextRefV2(state.toolContext.bundle),
+    planDigest: sha256Hash(canonicalJson(plan)),
+    scopePreviewsDigest: sha256Hash(canonicalJson(scopePreviews)),
+    recordedAt: input.recordedAt,
+    ...(input.commentaryProjection
+      ? { commentaryProjection: cloneJson(input.commentaryProjection) }
+      : {}),
+    confirmationProjection: cloneJson(input.confirmationProjection),
+  };
+  const authority: SessionPlanConfirmationAuthorityV2 = {
+    ...authorityWithoutDigest,
+    authorityDigest: sha256Hash(canonicalJson(authorityWithoutDigest)),
+  };
+  validateSessionPlanConfirmationAuthorityV2(authority, state);
+  return authority;
+}
+
+export function currentSessionPlanConfirmationAuthorityV2(
+  state: SessionKernelLoopStateV2
+): SessionPlanConfirmationAuthorityV2 | undefined {
+  const authority = state.planConfirmation;
+  if (!authority) return undefined;
+  validateSessionPlanConfirmationAuthorityV2(authority, state);
+  const plan = state.plan;
+  if (
+    !plan
+    || state.toolContext.refreshRequired
+    || authority.planRevision !== plan.planRevision
+    || authority.controlEpoch !== state.controlEpoch
+    || authority.planDigest !== sha256Hash(canonicalJson(plan))
+    || authority.scopePreviewsDigest !== sha256Hash(canonicalJson(
+      currentPlanScopePreviewsV2(state, plan)
+    ))
+    || canonicalJson(authority.toolContextRef)
+      !== canonicalJson(toolContextRefV2(state.toolContext.bundle))
+  ) {
+    return undefined;
+  }
+  return cloneJson(authority);
 }
 
 export function recordSessionUserInputV2(
@@ -552,6 +666,7 @@ export function recordSessionUserInputV2(
   );
   next.plan = undefined;
   next.workAuthority = undefined;
+  next.planConfirmation = undefined;
   next.planDecision = undefined;
   next.projectedPlanRevision = undefined;
   next.projectedPlanDecisionKey = undefined;
@@ -1326,6 +1441,132 @@ function validatePlanDecision(decision: SessionPlanDecisionV2): void {
   }
 }
 
+function validateSessionPlanConfirmationAuthorityV2(
+  authority: SessionPlanConfirmationAuthorityV2,
+  state: SessionKernelLoopStateV2
+): void {
+  requiredIdentity(authority.planRevision, 'planConfirmation.planRevision');
+  requiredIdentity(
+    authority.providerTurnId,
+    'planConfirmation.providerTurnId'
+  );
+  requiredDigestV2(
+    authority.providerResponseDigest,
+    'planConfirmation.providerResponseDigest'
+  );
+  positiveEpoch(authority.controlEpoch);
+  if (
+    !Number.isSafeInteger(authority.toolContextRef.contextVersion)
+    || authority.toolContextRef.contextVersion < 1
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_confirmation_context_invalid',
+      'Plan confirmation ToolContext version must be a positive safe integer.'
+    );
+  }
+  requiredDigestV2(
+    authority.toolContextRef.catalogDigest,
+    'planConfirmation.catalogDigest'
+  );
+  requiredDigestV2(
+    authority.toolContextRef.contextDigest,
+    'planConfirmation.contextDigest'
+  );
+  requiredDigestV2(authority.planDigest, 'planConfirmation.planDigest');
+  requiredDigestV2(
+    authority.scopePreviewsDigest,
+    'planConfirmation.scopePreviewsDigest'
+  );
+  requiredDigestV2(
+    authority.authorityDigest,
+    'planConfirmation.authorityDigest'
+  );
+  const recordedAt = Date.parse(authority.recordedAt);
+  if (
+    !Number.isFinite(recordedAt)
+    || new Date(recordedAt).toISOString() !== authority.recordedAt
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_confirmation_time_invalid',
+      'Plan confirmation recordedAt must be an ISO-compatible instant.'
+    );
+  }
+  const expectedPrefix = [
+    'run',
+    state.runId,
+    'plan',
+    authority.planRevision,
+  ].join(':');
+  validatePlanConfirmationProjectionRefV2(
+    authority.confirmationProjection,
+    `${expectedPrefix}:confirmation-ready`,
+    'confirmationProjection'
+  );
+  if (authority.commentaryProjection) {
+    validatePlanConfirmationProjectionRefV2(
+      authority.commentaryProjection,
+      `${expectedPrefix}:commentary-ready`,
+      'commentaryProjection'
+    );
+  }
+  const {
+    authorityDigest: _authorityDigest,
+    ...authorityWithoutDigest
+  } = authority;
+  if (
+    authority.authorityDigest
+      !== sha256Hash(canonicalJson(authorityWithoutDigest))
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_confirmation_digest_mismatch',
+      'Plan confirmation authority digest does not match its exact binding.'
+    );
+  }
+}
+
+function validatePlanConfirmationProjectionRefV2(
+  projection: SessionPlanConfirmationProjectionRefV2,
+  expectedProjectionId: string,
+  field: string
+): void {
+  if (projection.projectionId !== expectedProjectionId) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_confirmation_projection_mismatch',
+      `${field} does not bind the exact current Plan projection identity.`
+    );
+  }
+  requiredDigestV2(
+    projection.projectionDigest,
+    `planConfirmation.${field}.projectionDigest`
+  );
+}
+
+function currentPlanScopePreviewsV2(
+  state: SessionKernelLoopStateV2,
+  plan: SessionNaturalLanguagePlanV2
+): CapabilityScopePreviewRecordV2[] {
+  const contextRef = toolContextRefV2(state.toolContext.bundle);
+  return plan.actions.map((action) => {
+    const preview = state.previews[action.manifest.operationId];
+    if (
+      !preview
+      || preview.runId !== state.runId
+      || preview.controlEpoch !== state.controlEpoch
+      || preview.planRevision !== plan.planRevision
+      || preview.planActionId !== action.manifest.planActionId
+      || preview.operationId !== action.manifest.operationId
+      || preview.toolId !== action.manifest.toolId
+      || canonicalJson(preview.contextRef) !== canonicalJson(contextRef)
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_plan_confirmation_preview_mismatch',
+        'Plan confirmation authority requires every exact current canonical preview.'
+      );
+    }
+    return cloneJson(preview);
+  });
+}
+
 function validateUserInput(input: SessionUserInputRecordV2): void {
   requiredIdentity(input.inputId, 'inputId');
   requiredIdentity(input.opaqueInputRef, 'opaqueInputRef');
@@ -1387,6 +1628,16 @@ function requiredIdentity(value: string, field: string): string {
     throw new SessionKernelStateError(
       'session_kernel_state_identity_missing',
       `${field} must not be empty.`
+    );
+  }
+  return value;
+}
+
+function requiredDigestV2(value: string, field: string): string {
+  if (!/^sha256:[0-9a-f]{64}$/u.test(value)) {
+    throw new SessionKernelStateError(
+      'session_kernel_state_digest_invalid',
+      `${field} must be an exact lowercase SHA-256 digest.`
     );
   }
   return value;

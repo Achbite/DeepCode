@@ -168,7 +168,10 @@ export function canFinalizeSessionKernelReviewV2(
       && (
         state.planDecision?.planRevision
           !== workAuthority.planRevision
-        || state.planDecision.decision !== 'accept'
+        || (
+          state.planDecision.decision !== 'accept'
+          && state.planDecision.decision !== 'reject'
+        )
       )
     )
     || state.kernelWakeHint

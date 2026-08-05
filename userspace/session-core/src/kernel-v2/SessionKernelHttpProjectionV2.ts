@@ -47,6 +47,10 @@ export const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA =
   'deepcode.session.kernel-host-projection-request.v2' as const;
 export const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA =
   'deepcode.session.kernel-host-projection-reply.v2' as const;
+export const SESSION_KERNEL_HOST_PROJECTION_BATCH_REQUEST_V2_SCHEMA =
+  'deepcode.session.kernel-host-projection-batch-request.v2' as const;
+export const SESSION_KERNEL_HOST_PROJECTION_BATCH_REPLY_V2_SCHEMA =
+  'deepcode.session.kernel-host-projection-batch-reply.v2' as const;
 export const SESSION_KERNEL_PUBLIC_PROJECTION_V2_SCHEMA =
   'deepcode.session.kernel-public-projection.v2' as const;
 export const HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA =
@@ -99,6 +103,20 @@ export interface SessionKernelHostProjectionReplyV2 {
   replayed: boolean;
 }
 
+export interface SessionKernelHostProjectionBatchRequestV2 {
+  schemaVersion:
+    typeof SESSION_KERNEL_HOST_PROJECTION_BATCH_REQUEST_V2_SCHEMA;
+  sessionId: string;
+  hostRunId: string;
+  requests: SessionKernelHostProjectionRequestV2[];
+}
+
+export interface SessionKernelHostProjectionBatchReplyV2 {
+  schemaVersion:
+    typeof SESSION_KERNEL_HOST_PROJECTION_BATCH_REPLY_V2_SCHEMA;
+  receipts: SessionKernelHostProjectionReplyV2[];
+}
+
 interface HostSessionPriorEventsPageV2 {
   schemaVersion: typeof HOST_SESSION_PRIOR_EVENTS_PAGE_V2_SCHEMA;
   sessionId: string;
@@ -116,9 +134,17 @@ interface HostSessionPriorEventsPageV2 {
   pageDigest: string;
 }
 
+interface PreparedHostProjectionV2 {
+  projectionId: string;
+  eventDigest: string;
+  request: SessionKernelHostProjectionRequestV2;
+  timeline: AgentTimelineResult;
+}
+
 export class HttpSessionKernelHostProjectionSinkV2
 implements SessionKernelHostProjectionSinkV2 {
   private readonly endpoint: string;
+  private readonly batchEndpoint: string;
   private readonly priorEventsEndpoint: string;
   private readonly priorTimelineEndpoint: string;
   readonly #runCapability: string;
@@ -170,6 +196,14 @@ implements SessionKernelHostProjectionSinkV2 {
       encodeURIComponent(hostRunId),
       'kernel-v2/projections',
     ].join('/');
+    this.batchEndpoint = [
+      normalizeApiBase(apiBase),
+      'api/agent/sessions',
+      encodeURIComponent(sessionId),
+      'runs',
+      encodeURIComponent(hostRunId),
+      'kernel-v2/projection-batches',
+    ].join('/');
     this.priorEventsEndpoint = [
       normalizeApiBase(apiBase),
       'api/agent/sessions',
@@ -200,15 +234,25 @@ implements SessionKernelHostProjectionSinkV2 {
     return publication;
   }
 
+  async publishBatch(
+    events: readonly SessionKernelProjectionEventV2[],
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+  ): Promise<SessionKernelProjectionReceiptV2[]> {
+    const publication = this.publicationTail.then(() =>
+      this.publishBatchSerial(events, projectionHistory)
+    );
+    this.publicationTail = publication.then(
+      () => undefined,
+      () => undefined
+    );
+    return publication;
+  }
+
   private async publishSerial(
     event: SessionKernelProjectionEventV2,
     projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
   ): Promise<SessionKernelProjectionReceiptV2> {
-    assertNoTransportCapabilities(event);
-    const projectionId = requiredIdentity(
-      event.projectionId,
-      'projectionId'
-    );
+    const projectionId = requiredIdentity(event.projectionId, 'projectionId');
     const eventDigest = sha256Hash(canonicalJson(event));
     const replay = this.lastPublished?.projectionId === projectionId
       ? this.lastPublished
@@ -224,6 +268,72 @@ implements SessionKernelHostProjectionSinkV2 {
       this.currentTimeline = cloneJson(replay.timeline);
       return receipt;
     }
+    const prepared = await this.prepareProjectionRequest(
+      event,
+      projectionHistory
+    );
+    const receipt = await this.sendProjectionRequest(prepared.request);
+    this.commitPreparedProjection(prepared);
+    return receipt;
+  }
+
+  private async publishBatchSerial(
+    events: readonly SessionKernelProjectionEventV2[],
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+  ): Promise<SessionKernelProjectionReceiptV2[]> {
+    if (
+      events.length < 1
+      || events.length > 2
+      || events.at(-1)?.kind !== 'plan.confirmationReady'
+      || (events.length === 2
+        && events[0]?.kind !== 'plan.commentaryReleased')
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_batch_invalid',
+        'Only one exact ordered Plan confirmation boundary may use atomic projection publication.'
+      );
+    }
+    const history = await projectionHistory();
+    const prepared: PreparedHostProjectionV2[] = [];
+    for (const event of events) {
+      const index = history.findIndex(
+        (candidate) => candidate.projectionId === event.projectionId
+      );
+      if (index < 0) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_history_missing',
+          `Projection ${event.projectionId} is missing from its atomic history.`
+        );
+      }
+      prepared.push(await this.prepareProjectionRequest(
+        event,
+        () => Promise.resolve(history.slice(0, index + 1))
+      ));
+    }
+    const receipts = await this.sendProjectionBatchRequest(
+      prepared.map((item) => item.request)
+    );
+    const last = prepared.at(-1)!;
+    this.currentTimeline = cloneJson(last.timeline);
+    this.lastPublished = {
+      projectionId: last.projectionId,
+      eventDigest: last.eventDigest,
+      request: cloneJson(last.request),
+      timeline: cloneJson(last.timeline),
+    };
+    return receipts;
+  }
+
+  private async prepareProjectionRequest(
+    event: SessionKernelProjectionEventV2,
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+  ): Promise<PreparedHostProjectionV2> {
+    assertNoTransportCapabilities(event);
+    const projectionId = requiredIdentity(
+      event.projectionId,
+      'projectionId'
+    );
+    const eventDigest = sha256Hash(canonicalJson(event));
     const agentEvent = sessionKernelAgentEventV2(
       this.sessionId,
       event
@@ -316,15 +426,24 @@ implements SessionKernelHostProjectionSinkV2 {
       timelineUpdate,
     };
     assertNoTransportCapabilities(request);
-    const receipt = await this.sendProjectionRequest(request);
-    this.currentTimeline = cloneJson(timeline);
-    this.lastPublished = {
+    return {
       projectionId,
       eventDigest,
-      request: cloneJson(request),
-      timeline: cloneJson(timeline),
+      request,
+      timeline,
     };
-    return receipt;
+  }
+
+  private commitPreparedProjection(
+    prepared: PreparedHostProjectionV2
+  ): void {
+    this.currentTimeline = cloneJson(prepared.timeline);
+    this.lastPublished = {
+      projectionId: prepared.projectionId,
+      eventDigest: prepared.eventDigest,
+      request: cloneJson(prepared.request),
+      timeline: cloneJson(prepared.timeline),
+    };
   }
 
   private async sendProjectionRequest(
@@ -421,6 +540,100 @@ implements SessionKernelHostProjectionSinkV2 {
       projectionDigest,
       delivered: true,
     };
+  }
+
+  private async sendProjectionBatchRequest(
+    requests: SessionKernelHostProjectionRequestV2[]
+  ): Promise<SessionKernelProjectionReceiptV2[]> {
+    const request: SessionKernelHostProjectionBatchRequestV2 = {
+      schemaVersion:
+        SESSION_KERNEL_HOST_PROJECTION_BATCH_REQUEST_V2_SCHEMA,
+      sessionId: this.sessionId,
+      hostRunId: this.hostRunId,
+      requests: cloneJson(requests),
+    };
+    assertNoTransportCapabilities(request);
+    const encodedRequest = JSON.stringify(request);
+    if (
+      new TextEncoder().encode(encodedRequest).byteLength
+        > MAX_PROJECTION_REQUEST_UTF8_BYTES
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_limit_exceeded',
+        'Session v2 atomic projection request exceeds the Host transport limit.'
+      );
+    }
+    const response = await this.fetchImpl(this.batchEndpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-deepcode-run-capability': this.#runCapability,
+      },
+      body: encodedRequest,
+    });
+    if (!response.ok) {
+      const failure = await projectionHttpFailure(
+        response,
+        requests.at(-1)?.projectionId ?? 'projection-batch'
+      );
+      throw new SessionKernelProjectionTransportError(
+        failure.code,
+        failure.message
+      );
+    }
+    let envelope: Record<string, unknown>;
+    try {
+      envelope = exactObject(await response.json(), ['ok', 'data']);
+    } catch {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_batch_reply_invalid',
+        'Host returned an invalid atomic projection reply.'
+      );
+    }
+    let data: Record<string, unknown>;
+    try {
+      data = exactObject(envelope.data, ['schemaVersion', 'receipts']);
+    } catch {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_batch_reply_invalid',
+        'Host returned an invalid atomic projection reply.'
+      );
+    }
+    if (
+      envelope.ok !== true
+      || data.schemaVersion
+        !== SESSION_KERNEL_HOST_PROJECTION_BATCH_REPLY_V2_SCHEMA
+      || !Array.isArray(data.receipts)
+      || data.receipts.length !== requests.length
+    ) {
+      throw new SessionKernelProjectionTransportError(
+        'session_kernel_projection_batch_reply_invalid',
+        'Host atomic projection receipt count or schema is invalid.'
+      );
+    }
+    return data.receipts.map((value, index) => {
+      const receipt = exactObject(
+        value,
+        ['schemaVersion', 'projectionId', 'projectionDigest', 'replayed']
+      );
+      const expected = requests[index]!;
+      if (
+        receipt.schemaVersion !== SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA
+        || receipt.projectionId !== expected.projectionId
+        || receipt.projectionDigest !== expected.projectionDigest
+        || typeof receipt.replayed !== 'boolean'
+      ) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_batch_reply_invalid',
+          'Host atomic projection receipt does not match its ordered request.'
+        );
+      }
+      return {
+        projectionId: expected.projectionId,
+        projectionDigest: expected.projectionDigest,
+        delivered: true,
+      };
+    });
   }
 
   private priorEventsForProjection(): Promise<AgentEvent[]> {
@@ -1021,7 +1234,7 @@ function publicPresentation(
           summary: decision === 'accept'
             ? 'Plan accepted for scoped execution.'
             : decision === 'reject'
-              ? 'Plan rejected; replanning guidance recorded.'
+              ? 'Plan rejected; planned actions remain unexecuted.'
               : 'Plan revision requested; guidance recorded.',
         },
       };
@@ -1495,13 +1708,17 @@ function currentProjectionData(
       return data;
     }
     case 'plan.confirmationReady': {
-      const data = exactCurrentProjectionRecord(event, {
-        planRevision: 'identity',
-        providerTurnId: 'identity',
-        plan: 'object',
-        scopePreviews: 'array',
-        recordedAt: 'identity',
-      });
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          planRevision: 'identity',
+          providerTurnId: 'identity',
+          plan: 'object',
+          scopePreviews: 'array',
+          recordedAt: 'identity',
+        },
+        { commentaryProjectionId: 'identity' }
+      );
       const plan = projectionObject(data, 'plan');
       validateCurrentPlan(plan);
       const planRevision = textField(plan, 'planRevision');

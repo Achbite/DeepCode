@@ -2024,7 +2024,7 @@ fn prepare_agent_decision_v2(
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        .unwrap_or("User rejected the current Plan; produce a new Plan.")
+                        .unwrap_or("User rejected the current Plan; do not execute it.")
                         .to_string(),
                 ),
                 HostKernelPlanDecisionV2::Revise => Some(

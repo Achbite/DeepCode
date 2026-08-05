@@ -311,6 +311,30 @@ export interface SessionPlanDecisionV2 {
   recordedAt: string;
 }
 
+export interface SessionPlanConfirmationProjectionRefV2 {
+  projectionId: string;
+  projectionDigest: string;
+}
+
+/**
+ * Durable Session authority proving that the exact current Plan, canonical
+ * previews, sealed Provider response, and public confirmation boundary were
+ * committed together before a trusted user decision was admitted.
+ */
+export interface SessionPlanConfirmationAuthorityV2 {
+  planRevision: string;
+  providerTurnId: string;
+  providerResponseDigest: string;
+  controlEpoch: number;
+  toolContextRef: ToolContextRefV2;
+  planDigest: string;
+  scopePreviewsDigest: string;
+  authorityDigest: string;
+  recordedAt: string;
+  commentaryProjection?: SessionPlanConfirmationProjectionRefV2;
+  confirmationProjection: SessionPlanConfirmationProjectionRefV2;
+}
+
 export interface SessionUserInputRecordV2 {
   inputId: string;
   opaqueInputRef: string;

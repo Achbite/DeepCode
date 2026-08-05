@@ -32,9 +32,12 @@ import {
 } from './review.js';
 import {
   checkpointSessionKernelStateV2,
+  buildSessionPlanConfirmationAuthorityV2,
   cloneSessionKernelLoopStateV2,
   createSessionKernelLoopStateV2,
+  currentSessionPlanConfirmationAuthorityV2,
   currentSessionWorkAuthorityV3,
+  recordSessionPlanConfirmationAuthorityV2,
   recordSessionProviderOutcomeV2,
   recordSessionPlanDecisionV2,
   recordSessionPlanV2,
@@ -61,6 +64,7 @@ import type {
   SessionKernelReviewV2,
   SessionRunCancellationV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanConfirmationAuthorityV2,
   SessionPlanActionSettlementV2,
   SessionPlanDecisionV2,
   SessionProviderTurnRequestV2,
@@ -366,6 +370,42 @@ export class SessionKernelLoopV2 {
           `Plan revision ${input.planRevision} is not the current persisted Plan.`
         );
       }
+      const guidance = input.guidance;
+      const existing = this.state.planDecision
+        ?? (
+          this.pendingPlanDecision?.planRevision === input.planRevision
+            ? this.pendingPlanDecision
+            : undefined
+        );
+      if (existing) {
+        if (
+          existing.planRevision !== input.planRevision
+          || existing.decision !== input.decision
+          || (existing.guidance ?? undefined) !== (guidance || undefined)
+        ) {
+          throw new SessionKernelLoopError(
+            'session_kernel_plan_decision_conflict',
+            `Plan revision ${input.planRevision} already has a different immutable decision attempt.`
+          );
+        }
+        if (!this.state.planDecision) {
+          await this.ports.persistence.persistPlanDecision(existing);
+          this.state = recordSessionPlanDecisionV2(
+            this.state,
+            existing
+          );
+          this.pendingPlanDecision = undefined;
+          await this.saveCheckpoint();
+        }
+        await this.ensurePlanDecisionProjected();
+        return cloneJson(existing);
+      }
+      if (!currentSessionPlanConfirmationAuthorityV2(this.state)) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_confirmation_required',
+          'The exact current Plan confirmation boundary must be durably published before a trusted decision.'
+        );
+      }
       if (
         input.decision === 'accept'
         && (
@@ -401,36 +441,6 @@ export class SessionKernelLoopV2 {
           'session_kernel_plan_scope_preview_required',
           'Every PlanAction must have a canonical Kernel scope preview before Plan acceptance.'
         );
-      }
-      const guidance = input.guidance;
-      const existing = this.state.planDecision
-        ?? (
-          this.pendingPlanDecision?.planRevision === input.planRevision
-            ? this.pendingPlanDecision
-            : undefined
-        );
-      if (existing) {
-        if (
-          existing.planRevision !== input.planRevision
-          || existing.decision !== input.decision
-          || (existing.guidance ?? undefined) !== (guidance || undefined)
-        ) {
-          throw new SessionKernelLoopError(
-            'session_kernel_plan_decision_conflict',
-            `Plan revision ${input.planRevision} already has a different immutable decision attempt.`
-          );
-        }
-        if (!this.state.planDecision) {
-          await this.ports.persistence.persistPlanDecision(existing);
-          this.state = recordSessionPlanDecisionV2(
-            this.state,
-            existing
-          );
-          this.pendingPlanDecision = undefined;
-          await this.saveCheckpoint();
-        }
-        await this.ensurePlanDecisionProjected();
-        return cloneJson(existing);
       }
       const decision: SessionPlanDecisionV2 = {
         planRevision: input.planRevision,
@@ -541,16 +551,38 @@ export class SessionKernelLoopV2 {
           'Plan confirmation publication cannot follow a durable Plan decision.'
         );
       }
+      const existingAuthority =
+        currentSessionPlanConfirmationAuthorityV2(this.state);
+      if (existingAuthority) {
+        return planConfirmationReadyResultV2(existingAuthority);
+      }
       const plan = this.state.plan!;
+      if (this.state.toolContext.refreshRequired) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_confirmation_context_stale',
+          'Plan confirmation cannot publish while ToolContext refresh is required.'
+        );
+      }
+      const currentContextRef = toolContextRefV2(
+        this.state.toolContext.bundle
+      );
       const scopePreviews = plan.actions.map((action) => {
         const preview =
           this.state.previews[action.manifest.operationId];
         if (
           !preview
+          || preview.runId !== this.state.runId
+          || preview.controlEpoch !== this.state.controlEpoch
           || preview.planRevision !== expectedPlanRevision
           || preview.planActionId !== action.manifest.planActionId
           || preview.operationId !== action.manifest.operationId
           || preview.toolId !== action.manifest.toolId
+          || preview.contextRef.contextVersion
+            !== currentContextRef.contextVersion
+          || preview.contextRef.catalogDigest
+            !== currentContextRef.catalogDigest
+          || preview.contextRef.contextDigest
+            !== currentContextRef.contextDigest
         ) {
           throw new SessionKernelLoopError(
             'session_kernel_plan_confirmation_preview_incomplete',
@@ -569,6 +601,7 @@ export class SessionKernelLoopV2 {
       if (
         !providerTurn
         || providerTurn.target.kind !== 'planning'
+        || providerTurn.controlEpoch !== this.state.controlEpoch
         || providerTurn.status !== 'completed'
         || !providerTurn.response
         || !providerOutcome
@@ -584,9 +617,9 @@ export class SessionKernelLoopV2 {
         item.kind === 'text' && item.phase === 'commentary'
       );
       const recordedAt = this.ports.clock.now();
-      const commentaryProjection = orderedItems.length === 0
+      const commentaryEvent = orderedItems.length === 0
         ? undefined
-        : await this.project(
+        : this.event(
             `plan:${expectedPlanRevision}:commentary-ready`,
             'plan.commentaryReleased',
             {
@@ -598,7 +631,7 @@ export class SessionKernelLoopV2 {
             },
             recordedAt
           );
-      const confirmationProjection = await this.project(
+      const confirmationEvent = this.event(
         `plan:${expectedPlanRevision}:confirmation-ready`,
         'plan.confirmationReady',
         {
@@ -606,17 +639,60 @@ export class SessionKernelLoopV2 {
           providerTurnId: providerTurn.providerTurnId,
           plan,
           scopePreviews,
+          ...(commentaryEvent
+            ? { commentaryProjectionId: commentaryEvent.projectionId }
+            : {}),
           recordedAt,
         },
         recordedAt
       );
-      return {
-        planRevision: expectedPlanRevision,
-        providerTurnId: providerTurn.providerTurnId,
-        recordedAt,
-        ...(commentaryProjection ? { commentaryProjection } : {}),
-        confirmationProjection,
-      };
+      const projectionReceipts = await this.ports.projection.projectBatch([
+        ...(commentaryEvent ? [commentaryEvent] : []),
+        confirmationEvent,
+      ]);
+      const commentaryProjection = commentaryEvent
+        ? requiredDeliveredProjectionReceiptV2(
+            projectionReceipts,
+            commentaryEvent.projectionId
+          )
+        : undefined;
+      const confirmationProjection = requiredDeliveredProjectionReceiptV2(
+        projectionReceipts,
+        confirmationEvent.projectionId
+      );
+      const authority = buildSessionPlanConfirmationAuthorityV2(
+        this.state,
+        {
+          providerTurnId: providerTurn.providerTurnId,
+          providerResponseDigest:
+            providerTurn.response.completion.responseDigest,
+          recordedAt,
+          ...(commentaryProjection
+            ? {
+                commentaryProjection: {
+                  projectionId: commentaryProjection.projectionId,
+                  projectionDigest: commentaryProjection.projectionDigest,
+                },
+              }
+            : {}),
+          confirmationProjection: {
+            projectionId: confirmationProjection.projectionId,
+            projectionDigest: confirmationProjection.projectionDigest,
+          },
+        }
+      );
+      const previousState = this.state;
+      this.state = recordSessionPlanConfirmationAuthorityV2(
+        previousState,
+        authority
+      );
+      try {
+        await this.saveCheckpoint();
+      } catch (error) {
+        this.state = previousState;
+        throw error;
+      }
+      return planConfirmationReadyResultV2(authority);
     } finally {
       this.endMaintenance();
     }
@@ -1186,7 +1262,7 @@ export class SessionKernelLoopV2 {
       }
       if (workAuthority.kind === 'plan') {
         this.requireCurrentPlanRevision(workAuthority.planRevision);
-        this.requireAcceptedPlan();
+        this.requireReviewablePlanDecision();
       }
       await this.reconcileFactsInternal();
       const review = finalizeSessionKernelReviewV2(
@@ -1638,6 +1714,25 @@ export class SessionKernelLoopV2 {
     }
   }
 
+  private requireReviewablePlanDecision(): void {
+    const plan = this.state.plan;
+    const decision = this.state.planDecision;
+    if (
+      !plan
+      || !decision
+      || decision.planRevision !== plan.planRevision
+      || (
+        decision.decision !== 'accept'
+        && decision.decision !== 'reject'
+      )
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_review_decision_required',
+        'The exact current Plan revision must be durably accepted or rejected before Review finalization.'
+      );
+    }
+  }
+
   private requireCurrentPlanRevision(
     expectedPlanRevision: string
   ): void {
@@ -1809,6 +1904,48 @@ export class SessionKernelLoopV2 {
       data: data === undefined ? null : data,
     };
   }
+}
+
+function requiredDeliveredProjectionReceiptV2(
+  receipts: readonly SessionKernelProjectionReceiptV2[],
+  projectionId: string
+): SessionKernelProjectionReceiptV2 {
+  const receipt = receipts.find(
+    (candidate) => candidate.projectionId === projectionId
+  );
+  if (
+    !receipt
+    || !receipt.delivered
+    || !/^sha256:[0-9a-f]{64}$/u.test(receipt.projectionDigest)
+  ) {
+    throw new SessionKernelLoopError(
+      'session_kernel_plan_confirmation_projection_unconfirmed',
+      `Plan confirmation projection ${projectionId} was not durably acknowledged by Host.`
+    );
+  }
+  return cloneJson(receipt);
+}
+
+function planConfirmationReadyResultV2(
+  authority: SessionPlanConfirmationAuthorityV2
+): SessionPlanConfirmationReadyResultV2 {
+  return {
+    planRevision: authority.planRevision,
+    providerTurnId: authority.providerTurnId,
+    recordedAt: authority.recordedAt,
+    ...(authority.commentaryProjection
+      ? {
+          commentaryProjection: {
+            ...cloneJson(authority.commentaryProjection),
+            delivered: true,
+          },
+        }
+      : {}),
+    confirmationProjection: {
+      ...cloneJson(authority.confirmationProjection),
+      delivered: true,
+    },
+  };
 }
 
 function validateRunCancelInput(

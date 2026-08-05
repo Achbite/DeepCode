@@ -88,13 +88,9 @@ pub(crate) async fn ask(
     let mut request = StartAgentRunRequest::ask(prompt, caller_request_id);
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
-    let (result, final_text, final_already_streamed) =
+    let (result, final_text) =
         match start_and_wait_for_run(client, &session_id, request, !plain).await? {
-            StartedRunOutcome::Settled {
-                result,
-                final_text,
-                final_already_streamed,
-            } => (result, final_text, final_already_streamed),
+            StartedRunOutcome::Settled { result, final_text } => (result, final_text),
             StartedRunOutcome::ActionRequired(message) => {
                 return Ok(CliCommandOutcome::ActionRequired(message));
             }
@@ -104,9 +100,7 @@ pub(crate) async fn ask(
         return Ok(CliCommandOutcome::Completed);
     }
     eprintln!("session: {}", result.run.session_id);
-    if !final_already_streamed {
-        println!("{final_text}");
-    }
+    println!("{final_text}");
     Ok(CliCommandOutcome::Completed)
 }
 
@@ -200,21 +194,15 @@ pub(crate) async fn resolve_session_decision(
     request.run_id = Some(pending.run_id);
     request.target_id = Some(pending.target_id);
     request.guidance = guidance;
-    let (result, final_text, final_already_streamed) =
+    let (result, final_text) =
         match start_and_wait_for_run(client, &session_id, request, true).await? {
-            StartedRunOutcome::Settled {
-                result,
-                final_text,
-                final_already_streamed,
-            } => (result, final_text, final_already_streamed),
+            StartedRunOutcome::Settled { result, final_text } => (result, final_text),
             StartedRunOutcome::ActionRequired(message) => {
                 return Ok(CliCommandOutcome::ActionRequired(message));
             }
         };
     eprintln!("session: {}", result.run.session_id);
-    if !final_already_streamed {
-        println!("{final_text}");
-    }
+    println!("{final_text}");
     Ok(CliCommandOutcome::Completed)
 }
 
@@ -222,7 +210,6 @@ enum StartedRunOutcome {
     Settled {
         result: AgentRunResult,
         final_text: String,
-        final_already_streamed: bool,
     },
     ActionRequired(String),
 }
@@ -528,13 +515,10 @@ async fn start_and_wait_for_run(
                                                 live_projection.report_refresh_error_once(&error);
                                             }
                                         }
-                                        Err(error) => {
-                                            live_projection.report_refresh_error_once(
-                                                &format!(
-                                                    "typed Run mapping is not available yet: {error}"
-                                                ),
-                                            );
-                                        }
+                                        // Admission has not returned the authoritative Run identity yet,
+                                        // so a newly observed timeline Run may not be durably mapped. The
+                                        // exact Host result is bound and validated immediately after admission.
+                                        Err(_) => {}
                                     },
                                     _ = wait_for_cli_interrupt() => {
                                         return Err(
@@ -810,12 +794,10 @@ async fn wait_for_started_run(
                 result.run.run_id
             )
         })?;
-    let final_already_streamed = live_projection.committed_final_was_streamed(&final_text);
     live_projection.finish_commentary_line()?;
     Ok(StartedRunOutcome::Settled {
         result: result.clone(),
         final_text,
-        final_already_streamed,
     })
 }
 
@@ -1040,11 +1022,9 @@ struct LiveProjectionCursor {
     live_turn_id: Option<String>,
     emit_updates: bool,
     block_text: std::collections::HashMap<String, String>,
-    emitted_block_text: std::collections::HashMap<String, String>,
     operation_state: std::collections::HashMap<String, String>,
     current_activity: Option<String>,
     commentary_line_open: bool,
-    open_text_role: Option<AgentTimelineEntryRole>,
     tty_updates: bool,
     replaceable_line_open: bool,
     refresh_error_reported: bool,
@@ -1116,14 +1096,12 @@ impl LiveProjectionCursor {
             live_turn_id: None,
             emit_updates,
             block_text: std::collections::HashMap::new(),
-            emitted_block_text: std::collections::HashMap::new(),
             operation_state: std::collections::HashMap::new(),
             current_activity: snapshot
                 .and_then(|snapshot| snapshot.run_projection.as_ref())
                 .and_then(|projection| projection.current_activity.0.as_ref())
                 .map(current_activity_key),
             commentary_line_open: false,
-            open_text_role: None,
             tty_updates: emit_updates && io::stderr().is_terminal(),
             replaceable_line_open: false,
             refresh_error_reported: false,
@@ -1338,51 +1316,6 @@ impl LiveProjectionCursor {
         ))
     }
 
-    fn committed_final_was_streamed(&self, final_text: &str) -> bool {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return false;
-        };
-        let Some(run) = snapshot.run_projection.as_ref() else {
-            return false;
-        };
-        if self.live_run_id.as_deref() != Some(run.run_id.as_str()) {
-            return false;
-        }
-        let Some(turn_id) = run.turn_id.as_deref() else {
-            return false;
-        };
-        let Some(turn) = snapshot.turns.iter().find(|turn| turn.id == turn_id) else {
-            return false;
-        };
-        let blocks = turn
-            .blocks
-            .iter()
-            .map(|block| (block.id.as_str(), block))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut streamed = String::new();
-        let mut found_final = false;
-        for part in &turn.parts {
-            let AgentTimelineTurnPart::Block { block_id } = part else {
-                continue;
-            };
-            let Some(block) = blocks.get(block_id.as_str()) else {
-                return false;
-            };
-            if block.entry_role != AgentTimelineEntryRole::FinalAnswer
-                || block.durability != AgentTimelineDurability::Committed
-            {
-                continue;
-            }
-            found_final = true;
-            let body = timeline_block_body_v2(block);
-            if self.emitted_block_text.get(block_id) != Some(&body) {
-                return false;
-            }
-            streamed.push_str(&body);
-        }
-        found_final && streamed.trim() == final_text.trim()
-    }
-
     fn accepts_unbound_projection(
         &self,
         snapshot: &AgentTimelineSnapshot,
@@ -1424,10 +1357,7 @@ impl LiveProjectionCursor {
 
     fn remember_turn(&mut self, turn: &deepcode_kernel_client::AgentTimelineTurn) {
         for block in &turn.blocks {
-            if matches!(
-                block.entry_role,
-                AgentTimelineEntryRole::AgentUpdate | AgentTimelineEntryRole::FinalAnswer
-            ) {
+            if block.entry_role == AgentTimelineEntryRole::AgentUpdate {
                 self.block_text
                     .insert(block.id.clone(), timeline_block_body_v2(block));
             }
@@ -1462,21 +1392,17 @@ impl LiveProjectionCursor {
                     let block = blocks.get(block_id.as_str()).ok_or_else(|| {
                         format!("typed Shared Projection v2 references missing block {block_id}")
                     })?;
-                    if !matches!(
-                        block.entry_role,
-                        AgentTimelineEntryRole::AgentUpdate | AgentTimelineEntryRole::FinalAnswer
-                    ) {
+                    if block.entry_role != AgentTimelineEntryRole::AgentUpdate
+                        || (block.provider_phase.is_none()
+                            && block.status == AgentTimelineStatus::Running)
+                    {
                         continue;
                     }
                     let next = timeline_block_body_v2(block);
                     let previous = self.block_text.get(block_id).cloned().unwrap_or_default();
                     if next.starts_with(&previous) && next.len() > previous.len() {
                         let suffix = &next[previous.len()..];
-                        if previous.is_empty()
-                            && self.commentary_line_open
-                            && !(block.entry_role == AgentTimelineEntryRole::FinalAnswer
-                                && self.open_text_role == Some(AgentTimelineEntryRole::FinalAnswer))
-                        {
+                        if previous.is_empty() && self.commentary_line_open {
                             self.finish_commentary_line()?;
                         }
                         self.clear_replaceable_line()?;
@@ -1485,16 +1411,6 @@ impl LiveProjectionCursor {
                             format!("failed to flush live Session commentary: {error}")
                         })?;
                         self.commentary_line_open = !next.ends_with('\n');
-                        self.open_text_role = self.commentary_line_open.then_some(block.entry_role);
-                        let emitted_prefix = self
-                            .emitted_block_text
-                            .get(block_id)
-                            .map(String::as_str)
-                            .unwrap_or_default();
-                        if previous.is_empty() || emitted_prefix == previous.as_str() {
-                            self.emitted_block_text
-                                .insert(block_id.clone(), next.clone());
-                        }
                     }
                     self.block_text.insert(block_id.clone(), next);
                 }
@@ -1577,7 +1493,6 @@ impl LiveProjectionCursor {
                 .flush()
                 .map_err(|error| format!("failed to finish live Session commentary: {error}"))?;
             self.commentary_line_open = false;
-            self.open_text_role = None;
         }
         self.clear_replaceable_line()?;
         Ok(())
