@@ -38,14 +38,12 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
       setProfiles([]);
       setDefaultProfileId(undefined);
       setLoadState('error');
-      onAvailabilityChange(false);
       return [];
     }
     if (!result.ok || !result.data) {
       setProfiles([]);
       setDefaultProfileId(undefined);
       setLoadState('error');
-      onAvailabilityChange(false);
       return [];
     }
     const enabledProfiles = result.data.profiles.filter(
@@ -62,19 +60,17 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         : undefined
     );
     setLoadState('ready');
-    onAvailabilityChange(enabledProfiles.length > 0);
     return enabledProfiles;
-  }, [onAvailabilityChange]);
+  }, []);
 
   useEffect(() => {
     if (apiStatus !== 'connected') {
       setLoadState(apiStatus === 'checking' ? 'loading' : 'error');
-      onAvailabilityChange(false);
       return;
     }
     setLoadState('loading');
     void loadProfiles();
-  }, [apiStatus, loadProfiles, onAvailabilityChange]);
+  }, [apiStatus, loadProfiles]);
 
   useEffect(() => {
     const onProfilesUpdated = () => {
@@ -87,11 +83,17 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
   }, [loadProfiles, refreshSessionProfile]);
 
-  const selectedProfileId = session?.profileId ?? defaultProfileId ?? '';
+  const selectedProfileId = session
+    ? session.profileId ?? ''
+    : defaultProfileId ?? '';
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
   );
+  const sessionProfileAvailable = Boolean(session?.profileId && selectedProfile);
+  useEffect(() => {
+    onAvailabilityChange(loadState === 'ready' && sessionProfileAvailable);
+  }, [loadState, onAvailabilityChange, sessionProfileAvailable]);
   const unavailable = loadState !== 'ready' || profiles.length === 0;
   const disabled = locked || profileSelectionBusy || unavailable || !session;
   const selectorTitle = locked
@@ -104,7 +106,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           ? t(language, 'agent.profile.unavailable')
           : selectedProfile
             ? profileLabel(selectedProfile)
-            : t(language, 'agent.profile.selector');
+            : t(language, 'agent.profile.selectionRequired');
 
   return (
     <div className="deepcode-session-model">
@@ -130,7 +132,9 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
                 ? t(language, 'agent.profile.loading')
                 : loadState === 'error'
                   ? t(language, 'agent.profile.loadFailed')
-                  : t(language, 'agent.profile.unavailable')}
+                  : profiles.length === 0
+                    ? t(language, 'agent.profile.unavailable')
+                    : t(language, 'agent.profile.selectionRequired')}
             </option>
           )}
           {profiles.map((profile) => (

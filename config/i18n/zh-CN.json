@@ -586,6 +586,7 @@
     "agent.profile.selector": "本会话使用的模型",
     "agent.profile.loading": "正在加载模型配置",
     "agent.profile.unavailable": "没有已启用的模型 Profile，无法发送消息",
+    "agent.profile.selectionRequired": "请先为本会话选择一个已启用的模型 Profile",
     "agent.profile.loadFailed": "无法读取模型 Profile",
     "agent.profile.locked": "当前运行或待确认事项尚未结束，不能切换模型",
     "agent.profile.updateFailed": "会话模型切换失败",

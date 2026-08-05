@@ -586,6 +586,7 @@
     "agent.profile.selector": "Model used by this session",
     "agent.profile.loading": "Loading model profiles",
     "agent.profile.unavailable": "No enabled model Profile is available, so messages cannot be sent",
+    "agent.profile.selectionRequired": "Select an enabled model Profile for this session before sending a message",
     "agent.profile.loadFailed": "Model Profiles could not be loaded",
     "agent.profile.locked": "The model cannot be changed while a run or interaction is pending",
     "agent.profile.updateFailed": "Session model update failed",

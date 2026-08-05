@@ -155,7 +155,14 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         />
       )}
       sendBlocked={!modelAvailable}
-      sendBlockedTitle={!modelAvailable ? t(language, 'agent.profile.unavailable') : undefined}
+      sendBlockedTitle={!modelAvailable
+        ? t(
+          language,
+          session && !session.profileId
+            ? 'agent.profile.selectionRequired'
+            : 'agent.profile.unavailable'
+        )
+        : undefined}
       pendingDecision={composerPendingDecision}
       onDecisionSubmit={(guidance, action) => {
         if (!composerPendingDecision) return;
