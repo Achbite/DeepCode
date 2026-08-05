@@ -15,7 +15,10 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Response, StatusCode};
 use axum::routing::post;
 use axum::Router;
+use deepcode_kernel_runtime::executors::{EmptySecretProvider, KernelExecutorConfig};
+use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener as StdTcpListener;
@@ -27,6 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+// Supporting development contracts only. These tests exercise durable
+// dispatch/fence behavior and owned-resource cleanup; real Provider CLI/GUI/TUI
+// conversations remain the acceptance path.
 
 struct TestRoot {
     path: PathBuf,
@@ -229,6 +236,10 @@ fn sha256_literal(fill: char) -> String {
     format!("sha256:{}", fill.to_string().repeat(64))
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 fn persistence_record(
     session_id: &str,
     run_id: &str,
@@ -356,6 +367,7 @@ fn checkpoint(
             "inputHistoryOmittedCount": 0,
             "providerTerminalRefs": [],
             "providerOutcomeHistoryOmittedCount": 0,
+            "reviewFactsAfterLedgerSequence": 0,
             "afterLedgerSequence": 0,
             "snapshotHighWater": 0,
         },
@@ -483,6 +495,7 @@ async fn create_test_session_store(
                 },
                 recorded_at: "2026-08-03T00:00:00Z".to_string(),
             },
+            Some(root.path.as_path()),
         )
         .expect("register test active Run");
     active_runs
@@ -537,6 +550,7 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
                 },
                 recorded_at: "2026-08-03T00:00:00Z".to_string(),
             },
+            Some(root.path.as_path()),
         )
         .expect("register test active Run");
     active_runs
@@ -545,6 +559,12 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
     drop(turn);
 
     let session_store = SessionKernelV2Store::new(root.path.clone(), active_runs);
+    let kernel_service = KernelSessionServiceV2::open(
+        root.path.join("kernel-v2.sqlite3"),
+        KernelExecutorConfig::default(),
+        Arc::new(EmptySecretProvider),
+    )
+    .expect("open test-owned canonical Kernel service");
     let registry = deepcode_kernel_tools::KernelToolRegistry::new();
     let tool_context = registry
         .tool_context_v2(
@@ -630,9 +650,8 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
         .expect("resolve Provider trace path");
     let profile = ResolvedLlmProfile {
         id: profile_id.clone(),
-        name: "Controlled Provider".to_string(),
         kind: "openaiCompatible".to_string(),
-        provider_flavor: None,
+        provider_flavor: Some("deepseek".to_string()),
         base_url: Some(provider.base_url.clone()),
         model: "controlled-model".to_string(),
         max_output_tokens: Some(1024),
@@ -673,7 +692,7 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
                 run_id: run_id.clone(),
                 user_turn_id: initial_input_id.clone(),
                 provider_turn_id: provider_turn_id.clone(),
-                provider_kind: "openaiCompatible".to_string(),
+                provider_kind: "deepseek".to_string(),
                 model: "controlled-model".to_string(),
                 profile_id: profile_id.clone(),
                 profile_revision: profile_revision.clone(),
@@ -682,6 +701,7 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
             },
             dispatch_authority: ProviderStreamDispatchAuthorityV1 {
                 session_store: session_store.clone(),
+                kernel_service,
                 run_capability: capability.clone(),
                 admission: captured_admission.clone(),
             },
@@ -1376,6 +1396,7 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
         current_input_digest: provider_input_digest,
         purpose: ProviderTracePurposeV1::Primary,
         plan_revision: None,
+        work_authority: admission.work_authority.clone(),
         review_revision: None,
         snapshot_high_water: None,
     };
@@ -1410,6 +1431,13 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
             content_type: Some("text/event-stream".to_string()),
         })
         .expect("archive Provider response boundary");
+    let reasoning = "controlled terminal reasoning";
+    trace
+        .append_normalized_event(json!({
+            "type": "reasoning_delta",
+            "content": reasoning,
+        }))
+        .expect("archive exact plaintext reasoning");
     trace
         .append_normalized_event(json!({
             "type": "validatedTerminal",
@@ -1420,7 +1448,7 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
             },
             "reasoningPresent": true,
             "reasoningTransport": "openaiPlaintext",
-            "reasoningDigest": sha256_literal('8'),
+            "reasoningDigest": sha256_bytes(reasoning.as_bytes()),
             "responseDigest": sha256_literal('9'),
             "providerResult": {
                 "providerProfileId": profile_id,

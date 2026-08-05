@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Real Host v2 integration behind the repository test controller."""
+"""Real Host v2 integration behind the repository test controller.
+
+This suite is supporting development evidence, not final product acceptance.
+Its fixed Provider instruction proves the real Provider -> Session -> Kernel v2
+ToolIntent -> canonical facts -> Provider continuation chain without replacing
+manual CLI/GUI/TUI experience validation.
+"""
 
 from __future__ import annotations
 
@@ -44,6 +50,20 @@ PROVIDER_REASONING = (
     * 12_000
 )
 CLI_PROMPT = "Return the controlled Host integration response through the CLI."
+CLI_TOOL_PROMPT = (
+    "Use the current fs.read tool to read README.md, then answer only after "
+    "the canonical tool result is available."
+)
+CLI_TOOL_FINAL_TEXT = (
+    "README.md was read through the real Session and Kernel v2 tool chain."
+)
+FIXED_TOOL_REASONING = (
+    "Use only the exposed read tool, then rely on canonical Kernel facts."
+)
+FIXED_TOOL_CALL_ID = "call-host-v2-read-readme"
+FIXED_TOOL_ID = "fs.read"
+FIXED_PROVIDER_TOOL_NAME = "dcv2_66732e72656164"
+FIXED_TOOL_ARGUMENTS = {"path": "README.md"}
 TEST_API_KEY = "host-v2-integration-key"
 EXEC_DAEMON_ARGUMENT = "--exec-owned-daemon"
 CLEANUP_OWNERS_ARGUMENT = "--cleanup-owned-resources"
@@ -294,62 +314,35 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
             return
         with server.request_lock:
             server.requests.append(request)
-        chunks = [
-            {
-                "id": "chatcmpl-host-v2-integration",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "host-v2-integration-model",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "reasoning_content": PROVIDER_REASONING,
-                        },
-                        "finish_reason": None,
-                    }
-                ],
-            },
-            {
-                "id": "chatcmpl-host-v2-integration",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "host-v2-integration-model",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": FINAL_TEXT},
-                        "finish_reason": None,
-                    }
-                ],
-            },
-            {
-                "id": "chatcmpl-host-v2-integration",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "host-v2-integration-model",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }
-                ],
-            },
-            {
-                "id": "chatcmpl-host-v2-integration",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "host-v2-integration-model",
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 8,
-                    "completion_tokens": 9,
-                    "total_tokens": 17,
-                },
-            },
-        ]
+        current_input = provider_current_input_text(request)
+        if current_input == CLI_TOOL_PROMPT:
+            if provider_current_input_target_kind(request) == "finalAnswer":
+                require(
+                    not request.get("tools"),
+                    "fixed finalAnswer request exposed Provider tools",
+                )
+                chunks = provider_final_chunks(
+                    CLI_TOOL_FINAL_TEXT,
+                    reasoning=FIXED_TOOL_REASONING,
+                )
+            elif provider_request_has_tool_result(request, FIXED_TOOL_CALL_ID):
+                chunks = provider_final_chunks(
+                    "README.md evidence is sufficient; no additional tool is needed.",
+                    reasoning=FIXED_TOOL_REASONING,
+                )
+            else:
+                require(
+                    provider_request_exposes_tool(
+                        request,
+                        FIXED_PROVIDER_TOOL_NAME,
+                    ),
+                    "fixed dispatch request omitted the current fs.read definition",
+                )
+                chunks = provider_tool_call_chunks(
+                    reasoning=FIXED_TOOL_REASONING,
+                )
+        else:
+            chunks = provider_final_chunks(FINAL_TEXT)
         frames = [
             b"data: "
             + json.dumps(chunk, separators=(",", ":")).encode("utf-8")
@@ -369,6 +362,239 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
+
+
+def provider_final_chunks(
+    text: str,
+    *,
+    reasoning: str = PROVIDER_REASONING,
+) -> list[dict[str, Any]]:
+    return [
+        provider_reasoning_chunk(
+            "chatcmpl-host-v2-integration",
+            reasoning=reasoning,
+        ),
+        {
+            "id": "chatcmpl-host-v2-integration",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "host-v2-integration-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": text},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-host-v2-integration",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "host-v2-integration-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        provider_usage_chunk(),
+    ]
+
+
+def provider_tool_call_chunks(
+    *,
+    reasoning: str = PROVIDER_REASONING,
+) -> list[dict[str, Any]]:
+    request_id = "chatcmpl-host-v2-integration-tool"
+    return [
+        provider_reasoning_chunk(request_id, reasoning=reasoning),
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "host-v2-integration-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": FIXED_TOOL_CALL_ID,
+                                "type": "function",
+                                "function": {
+                                    "name": FIXED_PROVIDER_TOOL_NAME,
+                                    "arguments": json.dumps(
+                                        FIXED_TOOL_ARGUMENTS,
+                                        separators=(",", ":"),
+                                    ),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "host-v2-integration-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+        provider_usage_chunk(request_id),
+    ]
+
+
+def provider_reasoning_chunk(
+    request_id: str,
+    *,
+    reasoning: str = PROVIDER_REASONING,
+) -> dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "host-v2-integration-model",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "reasoning_content": reasoning,
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+
+
+def provider_usage_chunk(
+    request_id: str = "chatcmpl-host-v2-integration",
+) -> dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "host-v2-integration-model",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 8,
+            "completion_tokens": 9,
+            "total_tokens": 17,
+        },
+    }
+
+
+def provider_current_input_payloads(
+    request: dict[str, Any],
+) -> list[dict[str, Any]]:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    current_inputs: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schemaVersion")
+            == "deepcode.session.provider-current-input.v2"
+        ):
+            current_inputs.append(payload)
+    return current_inputs
+
+
+def provider_current_input_text(request: dict[str, Any]) -> str | None:
+    current_inputs = provider_current_input_payloads(request)
+    if len(current_inputs) != 1:
+        return None
+    current_input = current_inputs[0].get("currentInput")
+    text = current_input.get("text") if isinstance(current_input, dict) else None
+    return text if isinstance(text, str) else None
+
+
+def provider_current_input_target_kind(
+    request: dict[str, Any],
+) -> str | None:
+    current_inputs = provider_current_input_payloads(request)
+    if len(current_inputs) != 1:
+        return None
+    target = current_inputs[0].get("target")
+    kind = target.get("kind") if isinstance(target, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
+def provider_canonical_fact_payloads(
+    request: dict[str, Any],
+) -> list[dict[str, Any]]:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    payloads: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schemaVersion")
+            == "deepcode.session.provider-canonical-facts.v2"
+        ):
+            payloads.append(payload)
+    return payloads
+
+
+def provider_request_has_tool_result(
+    request: dict[str, Any],
+    call_id: str,
+) -> bool:
+    messages = request.get("messages")
+    return isinstance(messages, list) and any(
+        isinstance(message, dict)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id") == call_id
+        and isinstance(message.get("content"), str)
+        and bool(message["content"].strip())
+        for message in messages
+    )
+
+
+def provider_request_exposes_tool(
+    request: dict[str, Any],
+    wire_name: str,
+) -> bool:
+    tools = request.get("tools")
+    return isinstance(tools, list) and any(
+        isinstance(tool, dict)
+        and tool.get("type") == "function"
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") == wire_name
+        for tool in tools
+    )
 
 
 class ProviderServer(http.server.ThreadingHTTPServer):
@@ -418,25 +644,7 @@ def assert_provider_received_current_input(
     request: dict[str, Any],
     expected_text: str,
 ) -> None:
-    messages = request.get("messages")
-    require(isinstance(messages, list), "Provider request omitted messages")
-    current_inputs: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
-            continue
-        if (
-            isinstance(payload, dict)
-            and payload.get("schemaVersion")
-            == "deepcode.session.provider-current-input.v2"
-        ):
-            current_inputs.append(payload)
+    current_inputs = provider_current_input_payloads(request)
     require(
         len(current_inputs) == 1,
         "Provider request did not contain one exact current-input envelope",
@@ -447,6 +655,104 @@ def assert_provider_received_current_input(
         and current_input.get("text") == expected_text,
         "Provider request changed or omitted the CLI instruction",
     )
+
+
+def assert_fixed_tool_provider_sequence(
+    initial: dict[str, Any],
+    continuation: dict[str, Any],
+    final_answer: dict[str, Any],
+) -> None:
+    assert_provider_received_current_input(initial, CLI_TOOL_PROMPT)
+    assert_provider_received_current_input(continuation, CLI_TOOL_PROMPT)
+    assert_provider_received_current_input(final_answer, CLI_TOOL_PROMPT)
+    require(
+        provider_current_input_target_kind(initial) == "planning"
+        and provider_current_input_target_kind(continuation) == "planning"
+        and provider_current_input_target_kind(final_answer) == "finalAnswer",
+        "fixed dispatch did not preserve planning continuation before bound finalAnswer",
+    )
+    require(
+        provider_request_exposes_tool(initial, FIXED_PROVIDER_TOOL_NAME)
+        and provider_request_exposes_tool(
+            continuation,
+            FIXED_PROVIDER_TOOL_NAME,
+        ),
+        "fixed planning requests did not expose the current fs.read definition",
+    )
+    require(
+        not provider_request_has_tool_result(initial, FIXED_TOOL_CALL_ID),
+        "initial fixed dispatch request already contained a tool result",
+    )
+    require(
+        provider_request_has_tool_result(continuation, FIXED_TOOL_CALL_ID),
+        "fixed planning continuation omitted the native tool result",
+    )
+    require(
+        not final_answer.get("tools")
+        and not provider_request_has_tool_result(
+            final_answer,
+            FIXED_TOOL_CALL_ID,
+        ),
+        "bound finalAnswer request exposed tools or raw native tool history",
+    )
+    for label, request in (
+        ("planning continuation", continuation),
+        ("bound finalAnswer", final_answer),
+    ):
+        fact_payloads = provider_canonical_fact_payloads(request)
+        require(
+            len(fact_payloads) == 1,
+            f"{label} omitted the canonical Kernel fact envelope",
+        )
+        facts = fact_payloads[0].get("facts")
+        require(
+            isinstance(facts, list),
+            f"{label} canonical Kernel fact envelope omitted facts",
+        )
+        completed = [
+            fact
+            for fact in facts
+            if isinstance(fact, dict)
+            and fact.get("factKind") == "toolCompleted"
+        ]
+        require(
+            len(completed) == 1,
+            f"{label} did not receive one canonical toolCompleted fact; "
+            f"safeSummary={json.dumps(fixed_tool_provider_request_summary(request), separators=(',', ':'))}",
+        )
+
+
+def fixed_tool_provider_request_summary(request: dict[str, Any]) -> dict[str, Any]:
+    fact_payloads = provider_canonical_fact_payloads(request)
+    fact_kinds = [
+        fact.get("factKind")
+        for payload in fact_payloads
+        for fact in (
+            payload.get("facts")
+            if isinstance(payload.get("facts"), list)
+            else []
+        )
+        if isinstance(fact, dict) and isinstance(fact.get("factKind"), str)
+    ]
+    messages = request.get("messages")
+    return {
+        "targetKind": provider_current_input_target_kind(request),
+        "toolCount": len(request.get("tools", []))
+        if isinstance(request.get("tools"), list)
+        else None,
+        "messageRoles": [
+            message.get("role")
+            for message in messages
+            if isinstance(message, dict)
+        ]
+        if isinstance(messages, list)
+        else None,
+        "hasNativeToolResult": provider_request_has_tool_result(
+            request,
+            FIXED_TOOL_CALL_ID,
+        ),
+        "canonicalFactKinds": fact_kinds,
+    }
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1435,90 @@ def _member_is_owned(
     return roots
 
 
+def _observe_owner_without_leader(
+    record: OwnerRecord,
+    initial_members: tuple[int, ...],
+    reason: str,
+) -> OwnerObservation:
+    try:
+        members = process_group_member_pids(record.process_group)
+        exact_owned = owned_member_pids(record)
+    except IntegrationFailure as error:
+        return OwnerObservation("unverifiable", safe_diagnostic(error), initial_members)
+    if exact_owned is None:
+        return OwnerObservation(
+            "unverifiable",
+            f"{reason}; exact owner-bound members are not fully readable",
+            members,
+        )
+    if record.leader_pid in members or record.leader_pid in exact_owned:
+        return OwnerObservation(
+            "unverifiable",
+            f"{reason}; leader identity raced with group re-enumeration",
+            members,
+        )
+    if not exact_owned:
+        return OwnerObservation(
+            "absent",
+            f"{reason}; no exact root/instance-bound process remains",
+            members,
+        )
+    if not members or not set(exact_owned).issubset(members):
+        return OwnerObservation(
+            "unverifiable",
+            f"{reason}; exact owner-bound processes remain outside the numeric group",
+            tuple(sorted(set((*members, *exact_owned)))),
+        )
+
+    observed_owned: list[int] = []
+    unrelated: list[int] = []
+    for pid in members:
+        try:
+            member = capture_process_identity(pid)
+        except ProcessLookupError:
+            return OwnerObservation(
+                "unverifiable",
+                f"{reason}; group membership changed during re-enumeration",
+                members,
+            )
+        except PermissionError:
+            return OwnerObservation(
+                "permissionDenied",
+                f"{reason}; orphan group member identity is not readable",
+                members,
+            )
+        except IntegrationFailure as error:
+            return OwnerObservation("unverifiable", safe_diagnostic(error), members)
+        owned = _member_is_owned(pid, member, record)
+        if owned is None:
+            return OwnerObservation(
+                "unverifiable",
+                f"{reason}; orphan group ownership is unverifiable",
+                members,
+            )
+        if owned:
+            observed_owned.append(pid)
+        else:
+            unrelated.append(pid)
+    if set(observed_owned) != set(exact_owned):
+        return OwnerObservation(
+            "unverifiable",
+            f"{reason}; owner-bound member evidence changed during observation",
+            members,
+        )
+    if unrelated:
+        return OwnerObservation(
+            "identityMismatch",
+            "owned and unrelated processes share the numeric PGID",
+            members,
+        )
+    return OwnerObservation(
+        "exactOwnedSignalable",
+        "leader exited but exact owned group members remain",
+        members,
+    )
+
+
 def observe_owner(record: OwnerRecord) -> OwnerObservation:
     if os.geteuid() != record.effective_uid:
         return OwnerObservation(
@@ -1166,10 +1556,10 @@ def observe_owner(record: OwnerRecord) -> OwnerObservation:
         else:
             current = None
         if current is None:
-            return OwnerObservation(
-                "unverifiable",
-                "leader disappeared during exact identity observation",
+            return _observe_owner_without_leader(
+                record,
                 members,
+                "leader disappeared during exact identity observation",
             )
         if not _identity_matches_record(current, record):
             return OwnerObservation("identityMismatch", "leader identity changed", members)
@@ -1219,48 +1609,10 @@ def observe_owner(record: OwnerRecord) -> OwnerObservation:
             members,
         )
 
-    owned_members = 0
-    unrelated_members = 0
-    for pid in members:
-        try:
-            member = capture_process_identity(pid)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            return OwnerObservation(
-                "permissionDenied",
-                "orphan group member is not readable",
-                members,
-            )
-        except IntegrationFailure as error:
-            return OwnerObservation("unverifiable", safe_diagnostic(error), members)
-        owned = _member_is_owned(pid, member, record)
-        if owned is None:
-            return OwnerObservation(
-                "unverifiable",
-                "orphan group ownership is unverifiable",
-                members,
-            )
-        if owned:
-            owned_members += 1
-        else:
-            unrelated_members += 1
-    if owned_members and unrelated_members:
-        return OwnerObservation(
-            "identityMismatch",
-            "owned and unrelated processes share the numeric PGID",
-            members,
-        )
-    if owned_members:
-        return OwnerObservation(
-            "exactOwnedSignalable",
-            "leader exited but exact owned group members remain",
-            members,
-        )
-    return OwnerObservation(
-        "absent",
-        "leader disappeared and numeric PGID belongs only to unrelated processes",
+    return _observe_owner_without_leader(
+        record,
         members,
+        "registered leader is absent from the numeric process group",
     )
 
 
@@ -1459,7 +1811,7 @@ def write_profile(config_root: pathlib.Path, provider_port: int) -> None:
                 "id": "host-v2-integration-profile",
                 "name": "Host v2 integration",
                 "kind": "openaiCompatible",
-                "providerFlavor": "generic",
+                "providerFlavor": "openai",
                 "reasoningTransport": "openaiPlaintext",
                 "thinking": "enabled",
                 "baseUrl": f"http://127.0.0.1:{provider_port}/v1",
@@ -1767,10 +2119,16 @@ def wait_for_owner_change(
     deadline = time.monotonic() + timeout
     while True:
         observation = observe_owner(record)
-        if observation.state != "exactOwnedSignalable":
+        if observation.state == "absent":
             return observation
-        if _maybe_reap_exact_zombie(record, observation, process):
+        if observation.state == "exactOwnedSignalable" and _maybe_reap_exact_zombie(
+            record,
+            observation,
+            process,
+        ):
             continue
+        if observation.state in ("identityMismatch", "permissionDenied"):
+            return observation
         if time.monotonic() >= deadline:
             return observation
         time.sleep(0.05)
@@ -1859,7 +2217,7 @@ def request_owned_host_shutdown(owned: OwnedDaemon) -> None:
         owned.base_url,
         "POST",
         "/api/host/shutdown",
-        payload={},
+        payload={"expectedIdentity": identity_body["data"]},
         host_capability=owned.host_capability,
     )
     data = require_api_ok(status, body, "Host shutdown")
@@ -2086,6 +2444,25 @@ def create_session(daemon: OwnedDaemon) -> str:
         and session.get("kernelAbiVersion") == ABI_VERSION,
         "Session metadata did not use the v2 contract",
     )
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    status, body = request_json(
+        daemon.base_url,
+        "PATCH",
+        f"/api/agent/sessions/{encoded_session_id}",
+        payload={"profileId": "host-v2-integration-profile"},
+        host_capability=daemon.host_capability,
+    )
+    bound = require_api_ok(status, body, "Session Profile binding")
+    require(isinstance(bound, dict), "Session Profile binding returned invalid data")
+    bound_session = bound.get("session")
+    if not isinstance(bound_session, dict):
+        bound_session = bound
+    require(
+        isinstance(bound_session, dict)
+        and bound_session.get("id") == session_id
+        and bound_session.get("profileId") == "host-v2-integration-profile",
+        "Session did not retain the exact controlled Provider Profile",
+    )
     return session_id
 
 
@@ -2120,7 +2497,7 @@ def kernel_fact_store(config_root: pathlib.Path) -> pathlib.Path:
 
 
 def host_operation_store(config_root: pathlib.Path) -> pathlib.Path:
-    return config_root / "sessions" / ".host-v2" / "host-kernel-v2.sqlite3"
+    return config_root / "sessions" / ".host-v3" / "host-kernel-v3.sqlite3"
 
 
 def query_host_operation_snapshot(
@@ -2314,13 +2691,168 @@ def canonical_run_snapshot(
     )
 
 
-def read_stable_kernel_v3_run_store(
+def require_fixed_read_canonical_facts(
+    config_root: pathlib.Path,
+    snapshot: CanonicalRunSnapshot,
+    expected_bytes: int,
+) -> None:
+    database = kernel_fact_store(config_root)
+    try:
+        with sqlite3.connect(
+            f"file:{database}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        ) as connection:
+            rows = connection.execute(
+                "SELECT ledger_sequence, envelope_json FROM kernel_facts "
+                "WHERE run_id = ?1 ORDER BY ledger_sequence",
+                (snapshot.run_id,),
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise IntegrationFailure(
+            f"fixed read canonical fact query failed: {safe_diagnostic(error)}"
+        ) from error
+
+    decoded: list[tuple[int, dict[str, Any]]] = []
+    for sequence, envelope_json in rows:
+        try:
+            envelope = json.loads(envelope_json)
+            fact = envelope["payload"]["fact"]
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise IntegrationFailure(
+                "fixed read canonical fact envelope is invalid"
+            ) from error
+        require(isinstance(fact, dict), "fixed read fact payload is invalid")
+        decoded.append((int(sequence), fact))
+
+    admitted = [
+        (sequence, fact)
+        for sequence, fact in decoded
+        if fact.get("kind") == "toolIntentAdmitted"
+        and isinstance(fact.get("data"), dict)
+        and fact["data"].get("toolId") == FIXED_TOOL_ID
+    ]
+    completed = [
+        (sequence, fact)
+        for sequence, fact in decoded
+        if fact.get("kind") == "toolCompleted"
+        and isinstance(fact.get("data"), dict)
+        and isinstance(fact["data"].get("output"), dict)
+    ]
+    observed = [
+        (sequence, fact)
+        for sequence, fact in decoded
+        if isinstance(fact.get("kind"), str)
+        and fact["kind"].startswith("toolObserved")
+    ]
+    require(
+        len(admitted) == 1 and len(completed) == 1 and len(observed) == 1,
+        "fixed fs.read did not produce one admitted, observed, and completed fact; "
+        + json.dumps(
+            {
+                "factKinds": [fact.get("kind") for _, fact in decoded],
+                "admittedCount": len(admitted),
+                "observedCount": len(observed),
+                "completedCount": len(completed),
+                "completedOutputs": [
+                    {
+                        "payloadKind": data.get("output", {})
+                        .get("payload", {})
+                        .get("kind"),
+                        "truncationKind": data.get("output", {})
+                        .get("truncation", {})
+                        .get("kind"),
+                    }
+                    for _, fact in decoded
+                    for data in [fact.get("data")]
+                    if fact.get("kind") == "toolCompleted"
+                    and isinstance(data, dict)
+                    and isinstance(data.get("output"), dict)
+                ],
+            },
+            separators=(",", ":"),
+        ),
+    )
+    admitted_sequence, admitted_fact = admitted[0]
+    observed_sequence, observed_fact = observed[0]
+    completed_sequence, completed_fact = completed[0]
+    admitted_lineage = admitted_fact["data"].get("identity")
+    observed_data = observed_fact.get("data")
+    completed_data = completed_fact["data"]
+    observed_lineage = (
+        observed_data.get("identity") if isinstance(observed_data, dict) else None
+    )
+    completed_lineage = completed_data.get("identity")
+    require(
+        isinstance(admitted_lineage, dict)
+        and isinstance(observed_lineage, dict)
+        and isinstance(completed_lineage, dict)
+        and admitted_lineage.get("invocationId")
+        == observed_lineage.get("invocationId")
+        == completed_lineage.get("invocationId")
+        and observed_lineage.get("effectId")
+        == completed_lineage.get("effectId")
+        and observed_lineage.get("effectId") is not None
+        and admitted_sequence < observed_sequence < completed_sequence,
+        "fixed fs.read canonical lineage or fact order changed",
+    )
+    resource_scope = admitted_fact["data"].get("resourceScope")
+    scope_data = (
+        resource_scope.get("data") if isinstance(resource_scope, dict) else None
+    )
+    targets = scope_data.get("targets") if isinstance(scope_data, dict) else None
+    require(
+        isinstance(resource_scope, dict)
+        and resource_scope.get("kind") == "workspace"
+        and isinstance(targets, list)
+        and len(targets) == 1
+        and isinstance(targets[0], dict)
+        and targets[0].get("relativePath") == "README.md"
+        and targets[0].get("access") == "read",
+        "fixed fs.read admission did not bind the canonical README.md read scope",
+    )
+    evidence = (
+        observed_data.get("evidence") if isinstance(observed_data, dict) else None
+    )
+    evidence_data = evidence.get("data") if isinstance(evidence, dict) else None
+    require(
+        isinstance(evidence, dict)
+        and evidence.get("kind") == "contentRead"
+        and isinstance(evidence_data, dict)
+        and evidence_data.get("byteLength") == expected_bytes,
+        "fixed fs.read observation changed the canonical README.md byte count",
+    )
+    output = completed_data["output"]
+    payload = output.get("payload")
+    truncation = output.get("truncation")
+    require(
+        isinstance(payload, dict)
+        and payload.get("kind") == "utf8Text"
+        and isinstance(payload.get("data"), dict)
+        and isinstance(payload["data"].get("text"), str)
+        and isinstance(truncation, dict)
+        and truncation.get("kind") == "complete",
+        "fixed fs.read completion did not retain one complete UTF-8 result",
+    )
+
+
+def read_stable_current_session_run_store(
     config_root: pathlib.Path,
     session_id: str,
     run_id: str,
 ) -> tuple[bytes, list[dict[str, Any]]]:
     run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
-    path = config_root / "sessions" / session_id / "kernel-v3" / f"{run_digest}.jsonl"
+    session_root = config_root / "sessions" / session_id
+    require(
+        not (session_root / "kernel-v3").exists(),
+        "current Session created the rejected pre-cutover kernel-v3 directory",
+    )
+    path = (
+        session_root
+        / "kernel-v2"
+        / "session-runs"
+        / f"{run_digest}.jsonl"
+    )
     try:
         before = path.stat()
         raw = path.read_bytes()
@@ -2328,17 +2860,17 @@ def read_stable_kernel_v3_run_store(
         records = [json.loads(line.decode("utf-8")) for line in raw.splitlines()]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise IntegrationFailure(
-            f"kernel-v3 Run store is unavailable: {safe_diagnostic(error)}"
+            f"current pure-v2 Session Run store is unavailable: {safe_diagnostic(error)}"
         ) from error
     require(
         before.st_size == after.st_size
         and before.st_mtime_ns == after.st_mtime_ns
         and raw.endswith(b"\n"),
-        "retired kernel-v3 Run store changed during its read-only snapshot",
+        "retired pure-v2 Session Run store changed during its read-only snapshot",
     )
     require(
         records and all(isinstance(record, dict) for record in records),
-        "kernel-v3 Run store contains a non-object record",
+        "pure-v2 Session Run store contains a non-object record",
     )
     return raw, records
 
@@ -2397,7 +2929,7 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
     session_id: str,
     canonical_snapshot: CanonicalRunSnapshot,
 ) -> bytes:
-    raw, records = read_stable_kernel_v3_run_store(
+    raw, records = read_stable_current_session_run_store(
         config_root,
         session_id,
         canonical_snapshot.run_id,
@@ -2405,7 +2937,7 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
     require(
         TEST_API_KEY.encode("utf-8") not in raw
         and daemon.host_capability.encode("utf-8") not in raw,
-        "kernel-v3 Run store leaked Provider or Host authority material",
+        "pure-v2 Session Run store leaked Provider or Host authority material",
     )
     for record in records:
         require(
@@ -2418,11 +2950,11 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
                 r"sha256:[0-9a-f]{64}", str(record.get("recordDigest"))
             )
             is not None,
-            "kernel-v3 Run store contains an invalid record envelope",
+            "pure-v2 Session Run store contains an invalid record envelope",
         )
     require(
         len(records) == len({record["recordId"] for record in records}),
-        "kernel-v3 Run store contains a duplicate immutable record identity",
+        "pure-v2 Session Run store contains a duplicate immutable record identity",
     )
     require(
         len(records) >= 5
@@ -3650,8 +4182,8 @@ def provider_profile_quarantine_requires_explicit_reenable_intent(
     )
     require(
         profile_from_settings(quarantined_settings, profile_id).get("enabled") is False
-        and quarantined_settings.get("defaultProfileId") is None,
-        "Exact quarantined Profile revision remained effectively selectable",
+        and quarantined_settings.get("defaultProfileId") == profile_id,
+        "Quarantine changed the stored default identity or left the Profile effectively enabled",
     )
 
     status, body = request_json(
@@ -3668,7 +4200,7 @@ def provider_profile_quarantine_requires_explicit_reenable_intent(
     )
     require(
         profile_from_settings(stale_result, profile_id).get("enabled") is False
-        and stale_result.get("defaultProfileId") is None,
+        and stale_result.get("defaultProfileId") == profile_id,
         "Stale full-array save cleared Profile quarantine without explicit intent",
     )
     records_after_stale_patch = read_profile_availability_records(availability_path)
@@ -3841,12 +4373,42 @@ def open_host_run(
     require(isinstance(data, dict), "Host-owned RunOpen returned invalid data")
     run = data.get("run")
     require(isinstance(run, dict), "Host-owned RunOpen omitted the public Run")
+    host_run_id = run.get("runId")
+    require(
+        isinstance(host_run_id, str) and host_run_id,
+        "Host-owned RunOpen omitted its exact Host Run identity",
+    )
+    deadline = time.monotonic() + 45.0
+    while run.get("status") == "running":
+        require(
+            time.monotonic() < deadline,
+            "Host-owned Run remained running after its controlled Provider turn",
+        )
+        time.sleep(0.05)
+        status, body = request_json(
+            daemon.base_url,
+            "GET",
+            f"/api/agent/sessions/{urllib.parse.quote(session_id, safe='')}/runs/"
+            f"{urllib.parse.quote(host_run_id, safe='')}",
+            host_capability=daemon.host_capability,
+            timeout=5.0,
+        )
+        polled = require_api_ok(status, body, "Host-owned Run reconciliation")
+        require(
+            isinstance(polled, dict) and isinstance(polled.get("run"), dict),
+            "Host-owned Run reconciliation omitted the public Run",
+        )
+        run = polled["run"]
+        require(
+            run.get("runId") == host_run_id
+            and run.get("sessionId") == session_id,
+            "Host-owned Run reconciliation changed its exact identity",
+        )
     observed = safe_diagnostic(
         json.dumps(
             {
                 "status": run.get("status"),
                 "message": run.get("message"),
-                "finalText": run.get("finalText"),
             },
             separators=(",", ":"),
         ),
@@ -3856,9 +4418,54 @@ def open_host_run(
         run.get("status") == "completed",
         f"Host-owned Run did not complete: {observed}",
     )
+    kernel_run_id = run.get("kernelRunId")
     require(
-        run.get("finalText") == FINAL_TEXT,
-        f"Host-owned Run lost provider output: {observed}",
+        isinstance(kernel_run_id, str) and kernel_run_id,
+        "completed Host-owned Run omitted its exact Kernel Run identity",
+    )
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        f"/api/agent/sessions/{urllib.parse.quote(session_id, safe='')}/timeline",
+        host_capability=daemon.host_capability,
+    )
+    timeline = require_api_ok(status, body, "Host-owned Run Shared Projection")
+    require(
+        isinstance(timeline, dict)
+        and timeline.get("schemaVersion")
+        == "deepcode.shared-conversation-projection.v2"
+        and timeline.get("shapeVersion")
+        == "deepcode.shared-conversation.work-segments.v1"
+        and isinstance(timeline.get("runProjection"), dict)
+        and timeline["runProjection"].get("runId") == kernel_run_id
+        and timeline["runProjection"].get("status") == "succeeded",
+        "completed Host-owned Run did not reconcile to its terminal typed Shared Projection",
+    )
+    turn_id = timeline["runProjection"].get("turnId")
+    turns = timeline.get("turns")
+    turn = next(
+        (
+            candidate
+            for candidate in turns
+            if isinstance(candidate, dict) and candidate.get("id") == turn_id
+        ),
+        None,
+    ) if isinstance(turns, list) else None
+    blocks = turn.get("blocks") if isinstance(turn, dict) else None
+    committed_finals = [
+        block
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("kind") == "assistant"
+        and block.get("entryRole") == "finalAnswer"
+        and "providerPhase" not in block
+        and block.get("durability") == "committed"
+        and block.get("status") == "completed"
+        and block.get("bodyMarkdown") == FINAL_TEXT
+    ] if isinstance(blocks, list) else []
+    require(
+        len(committed_finals) == 1,
+        "completed Host-owned Run lost its one committed finalAnswer in Shared Projection",
     )
     return run
 
@@ -4150,16 +4757,103 @@ def run() -> None:
             session_id,
             cli_snapshot.run_id,
         )
+        provider.require_healthy()
+        passed("CLI ask through Session bridge and canonical Kernel facts")
+        passed("Provider trace seal, bounded export, replay, and metadata-only audit")
+
+        fixed_tool_session_id = create_session(owned)
+        readme_path = workspace / "README.md"
+        readme_before = readme_path.read_bytes()
+        provider_count_before_fixed_tool = provider.request_count()
+        try:
+            fixed_tool_cli = run_cli(
+                owned.base_url,
+                owned.host_capability,
+                [
+                    "--print",
+                    "--session",
+                    fixed_tool_session_id,
+                    "--workspace",
+                    str(workspace),
+                    "ask",
+                    CLI_TOOL_PROMPT,
+                ],
+                expect_success=True,
+            )
+        except subprocess.TimeoutExpired as error:
+            fixed_requests = provider.request_snapshot()[
+                provider_count_before_fixed_tool:
+            ]
+            provider_errors: str | None = None
+            try:
+                provider.require_healthy()
+            except IntegrationFailure as provider_error:
+                provider_errors = safe_diagnostic(provider_error)
+            raise IntegrationFailure(
+                "fixed CLI tool chain timed out; safe Provider sequence="
+                f"{json.dumps([fixed_tool_provider_request_summary(request) for request in fixed_requests], separators=(',', ':'))}; "
+                f"providerErrors={provider_errors or 'none'}"
+            ) from error
+        require(
+            fixed_tool_cli.stdout.strip() == CLI_TOOL_FINAL_TEXT,
+            "fixed tool CLI turn did not print the post-Kernel Provider answer: "
+            f"stdout={safe_diagnostic(fixed_tool_cli.stdout, owned.host_capability)!r}; "
+            f"stderr={safe_diagnostic(fixed_tool_cli.stderr, owned.host_capability)!r}",
+        )
+        provider_count_after_fixed_tool = provider.request_count()
+        require(
+            provider_count_after_fixed_tool == provider_count_before_fixed_tool + 3,
+            "fixed tool CLI turn did not use planning tool-call, planning continuation, and no-tools finalAnswer turns",
+        )
+        fixed_tool_requests = provider.request_snapshot()[
+            provider_count_before_fixed_tool:provider_count_after_fixed_tool
+        ]
+        require(
+            len(fixed_tool_requests) == 3,
+            "fixed tool Provider request snapshot changed during validation",
+        )
+        assert_fixed_tool_provider_sequence(
+            fixed_tool_requests[0],
+            fixed_tool_requests[1],
+            fixed_tool_requests[2],
+        )
+        fixed_tool_host_run_id = read_cli_ask_host_run_identity(
+            config_root,
+            fixed_tool_session_id,
+        )
+        fixed_tool_snapshot = canonical_run_snapshot(
+            config_root,
+            fixed_tool_session_id,
+            fixed_tool_host_run_id,
+        )
+        require_fixed_read_canonical_facts(
+            config_root,
+            fixed_tool_snapshot,
+            len(readme_before),
+        )
+        require(
+            readme_path.read_bytes() == readme_before,
+            "fixed fs.read distribution instruction mutated README.md",
+        )
+        delete_session_and_require_private_storage_released(
+            owned,
+            config_root,
+            fixed_tool_session_id,
+        )
+        provider.require_healthy()
+        passed(
+            "Supporting evidence: fixed CLI instruction reached Session, Kernel fs.read, "
+            "canonical facts, planning continuation, and bound finalAnswer; not final acceptance"
+        )
+
         provider_profile_quarantine_requires_explicit_reenable_intent(
             owned,
             config_root,
             provider_trace_replay["metadata"],
         )
-        provider.require_healthy()
-        passed("CLI ask through Session bridge and canonical Kernel facts")
-        passed("Provider trace seal, bounded export, replay, and metadata-only audit")
         passed("Provider Profile quarantine requires exact explicit re-enable intent")
 
+        provider_count_before_direct_run = provider.request_count()
         caller_request = {
             "op": "ask",
             "content": "Return the controlled Host integration response.",
@@ -4178,11 +4872,11 @@ def run() -> None:
         require(isinstance(host_run_id, str) and host_run_id, "Host Run ID is missing")
         provider_count_after_direct_run = provider.request_count()
         require(
-            provider_count_after_direct_run == provider_count_after_cli_ask + 1,
+            provider_count_after_direct_run == provider_count_before_direct_run + 1,
             "initial Host Run did not call Provider once",
         )
         first_snapshot = canonical_run_snapshot(config_root, session_id, host_run_id)
-        first_kernel_v3_snapshot = (
+        first_session_run_store_snapshot = (
             host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_and_cleanup(
                 owned,
                 config_root,
@@ -4229,14 +4923,14 @@ def run() -> None:
             replayed_snapshot == first_snapshot,
             "exact restart replay changed canonical facts or their high-water",
         )
-        replayed_kernel_v3_snapshot, _ = read_stable_kernel_v3_run_store(
+        replayed_session_run_store_snapshot, _ = read_stable_current_session_run_store(
             config_root,
             session_id,
             replayed_snapshot.run_id,
         )
         require(
-            replayed_kernel_v3_snapshot == first_kernel_v3_snapshot,
-            "daemon restart or exact caller replay rewrote the immutable kernel-v3 Run store",
+            replayed_session_run_store_snapshot == first_session_run_store_snapshot,
+            "daemon restart or exact caller replay rewrote the immutable pure-v2 Session Run store",
         )
         provider.require_healthy()
         passed("Provider trace export capability invalidated by daemon restart")

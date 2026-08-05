@@ -18,8 +18,8 @@ import {
 
 export const contractCases = [
   {
-    id: 'shared_projection_native_and_legacy_shapes_are_explicit_and_ordered',
-    run: sharedProjectionNativeAndLegacyShapesAreExplicitAndOrdered,
+    id: 'shared_projection_accepts_only_exact_work_segments_shape',
+    run: sharedProjectionAcceptsOnlyExactWorkSegmentsShape,
   },
   {
     id: 'work_segment_orders_commentary_tools_and_canonical_effects_without_lifecycle_cards',
@@ -31,14 +31,16 @@ export const contractCases = [
   },
 ];
 
-async function sharedProjectionNativeAndLegacyShapesAreExplicitAndOrdered() {
+async function sharedProjectionAcceptsOnlyExactWorkSegmentsShape() {
   const sessionId = 'session-projection-shape-contract';
   const runId = 'run-projection-shape-contract';
   const events = [
     publicProjectionEvent(sessionId, runId, 1, 'input.persisted', {
       inputId: 'input-projection-shape',
+      opaqueInputRef: 'opaque-input-projection-shape',
       text: 'Inspect the workspace.',
       attachments: [],
+      recordedAt: timestamp(1),
       controlEpoch: 1,
     }),
     publicProjectionEvent(sessionId, runId, 2, 'provider.completed', {
@@ -55,7 +57,7 @@ async function sharedProjectionNativeAndLegacyShapesAreExplicitAndOrdered() {
   ];
   const native = buildNarrativeTimelineProjection({ sessionId, events });
   assertSharedConversationProjectionV2(native);
-  assert.equal(native.legacyPrefixTurnCount, 0);
+  assert.equal(Object.hasOwn(native, 'legacyPrefixTurnCount'), false);
   assert.equal(native.turns.length, 1);
   assert.equal(native.turns[0].status, 'completed');
   assert.deepEqual(
@@ -66,51 +68,31 @@ async function sharedProjectionNativeAndLegacyShapesAreExplicitAndOrdered() {
     }))
   );
 
-  const flatV2 = clone(native);
-  delete flatV2.shapeVersion;
-  delete flatV2.legacyPrefixTurnCount;
-  for (const turn of flatV2.turns) {
-    delete turn.workSegments;
-    delete turn.parts;
-    turn.blocks.reverse();
-  }
-  assert.deepEqual(
-    flatV2.turns[0].blocks.map((block) => block.id),
-    [...native.turns[0].blocks].reverse().map((block) => block.id),
-    'legacy fixture must make array order differ from native sequence order'
-  );
-  const normalized = normalizeAgentTimelineSnapshot(flatV2);
-  assert.equal(normalized.compatibility, 'legacySettledNeutral');
-  assert.equal(
-    normalized.timeline.legacyPrefixTurnCount,
-    flatV2.turns.length
-  );
-  for (const [index, turn] of normalized.timeline.turns.entries()) {
-    assert.deepEqual(
-      turn.blocks,
-      flatV2.turns[index].blocks,
-      'settled flat-v2 blocks must retain their original array order and content'
+  const unsupportedHistoryShapes = [
+    mutate(native, (value) => {
+      delete value.shapeVersion;
+    }),
+    mutate(native, (value) => {
+      delete value.turns[0].workSegments;
+    }),
+    mutate(native, (value) => {
+      delete value.turns[0].parts;
+    }),
+  ];
+  for (const unsupported of unsupportedHistoryShapes) {
+    assert.throws(
+      () => normalizeAgentTimelineSnapshot(unsupported),
+      (error) => error?.code === 'UnsupportedHistorySchema',
+      'every pre-cutover projection shape must fail closed'
     );
-    assert.deepEqual(turn.workSegments, []);
-    assert.deepEqual(
-      turn.parts,
-      flatV2.turns[index].blocks.map((block) => ({
-        kind: 'block',
-        blockId: block.id,
-      }))
-    );
-    assert.equal(Object.hasOwn(turn, 'legacyGroup'), false);
-    assert.equal(Object.hasOwn(turn, 'legacy'), false);
   }
-
-  const activeFlatV2 = clone(flatV2);
-  activeFlatV2.turns[0].status = 'running';
-  activeFlatV2.turns[0].completedAt = undefined;
-  activeFlatV2.runProjection.status = 'active';
-  activeFlatV2.runProjection.phase = 'executing';
+  const legacyFieldOnCurrentShape = mutate(native, (value) => {
+    value.legacyPrefixTurnCount = 0;
+  });
   assert.throws(
-    () => normalizeAgentTimelineSnapshot(activeFlatV2),
-    (error) => error?.code === 'UnsupportedHistorySchema'
+    () => normalizeAgentTimelineSnapshot(legacyFieldOnCurrentShape),
+    /session_projection_v2_root_field_invalid/u,
+    'current shape must reject every removed compatibility field'
   );
 
   const duplicatePart = clone(native);
@@ -145,13 +127,22 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
   const events = [
     publicProjectionEvent(sessionId, runId, 1, 'input.persisted', {
       inputId: 'input-work-segment',
+      opaqueInputRef: 'opaque-input-work-segment',
       text: 'Read and update the workspace.',
       attachments: [],
+      recordedAt: timestamp(1),
       controlEpoch: 1,
     }),
     publicProjectionEvent(sessionId, runId, 2, 'provider.started', {
       providerTurnId,
       controlEpoch: 1,
+      contextRef: {
+        contextVersion: 1,
+        catalogDigest: `sha256:${'1'.repeat(64)}`,
+        contextDigest: `sha256:${'2'.repeat(64)}`,
+      },
+      factProjection: {},
+      contextAssembly: {},
     }),
     publicProjectionEvent(sessionId, runId, 3, 'wait.changed', null),
     publicProjectionEvent(sessionId, runId, 4, 'provider.completed', {
@@ -159,6 +150,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
       controlEpoch: 1,
       outputKind: 'toolIntent',
       terminalScope: 'providerTurn',
+      status: 'responseAccepted',
       orderedItems: [
         { kind: 'text', phase: 'commentary', text: 'I will inspect the file.' },
         {
@@ -195,11 +187,14 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
       5,
       'kernelFacts.reconciled',
       {
+        requestId: 'request-facts-work-segment',
         pageFactIds: [
           'fact-read-completed',
           'fact-write-completed',
         ],
+        pageFactCount: 2,
         snapshotHighWater: 2,
+        nextAfterLedgerSequence: 2,
         operationFacts: [
           canonicalOperationFact({
             operationId: 'operation-read',
@@ -240,6 +235,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
         controlEpoch: 1,
         outputKind: 'toolIntent',
         terminalScope: 'providerTurn',
+        status: 'responseAccepted',
         orderedItems: [{
           kind: 'toolCall',
           ordinal: 1,
@@ -259,6 +255,27 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
 
   const rawArgumentsSentinel =
     'must-not-publish-tool-intent-arguments.txt';
+  assert.throws(
+    () => publicProjectionEvent(
+      sessionId,
+      runId,
+      6,
+      'toolIntent.submitted',
+      {
+        requestId: 'request-raw-arguments-rejected',
+        operationId: 'operation-raw-arguments-rejected',
+        toolId: 'fs.read',
+        expectedControlEpoch: 1,
+        authorityKind: 'contextRead',
+        replyKind: 'admitted',
+        invocationId: 'invocation-raw-arguments-rejected',
+        rawArguments: { path: rawArgumentsSentinel },
+      }
+    ),
+    (error) =>
+      error?.code === 'session_kernel_projection_data_invalid',
+    'public ToolIntent projection must reject raw Provider arguments'
+  );
   const rawIntentEvent = publicProjectionEvent(
     sessionId,
     runId,
@@ -272,9 +289,6 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
       authorityKind: 'contextRead',
       replyKind: 'admitted',
       invocationId: 'invocation-raw-arguments-omitted',
-      rawArguments: { path: rawArgumentsSentinel },
-      target: rawArgumentsSentinel,
-      effectSummary: rawArgumentsSentinel,
     }
   );
   const rawOmissionProjection = buildNarrativeTimelineProjection({
@@ -418,13 +432,27 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
     new AbortController().signal,
     async (delta) => published.push(delta)
   );
-  assert.deepEqual(published, [{
-    providerTurnId: requestId,
-    streamSequence: 1,
-    textOrdinal: 1,
-    providerPhase: 'commentary',
-    textDelta: 'Archived commentary.',
-  }]);
+  assert.deepEqual(published, [
+    {
+      providerTurnId: requestId,
+      streamSequence: 1,
+      textOrdinal: 1,
+      providerPhase: 'commentary',
+      textDelta: 'Archived commentary.',
+    },
+    {
+      providerTurnId: requestId,
+      streamSequence: 2,
+      textOrdinal: 2,
+      textDelta: '  {"toolId":"fs.read"}',
+    },
+    {
+      providerTurnId: requestId,
+      streamSequence: 3,
+      textOrdinal: 3,
+      textDelta: 'Final answer.',
+    },
+  ], 'all archived assistant text is visible while unsealed phases stay unknown');
   assert.deepEqual(
     streamResult.items.map((item) => item.kind === 'text'
       ? { phase: item.phase, text: item.text }
@@ -434,7 +462,7 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
       { phase: 'unknown', text: '  {"toolId":"fs.read"}' },
       { phase: 'final_answer', text: 'Final answer.' },
     ],
-    'final and tool-shaped unknown text stay private until the sealed terminal'
+    'the sealed terminal binds phases without treating tool-shaped text as control data'
   );
   const input = publicProjectionEvent(
     sessionId,
@@ -443,8 +471,10 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
     'input.persisted',
     {
       inputId: 'input-provider-composing',
+      opaqueInputRef: 'opaque-input-provider-composing',
       text: 'Explain before using tools.',
       attachments: [],
+      recordedAt: timestamp(1),
       controlEpoch: 1,
     }
   );
@@ -639,4 +669,10 @@ function timestamp(sequence) {
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function mutate(value, callback) {
+  const copy = clone(value);
+  callback(copy);
+  return copy;
 }

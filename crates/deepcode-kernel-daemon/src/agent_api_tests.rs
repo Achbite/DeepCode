@@ -10,7 +10,7 @@ fn session_schema_accepts_only_current_v3_history() {
         Some("workspace-v2"),
         Some("workspace-hash-v2"),
     );
-    assert!(session_schema_is_compatible(&current));
+    assert!(session_schema_is_current(&current));
     assert_eq!(
         current.get("historySchema").and_then(Value::as_str),
         Some(SESSION_KERNEL_HISTORY_SCHEMA_V3)
@@ -25,7 +25,7 @@ fn session_schema_accepts_only_current_v3_history() {
         let mut legacy = current.clone();
         legacy[field] = json!(legacy_value);
         assert!(
-            !session_schema_is_compatible(&legacy),
+            !session_schema_is_current(&legacy),
             "{field} must fail closed for legacy history"
         );
     }

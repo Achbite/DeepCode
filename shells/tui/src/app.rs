@@ -1784,15 +1784,61 @@ fn parse_pending_permission_input(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deepcode_kernel_client::KernelClientConfig;
     use serde_json::json;
+
+    // Supporting development contracts only. They verify typed projection
+    // consumption and never replace a real TUI/CLI/GUI user-experience check.
+
+    fn timeline_snapshot(session_id: &str, kernel_run_id: &str) -> AgentTimelineSnapshot {
+        serde_json::from_value(json!({
+            "schemaVersion": "deepcode.shared-conversation-projection.v2",
+            "shapeVersion": "deepcode.shared-conversation.work-segments.v1",
+            "sessionId": session_id,
+            "revision": 1,
+            "sourceEventVersion": 1,
+            "generatedAt": "2026-08-05T00:00:00.000Z",
+            "turns": [],
+            "eventCount": 1,
+            "runProjection": {
+                "runId": kernel_run_id,
+                "revision": 1,
+                "status": "active",
+                "phase": "processing",
+                "currentActivity": null,
+                "wait": null,
+                "languageBinding": {
+                    "language": "neutral",
+                    "status": "unavailable"
+                }
+            }
+        }))
+        .expect("exact native work-segments timeline")
+    }
+
+    fn test_tui_app() -> TuiApp {
+        let client = HttpKernelClient::new(
+            KernelClientConfig::new("http://127.0.0.1:9")
+                .with_host_shell_capability(format!("dchostv2_{}", "a".repeat(64))),
+        )
+        .expect("valid loopback test client");
+        TuiApp::new(client, Renderer::default(), TuiHostOptions::default())
+    }
 
     fn plain_pending_decision() -> PendingDecision {
         PendingDecision {
             kind: "plan".to_string(),
             run_id: "run-generic".to_string(),
-            target_id: Some("target-generic".to_string()),
-            options: Vec::new(),
+            target_id: "target-generic".to_string(),
         }
+    }
+
+    fn timeline_with_pending(pending: serde_json::Value) -> AgentTimelineSnapshot {
+        let mut timeline =
+            serde_json::to_value(timeline_snapshot("session-pending", "kernel-run-pending"))
+                .expect("encode exact typed timeline");
+        timeline["interactionProjection"] = json!({ "pending": pending });
+        serde_json::from_value(timeline).expect("decode exact typed pending interaction")
     }
 
     #[test]
@@ -1811,87 +1857,79 @@ mod tests {
         assert!(end.guidance.is_none());
     }
 
-    #[test]
-    fn pending_decision_input_maps_numbered_options_to_accept_guidance() {
-        let pending = PendingDecision {
-            kind: "requirement".to_string(),
-            run_id: "run-choice".to_string(),
-            target_id: Some("requirement-choice".to_string()),
-            options: vec![
-                PendingDecisionOption {
-                    id: "option-a".to_string(),
-                    label: "Option A".to_string(),
-                    description: Some("First generic option.".to_string()),
-                    recommended: true,
-                },
-                PendingDecisionOption {
-                    id: "option-b".to_string(),
-                    label: "Option B".to_string(),
-                    description: Some("Second generic option.".to_string()),
-                    recommended: false,
-                },
-            ],
-        };
+    #[tokio::test]
+    async fn new_session_waits_for_matching_initial_snapshot_before_opening_stream() {
+        let mut app = test_tui_app();
+        app.current_session_id = Some("session-old".to_string());
+        app.timeline = Some(timeline_snapshot("session-old", "kernel-run-old"));
+        app.pending_run = Some(PendingRun {
+            operation: RunOperation::Ask,
+            session_id: "session-new".to_string(),
+            run_id: "host-run-new".to_string(),
+            kernel_run_id: "kernel-run-new".to_string(),
+            timeline_stream: None,
+            projection_terminal_since: None,
+            last_projection_activity_at: Instant::now(),
+            last_watchdog_snapshot_at: Instant::now(),
+            stream_reconnect_not_before: Instant::now(),
+            cancel_requested: false,
+            last_refresh_error: None,
+        });
 
-        let selected = parse_pending_decision_input("2 with extra constraint", &pending);
-        assert_eq!(selected.decision, "accept");
-        let guidance = selected.guidance.unwrap_or_default();
-        assert!(guidance.contains("- id: option-b"));
-        assert!(guidance.contains("- label: Option B"));
-        assert!(guidance.contains("with extra constraint"));
+        assert!(!app.pending_projection_is_bound());
+        app.ensure_pending_timeline_stream();
+        assert!(
+            app.pending_run
+                .as_ref()
+                .is_some_and(|pending| pending.timeline_stream.is_none()),
+            "stale prior-Session projection opened a timeline stream"
+        );
+
+        app.timeline = Some(timeline_snapshot("session-new", "kernel-run-new"));
+        assert!(app.pending_projection_is_bound());
+        app.ensure_pending_timeline_stream();
+        assert!(
+            app.pending_run
+                .as_ref()
+                .is_some_and(|pending| pending.timeline_stream.is_some()),
+            "matching initial snapshot did not open the typed timeline stream"
+        );
+
+        app.pending_run = None;
     }
 
     #[test]
-    fn latest_pending_decision_finds_plan_review() {
-        let timeline = json!({
-            "interactionProjection": { "pending": {
-                "kind": "plan",
-                "runId": "run-generic",
-                "planId": "plan-generic"
-            } }
-        });
+    fn latest_pending_decision_reads_exact_typed_plan_projection() {
+        let timeline = timeline_with_pending(json!({
+            "kind": "plan",
+            "interactionId": "interaction-plan-generic",
+            "interactionRevision": "interaction-revision-plan-generic",
+            "targetId": "plan-generic",
+            "runId": "run-generic",
+            "planId": "plan-generic"
+        }));
         let pending = latest_pending_decision(Some(&timeline)).expect("pending plan");
         assert_eq!(pending.kind, "plan");
         assert_eq!(pending.run_id, "run-generic");
-        assert_eq!(pending.target_id.as_deref(), Some("plan-generic"));
-        assert!(pending.options.is_empty());
+        assert_eq!(pending.target_id, "plan-generic");
     }
 
     #[test]
-    fn latest_pending_decision_finds_plan_card() {
-        let timeline = json!({
-            "interactionProjection": { "pending": {
-                "kind": "plan",
-                "runId": "run-plan-card",
-                "planId": "plan-card"
-            } }
-        });
-        let pending = latest_pending_decision(Some(&timeline)).expect("pending plan card");
-        assert_eq!(pending.kind, "plan");
-        assert_eq!(pending.run_id, "run-plan-card");
-        assert_eq!(pending.target_id.as_deref(), Some("plan-card"));
-        assert!(pending.options.is_empty());
-    }
-
-    #[test]
-    fn latest_pending_decision_keeps_requirement_options() {
-        let timeline = json!({
-            "interactionProjection": { "pending": {
-                "kind": "requirement",
-                "runId": "run-requirement",
-                "requirementId": "requirement-generic",
-                "decisionRequest": {
-                    "options": [
-                        { "id": "option-a", "label": "Option A", "recommended": true },
-                        { "id": "option-b", "label": "Option B", "description": "Second generic option." }
-                    ]
-                }
-            } }
-        });
-        let pending = latest_pending_decision(Some(&timeline)).expect("pending requirement");
-        assert_eq!(pending.kind, "requirement");
-        assert_eq!(pending.options.len(), 2);
-        assert_eq!(pending.options[0].id, "option-a");
-        assert_eq!(pending.options[1].label, "Option B");
+    fn latest_pending_decision_rejects_mismatched_permission_identity() {
+        let timeline = timeline_with_pending(json!({
+            "kind": "permission",
+            "interactionId": "interaction-permission-generic",
+            "interactionRevision": "interaction-revision-permission-generic",
+            "targetId": "permission-target-generic",
+            "requestId": "permission-request-generic",
+            "request": {
+                "id": "permission-request-generic",
+                "runId": "run-generic",
+                "toolName": "fs.read",
+                "riskLevel": "low",
+                "summary": "Read one workspace file."
+            }
+        }));
+        assert!(latest_pending_decision(Some(&timeline)).is_none());
     }
 }

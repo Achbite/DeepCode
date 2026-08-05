@@ -26,6 +26,10 @@ import {
   toolContextRef,
 } from './harness.mjs';
 
+// Supporting development contracts only. Product acceptance still requires the
+// real Provider CLI/GUI/TUI path; these cases must never add text parsers or
+// sample-specific production branches to manufacture a successful tool call.
+
 export const contractCases = [
   {
     id: 'tool_context_is_injected_verbatim_without_transport_secrets',
@@ -46,10 +50,6 @@ export const contractCases = [
   {
     id: 'ordinary_narration_never_submits_an_intent',
     run: ordinaryNarrationNeverSubmitsAnIntent,
-  },
-  {
-    id: 'text_tool_intent_requires_one_standalone_structural_frame',
-    run: textToolIntentRequiresOneStandaloneStructuralFrame,
   },
   {
     id: 'plan_action_authority_comes_from_persisted_session_state',
@@ -555,60 +555,6 @@ async function ordinaryNarrationNeverSubmitsAnIntent() {
     harness.calls('submitToolIntent').length,
     0,
     'ordinary answer text must never be scanned for executable JSON'
-  );
-}
-
-async function textToolIntentRequiresOneStandaloneStructuralFrame() {
-  const toolContext = createToolContext();
-  const frame = JSON.stringify({
-    schemaVersion: 'deepcode.session.tool-intent-frame.v2',
-    kind: 'toolIntent',
-    toolId: 'fs.read',
-    arguments: { path: 'notes/context.md' },
-  });
-  const binding = {
-    runId: 'run-text-frame',
-    controlEpoch: 3,
-    operationId: 'operation-text-frame',
-    authority: {
-      kind: 'contextRead',
-      data: { purpose: 'Read the requested note.' },
-    },
-    idempotencyKey: 'intent-text-frame',
-    toolContext,
-  };
-
-  const intent = normalizeProviderKernelToolIntentV2(
-    { source: 'textFrame', frame },
-    binding
-  );
-  assert.equal(intent.toolId, 'fs.read');
-  assert.deepEqual(intent.rawArguments, {
-    path: 'notes/context.md',
-  });
-  assert.deepEqual(intent.authority, binding.authority);
-
-  assert.throws(
-    () => normalizeProviderKernelToolIntentV2(
-      {
-        source: 'textFrame',
-        frame: `Please run this:\n${frame}`,
-      },
-      binding
-    ),
-    (error) =>
-      error?.code === 'session_tool_intent_text_not_structured'
-  );
-  assert.throws(
-    () => normalizeProviderKernelToolIntentV2(
-      {
-        source: 'textFrame',
-        frame: `\`\`\`json\n${frame}\n\`\`\``,
-      },
-      binding
-    ),
-    (error) =>
-      error?.code === 'session_tool_intent_text_not_structured'
   );
 }
 

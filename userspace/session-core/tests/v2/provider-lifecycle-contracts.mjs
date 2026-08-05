@@ -32,8 +32,8 @@ export const contractCases = [
     run: providerToolCallQueueAcceptsOneToThirtyTwoInOrder,
   },
   {
-    id: 'legacy_provider_profile_without_reasoning_transport_fails_closed',
-    run: legacyProviderProfileWithoutReasoningTransportFailsClosed,
+    id: 'provider_profile_without_reasoning_transport_is_not_current_schema',
+    run: providerProfileWithoutReasoningTransportIsNotCurrentSchema,
   },
 ];
 
@@ -262,7 +262,7 @@ async function providerToolCallQueueAcceptsOneToThirtyTwoInOrder() {
   }
 }
 
-async function legacyProviderProfileWithoutReasoningTransportFailsClosed() {
+async function providerProfileWithoutReasoningTransportIsNotCurrentSchema() {
   const initial = createInitialState();
   delete initial.providerProfile.reasoningTransport;
   const harness = createSessionHarness({ initial });
@@ -270,7 +270,7 @@ async function legacyProviderProfileWithoutReasoningTransportFailsClosed() {
   await assert.rejects(
     harness.open(),
     (error) => error?.code === 'session_kernel_provider_profile_invalid',
-    'an old Profile without reasoningTransport must remain visible only to Host migration UI and cannot open a Session Run'
+    'a Profile without reasoningTransport is not the current schema and cannot open a Session Run'
   );
   assert.equal(harness.providerInputs.length, 0);
   assert.equal(harness.calls('submitToolIntent').length, 0);

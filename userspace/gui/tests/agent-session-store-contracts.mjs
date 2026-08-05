@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const SUITE_ID = 'session.v2.contracts';
 const CONTRACT_CASE_TIMEOUT_MS = 15_000;
-const CANONICAL_PROGRESS_REFRESH_INTERVAL_MS = 300;
+const CANONICAL_PROGRESS_STREAM_RETRY_MS = 250;
 const LEGACY_LOADER_CHILD_ENV =
   'DEEPCODE_GUI_CONTRACT_LEGACY_LOADER_CHILD';
 const HOST_CAPABILITY = `dchostuiv2_${'a'.repeat(64)}`;
@@ -221,16 +221,6 @@ function sessionRecord(id, title = id) {
   };
 }
 
-function eventRecord(sessionId, id, kind = 'workflow_stage', payload = {}) {
-  return {
-    id,
-    sessionId,
-    ts: NOW,
-    kind,
-    payload,
-  };
-}
-
 function emptyTimeline(sessionId, revision = 0) {
   return {
     schemaVersion: 'deepcode.shared-conversation-projection.v2',
@@ -269,7 +259,6 @@ class Scenario {
     this.sessions = new Map(
       sessionIds.map((id) => [id, sessionRecord(id)])
     );
-    this.events = new Map(sessionIds.map((id) => [id, []]));
     this.timelines = new Map(
       sessionIds.map((id) => [id, emptyTimeline(id)])
     );
@@ -295,14 +284,12 @@ class Scenario {
   sessionResult(sessionId) {
     const session = this.sessions.get(sessionId);
     assert(session, `${this.name}: unknown session ${sessionId}`);
-    const events = this.events.get(sessionId) ?? [];
     return {
       session: {
         ...session,
-        eventCount: events.length,
+        eventCount: this.timelines.get(sessionId)?.eventCount ?? 0,
         updatedAt: NOW,
       },
-      events,
     };
   }
 
@@ -407,7 +394,11 @@ class ControlledHost {
     );
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
     const body = await readJsonBody(request);
-    const route = matchRoute(request.method ?? 'GET', url.pathname);
+    const route = matchRoute(
+      request.method ?? 'GET',
+      url.pathname,
+      url.searchParams
+    );
     if (route.kind === 'list') {
       return sendApiData(response, {
         sessions: this.allSessions(),
@@ -427,6 +418,7 @@ class ControlledHost {
       path: url.pathname,
       sessionId: route.sessionId,
       runId: route.runId,
+      afterRevision: route.afterRevision,
       body,
       startedAt: Date.now(),
       aborted: false,
@@ -468,7 +460,6 @@ class ControlledHost {
       route,
       scenario,
       host,
-      response,
       data,
       sseOpen,
       sseEvent,
@@ -479,12 +470,21 @@ class ControlledHost {
         host.currentSessionId = sessionId;
         data(scenario.sessionResult(sessionId));
         return;
-      case 'events':
-        data(scenario.sessionResult(sessionId));
-        return;
       case 'timeline':
         data(scenario.timelines.get(sessionId) ?? emptyTimeline(sessionId));
         return;
+      case 'timelineStream': {
+        const snapshot = scenario.timelines.get(sessionId)
+          ?? emptyTimeline(sessionId);
+        sseOpen();
+        sseEvent('snapshot', {
+          type: 'snapshot',
+          sessionId,
+          revision: snapshot.revision,
+          snapshot,
+        });
+        return;
+      }
       case 'start': {
         scenario.startSequence += 1;
         const hostRunId = `host-${sessionId}-${scenario.startSequence}`;
@@ -510,20 +510,6 @@ class ControlledHost {
         scenario.setRunStatus(runId, 'cancelled');
         data(scenario.runResult(sessionId, runId, 'cancelled'));
         return;
-      case 'stream': {
-        const run = scenario.runRoutes.get(runId);
-        sseOpen();
-        if (run && ['completed', 'failed', 'cancelled'].includes(run.status)) {
-          sseEvent('terminal', {
-            sessionId,
-            runId,
-            events: scenario.events.get(sessionId) ?? [],
-            eventCount: scenario.events.get(sessionId)?.length ?? 0,
-          });
-          response.end();
-        }
-        return;
-      }
       default:
         sendApiError(response, 404, 'route_not_found');
     }
@@ -555,7 +541,7 @@ function sendApiError(response, status, message) {
   }));
 }
 
-function matchRoute(method, pathname) {
+function matchRoute(method, pathname, searchParams) {
   if (method === 'GET' && pathname === '/api/agent/sessions') {
     return { kind: 'list' };
   }
@@ -563,22 +549,18 @@ function matchRoute(method, pathname) {
   if (method === 'POST' && match) {
     return { kind: 'activate', sessionId: decodeURIComponent(match[1]) };
   }
-  match = pathname.match(/^\/api\/agent\/sessions\/([^/]+)\/events$/);
-  if (method === 'GET' && match) {
-    return { kind: 'events', sessionId: decodeURIComponent(match[1]) };
-  }
   match = pathname.match(/^\/api\/agent\/sessions\/([^/]+)\/timeline$/);
   if (method === 'GET' && match) {
     return { kind: 'timeline', sessionId: decodeURIComponent(match[1]) };
   }
   match = pathname.match(
-    /^\/api\/agent\/sessions\/([^/]+)\/runs\/([^/]+)\/stream$/
+    /^\/api\/agent\/sessions\/([^/]+)\/timeline\/stream$/
   );
   if (method === 'GET' && match) {
     return {
-      kind: 'stream',
+      kind: 'timelineStream',
       sessionId: decodeURIComponent(match[1]),
-      runId: decodeURIComponent(match[2]),
+      afterRevision: Number(searchParams?.get('afterRevision') ?? 0),
     };
   }
   match = pathname.match(
@@ -641,7 +623,6 @@ async function activate(store, sessionId) {
 async function cleanupStore(store) {
   store.setState({
     session: null,
-    events: [],
     timeline: null,
     loading: false,
   });
@@ -652,6 +633,16 @@ function holdRequests(scenario, kind) {
   const held = [];
   scenario.handlers.set(kind, (context) => {
     held.push(context);
+    return true;
+  });
+  return held;
+}
+
+function holdSseRequests(scenario, kind) {
+  const held = [];
+  scenario.handlers.set(kind, (context) => {
+    held.push(context);
+    context.sseOpen();
     return true;
   });
   return held;
@@ -729,7 +720,7 @@ const contractCases = [
     },
   },
   {
-    id: 'canonical_progress_watcher_is_reference_counted_per_session',
+    id: 'canonical_timeline_stream_is_reference_counted_and_reconciles_revision_gaps',
     async run(host) {
       const sessionId = 'watcher-a';
       const scenario = new Scenario(this.id, [sessionId]);
@@ -738,61 +729,136 @@ const contractCases = [
       const store = await freshStore(this.id);
       await activate(store, sessionId);
       scenario.records.length = 0;
-      const heldEvents = holdRequests(scenario, 'events');
+      const heldStreams = holdSseRequests(scenario, 'timelineStream');
       const heldGuidance = holdRequests(scenario, 'guidance');
 
       const first = store.getState().sendMessage('first consumer');
       const second = store.getState().sendMessage('second consumer');
       await waitFor(
-        () => heldGuidance.length === 2 && heldEvents.length >= 1,
-        'two concurrent consumers and the shared watcher request'
+        () => heldGuidance.length === 2 && heldStreams.length >= 1,
+        'two concurrent consumers and the shared typed timeline stream'
       );
       await flushAsyncTurns();
       assert.equal(
-        heldEvents.length,
+        heldStreams.length,
         1,
         'concurrent consumers created duplicate watchers'
       );
-      scenario.handlers.delete('events');
-      heldEvents[0].data(scenario.sessionResult(sessionId));
+      assert.equal(
+        heldStreams[0].record.afterRevision,
+        1,
+        'typed timeline stream did not resume after the visible snapshot'
+      );
 
       respondGuidance(heldGuidance[0]);
       await first;
-      const eventsAfterFirstRelease = scenario.recordsOf('events').length;
-      await waitFor(
-        () => scenario.recordsOf('events').length > eventsAfterFirstRelease,
-        'watcher progress after the first consumer released',
-        1_000
+      assert.equal(
+        heldStreams[0].record.aborted,
+        false,
+        'the first consumer release aborted the shared watcher'
       );
-      await waitFor(
-        () => windowTimers.countByDelay(
-          CANONICAL_PROGRESS_REFRESH_INTERVAL_MS
-        ) > 0,
-        'remaining consumer watcher timer'
-      );
+      assert.equal(heldStreams.length, 1);
 
-      const heldTrailingEvents = holdRequests(scenario, 'events');
+      const heldTrailingTimeline = holdRequests(scenario, 'timeline');
       respondGuidance(heldGuidance[1]);
       await second;
       scenario.handlers.delete('guidance');
       await waitFor(
-        () => heldTrailingEvents.length >= 1,
-        'final watcher trailing refresh'
+        () => heldTrailingTimeline.length >= 1
+          && heldStreams[0].record.aborted,
+        'final watcher abort and trailing canonical snapshot refresh'
       );
       await flushAsyncTurns();
       assert.equal(
-        heldTrailingEvents.length,
+        heldTrailingTimeline.length,
         1,
-        'the final consumer release started duplicate trailing refreshes'
+        'the final consumer release started duplicate snapshot refreshes'
       );
-      scenario.handlers.delete('events');
-      heldTrailingEvents[0].data(scenario.sessionResult(sessionId));
-      await flushAsyncTurns();
+      scenario.handlers.delete('timeline');
+      scenario.handlers.delete('timelineStream');
+      heldTrailingTimeline[0].data(activeTimeline(
+        sessionId,
+        'kernel-watcher-a',
+        2
+      ));
+      await waitFor(
+        () => windowTimers.countByDelay(
+          CANONICAL_PROGRESS_STREAM_RETRY_MS
+        ) === 0,
+        'the final consumer release to clear the stream retry timer'
+      );
+      await cleanupStore(store);
+    },
+  },
+  {
+    id: 'canonical_timeline_revision_gap_refetches_exact_snapshot',
+    async run(host) {
+      const sessionId = 'revision-gap-a';
+      const scenario = new Scenario(this.id, [sessionId]);
+      scenario.setActiveRun(
+        sessionId,
+        'kernel-revision-gap-a',
+        'host-revision-gap-a'
+      );
+      host.register(scenario);
+      const store = await freshStore(this.id);
+      await activate(store, sessionId);
+      scenario.records.length = 0;
+      const heldTimeline = holdRequests(scenario, 'timeline');
+      const heldGuidance = holdRequests(scenario, 'guidance');
+      let streamSequence = 0;
+      scenario.handlers.set('timelineStream', (context) => {
+        streamSequence += 1;
+        context.sseOpen();
+        if (streamSequence === 1) {
+          context.sseEvent('delta', {
+            type: 'delta',
+            sessionId,
+            revision: 100,
+            delta: {
+              schemaVersion: 'deepcode.shared-conversation-projection.v2',
+              shapeVersion: 'deepcode.shared-conversation.work-segments.v1',
+              sessionId,
+              baseRevision: 99,
+              revision: 100,
+              sourceEventVersion: 100,
+              generatedAt: NOW,
+              eventCount: 100,
+              turnReplacements: [],
+              removedTurnIds: [],
+              rootReplacements: {},
+            },
+          });
+          context.response.end();
+        }
+        return true;
+      });
+
+      const mutation = store.getState().sendMessage('revision gap');
+      await waitFor(
+        () => heldGuidance.length === 1
+          && heldTimeline.length === 1
+          && scenario.recordsOf('timelineStream').length === 1,
+        'revision gap fallback to a canonical snapshot'
+      );
       assert.equal(
-        windowTimers.countByDelay(CANONICAL_PROGRESS_REFRESH_INTERVAL_MS),
-        0,
-        'the final consumer release left a watcher timer scheduled'
+        scenario.recordsOf('timelineStream')[0].afterRevision,
+        1
       );
+      scenario.timelines.set(
+        sessionId,
+        activeTimeline(sessionId, 'kernel-revision-gap-a', 2)
+      );
+      scenario.handlers.delete('timeline');
+      heldTimeline[0].data(scenario.timelines.get(sessionId));
+      await waitFor(
+        () => store.getState().timeline?.revision === 2,
+        'exact replacement snapshot after the revision gap'
+      );
+      respondGuidance(heldGuidance[0]);
+      await mutation;
+      scenario.handlers.delete('guidance');
+      scenario.handlers.delete('timelineStream');
       await cleanupStore(store);
     },
   },
@@ -803,52 +869,41 @@ const contractCases = [
       const sessionB = 'late-b';
       const scenario = new Scenario(this.id, [sessionA, sessionB]);
       scenario.setActiveRun(sessionA, 'kernel-late-a', 'host-late-a');
-      scenario.events.set(
-        sessionB,
-        [eventRecord(sessionB, 'event-b', 'user_msg', { content: 'B' })]
-      );
       host.register(scenario);
       const store = await freshStore(this.id);
       await activate(store, sessionA);
-      const heldEvents = holdRequests(scenario, 'events');
-      const heldTimeline = holdRequests(scenario, 'timeline');
       const heldGuidance = holdRequests(scenario, 'guidance');
       const mutation = store.getState().sendMessage('late A mutation');
       await waitFor(
-        () => heldEvents.length > 0
-          && heldTimeline.length > 0
-          && heldGuidance.length > 0,
-        'late A Host responses'
+        () => heldGuidance.length > 0
+          && scenario.recordsOf('timelineStream').length > 0,
+        'late A mutation and typed timeline stream'
       );
 
-      scenario.handlers.delete('timeline');
       await activate(store, sessionB);
       assert.equal(store.getState().session?.id, sessionB);
-      const lateEvent = eventRecord(
+      const heldTimeline = holdRequests(scenario, 'timeline');
+      scenario.timelines.set(
         sessionA,
-        'late-a-event',
-        'assistant_msg',
-        { content: 'late A' }
+        activeTimeline(sessionA, 'kernel-late-a', 2)
       );
-      scenario.events.set(sessionA, [lateEvent]);
-      heldEvents[0].data(scenario.sessionResult(sessionA));
+      respondGuidance(heldGuidance[0], 'late A updated');
+      await waitFor(
+        () => heldTimeline.length === 1,
+        'late canonical snapshot for Session A'
+      );
+      scenario.handlers.delete('timeline');
       heldTimeline[0].data(activeTimeline(
         sessionA,
         'kernel-late-a',
         2
       ));
-      respondGuidance(heldGuidance[0], 'late A updated');
       await mutation;
       await delay(50);
 
       const state = store.getState();
       assert.equal(state.session?.id, sessionB);
       assert.equal(state.timeline?.sessionId, sessionB);
-      assert(
-        state.events.every((event) => event.sessionId === sessionB),
-        'late A events were merged into active session B'
-      );
-      scenario.handlers.delete('events');
       scenario.handlers.delete('guidance');
       await cleanupStore(store);
     },
@@ -1062,10 +1117,17 @@ const contractCases = [
           return true;
         });
       };
-      hangOnce(runScenario, 'events');
       hangOnce(runScenario, 'timeline');
       hangOnce(runScenario, 'runGet');
-      hangOnce(runScenario, 'stream', true);
+      let firstTimelineStream = true;
+      runScenario.handlers.set('timelineStream', (context) => {
+        context.sseOpen();
+        if (firstTimelineStream) {
+          firstTimelineStream = false;
+          context.response.end();
+        }
+        return true;
+      });
       hangOnce(activationScenario, 'activate');
 
       const startedAt = Date.now();
@@ -1073,10 +1135,9 @@ const contractCases = [
       const activation =
         activationStore.getState().activateSession(activationSession);
       await waitFor(
-        () => runScenario.recordsOf('events').length > 0
-          && runScenario.recordsOf('timeline').length > 0
+        () => runScenario.recordsOf('timeline').length > 0
           && runScenario.recordsOf('runGet').length > 0
-          && runScenario.recordsOf('stream').length > 0
+          && runScenario.recordsOf('timelineStream').length > 0
           && activationScenario.recordsOf('activate').length > 0,
         'all bounded Host requests'
       );
@@ -1092,10 +1153,8 @@ const contractCases = [
       );
       await waitFor(
         () => [
-          [runScenario, 'events'],
           [runScenario, 'timeline'],
           [runScenario, 'runGet'],
-          [runScenario, 'stream'],
           [activationScenario, 'activate'],
         ].every(([scenario, kind]) =>
           scenario.recordsOf(kind).some((record) => record.aborted)
@@ -1104,10 +1163,8 @@ const contractCases = [
         1_500
       );
       for (const [scenario, kind] of [
-        [runScenario, 'events'],
         [runScenario, 'timeline'],
         [runScenario, 'runGet'],
-        [runScenario, 'stream'],
         [activationScenario, 'activate'],
       ]) {
         assert(
@@ -1139,10 +1196,6 @@ const contractCases = [
         'kernel-bookkeeping-a',
         'host-bookkeeping-a'
       );
-      scenario.events.set(
-        sessionB,
-        [eventRecord(sessionB, 'bookkeeping-b-event', 'user_msg')]
-      );
       host.register(scenario);
       const store = await freshStore(this.id);
       await activate(store, sessionA);
@@ -1150,10 +1203,6 @@ const contractCases = [
       const mutation = store.getState().sendMessage('update A');
       await waitFor(() => heldGuidance.length === 1, 'held A mutation');
       await activate(store, sessionB);
-      scenario.events.set(
-        sessionA,
-        [eventRecord(sessionA, 'bookkeeping-a-event', 'assistant_msg')]
-      );
       respondGuidance(heldGuidance[0], 'A bookkeeping updated');
       await mutation;
 
@@ -1168,10 +1217,7 @@ const contractCases = [
         !state.runningSessionIds.includes(sessionA),
         'origin Session running bookkeeping was not settled'
       );
-      assert(
-        state.events.every((event) => event.sessionId === sessionB),
-        'origin mutation completion replaced active Session events'
-      );
+      assert.equal(state.timeline?.sessionId, sessionB);
       scenario.handlers.delete('guidance');
       await cleanupStore(store);
     },

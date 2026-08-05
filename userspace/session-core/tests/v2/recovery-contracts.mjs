@@ -33,6 +33,9 @@ import {
   toolContextRef,
 } from './harness.mjs';
 
+// These recovery contracts are supporting development evidence only. They
+// validate exact durable identities and never replace real CLI/GUI/TUI acceptance.
+
 export const contractCases = [
   {
     id: 'session_schema_accepts_only_current_v3_history',
@@ -173,8 +176,10 @@ async function activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedR
     kind: 'input.persisted',
     data: {
       inputId: initial.initialInput.inputId,
+      opaqueInputRef: initial.initialInput.opaqueInputRef,
       text: initial.initialInput.text,
       attachments: initial.initialInput.attachments,
+      recordedAt: initial.initialInput.recordedAt,
       controlEpoch: initial.controlEpoch,
     },
   };

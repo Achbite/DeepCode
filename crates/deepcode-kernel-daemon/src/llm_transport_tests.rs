@@ -1,10 +1,11 @@
 use super::*;
-use deepcode_kernel_abi::LlmProviderErrorLayer;
+
+// Supporting development contracts only. They verify transport invariants but
+// do not replace a real configured Provider conversation or user acceptance.
 
 fn test_profile() -> ResolvedLlmProfile {
     ResolvedLlmProfile {
         id: "profile-1".to_string(),
-        name: "DeepSeek V4 Pro".to_string(),
         kind: "openaiCompatible".to_string(),
         provider_flavor: Some("deepseek".to_string()),
         base_url: Some("https://api.example.test/v1".to_string()),
@@ -18,38 +19,19 @@ fn test_profile() -> ResolvedLlmProfile {
 }
 
 #[test]
-fn provider_json_decode_diagnostic_keeps_raw_response_context() {
-    let profile = test_profile();
-    let diagnostic = provider_response_error(ProviderDiagnosticInput {
-        profile: &profile,
-        provider: "openaiCompatible",
-        reason: "ProviderJsonDecodeFailed",
-        error_layer: LlmProviderErrorLayer::JsonDecode,
-        status: Some(200),
-        content_type: Some("text/html"),
-        body: "token: should-not-leak\n<html>bad gateway</html>",
-        body_hash: Some("abc123"),
-        is_stream: false,
-        expected_schema: "openai.chat.completion.v1: choices[0].message",
-        message: "expected value at line 1 column 1".to_string(),
-    });
-
-    assert_eq!(diagnostic.reason, "ProviderJsonDecodeFailed");
-    assert_eq!(diagnostic.status, Some(200));
-    assert_eq!(diagnostic.content_type, "text/html");
-    assert!(!diagnostic.is_stream);
-    assert_eq!(
-        diagnostic.expected_schema,
-        "openai.chat.completion.v1: choices[0].message"
+fn provider_public_error_event_uses_bounded_message_and_ignores_raw_detail() {
+    let event = provider_public_error_event(
+        "request-public-error-contract",
+        "ProviderJsonDecodeFailed",
+        "token: should-not-leak\n<html>bad gateway</html>",
     );
-    assert!(diagnostic
-        .body_preview
-        .contains("[redacted-provider-error-line]"));
-    assert!(!diagnostic.body_preview.contains("should-not-leak"));
-    let archive_text = diagnostic.archive_text();
-    assert!(archive_text.contains("ProviderJsonDecodeFailed:"));
-    assert!(archive_text.contains("content_type = text/html"));
-    assert!(archive_text.contains("expected_schema = openai.chat.completion.v1"));
+
+    assert!(event.contains("provider_error"));
+    assert!(event.contains("request-public-error-contract"));
+    assert!(event.contains("ProviderJsonDecodeFailed"));
+    assert!(event.contains("Provider stream failed before a validated terminal receipt."));
+    assert!(!event.contains("should-not-leak"));
+    assert!(!event.contains("bad gateway"));
 }
 
 #[test]
@@ -123,7 +105,6 @@ fn deepseek_stream_request_includes_usage_options() {
 #[test]
 fn zhipu_stream_request_enables_tool_stream_for_tools() {
     let mut profile = test_profile();
-    profile.name = "Zhipu GLM".to_string();
     profile.provider_flavor = Some("zhipu".to_string());
     profile.base_url = Some("https://open.bigmodel.cn/api/paas/v4".to_string());
     profile.model = "glm-4.5".to_string();

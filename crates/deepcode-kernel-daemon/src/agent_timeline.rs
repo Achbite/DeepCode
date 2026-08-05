@@ -630,18 +630,31 @@ mod tests {
     }
 
     fn timeline_snapshot(session_id: &str, run_id: &str, revision: u64, status: &str) -> Value {
+        let phase = if status == "succeeded" {
+            "settled"
+        } else {
+            "processing"
+        };
         json!({
             "schemaVersion": "deepcode.shared-conversation-projection.v2",
             "shapeVersion": "deepcode.shared-conversation.work-segments.v1",
             "sessionId": session_id,
             "revision": revision,
             "sourceEventVersion": revision,
+            "generatedAt": "2026-08-05T00:00:00Z",
             "eventCount": revision,
-            "legacyPrefixTurnCount": 0,
             "turns": [],
             "runProjection": {
                 "runId": run_id,
-                "status": status
+                "revision": revision,
+                "status": status,
+                "phase": phase,
+                "currentActivity": null,
+                "wait": null,
+                "languageBinding": {
+                    "language": "neutral",
+                    "status": "unavailable"
+                }
             }
         })
     }
@@ -705,6 +718,7 @@ mod tests {
                     },
                     recorded_at: "2026-08-03T00:00:00Z".to_string(),
                 },
+                Some(&root.path),
             )
             .expect("register test active Run");
         broker
