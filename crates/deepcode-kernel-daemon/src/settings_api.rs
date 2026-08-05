@@ -614,24 +614,48 @@ pub(crate) async fn llm_profiles_patch(
     let mut active_profile_ids = {
         let runs = state.session_runs.lock().expect("session run state lock");
         runs.values()
-            .filter(|run| {
-                matches!(run.status.as_str(), "running" | "cancelling")
-                    || (run.status == "waiting"
-                        && session_has_pending_interaction(&state, &run.session_id))
-            })
+            .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
             .filter_map(|run| run.profile_id.clone())
             .collect::<std::collections::HashSet<_>>()
     };
-    for session in &gui.sessions {
-        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
-            continue;
+    let durable_active_runs = match state.host_services.active_runs_v2.active_run_records() {
+        Ok(records) => records,
+        Err(error) => {
+            return ApiResponse::error(
+                "llm_profile_active_run_scan_failed",
+                format!(
+                    "Active Host Run discovery failed before applying the LLM Profile configuration: {}",
+                    error.message
+                ),
+            )
+        }
+    };
+    for active in durable_active_runs {
+        let bootstrap = match state
+            .host_services
+            .kernel_operations_v2
+            .get_bootstrap(&active.session_id, &active.host_run_id)
+        {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                return ApiResponse::error(
+                    "llm_profile_active_run_bootstrap_failed",
+                    format!(
+                        "Active Host Run Profile identity could not be verified before applying the LLM Profile configuration: {}",
+                        error.message
+                    ),
+                )
+            }
         };
-        if !session_has_pending_interaction(&state, session_id) {
-            continue;
+        if bootstrap.run_id != active.run_id
+            || bootstrap.bootstrap_digest != active.bootstrap_digest
+        {
+            return ApiResponse::error(
+                "llm_profile_active_run_identity_conflict",
+                "Active Host Run bootstrap identity conflicts with its durable registration",
+            );
         }
-        if let Some(profile_id) = session.get("profileId").and_then(Value::as_str) {
-            active_profile_ids.insert(profile_id.to_string());
-        }
+        active_profile_ids.insert(bootstrap.provider_profile.provider_profile_id);
     }
     for profile_id in &active_profile_ids {
         let current = profile_value_by_id(&gui.llm_profiles, profile_id);

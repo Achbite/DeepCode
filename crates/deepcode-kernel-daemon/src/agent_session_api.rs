@@ -202,7 +202,16 @@ pub(crate) async fn agent_session_rename(
         .filter(|object| object.contains_key("profileId"))
         .map(|_| body.get("profileId").cloned().unwrap_or(Value::Null));
     let resolved_profile_id = if let Some(requested_profile_id) = requested_profile_id {
-        let run_locked = match state
+        let in_memory_run_locked = state
+            .session_runs
+            .lock()
+            .expect("session run state lock")
+            .values()
+            .any(|run| {
+                run.session_id == session_id
+                    && !matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+            });
+        let durable_run_locked = match state
             .host_services
             .active_runs_v2
             .resolve_session_active_run(&session_id)
@@ -210,10 +219,10 @@ pub(crate) async fn agent_session_rename(
             Ok(active) => active.is_some(),
             Err(error) => return ApiResponse::error(error.code, error.message),
         };
-        if run_locked || session_has_pending_interaction(&state, &session_id) {
+        if in_memory_run_locked || durable_run_locked {
             return ApiResponse::error(
                 "agent_session_profile_locked",
-                "session Profile is locked while a run or user interaction is active",
+                "session Profile is locked while a Run is active",
             );
         }
         let profile_id = if requested_profile_id.is_null() {
@@ -304,21 +313,6 @@ pub(crate) async fn agent_session_rename(
         return session_result(&gui, &session_id);
     }
     ApiResponse::error("agent_session_not_found", "agent session not found")
-}
-
-pub(crate) fn session_has_pending_interaction(state: &AppState, session_id: &str) -> bool {
-    state
-        .host_services
-        .projection_v2
-        .latest_timeline(session_id)
-        .map(|timeline| {
-            timeline
-                .as_ref()
-                .and_then(|timeline| timeline.get("interactionProjection"))
-                .and_then(|projection| projection.get("pending"))
-                .is_some_and(Value::is_object)
-        })
-        .unwrap_or(true)
 }
 
 fn session_deletion_failure_response(
