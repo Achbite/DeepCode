@@ -25,6 +25,9 @@ pub fn canonicalize_invocation(
     mut arguments: Value,
 ) -> Result<KernelCanonicalInvocation, InvocationNormalizationError> {
     use KernelToolKind as Tool;
+    if tool_id == Tool::FsDelete {
+        arguments = canonicalize_delete_arguments(&arguments)?;
+    }
     let fields = arguments
         .as_object_mut()
         .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
@@ -127,11 +130,19 @@ pub fn validate_canonical_invocation(
     invocation.validate()?;
     let encoded = serde_json::to_value(invocation)
         .map_err(|_| invalid_arguments(invocation.tool_id().as_str()))?;
-    let arguments = encoded
-        .as_object()
-        .and_then(|value| value.get("arguments"))
-        .cloned()
-        .ok_or_else(|| invalid_arguments(invocation.tool_id().as_str()))?;
+    let arguments = match invocation {
+        KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::File { path }) => {
+            json!({"path":path,"targetKind":"file"})
+        }
+        KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => {
+            json!({"path":path,"targetKind":"directory","recursive":true})
+        }
+        _ => encoded
+            .as_object()
+            .and_then(|value| value.get("arguments"))
+            .cloned()
+            .ok_or_else(|| invalid_arguments(invocation.tool_id().as_str()))?,
+    };
     let normalized = canonicalize_invocation(invocation.tool_id(), arguments)?;
     if normalized != *invocation {
         return Err(InvocationNormalizationError::NotCanonical {
@@ -139,6 +150,31 @@ pub fn validate_canonical_invocation(
         });
     }
     Ok(())
+}
+
+fn canonicalize_delete_arguments(arguments: &Value) -> Result<Value, InvocationNormalizationError> {
+    let tool_id = KernelToolKind::FsDelete.as_str();
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| invalid_arguments(tool_id))?;
+    let path = fields
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_arguments(tool_id))?;
+    let target_kind = fields
+        .get("targetKind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_arguments(tool_id))?;
+    match target_kind {
+        "file" if fields.len() == 2 => Ok(json!({"kind":"file","data":{"path":path}})),
+        "directory"
+            if fields.len() == 3
+                && fields.get("recursive").and_then(Value::as_bool) == Some(true) =>
+        {
+            Ok(json!({"kind":"directoryTree","data":{"path":path}}))
+        }
+        _ => Err(invalid_arguments(tool_id)),
+    }
 }
 
 pub fn normalize_workspace_path(

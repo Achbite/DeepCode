@@ -444,9 +444,11 @@ fn tool_prompt_v2(tool: KernelToolKind) -> &'static str {
         KernelToolKind::FsCreate
         | KernelToolKind::FsWrite
         | KernelToolKind::FsEdit
-        | KernelToolKind::FsDelete
         | KernelToolKind::FsEnsureDirectory => {
             "Use only for an accepted PlanAction and provide workspace-relative targets."
+        }
+        KernelToolKind::FsDelete => {
+            "Use only for an accepted PlanAction. Provide a workspace-relative path and an explicit targetKind. Directory deletion also requires recursive=true."
         }
         KernelToolKind::FsRename
         | KernelToolKind::GitCommit

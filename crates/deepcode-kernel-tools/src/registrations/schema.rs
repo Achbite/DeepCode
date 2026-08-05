@@ -43,14 +43,27 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "additionalProperties": false
         }),
         KernelToolKind::FsDelete => serde_json::json!({
-            "type": "object",
-            "required": ["path"],
-            "properties": {
-                "path": { "type": "string" },
-                "targetKind": { "type": "string", "enum": ["file", "directory"] },
-                "recursive": { "type": "boolean" }
-            },
-            "additionalProperties": false
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["path", "targetKind"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "targetKind": { "const": "file" }
+                    },
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "required": ["path", "targetKind", "recursive"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "targetKind": { "const": "directory" },
+                        "recursive": { "const": true }
+                    },
+                    "additionalProperties": false
+                }
+            ]
         }),
         KernelToolKind::CodeGrep => serde_json::json!({
             "type": "object",
