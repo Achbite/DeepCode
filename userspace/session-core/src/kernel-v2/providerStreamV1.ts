@@ -40,11 +40,6 @@ interface SessionKernelLlmStreamPendingTextItemV2
   extends SessionKernelLlmStreamTextItemV2 {
   /** One-based position in the eventual sealed ordered-items array. */
   textOrdinal: number;
-  publication:
-    | 'bufferingUnknown'
-    | 'streaming'
-    | 'withheld';
-  publicationBuffer: string;
   publicationStarted: boolean;
 }
 
@@ -71,6 +66,16 @@ export type SessionKernelLlmPublicTextObserverV2 = (
   delta: SessionKernelLlmPublicTextDeltaV2
 ) => Promise<void>;
 
+export interface SessionKernelLlmPublicActivityV2 {
+  providerTurnId: string;
+  activitySequence: number;
+  code: 'provider.reasoning' | 'provider.composing';
+}
+
+export type SessionKernelLlmPublicActivityObserverV2 = (
+  activity: SessionKernelLlmPublicActivityV2
+) => Promise<void>;
+
 export interface SessionKernelLlmStreamResultV2 {
   requestId: string;
   items: Array<
@@ -88,7 +93,8 @@ export interface SessionKernelLlmTransportV2 {
   request(
     request: LlmChatRequest,
     signal: AbortSignal,
-    publicTextObserver?: SessionKernelLlmPublicTextObserverV2
+    publicTextObserver?: SessionKernelLlmPublicTextObserverV2,
+    publicActivityObserver?: SessionKernelLlmPublicActivityObserverV2
   ): Promise<SessionKernelLlmStreamResultV2>;
 }
 
@@ -115,7 +121,8 @@ implements SessionKernelLlmTransportV2 {
   async request(
     request: LlmChatRequest,
     signal: AbortSignal,
-    publicTextObserver?: SessionKernelLlmPublicTextObserverV2
+    publicTextObserver?: SessionKernelLlmPublicTextObserverV2,
+    publicActivityObserver?: SessionKernelLlmPublicActivityObserverV2
   ): Promise<SessionKernelLlmStreamResultV2> {
     let response: Response;
     try {
@@ -174,7 +181,8 @@ implements SessionKernelLlmTransportV2 {
       response.body,
       request.requestId,
       signal,
-      publicTextObserver
+      publicTextObserver,
+      publicActivityObserver
     );
   }
 }
@@ -183,7 +191,8 @@ export async function consumeProviderSseV1(
   body: ReadableStream<Uint8Array>,
   expectedRequestId: string,
   signal: AbortSignal,
-  publicTextObserver?: SessionKernelLlmPublicTextObserverV2
+  publicTextObserver?: SessionKernelLlmPublicTextObserverV2,
+  publicActivityObserver?: SessionKernelLlmPublicActivityObserverV2
 ): Promise<SessionKernelLlmStreamResultV2> {
   const decoder = new TextDecoder('utf-8', { fatal: true });
   const reader = body.getReader();
@@ -202,6 +211,8 @@ export async function consumeProviderSseV1(
   let totalTextBytes = 0;
   let finalStarted = false;
   let publicStreamSequence = 0;
+  let publicActivitySequence = 0;
+  let publicComposingObserved = false;
   let pendingPublicTextBatch:
     | SessionKernelLlmPendingPublicTextBatchV2
     | undefined;
@@ -218,6 +229,18 @@ export async function consumeProviderSseV1(
     if (publicTextFlushTimer === undefined) return;
     clearTimeout(publicTextFlushTimer);
     publicTextFlushTimer = undefined;
+  };
+
+  const publishPublicActivity = async (
+    code: SessionKernelLlmPublicActivityV2['code']
+  ): Promise<void> => {
+    if (!publicActivityObserver) return;
+    publicActivitySequence += 1;
+    await publicActivityObserver({
+      providerTurnId: expectedRequestId,
+      activitySequence: publicActivitySequence,
+      code,
+    });
   };
 
   const enqueuePublicTextPublication = (
@@ -352,29 +375,12 @@ export async function consumeProviderSseV1(
     content: string
   ): Promise<void> => {
     if (!publicTextObserver || !content) return;
-    if (item.phase === 'final_answer' || item.publication === 'withheld') {
-      return;
-    }
     let textDelta = content;
-    if (item.phase === 'unknown') {
-      if (item.publication === 'streaming') {
-        // The first non-whitespace character already proved this is not a
-        // text-framed ToolIntent candidate.
-      } else {
-        item.publicationBuffer += content;
-        const firstNonWhitespace = item.text.match(/\S/u)?.[0];
-        if (!firstNonWhitespace) return;
-        if (firstNonWhitespace === '{') {
-          item.publication = 'withheld';
-          item.publicationBuffer = '';
-          return;
-        }
-        item.publication = 'streaming';
-        textDelta = item.publicationBuffer;
-        item.publicationBuffer = '';
-      }
-    }
     if (!item.publicationStarted) {
+      if (!publicComposingObserved) {
+        await publishPublicActivity('provider.composing');
+        publicComposingObserved = true;
+      }
       item.publicationStarted = true;
       const prefixLength = utf8PrefixLength(
         textDelta,
@@ -419,6 +425,7 @@ export async function consumeProviderSseV1(
           provider: identity(event.data.provider, 'provider', 1024),
           model: identity(event.data.model, 'model', 1024),
         };
+        await publishPublicActivity('provider.reasoning');
         return;
       }
       case 'provider_delta':
@@ -478,12 +485,6 @@ export async function consumeProviderSseV1(
             phase,
             text: content,
             textOrdinal: pendingItems.length + 1,
-            publication: phase === 'commentary'
-              ? 'streaming'
-              : phase === 'final_answer' || finalStarted
-                ? 'withheld'
-                : 'bufferingUnknown',
-            publicationBuffer: '',
             publicationStarted: false,
           };
           pendingItems.push(pendingText);

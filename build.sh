@@ -1128,6 +1128,175 @@ verify_protocol_v2_runtime() {
   return "$failed"
 }
 
+verify_llm_profiles_current() {
+  local profiles_path="$1"
+  local node_bin="$2"
+  local label="$3"
+  if [ ! -f "$profiles_path" ]; then
+    echo "==[build][verify-package-runtime][error]== missing $label: $profiles_path" >&2
+    return 1
+  fi
+  if [ ! -x "$node_bin" ]; then
+    echo "==[build][verify-package-runtime][error]== cannot validate $label without packaged Node: $node_bin" >&2
+    return 1
+  fi
+  if ! "$node_bin" - "$profiles_path" <<'NODE'
+const fs = require('node:fs');
+
+const path = process.argv[2];
+const rootFields = new Set(['profiles', 'defaultProfileId', 'storePath']);
+const profileFields = new Set([
+  'id',
+  'name',
+  'kind',
+  'reasoningTransport',
+  'providerFlavor',
+  'baseUrl',
+  'model',
+  'contextWindowTokens',
+  'maxOutputTokens',
+  'temperature',
+  'reasoningEffort',
+  'thinking',
+  'secretRef',
+  'enabled',
+]);
+const transportByKind = new Map([
+  ['openaiCompatible', 'openaiPlaintext'],
+  ['anthropic', 'anthropicPlaintext'],
+  ['ollama', 'ollamaPlaintext'],
+]);
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isTrimmedNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0 && value.trim() === value;
+}
+
+function isOptionalTrimmedNonEmptyString(record, field) {
+  return !(field in record) || isTrimmedNonEmptyString(record[field]);
+}
+
+function isLocalSecretRef(value) {
+  if (typeof value !== 'string' || value.trim() !== value) return false;
+  const prefix = 'local-secret:';
+  if (!value.startsWith(prefix)) return false;
+  const key = value.slice(prefix.length);
+  return key.length > 0 && key.trim() === key;
+}
+
+function isOptionalPositiveInteger(record, field) {
+  if (!(field in record)) return true;
+  const value = record[field];
+  return Number.isInteger(value) && value > 0 && value <= 1_000_000_000;
+}
+
+function reject(message) {
+  throw new Error(message);
+}
+
+try {
+  const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+  if (!isRecord(config)) reject('root must be an object');
+  const rootKeys = Object.keys(config);
+  if (
+    rootKeys.length !== rootFields.size
+    || rootKeys.some((field) => !rootFields.has(field))
+  ) {
+    reject('root must contain only profiles, defaultProfileId, and storePath');
+  }
+  if (!Array.isArray(config.profiles)) reject('profiles must be an array');
+
+  const profilesById = new Map();
+  for (const [index, profile] of config.profiles.entries()) {
+    if (!isRecord(profile)) reject(`profiles[${index}] must be an object`);
+    if (Object.keys(profile).some((field) => !profileFields.has(field))) {
+      reject(`profiles[${index}] contains an unsupported field`);
+    }
+    for (const field of ['id', 'name', 'model']) {
+      if (!isTrimmedNonEmptyString(profile[field])) {
+        reject(`profiles[${index}].${field} must be a trimmed non-empty string`);
+      }
+    }
+    if (profilesById.has(profile.id)) reject(`duplicate profile id: ${profile.id}`);
+    profilesById.set(profile.id, profile);
+    if (typeof profile.enabled !== 'boolean') {
+      reject(`profiles[${index}].enabled must be a boolean`);
+    }
+    const expectedTransport = transportByKind.get(profile.kind);
+    if (expectedTransport === undefined || profile.reasoningTransport !== expectedTransport) {
+      reject(`profiles[${index}] has an incompatible kind/reasoningTransport pair`);
+    }
+    if (
+      'providerFlavor' in profile
+      && !['openai', 'deepseek', 'zhipu'].includes(profile.providerFlavor)
+    ) {
+      reject(`profiles[${index}].providerFlavor is unsupported`);
+    }
+    if (!isOptionalTrimmedNonEmptyString(profile, 'baseUrl')) {
+      reject(`profiles[${index}].baseUrl must be a trimmed non-empty string when present`);
+    }
+    if ('secretRef' in profile && !isLocalSecretRef(profile.secretRef)) {
+      reject(`profiles[${index}].secretRef must be local-secret:<trimmed non-empty key>`);
+    }
+    for (const field of ['contextWindowTokens', 'maxOutputTokens']) {
+      if (!isOptionalPositiveInteger(profile, field)) {
+        reject(`profiles[${index}].${field} must be a bounded positive integer when present`);
+      }
+    }
+    if (
+      Number.isInteger(profile.contextWindowTokens)
+      && Number.isInteger(profile.maxOutputTokens)
+      && profile.maxOutputTokens >= profile.contextWindowTokens
+    ) {
+      reject(`profiles[${index}].maxOutputTokens must be below contextWindowTokens`);
+    }
+    if (
+      'temperature' in profile
+      && (typeof profile.temperature !== 'number' || !Number.isFinite(profile.temperature))
+    ) {
+      reject(`profiles[${index}].temperature must be finite when present`);
+    }
+    if (
+      'reasoningEffort' in profile
+      && !['low', 'medium', 'high', 'max'].includes(profile.reasoningEffort)
+    ) {
+      reject(`profiles[${index}].reasoningEffort is unsupported`);
+    }
+    if (
+      'thinking' in profile
+      && !['enabled', 'disabled'].includes(profile.thinking)
+    ) {
+      reject(`profiles[${index}].thinking is unsupported`);
+    }
+  }
+
+  if (
+    config.defaultProfileId !== null
+    && (
+      !isTrimmedNonEmptyString(config.defaultProfileId)
+      || profilesById.get(config.defaultProfileId)?.enabled !== true
+    )
+  ) {
+    reject('defaultProfileId must be null or reference an enabled profile by exact id');
+  }
+  if (config.storePath !== null && typeof config.storePath !== 'string') {
+    reject('storePath must be null or a string');
+  }
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
+NODE
+  then
+    echo "==[build][verify-package-runtime][error]== $label is not current: $profiles_path" >&2
+    return 1
+  fi
+  echo "==[build][verify-package-runtime]== ok $label: $profiles_path"
+}
+
 verify_frontend_package_assets() {
   local dist_dir="$1"
   local label="$2"
@@ -1241,12 +1410,20 @@ verify_macos_package_runtime() {
   [ -d "$macos_dir" ] || return 2
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
+  verify_runtime_executable "$macos_dir/DeepCode-CLI.command" "macOS CLI launcher" || missing=1
+  verify_runtime_executable "$macos_dir/DeepCode-TUI.command" "macOS TUI launcher" || missing=1
+  verify_runtime_executable "$macos_dir/libexec/DeepCode-CLI" "macOS CLI host" || missing=1
+  verify_runtime_executable "$macos_dir/libexec/DeepCode-TUI" "macOS TUI host" || missing=1
   verify_runtime_file "$macos_dir/build-info.json" "macOS shared build-info" || missing=1
   verify_runtime_file "$macos_dir/session-core/$SESSION_BRIDGE_NAME" "macOS Session v2 bridge" || missing=1
   verify_protocol_v2_runtime \
     "$macos_dir/node_modules/@deepcode/protocol/dist" \
     "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
+  verify_llm_profiles_current \
+    "$macos_dir/config/user/local/settings/llm-profiles.json" \
+    "$macos_dir/node/bin/node" \
+    "macOS LLM Profile store" || missing=1
 
   if [ -d "$macos_dir/DeepCode.app" ]; then
     checked_app=1

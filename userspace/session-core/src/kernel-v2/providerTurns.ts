@@ -54,16 +54,16 @@ import {
   type SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
-  decodeProviderToolIntentTextFrameV2,
   normalizeProviderKernelToolIntentV2,
   type ProviderKernelToolSourceV2,
 } from './toolIntent.js';
 import {
   decodeCompletedProviderTerminalV3,
-  decodeProviderPlanningResultEnvelopeV2,
+  decodeProviderPlanProposalArgumentsV2,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
 import type {
@@ -517,6 +517,12 @@ export class SessionKernelProviderTurnsV2 {
             providerTurnId,
             state.controlEpoch
           ),
+          publicActivityObserver: this.publicActivityObserverForTurn(
+            reservation,
+            generation,
+            providerTurnId,
+            state.controlEpoch
+          ),
           signal: controller.signal,
         });
         const evidence = await this.ports.persistence
@@ -596,6 +602,12 @@ export class SessionKernelProviderTurnsV2 {
                         evidence.terminal?.data.terminalKind === 'completed'
                           ? 'provider.outputValidation'
                           : 'provider.requestTurn',
+                      ...(evidence.terminal?.data.terminalKind === 'completed'
+                        ? {
+                            providerOutcome:
+                              evidence.terminal.data.providerResult,
+                          }
+                        : {}),
                     }
                   );
                 } catch {
@@ -657,7 +669,9 @@ export class SessionKernelProviderTurnsV2 {
                 {
                   providerTurnId,
                   code: safeErrorCode(error),
+                  message: safeErrorMessage(error),
                   stage: 'provider.outputAdmission',
+                  providerOutcome: output.providerResult,
                 }
               );
             }
@@ -968,19 +982,7 @@ export class SessionKernelProviderTurnsV2 {
           )
             ? 'turn'
             : 'providerTurn',
-        // Planning responses use one private structured envelope. The exact
-        // Provider text remains in the daemon terminal/Trace for recovery,
-        // while the public projection receives only the decoded Plan or
-        // semantic answer carried by `result`.
-        orderedItems: request.target.kind === 'planning'
-          ? output.kind === 'answer' && result.kind === 'answer'
-            ? [{
-                kind: 'text',
-                phase: 'unknown',
-                text: result.text,
-              }]
-            : []
-          : publicSessionProviderOrderedItemsV2(output.items),
+        orderedItems: publicSessionProviderOrderedItemsV2(output.items),
         providerOutcome: output.providerResult,
       },
       recordedAt
@@ -1391,6 +1393,24 @@ export class SessionKernelProviderTurnsV2 {
         physicalRequestCount: finalAnswer.physicalRequestCount,
         lastErrorCode: finalAnswer.lastErrorCode,
       })).slice('sha256:'.length)}`;
+    let providerOutcome:
+      | import('./types.js').SessionProviderResultMetadataV2
+      | undefined;
+    if (finalAnswer.providerTurnId) {
+      try {
+        const evidence = await this.ports.persistence
+          .loadProviderTurnEvidence(
+            state.runId,
+            finalAnswer.providerTurnId
+          );
+        if (evidence.terminal?.data.terminalKind === 'completed') {
+          providerOutcome = evidence.terminal.data.providerResult;
+        }
+      } catch {
+        // Failure projection remains available even when its optional usage
+        // metadata cannot be reloaded from the durable Provider terminal.
+      }
+    }
     await this.host.project(
       `provider:${failureIdentity}:final-answer-failed`,
       'diagnostic',
@@ -1407,6 +1427,7 @@ export class SessionKernelProviderTurnsV2 {
         controlEpoch: finalAnswer.binding.controlEpoch,
         reviewRevision: finalAnswer.binding.reviewRevision,
         snapshotHighWater: finalAnswer.binding.snapshotHighWater,
+        ...(providerOutcome ? { providerOutcome } : {}),
       },
       finalAnswer.failedAt
     );
@@ -2080,6 +2101,75 @@ export class SessionKernelProviderTurnsV2 {
     };
   }
 
+  private publicActivityObserverForTurn(
+    reservation: symbol,
+    generation: number,
+    providerTurnId: string,
+    controlEpoch: number
+  ): NonNullable<SessionProviderTurnInputV2['publicActivityObserver']> {
+    return async (activity) => {
+      if (
+        activity.providerTurnId !== providerTurnId
+        || !Number.isSafeInteger(activity.activitySequence)
+        || activity.activitySequence <= 0
+        || (
+          activity.code !== 'provider.reasoning'
+          && activity.code !== 'provider.composing'
+        )
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_public_activity_invalid',
+          'Provider public activity metadata is invalid.'
+        );
+      }
+      const commit = this.beginAdmissionCommit(
+        reservation,
+        generation
+      );
+      if (!commit) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_publication_stale',
+          'Provider public activity belongs to a stale authority epoch.'
+        );
+      }
+      try {
+        const turn = this.host.readState().providerTurn;
+        if (
+          turn?.providerTurnId !== providerTurnId
+          || turn.controlEpoch !== controlEpoch
+          || turn.status !== 'active'
+        ) {
+          throw new SessionKernelProviderTurnError(
+            'session_kernel_provider_publication_stale',
+            'Provider public activity no longer matches the active turn.'
+          );
+        }
+        await this.host.project(
+          `provider:${providerTurnId}:activity:${activity.activitySequence}`,
+          'provider.started',
+          {
+            providerTurnId,
+            controlEpoch,
+            activitySequence: activity.activitySequence,
+            currentActivityCode: activity.code,
+          }
+        );
+        if (this.resultIsStale(
+          reservation,
+          providerTurnId,
+          generation
+        )) {
+          throw new SessionKernelProviderTurnError(
+            'session_kernel_provider_publication_stale',
+            'Provider public activity was superseded during publication.'
+          );
+        }
+      } finally {
+        this.endAdmissionCommit(commit);
+      }
+    };
+  }
+
   private endAdmissionCommit(token: symbol): void {
     const commit = this.admissionCommit;
     if (!commit || commit.token !== token) {
@@ -2286,68 +2376,36 @@ function terminalItemsMatchProviderOutputV3(
   );
   if (
     planningTarget
-    && output.kind !== 'toolIntent'
-    && terminalTextItems.length === terminalItems.length
+    && output.kind === 'plan'
   ) {
     try {
-      const planningResult = decodeProviderPlanningResultEnvelopeV2(
-        terminalTextItems.map((item) => item.text).join('')
+      const controlItems = terminalItems.filter(
+        (item): item is Extract<
+          import('./types.js').SessionProviderTerminalOrderedItemV3,
+          { kind: 'toolCall' }
+        > => item.kind === 'toolCall'
+          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME
       );
-      if (planningResult.kind === 'answer') {
-        const item = outputItems[0];
-        return output.kind === 'answer'
-          && output.text === planningResult.text
-          && outputItems.length === 1
-          && item?.kind === 'text'
-          && item.phase === (
-            terminalTextItems.some(
-              (terminal) => terminal.phase === 'final_answer'
-            )
-              ? 'final_answer'
-              : 'unknown'
-          )
-          && item.text === planningResult.text;
+      if (
+        controlItems.length !== 1
+        || terminalTextItems.length + 1 !== terminalItems.length
+        || terminalItems.at(-1) !== controlItems[0]
+        || terminalTextItems.some(
+          (item) => item.phase === 'final_answer'
+        )
+      ) {
+        return false;
       }
-      return output.kind === 'plan'
-        && outputItems.length === 0
-        && output.plan.title === planningResult.plan.title
-        && output.plan.objective === planningResult.plan.objective
-        && output.plan.narrative === planningResult.plan.narrative
-        && output.plan.actions.length
-          === planningResult.plan.actions.length
-        && planningResult.plan.actions.every((draft, index) => {
-          const action = output.plan.actions[index];
-          return action?.manifest.toolId === draft.toolId
-            && canonicalJson(action.manifest.requestedResources)
-              === canonicalJson(draft.requestedResources)
-            && canonicalJson(action.previewArguments)
-              === canonicalJson(draft.previewArguments)
-            && canonicalJson(action.deadline) === canonicalJson(
-              draft.deadline ?? {
-                kind: 'contractDefault',
-                data: {},
-              }
-            );
-        });
-    } catch {
-      return false;
-    }
-  }
-  if (
-    terminalItems.length === 1
-    && terminalItems[0]?.kind === 'text'
-    && outputItems.length === 1
-    && outputItems[0]?.kind === 'toolCall'
-    && outputItems[0].source === 'textFrame'
-  ) {
-    try {
-      const frame = decodeProviderToolIntentTextFrameV2(
-        terminalItems[0].text
+      const draft = decodeProviderPlanProposalArgumentsV2(
+        controlItems[0]!.arguments
       );
-      return terminalItems[0].phase === 'unknown'
-        && frame.toolId === outputItems[0].toolId
-        && canonicalJson(frame.arguments)
-          === canonicalJson(outputItems[0].arguments);
+      const normalizedTextItems = terminalTextItems.map((item) => ({
+        kind: 'text' as const,
+        phase: 'commentary' as const,
+        text: item.text,
+      }));
+      return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
+        && providerPlanMatchesDraftV3(output.plan, draft);
     } catch {
       return false;
     }
@@ -2375,6 +2433,30 @@ function terminalItemsMatchProviderOutputV3(
   });
 }
 
+function providerPlanMatchesDraftV3(
+  plan: SessionNaturalLanguagePlanV2,
+  draft: ReturnType<typeof decodeProviderPlanProposalArgumentsV2>
+): boolean {
+  return plan.title === draft.title
+    && plan.objective === draft.objective
+    && plan.narrative === draft.narrative
+    && plan.actions.length === draft.actions.length
+    && draft.actions.every((actionDraft, index) => {
+      const action = plan.actions[index];
+      return action?.manifest.toolId === actionDraft.toolId
+        && canonicalJson(action.manifest.requestedResources)
+          === canonicalJson(actionDraft.requestedResources)
+        && canonicalJson(action.previewArguments)
+          === canonicalJson(actionDraft.previewArguments)
+        && canonicalJson(action.deadline) === canonicalJson(
+          actionDraft.deadline ?? {
+            kind: 'contractDefault',
+            data: {},
+          }
+        );
+    });
+}
+
 function sameProviderOutputIgnoringAdapterTimestampV3(
   left: SessionProviderTurnOutputV2,
   right: SessionProviderTurnOutputV2
@@ -2395,9 +2477,7 @@ function sameProviderOutputIgnoringAdapterTimestampV3(
 function providerSourceToolId(
   source: ProviderKernelToolSourceV2
 ): string {
-  return source.source === 'providerNative'
-    ? source.toolId
-    : decodeProviderToolIntentTextFrameV2(source.frame).toolId;
+  return source.toolId;
 }
 
 function providerCallIdentity(
@@ -2418,9 +2498,7 @@ function providerCallIdentity(
       'A Provider call requires an active persisted Provider turn identity.'
     );
   }
-  const callIdentity = source.source === 'providerNative'
-    ? `native:${source.callId}`
-    : `text:${sha256Hash(source.frame.trim())}`;
+  const callIdentity = `native:${source.callId}`;
   const digest = sha256Hash(canonicalJson({
     runId: state.runId,
     controlEpoch: state.controlEpoch,

@@ -22,16 +22,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(kernel_v2_user_decisions).layer(DefaultBodyLimit::max(MAX_USER_DECISION_BYTES_V2)),
         )
         .route(
-            "/api/session-store/:session_id/kernel-v3/:run_id",
-            get(session_kernel_v3_store_get)
-                .post(session_kernel_v3_store_append)
+            "/api/session-store/:session_id/session-runs/:run_id",
+            get(session_run_store_get)
+                .post(session_run_store_append)
                 .layer(DefaultBodyLimit::max(
                     SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,
                 )),
         )
         .route(
-            "/api/session-store/:session_id/kernel-v3/:run_id/records/:record_id",
-            get(session_kernel_v3_store_record_get),
+            "/api/session-store/:session_id/session-runs/:run_id/records/:record_id",
+            get(session_run_store_record_get),
         )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
@@ -65,10 +65,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/host/provider-traces/:session_id/:provider_turn_id/export",
             post(provider_trace_export).layer(DefaultBodyLimit::max(16 * 1024)),
-        )
-        .route(
-            "/api/llm/chat",
-            post(llm_chat).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/llm/chat/stream",
@@ -129,10 +125,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(agent_session_archive),
         )
         .route(
-            "/api/agent/sessions/:session_id/events",
-            get(agent_session_events),
-        )
-        .route(
             "/api/agent/sessions/:session_id/runs",
             post(agent_session_run_start),
         )
@@ -163,10 +155,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(agent_session_run_authority_revoke),
         )
         .route(
-            "/api/agent/sessions/:session_id/runs/:run_id/stream",
-            get(agent_session_run_stream),
-        )
-        .route(
             "/api/agent/sessions/:session_id/timeline",
             get(agent_session_timeline),
         )
@@ -176,7 +164,9 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route(
             "/api/agent/sessions/:session_id",
-            patch(agent_session_rename).delete(agent_session_delete),
+            get(agent_session_get)
+                .patch(agent_session_rename)
+                .delete(agent_session_delete),
         )
         .route("/api/host/skills", get(host_skills))
         .route("/api/browser/runtime-status", get(browser_status))

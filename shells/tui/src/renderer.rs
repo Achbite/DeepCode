@@ -1,6 +1,6 @@
 use crate::{
     app::TuiApp,
-    model::{CardKind, CardModel},
+    model::{CardKind, CardModel, CurrentWorkModel},
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -79,6 +79,9 @@ impl Renderer {
                 output.push_str(&self.render_plain_card(card));
             }
         }
+        if let Some(current_work) = app.current_work() {
+            output.push_str(&self.render_plain_current_work(current_work));
+        }
         output.push_str("────────────────────────────────────────\n");
         output.push_str("输入消息，或使用 /help /workspace /sessions /status /quit\n");
         output
@@ -117,7 +120,8 @@ impl Renderer {
         let area = columns[1];
 
         let cards = app.cards();
-        if cards.is_empty() {
+        let current_work = app.current_work();
+        if cards.is_empty() && current_work.is_none() {
             let cover = Paragraph::new(self.cover_lines(app))
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true });
@@ -125,8 +129,19 @@ impl Renderer {
             return;
         }
 
-        let visible_cards = usize::from(area.height.saturating_sub(1)).max(1);
-        let content_width = usize::from(area.width.saturating_sub(4));
+        let (timeline_area, current_work_area) = if let Some(current_work) = current_work {
+            let work_height = current_work_height(current_work, area.height);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(work_height)])
+                .split(area);
+            (rows[0], Some(rows[1]))
+        } else {
+            (area, None)
+        };
+
+        let visible_cards = usize::from(timeline_area.height.saturating_sub(1)).max(1);
+        let content_width = usize::from(timeline_area.width.saturating_sub(4));
         let items = cards
             .iter()
             .rev()
@@ -135,7 +150,92 @@ impl Renderer {
             .map(|card| ListItem::new(self.card_lines(card, content_width)))
             .collect::<Vec<_>>();
         let list = List::new(items).block(Block::default().borders(Borders::NONE));
-        frame.render_widget(list, area);
+        frame.render_widget(list, timeline_area);
+        if let (Some(current_work), Some(current_work_area)) = (current_work, current_work_area) {
+            self.draw_current_work(frame, current_work_area, current_work);
+        }
+    }
+
+    fn draw_current_work(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        current_work: &CurrentWorkModel,
+    ) {
+        let mut lines = Vec::new();
+        if let Some(activity) = &current_work.activity {
+            lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(self.theme.accent)),
+                Span::styled(activity.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+        if let Some(wait) = &current_work.wait {
+            lines.push(Line::from(Span::styled(
+                wait.clone(),
+                Style::default().fg(self.theme.warning),
+            )));
+        }
+        for segment in &current_work.segments {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if segment.expanded { "▾ " } else { "▸ " },
+                    Style::default().fg(self.theme.dim),
+                ),
+                Span::styled(
+                    segment.title.clone(),
+                    Style::default()
+                        .fg(if segment.attention_unresolved {
+                            self.theme.warning
+                        } else {
+                            self.theme.success
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", segment.summary),
+                    Style::default().fg(self.theme.dim),
+                ),
+            ]));
+            if let Some(attention) = &segment.attention {
+                lines.push(Line::from(Span::styled(
+                    format!("  {attention}"),
+                    Style::default().fg(if segment.attention_unresolved {
+                        self.theme.warning
+                    } else {
+                        self.theme.dim
+                    }),
+                )));
+            }
+            for operation in &segment.operations {
+                let detail = operation
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(" · {detail}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("  └ ", Style::default().fg(self.theme.dim)),
+                    Span::styled(operation.title.clone(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!(" · {}{detail}", operation.status),
+                        Style::default().fg(self.theme.dim),
+                    ),
+                ]));
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "等待共享投影更新",
+                Style::default().fg(self.theme.dim),
+            )));
+        }
+        let panel = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(self.theme.dim))
+                .title(" Current Work "),
+        );
+        frame.render_widget(panel, area);
     }
 
     fn cover_lines(&self, app: &TuiApp) -> Vec<Line<'static>> {
@@ -333,17 +433,41 @@ impl Renderer {
         out
     }
 
+    fn render_plain_current_work(&self, current_work: &CurrentWorkModel) -> String {
+        let mut out = String::from("Current Work\n");
+        if let Some(activity) = &current_work.activity {
+            out.push_str(&format!("  {activity}\n"));
+        }
+        if let Some(wait) = &current_work.wait {
+            out.push_str(&format!("  {wait}\n"));
+        }
+        for segment in &current_work.segments {
+            out.push_str(&format!("  {} · {}\n", segment.title, segment.summary));
+            if let Some(attention) = &segment.attention {
+                out.push_str(&format!("    {attention}\n"));
+            }
+            for operation in &segment.operations {
+                out.push_str(&format!("    {} · {}", operation.title, operation.status));
+                if let Some(detail) = &operation.detail {
+                    out.push_str(&format!(" · {detail}"));
+                }
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+        out
+    }
+
     fn card_color(&self, card: &CardModel) -> Color {
         match card.kind {
             CardKind::User => self.theme.accent,
             CardKind::Assistant => Color::White,
             CardKind::CommandHelp => self.theme.accent,
-            CardKind::Stage => self.theme.success,
-            CardKind::Tool => self.theme.warning,
+            CardKind::Notice => self.theme.success,
             CardKind::Permission => self.theme.warning,
             CardKind::Plan => self.theme.accent,
             CardKind::Review => self.theme.success,
-            CardKind::Error | CardKind::BridgeError => self.theme.danger,
+            CardKind::Error => self.theme.danger,
             CardKind::Final => self.theme.success,
             CardKind::AuditStatus => self.theme.warning,
         }
@@ -351,8 +475,8 @@ impl Renderer {
 
     fn body_color(&self, card: &CardModel) -> Color {
         match card.kind {
-            CardKind::Error | CardKind::BridgeError => self.theme.danger,
-            CardKind::Stage | CardKind::AuditStatus => Color::Gray,
+            CardKind::Error => self.theme.danger,
+            CardKind::Notice | CardKind::AuditStatus => Color::Gray,
             _ => Color::White,
         }
     }
@@ -367,13 +491,11 @@ fn icon(card: &CardModel) -> &'static str {
         CardKind::User => "›",
         CardKind::Assistant | CardKind::Final => "◆",
         CardKind::CommandHelp => "?",
-        CardKind::Stage => "•",
-        CardKind::Tool => "⌁",
+        CardKind::Notice => "•",
         CardKind::Permission => "!",
         CardKind::Plan => "◇",
         CardKind::Review => "✓",
         CardKind::Error => "×",
-        CardKind::BridgeError => "!",
         CardKind::AuditStatus => "◌",
     }
 }
@@ -383,16 +505,35 @@ fn label(card: &CardModel) -> &'static str {
         CardKind::User => "你",
         CardKind::Assistant => "DeepCode",
         CardKind::CommandHelp => "命令",
-        CardKind::Stage => "状态",
-        CardKind::Tool => "工具",
+        CardKind::Notice => "提示",
         CardKind::Permission => "权限",
         CardKind::Plan => "计划",
         CardKind::Review => "审查",
         CardKind::Error => "错误",
-        CardKind::BridgeError => "Runtime",
         CardKind::Final => "DeepCode",
         CardKind::AuditStatus => "审计",
     }
+}
+
+fn current_work_height(current_work: &CurrentWorkModel, available_height: u16) -> u16 {
+    let expanded_operation_count = current_work
+        .segments
+        .iter()
+        .map(|segment| segment.operations.len())
+        .sum::<usize>();
+    let attention_count = current_work
+        .segments
+        .iter()
+        .filter(|segment| segment.attention.is_some())
+        .count();
+    let desired = 2usize
+        + usize::from(current_work.activity.is_some())
+        + usize::from(current_work.wait.is_some())
+        + current_work.segments.len()
+        + attention_count
+        + expanded_operation_count;
+    let maximum = available_height.saturating_sub(3).clamp(3, 14);
+    u16::try_from(desired).unwrap_or(u16::MAX).clamp(3, maximum)
 }
 
 fn composer_cursor_position(area: Rect, input: &str) -> Position {

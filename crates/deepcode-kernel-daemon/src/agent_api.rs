@@ -61,12 +61,6 @@ pub(crate) struct AgentAuthorityRevokeRequestV2 {
     pub(crate) reason: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentRunStreamQuery {
-    pub(crate) since_event_count: Option<usize>,
-}
-
 fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiResponse> {
     let run = {
         let runs = state.session_runs.lock().expect("session run state lock");
@@ -77,13 +71,12 @@ fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiRes
     let Some(run) = run else {
         return ApiResponse::error("agent_run_not_found", "agent run not found");
     };
-    let Some((session, events)) = session_payload(state, session_id) else {
+    let Some(session) = session_metadata_payload(state, session_id) else {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
     };
     ApiResponse::ok(json!({
         "run": run,
-        "session": session,
-        "events": events
+        "session": session
     }))
 }
 
@@ -116,16 +109,12 @@ fn require_verified_selectable_session(
     verified_selectable_session(&gui, session_id).map(|_| ())
 }
 
-fn session_payload(state: &AppState, session_id: &str) -> Option<(Value, Vec<Value>)> {
-    let (session, sessions_dir) = {
+fn session_metadata_payload(state: &AppState, session_id: &str) -> Option<Value> {
+    let session = {
         let gui = state.gui.lock().expect("gui state lock");
-        (
-            session_by_id(&gui, session_id)?.clone(),
-            gui.paths.sessions_dir.clone(),
-        )
+        session_by_id(&gui, session_id)?.clone()
     };
-    let events = read_session_kernel_v2_public_agent_events(&sessions_dir, session_id).ok()?;
-    Some((session, events))
+    Some(session)
 }
 
 fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> bool {
@@ -135,17 +124,6 @@ fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> b
         .expect("session run state lock")
         .get(run_id)
         .is_some_and(|run| run.session_id == session_id)
-}
-
-fn run_status_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
-}
-
-fn sse_bytes(event: &str, payload: Value) -> Result<bytes::Bytes, std::convert::Infallible> {
-    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-    Ok(bytes::Bytes::from(format!(
-        "event: {event}\ndata: {data}\n\n"
-    )))
 }
 
 fn authoritative_project_run_context(
@@ -259,11 +237,11 @@ pub(crate) async fn agent_session_run_start(
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
         return response;
     }
-    let Some((session, _events)) = session_payload(&state, &session_id) else {
+    let Some(session) = session_metadata_payload(&state, &session_id) else {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
     };
-    if !session_schema_is_compatible(&session) {
-        return incompatible_session_response();
+    if !session_schema_is_current(&session) {
+        return unsupported_session_schema_response();
     }
     match body.op.as_str() {
         "resolveDecision" => {
@@ -293,11 +271,11 @@ pub(crate) async fn agent_session_run_start(
             if let Err(response) = require_verified_selectable_session(&state, &session_id) {
                 return response;
             }
-            let Some((session, _events)) = session_payload(&state, &session_id) else {
+            let Some(session) = session_metadata_payload(&state, &session_id) else {
                 return ApiResponse::error("agent_session_not_found", "agent session not found");
             };
-            if !session_schema_is_compatible(&session) {
-                return incompatible_session_response();
+            if !session_schema_is_current(&session) {
+                return unsupported_session_schema_response();
             }
             if body.decision_kind.is_some()
                 || body.decision.is_some()
@@ -361,51 +339,46 @@ async fn agent_session_run_open_admitted(
             .get("profileId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let stored_profile_available = match stored_profile_id.as_deref() {
-            Some(profile_id) => {
-                match effective_llm_profile_is_enabled(&state, &llm_profiles, profile_id) {
-                    Ok(available) => available,
-                    Err(error) => {
-                        return ApiResponse::error(
-                            error.code,
-                            "Provider Profile availability could not be verified before starting the Session Run",
-                        )
-                    }
-                }
-            }
-            None => false,
-        };
-        let profile_id = if stored_profile_available {
-            stored_profile_id.clone()
-        } else {
-            match preferred_effective_llm_profile_id(&state, &llm_profiles) {
-                Ok(profile_id) => profile_id,
-                Err(error) => {
-                    return ApiResponse::error(
-                        error.code,
-                        "Provider Profile availability could not be verified before starting the Session Run",
-                    )
-                }
-            }
-        };
-        let Some(profile_id) = profile_id else {
+        let Some(profile_id) = stored_profile_id else {
             return ApiResponse::error(
                 "llm_profile_unavailable",
-                "no enabled LLM Profile is available for this session",
+                "this Session has no selected LLM Profile; select one before starting a Run",
             );
         };
-        if stored_profile_id.as_deref() != Some(profile_id.as_str()) {
-            stored_session["profileId"] = json!(profile_id.clone());
-            stored_session["updatedAt"] = json!(now_text());
-            if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
-                return ApiResponse::error("agent_session_persist_failed", error);
+        let profile_available = match effective_llm_profile_is_enabled(
+            &state,
+            &llm_profiles,
+            &profile_id,
+        ) {
+            Ok(available) => available,
+            Err(error) => {
+                return ApiResponse::error(
+                    error.code,
+                    "Provider Profile availability could not be verified before starting the Session Run",
+                )
             }
+        };
+        if !profile_available {
+            return ApiResponse::error(
+                "llm_profile_unavailable",
+                "the Session's selected LLM Profile does not exist, is disabled, or its exact revision is unavailable; select or re-enable it explicitly",
+            );
         }
         profile_id
     };
-    let start_event_count = session_payload(state, session_id)
-        .map(|(_, events)| events.len())
-        .unwrap_or_default();
+    let start_event_count = {
+        let sessions_dir = state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .paths
+            .sessions_dir
+            .clone();
+        match read_session_kernel_v2_public_agent_events(&sessions_dir, session_id) {
+            Ok(events) => events.len(),
+            Err(error) => return ApiResponse::error(error.code, error.message),
+        }
+    };
     match open_agent_kernel_run_v2(
         state,
         session_id,
@@ -513,100 +486,6 @@ pub(crate) async fn agent_session_run_authority_revoke(
         Ok(result) => ApiResponse::ok(result),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
-}
-
-pub(crate) async fn agent_session_run_stream(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-    Query(query): Query<AgentRunStreamQuery>,
-) -> Response {
-    if let Some(response) =
-        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
-    {
-        return response.into_response();
-    }
-    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
-        return response.into_response();
-    }
-    let session_io_guard = session_private_io_lock(&session_id).read_owned().await;
-    let stream_state = state.clone();
-    let stream = async_stream::stream! {
-        let _session_io_guard = session_io_guard;
-        let mut sent_event_count = query.since_event_count.unwrap_or_else(|| {
-            let runs = stream_state.session_runs.lock().expect("session run state lock");
-            runs.get(&run_id).map(|run| run.start_event_count).unwrap_or(0)
-        });
-        let mut last_run_status = String::new();
-        let mut heartbeat_at = Instant::now();
-        loop {
-            let run = {
-                let runs = stream_state.session_runs.lock().expect("session run state lock");
-                runs.get(&run_id)
-                    .filter(|run| run.session_id == session_id)
-                    .cloned()
-            };
-            let Some(run) = run else {
-                yield sse_bytes("error", json!({
-                    "code": "agent_run_not_found",
-                    "message": "agent run not found",
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone()
-                }));
-                break;
-            };
-
-            if run.status != last_run_status {
-                last_run_status = run.status.clone();
-                yield sse_bytes("run", json!({
-                    "run": run.clone(),
-                    "sessionId": session_id.clone()
-                }));
-            }
-
-            let events = session_payload(&stream_state, &session_id)
-                .map(|(_, events)| events)
-                .unwrap_or_default();
-            if events.len() != sent_event_count {
-                let new_events = events.iter().skip(sent_event_count).cloned().collect::<Vec<_>>();
-                sent_event_count = events.len();
-                yield sse_bytes("events", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "events": new_events,
-                    "eventCount": sent_event_count
-                }));
-            }
-
-            if run_status_terminal(&run.status) {
-                yield sse_bytes("terminal", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "run": run.clone(),
-                    "events": [],
-                    "eventCount": sent_event_count
-                }));
-                break;
-            }
-
-            if heartbeat_at.elapsed() >= Duration::from_secs(10) {
-                heartbeat_at = Instant::now();
-                yield sse_bytes("heartbeat", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "at": now_text()
-                }));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    };
-    (
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

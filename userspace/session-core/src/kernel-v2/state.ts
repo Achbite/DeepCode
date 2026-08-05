@@ -1520,7 +1520,6 @@ function validateProviderTurnResponse(
   let finalStarted = false;
   let toolOrdinal = 0;
   let providerNativeToolCount = 0;
-  let textFrameToolCount = 0;
   for (const item of response.items) {
     if (item.kind === 'text') {
       if (
@@ -1547,10 +1546,7 @@ function validateProviderTurnResponse(
       item.kind !== 'toolCall'
       || finalStarted
       || item.ordinal !== toolOrdinal
-      || (
-        item.source !== 'providerNative'
-        && item.source !== 'textFrame'
-      )
+      || item.source !== 'providerNative'
       || !item.callId.trim()
       || !item.toolName.trim()
       || !item.toolId.trim()
@@ -1560,24 +1556,7 @@ function validateProviderTurnResponse(
         'Provider turn ordered tool item is invalid.'
       );
     }
-    if (item.source === 'providerNative') {
-      providerNativeToolCount += 1;
-    } else {
-      textFrameToolCount += 1;
-    }
-  }
-  if (
-    (providerNativeToolCount > 0 && textFrameToolCount > 0)
-    || textFrameToolCount > 1
-    || (
-      textFrameToolCount === 1
-      && response.items.length !== 1
-    )
-  ) {
-    throw new SessionKernelStateError(
-      'session_kernel_provider_response_invalid',
-      'Provider turn text-frame tool response is not isolated.'
-    );
+    providerNativeToolCount += 1;
   }
   const native = completion.nativeCompletion;
   const nativeInvalid =

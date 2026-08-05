@@ -1,6 +1,7 @@
 import {
   decodeRawToolArgumentsV2,
   type DeadlineRequestV2,
+  type ProviderWireToolDefinition,
   type RawToolArgumentsV2,
   type RequestedResourceV2,
 } from '@deepcode/protocol';
@@ -13,10 +14,6 @@ import type {
   SessionKernelClockPortV2,
   SessionKernelProviderPortV2,
 } from './ports.js';
-import {
-  decodeProviderToolIntentTextFrameV2,
-  SESSION_TOOL_INTENT_TEXT_FRAME_V2,
-} from './toolIntent.js';
 import type {
   SessionNaturalLanguagePlanV2,
   SessionProviderCompletionReceiptV1,
@@ -29,6 +26,163 @@ import type {
 import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
 } from './types.js';
+
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA =
+  'deepcode.session.plan-proposal.v2' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME =
+  'deepcode_session_plan_propose_v2' as const;
+
+export function sessionPlanProposalToolV2(): ProviderWireToolDefinition {
+  return {
+    name: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+    description: [
+      'Session-only structured Plan control; it never executes a Kernel tool.',
+      'Call it exactly once only when the requested work requires a Plan for user review.',
+      'For an ordinary answer, do not call it and reply with natural assistant text.',
+      'Commentary may precede this control, but final answer text may not share the response.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['schemaVersion', 'plan'],
+      properties: {
+        schemaVersion: {
+          type: 'string',
+          const: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+        },
+        plan: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['title', 'objective', 'narrative', 'actions'],
+          properties: {
+            title: { type: 'string', minLength: 1 },
+            objective: { type: 'string', minLength: 1 },
+            narrative: { type: 'string', minLength: 1 },
+            actions: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 128,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: [
+                  'toolId',
+                  'requestedResources',
+                  'previewArguments',
+                ],
+                properties: {
+                  toolId: { type: 'string', minLength: 1 },
+                  requestedResources: {
+                    type: 'array',
+                    items: sessionPlanRequestedResourceSchemaV2(),
+                  },
+                  previewArguments: {
+                    type: 'object',
+                    additionalProperties: true,
+                  },
+                  deadline: sessionPlanDeadlineSchemaV2(),
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+function sessionPlanRequestedResourceSchemaV2(): unknown {
+  const tagged = (
+    kind: string,
+    properties: Record<string, unknown>,
+    required: string[]
+  ): Record<string, unknown> => ({
+    type: 'object',
+    additionalProperties: false,
+    required: ['kind', 'data'],
+    properties: {
+      kind: { type: 'string', const: kind },
+      data: {
+        type: 'object',
+        additionalProperties: false,
+        required,
+        properties,
+      },
+    },
+  });
+  return {
+    oneOf: [
+      tagged(
+        'workspacePath',
+        {
+          path: { type: 'string', minLength: 1 },
+          access: { type: 'string', enum: ['read', 'write'] },
+        },
+        ['path', 'access']
+      ),
+      tagged(
+        'repository',
+        {
+          area: {
+            type: 'string',
+            enum: ['state', 'index', 'history'],
+          },
+        },
+        ['area']
+      ),
+      tagged(
+        'networkUrl',
+        { url: { type: 'string', minLength: 1 } },
+        ['url']
+      ),
+      tagged(
+        'networkQuery',
+        { query: { type: 'string', minLength: 1 } },
+        ['query']
+      ),
+      tagged(
+        'exactInvocation',
+        { invocationDigest: { type: 'string', minLength: 1 } },
+        ['invocationDigest']
+      ),
+    ],
+  };
+}
+
+function sessionPlanDeadlineSchemaV2(): unknown {
+  return {
+    oneOf: [
+      {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'data'],
+        properties: {
+          kind: { type: 'string', const: 'contractDefault' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+          },
+        },
+      },
+      {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'data'],
+        properties: {
+          kind: { type: 'string', const: 'exactMilliseconds' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['value'],
+            properties: {
+              value: { type: 'integer', minimum: 1 },
+            },
+          },
+        },
+      },
+    ],
+  };
+}
 
 export interface SessionProviderPlanActionDraftV2 {
   toolId: string;
@@ -55,6 +209,12 @@ export type SessionKernelProviderBackendOutputV2 = (
   | {
       kind: 'plan';
       plan: SessionProviderPlanDraftV2;
+      planProposal: {
+        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA;
+        callId: string;
+        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME;
+        argumentsDigest: string;
+      };
     }
   | {
       kind: 'nativeToolCalls';
@@ -106,10 +266,11 @@ export type SessionKernelProviderAdapterInputV2 = Pick<
 >;
 
 /**
- * Only provider-native tool calls or one exact standalone ToolIntent frame
- * enter the executable lane. The complete response is reduced to a safe
- * receipt before Session can persist and admit the ordered call queue. Prose,
- * fenced JSON, and embedded objects remain answers and can never execute.
+ * Only provider-native Kernel tool calls enter the executable lane. The
+ * Session-only Plan control remains orchestration data and never becomes a
+ * ToolIntent. The complete response is reduced to a safe receipt before
+ * Session can persist and admit the ordered call queue. Prose, fenced JSON,
+ * and embedded objects remain text and can never execute.
  */
 export class StrictSessionKernelProviderAdapterV2
 implements SessionKernelProviderAdapterV2 {
@@ -210,44 +371,6 @@ export function adaptSessionKernelProviderBackendOutputV2(
           };
         }
         requiredText(output.text, 'Provider text', 1024 * 1024);
-        if (claimsToolIntentFrame(output.text)) {
-          assertSealedTextFrameSource(input, output);
-          const frame =
-            decodeProviderToolIntentTextFrameV2(output.text);
-          requirePermittedTool(input, frame.toolId);
-          const textCallId =
-            `text-${sha256Hash(output.text.trim())
-              .slice('sha256:'.length)}`;
-          return {
-            kind: 'toolIntent',
-            items: [{
-              kind: 'toolCall',
-              source: 'textFrame',
-              ordinal: 1,
-              callId: textCallId,
-              toolName: frame.toolId,
-              toolId: frame.toolId,
-              arguments: cloneJson(frame.arguments),
-            }],
-            completion: cloneJson(output.completion),
-            sources: [{
-              source: 'textFrame',
-              frame: output.text,
-            }],
-            receipt: providerToolCallReceipt(
-              input.providerTurnId,
-              output.responseDigest,
-              [{
-                callId: textCallId,
-                toolName: frame.toolId,
-                toolId: frame.toolId,
-                arguments: frame.arguments,
-              }],
-              recordedAt
-            ),
-            providerResult: output.providerResult,
-          };
-        }
         return {
           kind: 'answer',
           ...completionFields,
@@ -272,25 +395,6 @@ export function adaptSessionKernelProviderBackendOutputV2(
     }
 }
 
-function assertSealedTextFrameSource(
-  input: SessionKernelProviderAdapterInputV2,
-  output: SessionKernelProviderBackendOutputV2 & { kind: 'text' }
-): void {
-  const item = output.items[0];
-  if (
-    input.purpose === 'finalAnswer'
-    || output.items.length !== 1
-    || item?.kind !== 'text'
-    || item.phase !== 'unknown'
-    || item.text !== output.text
-  ) {
-    throw new SessionKernelProviderAdapterError(
-      'session_kernel_provider_text_frame_source_invalid',
-      'A text ToolIntent requires one exact unphased sealed text item and is forbidden during finalAnswer.'
-    );
-  }
-}
-
 function assertCompletedProviderBackendOutputV2(
   input: SessionKernelProviderAdapterInputV2,
   output: SessionKernelProviderBackendOutputV2
@@ -308,6 +412,21 @@ function assertCompletedProviderBackendOutputV2(
     || output.responseDigest !== completion.responseDigest
   ) {
     throw providerCompletionInvalid();
+  }
+  if (output.kind === 'plan') {
+    if (
+      output.planProposal.schemaVersion
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA
+      || output.planProposal.toolName
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME
+    ) {
+      throw providerCompletionInvalid();
+    }
+    requiredIdentity(output.planProposal.callId, 'planProposal.callId');
+    requiredDigest(
+      output.planProposal.argumentsDigest,
+      'planProposal.argumentsDigest'
+    );
   }
   requiredDigest(completion.reasoningDigest, 'reasoningDigest');
   requiredDigest(completion.responseDigest, 'responseDigest');
@@ -440,7 +559,7 @@ function assertCompletedProviderBackendOutputV2(
     && (
       native.terminalSignal !== '[DONE]'
       || (
-        orderedTools.length > 0
+        orderedTools.length > 0 || output.kind === 'plan'
           ? native.finishReason !== 'tool_calls'
           : native.finishReason !== 'stop'
       )
@@ -864,22 +983,6 @@ function firstSchemaMismatchV2(
   mismatches: Array<string | undefined>
 ): string | undefined {
   return mismatches.find((mismatch) => mismatch !== undefined);
-}
-
-function claimsToolIntentFrame(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return false;
-  try {
-    const value = JSON.parse(trimmed) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      return false;
-    }
-    const record = value as Record<string, unknown>;
-    return record.schemaVersion === SESSION_TOOL_INTENT_TEXT_FRAME_V2
-      || record.kind === 'toolIntent';
-  } catch {
-    return false;
-  }
 }
 
 function cloneRequestedResource(

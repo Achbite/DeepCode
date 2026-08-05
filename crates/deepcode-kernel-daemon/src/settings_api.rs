@@ -328,6 +328,12 @@ fn mask_unavailable_llm_profile_revisions(
     profiles: &mut Value,
     assumed_available_profile_ids: &std::collections::HashSet<String>,
 ) -> Result<(), (String, String)> {
+    if !llm_profile_store_is_current(profiles) {
+        return Err((
+            "invalid_llm_profile_store_schema".to_string(),
+            "The LLM Profile store does not use the exact current schema".to_string(),
+        ));
+    }
     let Some(profile_items) = profiles.get_mut("profiles").and_then(Value::as_array_mut) else {
         return Err((
             "invalid_llm_profiles".to_string(),
@@ -335,18 +341,26 @@ fn mask_unavailable_llm_profile_revisions(
         ));
     };
     for profile in profile_items {
-        if profile.get("enabled").and_then(Value::as_bool) != Some(true)
-            || !profile_reasoning_transport_is_compatible(profile)
-        {
+        let profile_id = profile
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|profile_id| !profile_id.is_empty() && profile_id.trim() == *profile_id)
+            .ok_or_else(|| {
+                (
+                    "invalid_llm_profile".to_string(),
+                    "Every LLM Profile must use the current profile schema".to_string(),
+                )
+            })?;
+        if !llm_profile_value_is_current(profile) {
+            return Err((
+                "invalid_llm_profile_schema".to_string(),
+                format!("LLM Profile `{profile_id}` does not use the current profile schema"),
+            ));
+        }
+        if profile.get("enabled").and_then(Value::as_bool) != Some(true) {
             continue;
         }
-        let Some(profile_id) = profile.get("id").and_then(Value::as_str) else {
-            return Err((
-                "invalid_llm_profile".to_string(),
-                "An enabled LLM Profile has no identity".to_string(),
-            ));
-        };
-        if assumed_available_profile_ids.contains(profile_id.trim()) {
+        if assumed_available_profile_ids.contains(profile_id) {
             continue;
         }
         let profile_revision = config_value_hash(profile)
@@ -365,9 +379,6 @@ fn mask_unavailable_llm_profile_revisions(
             }
         }
     }
-    profiles["defaultProfileId"] = preferred_enabled_llm_profile_id(profiles)
-        .map(Value::String)
-        .unwrap_or(Value::Null);
     Ok(())
 }
 
@@ -398,8 +409,38 @@ pub(crate) async fn llm_profiles_patch(
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
     let _transition = settings_transition_gate_v2().write().await;
+    let Some(body_object) = body.as_object() else {
+        return ApiResponse::error(
+            "invalid_llm_profiles_request",
+            "LLM Profile update must use the exact current object schema",
+        );
+    };
+    const REQUEST_FIELDS: &[&str] = &[
+        "profiles",
+        "defaultProfileId",
+        "secrets",
+        "reenableProfileIds",
+    ];
+    if !body_object.contains_key("profiles")
+        || body_object
+            .keys()
+            .any(|field| !REQUEST_FIELDS.contains(&field.as_str()))
+        || body_object.get("defaultProfileId").is_some_and(|value| {
+            !value
+                .as_str()
+                .is_some_and(|value| !value.is_empty() && value.trim() == value)
+        })
+    {
+        return ApiResponse::error(
+            "invalid_llm_profiles_request",
+            "LLM Profile update contains unknown, missing, or invalid current fields",
+        );
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
-    let mut profiles = body.get("profiles").cloned().unwrap_or_else(|| json!([]));
+    let mut profiles = body
+        .get("profiles")
+        .cloned()
+        .expect("validated current profiles field");
     let Some(profile_items) = profiles.as_array() else {
         return ApiResponse::error("invalid_llm_profiles", "profiles must be an array");
     };
@@ -408,8 +449,7 @@ pub(crate) async fn llm_profiles_patch(
         let Some(profile_id) = profile
             .get("id")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|profile_id| !profile_id.is_empty())
+            .filter(|profile_id| !profile_id.is_empty() && profile_id.trim() == *profile_id)
         else {
             return ApiResponse::error(
                 "invalid_llm_profile",
@@ -422,10 +462,10 @@ pub(crate) async fn llm_profiles_patch(
                 format!("LLM Profile id `{profile_id}` is duplicated"),
             );
         }
-        if !profile_reasoning_transport_is_compatible(profile) {
+        if !llm_profile_value_is_current(profile) {
             return ApiResponse::error(
-                "invalid_llm_profile_reasoning_transport",
-                format!("LLM Profile `{profile_id}` requires a kind-compatible reasoningTransport"),
+                "invalid_llm_profile_schema",
+                format!("LLM Profile `{profile_id}` must use the exact current profile schema"),
             );
         }
         if profile.get("enabled").and_then(Value::as_bool) == Some(true)
@@ -444,11 +484,9 @@ pub(crate) async fn llm_profiles_patch(
         Some(Value::Array(profile_ids_to_reenable)) => {
             let mut requested = std::collections::HashSet::new();
             for profile_id in profile_ids_to_reenable {
-                let Some(profile_id) = profile_id
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|profile_id| !profile_id.is_empty())
-                else {
+                let Some(profile_id) = profile_id.as_str().filter(|profile_id| {
+                    !profile_id.is_empty() && profile_id.trim() == *profile_id
+                }) else {
                     return ApiResponse::error(
                         "invalid_llm_profile_reenable_ids",
                         "reenableProfileIds must contain only non-empty Profile ids",
@@ -482,9 +520,27 @@ pub(crate) async fn llm_profiles_patch(
     let Some(secret_items) = secrets.as_object() else {
         return ApiResponse::error("invalid_llm_secrets", "secrets must be an object");
     };
+    if secret_items.iter().any(|(profile_id, secret)| {
+        !profile_ids.contains(profile_id)
+            || !(secret.is_null()
+                || secret
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty()))
+    }) {
+        return ApiResponse::error(
+            "invalid_llm_secrets",
+            "secrets must map submitted Profile ids to non-empty strings or null",
+        );
+    }
     let secrets_path = gui.paths.llm_secrets_path.clone();
     let old_secret_store = match read_json_file(&secrets_path) {
-        Some(value) => value,
+        Some(value @ Value::Object(_)) => value,
+        Some(_) => {
+            return ApiResponse::error(
+                "llm_secret_store_invalid",
+                "The existing LLM secret store is not a JSON object; it was not overwritten",
+            )
+        }
         None if secrets_path.exists() => {
             return ApiResponse::error(
                 "llm_secret_store_unreadable",
@@ -526,16 +582,34 @@ pub(crate) async fn llm_profiles_patch(
     let requested_default_profile_id = body
         .get("defaultProfileId")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|profile_id| !profile_id.is_empty());
-    let mut next_profiles = json!({
+        .filter(|profile_id| !profile_id.is_empty() && profile_id.trim() == *profile_id);
+    if let Some(profile_id) = requested_default_profile_id {
+        let valid_default = profiles
+            .as_array()
+            .and_then(|profiles| {
+                profiles
+                    .iter()
+                    .find(|profile| profile.get("id").and_then(Value::as_str) == Some(profile_id))
+            })
+            .is_some_and(llm_profile_value_is_enabled);
+        if !valid_default {
+            return ApiResponse::error(
+                "invalid_default_llm_profile",
+                "defaultProfileId must name an enabled Profile in the exact submitted configuration",
+            );
+        }
+    }
+    let next_profiles = json!({
         "profiles": profiles,
         "defaultProfileId": requested_default_profile_id,
         "storePath": gui.paths.llm_profiles_path.to_string_lossy()
     });
-    next_profiles["defaultProfileId"] = preferred_enabled_llm_profile_id(&next_profiles)
-        .map(Value::String)
-        .unwrap_or(Value::Null);
+    if !llm_profile_store_is_current(&next_profiles) {
+        return ApiResponse::error(
+            "invalid_llm_profile_store_schema",
+            "the submitted LLM Profile store does not use the exact current schema",
+        );
+    }
 
     let mut active_profile_ids = {
         let runs = state.session_runs.lock().expect("session run state lock");
@@ -577,7 +651,6 @@ pub(crate) async fn llm_profiles_patch(
     }
 
     let old_profiles = gui.llm_profiles.clone();
-    let old_sessions = gui.sessions.clone();
     let old_secret_hash = match config_value_hash(&old_secret_store) {
         Ok(hash) => hash,
         Err(error) => return ApiResponse::error("config_digest_failed", error.message),
@@ -610,7 +683,7 @@ pub(crate) async fn llm_profiles_patch(
             profile
                 .get("id")
                 .and_then(Value::as_str)
-                .is_some_and(|profile_id| reenable_profile_ids.contains(profile_id.trim()))
+                .is_some_and(|profile_id| reenable_profile_ids.contains(profile_id))
         })
     {
         let Some(profile_id) = profile.get("id").and_then(Value::as_str) else {
@@ -644,40 +717,6 @@ pub(crate) async fn llm_profiles_patch(
     ) {
         return ApiResponse::error(code, message);
     }
-    let preferred_profile_id = preferred_enabled_llm_profile_id(&effective_next_profiles);
-    let mut next_sessions = old_sessions.clone();
-    let mut profile_migrations = Vec::new();
-    if let Some(preferred_profile_id) = preferred_profile_id.as_deref() {
-        for session in &mut next_sessions {
-            let current_profile_id = session
-                .get("profileId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if current_profile_id.as_deref().is_some_and(|profile_id| {
-                llm_profile_is_enabled(&effective_next_profiles, profile_id)
-            }) {
-                continue;
-            }
-            let Some(session_id) = session
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            session["profileId"] = json!(preferred_profile_id);
-            session["updatedAt"] = json!(now_text());
-            let mut migration = json!({
-                "sessionId": session_id,
-                "toProfileId": preferred_profile_id
-            });
-            if let Some(current_profile_id) = current_profile_id {
-                migration["fromProfileId"] = json!(current_profile_id);
-            }
-            profile_migrations.push(migration);
-        }
-    }
-
     let secrets_changed = secret_store != old_secret_store;
     let web_secret_key = gui
         .user_settings
@@ -724,7 +763,6 @@ pub(crate) async fn llm_profiles_patch(
     }
 
     let profiles_path = gui.paths.llm_profiles_path.clone();
-    let sessions_index_path = gui.paths.sessions_index_path.clone();
     let mut changed_keys = vec!["profiles".to_string(), "defaultProfileId".to_string()];
     if secrets_changed {
         changed_keys.push("secrets".to_string());
@@ -832,52 +870,7 @@ pub(crate) async fn llm_profiles_patch(
             }),
         );
     }
-    if !profile_migrations.is_empty() {
-        if let Err(error) = crate::session_metadata_v2::persist_session_index_values(
-            &sessions_index_path,
-            &next_sessions,
-        ) {
-            let mut rollback_errors = Vec::new();
-            if let Err(rollback_error) = atomic_write_json(&profiles_path, &old_profiles) {
-                rollback_errors.push(format!("profiles:{rollback_error}"));
-            }
-            if secret_written {
-                if let Err(rollback_error) = atomic_write_json(&secrets_path, &old_secret_store) {
-                    rollback_errors.push(format!("secretStore:{rollback_error}"));
-                }
-            }
-            if !rollback_executor_runtime_v2(&state, &mut previous_executor) {
-                rollback_errors.push("executorRuntime:rollback_failed".to_string());
-            }
-            let transition = json!({
-                "status": if rollback_errors.is_empty() { "failedBeforeApply" } else { "indeterminate" },
-                "executorTransition": executor_transition,
-                "writeError": error,
-                "rollbackErrors": rollback_errors
-            });
-            let config_audit = record_config_modified_audit(
-                &state,
-                "llmProfiles",
-                &changed_keys,
-                &profiles_path,
-                &old_hash,
-                &new_hash,
-                "settings_api.llm_profiles_patch",
-                transition.clone(),
-            );
-            return ApiResponse::error_with_data(
-                "agent_session_persist_failed",
-                "Profile migration could not be persisted; the configuration change was rolled back",
-                json!({
-                    "transition": transition,
-                    "configAudit": config_audit
-                }),
-            );
-        }
-    }
-
     gui.llm_profiles = next_profiles.clone();
-    gui.sessions = next_sessions;
     drop(gui);
     for (profile_id, profile_revision) in &reenabled_profile_revisions {
         if let Err(error) = state
@@ -920,10 +913,6 @@ pub(crate) async fn llm_profiles_patch(
     }
     if let Some(object) = output.as_object_mut() {
         object.insert("configAudit".to_string(), config_audit);
-        object.insert(
-            "profileMigrations".to_string(),
-            Value::Array(profile_migrations),
-        );
         object.insert("transition".to_string(), transition);
     }
     ApiResponse::ok(output)
@@ -1052,17 +1041,6 @@ pub(crate) async fn llm_probe(
             ApiResponse::ok(result)
         }
     }
-}
-
-pub(crate) async fn llm_chat(
-    State(_state): State<AppState>,
-    _headers: axum::http::HeaderMap,
-    _body: Result<Json<Value>, JsonRejection>,
-) -> Json<ApiResponse> {
-    ApiResponse::error(
-        "provider_nonstream_route_removed",
-        "Provider turns must use /api/llm/chat/stream",
-    )
 }
 
 struct AuthorizedLlmChatProfile {
@@ -1359,10 +1337,7 @@ pub(crate) async fn llm_chat_stream(
         }
         request_envelope["parentRequestId"] = json!(parent_request_id);
     }
-    if let Some(response_format) = body
-        .get("responseFormat")
-        .or_else(|| body.get("response_format"))
-    {
+    if let Some(response_format) = body.get("responseFormat") {
         request_envelope["responseFormat"] = response_format.clone();
     }
     llm_stream_response(
@@ -1540,7 +1515,7 @@ fn provider_trace_identity_from_request(
         provider_kind: profile
             .provider_flavor
             .clone()
-            .unwrap_or_else(|| profile.kind.clone()),
+            .expect("current LLM Profile providerFlavor"),
         model: profile.model.clone(),
         profile_id: profile.id.clone(),
         profile_revision: profile_revision.to_string(),
@@ -1685,6 +1660,7 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "id": "deepseek-v4-flash-openai",
                 "name": "DeepSeek V4 Flash",
                 "kind": "openaiCompatible",
+                "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-flash",
                 "contextWindowTokens": 1000000,
@@ -1699,6 +1675,7 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "id": "deepseek-v4-pro-openai",
                 "name": "DeepSeek V4 Pro",
                 "kind": "openaiCompatible",
+                "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-pro",
                 "contextWindowTokens": 1000000,

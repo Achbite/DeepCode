@@ -168,7 +168,6 @@ export function buildNarrativeTimelineProjection(
   const projection: AgentTimelineResult = {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
     shapeVersion: NARRATIVE_TIMELINE_SHAPE_VERSION,
-    legacyPrefixTurnCount: 0,
     sessionId: input.sessionId,
     revision: input.events.length,
     sourceEventVersion: input.events.length,
@@ -190,6 +189,195 @@ export function buildNarrativeTimelineProjection(
   stripUndefinedProjectionFields(projection);
   assertNativeWriterSharedConversationProjectionV2(projection);
   return projection;
+}
+
+/**
+ * Applies one already-durable Provider text delta to the current public
+ * projection. This is deliberately narrow: every non-composing event still
+ * goes through the canonical full projector and reconciles at a snapshot
+ * boundary.
+ */
+export function appendProviderComposingProjectionV2(
+  current: AgentTimelineResult,
+  event: AgentEvent
+): AgentTimelineResult {
+  assertNativeWriterSharedConversationProjectionV2(current);
+  const payload = recordValue(event.payload);
+  const runId = stringValue(payload?.runId);
+  const providerTurnId = stringValue(payload?.providerTurnId);
+  const projectionKind = stringValue(payload?.projectionKind);
+  const controlEpoch = nonnegativeIntegerValue(payload?.controlEpoch);
+  const streamSequence = nonnegativeIntegerValue(payload?.streamSequence);
+  const textOrdinal = nonnegativeIntegerValue(payload?.textOrdinal);
+  const textDelta = textContentValue(payload?.content);
+  const providerPhase = stringValue(payload?.providerPhase);
+  if (
+    event.sessionId !== current.sessionId
+    || event.kind !== 'assistant_msg'
+    || projectionKind !== 'provider.composing'
+    || !runId
+    || !providerTurnId
+    || controlEpoch === undefined
+    || controlEpoch === 0
+    || streamSequence === undefined
+    || streamSequence === 0
+    || textOrdinal === undefined
+    || textOrdinal === 0
+    || textDelta === undefined
+    || (providerPhase !== undefined && providerPhase !== 'commentary')
+  ) {
+    throw new Error('session_projection_provider_composing_invalid');
+  }
+  const runProjection = current.runProjection;
+  if (
+    !runProjection
+    || runProjection.runId !== runId
+    || runProjection.status === 'succeeded'
+    || runProjection.status === 'failed'
+    || runProjection.status === 'cancelled'
+  ) {
+    throw new Error('session_projection_provider_composing_run_invalid');
+  }
+  const turnIndex = runProjection.turnId
+    ? current.turns.findIndex((turn) => turn.id === runProjection.turnId)
+    : current.turns.findLastIndex((turn) =>
+        turn.id.startsWith(`turn:${runId}:`)
+      );
+  if (turnIndex < 0) {
+    throw new Error('session_projection_provider_composing_turn_missing');
+  }
+  const turn = current.turns[turnIndex]!;
+  const blockPrefix = `provider:${runId}:${providerTurnId}:text:`;
+  const lastStreamSequence = turn.blocks
+    .filter((block) => block.id.startsWith(blockPrefix))
+    .reduce(
+      (count, block) =>
+        count + block.provenance.sourceEventRefs.length,
+      0
+    );
+  if (streamSequence !== lastStreamSequence + 1) {
+    throw new Error('session_projection_provider_composing_sequence_invalid');
+  }
+  const blockId = `${blockPrefix}${textOrdinal}`;
+  const blockIndex = turn.blocks.findIndex((block) => block.id === blockId);
+  const existing = blockIndex < 0 ? undefined : turn.blocks[blockIndex];
+  const combinedText = `${existing?.bodyMarkdown ?? ''}${textDelta}`;
+  const block: AgentTimelineBlock = existing
+    ? {
+        ...existing,
+        revision: (existing.revision ?? 0) + 1,
+        deliveryMode: 'replay',
+        durability: 'committed',
+        entryRole: 'agentUpdate',
+        ...(providerPhase ? { providerPhase } : {}),
+        status: 'running',
+        summary: combinedText,
+        bodyMarkdown: combinedText,
+        provenance: {
+          ...existing.provenance,
+          sourceEventRefs: appendUniqueStrings(
+            existing.provenance.sourceEventRefs,
+            [event.id]
+          ),
+        },
+      }
+    : {
+        id: blockId,
+        sequence: turn.blocks.length,
+        revision: 1,
+        deliveryMode: 'replay',
+        durability: 'committed',
+        kind: 'assistant',
+        narrativeKind: 'assistantText',
+        entryRole: 'agentUpdate',
+        ...(providerPhase ? { providerPhase } : {}),
+        title: 'Assistant Msg',
+        summary: combinedText,
+        status: 'running',
+        defaultCollapsed: false,
+        bodyMarkdown: combinedText,
+        confirmable: false,
+        provenance: {
+          origin: 'provider',
+          authority: 'session',
+          sourceEventRefs: [event.id],
+          factRefs: [],
+          evidenceRefs: [],
+        },
+        languageBinding: {
+          language: 'neutral',
+          status: 'unavailable',
+        },
+      };
+  const blocks = [...turn.blocks];
+  const parts = [...turn.parts];
+  if (blockIndex < 0) {
+    blocks.push(block);
+    parts.push({ kind: 'block', blockId });
+  } else {
+    blocks[blockIndex] = block;
+  }
+  const nextTurn: AgentTimelineTurn = {
+    ...turn,
+    status: 'running',
+    blocks,
+    parts,
+  };
+  delete nextTurn.completedAt;
+  const turns = [...current.turns];
+  turns[turnIndex] = nextTurn;
+  const nextRevision = incrementProjectionCounter(
+    current.revision,
+    'revision'
+  );
+  const nextSourceEventVersion = incrementProjectionCounter(
+    current.sourceEventVersion,
+    'sourceEventVersion'
+  );
+  const nextEventCount = incrementProjectionCounter(
+    current.eventCount,
+    'eventCount'
+  );
+  const runRevision = incrementProjectionCounter(
+    runProjection.revision,
+    'runProjection.revision'
+  );
+  const waiting = runProjection.status === 'waitingUser'
+    || runProjection.status === 'waitingExternal'
+    || runProjection.status === 'paused';
+  const next: AgentTimelineResult = {
+    ...current,
+    revision: nextRevision,
+    sourceEventVersion: nextSourceEventVersion,
+    generatedAt: event.ts,
+    turns,
+    eventCount: nextEventCount,
+    runProjection: {
+      ...runProjection,
+      revision: runRevision,
+      ...(waiting
+        ? {}
+        : {
+            currentActivity: {
+              code: 'provider.composing',
+              updatedAt: event.ts,
+            },
+          }),
+    },
+  };
+  assertNativeWriterSharedConversationProjectionV2(next);
+  return next;
+}
+
+function incrementProjectionCounter(
+  value: number,
+  field: string
+): number {
+  const next = value + 1;
+  if (!Number.isSafeInteger(next)) {
+    throw new Error(`session_projection_${field}_exhausted`);
+  }
+  return next;
 }
 
 function settleInteractionBlocks(
@@ -353,33 +541,22 @@ export function findLatestPendingPermission(
 export function assertSharedConversationProjectionV2(
   value: AgentTimelineResult
 ): void {
-  assertSharedConversationProjection(
-    value,
-    'readCompatible'
-  );
+  assertSharedConversationProjection(value);
 }
 
 function assertNativeWriterSharedConversationProjectionV2(
   value: AgentTimelineResult
 ): void {
-  assertSharedConversationProjection(
-    value,
-    'nativeWriter'
-  );
+  assertSharedConversationProjection(value);
 }
 
 function assertSharedConversationProjection(
-  value: AgentTimelineResult,
-  validationMode: 'readCompatible' | 'nativeWriter'
+  value: AgentTimelineResult
 ): void {
   if (
     !recordValue(value)
     || value.schemaVersion !== NARRATIVE_TIMELINE_SCHEMA_VERSION
     || value.shapeVersion !== NARRATIVE_TIMELINE_SHAPE_VERSION
-    || (
-      value.legacyPrefixTurnCount !== undefined
-      && !nonnegativeInteger(value.legacyPrefixTurnCount)
-    )
     || !nonemptyString(value.sessionId)
     || !nonnegativeInteger(value.revision)
     || !nonnegativeInteger(value.sourceEventVersion)
@@ -413,7 +590,6 @@ function assertSharedConversationProjection(
   const rootKeys = new Set([
     'schemaVersion',
     'shapeVersion',
-    'legacyPrefixTurnCount',
     'sessionId',
     'revision',
     'sourceEventVersion',
@@ -429,16 +605,6 @@ function assertSharedConversationProjection(
   if (Object.keys(value).some((key) => !rootKeys.has(key))) {
     throw new Error('session_projection_v2_root_field_invalid');
   }
-  const legacyPrefixTurnCount = value.legacyPrefixTurnCount ?? 0;
-  if (
-    legacyPrefixTurnCount > value.turns.length
-    || (
-      validationMode === 'nativeWriter'
-      && legacyPrefixTurnCount !== 0
-    )
-  ) {
-    throw new Error('session_projection_v2_legacy_prefix_invalid');
-  }
   const turnIds = new Set<string>();
   const blockIds = new Set<string>();
   const workSegmentIds = new Set<string>();
@@ -446,8 +612,6 @@ function assertSharedConversationProjection(
   const workSegmentTurnIds = new Map<string, string>();
   const operationSegmentIds = new Map<string, string>();
   for (const [turnIndex, turn] of value.turns.entries()) {
-    const normalizedLegacy = turnIndex < legacyPrefixTurnCount;
-    const strictNative = !normalizedLegacy;
     if (
       !recordValue(turn)
       || !nonemptyString(turn.id)
@@ -482,17 +646,8 @@ function assertSharedConversationProjection(
           && key !== 'parts'
       )
       || containsPrivateProjectionData(turn)
-      || (
-        strictNative
-        && (
-          turn.sequence !== turnIndex
-          || !validNativeTurnLifecycle(turn)
-        )
-      )
-      || (
-        normalizedLegacy
-        && !validNormalizedLegacyTurnShape(turn)
-      )
+      || turn.sequence !== turnIndex
+      || !validNativeTurnLifecycle(turn)
     ) {
       throw new Error('session_projection_v2_turn_invalid');
     }
@@ -500,15 +655,9 @@ function assertSharedConversationProjection(
     const localBlockIds = new Set<string>();
     for (const [blockIndex, block] of turn.blocks.entries()) {
       if (
-        !isSharedConversationBlockV2(
-          block,
-          strictNative
-        )
+        !isSharedConversationBlockV2(block)
         || blockIds.has(block.id)
-        || (
-          strictNative
-          && block.sequence !== blockIndex
-        )
+        || block.sequence !== blockIndex
       ) {
         throw new Error('session_projection_v2_block_invalid');
       }
@@ -520,10 +669,7 @@ function assertSharedConversationProjection(
       if (
         !isSharedConversationWorkSegmentV1(segment)
         || workSegmentIds.has(segment.id)
-        || (
-          strictNative
-          && segment.sequence !== segmentIndex
-        )
+        || segment.sequence !== segmentIndex
       ) {
         throw new Error('session_projection_v2_work_segment_invalid');
       }
@@ -629,24 +775,6 @@ function assertSharedConversationProjection(
   }
 }
 
-function validNormalizedLegacyTurnShape(
-  turn: AgentTimelineTurn
-): boolean {
-  if (
-    !terminalTimelineStatus(turn.status)
-    || !Array.isArray(turn.workSegments)
-    || turn.workSegments.length !== 0
-    || !Array.isArray(turn.parts)
-    || turn.parts.length !== turn.blocks.length
-  ) {
-    return false;
-  }
-  return turn.parts.every((part, index) =>
-    part.kind === 'block'
-    && part.blockId === turn.blocks[index]?.id
-  );
-}
-
 export function isSharedConversationProjectionV2(
   value: unknown
 ): value is AgentTimelineResult {
@@ -659,8 +787,7 @@ export function isSharedConversationProjectionV2(
 }
 
 export function isSharedConversationBlockV2(
-  value: unknown,
-  strictNative = false
+  value: unknown
 ): value is AgentTimelineBlock {
   const block = recordValue(value);
   const provenance = recordValue(block?.provenance);
@@ -699,15 +826,8 @@ export function isSharedConversationBlockV2(
     || !languageStatus(languageBinding.status)
     || !validLanguageBinding(languageBinding)
     || !validTimelineAttachments(block.attachments)
-    || !validReadCompatibleBlockDetails(block)
-    || (
-      strictNative
-      && !validNativeBlockSemantics(block)
-    )
-    || (
-      strictNative
-      && !validNativeBlockDetails(block)
-    )
+    || !validNativeBlockSemantics(block)
+    || !validNativeBlockDetails(block)
   ) {
     return false;
   }
@@ -721,7 +841,6 @@ export function isSharedConversationBlockV2(
     'narrativeKind',
     'entryRole',
     'providerPhase',
-    'activity',
     'title',
     'summary',
     'status',
@@ -743,151 +862,9 @@ export function isSharedConversationBlockV2(
     && !containsPrivateProjectionData(block);
 }
 
-function validReadCompatibleBlockDetails(
-  block: Record<string, unknown>
-): boolean {
-  return timelineBlockKind(block.kind)
-    && (
-      block.narrativeKind === undefined
-      || timelineNarrativeKind(block.narrativeKind)
-    )
-    && (
-      block.deliveryMode === undefined
-      || block.deliveryMode === 'live'
-      || block.deliveryMode === 'buffered'
-      || block.deliveryMode === 'replay'
-    )
-    && (
-      block.activity === undefined
-      || validLegacyActivity(block.activity)
-    )
-    && (
-      block.bodyMarkdown === undefined
-      || typeof block.bodyMarkdown === 'string'
-    )
-    && (
-      block.localizedContent === undefined
-      || validLocalizedText(block.localizedContent)
-    )
-    && (
-      block.structuredProjection === undefined
-      || validStructuredProjection(block.structuredProjection)
-    )
-    && (
-      block.decisionRequest === undefined
-      || validDecisionRequest(block.decisionRequest)
-    )
-    && (
-      block.interaction === undefined
-      || validInteractionView(block.interaction)
-    )
-    && (
-      block.confirmable === undefined
-      || typeof block.confirmable === 'boolean'
-    )
-    && (
-      block.displayHints === undefined
-      || validDisplayHints(block.displayHints)
-    )
-    && (
-      block.evidenceRefs === undefined
-      || stringArray(block.evidenceRefs)
-    )
-    && (
-      block.taskProjectionRef === undefined
-      || nonemptyString(block.taskProjectionRef)
-    )
-    && (
-      block.providerPhase === undefined
-      || block.kind === 'assistant'
-    );
-}
-
-function validLegacyActivity(value: unknown): boolean {
-  const activity = recordValue(value);
-  return Boolean(
-    activity
-    && exactOptionalKeys(activity, [
-      'activityId',
-      'kind',
-      'status',
-      'title',
-      'summary',
-      'source',
-    ], [
-      'activityRevision',
-      'runId',
-      'planId',
-      'draftId',
-      'targets',
-      'actionIds',
-      'toolName',
-      'operation',
-      'itemCount',
-      'errorCode',
-      'errorMessage',
-    ])
-    && nonemptyString(activity.activityId)
-    && (
-      activity.activityRevision === undefined
-      || nonnegativeInteger(activity.activityRevision)
-    )
-    && (
-      activity.kind === 'providerThinking'
-      || activity.kind === 'resourceSearch'
-      || activity.kind === 'resourceRead'
-      || activity.kind === 'toolExecution'
-      || activity.kind === 'reviewCheckpoint'
-      || activity.kind === 'diagnostic'
-    )
-    && timelineStatus(activity.status)
-    && typeof activity.title === 'string'
-    && typeof activity.summary === 'string'
-    && (
-      activity.source === 'session'
-      || activity.source === 'kernel'
-      || activity.source === 'provider'
-      || activity.source === 'llm'
-    )
-    && [
-      'runId',
-      'planId',
-      'draftId',
-      'toolName',
-      'operation',
-      'errorCode',
-      'errorMessage',
-    ].every(
-      (key) =>
-        activity[key] === undefined
-        || typeof activity[key] === 'string'
-    )
-    && (
-      activity.targets === undefined
-      || stringArray(activity.targets)
-    )
-    && (
-      activity.actionIds === undefined
-      || stringArray(activity.actionIds)
-    )
-    && (
-      activity.itemCount === undefined
-      || nonnegativeInteger(activity.itemCount)
-    )
-  );
-}
-
 function validNativeBlockSemantics(
   block: Record<string, unknown>
 ): boolean {
-  if (
-    block.kind === 'thinking'
-    || block.kind === 'stage'
-    || block.kind === 'turnActions'
-    || block.activity !== undefined
-  ) {
-    return false;
-  }
   if (block.kind === 'user') {
     return block.narrativeKind === 'user'
       && block.entryRole === 'userMessage'
@@ -2316,7 +2293,10 @@ function projectProviderComposingIntoTurn(
       && turn.controlEpoch !== controlEpoch
     )
     || textDelta === undefined
-    || (providerPhase !== undefined && providerPhase !== 'commentary')
+    || (
+      providerPhase !== undefined
+      && providerPhase !== 'commentary'
+    )
   ) {
     throw new Error('session_projection_provider_composing_invalid');
   }
@@ -2907,11 +2887,10 @@ function applyCanonicalWorkFact(
     operation.resourceRefs,
     resourceRefs
   );
+  const canonicalTargets = stringArrayValue(fact.targets);
   operation.targets = appendUniqueStrings(
     operation.targets ?? [],
-    stringArrayValue(fact.targets).length > 0
-      ? stringArrayValue(fact.targets)
-      : resourceRefs
+    canonicalTargets
   );
   operation.factRefs = appendUniqueStrings(
     operation.factRefs,
@@ -3454,6 +3433,14 @@ function settleProviderTurnArtifacts(
     ) {
       continue;
     }
+    if (
+      segment.operations.length > 0
+      && segment.operations.every((operation) =>
+        terminalWorkOperationStatus(operation.status)
+      )
+    ) {
+      continue;
+    }
     segment.lifecycle = 'cancelled';
     segment.completedAt = event.ts;
     touchWorkSegment(segment, event, []);
@@ -3482,6 +3469,17 @@ function settleTerminalTurnArtifacts(
   if (turn.status === 'completed') return;
   for (const segment of turn.workSegments) {
     if (segment.lifecycle !== 'active') continue;
+    if (
+      segment.operations.length > 0
+      && segment.operations.every((operation) =>
+        terminalWorkOperationStatus(operation.status)
+      )
+    ) {
+      // A later turn-level failure cannot rewrite already-settled operation
+      // facts. The finalizer derives completed/cancelled from those terminal
+      // operation statuses without attaching the later error to the segment.
+      continue;
+    }
     segment.lifecycle = turn.status === 'cancelled'
       ? 'cancelled'
       : 'failed';
@@ -3501,12 +3499,6 @@ function settleTimelineBlock(
     block.provenance.sourceEventRefs,
     [event.id]
   );
-  if (block.activity) {
-    block.activity = {
-      ...block.activity,
-      status,
-    };
-  }
 }
 
 function buildTaskProjection(events: AgentEvent[]): AgentTimelineTaskProjection | undefined {
@@ -4021,10 +4013,10 @@ function buildTokenUsageProjection(
       && runId
       && providerTurnId
     ) {
-      providerStartByTurn.set(
-        providerUsageTurnKey(runId, providerTurnId),
-        { event, runId }
-      );
+      const turnKey = providerUsageTurnKey(runId, providerTurnId);
+      if (!providerStartByTurn.has(turnKey)) {
+        providerStartByTurn.set(turnKey, { event, runId });
+      }
       continue;
     }
     if (
@@ -4035,7 +4027,7 @@ function buildTokenUsageProjection(
       continue;
     }
 
-    const outcome = recordValue(payload.providerOutcome);
+    const outcome = recordValue(payload?.providerOutcome);
     if (!outcome) {
       throw new Error('session_projection_v2_provider_outcome_invalid');
     }
@@ -4726,7 +4718,7 @@ function eventNarrativeKind(kind: string): AgentTimelineNarrativeKind {
   if (kind === 'permission_request' || kind === 'permission_result') return 'permission';
   if (kind === 'review_summary') return 'review';
   if (kind === 'error') return 'diagnostic';
-  return 'operationEvidence';
+  throw new Error('session_projection_v2_history_block_kind_invalid');
 }
 
 function eventEntryRole(kind: string): AgentTimelineBlock['entryRole'] {
@@ -4739,10 +4731,8 @@ function eventEntryRole(kind: string): AgentTimelineBlock['entryRole'] {
   ) {
     return 'interaction';
   }
-  if (kind === 'tool_call' || kind === 'workflow_stage') return 'activityGroup';
-  if (kind === 'tool_result' || kind === 'permission_result') return 'evidence';
   if (kind === 'error') return 'diagnostic';
-  return 'agentUpdate';
+  throw new Error('session_projection_v2_history_block_kind_invalid');
 }
 
 function eventBlockKind(kind: string): AgentTimelineBlock['kind'] {
@@ -4752,7 +4742,7 @@ function eventBlockKind(kind: string): AgentTimelineBlock['kind'] {
   if (kind === 'permission_request' || kind === 'permission_result') return 'permission';
   if (kind === 'review_summary') return 'review';
   if (kind === 'error') return 'error';
-  return 'stage';
+  throw new Error('session_projection_v2_history_block_kind_invalid');
 }
 
 function eventOrigin(kind: string): AgentTimelineBlock['provenance']['origin'] {
@@ -4997,8 +4987,6 @@ function workOperationStatus(
 function entryRole(value: unknown): boolean {
   return value === 'userMessage'
     || value === 'agentUpdate'
-    || value === 'activityGroup'
-    || value === 'evidence'
     || value === 'interaction'
     || value === 'finalAnswer'
     || value === 'diagnostic';
@@ -5007,24 +4995,17 @@ function entryRole(value: unknown): boolean {
 function timelineBlockKind(value: unknown): boolean {
   return value === 'user'
     || value === 'assistant'
-    || value === 'thinking'
-    || value === 'stage'
     || value === 'permission'
     || value === 'plan'
     || value === 'review'
-    || value === 'error'
-    || value === 'turnActions';
+    || value === 'error';
 }
 
 function timelineNarrativeKind(value: unknown): boolean {
   return value === 'user'
-    || value === 'thinking'
-    || value === 'assistantNarration'
     || value === 'assistantText'
-    || value === 'operationEvidence'
     || value === 'plan'
     || value === 'permission'
-    || value === 'verification'
     || value === 'review'
     || value === 'diagnostic';
 }

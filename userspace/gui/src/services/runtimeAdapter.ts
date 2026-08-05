@@ -450,18 +450,20 @@ export function deleteAgentSession(
   return api.deleteAgentSession(sessionId);
 }
 
-export function getAgentSession(
-  sessionId: string,
-  signal?: AbortSignal
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.getAgentSession(sessionId, signal);
-}
-
 export function getAgentTimeline(
   sessionId: string,
   signal?: AbortSignal
 ) {
   return api.getAgentTimeline(sessionId, signal);
+}
+
+export function streamAgentTimeline(
+  sessionId: string,
+  onEvent: Parameters<typeof api.streamAgentTimeline>[1],
+  cursor?: Parameters<typeof api.streamAgentTimeline>[2],
+  signal?: AbortSignal
+): Promise<void> {
+  return api.streamAgentTimeline(sessionId, onEvent, cursor, signal);
 }
 
 export function startAgentRun(
@@ -477,16 +479,6 @@ export function getAgentRun(
   signal?: AbortSignal
 ): Promise<ApiResponse<api.AgentRunResult>> {
   return api.getAgentRun(sessionId, runId, signal);
-}
-
-export function streamAgentRun(
-  sessionId: string,
-  runId: string,
-  onEvent: (event: api.AgentRunStreamEvent) => void,
-  cursor?: { sinceEventCount?: number },
-  signal?: AbortSignal
-): Promise<void> {
-  return api.streamAgentRun(sessionId, runId, onEvent, cursor, signal);
 }
 
 export function cancelAgentRunById(

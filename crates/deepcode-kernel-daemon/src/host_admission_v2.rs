@@ -48,14 +48,11 @@ pub(crate) fn route_uses_specialized_transport(method: &Method, path: &str) -> b
     }
     if matches!(
         path,
-        "/api/kernel/v2/commands"
-            | "/api/kernel/v2/user-decisions"
-            | "/api/llm/chat"
-            | "/api/llm/chat/stream"
+        "/api/kernel/v2/commands" | "/api/kernel/v2/user-decisions" | "/api/llm/chat/stream"
     ) {
         return true;
     }
-    if path.starts_with("/api/session-store/") && path.contains("/kernel-v3/") {
+    if path.starts_with("/api/session-store/") && path.contains("/session-runs/") {
         return true;
     }
     path.starts_with("/api/agent/sessions/")

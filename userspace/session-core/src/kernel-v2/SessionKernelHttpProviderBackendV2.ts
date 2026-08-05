@@ -3,7 +3,6 @@ import type {
   LlmChatRequest,
   RawToolArgumentsV2,
   RequestedResourceV2,
-  ProviderWireToolDefinition,
 } from '@deepcode/protocol';
 import { decodeRawToolArgumentsV2 } from '@deepcode/protocol';
 import {
@@ -13,6 +12,7 @@ import {
 import {
   providerCallableToolsV2,
   providerWireToolNameV2,
+  providerWireToolDefinitionsV2,
   sessionPlanningResponseContractReminderV2,
 } from './providerContext.js';
 import type {
@@ -21,6 +21,10 @@ import type {
   SessionKernelProviderOrderedItemV2,
   SessionProviderPlanActionDraftV2,
   SessionProviderPlanDraftV2,
+} from './SessionKernelProviderAdapterV2.js';
+import {
+  SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
   SessionProviderResultMetadataV2,
@@ -48,28 +52,15 @@ export type {
   SessionKernelLlmTransportV2,
 } from './providerStreamV1.js';
 
-export const SESSION_PROVIDER_PLANNING_RESULT_V2_SCHEMA =
-  'deepcode.session.planning-result.v2' as const;
-
-export type SessionProviderPlanningResultV2 =
-  | {
-      kind: 'answer';
-      text: string;
-    }
-  | {
-      kind: 'plan';
-      plan: SessionProviderPlanDraftV2;
-    };
-
 export type SessionKernelProviderDecodeInputV2 = Pick<
   SessionProviderTurnInputV2,
   'providerTurnId' | 'target' | 'plan' | 'toolContext'
 >;
 
 /**
- * Provider-specific wire adapter. Kernel ToolIds are reversibly encoded only
- * in the provider function-name field; descriptions and JSON Schemas are
- * transported unchanged.
+ * Provider-specific wire adapter. Kernel ToolIds are reversibly encoded in
+ * provider function names; the separately namespaced Session Plan proposal is
+ * decoded locally and can never enter Kernel ToolIntent admission.
  */
 export class HttpSessionKernelProviderBackendV2
 implements SessionKernelProviderBackendV2 {
@@ -83,9 +74,6 @@ implements SessionKernelProviderBackendV2 {
   ): Promise<SessionKernelProviderBackendOutputV2> {
     assertProviderToolContextBindingV2(input);
     const purpose = input.purpose;
-    const exposed = purpose === 'finalAnswer'
-      ? []
-      : providerCallableToolsV2(input);
     const parentRequestId = providerContinuationParentIdV2(
       input,
       this.profileId
@@ -96,15 +84,7 @@ implements SessionKernelProviderBackendV2 {
       profileId: this.profileId,
       stream: true,
       messages: cloneJson(input.contextAssembly.messages),
-      ...(input.target.kind === 'planning'
-        && input.providerProfile.reasoningTransport === 'openaiPlaintext'
-        ? { responseFormat: { type: 'json_object' as const } }
-        : {}),
-      tools: exposed.map((tool): ProviderWireToolDefinition => ({
-        name: providerWireToolNameV2(tool.toolId),
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-      })),
+      tools: providerWireToolDefinitionsV2(input),
       providerOptions: {
         deepcode: {
           sessionKernelV2: {
@@ -133,9 +113,8 @@ implements SessionKernelProviderBackendV2 {
     const response = await this.transport.request(
       request,
       input.signal,
-      input.target.kind === 'planning'
-        ? undefined
-        : input.publicTextObserver
+      input.publicTextObserver,
+      input.publicActivityObserver
     );
     return decodeSessionKernelLlmStreamResultV2(
       input,
@@ -206,8 +185,65 @@ export function decodeSessionKernelLlmStreamResultV2(
     if (streamCalls.length > 32) {
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_tool_call_count_exceeded',
-        'One Provider turn may return at most 32 ordered Kernel tool calls.'
+        'One Provider turn may return at most 32 ordered function calls.'
       );
+    }
+    const planProposalCalls = streamCalls.filter(
+      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME
+    );
+    if (planProposalCalls.length > 0) {
+      if (
+        input.target.kind !== 'planning'
+        || planProposalCalls.length !== 1
+        || streamCalls.length !== 1
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_plan_proposal_conflict',
+          'A Session Plan proposal must be the only control or Kernel tool in one planning response.'
+        );
+      }
+      const control = planProposalCalls[0]!;
+      const controlIndex = response.items.indexOf(control);
+      const textItems = response.items.filter(
+        (item): item is Extract<
+          SessionKernelLlmStreamResultV2['items'][number],
+          { kind: 'text' }
+        > => item.kind === 'text'
+      );
+      if (
+        response.items.slice(controlIndex + 1).some(
+          (item) => item.kind === 'text'
+        )
+        || textItems.some((item) => item.phase === 'final_answer')
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_plan_proposal_phase_conflict',
+          'A Session Plan proposal may follow commentary but cannot share or precede final answer text.'
+        );
+      }
+      const plan = decodeProviderPlanProposalArgumentsV2(
+        control.arguments
+      );
+      return {
+        kind: 'plan',
+        plan,
+        planProposal: {
+          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+          callId: requiredIdentity(control.callId, 'callId'),
+          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+          argumentsDigest: sha256Hash(canonicalJson(
+            decodeProviderNativeArguments(control.arguments)
+          )),
+        },
+        items: textItems.map((item) => ({
+          kind: 'text',
+          phase: 'commentary',
+          text: item.text,
+        })),
+        completion: response.completion,
+        providerResult,
+        responseDigest: response.completion.responseDigest,
+      };
     }
     let toolOrdinal = 0;
     const decodedItems: SessionKernelProviderOrderedItemV2[] =
@@ -260,37 +296,6 @@ export function decodeSessionKernelLlmStreamResultV2(
         { kind: 'text' }
       > => item.kind === 'text'
     );
-    if (input.target.kind === 'planning') {
-      const planningResult = decodeProviderPlanningResultEnvelopeV2(
-        textItems.map((item) => item.text).join('')
-      );
-      if (planningResult.kind === 'plan') {
-        return {
-          kind: 'plan',
-          plan: planningResult.plan,
-          items: [],
-          completion: response.completion,
-          providerResult,
-          responseDigest,
-        };
-      }
-      return {
-        kind: 'text',
-        text: planningResult.text,
-        items: [{
-          kind: 'text',
-          phase: textItems.some(
-            (item) => item.phase === 'final_answer'
-          )
-            ? 'final_answer'
-            : 'unknown',
-          text: planningResult.text,
-        }],
-        completion: response.completion,
-        providerResult,
-        responseDigest,
-      };
-    }
     const firstFinalIndex = textItems.findIndex(
       (item) => item.phase === 'final_answer'
     );
@@ -431,40 +436,17 @@ function assertProviderToolContextBindingV2(
   }
 }
 
-export function decodeProviderPlanningResultEnvelopeV2(
-  text: string
-): SessionProviderPlanningResultV2 {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+export function decodeProviderPlanProposalArgumentsV2(
+  value: unknown
+): SessionProviderPlanDraftV2 {
+  const decoded = decodeProviderNativeArguments(value);
+  const record = objectRecord(decoded);
+  if (!record) throw invalidPlanningResult();
+  exactKeys(record, ['schemaVersion', 'plan']);
+  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA) {
     throw invalidPlanningResult();
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(trimmed) as unknown;
-  } catch {
-    throw invalidPlanningResult();
-  }
-  const record = objectRecord(value);
-  if (
-    record?.schemaVersion
-      !== SESSION_PROVIDER_PLANNING_RESULT_V2_SCHEMA
-  ) {
-    throw invalidPlanningResult();
-  }
-  if (record.kind === 'answer') {
-    exactKeys(record, ['schemaVersion', 'kind', 'text']);
-    const answer = requiredText(record.text, 'text');
-    if (!answer.trim()) throw invalidPlanningResult();
-    return { kind: 'answer', text: answer };
-  }
-  if (record.kind !== 'plan') {
-    throw invalidPlanningResult();
-  }
-  exactKeys(record, ['schemaVersion', 'kind', 'plan']);
-  return {
-    kind: 'plan',
-    plan: decodeProviderPlanDraft(record.plan),
-  };
+  return decodeProviderPlanDraft(record.plan);
 }
 
 function decodeProviderPlanDraft(
@@ -477,6 +459,9 @@ function decodeProviderPlanDraft(
     ['title', 'objective', 'narrative', 'actions']
   );
   if (!Array.isArray(record.actions)) {
+    throw invalidPlanningResult();
+  }
+  if (record.actions.length < 1 || record.actions.length > 128) {
     throw invalidPlanningResult();
   }
   return {
@@ -697,7 +682,7 @@ function requiredText(value: unknown, _field: string): string {
 
 function invalidPlanningResult(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
-    'session_kernel_provider_planning_result_invalid',
-    'Planning response must be one exact deepcode.session.planning-result.v2 envelope.'
+    'session_kernel_provider_plan_proposal_invalid',
+    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v2 record.'
   );
 }

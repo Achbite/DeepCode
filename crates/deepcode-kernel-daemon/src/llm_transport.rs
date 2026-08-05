@@ -15,7 +15,6 @@ use std::convert::Infallible;
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLlmProfile {
     pub(crate) id: String,
-    pub(crate) name: String,
     pub(crate) kind: String,
     pub(crate) provider_flavor: Option<String>,
     pub(crate) base_url: Option<String>,
@@ -52,30 +51,151 @@ pub(crate) struct LlmChatOutput {
 const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
 const LLM_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn local_secret_ref_key(secret_ref: &str) -> Option<&str> {
+    if secret_ref.trim() != secret_ref {
+        return None;
+    }
+    let key = secret_ref.strip_prefix("local-secret:")?;
+    (!key.is_empty() && key.trim() == key).then_some(key)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderThinkingCompatibility {
     DeepSeek,
     GlmDeferred,
-    KimiDeferred,
     Generic,
 }
 
-pub(crate) fn llm_profile_is_enabled(config: &Value, profile_id: &str) -> bool {
-    config
-        .get("profiles")
-        .and_then(Value::as_array)
-        .and_then(|profiles| {
-            profiles
-                .iter()
-                .find(|profile| profile.get("id").and_then(Value::as_str) == Some(profile_id))
-        })
-        .is_some_and(llm_profile_value_is_enabled)
+pub(crate) fn llm_profile_value_is_enabled(profile: &Value) -> bool {
+    llm_profile_value_is_current(profile)
+        && profile.get("enabled").and_then(Value::as_bool) == Some(true)
+        && profile.get("thinking").and_then(Value::as_str) == Some("enabled")
 }
 
-fn llm_profile_value_is_enabled(profile: &Value) -> bool {
-    profile.get("enabled").and_then(Value::as_bool) == Some(true)
-        && profile.get("thinking").and_then(Value::as_str) == Some("enabled")
-        && profile_reasoning_transport_is_compatible(profile)
+pub(crate) fn llm_profile_value_is_current(profile: &Value) -> bool {
+    const FIELDS: &[&str] = &[
+        "id",
+        "name",
+        "kind",
+        "reasoningTransport",
+        "providerFlavor",
+        "baseUrl",
+        "model",
+        "contextWindowTokens",
+        "maxOutputTokens",
+        "temperature",
+        "reasoningEffort",
+        "thinking",
+        "secretRef",
+        "enabled",
+    ];
+    let Some(profile) = profile.as_object() else {
+        return false;
+    };
+    let optional_exact_string = |field: &str| {
+        profile.get(field).is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| !value.is_empty() && value.trim() == value)
+        })
+    };
+    let optional_positive_integer = |field: &str| {
+        profile.get(field).is_none_or(|value| {
+            value
+                .as_u64()
+                .is_some_and(|value| value > 0 && value <= 1_000_000_000)
+        })
+    };
+    profile.keys().all(|field| FIELDS.contains(&field.as_str()))
+        && profile
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.trim() == value)
+        && profile
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.trim() == value)
+        && profile
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.trim() == value)
+        && profile.get("enabled").and_then(Value::as_bool).is_some()
+        && matches!(
+            profile.get("providerFlavor").and_then(Value::as_str),
+            Some("openai" | "deepseek" | "zhipu")
+        )
+        && optional_exact_string("baseUrl")
+        && optional_positive_integer("contextWindowTokens")
+        && optional_positive_integer("maxOutputTokens")
+        && profile
+            .get("temperature")
+            .is_none_or(|value| value.as_f64().is_some_and(f64::is_finite))
+        && profile
+            .get("reasoningEffort")
+            .is_none_or(|value| matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
+        && profile
+            .get("thinking")
+            .is_none_or(|value| matches!(value.as_str(), Some("enabled" | "disabled")))
+        && profile
+            .get("secretRef")
+            .is_none_or(|value| value.as_str().and_then(local_secret_ref_key).is_some())
+        && match (
+            profile.get("contextWindowTokens").and_then(Value::as_u64),
+            profile.get("maxOutputTokens").and_then(Value::as_u64),
+        ) {
+            (Some(context), Some(output)) => output < context,
+            _ => true,
+        }
+        && matches!(
+            (
+                profile.get("kind").and_then(Value::as_str),
+                profile.get("reasoningTransport").and_then(Value::as_str),
+            ),
+            (Some("openaiCompatible"), Some("openaiPlaintext"))
+                | (Some("anthropic"), Some("anthropicPlaintext"))
+                | (Some("ollama"), Some("ollamaPlaintext"))
+        )
+}
+
+pub(crate) fn llm_profile_store_is_current(config: &Value) -> bool {
+    const FIELDS: &[&str] = &["profiles", "defaultProfileId", "storePath"];
+    let Some(config) = config.as_object() else {
+        return false;
+    };
+    if config.len() != FIELDS.len() || config.keys().any(|field| !FIELDS.contains(&field.as_str()))
+    {
+        return false;
+    }
+    let Some(profiles) = config.get("profiles").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut profile_ids = HashSet::with_capacity(profiles.len());
+    if profiles.iter().any(|profile| {
+        !llm_profile_value_is_current(profile)
+            || !profile_ids.insert(
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .expect("current LLM Profile id")
+                    .to_string(),
+            )
+    }) {
+        return false;
+    }
+    let default_profile_is_current = match config.get("defaultProfileId") {
+        Some(Value::Null) => true,
+        Some(Value::String(profile_id))
+            if !profile_id.is_empty() && profile_id.trim() == profile_id =>
+        {
+            profile_ids.contains(profile_id)
+        }
+        _ => false,
+    };
+    default_profile_is_current
+        && matches!(
+            config.get("storePath"),
+            Some(Value::Null | Value::String(_))
+        )
 }
 
 pub(crate) fn effective_llm_profile_is_enabled(
@@ -83,6 +203,9 @@ pub(crate) fn effective_llm_profile_is_enabled(
     config: &Value,
     profile_id: &str,
 ) -> Result<bool, ProviderTraceErrorV1> {
+    if !llm_profile_store_is_current(config) {
+        return Ok(false);
+    }
     let Some(profile) = config
         .get("profiles")
         .and_then(Value::as_array)
@@ -108,24 +231,13 @@ pub(crate) fn preferred_effective_llm_profile_id(
     state: &AppState,
     config: &Value,
 ) -> Result<Option<String>, ProviderTraceErrorV1> {
-    let Some(profiles) = config.get("profiles").and_then(Value::as_array) else {
+    if !llm_profile_store_is_current(config) {
         return Ok(None);
-    };
+    }
     let default_id = config.get("defaultProfileId").and_then(Value::as_str);
     if let Some(default_id) = default_id {
         if effective_llm_profile_is_enabled(state, config, default_id)? {
             return Ok(Some(default_id.to_string()));
-        }
-    }
-    for profile in profiles {
-        let Some(profile_id) = profile.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if Some(profile_id) == default_id {
-            continue;
-        }
-        if effective_llm_profile_is_enabled(state, config, profile_id)? {
-            return Ok(Some(profile_id.to_string()));
         }
     }
     Ok(None)
@@ -143,30 +255,13 @@ pub(crate) fn profile_reasoning_transport_is_compatible(profile: &Value) -> bool
     )
 }
 
-pub(crate) fn preferred_enabled_llm_profile_id(config: &Value) -> Option<String> {
-    let profiles = config.get("profiles").and_then(Value::as_array)?;
-    if let Some(default_id) = config
-        .get("defaultProfileId")
-        .and_then(Value::as_str)
-        .filter(|profile_id| llm_profile_is_enabled(config, profile_id))
-    {
-        return Some(default_id.to_string());
-    }
-    profiles.iter().find_map(|profile| {
-        if !llm_profile_value_is_enabled(profile) {
-            return None;
-        }
-        profile
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
-}
-
 pub(crate) fn resolve_llm_profile(
     gui: &GuiState,
     profile_id: Option<&str>,
 ) -> Result<ResolvedLlmProfile, String> {
+    if !llm_profile_store_is_current(&gui.llm_profiles) {
+        return Err("LLM Profile store does not use the current schema".to_string());
+    }
     let default_id = gui
         .llm_profiles
         .get("defaultProfileId")
@@ -177,26 +272,19 @@ pub(crate) fn resolve_llm_profile(
         .get("profiles")
         .and_then(Value::as_array)
         .ok_or_else(|| "LLM profiles are missing".to_string())?;
-    let profile = selected_id
-        .and_then(|id| {
-            profiles
-                .iter()
-                .find(|profile| profile.get("id").and_then(Value::as_str) == Some(id))
-        })
-        .or_else(|| {
-            profiles
-                .iter()
-                .find(|profile| llm_profile_value_is_enabled(profile))
-        })
-        .ok_or_else(|| "No enabled LLM profile is configured".to_string())?;
+    let profile = match selected_id {
+        Some(id) => profiles
+            .iter()
+            .find(|profile| profile.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or_else(|| format!("Selected LLM profile `{id}` does not exist"))?,
+        None => return Err("No default LLM profile is configured".to_string()),
+    };
 
     if profile.get("enabled").and_then(Value::as_bool) != Some(true) {
         return Err("Selected LLM profile is disabled".to_string());
     }
-    if !profile_reasoning_transport_is_compatible(profile) {
-        return Err(
-            "Selected LLM profile has no compatible plaintext reasoning transport".to_string(),
-        );
+    if !llm_profile_value_is_current(profile) {
+        return Err("Selected LLM profile does not use the current profile schema".to_string());
     }
     if profile.get("thinking").and_then(Value::as_str) != Some("enabled") {
         return Err("Selected LLM profile must have plaintext thinking enabled".to_string());
@@ -205,36 +293,54 @@ pub(crate) fn resolve_llm_profile(
     let id = profile
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("profile")
+        .expect("current LLM Profile id")
         .to_string();
     let kind = profile
         .get("kind")
         .and_then(Value::as_str)
-        .unwrap_or("openaiCompatible")
+        .expect("current LLM Profile kind")
         .to_string();
-    let secret_store = read_json_file(&gui.paths.llm_secrets_path).unwrap_or_else(|| json!({}));
-    let secret_key = profile
-        .get("secretRef")
-        .and_then(Value::as_str)
-        .and_then(|value| value.strip_prefix("local-secret:").map(str::to_string))
-        .unwrap_or_else(|| id.clone());
-    let api_key = secret_store
-        .get(&secret_key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| std::env::var("DEEPCODE_LLM_API_KEY").ok());
+    let secret_store = match read_json_file(&gui.paths.llm_secrets_path) {
+        Some(Value::Object(store)) => store,
+        Some(_) => {
+            return Err("LLM secret store must be a JSON object".to_string());
+        }
+        None if gui.paths.llm_secrets_path.exists() => {
+            return Err("LLM secret store exists but could not be decoded".to_string());
+        }
+        None => serde_json::Map::new(),
+    };
+    let api_key = match profile.get("secretRef").and_then(Value::as_str) {
+        Some(secret_ref) => {
+            let secret_key = local_secret_ref_key(secret_ref)
+                .ok_or_else(|| "Selected LLM profile has an invalid secretRef".to_string())?;
+            let secret = secret_store
+                .get(secret_key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "Selected LLM profile secretRef does not resolve to a non-empty local secret"
+                        .to_string()
+                })?;
+            Some(secret.to_string())
+        }
+        None => secret_store
+            .get(&id)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("DEEPCODE_LLM_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            }),
+    };
 
     Ok(ResolvedLlmProfile {
         id: id.clone(),
-        name: profile
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(&id)
-            .to_string(),
         kind,
         provider_flavor: profile
             .get("providerFlavor")
-            .or_else(|| profile.get("provider_flavor"))
             .and_then(Value::as_str)
             .map(str::to_string),
         base_url: profile
@@ -244,12 +350,9 @@ pub(crate) fn resolve_llm_profile(
         model: profile
             .get("model")
             .and_then(Value::as_str)
-            .unwrap_or("unknown")
+            .expect("current LLM Profile model")
             .to_string(),
-        max_output_tokens: profile
-            .get("maxOutputTokens")
-            .or_else(|| profile.get("maxTokens"))
-            .and_then(token_limit_u32),
+        max_output_tokens: profile.get("maxOutputTokens").and_then(token_limit_u32),
         temperature: profile.get("temperature").and_then(Value::as_f64),
         reasoning_effort: profile
             .get("reasoningEffort")
@@ -278,27 +381,18 @@ pub(crate) fn validate_provider_identity_expectation(
 ) -> Result<(), String> {
     let Some(expectation) = request
         .get("providerOptions")
-        .or_else(|| request.get("provider_options"))
         .and_then(|options| options.get("deepcode"))
-        .and_then(|deepcode| {
-            deepcode
-                .get("expectedProviderIdentity")
-                .or_else(|| deepcode.get("expected_provider_identity"))
-        })
+        .and_then(|deepcode| deepcode.get("expectedProviderIdentity"))
     else {
         return Ok(());
     };
     let expectation = expectation
         .as_object()
         .ok_or_else(|| "DeepCode expected Provider identity must be an object.".to_string())?;
-    let expected_profile_id =
-        required_provider_identity_field(expectation, "profileId", "profile_id")?;
-    let expected_provider = required_provider_identity_field(expectation, "provider", "provider")?;
-    let expected_model = required_provider_identity_field(expectation, "model", "model")?;
-    let actual_provider = profile
-        .provider_flavor
-        .as_deref()
-        .unwrap_or(profile.kind.as_str());
+    let expected_profile_id = required_provider_identity_field(expectation, "profileId")?;
+    let expected_provider = required_provider_identity_field(expectation, "provider")?;
+    let expected_model = required_provider_identity_field(expectation, "model")?;
+    let actual_provider = required_resolved_provider_flavor(profile);
     for (name, expected, actual) in [
         ("profileId", expected_profile_id, profile.id.as_str()),
         ("provider", expected_provider, actual_provider),
@@ -315,18 +409,20 @@ pub(crate) fn validate_provider_identity_expectation(
 
 fn required_provider_identity_field<'a>(
     expectation: &'a serde_json::Map<String, Value>,
-    camel_case: &str,
-    snake_case: &str,
+    field: &str,
 ) -> Result<&'a str, String> {
     expectation
-        .get(camel_case)
-        .or_else(|| expectation.get(snake_case))
+        .get(field)
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format!("DeepCode expected Provider identity requires non-empty `{camel_case}`.")
-        })
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .ok_or_else(|| format!("DeepCode expected Provider identity requires non-empty `{field}`."))
+}
+
+fn required_resolved_provider_flavor(profile: &ResolvedLlmProfile) -> &str {
+    profile
+        .provider_flavor
+        .as_deref()
+        .expect("current LLM Profile providerFlavor")
 }
 
 pub(crate) fn openai_compatible_request_body(
@@ -1060,10 +1156,7 @@ fn inject_provider_native_continuation(
     current_identity: &ProviderTraceIdentityV1,
     dispatch_authority: &ProviderStreamDispatchAuthorityV1,
 ) -> Result<(), ProviderNativeStreamTransportErrorV1> {
-    let Some(parent_request_value) = request_envelope
-        .get("parentRequestId")
-        .or_else(|| request_envelope.get("parent_request_id"))
-    else {
+    let Some(parent_request_value) = request_envelope.get("parentRequestId") else {
         return Ok(());
     };
     let parent_request_id = parent_request_value
@@ -1095,11 +1188,7 @@ fn inject_provider_native_continuation(
         || parent_identity.profile_revision != current_identity.profile_revision
         || parent_identity.control_epoch != current_identity.control_epoch
         || parent_identity.purpose == ProviderTracePurposeV1::FinalAnswer
-        || parent_identity.provider_kind
-            != profile
-                .provider_flavor
-                .as_deref()
-                .unwrap_or(profile.kind.as_str())
+        || parent_identity.provider_kind != required_resolved_provider_flavor(profile)
         || parent_identity.model != profile.model
         || parent_identity.profile_id != profile.id
     {
@@ -1130,12 +1219,7 @@ fn inject_provider_native_continuation(
             .provider_result
             .get("provider")
             .and_then(Value::as_str)
-            != Some(
-                profile
-                    .provider_flavor
-                    .as_deref()
-                    .unwrap_or(profile.kind.as_str()),
-            )
+            != Some(required_resolved_provider_flavor(profile))
     {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_invalid",
@@ -1982,10 +2066,7 @@ fn prepare_provider_native_stream_request(
         .cloned()
         .map(provider_tools_from_values)
         .unwrap_or_default();
-    let response_format = request_envelope
-        .get("responseFormat")
-        .or_else(|| request_envelope.get("response_format"))
-        .cloned();
+    let response_format = request_envelope.get("responseFormat").cloned();
     let provider_body = match provider_kind {
         ProviderNativeStreamKindV1::OpenAiCompatible => {
             validate_provider_thinking_continuation(profile, &messages).map_err(|_| {
@@ -2625,7 +2706,7 @@ pub(crate) fn llm_stream_response(
             "type": "provider_metadata",
             "requestId": request_id.as_str(),
             "providerProfileId": profile.id,
-            "provider": profile.provider_flavor.as_deref().unwrap_or(profile.kind.as_str()),
+            "provider": required_resolved_provider_flavor(&profile),
             "model": profile.model,
         });
         if let Err(error) = trace.append_normalized_event(metadata.clone()) {
@@ -3045,7 +3126,7 @@ pub(crate) fn llm_stream_response(
         };
         let mut provider_result = json!({
             "providerProfileId": profile.id,
-            "provider": profile.provider_flavor.as_deref().unwrap_or(profile.kind.as_str()),
+            "provider": required_resolved_provider_flavor(&profile),
             "model": profile.model,
         });
         if let Some(usage) = result.output.usage {
@@ -3270,40 +3351,12 @@ fn should_send_sampling(compatibility: ProviderThinkingCompatibility) -> bool {
 }
 
 fn provider_thinking_compatibility(profile: &ResolvedLlmProfile) -> ProviderThinkingCompatibility {
-    let flavor = profile
-        .provider_flavor
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !flavor.is_empty() {
-        return match flavor.as_str() {
-            "deepseek" => ProviderThinkingCompatibility::DeepSeek,
-            "zhipu" | "glm" => ProviderThinkingCompatibility::GlmDeferred,
-            "kimi" | "moonshot" => ProviderThinkingCompatibility::KimiDeferred,
-            _ => ProviderThinkingCompatibility::Generic,
-        };
+    match required_resolved_provider_flavor(profile) {
+        "deepseek" => ProviderThinkingCompatibility::DeepSeek,
+        "zhipu" => ProviderThinkingCompatibility::GlmDeferred,
+        "openai" => ProviderThinkingCompatibility::Generic,
+        _ => unreachable!("current LLM Profile providerFlavor"),
     }
-    let base_url = profile.base_url.as_deref().unwrap_or_default();
-    let model = profile.model.to_ascii_lowercase();
-    let base = base_url.to_ascii_lowercase();
-    if model.contains("deepseek") || base.contains("deepseek") {
-        return ProviderThinkingCompatibility::DeepSeek;
-    }
-    if model.contains("glm")
-        || model.contains("zhipu")
-        || base.contains("bigmodel")
-        || base.contains("zhipu")
-    {
-        return ProviderThinkingCompatibility::GlmDeferred;
-    }
-    if model.contains("kimi")
-        || model.contains("moonshot")
-        || base.contains("kimi")
-        || base.contains("moonshot")
-    {
-        return ProviderThinkingCompatibility::KimiDeferred;
-    }
-    ProviderThinkingCompatibility::Generic
 }
 
 fn validate_provider_thinking_continuation(

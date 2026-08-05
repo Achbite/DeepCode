@@ -44,7 +44,8 @@ pub(crate) enum HostRunLifecycleV2 {
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub(crate) enum HostBridgeOwnershipV2 {
     NotStarted,

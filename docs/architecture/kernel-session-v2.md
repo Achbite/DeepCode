@@ -118,55 +118,46 @@ Kernel fixedPrompt bytes
 ```
 
 The Kernel prompt bytes and tool semantics are not rewritten. Each
-Provider lifecycle records retain the profile binding, input budget, memory
+Provider lifecycle record retains the profile binding, input budget, memory
 snapshot/omission/digest, and deterministic trimming receipt, but lifecycle
 records are not permanent conversation blocks. The replaceable run projection
 may expose a safe current activity while the provider is active. Provider
 completion records retain the provider profile, provider, model, and validated
 nonnegative bounded token usage returned by the provider. The timeline
 token-usage projection accepts documented snake_case and camelCase provider
-counters; it does not synthesize cache telemetry.
+counters; it does not synthesize cache telemetry. Public token and cache totals
+are derived only from `provider.completed`. Failed, cancelled, stale, and
+diagnostic outcomes remain private evidence and do not change those totals or
+the cache key, hit, digest, or receipt boundary. A Provider activity publishes
+its context-assembly receipt once rather than copying it into every progress
+event.
 `estimatedInputTokens` conservatively counts one budget unit per UTF-8 byte over
 the actual message and encoded tool-definition envelope. This intentionally
 underfills tokenizers whose tokens cover multiple bytes; it does not claim to
 reproduce a provider's private tokenizer. Authoritative token usage is recorded
 only from validated provider usage metadata.
 
-### Structured planning result
+### Natural assistant text and Session-only planning control
 
-A Provider planning turn may first return provider-native read-only tool
-calls. When it returns no tool call, its entire sealed text response is one
-private, exact JSON envelope:
+Assistant answers and commentary use provider-native text items and may stream
+after archive-before-publication. A Plan is never encoded as assistant JSON.
+It is proposed only through the Session-only
+`deepcode_session_plan_propose_v2` control with exact arguments. That control
+is not a Kernel tool, is never registered in `KernelToolRegistry`, and can
+never become a `ToolIntent`.
 
-```text
-deepcode.session.planning-result.v2
-  kind = answer { text }
-       | plan   { plan { title, objective, narrative, actions } }
-```
+The sealed Provider response is validated as a whole before any Kernel tool is
+admitted. A Plan control, final-answer text, and Kernel tool calls must satisfy
+their frozen phase and mutual-exclusion rules; malformed or mixed responses
+fail before Plan persistence or tool admission. JSON-shaped assistant text and
+ordinary narration remain text and are never parsed as executable control.
 
-Every object uses exact keys. Plan actions contain only `toolId`,
-`requestedResources`, `previewArguments`, and an optional `deadline`.
-Resources and deadlines use the tagged Kernel ABI shapes. Markdown fences,
-surrounding prose, the former `deepcode.session.plan-draft.v2` frame, unknown
-fields, empty answers, and malformed nested resources fail the whole Provider
-turn before Plan persistence or tool admission; they are never reinterpreted
-as narration or an answer.
-
-For an OpenAI-compatible Profile, identified by the frozen
-`openaiPlaintext` reasoning transport, Session sends the existing
-`responseFormat: {type: "json_object"}` on planning requests. Anthropic and
-Ollama receive no new transport promise in this batch and remain strict
-fail-closed at the sealed decoder.
-
-Planning does not install the incremental public-text observer. The Daemon
-still archives the exact outbound request, raw upstream envelopes, normalized
-ordered items, native completion, and seal in the private Trace/terminal
-chain. Session deterministically decodes that private evidence into either a
-semantic answer or a structured Plan. Only the semantic answer or the normal
-`plan.persisted` projection may enter the shared conversation projection; the
-JSON envelope itself never becomes commentary, final-answer text, memory, or
-model-visible history. Recovery runs the same sealed decoder and binds the
-same terminal evidence without issuing another Provider request.
+The Daemon archives the exact outbound request, raw upstream envelopes,
+normalized ordered items, native completion, and seal in the private
+Trace/terminal chain. Session publishes only safe commentary/final text, the
+normal `plan.persisted` projection, or canonical tool/fact projection. Recovery
+uses the same sealed ordered items and control identity without issuing another
+Provider request.
 
 ## Run and trust boundary
 
@@ -235,7 +226,7 @@ A PlanAction lease is reusable inside the same epoch for the same approved
 tools and resources. Every use still receives independent invocation, attempt,
 effect, and fact identities.
 
-Provider-native calls and parser-validated text frames normalize to:
+Provider-native Kernel tool calls normalize to:
 
 ```text
 ToolIntent {
@@ -395,19 +386,24 @@ affected turns or root projections. Revision gaps require a fresh snapshot,
 and terminal delivery is reconciled with a final snapshot. GUI, CLI, and TUI
 use the same typed reducer.
 
-Settled historical flat-v2 timelines are normalized read-only by preserving
-the original block order, setting `workSegments = []`, and generating `parts`
-as the same ordered block references. No legacy group field is added and no
-tool, path, permission, or effect semantics are invented. Historical bytes
-are not rewritten. An active v2 checkpoint or queue without the work-segment,
-provider trace, and final-answer state returns `UnsupportedHistorySchema`.
+Durable public `AgentEvent` accepts only the current projection-kind set and an
+exact envelope. Outer kind/channel/visibility, payload keys, and the private to
+public `projectionId/runId/projectionKind/recordedAt` binding are validated
+before append. Unknown kinds, unknown fields, missing fields, and the removed
+`planAction.skipped` projection fail closed; no renderer or recovery path may
+reinterpret them.
 
-The timeline transport envelope carries a nonnegative
-`legacyPrefixTurnCount`. The first N turns are the only turns eligible for the
-neutral settled flat-v2 normalization above; every later turn is validated as
-native work-segment shape. Absence of this field means strict-native and never
-triggers validator-failure fallback. This transport metadata is not copied
-into a public turn or used to invent a legacy grouping field.
+There is no historical projection decoder. Settled flat-v2, active v2,
+`legacyPrefixTurnCount`, missing `workSegments/parts`, and every unknown field
+or discriminator fail closed with `UnsupportedHistorySchema`. Historical bytes
+remain untouched but cannot be used as current Run input, public timeline, UI
+replay, or recovery state.
+
+Same-Session persistence is supported only when every record already has the
+current exact schema, physical layout, field set, discriminator, and bound
+identity. Reading those records with the same exact decoder is ordinary current
+persistence, not a compatibility decoder. No old shape, layout, or field may be
+migrated, normalized, aliased, defaulted, or routed through a fallback.
 
 ## Provider streaming and private trace
 
@@ -431,6 +427,18 @@ blocks do not satisfy the requirement. A profile without a statically
 compatible transport remains visible but unavailable. Missing runtime
 reasoning fails the turn before tools or final content and quarantines the exact
 profile revision until explicit re-enable or a new configuration revision.
+
+Profile storage and ingress accept only the current exact field set. Unknown or
+missing fields, `maxTokens`, snake_case request aliases, the former readable or
+repair profile shape, and an explicit/default Profile ID that does not resolve
+all fail closed in exact Profile resolution; a missing ID is never treated as
+an alias for another Profile. A missing Profile file may create the current
+first-run defaults; an existing unreadable or invalid file never does. Updating
+Profiles does not rewrite inactive Sessions to another Profile: an unavailable
+Session binding stays visible and requires an explicit user selection or
+re-enable decision.
+`reasoningTransport` is checked statically against Provider kind; saving a
+Profile does not perform a network probe.
 
 The daemon stores one plaintext `deepcode.session.provider-trace.v1` per
 provider turn. It contains the exact serialized outbound request bytes,
@@ -489,7 +497,10 @@ control epoch, and exact Provider Profile revision; changing Review revision,
 facts high-water, or Plan binding does not reset it. Exact replay of the current
 provider turn still requires the complete Plan/Review/high-water identity.
 
-Active Session persistence uses the v3 discriminator and `kernel-v3` stream.
+Active Session persistence uses the current v3 record discriminator under the
+single physical `kernel-v2/session-runs/` root. The discriminator is a payload
+schema version and never selects a second `kernel-v3` directory or fallback
+stream.
 Its checkpoint is a compact recovery-control record: it references immutable
 input/Plan/Review/Provider/operation/projection facts, carries only active
 Provider or queue control, projection delivery position, final-answer control,
@@ -576,10 +587,10 @@ textDelta
 
 The event follows Trace archive-before-publication. It never contains reasoning,
 tool identity or arguments, or raw envelopes. Explicit commentary may stream;
-`final_answer` waits for the completed sealed response. Unknown text whose first
-non-whitespace character is `{` is buffered through terminal validation so a
-text-framed ToolIntent cannot leak. `provider.completed` reconciles the final
-safe ordered response in place.
+`final_answer` waits for the completed sealed response. Unknown text streams as
+text without content-based JSON or keyword classification. It can never become
+an executable ToolIntent. `provider.completed` reconciles the final safe ordered
+response in place.
 
 Run-capability timeline SSE is pinned at open to
 `sessionId + pinnedRunId + runCapability`. It never follows a later Run in the

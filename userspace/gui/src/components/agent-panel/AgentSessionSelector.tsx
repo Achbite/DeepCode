@@ -145,7 +145,6 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
                       </span>
                       <span className="agent-session-menu__meta">
                         {formatTime(item.updatedAt)}
-                        {item.lastSummary ? ` - ${item.lastSummary}` : ''}
                       </span>
                     </button>
                   )}

@@ -1,6 +1,5 @@
 import type {
   AgentEvent,
-  AgentTimelineBlock,
   AgentTimelineDelta,
   AgentTimelineDeliveryMode,
   AgentTimelineResult,
@@ -62,22 +61,6 @@ export function isNativeWorkSegmentsTimelineSnapshot(
   );
 }
 
-export function isLegacyFlatV2TimelineSnapshot(
-  snapshot: unknown
-): snapshot is Record<string, unknown> {
-  return isRecord(snapshot)
-    && snapshot.schemaVersion
-      === AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
-    && snapshot.shapeVersion === undefined
-    && Array.isArray(snapshot.turns)
-    && snapshot.turns.every((turn) =>
-      isRecord(turn)
-      && Array.isArray(turn.blocks)
-      && turn.workSegments === undefined
-      && turn.parts === undefined
-    );
-}
-
 export class CanonicalTimelineProjector {
   private auxiliaryEvents: AgentEvent[];
   private currentTimeline: AgentTimelineResult;
@@ -90,7 +73,7 @@ export class CanonicalTimelineProjector {
   ) {
     this.auxiliaryEvents = deduplicateAuxiliaryEvents(initialAuxiliaryEvents);
     const normalizedInitial = initialTimeline?.sessionId === sessionId
-      ? normalizeAgentTimelineSnapshot(initialTimeline).timeline
+      ? normalizeAgentTimelineSnapshot(initialTimeline)
       : undefined;
     this.currentTimeline =
       normalizedInitial?.eventCount === initialEvents.length
@@ -124,30 +107,14 @@ function deduplicateAuxiliaryEvents(events: readonly AgentEvent[]): AgentEvent[]
   return [...byId.values()];
 }
 
-export interface NormalizedAgentTimelineSnapshot {
-  timeline: AgentTimelineResult;
-  compatibility: 'nativeWorkSegments' | 'legacySettledNeutral';
-}
-
 export function normalizeAgentTimelineSnapshot(
   snapshot: AgentTimelineSnapshot | unknown
-): NormalizedAgentTimelineSnapshot {
-  if (isLegacyFlatV2TimelineSnapshot(snapshot)) {
-    const timeline = normalizeSettledLegacyFlatV2(snapshot);
-    assertSharedConversationProjectionV2(timeline);
-    return {
-      timeline,
-      compatibility: 'legacySettledNeutral',
-    };
-  }
+): AgentTimelineResult {
   if (!isNativeWorkSegmentsTimelineSnapshot(snapshot)) {
-    throw new Error('shared_conversation_projection_native_shape_required');
+    throw new UnsupportedTimelineHistorySchemaError();
   }
   assertSharedConversationProjectionV2(snapshot);
-  return {
-    timeline: snapshot,
-    compatibility: 'nativeWorkSegments',
-  };
+  return snapshot;
 }
 
 export function rebuildSharedConversationProjectionV2(
@@ -178,18 +145,6 @@ export function createAgentTimelineDelta(
   if (current.sessionId !== next.sessionId) {
     throw new Error('timeline_delta_session_mismatch');
   }
-  const legacyPrefixTurnCount = next.legacyPrefixTurnCount ?? 0;
-  if (
-    (current.legacyPrefixTurnCount ?? 0)
-      !== legacyPrefixTurnCount
-  ) {
-    throw new Error('timeline_delta_legacy_prefix_changed');
-  }
-  for (let index = 0; index < legacyPrefixTurnCount; index += 1) {
-    if (!jsonEqual(current.turns[index], next.turns[index])) {
-      throw new Error('timeline_delta_legacy_prefix_changed');
-    }
-  }
   if (next.revision <= current.revision) {
     throw new Error('timeline_delta_revision_not_advancing');
   }
@@ -215,7 +170,6 @@ export function createAgentTimelineDelta(
   return {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
     shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
-    legacyPrefixTurnCount,
     sessionId: next.sessionId,
     baseRevision: current.revision,
     revision: next.revision,
@@ -225,6 +179,64 @@ export function createAgentTimelineDelta(
     turnReplacements,
     removedTurnIds,
     rootReplacements: changedRootProjections(current, next),
+  };
+}
+
+export function createProviderComposingTimelineDelta(
+  current: AgentTimelineResult,
+  next: AgentTimelineResult
+): AgentTimelineDelta {
+  assertNativeTimeline(current);
+  assertNativeTimeline(next);
+  const turnId = next.runProjection?.turnId;
+  if (
+    current.sessionId !== next.sessionId
+    || !turnId
+    || current.runProjection?.runId !== next.runProjection?.runId
+    || next.revision !== current.revision + 1
+    || next.sourceEventVersion !== current.sourceEventVersion + 1
+    || next.eventCount !== current.eventCount + 1
+    || current.turns.length !== next.turns.length
+    || current.taskProjection !== next.taskProjection
+    || current.interactionProjection !== next.interactionProjection
+    || current.tokenUsageProjection !== next.tokenUsageProjection
+    || current.workspaceProjection !== next.workspaceProjection
+  ) {
+    throw new Error('provider_composing_timeline_delta_invalid');
+  }
+  let replacement: AgentTimelineTurn | undefined;
+  for (let index = 0; index < current.turns.length; index += 1) {
+    const before = current.turns[index]!;
+    const after = next.turns[index]!;
+    if (before.id !== after.id || before.sequence !== after.sequence) {
+      throw new Error('provider_composing_timeline_delta_turn_order_changed');
+    }
+    if (after.id === turnId) {
+      if (before === after) {
+        throw new Error('provider_composing_timeline_delta_turn_unchanged');
+      }
+      replacement = after;
+    } else if (before !== after) {
+      throw new Error('provider_composing_timeline_delta_cross_turn_change');
+    }
+  }
+  if (!replacement || current.runProjection === next.runProjection) {
+    throw new Error('provider_composing_timeline_delta_missing_change');
+  }
+  return {
+    schemaVersion: next.schemaVersion,
+    shapeVersion: next.shapeVersion,
+    sessionId: next.sessionId,
+    baseRevision: current.revision,
+    revision: next.revision,
+    sourceEventVersion: next.sourceEventVersion,
+    generatedAt: next.generatedAt,
+    eventCount: next.eventCount,
+    turnReplacements: [replacement],
+    removedTurnIds: [],
+    rootReplacements: {
+      runProjection: next.runProjection,
+    },
   };
 }
 
@@ -243,15 +255,6 @@ export function applyAgentTimelineDelta(
       delta.baseRevision
     );
   }
-  const currentLegacyPrefixTurnCount =
-    current.legacyPrefixTurnCount ?? 0;
-  const deltaLegacyPrefixTurnCount =
-    delta.legacyPrefixTurnCount ?? 0;
-  if (
-    currentLegacyPrefixTurnCount !== deltaLegacyPrefixTurnCount
-  ) {
-    throw new Error('timeline_delta_legacy_prefix_changed');
-  }
   if (delta.revision <= delta.baseRevision) {
     throw new Error('timeline_delta_revision_not_advancing');
   }
@@ -266,31 +269,15 @@ export function applyAgentTimelineDelta(
   const replacements = new Map(
     delta.turnReplacements.map((turn) => [turn.id, turn])
   );
-  const legacyTurnIds = new Set(
-    current.turns
-      .slice(0, currentLegacyPrefixTurnCount)
-      .map((turn) => turn.id)
-  );
-  if (
-    [...legacyTurnIds].some((turnId) =>
-      removed.has(turnId) || replacements.has(turnId)
-    )
-  ) {
-    throw new Error('timeline_delta_legacy_prefix_changed');
-  }
   for (const turnId of removed) {
     if (replacements.has(turnId)) {
       throw new Error('timeline_delta_turn_conflict');
     }
   }
 
-  const legacyTurns = current.turns.slice(
-    0,
-    currentLegacyPrefixTurnCount
-  );
   const turns: AgentTimelineTurn[] = [];
   const knownTurnIds = new Set<string>();
-  for (const turn of current.turns.slice(currentLegacyPrefixTurnCount)) {
+  for (const turn of current.turns) {
     if (removed.has(turn.id)) continue;
     const replacement = replacements.get(turn.id);
     turns.push(replacement ?? turn);
@@ -310,12 +297,11 @@ export function applyAgentTimelineDelta(
     ...current,
     schemaVersion: delta.schemaVersion,
     shapeVersion: delta.shapeVersion,
-    legacyPrefixTurnCount: deltaLegacyPrefixTurnCount,
     revision: delta.revision,
     sourceEventVersion: delta.sourceEventVersion,
     generatedAt: delta.generatedAt,
     eventCount: delta.eventCount,
-    turns: [...legacyTurns, ...turns],
+    turns,
   };
   applyRootProjectionReplacements(result, delta.rootReplacements);
   assertNativeTimeline(result);
@@ -412,7 +398,6 @@ export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   return {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
     shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
-    legacyPrefixTurnCount: 0,
     sessionId,
     revision: 0,
     sourceEventVersion: 0,
@@ -422,145 +407,9 @@ export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   };
 }
 
-function normalizeSettledLegacyFlatV2(
-  snapshot: Record<string, unknown>
-): AgentTimelineResult {
-  if (!legacyFlatSnapshotIsSettled(snapshot)) {
-    throw new UnsupportedTimelineHistorySchemaError();
-  }
-  const turns = (snapshot.turns as unknown[]).map((value) => {
-    const turn = isRecord(value) ? value : {};
-    const blocks = Array.isArray(turn.blocks)
-      ? turn.blocks.map((block) => ({ ...block })) as AgentTimelineBlock[]
-      : [];
-    return {
-      id: turn.id as string,
-      ...(turn.sequence === undefined
-        ? {}
-        : { sequence: turn.sequence as number }),
-      sessionId: turn.sessionId as string,
-      status: turn.status as AgentTimelineTurn['status'],
-      ...(turn.startedAt === undefined
-        ? {}
-        : { startedAt: turn.startedAt as string }),
-      ...(turn.completedAt === undefined
-        ? {}
-        : { completedAt: turn.completedAt as string }),
-      blocks,
-      workSegments: [],
-      parts: blocks.map((block) => ({
-        kind: 'block' as const,
-        blockId: block.id,
-      })),
-    };
-  });
-  const runProjection = normalizeLegacySettledRunProjection(
-    snapshot.runProjection
-  );
-  const result: AgentTimelineResult = {
-    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
-    legacyPrefixTurnCount: turns.length,
-    sessionId: snapshot.sessionId as string,
-    revision: snapshot.revision as number,
-    sourceEventVersion: snapshot.sourceEventVersion as number,
-    generatedAt: snapshot.generatedAt as string,
-    turns,
-    eventCount: snapshot.eventCount as number,
-    ...(snapshot.taskProjection === undefined
-      ? {}
-      : {
-          taskProjection:
-            snapshot.taskProjection as AgentTimelineResult['taskProjection'],
-        }),
-    ...(snapshot.interactionProjection === undefined
-      ? {}
-      : {
-          interactionProjection:
-            snapshot.interactionProjection as AgentTimelineResult['interactionProjection'],
-        }),
-    ...(runProjection ? { runProjection } : {}),
-    ...(snapshot.tokenUsageProjection === undefined
-      ? {}
-      : {
-          tokenUsageProjection:
-            snapshot.tokenUsageProjection as AgentTimelineResult['tokenUsageProjection'],
-        }),
-    ...(snapshot.workspaceProjection === undefined
-      ? {}
-      : {
-          workspaceProjection:
-            snapshot.workspaceProjection as AgentTimelineResult['workspaceProjection'],
-        }),
-  };
-  return result;
-}
-
-function legacyFlatSnapshotIsSettled(
-  snapshot: Record<string, unknown>
-): boolean {
-  const run = isRecord(snapshot.runProjection)
-    ? snapshot.runProjection
-    : undefined;
-  const turns = Array.isArray(snapshot.turns)
-    ? snapshot.turns
-    : [];
-  const turnsAreTerminal = turns.every((value) => {
-    const turn = isRecord(value) ? value : undefined;
-    return Boolean(
-      turn
-      && (
-        turn.status === 'completed'
-        || turn.status === 'cancelled'
-        || turn.status === 'failed'
-      )
-    );
-  });
-  if (!turnsAreTerminal) return false;
-  if (!run) return false;
-  return run.phase === 'settled'
-    && (
-      run.status === 'succeeded'
-      || run.status === 'failed'
-      || run.status === 'cancelled'
-    );
-}
-
-function normalizeLegacySettledRunProjection(
-  value: unknown
-): AgentTimelineResult['runProjection'] {
-  const run = isRecord(value) ? value : undefined;
-  if (!run) return undefined;
-  return {
-    runId: run.runId as string,
-    ...(run.turnId === undefined
-      ? {}
-      : { turnId: run.turnId as string }),
-    ...(run.taskId === undefined
-      ? {}
-      : { taskId: run.taskId as string }),
-    revision: run.revision as number,
-    status: run.status as NonNullable<
-      AgentTimelineResult['runProjection']
-    >['status'],
-    phase: run.phase as NonNullable<
-      AgentTimelineResult['runProjection']
-    >['phase'],
-    currentActivity: null,
-    wait: null,
-    languageBinding:
-      run.languageBinding as NonNullable<
-        AgentTimelineResult['runProjection']
-      >['languageBinding'],
-  };
-}
-
 function assertNativeTimeline(
   timeline: AgentTimelineResult
 ): void {
-  if (isLegacyFlatV2TimelineSnapshot(timeline)) {
-    throw new UnsupportedTimelineHistorySchemaError();
-  }
   if (!isNativeWorkSegmentsTimelineSnapshot(timeline)) {
     throw new Error('shared_conversation_projection_native_shape_required');
   }
@@ -568,28 +417,44 @@ function assertNativeTimeline(
 }
 
 function assertTimelineDelta(delta: AgentTimelineDelta): void {
+  const deltaKeys = [
+    'schemaVersion',
+    'shapeVersion',
+    'sessionId',
+    'baseRevision',
+    'revision',
+    'sourceEventVersion',
+    'generatedAt',
+    'eventCount',
+    'turnReplacements',
+    'removedTurnIds',
+    'rootReplacements',
+  ];
   if (
     !isRecord(delta)
+    || !hasExactKeys(delta, deltaKeys)
     || delta.schemaVersion
       !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
     || delta.shapeVersion
       !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1
-    || (
-      delta.legacyPrefixTurnCount !== undefined
-      && (
-        !Number.isSafeInteger(delta.legacyPrefixTurnCount)
-        || delta.legacyPrefixTurnCount < 0
-      )
-    )
     || typeof delta.sessionId !== 'string'
-    || !Number.isSafeInteger(delta.baseRevision)
-    || !Number.isSafeInteger(delta.revision)
-    || !Number.isSafeInteger(delta.sourceEventVersion)
+    || delta.sessionId.length === 0
+    || !isNonnegativeSafeInteger(delta.baseRevision)
+    || !isNonnegativeSafeInteger(delta.revision)
+    || !isNonnegativeSafeInteger(delta.sourceEventVersion)
     || typeof delta.generatedAt !== 'string'
-    || !Number.isSafeInteger(delta.eventCount)
+    || delta.generatedAt.length === 0
+    || !isNonnegativeSafeInteger(delta.eventCount)
     || !Array.isArray(delta.turnReplacements)
     || !Array.isArray(delta.removedTurnIds)
     || !isRecord(delta.rootReplacements)
+    || !hasOnlyKeys(delta.rootReplacements, [
+      'taskProjection',
+      'interactionProjection',
+      'runProjection',
+      'tokenUsageProjection',
+      'workspaceProjection',
+    ])
   ) {
     throw new Error('invalid_timeline_delta');
   }
@@ -598,6 +463,7 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     if (
       !isRecord(turn)
       || typeof turn.id !== 'string'
+      || turn.id.length === 0
       || replacementIds.has(turn.id)
     ) {
       throw new Error('invalid_timeline_delta_turn_replacement');
@@ -608,6 +474,7 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
   for (const turnId of delta.removedTurnIds) {
     if (
       typeof turnId !== 'string'
+      || turnId.length === 0
       || removedIds.has(turnId)
     ) {
       throw new Error('invalid_timeline_delta_removed_turn');
@@ -707,6 +574,26 @@ function jsonEqual(left: unknown, right: unknown): boolean {
 
 function hasOwn(value: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  return Object.keys(value).length === keys.length
+    && hasOnlyKeys(value, keys);
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

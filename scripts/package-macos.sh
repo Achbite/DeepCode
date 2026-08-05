@@ -913,6 +913,8 @@ JSON
       "id": "deepseek-v4-flash-openai",
       "name": "DeepSeek V4 Flash",
       "kind": "openaiCompatible",
+      "reasoningTransport": "openaiPlaintext",
+      "providerFlavor": "deepseek",
       "baseUrl": "https://api.deepseek.com",
       "model": "deepseek-v4-flash",
       "contextWindowTokens": 1000000,
@@ -926,6 +928,8 @@ JSON
       "id": "deepseek-v4-pro-openai",
       "name": "DeepSeek V4 Pro",
       "kind": "openaiCompatible",
+      "reasoningTransport": "openaiPlaintext",
+      "providerFlavor": "deepseek",
       "baseUrl": "https://api.deepseek.com",
       "model": "deepseek-v4-pro",
       "contextWindowTokens": 1000000,
@@ -978,10 +982,7 @@ SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 HOST="\${DEEPCODE_HOST:-127.0.0.1}"
 KERNEL_BIN="\$SCRIPT_DIR/deepcode-kernel"
 TUI_BIN="\$SCRIPT_DIR/libexec/$TUI_EXEC_NAME"
-WEB_DIR="\$SCRIPT_DIR/$WEB_DIR_NAME"
 CONFIG_ROOT="\${DEEPCODE_CONFIG_DIR:-\$SCRIPT_DIR}"
-LOG_DIR="\${DEEPCODE_LOG_DIR:-\$CONFIG_ROOT/logs}"
-mkdir -p "\$LOG_DIR"
 
 fail() {
   printf '$PRODUCT TUI launcher error: %s\n' "\$*" >&2
@@ -1012,58 +1013,17 @@ choose_port() {
   fail "no free localhost port found in $DEFAULT_PORT-31345"
 }
 
-health_ok() {
-  /usr/bin/curl -fsS "\$1/api/health" >/dev/null 2>&1
-}
-
-wait_for_kernel() {
-  local api_url="\$1"
-  local attempt=1
-  while [ "\$attempt" -le 80 ]; do
-    if health_ok "\$api_url"; then
-      return 0
-    fi
-    sleep 0.1
-    attempt=\$((attempt + 1))
-  done
-  return 1
-}
-
 [ -x "\$KERNEL_BIN" ] || fail "missing executable: \$KERNEL_BIN"
 [ -x "\$TUI_BIN" ] || fail "missing executable: \$TUI_BIN"
-[ -f "\$WEB_DIR/index.html" ] || fail "missing GUI web assets: \$WEB_DIR/index.html"
 
 PORT="\$(choose_port)"
 API_URL="http://\$HOST:\$PORT"
-KERNEL_PID=""
-STARTED_KERNEL=0
-
-cleanup() {
-  if [ "\$STARTED_KERNEL" = "1" ] && [ "\$KERNEL_PID" != "" ]; then
-    kill "\$KERNEL_PID" >/dev/null 2>&1 || true
-    wait "\$KERNEL_PID" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-if ! health_ok "\$API_URL"; then
-  DEEPCODE_HOST="\$HOST" \
-  DEEPCODE_PORT="\$PORT" \
-  DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT" \
-  DEEPCODE_CLIENT_DIST="\$WEB_DIR" \
-    "\$KERNEL_BIN" >>"\$LOG_DIR/deepcode-kernel.log" 2>&1 &
-  KERNEL_PID="\$!"
-  STARTED_KERNEL=1
-
-  if ! wait_for_kernel "\$API_URL"; then
-    fail "kernel did not become ready at \$API_URL; see \$LOG_DIR/deepcode-kernel.log"
-  fi
-fi
 
 export DEEPCODE_HOST="\$HOST"
 export DEEPCODE_PORT="\$PORT"
 export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
 export DEEPCODE_API_URL="\$API_URL"
+export DEEPCODE_KERNEL_BIN="\$KERNEL_BIN"
 if [ -f "\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME" ]; then
   export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME"
 fi

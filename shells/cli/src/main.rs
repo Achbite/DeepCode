@@ -1,19 +1,23 @@
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunResult, AgentTimelineDurability, AgentTimelineEntryRole,
-    AgentTimelineRunStatus, AgentTimelineSnapshot, AgentTimelineStatus, AgentTimelineTurnPart,
-    CreateAgentSessionRequest, HttpKernelClient, KernelBootstrap, KernelBootstrapOptions,
-    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentRunCallerRequest, AgentRunResult, AgentTimelineDurability,
+    AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot, AgentTimelineStatus,
+    AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient, KernelBootstrap,
+    KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
 const EXIT_ACTION_REQUIRED: i32 = 5;
+const EXIT_INTERRUPTED: i32 = 130;
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_RUN_TIMEOUT_ENV: &str = "DEEPCODE_CLI_RUN_TIMEOUT_MS";
+const CLI_INTERRUPT_CLEANUP_WINDOW: Duration = Duration::from_secs(5);
+static CLI_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum CliCommandOutcome {
@@ -32,7 +36,38 @@ async fn main() {
         }
     };
 
-    match run(command).await {
+    CLI_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    let interrupt_task = tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            CLI_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        }
+    });
+    let mut running = Box::pin(run(command));
+    let outcome = tokio::select! {
+        outcome = &mut running => outcome,
+        _ = wait_for_cli_interrupt() => {
+            match tokio::time::timeout(CLI_INTERRUPT_CLEANUP_WINDOW, &mut running).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(
+                    "CLI interrupt cleanup timed out; the owned Kernel guard was reclaimed, but an externally owned Run may still require cancellation"
+                        .to_string(),
+                ),
+            }
+        }
+    };
+    drop(running);
+    interrupt_task.abort();
+
+    if CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        if let Err(error) = outcome {
+            eprintln!("{error}");
+        } else {
+            eprintln!("CLI was interrupted by the user");
+        }
+        std::process::exit(EXIT_INTERRUPTED);
+    }
+
+    match outcome {
         Ok(CliCommandOutcome::Completed) => {}
         Ok(CliCommandOutcome::ActionRequired(message)) => {
             eprintln!("{message}");
@@ -42,6 +77,12 @@ async fn main() {
             eprintln!("{error}");
             std::process::exit(EXIT_DAEMON_UNAVAILABLE);
         }
+    }
+}
+
+async fn wait_for_cli_interrupt() {
+    while !CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

@@ -1,18 +1,22 @@
 import { create } from 'zustand';
 import type {
   AgentInputAttachmentV2,
-  AgentEvent,
   AgentSession,
   AgentTimelinePermissionRequestView,
   AgentTimelineResult,
+  AgentTimelineStreamEvent,
   ListAgentSessionsRequest,
 } from '@deepcode/protocol';
 import {
+  AgentTimelineRevisionGapError,
+  UnsupportedTimelineHistorySchemaError,
+  applyAgentTimelineDelta,
+  assertSharedConversationProjectionV2,
   createWorkspaceBinding,
   createWorkspaceScope,
   createWorkspaceScopeKey,
   emptyTimeline,
-  findLatestPendingPermission,
+  isNativeWorkSegmentsTimelineSnapshot,
   reconcileTimelineSnapshot,
   timelineAsReplay,
 } from '@deepcode/session-core';
@@ -23,17 +27,17 @@ import {
   cancelAgentRunById,
   createAgentSession,
   getAgentRun,
-  getAgentSession,
   getAgentTimeline,
   getCurrentAgentSession,
   listAgentSessions,
   renameAgentSession,
   startAgentRun,
-  streamAgentRun,
+  streamAgentTimeline,
   submitAgentRunGuidance,
   updateAgentSession,
 } from '../services/runtimeAdapter';
-import type { AgentRunResult, AgentRunStreamEvent, StartAgentRunRequest } from '../services/apiClient';
+import { AgentTimelineStreamProtocolError } from '../services/apiClient';
+import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
 import { activeT } from '../i18n';
 import { useWorkspaceStore } from './workspaceStore';
 
@@ -67,7 +71,6 @@ interface AgentSessionState {
   sessions: AgentSession[];
   currentSessionId?: string;
   localWorkspaceScopeKey?: string;
-  events: AgentEvent[];
   timeline: AgentTimelineResult | null;
   profileId?: string;
   profileSelectionBusy: boolean;
@@ -120,7 +123,7 @@ interface ActiveAgentRunIdentity {
 const activeAgentRunIds = new Map<string, ActiveAgentRunIdentity>();
 const workspaceTreeRevisionBySession = new Map<string, number>();
 const MAX_AGENT_INPUT_ATTACHMENTS_V2 = 32;
-const CANONICAL_PROGRESS_REFRESH_INTERVAL_MS = 300;
+const CANONICAL_PROGRESS_STREAM_RETRY_MS = 250;
 const CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS = 5_000;
 const CANONICAL_PROGRESS_TRAILING_ATTEMPTS = 3;
 
@@ -135,6 +138,7 @@ const canonicalProgressWatchers =
 const canonicalTimelineFetches =
   new Map<string, ReturnType<typeof getAgentTimeline>>();
 const canonicalTimelineStaleSessions = new Set<string>();
+const canonicalTimelineFailClosedSessions = new Set<string>();
 const canonicalTimelineGenerations = new Map<string, number>();
 let agentSessionActivationGeneration = 0;
 let settledAgentSessionActivationGeneration = 0;
@@ -168,20 +172,6 @@ function hostObservedRunIdentity(
       timelineRevisionFloor,
       currentTimelineRevision(sessionId)
     ),
-  };
-}
-
-function createLocalEvent(
-  sessionId: string,
-  kind: AgentEvent['kind'],
-  payload: unknown
-): AgentEvent {
-  return {
-    id: `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    sessionId,
-    ts: new Date().toISOString(),
-    kind,
-    payload,
   };
 }
 
@@ -345,100 +335,73 @@ type DurableSessionAttachments =
   | { ok: false };
 
 function durableSessionAttachments(
-  events: AgentEvent[],
+  timeline: AgentTimelineResult,
   activeFolderId?: string | null,
   expectedSessionId?: string
 ): DurableSessionAttachments {
   if (!activeFolderId) return { ok: true, attachments: [] };
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.kind !== 'user_msg') continue;
-    if (expectedSessionId && event.sessionId !== expectedSessionId) {
-      return { ok: false };
-    }
-    const payload = isRecord(event.payload) ? event.payload : null;
-    if (
-      payload?.schemaVersion !== 'deepcode.session.kernel-public-projection.v2'
-      || payload.projectionKind !== 'input.persisted'
-    ) {
-      continue;
-    }
-    if (!Array.isArray(payload.attachments) || payload.attachments.length > 32) {
-      return { ok: false };
-    }
-    const decoded: AgentInputAttachmentV2[] = [];
-    const paths = new Set<string>();
-    for (const value of payload.attachments) {
-      if (!isRecord(value)) return { ok: false };
-      const keys = Object.keys(value);
-      if (
-        keys.some((key) => ![
-          'kind',
-          'path',
-          'scope',
-          'resourceId',
-          'folderId',
-        ].includes(key))
-        || !Object.hasOwn(value, 'kind')
-        || !Object.hasOwn(value, 'path')
-        || !Object.hasOwn(value, 'scope')
-        || (value.kind !== 'file' && value.kind !== 'directory')
-        || (value.scope !== 'message' && value.scope !== 'session')
-      ) {
+  if (expectedSessionId && timeline.sessionId !== expectedSessionId) {
+    return { ok: false };
+  }
+  for (let turnIndex = timeline.turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const blocks = timeline.turns[turnIndex].blocks;
+    for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = blocks[blockIndex];
+      if (block.kind !== 'user') continue;
+      const attachments = block.attachments ?? [];
+      if (attachments.length > 32) return { ok: false };
+      const decoded: AgentInputAttachmentV2[] = [];
+      const paths = new Set<string>();
+      for (const value of attachments) {
+        const path = decodeDurableWorkspaceRelativePath(value.path);
+        if (!path || paths.has(path)) return { ok: false };
+        paths.add(path);
+        const folderId = value.folderId;
+        const resourceId = value.resourceId;
+        if (
+          (
+            folderId !== undefined
+            && (
+              !folderId
+              || folderId.trim() !== folderId
+              || new TextEncoder().encode(folderId).byteLength > 512
+              || /[\u0000-\u001f\u007f-\u009f]/u.test(folderId)
+            )
+          )
+          || (
+            resourceId !== undefined
+            && (
+              !resourceId
+              || resourceId.trim() !== resourceId
+              || new TextEncoder().encode(resourceId).byteLength > 512
+              || /[\u0000-\u001f\u007f-\u009f]/u.test(resourceId)
+            )
+          )
+        ) {
+          return { ok: false };
+        }
+        decoded.push({
+          kind: value.kind,
+          path,
+          scope: value.scope,
+          folderId,
+          ...(resourceId ? { resourceId } : {}),
+        });
+      }
+      const sessionAttachments = decoded.filter(
+        (attachment) => attachment.scope === 'session'
+      );
+      if (sessionAttachments.some((attachment) => attachment.folderId !== activeFolderId)) {
         return { ok: false };
       }
-      const path = decodeDurableWorkspaceRelativePath(value.path);
-      if (!path || paths.has(path)) return { ok: false };
-      paths.add(path);
-      const folderId = typeof value.folderId === 'string'
-        ? value.folderId
-        : undefined;
-      const resourceId = typeof value.resourceId === 'string'
-        ? value.resourceId
-        : undefined;
-      if (
-        value.folderId !== undefined && folderId === undefined
-        || value.resourceId !== undefined && resourceId === undefined
-        || (
-          folderId !== undefined
-          && (
-            !folderId
-            || folderId.trim() !== folderId
-            || new TextEncoder().encode(folderId).byteLength > 512
-            || /[\u0000-\u001f\u007f-\u009f]/u.test(folderId)
-          )
-        )
-        || (
-          resourceId !== undefined
-          && (
-            !resourceId
-            || resourceId.trim() !== resourceId
-            || new TextEncoder().encode(resourceId).byteLength > 512
-            || /[\u0000-\u001f\u007f-\u009f]/u.test(resourceId)
-          )
-        )
-      ) {
-        return { ok: false };
-      }
-      decoded.push({
-        kind: value.kind,
-        path,
-        scope: value.scope,
-        folderId,
-        ...(resourceId ? { resourceId } : {}),
-      });
+      return { ok: true, attachments: sessionAttachments };
     }
-    const sessionAttachments = decoded.filter((attachment) => attachment.scope === 'session');
-    if (sessionAttachments.some((attachment) => attachment.folderId !== activeFolderId)) {
-      return { ok: false };
-    }
-    return { ok: true, attachments: sessionAttachments };
   }
   return { ok: true, attachments: [] };
 }
 
 function restoredSessionAttachmentState(
-  events: AgentEvent[],
+  timeline: AgentTimelineResult,
   expectedSessionId?: string
 ): {
   sessionAttachments: AgentInputAttachmentV2[];
@@ -448,7 +411,7 @@ function restoredSessionAttachmentState(
   const activeFolderId = workspaceState.activeFolderId
     ?? workspaceState.getActiveFolder()?.id;
   const restored = durableSessionAttachments(
-    events,
+    timeline,
     activeFolderId,
     expectedSessionId
   );
@@ -533,24 +496,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentEvent[] {
-  const byId = new Map<string, AgentEvent>();
-  for (const event of existing) byId.set(event.id, event);
-  for (const event of incoming) byId.set(event.id, event);
-  return [...byId.values()].sort((left, right) => (left.ts ?? '').localeCompare(right.ts ?? ''));
+function requireExactNativeTimeline(value: unknown): AgentTimelineResult {
+  if (
+    !isNativeWorkSegmentsTimelineSnapshot(value)
+    || Object.prototype.hasOwnProperty.call(value, 'legacyPrefixTurnCount')
+  ) {
+    throw new UnsupportedTimelineHistorySchemaError();
+  }
+  assertSharedConversationProjectionV2(value);
+  return value;
 }
 
-function boundedAgentSessionRequest(
-  sessionId: string
-): ReturnType<typeof getAgentSession> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(
-    () => controller.abort(),
-    CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS
-  );
-  return getAgentSession(sessionId, controller.signal).finally(() => {
-    window.clearTimeout(timeout);
-  });
+function pendingPermissionFromTimeline(
+  timeline: AgentTimelineResult
+): PendingPermission | null {
+  const pending = timeline.interactionProjection?.pending;
+  return pending?.kind === 'permission'
+    ? { request: pending.request }
+    : null;
 }
 
 function boundedAgentTimelineRequest(
@@ -633,7 +596,19 @@ async function refreshCanonicalTimeline(
     return false;
   }
   if (useAgentSessionStore.getState().session?.id !== sessionId) return true;
-  const incomingTimeline = result.data;
+  let incomingTimeline: AgentTimelineResult;
+  try {
+    incomingTimeline = requireExactNativeTimeline(result.data);
+  } catch (error) {
+    canonicalTimelineStaleSessions.add(sessionId);
+    canonicalTimelineFailClosedSessions.add(sessionId);
+    useAgentSessionStore.setState((state) => state.session?.id === sessionId
+      ? {
+          errorMessage: error instanceof Error ? error.message : String(error),
+        }
+      : state);
+    return false;
+  }
   let nextTimeline: AgentTimelineResult | null = null;
   useAgentSessionStore.setState((state) => {
     if (
@@ -641,12 +616,16 @@ async function refreshCanonicalTimeline(
       state.timeline &&
       (incomingTimeline.revision ?? 0) < (state.timeline.revision ?? 0)
     ) {
+      nextTimeline = state.timeline;
       return state;
     }
     nextTimeline = preservePlayback
       ? reconcileTimelineSnapshot(state.timeline, incomingTimeline)
       : timelineAsReplay(incomingTimeline);
-    return { timeline: nextTimeline };
+    return {
+      timeline: nextTimeline,
+      pendingPermission: pendingPermissionFromTimeline(nextTimeline),
+    };
   });
   if (nextTimeline) {
     refreshWorkspaceTreeForTimeline(nextTimeline);
@@ -666,6 +645,7 @@ async function refreshCanonicalTimeline(
     return false;
   }
   canonicalTimelineStaleSessions.delete(sessionId);
+  canonicalTimelineFailClosedSessions.delete(sessionId);
   return true;
 }
 
@@ -677,9 +657,9 @@ function startCanonicalProgressWatcher(
 
   let stopped = false;
   let consumers = 0;
-  let refreshInFlight: Promise<boolean> | undefined;
+  let streamInFlight: Promise<void> | undefined;
+  let streamController: AbortController | undefined;
   let releaseInFlight: Promise<void> | undefined;
-  let timer: number | undefined;
   let unsubscribe: (() => void) | undefined;
   const isActiveSession = () =>
     !stopped
@@ -687,73 +667,146 @@ function startCanonicalProgressWatcher(
   const stop = () => {
     if (stopped) return;
     stopped = true;
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
-      timer = undefined;
-    }
+    streamController?.abort();
+    streamController = undefined;
     unsubscribe?.();
     unsubscribe = undefined;
     if (canonicalProgressWatchers.get(sessionId) === watcher) {
       canonicalProgressWatchers.delete(sessionId);
     }
   };
-  const refreshSessionEvents = async (): Promise<boolean> => {
-    const current = await boundedAgentSessionRequest(sessionId);
-    if (!current.ok || !current.data) return false;
-    if (!isActiveSession()) return true;
+  const applyStreamEvent = (event: AgentTimelineStreamEvent): void => {
+    if (event.sessionId !== sessionId || event.revision < 0) {
+      throw new Error('Agent timeline stream session or revision mismatch.');
+    }
+    let appliedTimeline: AgentTimelineResult | null = null;
+    let applyError: unknown;
     useAgentSessionStore.setState((state) => {
       if (state.session?.id !== sessionId || !isActiveSession()) return state;
-      const events = mergeEventsById(state.events, current.data!.events);
-      return {
-        session: current.data!.session,
-        events,
-        pendingPermission: findLatestPendingPermission(events),
-      };
+      try {
+        if (event.type === 'snapshot') {
+          const incoming = requireExactNativeTimeline(event.snapshot);
+          if (
+            incoming.sessionId !== sessionId
+            || incoming.revision !== event.revision
+          ) {
+            throw new Error('Agent timeline snapshot identity mismatch.');
+          }
+          if (
+            state.timeline
+            && incoming.revision < state.timeline.revision
+          ) {
+            return state;
+          }
+          appliedTimeline = reconcileTimelineSnapshot(state.timeline, incoming);
+        } else {
+          if (
+            event.delta.sessionId !== sessionId
+            || event.delta.revision !== event.revision
+          ) {
+            throw new Error('Agent timeline delta identity mismatch.');
+          }
+          if (
+            state.timeline
+            && event.delta.revision <= state.timeline.revision
+          ) {
+            return state;
+          }
+          if (!state.timeline) {
+            throw new AgentTimelineRevisionGapError(0, event.delta.baseRevision);
+          }
+          appliedTimeline = applyAgentTimelineDelta(state.timeline, event.delta);
+          requireExactNativeTimeline(appliedTimeline);
+        }
+        return {
+          timeline: appliedTimeline,
+          pendingPermission: pendingPermissionFromTimeline(appliedTimeline),
+        };
+      } catch (error) {
+        applyError = error instanceof AgentTimelineRevisionGapError
+          || error instanceof UnsupportedTimelineHistorySchemaError
+          || error instanceof AgentTimelineStreamProtocolError
+          ? error
+          : new AgentTimelineStreamProtocolError(
+              error instanceof Error ? error.message : String(error)
+            );
+        return state;
+      }
     });
-    return true;
-  };
-  const refresh = async (forceFresh = false): Promise<boolean> => {
-    if (!isActiveSession()) return true;
-    if (refreshInFlight) return refreshInFlight;
-    const current = Promise.allSettled([
-      refreshSessionEvents(),
-      refreshCanonicalTimeline(sessionId, true, forceFresh),
-    ]).then((results) => results.every(
-      (result) => result.status === 'fulfilled' && result.value
-    ));
-    refreshInFlight = current;
-    try {
-      await current;
-    } finally {
-      if (refreshInFlight === current) {
-        refreshInFlight = undefined;
-      }
-      if (consumers > 0 && isActiveSession()) {
-        timer = window.setTimeout(() => {
-          timer = undefined;
-          void refresh();
-        }, CANONICAL_PROGRESS_REFRESH_INTERVAL_MS);
-      }
-    }
-    return current;
-  };
-  const schedule = () => {
-    if (stopped || consumers === 0 || refreshInFlight || timer !== undefined) {
+    if (applyError) throw applyError;
+    if (!appliedTimeline) return;
+    refreshWorkspaceTreeForTimeline(appliedTimeline);
+    if (isCanonicalTimelineTerminal(appliedTimeline)) {
+      publishActiveAgentRunIdentity(sessionId, null);
+      stop();
       return;
     }
-    if (isActiveSession()) void refresh();
+    void refreshActiveAgentRunIdentity(appliedTimeline).then((ready) => {
+      if (!ready) markCanonicalTimelineStale(sessionId);
+    });
+  };
+  const runStreamLoop = async (): Promise<void> => {
+    while (consumers > 0 && isActiveSession()) {
+      const controller = new AbortController();
+      streamController = controller;
+      try {
+        await streamAgentTimeline(
+          sessionId,
+          applyStreamEvent,
+          { afterRevision: currentTimelineRevision(sessionId) },
+          controller.signal
+        );
+      } catch (error) {
+        if (controller.signal.aborted || stopped || consumers === 0) break;
+        if (
+          error instanceof UnsupportedTimelineHistorySchemaError
+          || error instanceof AgentTimelineStreamProtocolError
+        ) {
+          canonicalTimelineStaleSessions.add(sessionId);
+          canonicalTimelineFailClosedSessions.add(sessionId);
+          useAgentSessionStore.setState((state) => state.session?.id === sessionId
+            ? {
+                errorMessage: error.message,
+              }
+            : state);
+          break;
+        }
+        markCanonicalTimelineStale(sessionId);
+      } finally {
+        if (streamController === controller) streamController = undefined;
+      }
+      if (controller.signal.aborted || stopped || consumers === 0) break;
+      await refreshCanonicalTimeline(sessionId, true, true);
+      if (stopped || consumers === 0 || !isActiveSession()) break;
+      await sleep(CANONICAL_PROGRESS_STREAM_RETRY_MS);
+    }
+  };
+  const ensureStream = () => {
+    if (
+      stopped
+      || consumers === 0
+      || streamInFlight
+      || canonicalTimelineFailClosedSessions.has(sessionId)
+      || !isActiveSession()
+    ) {
+      return;
+    }
+    const current = runStreamLoop();
+    streamInFlight = current;
+    const finish = () => {
+      if (streamInFlight === current) streamInFlight = undefined;
+      if (!stopped && consumers > 0 && isActiveSession()) ensureStream();
+    };
+    void current.then(finish, finish);
   };
   const releaseWhenUnused = (): Promise<void> => {
     if (releaseInFlight) return releaseInFlight;
     const current = (async () => {
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
-        timer = undefined;
-      }
-      const pendingRefresh = refreshInFlight;
-      if (pendingRefresh) await pendingRefresh;
+      streamController?.abort();
+      const pendingStream = streamInFlight;
+      if (pendingStream) await pendingStream;
       if (consumers > 0) {
-        schedule();
+        ensureStream();
         return;
       }
       if (!isActiveSession()) {
@@ -766,15 +819,15 @@ function startCanonicalProgressWatcher(
         attempt += 1
       ) {
         if (consumers > 0 || !isActiveSession()) break;
-        if (await refresh(true)) break;
+        if (await refreshCanonicalTimeline(sessionId, true, true)) break;
         if (attempt + 1 < CANONICAL_PROGRESS_TRAILING_ATTEMPTS) {
-          await sleep(CANONICAL_PROGRESS_REFRESH_INTERVAL_MS);
+          await sleep(CANONICAL_PROGRESS_STREAM_RETRY_MS);
         }
       }
       if (consumers === 0) {
         stop();
       } else {
-        schedule();
+        ensureStream();
       }
     })().catch(() => {
       if (consumers === 0) stop();
@@ -796,7 +849,7 @@ function startCanonicalProgressWatcher(
     acquire: () => {
       if (stopped) return async () => {};
       consumers += 1;
-      schedule();
+      ensureStream();
       let released = false;
       return async () => {
         if (released) return;
@@ -811,13 +864,10 @@ function startCanonicalProgressWatcher(
   canonicalProgressWatchers.set(sessionId, watcher);
   unsubscribe = useAgentSessionStore.subscribe((state) => {
     if (state.session?.id === sessionId) {
-      schedule();
+      ensureStream();
       return;
     }
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
-      timer = undefined;
-    }
+    stop();
   });
   return watcher.acquire();
 }
@@ -829,6 +879,10 @@ async function refreshActiveAgentRunIdentity(
   const routeRunId = runProjection?.runId.trim();
   if (!runProjection || !routeRunId) {
     return !activeAgentRunIds.has(timeline.sessionId);
+  }
+  if (isCanonicalTimelineTerminal(timeline)) {
+    publishActiveAgentRunIdentity(timeline.sessionId, null);
+    return true;
   }
   const timelineRevision = timeline.revision ?? 0;
   let knownIdentity = activeAgentRunIds.get(timeline.sessionId);
@@ -898,27 +952,23 @@ function refreshWorkspaceTreeForTimeline(timeline: AgentTimelineResult): void {
 }
 
 
-function streamHandlersForSession(sessionId: string): {
-  onEvents: (events: AgentEvent[]) => void;
-} {
-  return {
-    onEvents: (events) => {
-      if (!events.length) return;
-      const activeSession = useAgentSessionStore.getState().session;
-      if (activeSession?.id !== sessionId) return;
-      useAgentSessionStore.setState((state) => {
-        const merged = mergeEventsById(state.events, events);
-        return {
-          events: merged,
-          pendingPermission: findLatestPendingPermission(merged),
-        };
-      });
-    },
-  };
-}
-
 function isTerminalRunStatus(status: string): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+function isCanonicalTimelineTerminal(timeline: AgentTimelineResult): boolean {
+  const status = timeline.runProjection?.status;
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+}
+
+function canonicalTimelineTerminalAfter(
+  sessionId: string,
+  revisionFloor: number
+): boolean {
+  const timeline = useAgentSessionStore.getState().timeline;
+  return timeline?.sessionId === sessionId
+    && timeline.revision > revisionFloor
+    && isCanonicalTimelineTerminal(timeline);
 }
 
 function isQuiescentRunStatus(status: string): boolean {
@@ -935,10 +985,7 @@ function newHostCallerRequestId(kind: string): string {
 
 async function startAndWaitAgentRun(
   sessionId: string,
-  request: StartAgentRunRequest,
-  handlers: {
-    onEvents?: (events: AgentEvent[]) => void;
-  } = {}
+  request: StartAgentRunRequest
 ): Promise<AgentRunResult> {
   const timelineRevisionFloor = currentTimelineRevision(sessionId);
   const started = await startAgentRun(sessionId, request);
@@ -956,64 +1003,13 @@ async function startAndWaitAgentRun(
       timelineRevisionFloor
     )
   );
-  handlers.onEvents?.(result.events);
-  const controller = new AbortController();
-  let lastEventCount = result.events.length;
-  let terminalStreamObserved = false;
-  let stopStream = false;
-  let resolveTerminalStreamEvent: (() => void) | undefined;
-  const terminalStreamEvent = new Promise<void>((resolve) => {
-    resolveTerminalStreamEvent = resolve;
-  });
-  const streamEventMatchesRun = (data: Record<string, unknown>) =>
-    data.sessionId === sessionId && data.runId === runId;
-  const updateEventCursor = (data: Record<string, unknown>, eventCount: number) => {
-    lastEventCount = typeof data.eventCount === 'number'
-      ? Math.max(lastEventCount, data.eventCount)
-      : lastEventCount + eventCount;
-  };
-  const handleStreamEvent = (event: AgentRunStreamEvent) => {
-    const data = event.data;
-    if (!isRecord(data) || !streamEventMatchesRun(data)) return;
-    if ((event.event === 'events' || event.event === 'terminal') && Array.isArray(data.events)) {
-      const events = data.events.filter(isRecord) as unknown as AgentEvent[];
-      updateEventCursor(data, events.length);
-      handlers.onEvents?.(events);
-    }
-    if (event.event === 'terminal') {
-      terminalStreamObserved = true;
-      resolveTerminalStreamEvent?.();
-    }
-  };
-  const retryDelays = [100, 250, 500, 1000] as const;
-  const streamDone = (async () => {
-    let retryIndex = 0;
-    while (!stopStream && !controller.signal.aborted && !terminalStreamObserved) {
-      const beforeEventCount = lastEventCount;
-      try {
-        await streamAgentRun(
-          sessionId,
-          runId,
-          handleStreamEvent,
-          { sinceEventCount: lastEventCount },
-          controller.signal
-        );
-      } catch {
-        if (stopStream || controller.signal.aborted) break;
-      }
-      if (stopStream || controller.signal.aborted || terminalStreamObserved) break;
-      const progressed = lastEventCount > beforeEventCount;
-      if (progressed) retryIndex = 0;
-      const retryDelay = retryDelays[Math.min(retryIndex, retryDelays.length - 1)];
-      retryIndex = Math.min(retryIndex + 1, retryDelays.length - 1);
-      await sleep(retryDelay);
-    }
-  })();
   try {
-    while (!isQuiescentRunStatus(result.run.status)) {
-      if (!terminalStreamObserved) {
-        await Promise.race([sleep(300), terminalStreamEvent]);
-      }
+    while (
+      !isQuiescentRunStatus(result.run.status)
+      && !canonicalTimelineTerminalAfter(sessionId, timelineRevisionFloor)
+    ) {
+      await sleep(300);
+      if (canonicalTimelineTerminalAfter(sessionId, timelineRevisionFloor)) break;
       const current = await boundedAgentRunRequest(
         result.run.sessionId,
         result.run.runId
@@ -1022,22 +1018,16 @@ async function startAndWaitAgentRun(
         throw new Error(current.message ?? current.error ?? 'Shared session run refresh failed');
       }
       result = current.data;
-      await refreshCanonicalTimeline(sessionId, true);
     }
-    handlers.onEvents?.(result.events);
-    lastEventCount = Math.max(lastEventCount, result.events.length);
-    if (isTerminalRunStatus(result.run.status) && !terminalStreamObserved) {
-      await Promise.race([terminalStreamEvent, sleep(1500)]);
-    }
-    await refreshCanonicalTimeline(sessionId, true);
+    await refreshCanonicalTimeline(sessionId, true, true);
     return result;
   } finally {
-    stopStream = true;
-    controller.abort();
-    await streamDone;
     if (
       activeAgentRunIds.get(sessionId)?.hostRunId === runId
-      && isTerminalRunStatus(result.run.status)
+      && (
+        isTerminalRunStatus(result.run.status)
+        || canonicalTimelineTerminalAfter(sessionId, timelineRevisionFloor)
+      )
     ) {
       clearActiveAgentRunIdentityByHostRunId(sessionId, runId);
     }
@@ -1064,7 +1054,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   sessions: [],
   currentSessionId: undefined,
   localWorkspaceScopeKey: undefined,
-  events: [],
   timeline: null,
   profileId: undefined,
   profileSelectionBusy: false,
@@ -1107,22 +1096,27 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const current = await getCurrentAgentSession(scope);
       if (current.ok && current.data) {
         const timelineResult = await getAgentTimeline(current.data.session.id);
-        const timeline = timelineResult.ok && timelineResult.data
-          ? timelineAsReplay(timelineResult.data)
-          : emptyTimeline(current.data.session.id);
+        if (!timelineResult.ok || !timelineResult.data) {
+          throw new Error(
+            timelineResult.message ?? 'Canonical Session timeline is unavailable.'
+          );
+        }
+        const timeline = timelineAsReplay(
+          requireExactNativeTimeline(timelineResult.data)
+        );
         await refreshActiveAgentRunIdentity(timeline);
         const restoredAttachments = restoredSessionAttachmentState(
-          current.data.events,
+          timeline,
           current.data.session.id
         );
         set({
           session: current.data.session,
           localWorkspaceScopeKey: nextScopeKey,
-          events: current.data.events,
           timeline,
           profileId: current.data.session.profileId,
           messageAttachments: [],
           sessionAttachments: restoredAttachments.sessionAttachments,
+          pendingPermission: pendingPermissionFromTimeline(timeline),
           errorMessage: restoredAttachments.attachmentError,
           loading: false,
         });
@@ -1135,7 +1129,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           localWorkspaceScopeKey: nextScopeKey,
           sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
           currentSessionId: created.data.session.id,
-          events: created.data.events,
           timeline: emptyTimeline(created.data.session.id),
           profileId: created.data.session.profileId,
           messageAttachments: [],
@@ -1189,7 +1182,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             ...state.sessions.filter((item) => item.id !== rebound.data!.session.id),
           ],
           currentSessionId: rebound.data!.session.id,
-          events: rebound.data!.events,
           messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
           sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
           errorMessage: null,
@@ -1208,7 +1200,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         localWorkspaceScopeKey: currentWorkspaceScopeKey(),
         sessions: [result.data!.session, ...state.sessions.filter((item) => item.id !== result.data!.session.id)],
         currentSessionId: result.data!.session.id,
-        events: result.data!.events,
         timeline: emptyTimeline(result.data!.session.id),
         profileId: result.data!.session.profileId,
         pendingPermission: null,
@@ -1247,12 +1238,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             result.data.session.id
           );
           if (activationGeneration !== agentSessionActivationGeneration) return;
-          const timeline = timelineResult.ok && timelineResult.data
-            ? timelineAsReplay(timelineResult.data)
-            : emptyTimeline(result.data.session.id);
-          const identityReady = timelineResult.ok && timelineResult.data
-            ? await refreshActiveAgentRunIdentity(timeline)
-            : false;
+          if (!timelineResult.ok || !timelineResult.data) {
+            throw new Error(
+              timelineResult.message ?? 'Canonical Session timeline is unavailable.'
+            );
+          }
+          const timeline = timelineAsReplay(
+            requireExactNativeTimeline(timelineResult.data)
+          );
+          const identityReady = await refreshActiveAgentRunIdentity(timeline);
           if (activationGeneration !== agentSessionActivationGeneration) return;
           const canonicalReady = identityReady
             && (canonicalTimelineGenerations.get(sessionId) ?? 0)
@@ -1263,17 +1257,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             markCanonicalTimelineStale(sessionId);
           }
           const restoredAttachments = restoredSessionAttachmentState(
-            result.data.events,
+            timeline,
             result.data.session.id
           );
           set({
             session: result.data.session,
             localWorkspaceScopeKey: currentWorkspaceScopeKey(),
             currentSessionId: result.data.session.id,
-            events: result.data.events,
             timeline,
             profileId: result.data.session.profileId,
-            pendingPermission: findLatestPendingPermission(result.data.events),
+            pendingPermission: pendingPermissionFromTimeline(timeline),
             resolvingPermission: null,
             resolvingPlan: null,
             messageAttachments: [],
@@ -1328,7 +1321,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
         ...(wasActive ? {
           session: null,
-          events: [],
           timeline: null,
           pendingPermission: null,
           resolvingPermission: null,
@@ -1364,7 +1356,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
         ...(wasActive ? {
           session: null,
-          events: [],
           timeline: null,
           pendingPermission: null,
           resolvingPermission: null,
@@ -1447,71 +1438,63 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!sessionId) return;
     let result;
     try {
-      result = await getAgentSession(sessionId);
+      result = await listAgentSessions(currentWorkspaceScope());
     } catch {
       return;
     }
     if (!result.ok || !result.data) return;
-    const restoredAttachments = restoredSessionAttachmentState(
-      result.data.events,
-      result.data.session.id
-    );
+    const refreshedSession = result.data.sessions.find((item) => item.id === sessionId);
+    if (!refreshedSession) return;
     set((state) => ({
-      session: state.session?.id === sessionId ? result.data!.session : state.session,
-      sessions: [
-        result.data!.session,
-        ...state.sessions.filter((item) => item.id !== result.data!.session.id),
-      ],
+      session: state.session?.id === sessionId ? refreshedSession : state.session,
+      sessions: result.data!.sessions,
       profileId: state.session?.id === sessionId
-        ? result.data!.session.profileId
+        ? refreshedSession.profileId
         : state.profileId,
-      events: state.session?.id === sessionId
-        ? result.data!.events
-        : state.events,
-      messageAttachments: state.session?.id === sessionId
-        ? []
-        : state.messageAttachments,
-      sessionAttachments: state.session?.id === sessionId
-        ? restoredAttachments.sessionAttachments
-        : state.sessionAttachments,
-      errorMessage: state.session?.id === sessionId
-        ? restoredAttachments.attachmentError
-        : state.errorMessage,
     }));
   },
   refreshActiveSessionContext: async () => {
     const sessionId = get().session?.id;
     if (!sessionId) return;
-    const [sessionResult, timelineResult] = await Promise.all([
-      getAgentSession(sessionId),
+    const [sessionsResult, timelineResult] = await Promise.all([
+      listAgentSessions(currentWorkspaceScope()),
       getAgentTimeline(sessionId),
     ]);
-    if (!sessionResult.ok || !sessionResult.data) {
+    if (!sessionsResult.ok || !sessionsResult.data) {
       set({
-        errorMessage: sessionResult.message
+        errorMessage: sessionsResult.message
+          ?? agentSessionMessage('memoryV2.refreshFailed'),
+      });
+      return;
+    }
+    const refreshedSession = sessionsResult.data.sessions.find(
+      (item) => item.id === sessionId
+    );
+    if (!refreshedSession || !timelineResult.ok || !timelineResult.data) {
+      set({
+        errorMessage: timelineResult.message
           ?? agentSessionMessage('memoryV2.refreshFailed'),
       });
       return;
     }
     if (get().session?.id !== sessionId) return;
-    const restoredAttachments = restoredSessionAttachmentState(
-      sessionResult.data.events,
-      sessionResult.data.session.id
-    );
+    let timeline: AgentTimelineResult;
+    try {
+      timeline = timelineAsReplay(
+        requireExactNativeTimeline(timelineResult.data)
+      );
+    } catch (error) {
+      set({
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
     set((state) => ({
-      session: sessionResult.data!.session,
-      sessions: [
-        sessionResult.data!.session,
-        ...state.sessions.filter((item) => item.id !== sessionResult.data!.session.id),
-      ],
-      events: sessionResult.data!.events,
-      timeline: timelineResult.ok && timelineResult.data
-        ? timelineAsReplay(timelineResult.data)
-        : state.timeline,
-      pendingPermission: findLatestPendingPermission(sessionResult.data!.events),
-      messageAttachments: [],
-      sessionAttachments: restoredAttachments.sessionAttachments,
-      errorMessage: restoredAttachments.attachmentError,
+      session: refreshedSession,
+      sessions: sessionsResult.data!.sessions,
+      timeline,
+      pendingPermission: pendingPermissionFromTimeline(timeline),
+      errorMessage: null,
     }));
   },
   addAttachment: (attachment) => {
@@ -1657,16 +1640,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
               ),
             ];
             if (state.session?.id !== session.id) return { sessions };
-            const events = mergeEventsById(
-              state.events,
-              result.data!.events
-            );
             return {
               session: result.data!.session,
               sessions,
               currentSessionId: result.data!.session.id,
-              events,
-              pendingPermission: findLatestPendingPermission(events),
               messageAttachments: [],
               errorMessage: null,
             };
@@ -1739,16 +1716,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
               ),
             ];
             if (state.session?.id !== session.id) return { sessions };
-            const events = mergeEventsById(
-              state.events,
-              result.data!.events
-            );
             return {
               session: result.data!.session,
               sessions,
               currentSessionId: result.data!.session.id,
-              events,
-              pendingPermission: findLatestPendingPermission(events),
               messageAttachments: [],
               errorMessage: null,
             };
@@ -1799,11 +1770,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         workspacePath,
         noWorkspace: session.projectId ? undefined : !workspacePath,
         callerRequestId: newHostCallerRequestId('ask'),
-      }, streamHandlersForSession(session.id));
-      const data = {
-        session: result.session,
-        events: result.events,
-      };
+      });
+      const data = { session: result.session };
       set((state) => {
         const nextState: Partial<Store> = {
           sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
@@ -1814,8 +1782,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (state.session?.id === data.session.id) {
           nextState.session = data.session;
           nextState.currentSessionId = data.session.id;
-          nextState.events = mergeEventsById(state.events, data.events);
-          nextState.pendingPermission = findLatestPendingPermission(data.events);
           nextState.messageAttachments = [];
         }
         return nextState;
@@ -1825,12 +1791,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
-        events: state.session?.id === session.id
-          ? [
-              ...state.events,
-              createLocalEvent(session.id, 'error', { message }),
-            ]
-          : state.events,
         errorMessage: state.session?.id === session.id ? message : state.errorMessage,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
@@ -1902,15 +1862,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ),
         };
         if (state.session?.id === session.id) {
-          const events = mergeEventsById(
-            state.events,
-            result.data!.events
-          );
           nextState.session = result.data!.session;
           nextState.currentSessionId = result.data!.session.id;
-          nextState.events = events;
-          nextState.pendingPermission =
-            findLatestPendingPermission(events);
           nextState.errorMessage = null;
         }
         return nextState;
@@ -1951,11 +1904,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runId,
         targetId: request.id,
         callerRequestId: newHostCallerRequestId('permission-allow'),
-      }, streamHandlersForSession(session.id));
-      const data = {
-        session: result.session,
-        events: result.events,
-      };
+      });
+      const data = { session: result.session };
       set((state) => {
         const nextState: Partial<Store> = {
           sessions: [
@@ -1971,11 +1921,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ),
         };
         if (state.session?.id === data.session.id) {
-          const events = mergeEventsById(state.events, data.events);
           nextState.session = data.session;
-          nextState.events = events;
-          nextState.pendingPermission =
-            findLatestPendingPermission(events);
         }
         return nextState;
       });
@@ -2018,11 +1964,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runId,
         targetId: request.id,
         callerRequestId: newHostCallerRequestId('permission-deny'),
-      }, streamHandlersForSession(session.id));
-      const data = {
-        session: result.session,
-        events: result.events,
-      };
+      });
+      const data = { session: result.session };
       set((state) => {
         const nextState: Partial<Store> = {
           sessions: [
@@ -2038,11 +1981,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ),
         };
         if (state.session?.id === data.session.id) {
-          const events = mergeEventsById(state.events, data.events);
           nextState.session = data.session;
-          nextState.events = events;
-          nextState.pendingPermission =
-            findLatestPendingPermission(events);
         }
         return nextState;
       });
@@ -2080,11 +2019,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runId,
         targetId: planId,
         callerRequestId: newHostCallerRequestId('plan-decision'),
-      }, streamHandlersForSession(session.id));
-      const data = {
-        session: result.session,
-        events: result.events,
-      };
+      });
+      const data = { session: result.session };
       set((state) => {
         const nextState: Partial<Store> = {
           sessions: [
@@ -2101,12 +2037,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ),
         };
         if (state.session?.id === data.session.id) {
-          const events = mergeEventsById(state.events, data.events);
           nextState.session = data.session;
           nextState.currentSessionId = data.session.id;
-          nextState.events = events;
-          nextState.pendingPermission =
-            findLatestPendingPermission(events);
         }
         return nextState;
       });

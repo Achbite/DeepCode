@@ -35,7 +35,6 @@ pub struct AgentSessionListResult {
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionResult {
     pub session: Value,
-    pub events: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,7 +253,6 @@ pub struct AgentRunStatus {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub message: Option<String>,
-    pub final_text: Option<String>,
 }
 
 impl AgentRunStatus {
@@ -268,7 +266,6 @@ impl AgentRunStatus {
 pub struct AgentRunResult {
     pub run: AgentRunStatus,
     pub session: Value,
-    pub events: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]

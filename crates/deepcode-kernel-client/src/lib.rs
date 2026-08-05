@@ -5,6 +5,7 @@ use deepcode_kernel_abi::{
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
@@ -21,18 +22,17 @@ pub use agent::{
     ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
 };
 pub use agent_projection::{
-    AgentConversationActivity, AgentConversationActivityKind, AgentConversationActivitySource,
-    AgentProjectionValidationError, AgentTimelineAttachment, AgentTimelineAttachmentKind,
-    AgentTimelineAttachmentScope, AgentTimelineBlock, AgentTimelineBlockKind,
-    AgentTimelineCheckpointKind, AgentTimelineCurrentActivity, AgentTimelineCurrentActivityCode,
-    AgentTimelineDecisionRequest, AgentTimelineDecisionSource, AgentTimelineDeliveryMode,
-    AgentTimelineDelta, AgentTimelineDisplayDensity, AgentTimelineDisplayHints,
-    AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineEvidenceMode,
-    AgentTimelineExecutionPhase, AgentTimelineInteractionKind, AgentTimelineInteractionOption,
-    AgentTimelineInteractionProjection, AgentTimelineInteractionState,
-    AgentTimelineInteractionView, AgentTimelineLanguage, AgentTimelineLanguageBinding,
-    AgentTimelineLanguageBindingStatus, AgentTimelineLocalizedText, AgentTimelineNarrativeKind,
-    AgentTimelineNullableCurrentActivity, AgentTimelineNullableWait,
+    reduce_agent_timeline_stream_event, AgentProjectionValidationError, AgentTimelineAttachment,
+    AgentTimelineAttachmentKind, AgentTimelineAttachmentScope, AgentTimelineBlock,
+    AgentTimelineBlockKind, AgentTimelineCheckpointKind, AgentTimelineCurrentActivity,
+    AgentTimelineCurrentActivityCode, AgentTimelineDecisionRequest, AgentTimelineDecisionSource,
+    AgentTimelineDeliveryMode, AgentTimelineDelta, AgentTimelineDisplayDensity,
+    AgentTimelineDisplayHints, AgentTimelineDurability, AgentTimelineEntryRole,
+    AgentTimelineEvidenceMode, AgentTimelineExecutionPhase, AgentTimelineInteractionKind,
+    AgentTimelineInteractionOption, AgentTimelineInteractionProjection,
+    AgentTimelineInteractionState, AgentTimelineInteractionView, AgentTimelineLanguage,
+    AgentTimelineLanguageBinding, AgentTimelineLanguageBindingStatus, AgentTimelineLocalizedText,
+    AgentTimelineNarrativeKind, AgentTimelineNullableCurrentActivity, AgentTimelineNullableWait,
     AgentTimelineNullableWorkAttention, AgentTimelinePendingInteraction,
     AgentTimelinePendingPermission, AgentTimelinePendingPlan, AgentTimelinePermissionRequestKind,
     AgentTimelinePermissionRequestView, AgentTimelineProjectionReplacement,
@@ -40,7 +40,7 @@ pub use agent_projection::{
     AgentTimelineProviderPhase, AgentTimelineRiskLevel, AgentTimelineRootProjectionReplacements,
     AgentTimelineRunPhase, AgentTimelineRunProjection, AgentTimelineRunStatus,
     AgentTimelineSelectedDecision, AgentTimelineSnapshot, AgentTimelineStatus,
-    AgentTimelineStreamEvent, AgentTimelineStructuredProjection,
+    AgentTimelineStreamEvent, AgentTimelineStreamReduction, AgentTimelineStructuredProjection,
     AgentTimelineStructuredProjectionItem, AgentTimelineStructuredProjectionKind,
     AgentTimelineStructuredProjectionSection, AgentTimelineTaskProjection,
     AgentTimelineTaskProjectionItem, AgentTimelineTaskSettlementKind,
@@ -53,6 +53,63 @@ pub use agent_projection::{
     AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
     AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
 };
+
+const AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+pub struct AgentTimelineSseStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    pending: VecDeque<AgentTimelineStreamEvent>,
+    ended: bool,
+}
+
+impl AgentTimelineSseStream {
+    pub async fn next_event(&mut self) -> KernelClientResult<Option<AgentTimelineStreamEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.ended {
+                if self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    return Err(KernelClientError::Api(
+                        "timeline SSE ended with an incomplete event".to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
+            match self.response.chunk().await? {
+                Some(chunk) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    self.consume_complete_events()?;
+                    if self.buffer.len() > AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES {
+                        return Err(KernelClientError::Api(
+                            "timeline SSE event exceeds the client buffer limit".to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    self.ended = true;
+                }
+            }
+        }
+    }
+
+    fn consume_complete_events(&mut self) -> KernelClientResult<()> {
+        while let Some((boundary, separator_len)) = sse_event_boundary(&self.buffer) {
+            if boundary > AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES {
+                return Err(KernelClientError::Api(
+                    "timeline SSE event exceeds the client buffer limit".to_string(),
+                ));
+            }
+            let raw = self.buffer[..boundary].to_vec();
+            self.buffer.drain(..boundary + separator_len);
+            if let Some(event) = decode_timeline_sse_event(&raw)? {
+                self.pending.push_back(event);
+            }
+        }
+        Ok(())
+    }
+}
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 pub use v2::{
     KernelV2ClientError, KernelV2ClientResult, KernelV2HttpErrorCode, SessionKernelV2Client,
@@ -166,6 +223,7 @@ impl KernelClientConfig {
 pub struct HttpKernelClient {
     config: KernelClientConfig,
     http: reqwest::Client,
+    stream_http: reqwest::Client,
 }
 
 impl HttpKernelClient {
@@ -183,6 +241,11 @@ impl HttpKernelClient {
             HeaderName::from_static(HOST_SHELL_CAPABILITY_HEADER_V2),
             capability_header,
         );
+        let stream_http = reqwest::Client::builder()
+            .default_headers(default_headers.clone())
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .default_headers(default_headers)
@@ -190,7 +253,11 @@ impl HttpKernelClient {
             .no_proxy()
             .build()?;
         config.host_shell_capability = None;
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            stream_http,
+        })
     }
 
     pub fn base_url(&self) -> &str {
@@ -220,18 +287,6 @@ impl HttpKernelClient {
 
     pub async fn daemon_status(&self) -> KernelClientResult<DaemonStatus> {
         self.health().await
-    }
-
-    pub async fn agent_timeline(&self, session_id: &str) -> KernelClientResult<Value> {
-        let value = self
-            .http
-            .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        api_data(value)
     }
 
     pub async fn agent_timeline_v2(
@@ -270,6 +325,45 @@ impl HttpKernelClient {
             .validate()
             .map_err(|error| KernelClientError::Api(error.to_string()))?;
         Ok(Some(timeline))
+    }
+
+    pub async fn agent_timeline_stream_v2(
+        &self,
+        session_id: &str,
+        after_revision: Option<u64>,
+    ) -> KernelClientResult<AgentTimelineSseStream> {
+        let response = self
+            .stream_http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline/stream")))
+            .query(
+                &after_revision
+                    .map(|revision| [("afterRevision", revision)])
+                    .unwrap_or_default(),
+            )
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(KernelClientError::Api(
+                "timeline stream did not return text/event-stream".to_string(),
+            ));
+        }
+        Ok(AgentTimelineSseStream {
+            response,
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            ended: false,
+        })
     }
 
     pub async fn list_agent_sessions(
@@ -413,7 +507,7 @@ impl HttpKernelClient {
     ) -> KernelClientResult<AgentSessionResult> {
         let value = self
             .http
-            .get(self.url(&format!("/api/agent/sessions/{session_id}/events")))
+            .get(self.url(&format!("/api/agent/sessions/{session_id}")))
             .send()
             .await?
             .error_for_status()?
@@ -532,6 +626,66 @@ fn decode_api_data_with_code<T: DeserializeOwned>(value: Value) -> KernelClientR
         return Err(KernelClientError::Api(format!("{code}: {message}")));
     }
     decode_api_data(value)
+}
+
+fn sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
+    }
+}
+
+fn decode_timeline_sse_event(raw: &[u8]) -> KernelClientResult<Option<AgentTimelineStreamEvent>> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| KernelClientError::Api("timeline SSE event is not valid UTF-8".to_string()))?;
+    let mut event_name = None;
+    let mut data = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line, ""));
+        match field {
+            "event" => event_name = Some(value),
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let event_name = event_name.ok_or_else(|| {
+        KernelClientError::Api("timeline SSE event has no explicit type".to_string())
+    })?;
+    if !matches!(event_name, "snapshot" | "delta") {
+        return Err(KernelClientError::Api(format!(
+            "timeline SSE returned unsupported event type {event_name}"
+        )));
+    }
+    let event = serde_json::from_str::<AgentTimelineStreamEvent>(&data.join("\n"))?;
+    event
+        .validate()
+        .map_err(|error| KernelClientError::Api(error.to_string()))?;
+    match (&event, event_name) {
+        (AgentTimelineStreamEvent::Snapshot { .. }, "snapshot")
+        | (AgentTimelineStreamEvent::Delta { .. }, "delta") => Ok(Some(event)),
+        _ => Err(KernelClientError::Api(
+            "timeline SSE event name does not match its typed envelope".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

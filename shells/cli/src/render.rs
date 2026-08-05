@@ -36,9 +36,8 @@ pub(crate) fn render_timeline(timeline: &AgentTimelineSnapshot) -> Result<(), St
 }
 
 fn render_timeline_block(block: &deepcode_kernel_client::AgentTimelineBlock) -> Result<(), String> {
-    if block.kind == deepcode_kernel_client::AgentTimelineBlockKind::Thinking
-        || (block.entry_role == AgentTimelineEntryRole::FinalAnswer
-            && block.durability != AgentTimelineDurability::Committed)
+    if block.entry_role == AgentTimelineEntryRole::FinalAnswer
+        && block.durability != AgentTimelineDurability::Committed
     {
         return Ok(());
     }
@@ -63,10 +62,7 @@ fn timeline_block_text(
             | deepcode_kernel_client::AgentTimelineBlockKind::Review
     ) {
         if let Some(readable) = block.structured_projection.as_ref() {
-            let readable = serde_json::to_value(readable).map_err(|error| {
-                format!("failed to render typed structured projection: {error}")
-            })?;
-            let text = render_readable_projection(&readable);
+            let text = render_readable_projection(readable);
             if !text.trim().is_empty() {
                 return Ok(text);
             }
@@ -154,13 +150,10 @@ fn timeline_block_kind_label(block: &deepcode_kernel_client::AgentTimelineBlock)
     match block.kind {
         User => "user",
         Assistant => "assistant",
-        Thinking => "thinking",
-        Stage => "stage",
         Permission => "permission",
         Plan => "plan",
         Review => "review",
         Error => "error",
-        TurnActions => "turnActions",
     }
 }
 
@@ -206,16 +199,18 @@ fn work_operation_status_label(
     }
 }
 
-fn render_readable_projection(readable: &Value) -> String {
+fn render_readable_projection(
+    readable: &deepcode_kernel_client::AgentTimelineStructuredProjection,
+) -> String {
     let mut lines = Vec::new();
-    let sections = readable.get("sections").and_then(Value::as_array);
-    let summary_is_structured = sections
-        .map(|sections| sections.iter().any(readable_section_has_summary_items))
-        .unwrap_or(false);
+    let summary_is_structured = readable
+        .sections
+        .iter()
+        .any(readable_section_has_summary_items);
     if !summary_is_structured {
-        if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
+        if let Some(summary) = readable.summary.as_deref() {
             lines.push(summary.to_string());
-        } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
+        } else if let Some(summary_key) = readable.summary_key.as_deref() {
             lines.push(
                 readable_summary_key_text(summary_key)
                     .unwrap_or(summary_key)
@@ -223,50 +218,33 @@ fn render_readable_projection(readable: &Value) -> String {
             );
         }
     }
-    if let Some(sections) = sections {
-        for section in sections {
-            if let Some(title) = readable_section_title(section) {
-                lines.push(format!("## {title}"));
-            }
-            let mut seen_section_lines: Vec<String> = Vec::new();
-            let items = section
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if items.is_empty() {
-                if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
-                    if let Some(message) = readable_empty_message(empty) {
-                        lines.push(format!("- {message}"));
-                    }
+    for section in &readable.sections {
+        lines.push(format!("## {}", readable_section_title(section)));
+        let mut seen_section_lines: Vec<String> = Vec::new();
+        if section.items.is_empty() {
+            if let Some(empty) = section.empty_message_key.as_deref() {
+                if let Some(message) = readable_empty_message(empty) {
+                    lines.push(format!("- {message}"));
                 }
             }
-            for item in items {
-                let item_text = readable_item_text(&item);
-                if let Some(text) = &item_text {
+        }
+        for item in &section.items {
+            let item_text = readable_item_text(item);
+            if let Some(text) = &item_text {
+                push_unique_render_line(&mut lines, &mut seen_section_lines, format!("- {text}"));
+            }
+            if let Some(targets) = item.target_refs.as_ref() {
+                let target_text = targets.join(", ");
+                let target_is_already_visible = item_text
+                    .as_ref()
+                    .map(|text| text.contains(&target_text))
+                    .unwrap_or(false);
+                if !target_text.is_empty() && !target_is_already_visible {
                     push_unique_render_line(
                         &mut lines,
                         &mut seen_section_lines,
-                        format!("- {text}"),
+                        format!("  - targets: {target_text}"),
                     );
-                }
-                if let Some(targets) = item.get("targetRefs").and_then(Value::as_array) {
-                    let target_text = targets
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let target_is_already_visible = item_text
-                        .as_ref()
-                        .map(|text| text.contains(&target_text))
-                        .unwrap_or(false);
-                    if !target_text.is_empty() && !target_is_already_visible {
-                        push_unique_render_line(
-                            &mut lines,
-                            &mut seen_section_lines,
-                            format!("  - targets: {target_text}"),
-                        );
-                    }
                 }
             }
         }
@@ -283,12 +261,10 @@ fn push_unique_render_line(lines: &mut Vec<String>, seen: &mut Vec<String>, line
     lines.push(line);
 }
 
-fn readable_section_has_summary_items(section: &Value) -> bool {
-    let section_key = section
-        .get("sectionId")
-        .or_else(|| section.get("titleKey"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+fn readable_section_has_summary_items(
+    section: &deepcode_kernel_client::AgentTimelineStructuredProjectionSection,
+) -> bool {
+    let section_key = structured_section_key(section);
     if !matches!(
         section_key,
         "summary" | "session.projection.plan.section.summary"
@@ -296,10 +272,9 @@ fn readable_section_has_summary_items(section: &Value) -> bool {
         return false;
     }
     section
-        .get("items")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().any(|item| readable_item_text(item).is_some()))
-        .unwrap_or(false)
+        .items
+        .iter()
+        .any(|item| readable_item_text(item).is_some())
 }
 
 fn readable_summary_key_text(key: &str) -> Option<&'static str> {
@@ -314,18 +289,23 @@ fn readable_summary_key_text(key: &str) -> Option<&'static str> {
     }
 }
 
-fn readable_item_text(item: &Value) -> Option<String> {
-    if let Some(text) = item.get("text").and_then(Value::as_str) {
+fn readable_item_text(
+    item: &deepcode_kernel_client::AgentTimelineStructuredProjectionItem,
+) -> Option<String> {
+    if let Some(text) = item.text.as_deref() {
         if !text.trim().is_empty() {
             return Some(text.to_string());
         }
     }
-    item.get("messageKey")
-        .and_then(Value::as_str)
+    item.message_key
+        .as_deref()
         .and_then(|key| readable_message_text(key, item))
 }
 
-fn readable_message_text(key: &str, item: &Value) -> Option<String> {
+fn readable_message_text(
+    key: &str,
+    item: &deepcode_kernel_client::AgentTimelineStructuredProjectionItem,
+) -> Option<String> {
     let arg = |name: &str| readable_message_arg(item, name).unwrap_or_default();
     match key {
         "session.projection.plan.boundary.notExecution" => {
@@ -420,57 +400,61 @@ fn readable_message_text(key: &str, item: &Value) -> Option<String> {
     }
 }
 
-fn readable_message_arg(item: &Value, name: &str) -> Option<String> {
-    item.get("messageArgs")?
-        .get(name)?
-        .as_str()
-        .map(str::to_string)
+fn readable_message_arg(
+    item: &deepcode_kernel_client::AgentTimelineStructuredProjectionItem,
+    name: &str,
+) -> Option<String> {
+    item.message_args.as_ref()?.get(name).cloned()
 }
 
-fn readable_section_title(section: &Value) -> Option<String> {
-    if let Some(title) = section.get("title").and_then(Value::as_str) {
-        return Some(title.to_string());
-    }
-    let key = section
-        .get("sectionId")
-        .or_else(|| section.get("titleKey"))
-        .and_then(Value::as_str)?;
-    Some(
-        match key {
-            "summary" | "session.projection.plan.section.summary" => "Summary",
-            "tasks" | "session.projection.plan.section.tasks" => "Tasks",
-            "risks" | "session.projection.plan.section.risks" => "Risks",
-            "reviewCheckpoints" | "session.projection.plan.section.reviewCheckpoints" => {
-                "Review checkpoints"
-            }
-            "boundary" | "session.projection.plan.section.boundary" => "Boundary",
-            "executionResult" | "session.projection.review.section.executionResult" => {
-                "Execution result"
-            }
-            "execution" | "session.projection.review.section.execution" => "Execution",
-            "changedFiles" | "session.projection.review.section.changedFiles" => {
-                "Files changed in this batch"
-            }
-            "generatedArtifacts" | "session.projection.review.section.generatedArtifacts" => {
-                "Agent generated artifacts"
-            }
-            "pathDiagnostics" | "session.projection.review.section.pathDiagnostics" => {
-                "Path normalization diagnostics"
-            }
-            "gitChanges" | "session.projection.review.section.gitChanges" => "Git changes",
-            "auditDetails" | "session.projection.review.section.auditDetails" => "Audit details",
-            "originalPlan" | "session.projection.review.section.originalPlan" => {
-                "Original plan summary"
-            }
-            "validation" | "session.projection.review.section.validation" => {
-                "Validation and startup suggestions"
-            }
-            "nextDecision" | "session.projection.review.section.nextDecision" => "Next decision",
-            "audit" | "session.projection.review.section.audit" => "Audit",
-            _ => key,
+fn readable_section_title(
+    section: &deepcode_kernel_client::AgentTimelineStructuredProjectionSection,
+) -> String {
+    let key = structured_section_key(section);
+    match key {
+        "summary" | "session.projection.plan.section.summary" => "Summary",
+        "tasks" | "session.projection.plan.section.tasks" => "Tasks",
+        "risks" | "session.projection.plan.section.risks" => "Risks",
+        "reviewCheckpoints" | "session.projection.plan.section.reviewCheckpoints" => {
+            "Review checkpoints"
         }
-        .to_string(),
-    )
+        "boundary" | "session.projection.plan.section.boundary" => "Boundary",
+        "executionResult" | "session.projection.review.section.executionResult" => {
+            "Execution result"
+        }
+        "execution" | "session.projection.review.section.execution" => "Execution",
+        "changedFiles" | "session.projection.review.section.changedFiles" => {
+            "Files changed in this batch"
+        }
+        "generatedArtifacts" | "session.projection.review.section.generatedArtifacts" => {
+            "Agent generated artifacts"
+        }
+        "pathDiagnostics" | "session.projection.review.section.pathDiagnostics" => {
+            "Path normalization diagnostics"
+        }
+        "gitChanges" | "session.projection.review.section.gitChanges" => "Git changes",
+        "auditDetails" | "session.projection.review.section.auditDetails" => "Audit details",
+        "originalPlan" | "session.projection.review.section.originalPlan" => {
+            "Original plan summary"
+        }
+        "validation" | "session.projection.review.section.validation" => {
+            "Validation and startup suggestions"
+        }
+        "nextDecision" | "session.projection.review.section.nextDecision" => "Next decision",
+        "audit" | "session.projection.review.section.audit" => "Audit",
+        _ => key,
+    }
+    .to_string()
+}
+
+fn structured_section_key(
+    section: &deepcode_kernel_client::AgentTimelineStructuredProjectionSection,
+) -> &str {
+    if section.section_id.is_empty() {
+        section.title_key.as_str()
+    } else {
+        section.section_id.as_str()
+    }
 }
 
 fn readable_empty_message(key: &str) -> Option<&'static str> {

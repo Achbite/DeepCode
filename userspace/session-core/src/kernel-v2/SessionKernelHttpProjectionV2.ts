@@ -10,12 +10,17 @@ import type {
   AgentEventChannel,
   AgentEventKind,
   AgentEventVisibility,
+  AgentTimelineDelta,
   AgentTimelineResult,
 } from '@deepcode/protocol';
 import {
   CanonicalTimelineProjector,
+  createProviderComposingTimelineDelta,
   normalizeAgentTimelineSnapshot,
 } from '../timelineDelta.js';
+import {
+  appendProviderComposingProjectionV2,
+} from '../projectionV2.js';
 import type {
   SessionKernelHostProjectionSinkV2,
 } from './SessionKernelHttpPersistenceV2.js';
@@ -77,7 +82,9 @@ export interface SessionKernelHostProjectionRequestV2 {
   projectionDigest: string;
   event: SessionKernelProjectionEventV2;
   agentEvent: AgentEvent;
-  timeline: AgentTimelineResult;
+  timelineUpdate:
+    | { kind: 'snapshot'; snapshot: AgentTimelineResult }
+    | { kind: 'delta'; delta: AgentTimelineDelta };
 }
 
 /**
@@ -117,6 +124,14 @@ implements SessionKernelHostProjectionSinkV2 {
   readonly #runCapability: string;
   private fullPriorSessionEvents?: Promise<AgentEvent[]>;
   private frozenPriorTimeline?: Promise<AgentTimelineResult | undefined>;
+  private currentTimeline?: AgentTimelineResult;
+  private publicationTail: Promise<void> = Promise.resolve();
+  private lastPublished?: {
+    projectionId: string;
+    eventDigest: string;
+    request: SessionKernelHostProjectionRequestV2;
+    timeline: AgentTimelineResult;
+  };
 
   constructor(
     private readonly sessionId: string,
@@ -173,68 +188,116 @@ implements SessionKernelHostProjectionSinkV2 {
 
   async publish(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: SessionKernelProjectionEventV2[]
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+  ): Promise<SessionKernelProjectionReceiptV2> {
+    const publication = this.publicationTail.then(() =>
+      this.publishSerial(event, projectionHistory)
+    );
+    this.publicationTail = publication.then(
+      () => undefined,
+      () => undefined
+    );
+    return publication;
+  }
+
+  private async publishSerial(
+    event: SessionKernelProjectionEventV2,
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
   ): Promise<SessionKernelProjectionReceiptV2> {
     assertNoTransportCapabilities(event);
     const projectionId = requiredIdentity(
       event.projectionId,
       'projectionId'
     );
+    const eventDigest = sha256Hash(canonicalJson(event));
+    const replay = this.lastPublished?.projectionId === projectionId
+      ? this.lastPublished
+      : undefined;
+    if (replay) {
+      if (replay.eventDigest !== eventDigest) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_identity_conflict',
+          'Session projection identity was reused with different content.'
+        );
+      }
+      const receipt = await this.sendProjectionRequest(replay.request);
+      this.currentTimeline = cloneJson(replay.timeline);
+      return receipt;
+    }
     const agentEvent = sessionKernelAgentEventV2(
       this.sessionId,
       event
     );
-    const currentRunAgentEvents = projectionHistory.map(
-      (projection) =>
-        sessionKernelAgentEventV2(this.sessionId, projection)
-    );
-    const [priorEvents, priorTimeline] = await Promise.all([
-      this.priorEventsForProjection(),
-      this.priorTimelineForProjection(),
-    ]);
-    const agentEvents = [
-      ...priorEvents,
-      ...currentRunAgentEvents,
-    ];
-    const sourceEventVersion =
-      this.priorSessionEvents.sourceEventVersion
-      + currentRunAgentEvents.length;
-    if (!Number.isSafeInteger(sourceEventVersion)) {
-      throw new SessionKernelProjectionTransportError(
-        'session_kernel_projection_version_exhausted',
-        'Session projection source-event version is exhausted.'
+    let timeline: AgentTimelineResult;
+    let timelineUpdate:
+      SessionKernelHostProjectionRequestV2['timelineUpdate'];
+    if (event.kind === 'provider.composing' && this.currentTimeline) {
+      timeline = appendProviderComposingProjectionV2(
+        this.currentTimeline,
+        agentEvent
       );
-    }
-    const projected = priorTimeline
-      ? appendCurrentRunProjection(
-          priorTimeline,
-          new CanonicalTimelineProjector(
+      timelineUpdate = {
+        kind: 'delta',
+        delta: createProviderComposingTimelineDelta(
+          this.currentTimeline,
+          timeline
+        ),
+      };
+    } else {
+      const currentRunProjectionHistory = await projectionHistory();
+      const currentRunAgentEvents = currentRunProjectionHistory.map(
+        (projection) =>
+          sessionKernelAgentEventV2(this.sessionId, projection)
+      );
+      const [priorEvents, priorTimeline] = await Promise.all([
+        this.priorEventsForProjection(),
+        this.priorTimelineForProjection(),
+      ]);
+      const agentEvents = [
+        ...priorEvents,
+        ...currentRunAgentEvents,
+      ];
+      const sourceEventVersion =
+        this.priorSessionEvents.sourceEventVersion
+        + currentRunAgentEvents.length;
+      if (!Number.isSafeInteger(sourceEventVersion)) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_projection_version_exhausted',
+          'Session projection source-event version is exhausted.'
+        );
+      }
+      const projected = priorTimeline
+        ? appendCurrentRunProjection(
+            priorTimeline,
+            new CanonicalTimelineProjector(
+              this.sessionId,
+              currentRunAgentEvents
+            ).snapshot(),
+            sourceEventVersion,
+            event.recordedAt
+          )
+        : new CanonicalTimelineProjector(
             this.sessionId,
-            currentRunAgentEvents
-          ).snapshot(),
-          sourceEventVersion,
-          event.recordedAt
-        )
-      : new CanonicalTimelineProjector(
-          this.sessionId,
-          agentEvents
-        ).snapshot();
-    const timeline: AgentTimelineResult = {
-      ...projected,
-      revision: sourceEventVersion,
-      sourceEventVersion,
-      generatedAt: event.recordedAt,
-    };
-    if (
-      agentEvents.at(-1)?.id !== agentEvent.id
-      || timeline.sessionId !== this.sessionId
-      || timeline.eventCount !== agentEvents.length
-      || timeline.sourceEventVersion !== sourceEventVersion
-    ) {
-      throw new SessionKernelProjectionTransportError(
-        'session_kernel_timeline_snapshot_identity_mismatch',
-        'Canonical timeline does not end at the current durable AgentEvent high-water.'
-      );
+            agentEvents
+          ).snapshot();
+      timeline = {
+        ...projected,
+        revision: sourceEventVersion,
+        sourceEventVersion,
+        generatedAt: event.recordedAt,
+      };
+      if (
+        agentEvents.at(-1)?.id !== agentEvent.id
+        || timeline.sessionId !== this.sessionId
+        || timeline.eventCount !== agentEvents.length
+        || timeline.sourceEventVersion !== sourceEventVersion
+      ) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_timeline_snapshot_identity_mismatch',
+          'Canonical timeline does not end at the current durable AgentEvent high-water.'
+        );
+      }
+      timelineUpdate = { kind: 'snapshot', snapshot: timeline };
     }
     const projectionDigest = sha256Hash(canonicalJson({
       event,
@@ -250,9 +313,24 @@ implements SessionKernelHostProjectionSinkV2 {
       projectionDigest,
       event: cloneJson(event),
       agentEvent,
-      timeline,
+      timelineUpdate,
     };
     assertNoTransportCapabilities(request);
+    const receipt = await this.sendProjectionRequest(request);
+    this.currentTimeline = cloneJson(timeline);
+    this.lastPublished = {
+      projectionId,
+      eventDigest,
+      request: cloneJson(request),
+      timeline: cloneJson(timeline),
+    };
+    return receipt;
+  }
+
+  private async sendProjectionRequest(
+    request: SessionKernelHostProjectionRequestV2
+  ): Promise<SessionKernelProjectionReceiptV2> {
+    const { projectionId, projectionDigest } = request;
     const encodedRequest = JSON.stringify(request);
     if (
       new TextEncoder().encode(encodedRequest).byteLength
@@ -418,7 +496,7 @@ implements SessionKernelHostProjectionSinkV2 {
           ? 'UnsupportedHistorySchema'
           : 'host_session_prior_timeline_unavailable',
         code === 'UnsupportedHistorySchema'
-          ? 'Prior active flat-v2 history cannot be resumed.'
+          ? 'Prior Session history uses an unsupported schema.'
           : 'Prior Session timeline is unavailable.'
       );
     }
@@ -430,7 +508,7 @@ implements SessionKernelHostProjectionSinkV2 {
     }
     let timeline: AgentTimelineResult;
     try {
-      timeline = normalizeAgentTimelineSnapshot(envelope.data).timeline;
+      timeline = normalizeAgentTimelineSnapshot(envelope.data);
     } catch (error) {
       const code = objectRecord(error)?.code;
       throw new SessionKernelProjectionTransportError(
@@ -438,7 +516,7 @@ implements SessionKernelHostProjectionSinkV2 {
           ? 'UnsupportedHistorySchema'
           : 'host_session_prior_timeline_invalid',
         code === 'UnsupportedHistorySchema'
-          ? 'Prior active flat-v2 history cannot be resumed.'
+          ? 'Prior Session history uses an unsupported schema.'
           : 'Prior Session timeline failed native projection validation.'
       );
     }
@@ -572,8 +650,6 @@ function appendCurrentRunProjection(
   const timeline: AgentTimelineResult = {
     schemaVersion: current.schemaVersion,
     shapeVersion: current.shapeVersion,
-    legacyPrefixTurnCount:
-      history.legacyPrefixTurnCount ?? 0,
     sessionId: current.sessionId,
     revision: sourceEventVersion,
     sourceEventVersion,
@@ -604,7 +680,7 @@ function appendCurrentRunProjection(
         }
       : {}),
   };
-  return normalizeAgentTimelineSnapshot(timeline).timeline;
+  return normalizeAgentTimelineSnapshot(timeline);
 }
 
 function mergeTimelineTokenUsage(
@@ -855,7 +931,7 @@ export function sessionKernelAgentEventV2(
   sessionId: string,
   event: SessionKernelProjectionEventV2
 ): AgentEvent {
-  const data = objectRecord(event.data);
+  const data = currentProjectionData(event);
   const presentation = publicPresentation(event, data);
   return {
     id: `kernel-v2:${event.projectionId}`,
@@ -950,7 +1026,7 @@ function publicPresentation(
       }
       return planScopePreviewPresentation(event, data);
     case 'capability.awaiting':
-      return permissionRequestPresentation(event, data);
+      return permissionRequestPresentation(data);
     case 'toolIntent.submitted':
       return {
         kind: 'tool_call',
@@ -1129,7 +1205,33 @@ function publicPresentation(
         },
       };
     }
-    case 'provider.started':
+    case 'provider.started': {
+      const currentActivityCode = textField(
+        data,
+        'currentActivityCode'
+      );
+      const activitySequence = data?.activitySequence;
+      if (
+        (
+          currentActivityCode !== undefined
+          && currentActivityCode !== 'provider.reasoning'
+          && currentActivityCode !== 'provider.composing'
+        )
+        || ((currentActivityCode === undefined)
+          !== (activitySequence === undefined))
+        || (
+          activitySequence !== undefined
+          && (
+            !Number.isSafeInteger(activitySequence)
+            || Number(activitySequence) <= 0
+          )
+        )
+      ) {
+        throw new SessionKernelProjectionTransportError(
+          'session_kernel_provider_activity_invalid',
+          'Provider activity projection is not exact safe metadata.'
+        );
+      }
       return {
         kind: 'workflow_stage',
         channel: 'progress',
@@ -1138,12 +1240,23 @@ function publicPresentation(
           status: 'running',
           providerTurnId: textField(data, 'providerTurnId'),
           controlEpoch: data?.controlEpoch,
+          ...(currentActivityCode
+            ? {
+                currentActivityCode,
+              }
+            : {}),
+          ...(activitySequence === undefined
+            ? {}
+            : { activitySequence }),
           contextAssembly: data?.contextAssembly === undefined
             ? undefined
             : cloneJson(data.contextAssembly),
-          summary: 'Session provider turn started.',
+          ...(currentActivityCode
+            ? {}
+            : { summary: 'Session provider turn started.' }),
         },
       };
+    }
     case 'provider.stale':
       return {
         kind: 'workflow_stage',
@@ -1227,6 +1340,13 @@ function publicPresentation(
           code: textField(data, 'code') ?? 'session_kernel_diagnostic',
           providerTurnId: textField(data, 'providerTurnId'),
           terminalScope: publicTerminalScope(data),
+          ...(data?.providerOutcome === undefined
+            ? {}
+            : {
+                providerOutcome: publicProviderOutcome(
+                  data.providerOutcome
+                ),
+              }),
           message: textField(data, 'message')
             ?? stage
             ?? 'Session Kernel diagnostic.',
@@ -1234,18 +1354,749 @@ function publicPresentation(
       };
     }
     default:
-      return {
-        kind: 'workflow_stage',
-        channel: 'progress',
-        visibility: 'trace',
-        fields: {
-          status: event.kind,
-          summary: `Session projection ${event.kind}.`,
-        },
-      };
+      throw unsupportedProjectionKind(event);
   }
 }
 
+type CurrentProjectionFieldKind =
+  | 'identity'
+  | 'string'
+  | 'array'
+  | 'object'
+  | 'positiveInteger'
+  | 'nonNegativeInteger'
+  | 'unknown';
+
+type CurrentProjectionFieldSchema = Readonly<
+  Record<string, CurrentProjectionFieldKind>
+>;
+
+const CURRENT_PLAN_FIELDS = {
+  runId: 'identity',
+  inputId: 'identity',
+  planRevision: 'identity',
+  title: 'string',
+  objective: 'string',
+  narrative: 'string',
+  actions: 'array',
+  recordedAt: 'identity',
+} as const satisfies CurrentProjectionFieldSchema;
+
+const CURRENT_SCOPE_PREVIEW_FIELDS = {
+  previewId: 'identity',
+  runId: 'identity',
+  controlEpoch: 'positiveInteger',
+  planRevision: 'identity',
+  planActionId: 'identity',
+  operationId: 'identity',
+  toolId: 'identity',
+  canonicalArgumentsDigest: 'identity',
+  canonicalScope: 'object',
+  scopeDigest: 'identity',
+  authorizationDigest: 'identity',
+  toolContractDigest: 'identity',
+  contextRef: 'object',
+  effectClass: 'identity',
+  effectScope: 'identity',
+  risk: 'identity',
+  effectiveDeadlineMs: 'positiveInteger',
+  disposition: 'identity',
+  approvalView: 'object',
+} as const satisfies CurrentProjectionFieldSchema;
+
+export function validateCurrentSessionKernelProjectionEventV2(
+  event: SessionKernelProjectionEventV2
+): void {
+  currentProjectionData(event);
+}
+
+function currentProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> | undefined {
+  switch (event.kind) {
+    case 'input.persisted':
+      return exactCurrentProjectionRecord(event, {
+        inputId: 'identity',
+        opaqueInputRef: 'identity',
+        text: 'string',
+        attachments: 'array',
+        recordedAt: 'identity',
+        controlEpoch: 'positiveInteger',
+      });
+    case 'plan.persisted': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        CURRENT_PLAN_FIELDS
+      );
+      validateCurrentPlan(data);
+      return data;
+    }
+    case 'plan.decided': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          planRevision: 'identity',
+          decision: 'string',
+          recordedAt: 'identity',
+        },
+        { guidance: 'string' }
+      );
+      projectionEnum(data, 'decision', ['accept', 'reject', 'revise']);
+      return data;
+    }
+    case 'scope.previewed':
+      return currentScopePreviewProjectionData(event);
+    case 'provider.started':
+      return currentProviderStartedProjectionData(event);
+    case 'provider.composing':
+      return exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          controlEpoch: 'positiveInteger',
+          streamSequence: 'positiveInteger',
+          textOrdinal: 'positiveInteger',
+          textDelta: 'string',
+        },
+        { providerPhase: 'string' }
+      );
+    case 'provider.completed':
+      return currentProviderCompletedProjectionData(event);
+    case 'provider.stale':
+      return exactCurrentProjectionRecord(
+        event,
+        { providerTurnId: 'identity' },
+        { controlEpoch: 'positiveInteger' }
+      );
+    case 'toolIntent.submitted':
+      return currentToolIntentProjectionData(event);
+    case 'capability.awaiting': {
+      const data = exactCurrentProjectionRecord(event, {
+        operationId: 'identity',
+        invocationId: 'identity',
+        preview: 'object',
+      });
+      validateCurrentScopePreview(
+        data.preview,
+        'capability.awaiting.preview'
+      );
+      return data;
+    }
+    case 'kernelFacts.reconciled':
+      return exactCurrentProjectionRecord(event, {
+        requestId: 'identity',
+        pageFactIds: 'array',
+        pageFactCount: 'nonNegativeInteger',
+        operationFacts: 'array',
+        nextAfterLedgerSequence: 'nonNegativeInteger',
+        snapshotHighWater: 'nonNegativeInteger',
+      });
+    case 'authorization.decided': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          factId: 'identity',
+          factKind: 'string',
+          controlEpoch: 'positiveInteger',
+          planActionIds: 'array',
+          operationId: 'identity',
+          resourceIds: 'array',
+          details: 'object',
+        },
+        {
+          previewId: 'identity',
+          toolId: 'identity',
+          capabilityLease: 'object',
+          guidance: 'string',
+          scopeDelta: 'unknown',
+        }
+      );
+      projectionEnum(data, 'factKind', [
+        'capabilityIssued',
+        'capabilityDenied',
+        'expansionAllowed',
+        'expansionDenied',
+      ]);
+      return data;
+    }
+    case 'review.revised': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          projectionVersion: 'identity',
+          revision: 'positiveInteger',
+          status: 'string',
+          planActionSettlementDigest: 'identity',
+          snapshotHighWater: 'nonNegativeInteger',
+          planned: 'array',
+          scopeExpansions: 'array',
+          actualEffects: 'array',
+          unexecuted: 'array',
+          denied: 'array',
+          rejections: 'array',
+          completions: 'array',
+          cleanup: 'array',
+          indeterminate: 'array',
+          priorEpochLateFacts: 'array',
+          factCoverage: 'object',
+          factsQuery: 'object',
+          pendingCleanupCount: 'nonNegativeInteger',
+          createdAt: 'identity',
+        },
+        {
+          workAuthority: 'object',
+          planRevision: 'identity',
+          planDecision: 'object',
+          plan: 'object',
+          finalizedAt: 'identity',
+        }
+      );
+      projectionEnum(data, 'status', ['draft', 'final']);
+      return data;
+    }
+    case 'planAction.completed': {
+      const data = exactCurrentProjectionRecord(event, {
+        kind: 'string',
+        planActionId: 'identity',
+        completionKind: 'string',
+        providerTurnId: 'identity',
+        recordedAt: 'identity',
+      });
+      projectionEnum(data, 'kind', ['completed']);
+      projectionEnum(data, 'completionKind', ['answer', 'noTool']);
+      return data;
+    }
+    case 'run.cancelled':
+      return exactCurrentProjectionRecord(event, {
+        callerRequestId: 'identity',
+        callerRequestDigest: 'identity',
+        cancelOperationId: 'identity',
+        controlEpoch: 'positiveInteger',
+        cancellation: 'object',
+        facts: 'object',
+      });
+    case 'wait.changed':
+      return currentWaitProjectionData(event);
+    case 'diagnostic':
+      return currentDiagnosticProjectionData(event);
+    default:
+      throw unsupportedProjectionKind(event);
+  }
+}
+
+function currentScopePreviewProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const data = exactCurrentProjectionRecord(event, {
+    kind: 'string',
+    data: 'object',
+    plan: 'object',
+    scopePreviews: 'array',
+    planRevision: 'identity',
+    planActionId: 'identity',
+    operationId: 'identity',
+  });
+  validateCurrentPlan(projectionObject(data, 'plan'));
+  projectionArray(data, 'scopePreviews').forEach((preview, index) =>
+    validateCurrentScopePreview(
+      preview,
+      'scopePreviews[' + String(index) + ']'
+    )
+  );
+  const reply = projectionObject(data, 'data');
+  if (
+    projectionEnum(data, 'kind', ['previewed', 'rejected'])
+      === 'previewed'
+  ) {
+    const previewed = exactCurrentProjectionValue(
+      reply,
+      'scope.previewed.data',
+      { preview: 'object' }
+    );
+    validateCurrentScopePreview(
+      previewed.preview,
+      'scope.previewed.data.preview'
+    );
+  } else {
+    const rejected = exactCurrentProjectionValue(
+      reply,
+      'scope.previewed.data',
+      {
+        toolId: 'identity',
+        reason: 'identity',
+        guidance: 'string',
+      }
+    );
+    projectionEnum(rejected, 'reason', [
+      'toolNotRegistered',
+      'toolUnavailable',
+      'invalidArguments',
+      'requestedScopeInvalid',
+      'settingsDenied',
+      'staleToolContext',
+      'staleControlEpoch',
+    ]);
+  }
+  return data;
+}
+
+function currentProviderStartedProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const raw = objectRecord(event.data);
+  if (
+    raw
+    && Object.prototype.hasOwnProperty.call(
+      raw,
+      'currentActivityCode'
+    )
+  ) {
+    const data = exactCurrentProjectionRecord(event, {
+      providerTurnId: 'identity',
+      controlEpoch: 'positiveInteger',
+      activitySequence: 'positiveInteger',
+      currentActivityCode: 'string',
+    });
+    projectionEnum(data, 'currentActivityCode', [
+      'provider.reasoning',
+      'provider.composing',
+    ]);
+    return data;
+  }
+  return exactCurrentProjectionRecord(event, {
+    providerTurnId: 'identity',
+    controlEpoch: 'positiveInteger',
+    contextRef: 'object',
+    factProjection: 'object',
+    contextAssembly: 'object',
+  });
+}
+
+function currentProviderCompletedProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const data = exactCurrentProjectionRecord(
+    event,
+    {
+      providerTurnId: 'identity',
+      controlEpoch: 'positiveInteger',
+      outputKind: 'string',
+      terminalScope: 'string',
+      orderedItems: 'array',
+      providerOutcome: 'object',
+    },
+    {
+      status: 'string',
+      result: 'object',
+      toolCallReceipt: 'object',
+    }
+  );
+  projectionEnum(data, 'outputKind', [
+    'plan',
+    'answer',
+    'noTool',
+    'toolIntent',
+  ]);
+  projectionEnum(data, 'terminalScope', ['turn', 'providerTurn']);
+  if (data.status !== undefined) {
+    projectionEnum(data, 'status', ['responseAccepted']);
+  }
+  const responseAccepted = data.status === 'responseAccepted';
+  const hasResult = Object.prototype.hasOwnProperty.call(data, 'result');
+  if (responseAccepted === hasResult) {
+    throw invalidCurrentProjectionData(
+      event.kind,
+      'result does not match the current Provider completion variant'
+    );
+  }
+  return data;
+}
+
+function currentToolIntentProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const data = exactCurrentProjectionRecord(
+    event,
+    {
+      requestId: 'identity',
+      operationId: 'identity',
+      toolId: 'identity',
+      expectedControlEpoch: 'positiveInteger',
+      authorityKind: 'string',
+      replyKind: 'string',
+    },
+    {
+      planRevision: 'identity',
+      planActionId: 'identity',
+      invocationId: 'identity',
+      replyReason: 'identity',
+    }
+  );
+  const authorityKind = projectionEnum(data, 'authorityKind', [
+    'planAction',
+    'contextRead',
+  ]);
+  const replyKind = projectionEnum(data, 'replyKind', [
+    'admitted',
+    'awaitingCapability',
+    'rejected',
+  ]);
+  const hasPlanRevision = data.planRevision !== undefined;
+  const hasPlanActionId = data.planActionId !== undefined;
+  if (
+    hasPlanRevision !== hasPlanActionId
+    || (authorityKind === 'planAction') !== hasPlanRevision
+  ) {
+    throw invalidCurrentProjectionData(
+      event.kind,
+      'PlanAction authority binding is incomplete'
+    );
+  }
+  const hasInvocation = data.invocationId !== undefined;
+  const hasRejection = data.replyReason !== undefined;
+  if (
+    (replyKind === 'rejected' && (!hasRejection || hasInvocation))
+    || (replyKind !== 'rejected' && (!hasInvocation || hasRejection))
+  ) {
+    throw invalidCurrentProjectionData(
+      event.kind,
+      'Kernel ToolIntent reply fields conflict with replyKind'
+    );
+  }
+  return data;
+}
+
+function currentWaitProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> | undefined {
+  if (event.data === null) return undefined;
+  const kind = objectRecord(event.data)?.kind;
+  switch (kind) {
+    case 'capability': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          kind: 'string',
+          operationId: 'identity',
+          invocationId: 'identity',
+          previewId: 'identity',
+          sinceHighWater: 'nonNegativeInteger',
+        },
+        {
+          decisionHint: 'string',
+          denialGuidance: 'string',
+        }
+      );
+      if (data.decisionHint !== undefined) {
+        projectionEnum(data, 'decisionHint', ['allow', 'deny']);
+      }
+      return data;
+    }
+    case 'invocation':
+      return exactCurrentProjectionRecord(event, {
+        kind: 'string',
+        operationId: 'identity',
+        invocationId: 'identity',
+        sinceHighWater: 'nonNegativeInteger',
+      });
+    case 'backpressure': {
+      const data = exactCurrentProjectionRecord(event, {
+        kind: 'string',
+        operationId: 'identity',
+        reason: 'string',
+        retryAt: 'identity',
+        guidance: 'string',
+      });
+      projectionEnum(data, 'reason', ['runBusy', 'capacityExceeded']);
+      return data;
+    }
+    case 'manualRecovery': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          kind: 'string',
+          operationId: 'identity',
+          reason: 'string',
+          factIds: 'array',
+        },
+        { invocationId: 'identity' }
+      );
+      projectionEnum(data, 'reason', ['indeterminate']);
+      return data;
+    }
+    default:
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'wait kind is not current'
+      );
+  }
+}
+
+function currentDiagnosticProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const stage = objectRecord(event.data)?.stage;
+  let data: Record<string, unknown>;
+  switch (stage) {
+    case 'provider.toolCallQueue':
+      data = exactCurrentProjectionRecord(event, {
+        providerTurnId: 'identity',
+        status: 'string',
+        code: 'identity',
+        stage: 'string',
+        reason: 'string',
+        orderedItems: 'array',
+        unexecutedOrdinals: 'array',
+        toolCallReceipt: 'object',
+      });
+      projectionEnum(data, 'status', ['blocked']);
+      break;
+    case 'provider.finalAnswer':
+      data = exactCurrentProjectionRecord(
+        event,
+        {
+          stage: 'string',
+          status: 'string',
+          terminalScope: 'string',
+          code: 'identity',
+          message: 'string',
+          physicalRequestCount: 'positiveInteger',
+          controlEpoch: 'positiveInteger',
+          reviewRevision: 'positiveInteger',
+          snapshotHighWater: 'nonNegativeInteger',
+        },
+        {
+          providerTurnId: 'identity',
+          providerOutcome: 'object',
+        }
+      );
+      projectionEnum(data, 'status', ['failed']);
+      projectionEnum(data, 'terminalScope', ['turn']);
+      break;
+    case 'provider.requestTurn':
+    case 'provider.outputValidation':
+      data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          status: 'string',
+          terminalScope: 'string',
+          code: 'identity',
+          message: 'string',
+          stage: 'string',
+        },
+        { providerOutcome: 'object' }
+      );
+      projectionEnum(data, 'status', ['failed']);
+      projectionEnum(data, 'terminalScope', ['turn']);
+      break;
+    case 'provider.outputAdmission':
+      data = exactCurrentProjectionRecord(event, {
+        providerTurnId: 'identity',
+        code: 'identity',
+        message: 'string',
+        stage: 'string',
+        providerOutcome: 'object',
+      });
+      break;
+    default:
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'diagnostic stage is not current'
+      );
+  }
+  projectionEnum(data, 'stage', [stage]);
+  return data;
+}
+
+function validateCurrentPlan(data: Record<string, unknown>): void {
+  const plan = exactCurrentProjectionValue(
+    data,
+    'plan',
+    CURRENT_PLAN_FIELDS
+  );
+  for (const field of ['title', 'objective', 'narrative'] as const) {
+    if (!(plan[field] as string).trim()) {
+      throw invalidCurrentProjectionData(
+        'plan',
+        field + ' must be non-empty'
+      );
+    }
+  }
+}
+
+function validateCurrentScopePreview(value: unknown, field: string): void {
+  const preview = exactCurrentProjectionValue(
+    value,
+    field,
+    CURRENT_SCOPE_PREVIEW_FIELDS
+  );
+  projectionEnum(preview, 'effectClass', ['read', 'mutation']);
+  projectionEnum(preview, 'effectScope', [
+    'workspaceRead',
+    'workspaceWrite',
+    'repositoryRead',
+    'repositoryIndexWrite',
+    'repositoryHistoryWrite',
+    'networkRead',
+  ]);
+  projectionEnum(preview, 'risk', [
+    'low',
+    'medium',
+    'high',
+    'critical',
+  ]);
+  projectionEnum(preview, 'disposition', [
+    'autoIssuable',
+    'requiresUserDecision',
+  ]);
+}
+
+function exactCurrentProjectionRecord(
+  event: SessionKernelProjectionEventV2,
+  required: CurrentProjectionFieldSchema,
+  optional: CurrentProjectionFieldSchema = {}
+): Record<string, unknown> {
+  return exactCurrentProjectionValue(
+    event.data,
+    event.kind,
+    required,
+    optional
+  );
+}
+
+function exactCurrentProjectionValue(
+  value: unknown,
+  field: string,
+  required: CurrentProjectionFieldSchema,
+  optional: CurrentProjectionFieldSchema = {}
+): Record<string, unknown> {
+  const record = objectRecord(value);
+  const permitted = new Set([
+    ...Object.keys(required),
+    ...Object.keys(optional),
+  ]);
+  if (
+    !record
+    || Object.keys(record).some((key) => !permitted.has(key))
+    || Object.keys(required).some(
+      (key) =>
+        !Object.prototype.hasOwnProperty.call(record, key)
+        || record[key] === undefined
+    )
+  ) {
+    throw invalidCurrentProjectionData(
+      field,
+      'record fields are not exact'
+    );
+  }
+  for (const [key, kind] of Object.entries({
+    ...required,
+    ...optional,
+  })) {
+    if (record[key] !== undefined) {
+      validateCurrentProjectionField(record[key], key, kind);
+    }
+  }
+  return record;
+}
+
+function validateCurrentProjectionField(
+  value: unknown,
+  field: string,
+  kind: CurrentProjectionFieldKind
+): void {
+  const invalid =
+    (kind === 'identity' && !currentProjectionIdentity(value))
+    || (kind === 'string' && typeof value !== 'string')
+    || (kind === 'array' && !Array.isArray(value))
+    || (kind === 'object' && objectRecord(value) === undefined)
+    || (
+      kind === 'positiveInteger'
+      && (
+        typeof value !== 'number'
+        || !Number.isSafeInteger(value)
+        || value <= 0
+      )
+    )
+    || (
+      kind === 'nonNegativeInteger'
+      && (
+        typeof value !== 'number'
+        || !Number.isSafeInteger(value)
+        || value < 0
+      )
+    );
+  if (invalid) {
+    throw invalidCurrentProjectionData(
+      field,
+      kind + ' field is invalid'
+    );
+  }
+}
+
+function currentProjectionIdentity(value: unknown): boolean {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.trim() === value
+    && new TextEncoder().encode(value).byteLength <= 512
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function projectionArray(
+  data: Record<string, unknown>,
+  field: string
+): unknown[] {
+  const value = data[field];
+  if (!Array.isArray(value)) {
+    throw invalidCurrentProjectionData(field, 'array field is invalid');
+  }
+  return value;
+}
+
+function projectionObject(
+  data: Record<string, unknown>,
+  field: string
+): Record<string, unknown> {
+  const value = objectRecord(data[field]);
+  if (!value) {
+    throw invalidCurrentProjectionData(field, 'object field is invalid');
+  }
+  return value;
+}
+
+function projectionEnum<const T extends string>(
+  data: Record<string, unknown>,
+  field: string,
+  values: readonly T[]
+): T {
+  const value = data[field];
+  if (typeof value !== 'string' || !values.includes(value as T)) {
+    throw invalidCurrentProjectionData(field, 'enum field is invalid');
+  }
+  return value as T;
+}
+
+function invalidCurrentProjectionData(
+  kind: string,
+  reason: string
+): SessionKernelProjectionTransportError {
+  return new SessionKernelProjectionTransportError(
+    'session_kernel_projection_data_invalid',
+    'Session ' + kind
+      + ' projection is not exact current v2 data: ' + reason + '.'
+  );
+}
+
+function unsupportedProjectionKind(
+  event: { kind: unknown }
+): SessionKernelProjectionTransportError {
+  return new SessionKernelProjectionTransportError(
+    'UnsupportedHistorySchema',
+    'Session projection kind ' + String(event.kind)
+      + ' is not current v2.'
+  );
+}
 function providerComposingPresentation(
   data: Record<string, unknown> | undefined
 ): ReturnType<typeof publicPresentation> {
@@ -1607,15 +2458,14 @@ function requestedResourceRefs(
 }
 
 function permissionRequestPresentation(
-  event: SessionKernelProjectionEventV2,
   data: Record<string, unknown> | undefined
 ): ReturnType<typeof publicPresentation> {
-  const preview = objectRecord(data?.preview)
-    ?? objectRecord(objectRecord(data?.data)?.preview);
-  const operationId = textField(data, 'operationId')
-    ?? textField(preview, 'operationId');
-  const previewId = textField(preview, 'previewId')
-    ?? event.projectionId;
+  const preview = projectionObject(data ?? {}, 'preview');
+  const operationId = requiredIdentity(
+    data?.operationId,
+    'operationId'
+  );
+  const previewId = requiredIdentity(preview.previewId, 'previewId');
   return {
     kind: 'permission_request',
     channel: 'tool',

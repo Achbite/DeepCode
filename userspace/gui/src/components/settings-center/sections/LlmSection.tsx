@@ -8,10 +8,10 @@ import {
   reasoningTransportForProviderKind,
 } from '@deepcode/protocol';
 import type {
+  LlmProviderFlavor,
   LlmProviderKind,
   LlmProviderProfile,
   LlmReasoningTransport,
-  ReadableLlmProviderProfile,
 } from '@deepcode/protocol';
 import {
   getLlmProfiles,
@@ -25,6 +25,15 @@ const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
   { value: 'openaiCompatible', label: 'OpenAI Compatible' },
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'ollama', label: 'Ollama' },
+];
+
+const PROVIDER_FLAVORS: Array<{
+  value: LlmProviderFlavor;
+  label: string;
+}> = [
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'zhipu', label: 'Zhipu' },
 ];
 
 const REASONING_TRANSPORT_LABELS: Record<LlmReasoningTransport, string> = {
@@ -49,6 +58,7 @@ const PROFILE_PRESETS: Array<{
       name: 'DeepSeek V4 Flash',
       kind: 'openaiCompatible',
       reasoningTransport: 'openaiPlaintext',
+      providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-flash',
       contextWindowTokens: 1000000,
@@ -65,6 +75,7 @@ const PROFILE_PRESETS: Array<{
       name: 'DeepSeek V4 Pro',
       kind: 'openaiCompatible',
       reasoningTransport: 'openaiPlaintext',
+      providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-pro',
       contextWindowTokens: 1000000,
@@ -81,6 +92,7 @@ const PROFILE_PRESETS: Array<{
       name: 'DeepSeek V4 Flash (Anthropic)',
       kind: 'anthropic',
       reasoningTransport: 'anthropicPlaintext',
+      providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
       model: 'deepseek-v4-flash',
       contextWindowTokens: 1000000,
@@ -105,6 +117,7 @@ function createProfile(
     name: 'OpenAI Compatible',
     kind: 'openaiCompatible',
     reasoningTransport: 'openaiPlaintext',
+    providerFlavor: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
     thinking: 'enabled',
@@ -113,7 +126,7 @@ function createProfile(
 }
 
 function profileWithProviderKind(
-  profile: ReadableLlmProviderProfile,
+  profile: LlmProviderProfile,
   kind: LlmProviderKind,
 ): LlmProviderProfile {
   switch (kind) {
@@ -146,7 +159,7 @@ function optionalNumber(value: string): number | undefined {
 }
 
 const LlmSection: React.FC = () => {
-  const [profiles, setProfiles] = useState<ReadableLlmProviderProfile[]>([]);
+  const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [storePath, setStorePath] = useState<string | undefined>();
@@ -271,11 +284,7 @@ const LlmSection: React.FC = () => {
       setSecrets({});
       reenableProfileIdsRef.current.clear();
       setMessage(t(language, 'settings.llm.saved'));
-      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated', {
-        detail: {
-          profileMigrations: result.data.profileMigrations ?? [],
-        },
-      }));
+      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
     } else {
       setMessage(result.message ?? t(language, 'settings.llm.saveFailed'));
     }
@@ -419,25 +428,28 @@ const LlmSection: React.FC = () => {
 
               <div className="llm-profile__grid">
                 <label>
+                  <span>Provider flavor</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.providerFlavor}
+                    onChange={(e) => updateProfile(profile.id, {
+                      providerFlavor: e.target.value as LlmProviderFlavor,
+                    })}
+                  >
+                    {PROVIDER_FLAVORS.map((flavor) => (
+                      <option key={flavor.value} value={flavor.value}>
+                        {flavor.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
                   <span>Reasoning transport</span>
                   <select
                     className="settings-field__select"
-                    value={
-                      hasCompatibleReasoningTransport(profile)
-                        ? profile.reasoningTransport
-                        : ''
-                    }
-                    onChange={(e) => {
-                      if (e.target.value) {
-                        updateProfileProviderKind(profile.id, profile.kind);
-                      }
-                    }}
+                    value={profile.reasoningTransport}
+                    onChange={() => updateProfileProviderKind(profile.id, profile.kind)}
                   >
-                    {!hasCompatibleReasoningTransport(profile) && (
-                      <option value="">
-                        {language === 'zh-CN' ? '需要配置' : 'Configuration required'}
-                      </option>
-                    )}
                     <option value={reasoningTransportForProviderKind(profile.kind)}>
                       {REASONING_TRANSPORT_LABELS[
                         reasoningTransportForProviderKind(profile.kind)
@@ -519,11 +531,10 @@ const LlmSection: React.FC = () => {
                     className="settings-field__input"
                     type="number"
                     min={1}
-                    value={profile.maxOutputTokens ?? profile.maxTokens ?? ''}
+                    value={profile.maxOutputTokens ?? ''}
                     onChange={(e) =>
                       updateProfile(profile.id, {
                         maxOutputTokens: optionalNumber(e.target.value),
-                        maxTokens: undefined,
                       })
                     }
                     placeholder="384000"
@@ -571,13 +582,6 @@ const LlmSection: React.FC = () => {
               {profile.thinking === 'enabled' && (
                 <div className="settings-card__hint">
                   {t(language, 'settings.llm.thinkingHint')}
-                </div>
-              )}
-              {!hasCompatibleReasoningTransport(profile) && (
-                <div className="settings-card__hint" role="status">
-                  {language === 'zh-CN'
-                    ? '此旧 Profile 缺少 reasoning transport，当前不可用于会话。选择上方匹配项后保存即可启用。'
-                    : 'This legacy profile has no reasoning transport and is unavailable for sessions. Select the matching value above and save it to enable the profile.'}
                 </div>
               )}
               {profile.thinking !== 'enabled' && (

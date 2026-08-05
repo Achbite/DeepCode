@@ -104,7 +104,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   );
   const settingsTitle = t(language, 'settings.title');
   const agentSession = useAgentSessionStore((state) => state.session);
-  const agentEvents = useAgentSessionStore((state) => state.events);
+  const agentTimeline = useAgentSessionStore((state) => state.timeline);
   const refreshActiveSessionContext = useAgentSessionStore(
     (state) => state.refreshActiveSessionContext
   );
@@ -505,7 +505,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <div className="agent-memory-sheet" onMouseDown={(event) => event.stopPropagation()}>
             <AgentMemoryViewer
               language={language}
-              events={agentEvents}
+              timeline={agentTimeline}
               sessionId={agentSession?.id}
               refreshing={memoryRefreshing}
               onRefresh={async () => {

@@ -42,7 +42,6 @@ export interface AgentSession {
   workspaceHash?: string;
   workspaceScopeKey?: string;
   archivedAt?: string;
-  lastSummary?: string;
   titleSource?: AgentSessionTitleSource;
   eventCount?: number;
   createdAt: string;
@@ -63,6 +62,8 @@ export interface AgentWorkspaceBinding {
   openPath?: string;
   activeFolderId?: string;
   folderHash?: string;
+  workspaceBindingRef?: string;
+  workspaceBindingIdentity?: string;
 }
 
 export type AgentProjectKind = 'folder' | 'blank';
@@ -96,23 +97,16 @@ export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1 =
 export type AgentTimelineBlockKind =
   | 'user'
   | 'assistant'
-  | 'thinking'
-  | 'stage'
   | 'permission'
   | 'plan'
   | 'review'
-  | 'error'
-  | 'turnActions';
+  | 'error';
 
 export type AgentTimelineNarrativeKind =
   | 'user'
-  | 'thinking'
-  | 'assistantNarration'
   | 'assistantText'
-  | 'operationEvidence'
   | 'plan'
   | 'permission'
-  | 'verification'
   | 'review'
   | 'diagnostic';
 
@@ -128,8 +122,6 @@ export type AgentTimelineStatus =
 export type AgentTimelineEntryRole =
   | 'userMessage'
   | 'agentUpdate'
-  | 'activityGroup'
-  | 'evidence'
   | 'interaction'
   | 'finalAnswer'
   | 'diagnostic';
@@ -218,34 +210,6 @@ export interface AgentTimelineRunProjection {
   languageBinding: AgentTimelineLanguageBinding;
 }
 
-export type AgentConversationActivityKind =
-  | 'providerThinking'
-  | 'resourceSearch'
-  | 'resourceRead'
-  | 'toolExecution'
-  | 'reviewCheckpoint'
-  | 'diagnostic';
-
-export interface AgentConversationActivity {
-  activityId: string;
-  activityRevision?: number;
-  kind: AgentConversationActivityKind;
-  status: AgentTimelineStatus;
-  title: string;
-  summary: string;
-  source: 'session' | 'kernel' | 'provider' | 'llm';
-  runId?: string;
-  planId?: string;
-  draftId?: string;
-  targets?: string[];
-  actionIds?: string[];
-  toolName?: string;
-  operation?: string;
-  itemCount?: number;
-  errorCode?: string;
-  errorMessage?: string;
-}
-
 export interface AgentTimelineDisplayHints {
   density?: 'normal' | 'compact' | 'debug';
   evidenceMode?: 'inline' | 'collapsed' | 'debugOnly';
@@ -255,9 +219,8 @@ export interface AgentTimelineDisplayHints {
   taskListLabel?: string;
   taskListSummary?: string;
   // P4(B)：阶段标记。投影层按 plan_review.accepted 边界算一次：
-  //   'explore' = plan 阶段探索性事件（plan_card accepted 之前的工具调用 / 思考等）
+  //   'explore' = plan 阶段探索性事件（plan_card accepted 之前的工具调用）
   //   'execute' = complete 阶段正式执行事件
-  // 旧数据无此字段时回退为 undefined，两壳应按 undefined 等同正常显示。
   phase?: 'explore' | 'execute';
 }
 
@@ -442,7 +405,6 @@ export interface AgentTimelineBlock {
   narrativeKind?: AgentTimelineNarrativeKind;
   entryRole: AgentTimelineEntryRole;
   providerPhase?: AgentTimelineProviderPhase;
-  activity?: AgentConversationActivity;
   title: string;
   summary: string;
   status: AgentTimelineStatus;
@@ -544,11 +506,6 @@ export interface AgentTimelineTurn {
 export interface AgentTimelineResult {
   schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
   shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
-  /**
-   * Immutable count of neutral settled flat-v2 turns at the start of this
-   * snapshot. Absence means a strict-native snapshot with no legacy prefix.
-   */
-  legacyPrefixTurnCount?: number;
   sessionId: string;
   revision: number;
   sourceEventVersion: number;
@@ -575,11 +532,6 @@ export interface AgentTimelineRootProjectionReplacements {
 export interface AgentTimelineDelta {
   schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
   shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
-  /**
-   * Exact immutable legacy-prefix boundary for the resulting snapshot.
-   * Absence means strict-native and therefore cannot extend a legacy prefix.
-   */
-  legacyPrefixTurnCount?: number;
   sessionId: string;
   baseRevision: number;
   revision: number;
@@ -709,5 +661,4 @@ export interface ArchiveAgentSessionRequest {
 
 export interface AgentSessionResult {
   session: AgentSession;
-  events: AgentEvent[];
 }

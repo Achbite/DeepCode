@@ -137,7 +137,7 @@ fn startup_route_is_available(
         && segments[0] == "api"
         && segments[1] == "session-store"
         && !segments[2].is_empty()
-        && segments[3] == "kernel-v3"
+        && segments[3] == "session-runs"
         && !segments[4].is_empty()
         && matches!(method, &Method::GET | &Method::POST)
     {
@@ -147,7 +147,7 @@ fn startup_route_is_available(
         && segments[0] == "api"
         && segments[1] == "session-store"
         && !segments[2].is_empty()
-        && segments[3] == "kernel-v3"
+        && segments[3] == "session-runs"
         && !segments[4].is_empty()
         && segments[5] == "records"
         && !segments[6].is_empty()

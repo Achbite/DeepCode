@@ -230,21 +230,28 @@ pub(crate) async fn agent_session_timeline_stream(
         }
     }
 
-    let Some(pinned_run_id) = resolve_timeline_stream_run_id(&state, &session_id, &authority).await
-    else {
-        return (
-            [
-                (header::CONTENT_TYPE, "text/event-stream"),
-                (header::CACHE_CONTROL, "no-cache"),
-                (
-                    header::HeaderName::from_static("x-content-type-options"),
-                    "nosniff",
-                ),
-            ],
-            axum::body::Body::empty(),
-        )
-            .into_response();
+    let pinned_run_id = match resolve_timeline_stream_run_id(&state, &session_id, &authority).await
+    {
+        Ok(Some(run_id)) => run_id,
+        Ok(None) => {
+            return ApiResponse::error(
+                "agent_timeline_unavailable",
+                "Session v2 public timeline is not available",
+            )
+            .into_response()
+        }
+        Err(error) => return ApiResponse::error(error.code, error.message).into_response(),
     };
+    {
+        let _io_guard = session_private_io_lock(&session_id).read_owned().await;
+        if let Err(error) = state
+            .host_services
+            .projection_v2
+            .latest_timeline_for_run(&session_id, &pinned_run_id)
+        {
+            return ApiResponse::error(error.code, error.message).into_response();
+        }
+    }
 
     let stream_state = state.clone();
     let stream = async_stream::stream! {
@@ -262,15 +269,25 @@ pub(crate) async fn agent_session_timeline_stream(
                             .host_services
                             .projection_v2
                             .latest_timeline_for_run(&session_id, &pinned_run_id)
-                            .ok()
-                            .flatten()
+                    };
+                    let terminal = match terminal {
+                        Ok(terminal) => terminal,
+                        Err(error) => {
+                            yield Err::<bytes::Bytes, std::io::Error>(
+                                std::io::Error::other(format!("{}: {}", error.code, error.message))
+                            );
+                            break;
+                        }
                     };
                     if terminal.as_ref().is_some_and(timeline_is_terminal) {
                         if let RunPinnedTimelineStreamActionV2::Event {
                             name, payload, ..
                         } = cursor.observe(&session_id, terminal)
                         {
-                            yield timeline_sse_bytes(&name, payload);
+                            yield Ok::<bytes::Bytes, std::io::Error>(
+                                timeline_sse_bytes(&name, payload)
+                                    .expect("timeline SSE serialization is infallible")
+                            );
                         }
                     }
                 }
@@ -299,7 +316,12 @@ pub(crate) async fn agent_session_timeline_stream(
             };
             let latest = match latest {
                 Ok(latest) => latest,
-                Err(_) => break,
+                Err(error) => {
+                    yield Err::<bytes::Bytes, std::io::Error>(
+                        std::io::Error::other(format!("{}: {}", error.code, error.message))
+                    );
+                    break;
+                }
             };
 
             match cursor.observe(&session_id, latest) {
@@ -308,7 +330,10 @@ pub(crate) async fn agent_session_timeline_stream(
                     payload,
                     terminal,
                 } => {
-                    yield timeline_sse_bytes(&name, payload);
+                    yield Ok::<bytes::Bytes, std::io::Error>(
+                        timeline_sse_bytes(&name, payload)
+                            .expect("timeline SSE serialization is infallible")
+                    );
                     if terminal {
                         break;
                     }
@@ -319,7 +344,7 @@ pub(crate) async fn agent_session_timeline_stream(
 
             if heartbeat_at.elapsed() >= Duration::from_secs(10) {
                 heartbeat_at = Instant::now();
-                yield Ok::<bytes::Bytes, std::convert::Infallible>(
+                yield Ok::<bytes::Bytes, std::io::Error>(
                     bytes::Bytes::from_static(b": heartbeat\n\n")
                 );
             }
@@ -344,9 +369,9 @@ async fn resolve_timeline_stream_run_id(
     state: &AppState,
     session_id: &str,
     authority: &TimelineTransportAuthorityV2,
-) -> Option<String> {
+) -> Result<Option<String>, crate::host_v2_storage::HostV2StorageError> {
     match authority {
-        TimelineTransportAuthorityV2::Run { run_id, .. } => Some(run_id.clone()),
+        TimelineTransportAuthorityV2::Run { run_id, .. } => Ok(Some(run_id.clone())),
         TimelineTransportAuthorityV2::HostViewer => {
             let _io_guard = session_private_io_lock(session_id).read_owned().await;
             match state
@@ -354,15 +379,16 @@ async fn resolve_timeline_stream_run_id(
                 .active_runs_v2
                 .resolve_session_active_run(session_id)
             {
-                Ok(Some(active)) => Some(active.run_id),
+                Ok(Some(active)) => Ok(Some(active.run_id)),
                 Ok(None) => state
                     .host_services
                     .projection_v2
                     .latest_timeline(session_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|timeline| timeline_run_id(&timeline).map(ToOwned::to_owned)),
-                Err(_) => None,
+                    .map(|timeline| {
+                        timeline
+                            .and_then(|timeline| timeline_run_id(&timeline).map(ToOwned::to_owned))
+                    }),
+                Err(error) => Err(error),
             }
         }
     }
@@ -454,10 +480,6 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
     if base.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Err("timeline delta belongs to another Session".to_string());
     }
-    let legacy_prefix_turn_count = timeline_optional_u64_field(next, "legacyPrefixTurnCount")?;
-    if timeline_optional_u64_field(base, "legacyPrefixTurnCount")? != legacy_prefix_turn_count {
-        return Err("timeline delta cannot change the normalized legacy prefix".to_string());
-    }
     let next_turns = next
         .get("turns")
         .and_then(Value::as_array)
@@ -466,14 +488,6 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
         .get("turns")
         .and_then(Value::as_array)
         .ok_or_else(|| "timeline turns are missing".to_string())?;
-    let legacy_prefix_len = usize::try_from(legacy_prefix_turn_count)
-        .map_err(|_| "timeline legacyPrefixTurnCount is invalid".to_string())?;
-    if legacy_prefix_len > base_turns.len() || legacy_prefix_len > next_turns.len() {
-        return Err("timeline legacyPrefixTurnCount exceeds turns".to_string());
-    }
-    if base_turns[..legacy_prefix_len] != next_turns[..legacy_prefix_len] {
-        return Err("timeline delta cannot mutate the normalized legacy prefix".to_string());
-    }
     let mut base_by_id = HashMap::new();
     for turn in base_turns {
         let id = turn
@@ -521,7 +535,6 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
     Ok(json!({
         "schemaVersion": next.get("schemaVersion").cloned().unwrap_or(Value::Null),
         "shapeVersion": next.get("shapeVersion").cloned().unwrap_or(Value::Null),
-        "legacyPrefixTurnCount": legacy_prefix_turn_count,
         "sessionId": session_id,
         "baseRevision": base_revision,
         "revision": revision,
@@ -539,15 +552,6 @@ fn timeline_u64_field(value: &Value, field: &str) -> Result<u64, String> {
         .get(field)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("Session timeline {field} is invalid"))
-}
-
-fn timeline_optional_u64_field(value: &Value, field: &str) -> Result<u64, String> {
-    match value.get(field) {
-        None => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| format!("Session timeline {field} is invalid")),
-    }
 }
 
 fn timeline_run_id(value: &Value) -> Option<&str> {

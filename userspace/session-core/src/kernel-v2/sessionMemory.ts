@@ -427,9 +427,6 @@ function decodeConversationPayload(
   )
     ? (value as Record<string, unknown>).projectionKind
     : undefined;
-  const legacyCompleted = kind === 'assistant_msg'
-    && projectionKind === 'provider.completed'
-    && Object.hasOwn(value as object, 'content');
   const record = exactObject(
     value,
     kind === 'user_msg'
@@ -443,24 +440,15 @@ function decodeConversationPayload(
             'streamSequence',
             'textOrdinal',
           ]
-        : legacyCompleted
-          ? [
-              ...common,
-              'content',
-              'status',
-              'outputKind',
-              'providerTurnId',
-              'providerOutcome',
-            ]
-          : [
-              ...common,
-              'status',
-              'outputKind',
-              'providerTurnId',
-              'terminalScope',
-              'orderedItems',
-              'providerOutcome',
-            ],
+        : [
+            ...common,
+            'status',
+            'outputKind',
+            'providerTurnId',
+            'terminalScope',
+            'orderedItems',
+            'providerOutcome',
+          ],
     kind === 'assistant_msg'
       && projectionKind === 'provider.composing'
       ? ['providerPhase']
@@ -520,38 +508,12 @@ function decodeConversationPayload(
       | 'provider.composing'
       | 'provider.completed',
     content: record.projectionKind === 'provider.completed'
-      ? legacyCompleted
-        ? legacyProviderCompletedMemoryText(record)
-        : providerCompletedMemoryText(record)
+      ? providerCompletedMemoryText(record)
       : record.content,
     attachments: kind === 'user_msg'
       ? record.attachments
       : [],
   };
-}
-
-function legacyProviderCompletedMemoryText(
-  record: Record<string, unknown>
-): string {
-  if (
-    record.channel !== 'final'
-    || record.visibility !== 'conversation'
-    || record.status !== 'completed'
-    || record.outputKind !== 'answer'
-    || !Number.isSafeInteger(record.controlEpoch)
-    || Number(record.controlEpoch) <= 0
-  ) {
-    throw invalidMemory(
-      'session_prior_event_projection_schema_unsupported',
-      'Prior legacy Provider completion is not an exact settled answer.'
-    );
-  }
-  identity(record.providerTurnId, 'providerTurnId');
-  return boundedText(
-    record.content,
-    'provider.completed.content',
-    1024 * 1024
-  );
 }
 
 function providerCompletedMemoryText(

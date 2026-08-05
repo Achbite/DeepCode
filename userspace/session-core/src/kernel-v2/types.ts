@@ -194,7 +194,7 @@ export type SessionProviderOrderedItemV2 =
     }
   | {
       kind: 'toolCall';
-      source: 'providerNative' | 'textFrame';
+      source: 'providerNative';
       ordinal: number;
       callId: string;
       toolName: string;
@@ -433,6 +433,15 @@ export interface SessionProviderTurnInputV2 {
     textOrdinal: number;
     providerPhase?: 'commentary';
     textDelta: string;
+  }) => Promise<void>;
+  /**
+   * Ephemeral metadata-only hook for replaceable Provider activity. It never
+   * carries reasoning text, raw upstream envelopes, or Provider arguments.
+   */
+  publicActivityObserver?: (activity: {
+    providerTurnId: string;
+    activitySequence: number;
+    code: 'provider.reasoning' | 'provider.composing';
   }) => Promise<void>;
   signal: AbortSignal;
 }

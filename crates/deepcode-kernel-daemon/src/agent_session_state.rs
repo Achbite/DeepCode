@@ -37,7 +37,7 @@ pub(crate) fn create_agent_session_value(
     })
 }
 
-pub(crate) fn session_schema_is_compatible(session: &Value) -> bool {
+pub(crate) fn session_schema_is_current(session: &Value) -> bool {
     session.get("sessionSchemaVersion").and_then(Value::as_str) == Some(AGENT_SESSION_SCHEMA_V2)
         && session.get("historySchema").and_then(Value::as_str)
             == Some(SESSION_KERNEL_HISTORY_SCHEMA_V3)
@@ -45,7 +45,7 @@ pub(crate) fn session_schema_is_compatible(session: &Value) -> bool {
             == Some(deepcode_kernel_abi::KERNEL_ABI_V2_VERSION)
 }
 
-pub(crate) fn incompatible_session_response() -> Json<ApiResponse> {
+pub(crate) fn unsupported_session_schema_response() -> Json<ApiResponse> {
     ApiResponse::error(
         "unsupported_history_schema",
         format!(
@@ -73,7 +73,7 @@ pub(crate) fn session_is_deletion_tombstone(session: &Value) -> bool {
 }
 
 pub(crate) fn session_is_verified_selectable(session: &Value) -> bool {
-    session_schema_is_compatible(session)
+    session_schema_is_current(session)
         && !is_archived_session(session)
         && session.get("deletion").is_none()
 }
@@ -321,8 +321,8 @@ pub(crate) fn verified_selectable_session<'a>(
         .iter()
         .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
         .ok_or_else(|| ApiResponse::error("agent_session_not_found", "agent session not found"))?;
-    if !session_schema_is_compatible(session) {
-        return Err(incompatible_session_response());
+    if !session_schema_is_current(session) {
+        return Err(unsupported_session_schema_response());
     }
     if session.get("deletion").is_some() {
         return Err(if session_is_deletion_tombstone(session) {
@@ -331,7 +331,7 @@ pub(crate) fn verified_selectable_session<'a>(
                 "Session deletion is pending or failed and must be retried before use",
             )
         } else {
-            incompatible_session_response()
+            unsupported_session_schema_response()
         });
     }
     if is_archived_session(session) {
@@ -453,7 +453,9 @@ pub(crate) fn first_user_message_content(events: &[Value]) -> Option<String> {
     })
 }
 
-pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
+pub(crate) fn refresh_pending_session_titles(
+    gui: &mut GuiState,
+) -> Result<(), crate::host_v2_storage::HostV2StorageError> {
     let sessions_dir = gui.paths.sessions_dir.clone();
     let pending_ids = gui
         .sessions
@@ -473,12 +475,12 @@ pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
         .collect::<Vec<_>>();
 
     for session_id in pending_ids {
-        let events = read_session_kernel_v2_public_agent_events(&sessions_dir, &session_id)
-            .unwrap_or_default();
+        let events = read_session_kernel_v2_public_agent_events(&sessions_dir, &session_id)?;
         if let Some(content) = first_user_message_content(&events) {
             maybe_auto_title_session(gui, &session_id, &content);
         }
     }
+    Ok(())
 }
 
 pub(crate) fn has_session(gui: &GuiState, session_id: &str) -> bool {
@@ -497,21 +499,5 @@ pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiRespon
         Ok(session) => session,
         Err(response) => return response,
     };
-    let events =
-        match read_session_kernel_v2_public_agent_events(&gui.paths.sessions_dir, session_id) {
-            Ok(events) => events,
-            Err(error) => {
-                return ApiResponse::error(
-                    error.code,
-                    format!(
-                        "Session v2 public projection is unavailable: {}",
-                        error.message
-                    ),
-                )
-            }
-        };
-    ApiResponse::ok(json!({
-        "session": session,
-        "events": events
-    }))
+    ApiResponse::ok(json!({ "session": session }))
 }

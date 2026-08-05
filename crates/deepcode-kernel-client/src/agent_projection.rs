@@ -84,10 +84,6 @@ pub enum AgentTimelineBlockKind {
     User,
     #[serde(rename = "assistant")]
     Assistant,
-    #[serde(rename = "thinking")]
-    Thinking,
-    #[serde(rename = "stage")]
-    Stage,
     #[serde(rename = "permission")]
     Permission,
     #[serde(rename = "plan")]
@@ -96,28 +92,18 @@ pub enum AgentTimelineBlockKind {
     Review,
     #[serde(rename = "error")]
     Error,
-    #[serde(rename = "turnActions")]
-    TurnActions,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AgentTimelineNarrativeKind {
     #[serde(rename = "user")]
     User,
-    #[serde(rename = "thinking")]
-    Thinking,
-    #[serde(rename = "assistantNarration")]
-    AssistantNarration,
     #[serde(rename = "assistantText")]
     AssistantText,
-    #[serde(rename = "operationEvidence")]
-    OperationEvidence,
     #[serde(rename = "plan")]
     Plan,
     #[serde(rename = "permission")]
     Permission,
-    #[serde(rename = "verification")]
-    Verification,
     #[serde(rename = "review")]
     Review,
     #[serde(rename = "diagnostic")]
@@ -130,10 +116,6 @@ pub enum AgentTimelineEntryRole {
     UserMessage,
     #[serde(rename = "agentUpdate")]
     AgentUpdate,
-    #[serde(rename = "activityGroup")]
-    ActivityGroup,
-    #[serde(rename = "evidence")]
-    Evidence,
     #[serde(rename = "interaction")]
     Interaction,
     #[serde(rename = "finalAnswer")]
@@ -254,67 +236,6 @@ pub struct AgentTimelineLocalizedText {
     pub message_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_args: Option<BTreeMap<String, String>>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AgentConversationActivityKind {
-    #[serde(rename = "providerThinking")]
-    ProviderThinking,
-    #[serde(rename = "resourceSearch")]
-    ResourceSearch,
-    #[serde(rename = "resourceRead")]
-    ResourceRead,
-    #[serde(rename = "toolExecution")]
-    ToolExecution,
-    #[serde(rename = "reviewCheckpoint")]
-    ReviewCheckpoint,
-    #[serde(rename = "diagnostic")]
-    Diagnostic,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AgentConversationActivitySource {
-    #[serde(rename = "session")]
-    Session,
-    #[serde(rename = "kernel")]
-    Kernel,
-    #[serde(rename = "provider")]
-    Provider,
-    #[serde(rename = "llm")]
-    Llm,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AgentConversationActivity {
-    pub activity_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activity_revision: Option<u64>,
-    pub kind: AgentConversationActivityKind,
-    pub status: AgentTimelineStatus,
-    pub title: String,
-    pub summary: String,
-    pub source: AgentConversationActivitySource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub draft_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub targets: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_ids: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -551,8 +472,6 @@ pub struct AgentTimelineBlock {
     pub entry_role: AgentTimelineEntryRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_phase: Option<AgentTimelineProviderPhase>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activity: Option<AgentConversationActivity>,
     pub title: String,
     pub summary: String,
     pub status: AgentTimelineStatus,
@@ -1065,8 +984,6 @@ pub struct AgentTimelineWorkspaceProjection {
 pub struct AgentTimelineSnapshot {
     pub schema_version: String,
     pub shape_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_prefix_turn_count: Option<u64>,
     pub session_id: String,
     pub revision: u64,
     pub source_event_version: u64,
@@ -1169,8 +1086,6 @@ pub struct AgentTimelineRootProjectionReplacements {
 pub struct AgentTimelineDelta {
     pub schema_version: String,
     pub shape_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_prefix_turn_count: Option<u64>,
     pub session_id: String,
     pub base_revision: u64,
     pub revision: u64,
@@ -1183,7 +1098,12 @@ pub struct AgentTimelineDelta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum AgentTimelineStreamEvent {
     Snapshot {
         session_id: String,
@@ -1195,6 +1115,98 @@ pub enum AgentTimelineStreamEvent {
         revision: u64,
         delta: AgentTimelineDelta,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentTimelineStreamReduction {
+    Unchanged,
+    Replace(AgentTimelineSnapshot),
+    ReconcileRequired {
+        current_revision: Option<u64>,
+        delta_base_revision: u64,
+    },
+}
+
+pub fn reduce_agent_timeline_stream_event(
+    current: Option<&AgentTimelineSnapshot>,
+    event: &AgentTimelineStreamEvent,
+) -> Result<AgentTimelineStreamReduction, AgentProjectionValidationError> {
+    event.validate()?;
+    match event {
+        AgentTimelineStreamEvent::Snapshot { snapshot, .. } => {
+            if let Some(current) = current {
+                if current.session_id != snapshot.session_id {
+                    return Err(AgentProjectionValidationError::new(
+                        "timeline stream snapshot belongs to another Session",
+                    ));
+                }
+                if snapshot.revision < current.revision {
+                    return Ok(AgentTimelineStreamReduction::Unchanged);
+                }
+                if snapshot.revision == current.revision {
+                    if serialized_projection_eq(current, snapshot)? {
+                        return Ok(AgentTimelineStreamReduction::Unchanged);
+                    }
+                    return Ok(AgentTimelineStreamReduction::ReconcileRequired {
+                        current_revision: Some(current.revision),
+                        delta_base_revision: snapshot.revision,
+                    });
+                }
+            }
+            Ok(AgentTimelineStreamReduction::Replace(snapshot.clone()))
+        }
+        AgentTimelineStreamEvent::Delta { delta, .. } => {
+            let Some(current) = current else {
+                return Ok(AgentTimelineStreamReduction::ReconcileRequired {
+                    current_revision: None,
+                    delta_base_revision: delta.base_revision,
+                });
+            };
+            if current.session_id != delta.session_id {
+                return Err(AgentProjectionValidationError::new(
+                    "timeline stream delta belongs to another Session",
+                ));
+            }
+            if delta.revision < current.revision {
+                return Ok(AgentTimelineStreamReduction::Unchanged);
+            }
+            if delta.revision == current.revision {
+                // A materialized snapshot cannot prove that a repeated delta with the same
+                // terminal revision has identical replacements or baseRevision. Reconcile
+                // against the canonical full snapshot instead of accepting metadata equality.
+                return Ok(AgentTimelineStreamReduction::ReconcileRequired {
+                    current_revision: Some(current.revision),
+                    delta_base_revision: delta.base_revision,
+                });
+            }
+            if current.revision != delta.base_revision {
+                return Ok(AgentTimelineStreamReduction::ReconcileRequired {
+                    current_revision: Some(current.revision),
+                    delta_base_revision: delta.base_revision,
+                });
+            }
+            Ok(AgentTimelineStreamReduction::Replace(
+                current.apply_delta(delta)?,
+            ))
+        }
+    }
+}
+
+fn serialized_projection_eq(
+    left: &AgentTimelineSnapshot,
+    right: &AgentTimelineSnapshot,
+) -> Result<bool, AgentProjectionValidationError> {
+    let left = serde_json::to_vec(left).map_err(|error| {
+        AgentProjectionValidationError::new(format!(
+            "current timeline snapshot could not be compared: {error}"
+        ))
+    })?;
+    let right = serde_json::to_vec(right).map_err(|error| {
+        AgentProjectionValidationError::new(format!(
+            "incoming timeline snapshot could not be compared: {error}"
+        ))
+    })?;
+    Ok(left == right)
 }
 
 impl AgentTimelineSnapshot {
@@ -1211,26 +1223,10 @@ impl AgentTimelineSnapshot {
             ));
         }
 
-        let legacy_prefix_len = self.legacy_prefix_turn_count.unwrap_or(0);
-        validate_safe_integer(legacy_prefix_len, "projection.legacyPrefixTurnCount")?;
-        let legacy_prefix_len = usize::try_from(legacy_prefix_len).map_err(|_| {
-            AgentProjectionValidationError::new(
-                "projection.legacyPrefixTurnCount cannot be represented on this platform",
-            )
-        })?;
-        if legacy_prefix_len > self.turns.len() {
-            return Err(AgentProjectionValidationError::new(
-                "projection.legacyPrefixTurnCount exceeds projection.turns",
-            ));
-        }
         let mut identities = ProjectionIdentities::default();
         for (index, turn) in self.turns.iter().enumerate() {
             validate_turn(turn, &self.session_id, &mut identities)?;
-            if index < legacy_prefix_len {
-                validate_normalized_legacy_turn_invariants(turn)?;
-            } else {
-                validate_native_turn_invariants(turn, Some(index as u64))?;
-            }
+            validate_native_turn_invariants(turn, Some(index as u64))?;
         }
         validate_optional_root_projections(
             self.task_projection.as_ref(),
@@ -1260,17 +1256,6 @@ impl AgentTimelineSnapshot {
                 self.revision, delta.base_revision
             )));
         }
-        let legacy_prefix_len = self.legacy_prefix_turn_count.unwrap_or(0);
-        if legacy_prefix_len != delta.legacy_prefix_turn_count.unwrap_or(0) {
-            return Err(AgentProjectionValidationError::new(
-                "timeline delta cannot change the normalized legacy prefix",
-            ));
-        }
-        let legacy_prefix_len = usize::try_from(legacy_prefix_len).map_err(|_| {
-            AgentProjectionValidationError::new(
-                "projection.legacyPrefixTurnCount cannot be represented on this platform",
-            )
-        })?;
         if delta.source_event_version <= self.source_event_version
             || delta.event_count <= self.event_count
         {
@@ -1297,22 +1282,13 @@ impl AgentTimelineSnapshot {
                 "timeline delta cannot replace and remove the same turn",
             ));
         }
-        if self.turns[..legacy_prefix_len].iter().any(|turn| {
-            removed.contains(turn.id.as_str()) || replacements.contains_key(turn.id.as_str())
-        }) {
-            return Err(AgentProjectionValidationError::new(
-                "timeline delta cannot replace or remove a normalized legacy prefix turn",
-            ));
-        }
-
         let mut turns = Vec::with_capacity(
             self.turns
                 .len()
                 .saturating_add(delta.turn_replacements.len()),
         );
         let mut known_turn_ids = HashSet::new();
-        turns.extend(self.turns[..legacy_prefix_len].iter().cloned());
-        for turn in &self.turns[legacy_prefix_len..] {
+        for turn in &self.turns {
             if removed.contains(turn.id.as_str()) {
                 continue;
             }
@@ -1329,14 +1305,13 @@ impl AgentTimelineSnapshot {
                 turns.push(replacement.clone());
             }
         }
-        turns[legacy_prefix_len..].sort_by_key(|turn| turn.sequence.unwrap_or(u64::MAX));
+        turns.sort_by_key(|turn| turn.sequence.unwrap_or(u64::MAX));
 
         let mut next = self.clone();
         next.revision = delta.revision;
         next.source_event_version = delta.source_event_version;
         next.generated_at = delta.generated_at.clone();
         next.event_count = delta.event_count;
-        next.legacy_prefix_turn_count = delta.legacy_prefix_turn_count;
         next.turns = turns;
         apply_root_replacements(&mut next, &delta.root_replacements);
         next.validate()?;
@@ -1353,10 +1328,6 @@ impl AgentTimelineDelta {
         validate_safe_integer(self.revision, "delta.revision")?;
         validate_safe_integer(self.source_event_version, "delta.sourceEventVersion")?;
         validate_safe_integer(self.event_count, "delta.eventCount")?;
-        validate_safe_integer(
-            self.legacy_prefix_turn_count.unwrap_or(0),
-            "delta.legacyPrefixTurnCount",
-        )?;
         if self.revision <= self.base_revision {
             return Err(AgentProjectionValidationError::new(
                 "delta.revision must be greater than delta.baseRevision",
@@ -1597,32 +1568,6 @@ fn validate_turn<'a>(
     Ok(())
 }
 
-fn validate_normalized_legacy_turn_invariants(
-    turn: &AgentTimelineTurn,
-) -> Result<(), AgentProjectionValidationError> {
-    if !turn.status.is_terminal() || !turn.work_segments.is_empty() {
-        return Err(AgentProjectionValidationError::new(
-            "normalized legacy turn must be terminal and contain no work segments",
-        ));
-    }
-    if turn.parts.len() != turn.blocks.len() {
-        return Err(AgentProjectionValidationError::new(
-            "normalized legacy turn parts changed the original block order",
-        ));
-    }
-    for (part, block) in turn.parts.iter().zip(&turn.blocks) {
-        if !matches!(
-            part,
-            AgentTimelineTurnPart::Block { block_id } if block_id == &block.id
-        ) {
-            return Err(AgentProjectionValidationError::new(
-                "normalized legacy turn parts changed the original block order",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_native_turn_invariants(
     turn: &AgentTimelineTurn,
     expected_sequence: Option<u64>,
@@ -1658,9 +1603,9 @@ fn validate_native_block_invariants(
     block: &AgentTimelineBlock,
     expected_sequence: u64,
 ) -> Result<(), AgentProjectionValidationError> {
-    if block.sequence != Some(expected_sequence) || block.activity.is_some() {
+    if block.sequence != Some(expected_sequence) {
         return Err(AgentProjectionValidationError::new(
-            "native block has invalid sequence or legacy activity",
+            "native block has invalid sequence",
         ));
     }
     let semantics_valid = match block.kind {
@@ -1708,9 +1653,6 @@ fn validate_native_block_invariants(
                 && block.entry_role == AgentTimelineEntryRole::Diagnostic
                 && block.provider_phase.is_none()
         }
-        AgentTimelineBlockKind::Thinking
-        | AgentTimelineBlockKind::Stage
-        | AgentTimelineBlockKind::TurnActions => false,
     };
     if !semantics_valid
         || (block.attachments.is_some() && !matches!(block.kind, AgentTimelineBlockKind::User))
@@ -1744,14 +1686,6 @@ fn validate_block(block: &AgentTimelineBlock) -> Result<(), AgentProjectionValid
             attachment.folder_id.as_deref(),
             "block.attachments.folderId",
         )?;
-    }
-    if let Some(activity) = &block.activity {
-        validate_identity(&activity.activity_id, "block.activity.activityId")?;
-        validate_optional_safe_integer(
-            activity.activity_revision,
-            "block.activity.activityRevision",
-        )?;
-        validate_optional_safe_integer(activity.item_count, "block.activity.itemCount")?;
     }
     if let Some(interaction) = &block.interaction {
         validate_interaction_view(interaction)?;

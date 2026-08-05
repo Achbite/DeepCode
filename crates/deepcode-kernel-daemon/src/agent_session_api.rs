@@ -11,7 +11,9 @@ pub(crate) async fn agent_sessions_list(
         return response;
     }
     let mut gui = state.gui.lock().expect("gui state lock");
-    refresh_pending_session_titles(&mut gui);
+    if let Err(error) = refresh_pending_session_titles(&mut gui) {
+        return ApiResponse::error(error.code, error.message);
+    }
     let include_archived = query.include_archived.unwrap_or(false);
     let scope_key = scope_key_from_query(&query);
     let sessions = if query.include_all_scopes.unwrap_or(false) {
@@ -138,7 +140,9 @@ pub(crate) async fn agent_session_current(
         return response;
     }
     let mut gui = state.gui.lock().expect("gui state lock");
-    refresh_pending_session_titles(&mut gui);
+    if let Err(error) = refresh_pending_session_titles(&mut gui) {
+        return ApiResponse::error(error.code, error.message);
+    }
     let scope_key = scope_key_from_query(&query);
     let session_id = query
         .project_id
@@ -171,7 +175,9 @@ pub(crate) async fn agent_session_activate(
                 .insert(scope_key, session_id.clone());
         }
         gui.current_session_id = Some(session_id.clone());
-        refresh_pending_session_titles(&mut gui);
+        if let Err(error) = refresh_pending_session_titles(&mut gui) {
+            return ApiResponse::error(error.code, error.message);
+        }
         return session_result(&gui, &session_id);
     }
     ApiResponse::error("agent_session_not_found", "agent session not found")
@@ -537,8 +543,8 @@ pub(crate) async fn agent_session_archive(
         else {
             return ApiResponse::error("agent_session_not_found", "agent session not found");
         };
-        if !session_schema_is_compatible(session) {
-            return incompatible_session_response();
+        if !session_schema_is_current(session) {
+            return unsupported_session_schema_response();
         }
         if session_is_deletion_tombstone(session) {
             return ApiResponse::error(
@@ -670,7 +676,7 @@ pub(crate) async fn agent_session_archive(
     }))
 }
 
-pub(crate) async fn agent_session_events(
+pub(crate) async fn agent_session_get(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
@@ -679,7 +685,6 @@ pub(crate) async fn agent_session_events(
     {
         return response;
     }
-    let _io_guard = session_private_io_lock(&session_id).read_owned().await;
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
 }

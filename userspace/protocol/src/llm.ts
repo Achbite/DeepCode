@@ -32,12 +32,11 @@ export type LlmResponseFormat = { type: 'json_object' };
 interface LlmProviderProfileFields {
   id: string;
   name: string;
-  providerFlavor?: LlmProviderFlavor;
+  providerFlavor: LlmProviderFlavor;
   baseUrl?: string;
   model: string;
   contextWindowTokens?: number;
   maxOutputTokens?: number;
-  maxTokens?: number;
   temperature?: number;
   reasoningEffort?: LlmReasoningEffort;
   thinking?: LlmThinkingMode;
@@ -47,21 +46,6 @@ interface LlmProviderProfileFields {
 
 export type LlmProviderProfile =
   LlmProviderProfileFields & LlmProviderReasoningContract;
-
-/**
- * Read model for stores created before the reasoning transport contract.
- *
- * This shape is intentionally excluded from write requests and execution
- * selection. It only lets settings surfaces show and repair the old profile.
- */
-export type LegacyReadableLlmProviderProfile = LlmProviderProfileFields & {
-  kind: LlmProviderKind;
-  reasoningTransport?: undefined;
-};
-
-export type ReadableLlmProviderProfile =
-  | LlmProviderProfile
-  | LegacyReadableLlmProviderProfile;
 
 export const LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND = {
   openaiCompatible: 'openaiPlaintext',
@@ -77,12 +61,7 @@ export function reasoningTransportForProviderKind<
   return LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND[kind];
 }
 
-/**
- * Runtime compatibility check for profiles loaded from durable stores.
- *
- * Older profiles without `reasoningTransport` remain readable, but callers
- * must not offer them for execution until the user saves a matching contract.
- */
+/** Runtime validation for the current Provider profile contract. */
 export function hasCompatibleReasoningTransport<
   Profile extends {
     kind: LlmProviderKind;
@@ -142,16 +121,9 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
 ];
 
 export interface LlmProfilesResult {
-  profiles: ReadableLlmProviderProfile[];
+  profiles: LlmProviderProfile[];
   defaultProfileId?: string;
   storePath?: string;
-  profileMigrations?: AgentSessionProfileMigration[];
-}
-
-export interface AgentSessionProfileMigration {
-  sessionId: string;
-  fromProfileId?: string;
-  toProfileId: string;
 }
 
 export interface PatchLlmProfilesRequest {

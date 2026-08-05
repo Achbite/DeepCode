@@ -88,9 +88,13 @@ pub(crate) async fn ask(
     let mut request = StartAgentRunRequest::ask(prompt, caller_request_id);
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
-    let (result, final_text) =
+    let (result, final_text, final_already_streamed) =
         match start_and_wait_for_run(client, &session_id, request, !plain).await? {
-            StartedRunOutcome::Settled { result, final_text } => (result, final_text),
+            StartedRunOutcome::Settled {
+                result,
+                final_text,
+                final_already_streamed,
+            } => (result, final_text, final_already_streamed),
             StartedRunOutcome::ActionRequired(message) => {
                 return Ok(CliCommandOutcome::ActionRequired(message));
             }
@@ -100,7 +104,9 @@ pub(crate) async fn ask(
         return Ok(CliCommandOutcome::Completed);
     }
     eprintln!("session: {}", result.run.session_id);
-    println!("{final_text}");
+    if !final_already_streamed {
+        println!("{final_text}");
+    }
     Ok(CliCommandOutcome::Completed)
 }
 
@@ -171,7 +177,7 @@ pub(crate) async fn resolve_session_decision(
                 .map(|value| format!(" for run {value}"))
                 .unwrap_or_default();
             format!(
-                "no exact pending {kind} decision{run_hint} is available in Shared Projection v2; legacy snapshots are read-only"
+                "no exact pending {kind} decision{run_hint} is available in Shared Projection v2; unsupported histories are rejected"
             )
         },
     )?;
@@ -194,15 +200,21 @@ pub(crate) async fn resolve_session_decision(
     request.run_id = Some(pending.run_id);
     request.target_id = Some(pending.target_id);
     request.guidance = guidance;
-    let (result, final_text) =
+    let (result, final_text, final_already_streamed) =
         match start_and_wait_for_run(client, &session_id, request, true).await? {
-            StartedRunOutcome::Settled { result, final_text } => (result, final_text),
+            StartedRunOutcome::Settled {
+                result,
+                final_text,
+                final_already_streamed,
+            } => (result, final_text, final_already_streamed),
             StartedRunOutcome::ActionRequired(message) => {
                 return Ok(CliCommandOutcome::ActionRequired(message));
             }
         };
     eprintln!("session: {}", result.run.session_id);
-    println!("{final_text}");
+    if !final_already_streamed {
+        println!("{final_text}");
+    }
     Ok(CliCommandOutcome::Completed)
 }
 
@@ -210,14 +222,8 @@ enum StartedRunOutcome {
     Settled {
         result: AgentRunResult,
         final_text: String,
+        final_already_streamed: bool,
     },
-    ActionRequired(String),
-}
-
-enum RunPollDisposition {
-    Continue,
-    Refreshed(AgentRunResult),
-    Settled,
     ActionRequired(String),
 }
 
@@ -326,6 +332,60 @@ async fn sleep_until_reconcile_retry(deadline: Instant) {
     }
 }
 
+async fn wait_for_optional_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn bounded_cli_stage_deadline(run_deadline: Option<Instant>, stage_window: Duration) -> Instant {
+    let stage_deadline = Instant::now() + stage_window;
+    run_deadline
+        .map(|deadline| deadline.min(stage_deadline))
+        .unwrap_or(stage_deadline)
+}
+
+async fn cancel_exact_run_before_cli_exit(
+    client: &HttpKernelClient,
+    result: &AgentRunResult,
+) -> Result<(), String> {
+    const CANCEL_REQUEST_WINDOW: Duration = Duration::from_secs(4);
+    if result.run.is_terminal() {
+        return Ok(());
+    }
+    let caller_request_id = match new_cli_request_id("cancel-on-exit") {
+        Ok(request_id) => request_id,
+        Err(error) => {
+            return Err(format!(
+                "could not create the exact cancellation identity for Host Run {}: {error}",
+                result.run.run_id
+            ))
+        }
+    };
+    match tokio::time::timeout(
+        CANCEL_REQUEST_WINDOW,
+        client.cancel_agent_run_by_id(
+            &result.run.session_id,
+            &result.run.run_id,
+            AgentRunCallerRequest::new(caller_request_id),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!(
+            "exact cancellation for Host Run {} failed: {error}",
+            result.run.run_id
+        )),
+        Err(_) => Err(format!(
+            "exact cancellation for Host Run {} did not complete within {} ms",
+            result.run.run_id,
+            CANCEL_REQUEST_WINDOW.as_millis()
+        )),
+    }
+}
+
 fn new_cli_request_id(prefix: &str) -> Result<String, String> {
     Ok(format!(
         "cli-{prefix}-{}-{}",
@@ -369,24 +429,59 @@ async fn start_and_wait_for_run(
     request: StartAgentRunRequest,
     show_progress: bool,
 ) -> Result<StartedRunOutcome, String> {
-    let baseline = client
-        .agent_timeline_v2_optional(session_id)
-        .await
-        .map_err(|error| {
+    const PROJECTION_BASELINE_WINDOW: Duration = Duration::from_secs(10);
+    const RUN_ADMISSION_WINDOW: Duration = Duration::from_secs(15);
+    let run_timeout = cli_run_timeout()?;
+    let run_started = Instant::now();
+    let run_deadline = run_timeout.map(|limit| run_started + limit);
+    let baseline_deadline = bounded_cli_stage_deadline(run_deadline, PROJECTION_BASELINE_WINDOW);
+    let baseline_budget = baseline_deadline.saturating_duration_since(run_started);
+    let mut baseline_request = Box::pin(client.agent_timeline_v2_optional(session_id));
+    let baseline = tokio::select! {
+        baseline = &mut baseline_request => baseline.map_err(|error| {
             format!("failed to establish typed Shared Projection v2 baseline: {error}")
-        })?;
+        })?,
+        _ = wait_for_cli_interrupt() => {
+            return Err(
+                "CLI was interrupted before Session Run admission; the owned Kernel guard will be reclaimed"
+                    .to_string(),
+            );
+        }
+        _ = wait_for_optional_deadline(Some(baseline_deadline)) => {
+            return Err(format!(
+                "Shared Projection baseline exceeded its bounded phase window of {} ms",
+                baseline_budget.as_millis()
+            ));
+        }
+    };
+    drop(baseline_request);
     let mut live_projection =
         LiveProjectionCursor::from_baseline(baseline.as_ref(), &request, show_progress)?;
     let mut start = Box::pin(client.start_agent_run(session_id, request));
+    let admission_started = Instant::now();
+    let admission_deadline = bounded_cli_stage_deadline(run_deadline, RUN_ADMISSION_WINDOW);
+    let admission_budget = admission_deadline.saturating_duration_since(admission_started);
     let mut refresh = tokio::time::interval(RUN_POLL_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     refresh.tick().await;
-    let result = 'start: loop {
+    let mut result = 'start: loop {
         tokio::select! {
             result = &mut start => {
                 break 'start result.map_err(|error| {
                     format!("failed to start shared session run: {error}")
                 })?;
+            }
+            _ = wait_for_cli_interrupt() => {
+                return Err(
+                    "CLI was interrupted before the daemon returned an exact Run identity; the owned Kernel guard will be reclaimed"
+                        .to_string(),
+                );
+            }
+            _ = wait_for_optional_deadline(Some(admission_deadline)) => {
+                return Err(format!(
+                    "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available",
+                    admission_budget.as_millis()
+                ));
             }
             _ = refresh.tick() => {
                 let mut projection = Box::pin(client.agent_timeline_v2_optional(session_id));
@@ -395,6 +490,18 @@ async fn start_and_wait_for_run(
                         break 'start result.map_err(|error| {
                             format!("failed to start shared session run: {error}")
                         })?;
+                    }
+                    _ = wait_for_cli_interrupt() => {
+                        return Err(
+                            "CLI was interrupted before the daemon returned an exact Run identity; the owned Kernel guard will be reclaimed"
+                                .to_string(),
+                        );
+                    }
+                    _ = wait_for_optional_deadline(Some(admission_deadline)) => {
+                        return Err(format!(
+                            "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available",
+                            admission_budget.as_millis()
+                        ));
                     }
                     timeline = &mut projection => match timeline {
                         Ok(Some(timeline)) => {
@@ -429,6 +536,18 @@ async fn start_and_wait_for_run(
                                             );
                                         }
                                     },
+                                    _ = wait_for_cli_interrupt() => {
+                                        return Err(
+                                            "CLI was interrupted before the daemon returned an exact Run identity; the owned Kernel guard will be reclaimed"
+                                                .to_string(),
+                                        );
+                                    }
+                                    _ = wait_for_optional_deadline(Some(admission_deadline)) => {
+                                        return Err(format!(
+                                            "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available",
+                                            admission_budget.as_millis()
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -441,8 +560,43 @@ async fn start_and_wait_for_run(
             }
         }
     };
-    bind_live_projection_to_host_result(client, &result, &mut live_projection).await?;
-    wait_for_started_run(client, result, live_projection).await
+    let mut binding = Box::pin(bind_live_projection_to_host_result(
+        client,
+        &result,
+        &mut live_projection,
+    ));
+    let binding_result = tokio::select! {
+        binding = &mut binding => binding,
+        _ = wait_for_cli_interrupt() => Err(
+            "CLI was interrupted while binding the exact typed Run identity".to_string(),
+        ),
+        _ = wait_for_optional_deadline(run_deadline) => Err(format!(
+            "typed Run identity binding exceeded the configured CLI timeout of {} ms",
+            run_timeout.map(|limit| limit.as_millis()).unwrap_or_default()
+        )),
+    };
+    drop(binding);
+    if let Err(error) = binding_result {
+        return match cancel_exact_run_before_cli_exit(client, &result).await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; {cleanup}")),
+        };
+    }
+    match wait_for_started_run(
+        client,
+        &mut result,
+        live_projection,
+        run_timeout,
+        run_deadline,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => match cancel_exact_run_before_cli_exit(client, &result).await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; {cleanup}")),
+        },
+    }
 }
 
 async fn bind_live_projection_to_host_result(
@@ -535,62 +689,104 @@ async fn bind_live_projection_to_host_result(
     }
 }
 
-async fn refresh_live_projection(
-    client: &HttpKernelClient,
-    session_id: &str,
-    cursor: &mut LiveProjectionCursor,
-) -> Result<(), String> {
-    match client.agent_timeline_v2_optional(session_id).await {
-        Ok(Some(timeline)) => cursor.observe(&timeline),
-        Ok(None) => Ok(()),
-        Err(error) => {
-            cursor.report_refresh_error_once(&error.to_string());
-            Ok(())
-        }
-    }
-}
-
 async fn wait_for_started_run(
     client: &HttpKernelClient,
-    mut result: AgentRunResult,
+    result: &mut AgentRunResult,
     mut live_projection: LiveProjectionCursor,
+    run_timeout: Option<Duration>,
+    run_deadline: Option<Instant>,
 ) -> Result<StartedRunOutcome, String> {
-    let run_timeout = cli_run_timeout()?;
-    let run_started = Instant::now();
+    let mut projection_stream = if live_projection.bound_run_terminal().is_some() {
+        None
+    } else {
+        reopen_live_projection_stream(client, &result, &live_projection, run_deadline).await?
+    };
+    let mut maintenance_tick = tokio::time::interval(RUN_POLL_INTERVAL);
+    maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    maintenance_tick.tick().await;
     loop {
-        match run_poll_disposition(client, &result.run).await? {
-            RunPollDisposition::Continue => {}
-            RunPollDisposition::Refreshed(refreshed) => {
-                result = refreshed;
-                continue;
-            }
-            RunPollDisposition::Settled => break,
-            RunPollDisposition::ActionRequired(message) => {
-                refresh_live_projection(client, &result.run.session_id, &mut live_projection)
-                    .await?;
-                live_projection.finish_commentary_line()?;
-                return Ok(StartedRunOutcome::ActionRequired(message));
-            }
+        if let Some(projection_status) = live_projection.bound_run_terminal() {
+            *result =
+                reconcile_host_terminal_after_projection(client, result, projection_status).await?;
+            break;
         }
-        if let Some(limit) = run_timeout {
-            if run_started.elapsed() >= limit {
+        if let Some(message) = live_projection.bound_action_required(&result.run.run_id) {
+            reconcile_host_wait_after_projection(client, &result).await?;
+            live_projection.finish_commentary_line()?;
+            return Ok(StartedRunOutcome::ActionRequired(message));
+        }
+        tokio::select! {
+            stream_event = next_live_projection_event(&mut projection_stream) => {
+                match stream_event {
+                    Ok(Some(event)) => {
+                        if live_projection.apply_stream_event(&event)? {
+                            reconcile_live_projection_snapshot(
+                                client,
+                                &result.run.session_id,
+                                &mut live_projection,
+                                run_deadline,
+                            )
+                            .await?;
+                            projection_stream = reopen_live_projection_stream(
+                                client,
+                                &result,
+                                &live_projection,
+                                run_deadline,
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(None) => {
+                        reconcile_live_projection_snapshot(
+                            client,
+                            &result.run.session_id,
+                            &mut live_projection,
+                            run_deadline,
+                        )
+                        .await?;
+                        projection_stream = None;
+                    }
+                    Err(error) => {
+                        live_projection.report_refresh_error_once(&error.to_string());
+                        reconcile_live_projection_snapshot(
+                            client,
+                            &result.run.session_id,
+                            &mut live_projection,
+                            run_deadline,
+                        )
+                        .await?;
+                        projection_stream = None;
+                    }
+                }
+            }
+            _ = wait_for_cli_interrupt() => {
                 return Err(format!(
-                    "shared session run {} is still {} after {} ms; inspect it with `DeepCode-CLI timeline {}` or set {CLI_RUN_TIMEOUT_ENV}=0 to wait without a CLI-side timeout",
-                    result.run.run_id,
-                    result.run.status,
-                    limit.as_millis(),
-                    result.run.session_id
+                    "shared session run {} was interrupted by the CLI user",
+                    result.run.run_id
                 ));
             }
+            _ = wait_for_optional_deadline(run_deadline) => {
+                return Err(format!(
+                    "shared session run {} is still {} after {} ms",
+                    result.run.run_id,
+                    result.run.status,
+                    run_timeout.map(|limit| limit.as_millis()).unwrap_or_default()
+                ));
+            }
+            _ = maintenance_tick.tick() => {
+                if projection_stream.is_none()
+                    && live_projection.bound_run_terminal().is_none()
+                {
+                    projection_stream = reopen_live_projection_stream(
+                        client,
+                        &result,
+                        &live_projection,
+                        run_deadline,
+                    )
+                    .await?;
+                }
+            }
         }
-        tokio::time::sleep(RUN_POLL_INTERVAL).await;
-        refresh_live_projection(client, &result.run.session_id, &mut live_projection).await?;
-        let session_id = result.run.session_id.clone();
-        let run_id = result.run.run_id.clone();
-        result = client
-            .get_agent_run(&session_id, &run_id)
-            .await
-            .map_err(|error| format!("failed to read shared session run: {error}"))?;
     }
     if matches!(result.run.status.as_str(), "failed" | "cancelled") {
         let _ = reconcile_terminal_projection(client, &result, &mut live_projection).await?;
@@ -614,141 +810,213 @@ async fn wait_for_started_run(
                 result.run.run_id
             )
         })?;
+    let final_already_streamed = live_projection.committed_final_was_streamed(&final_text);
     live_projection.finish_commentary_line()?;
-    Ok(StartedRunOutcome::Settled { result, final_text })
+    Ok(StartedRunOutcome::Settled {
+        result: result.clone(),
+        final_text,
+        final_already_streamed,
+    })
 }
 
-async fn run_poll_disposition(
+async fn reconcile_live_projection_snapshot(
     client: &HttpKernelClient,
-    run: &deepcode_kernel_client::AgentRunStatus,
-) -> Result<RunPollDisposition, String> {
-    if run.is_terminal() {
-        return Ok(RunPollDisposition::Settled);
+    session_id: &str,
+    cursor: &mut LiveProjectionCursor,
+    run_deadline: Option<Instant>,
+) -> Result<(), String> {
+    const SNAPSHOT_RECONCILE_WINDOW: Duration = Duration::from_secs(4);
+    let requested_at = Instant::now();
+    let stage_deadline = requested_at + SNAPSHOT_RECONCILE_WINDOW;
+    let deadline = run_deadline
+        .map(|deadline| deadline.min(stage_deadline))
+        .unwrap_or(stage_deadline);
+    let budget = deadline.saturating_duration_since(requested_at);
+    if budget.is_zero() {
+        return Err(
+            "typed Shared Projection snapshot reconciliation exceeded the configured CLI timeout"
+                .to_string(),
+        );
     }
-    if run.status != "waiting" {
-        return Ok(RunPollDisposition::Continue);
-    }
+    let mut request = Box::pin(client.agent_timeline_v2(session_id));
+    let timeline = tokio::select! {
+        timeline = &mut request => timeline.map_err(|error| {
+            format!("failed to reconcile typed Shared Projection v2 snapshot: {error}")
+        })?,
+        _ = wait_for_cli_interrupt() => {
+            return Err(
+                "CLI was interrupted while reconciling the typed Shared Projection snapshot"
+                    .to_string(),
+            );
+        }
+        _ = wait_for_optional_deadline(Some(deadline)) => {
+            return Err(format!(
+                "typed Shared Projection snapshot reconciliation exceeded {} ms",
+                budget.as_millis()
+            ));
+        }
+    };
+    cursor.observe(&timeline)
+}
 
-    tokio::time::timeout(Duration::from_secs(2), reconcile_waiting_run(client, run))
+async fn next_live_projection_event(
+    stream: &mut Option<deepcode_kernel_client::AgentTimelineSseStream>,
+) -> deepcode_kernel_client::KernelClientResult<
+    Option<deepcode_kernel_client::AgentTimelineStreamEvent>,
+> {
+    match stream {
+        Some(stream) => stream.next_event().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn reopen_live_projection_stream(
+    client: &HttpKernelClient,
+    result: &AgentRunResult,
+    cursor: &LiveProjectionCursor,
+    run_deadline: Option<Instant>,
+) -> Result<Option<deepcode_kernel_client::AgentTimelineSseStream>, String> {
+    const SSE_OPEN_WINDOW: Duration = Duration::from_secs(10);
+    if cursor.bound_run_terminal().is_some() {
+        return Ok(None);
+    }
+    let open_started = Instant::now();
+    let stage_deadline = open_started + SSE_OPEN_WINDOW;
+    let deadline = run_deadline
+        .map(|deadline| deadline.min(stage_deadline))
+        .unwrap_or(stage_deadline);
+    let open_budget = deadline.saturating_duration_since(open_started);
+    tokio::select! {
+        stream = client.agent_timeline_stream_v2(
+            &result.run.session_id,
+            Some(cursor.last_revision),
+        ) => stream.map(Some).map_err(|error| {
+            format!(
+                "failed to open typed Shared Projection v2 stream for Host Run {}: {error}",
+                result.run.run_id
+            )
+        }),
+        _ = wait_for_cli_interrupt() => Err(format!(
+            "CLI was interrupted while opening the typed Shared Projection stream for Host Run {}",
+            result.run.run_id
+        )),
+        _ = wait_for_optional_deadline(Some(deadline)) => Err(format!(
+            "opening the typed Shared Projection stream for Host Run {} exceeded {} ms",
+            result.run.run_id,
+            open_budget.as_millis()
+        )),
+    }
+}
+
+async fn reconcile_host_terminal_after_projection(
+    client: &HttpKernelClient,
+    current: &AgentRunResult,
+    projection_status: AgentTimelineRunStatus,
+) -> Result<AgentRunResult, String> {
+    const HOST_TERMINAL_RECONCILE_WINDOW: Duration = Duration::from_secs(4);
+    let expected = match projection_status {
+        AgentTimelineRunStatus::Succeeded => "completed",
+        AgentTimelineRunStatus::Failed => "failed",
+        AgentTimelineRunStatus::Cancelled => "cancelled",
+        _ => {
+            return Err(format!(
+                "Shared Projection Run is not terminal: {projection_status:?}"
+            ))
+        }
+    };
+    let deadline = Instant::now() + HOST_TERMINAL_RECONCILE_WINDOW;
+    let mut last_status = current.run.status.clone();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let refreshed = tokio::time::timeout(
+            remaining,
+            client.get_agent_run(&current.run.session_id, &current.run.run_id),
+        )
         .await
         .map_err(|_| {
             format!(
-                "timed out reconciling waiting Host Run {} with Shared Projection v2",
-                run.run_id
+                "timed out reconciling Host Run {} after canonical projection terminal",
+                current.run.run_id
             )
         })?
-}
-
-async fn reconcile_waiting_run(
-    client: &HttpKernelClient,
-    run: &deepcode_kernel_client::AgentRunStatus,
-) -> Result<RunPollDisposition, String> {
-    const WAIT_RECONCILE_ATTEMPTS: usize = 4;
-    let mut mismatch = None;
-    for attempt in 0..WAIT_RECONCILE_ATTEMPTS {
-        let mut attempt_mismatch = None;
-        let timeline = client
-            .agent_timeline_v2(&run.session_id)
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to classify waiting run {} from typed Shared Projection v2: {error}",
-                    run.run_id
-                )
-            })?;
-        let projection = timeline.run_projection.as_ref().ok_or_else(|| {
+        .map_err(|error| {
             format!(
-                "waiting run {} has no canonical runProjection in Shared Projection v2",
-                run.run_id
+                "failed to reconcile Host Run {} after canonical projection terminal: {error}",
+                current.run.run_id
             )
         })?;
-        match client
-            .get_agent_run(&run.session_id, &projection.run_id)
-            .await
-        {
-            Ok(mapped)
-                if mapped.run.session_id == run.session_id && mapped.run.run_id == run.run_id =>
-            {
-                if mapped.run.status != "waiting"
-                    || mapped.run.message != run.message
-                    || mapped.run.is_terminal()
-                {
-                    return Ok(RunPollDisposition::Refreshed(mapped));
-                }
-            }
-            Ok(mapped) => {
-                attempt_mismatch = Some(format!(
-                    "waiting run binding mismatch: Host Run {} maps from Shared Projection v2 Run {} to session={} hostRun={}",
-                    run.run_id, projection.run_id, mapped.run.session_id, mapped.run.run_id
-                ));
-            }
-            Err(mapping_error) => {
-                attempt_mismatch = Some(format!(
-                    "failed to verify active waiting Host Run {} against Shared Projection v2 Run {}: {mapping_error}",
-                    run.run_id, projection.run_id
-                ));
-            }
+        if refreshed.run.status == expected {
+            return Ok(refreshed);
         }
-
-        if attempt_mismatch.is_none() {
-            match projection.status {
-                AgentTimelineRunStatus::WaitingExternal => return Ok(RunPollDisposition::Continue),
-                AgentTimelineRunStatus::WaitingUser | AgentTimelineRunStatus::Paused => {
-                    let reason = projection
-                        .wait
-                        .0
-                        .as_ref()
-                        .and_then(|wait| wait.reason.as_deref())
-                        .filter(|reason| !reason.trim().is_empty())
-                        .unwrap_or("the Session requires an explicit user action");
-                    return Ok(RunPollDisposition::ActionRequired(format!(
-                        "shared session run {} requires user action: {reason}",
-                        run.run_id
-                    )));
-                }
-                AgentTimelineRunStatus::Active => {
-                    attempt_mismatch = Some(format!(
-                        "Host Run {} is waiting while Shared Projection v2 Run {} remains active",
-                        run.run_id, projection.run_id
-                    ));
-                }
-                AgentTimelineRunStatus::Succeeded
-                | AgentTimelineRunStatus::Failed
-                | AgentTimelineRunStatus::Cancelled => {
-                    attempt_mismatch = Some(format!(
-                        "Host Run {} remained waiting after Shared Projection v2 Run {} reached a terminal state",
-                        run.run_id, projection.run_id
-                    ));
-                }
-            }
-        }
-
-        let refreshed = client
-            .get_agent_run(&run.session_id, &run.run_id)
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to refresh exact waiting Host Run {}: {error}",
-                    run.run_id
-                )
-            })?;
-        if refreshed.run.status != run.status
-            || refreshed.run.message != run.message
-            || refreshed.run.is_terminal()
-        {
-            return Ok(RunPollDisposition::Refreshed(refreshed));
-        }
-        mismatch = attempt_mismatch;
-        if attempt + 1 < WAIT_RECONCILE_ATTEMPTS {
-            tokio::time::sleep(RUN_POLL_INTERVAL).await;
-        }
+        last_status = refreshed.run.status.clone();
+        sleep_until_reconcile_retry(deadline).await;
     }
-    Err(mismatch.unwrap_or_else(|| {
-        format!(
-            "waiting run {} could not be reconciled with Shared Projection v2",
-            run.run_id
-        )
-    }))
+    Err(format!(
+        "canonical projection reached {projection_status:?}, but Host Run {} remained {last_status} after {} ms",
+        current.run.run_id,
+        HOST_TERMINAL_RECONCILE_WINDOW.as_millis()
+    ))
+}
+
+async fn reconcile_host_wait_after_projection(
+    client: &HttpKernelClient,
+    current: &AgentRunResult,
+) -> Result<(), String> {
+    const HOST_WAIT_RECONCILE_WINDOW: Duration = Duration::from_secs(4);
+    let deadline = Instant::now() + HOST_WAIT_RECONCILE_WINDOW;
+    let mut last_status = current.run.status.clone();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut request = Box::pin(tokio::time::timeout(
+            remaining,
+            client.get_agent_run(&current.run.session_id, &current.run.run_id),
+        ));
+        let refreshed = tokio::select! {
+            refreshed = &mut request => refreshed
+                .map_err(|_| {
+                    format!(
+                        "timed out reconciling Host Run {} after canonical user-action wait",
+                        current.run.run_id
+                    )
+                })?
+                .map_err(|error| {
+                    format!(
+                        "failed to reconcile Host Run {} after canonical user-action wait: {error}",
+                        current.run.run_id
+                    )
+                })?,
+            _ = wait_for_cli_interrupt() => {
+                return Err(format!(
+                    "CLI was interrupted while reconciling user-action wait for Host Run {}",
+                    current.run.run_id
+                ));
+            }
+        };
+        if refreshed.run.session_id != current.run.session_id
+            || refreshed.run.run_id != current.run.run_id
+        {
+            return Err(format!(
+                "Host wait reconciliation changed identity for Run {}",
+                current.run.run_id
+            ));
+        }
+        if refreshed.run.status == "waiting" {
+            return Ok(());
+        }
+        last_status = refreshed.run.status.clone();
+        sleep_until_reconcile_retry(deadline).await;
+    }
+    Err(format!(
+        "canonical projection requires user action, but Host Run {} remained {last_status} after {} ms",
+        current.run.run_id,
+        HOST_WAIT_RECONCILE_WINDOW.as_millis()
+    ))
 }
 
 enum LiveProjectionExpectation {
@@ -764,14 +1032,19 @@ enum LiveProjectionExpectation {
 
 struct LiveProjectionCursor {
     last_revision: u64,
+    snapshot: Option<AgentTimelineSnapshot>,
     expectation: LiveProjectionExpectation,
     live_run_id: Option<String>,
     live_turn_id: Option<String>,
     emit_updates: bool,
     block_text: std::collections::HashMap<String, String>,
+    emitted_block_text: std::collections::HashMap<String, String>,
     operation_state: std::collections::HashMap<String, String>,
     current_activity: Option<String>,
     commentary_line_open: bool,
+    open_text_role: Option<AgentTimelineEntryRole>,
+    tty_updates: bool,
+    replaceable_line_open: bool,
     refresh_error_reported: bool,
     candidates: std::collections::HashMap<String, LiveProjectionCandidate>,
 }
@@ -820,17 +1093,22 @@ impl LiveProjectionCursor {
         };
         let mut cursor = Self {
             last_revision: snapshot.map(|snapshot| snapshot.revision).unwrap_or(0),
+            snapshot: snapshot.cloned(),
             expectation,
             live_run_id: None,
             live_turn_id: None,
             emit_updates,
             block_text: std::collections::HashMap::new(),
+            emitted_block_text: std::collections::HashMap::new(),
             operation_state: std::collections::HashMap::new(),
             current_activity: snapshot
                 .and_then(|snapshot| snapshot.run_projection.as_ref())
                 .and_then(|projection| projection.current_activity.0.as_ref())
                 .map(current_activity_key),
             commentary_line_open: false,
+            open_text_role: None,
+            tty_updates: emit_updates && io::stderr().is_terminal(),
+            replaceable_line_open: false,
             refresh_error_reported: false,
             candidates: std::collections::HashMap::new(),
         };
@@ -916,8 +1194,26 @@ impl LiveProjectionCursor {
     }
 
     fn observe(&mut self, snapshot: &AgentTimelineSnapshot) -> Result<(), String> {
-        if snapshot.revision <= self.last_revision {
+        if snapshot.revision < self.last_revision {
             return Ok(());
+        }
+        if snapshot.revision == self.last_revision {
+            let Some(current) = self.snapshot.as_ref() else {
+                return Ok(());
+            };
+            let current = serde_json::to_vec(current).map_err(|error| {
+                format!("failed to compare current Shared Projection snapshot: {error}")
+            })?;
+            let incoming = serde_json::to_vec(snapshot).map_err(|error| {
+                format!("failed to compare incoming Shared Projection snapshot: {error}")
+            })?;
+            if current == incoming {
+                return Ok(());
+            }
+            return Err(format!(
+                "Shared Projection revision {} has conflicting snapshot content; reconciliation cannot select an authority",
+                snapshot.revision
+            ));
         }
         let Some(projection) = snapshot.run_projection.as_ref() else {
             return Ok(());
@@ -945,6 +1241,8 @@ impl LiveProjectionCursor {
             if self.emit_updates {
                 self.render_current_activity(projection)?;
             }
+            self.last_revision = snapshot.revision;
+            self.snapshot = Some(snapshot.clone());
             return Ok(());
         };
         let turn = snapshot
@@ -962,7 +1260,105 @@ impl LiveProjectionCursor {
             self.render_current_activity(projection)?;
         }
         self.last_revision = snapshot.revision;
+        self.snapshot = Some(snapshot.clone());
         Ok(())
+    }
+
+    fn apply_stream_event(
+        &mut self,
+        event: &deepcode_kernel_client::AgentTimelineStreamEvent,
+    ) -> Result<bool, String> {
+        match deepcode_kernel_client::reduce_agent_timeline_stream_event(
+            self.snapshot.as_ref(),
+            event,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            deepcode_kernel_client::AgentTimelineStreamReduction::Unchanged => Ok(false),
+            deepcode_kernel_client::AgentTimelineStreamReduction::Replace(snapshot) => {
+                self.observe(&snapshot)?;
+                Ok(false)
+            }
+            deepcode_kernel_client::AgentTimelineStreamReduction::ReconcileRequired { .. } => {
+                Ok(true)
+            }
+        }
+    }
+
+    fn bound_run_terminal(&self) -> Option<AgentTimelineRunStatus> {
+        let run = self.snapshot.as_ref()?.run_projection.as_ref()?;
+        if self.live_run_id.as_deref() == Some(run.run_id.as_str()) && run.status.is_terminal() {
+            Some(run.status)
+        } else {
+            None
+        }
+    }
+
+    fn bound_action_required(&self, host_run_id: &str) -> Option<String> {
+        let run = self.snapshot.as_ref()?.run_projection.as_ref()?;
+        if self.live_run_id.as_deref() != Some(run.run_id.as_str())
+            || !matches!(
+                run.status,
+                AgentTimelineRunStatus::WaitingUser | AgentTimelineRunStatus::Paused
+            )
+        {
+            return None;
+        }
+        let reason = run
+            .wait
+            .0
+            .as_ref()
+            .and_then(|wait| wait.reason.as_deref())
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("the Session requires an explicit user action");
+        Some(format!(
+            "shared session run {host_run_id} requires user action: {reason}"
+        ))
+    }
+
+    fn committed_final_was_streamed(&self, final_text: &str) -> bool {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(run) = snapshot.run_projection.as_ref() else {
+            return false;
+        };
+        if self.live_run_id.as_deref() != Some(run.run_id.as_str()) {
+            return false;
+        }
+        let Some(turn_id) = run.turn_id.as_deref() else {
+            return false;
+        };
+        let Some(turn) = snapshot.turns.iter().find(|turn| turn.id == turn_id) else {
+            return false;
+        };
+        let blocks = turn
+            .blocks
+            .iter()
+            .map(|block| (block.id.as_str(), block))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut streamed = String::new();
+        let mut found_final = false;
+        for part in &turn.parts {
+            let AgentTimelineTurnPart::Block { block_id } = part else {
+                continue;
+            };
+            let Some(block) = blocks.get(block_id.as_str()) else {
+                return false;
+            };
+            if block.entry_role != AgentTimelineEntryRole::FinalAnswer
+                || block.durability != AgentTimelineDurability::Committed
+            {
+                continue;
+            }
+            found_final = true;
+            let body = timeline_block_body_v2(block);
+            if self.emitted_block_text.get(block_id) != Some(&body) {
+                return false;
+            }
+            streamed.push_str(&body);
+        }
+        found_final && streamed.trim() == final_text.trim()
     }
 
     fn accepts_unbound_projection(
@@ -1006,7 +1402,10 @@ impl LiveProjectionCursor {
 
     fn remember_turn(&mut self, turn: &deepcode_kernel_client::AgentTimelineTurn) {
         for block in &turn.blocks {
-            if block.entry_role == AgentTimelineEntryRole::AgentUpdate {
+            if matches!(
+                block.entry_role,
+                AgentTimelineEntryRole::AgentUpdate | AgentTimelineEntryRole::FinalAnswer
+            ) {
                 self.block_text
                     .insert(block.id.clone(), timeline_block_body_v2(block));
             }
@@ -1041,25 +1440,39 @@ impl LiveProjectionCursor {
                     let block = blocks.get(block_id.as_str()).ok_or_else(|| {
                         format!("typed Shared Projection v2 references missing block {block_id}")
                     })?;
-                    if block.entry_role != AgentTimelineEntryRole::AgentUpdate {
+                    if !matches!(
+                        block.entry_role,
+                        AgentTimelineEntryRole::AgentUpdate | AgentTimelineEntryRole::FinalAnswer
+                    ) {
                         continue;
                     }
                     let next = timeline_block_body_v2(block);
-                    let previous = self
-                        .block_text
-                        .get(block_id)
-                        .map(String::as_str)
-                        .unwrap_or_default();
-                    if next.starts_with(previous) && next.len() > previous.len() {
+                    let previous = self.block_text.get(block_id).cloned().unwrap_or_default();
+                    if next.starts_with(&previous) && next.len() > previous.len() {
                         let suffix = &next[previous.len()..];
-                        if previous.is_empty() && self.commentary_line_open {
+                        if previous.is_empty()
+                            && self.commentary_line_open
+                            && !(block.entry_role == AgentTimelineEntryRole::FinalAnswer
+                                && self.open_text_role == Some(AgentTimelineEntryRole::FinalAnswer))
+                        {
                             self.finish_commentary_line()?;
                         }
+                        self.clear_replaceable_line()?;
                         eprint!("{suffix}");
                         io::stderr().flush().map_err(|error| {
                             format!("failed to flush live Session commentary: {error}")
                         })?;
                         self.commentary_line_open = !next.ends_with('\n');
+                        self.open_text_role = self.commentary_line_open.then_some(block.entry_role);
+                        let emitted_prefix = self
+                            .emitted_block_text
+                            .get(block_id)
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        if previous.is_empty() || emitted_prefix == previous.as_str() {
+                            self.emitted_block_text
+                                .insert(block_id.clone(), next.clone());
+                        }
                     }
                     self.block_text.insert(block_id.clone(), next);
                 }
@@ -1089,10 +1502,10 @@ impl LiveProjectionCursor {
                                 .filter(|summary| !summary.trim().is_empty())
                                 .map(|summary| format!(" — {summary}"))
                                 .unwrap_or_default();
-                            eprintln!(
+                            self.render_replaceable_line(format!(
                                 "[work] {name} {}{target}{effect}",
                                 work_operation_status(operation.status)
-                            );
+                            ))?;
                             self.operation_state
                                 .insert(operation.operation_id.clone(), next);
                         }
@@ -1115,7 +1528,12 @@ impl LiveProjectionCursor {
         if next != self.current_activity {
             if let Some(activity) = projection.current_activity.0.as_ref() {
                 self.finish_commentary_line()?;
-                eprintln!("[status] {}", current_activity_label(activity.code));
+                self.render_replaceable_line(format!(
+                    "[status] {}",
+                    current_activity_label(activity.code)
+                ))?;
+            } else {
+                self.clear_replaceable_line()?;
             }
             self.current_activity = next;
         }
@@ -1124,10 +1542,7 @@ impl LiveProjectionCursor {
 
     fn report_refresh_error_once(&mut self, error: &str) {
         if self.emit_updates && !self.refresh_error_reported {
-            if self.commentary_line_open {
-                eprintln!();
-                self.commentary_line_open = false;
-            }
+            let _ = self.finish_commentary_line();
             eprintln!("[status] live Shared Projection refresh unavailable: {error}");
             self.refresh_error_reported = true;
         }
@@ -1140,6 +1555,35 @@ impl LiveProjectionCursor {
                 .flush()
                 .map_err(|error| format!("failed to finish live Session commentary: {error}"))?;
             self.commentary_line_open = false;
+            self.open_text_role = None;
+        }
+        self.clear_replaceable_line()?;
+        Ok(())
+    }
+
+    fn render_replaceable_line(&mut self, line: String) -> Result<(), String> {
+        if !self.emit_updates {
+            return Ok(());
+        }
+        if self.tty_updates {
+            eprint!("\r\x1b[2K{line}");
+            io::stderr()
+                .flush()
+                .map_err(|error| format!("failed to refresh live Session status: {error}"))?;
+            self.replaceable_line_open = true;
+        } else {
+            eprintln!("{line}");
+        }
+        Ok(())
+    }
+
+    fn clear_replaceable_line(&mut self) -> Result<(), String> {
+        if self.tty_updates && self.replaceable_line_open {
+            eprint!("\r\x1b[2K");
+            io::stderr()
+                .flush()
+                .map_err(|error| format!("failed to clear live Session status: {error}"))?;
+            self.replaceable_line_open = false;
         }
         Ok(())
     }
@@ -1150,6 +1594,11 @@ impl Drop for LiveProjectionCursor {
         if self.emit_updates && self.commentary_line_open {
             eprintln!();
             self.commentary_line_open = false;
+        }
+        if self.tty_updates && self.replaceable_line_open {
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+            self.replaceable_line_open = false;
         }
     }
 }

@@ -6,49 +6,19 @@ const WORK_SEGMENTS_SHAPE_V1: &str = "deepcode.shared-conversation.work-segments
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROVIDER_USAGE_TOKENS: u64 = 1_000_000_000_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SharedProjectionTimelineKind {
-    NativeWorkSegmentsV1,
-    LegacyFlatV2,
-}
-
-pub(crate) fn classify_shared_projection_timeline(
-    timeline: &Value,
-) -> Result<SharedProjectionTimelineKind, String> {
-    let object = timeline
-        .as_object()
-        .ok_or_else(|| "Session v2 public projection must be an object".to_string())?;
-    if object.get("schemaVersion").and_then(Value::as_str) != Some(PROJECTION_SCHEMA_V2) {
-        return Err("Session v2 public projection has an unsupported schema".to_string());
-    }
-    reject_private_projection_fields(timeline)?;
-    match object.get("shapeVersion") {
-        Some(Value::String(shape)) if shape == WORK_SEGMENTS_SHAPE_V1 => {
-            validate_work_segments_shared_projection_timeline(timeline)?;
-            Ok(SharedProjectionTimelineKind::NativeWorkSegmentsV1)
-        }
-        None => {
-            validate_legacy_flat_projection(timeline)?;
-            Ok(SharedProjectionTimelineKind::LegacyFlatV2)
-        }
-        _ => Err("Session v2 public projection has an unsupported shape".to_string()),
-    }
-}
-
 pub(crate) fn validate_work_segments_shared_projection_timeline(
     timeline: &Value,
-) -> Result<usize, String> {
+) -> Result<(), String> {
     validate_work_segments_projection(timeline)
 }
 
-fn validate_work_segments_projection(timeline: &Value) -> Result<usize, String> {
+fn validate_work_segments_projection(timeline: &Value) -> Result<(), String> {
     let object = timeline
         .as_object()
         .ok_or_else(|| "Session v2 public projection must be an object".to_string())?;
     let allowed_root = HashSet::from([
         "schemaVersion",
         "shapeVersion",
-        "legacyPrefixTurnCount",
         "sessionId",
         "revision",
         "sourceEventVersion",
@@ -80,28 +50,9 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<usize, String> 
         .get("turns")
         .and_then(Value::as_array)
         .ok_or_else(|| "Session v2 public projection requires turns".to_string())?;
-    let legacy_prefix_len = match object.get("legacyPrefixTurnCount") {
-        Some(value) => usize::try_from(required_safe_integer(
-            Some(value),
-            "projection.legacyPrefixTurnCount",
-        )?)
-        .map_err(|_| {
-            "Session v2 public projection legacy prefix exceeds this platform".to_string()
-        })?,
-        None => 0,
-    };
-    if legacy_prefix_len > turns.len() {
-        return Err(
-            "Session v2 public projection legacy prefix exceeds its turn count".to_string(),
-        );
-    }
     let mut identities = NativeProjectionIdentities::default();
     for (index, turn) in turns.iter().enumerate() {
-        if index < legacy_prefix_len {
-            validate_normalized_legacy_turn(turn, session_id, &mut identities)?;
-        } else {
-            validate_native_turn(turn, session_id, index as u64, &mut identities)?;
-        }
+        validate_native_turn(turn, session_id, index as u64, &mut identities)?;
     }
     if let Some(task_projection) = object.get("taskProjection") {
         validate_task_projection(task_projection, &identities.block_ids)?;
@@ -118,7 +69,7 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<usize, String> 
     if let Some(workspace_projection) = object.get("workspaceProjection") {
         validate_workspace_projection(workspace_projection)?;
     }
-    Ok(legacy_prefix_len)
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -129,94 +80,6 @@ struct NativeProjectionIdentities<'a> {
     work_segment_turn_ids: HashMap<&'a str, &'a str>,
     operation_ids: HashSet<&'a str>,
     operation_segment_ids: HashMap<&'a str, &'a str>,
-}
-
-fn validate_normalized_legacy_turn<'a>(
-    turn: &'a Value,
-    session_id: &str,
-    identities: &mut NativeProjectionIdentities<'a>,
-) -> Result<(), String> {
-    let object = turn.as_object().ok_or_else(|| {
-        "Session v2 public projection normalized legacy turn must be an object".to_string()
-    })?;
-    let allowed = HashSet::from([
-        "id",
-        "sequence",
-        "sessionId",
-        "status",
-        "startedAt",
-        "completedAt",
-        "blocks",
-        "workSegments",
-        "parts",
-    ]);
-    reject_unknown_fields(
-        object.keys().map(String::as_str),
-        &allowed,
-        "normalized legacy turn",
-    )?;
-    let turn_id = required_identity(object.get("id"), "turn.id")?;
-    if !identities.turn_ids.insert(turn_id) {
-        return Err(format!(
-            "Session v2 public projection repeats turn {turn_id}"
-        ));
-    }
-    if object.get("sessionId").and_then(Value::as_str) != Some(session_id) {
-        return Err("Session v2 public projection turn crosses Session identity".to_string());
-    }
-    validate_optional_safe_integer(object.get("sequence"), "turn.sequence")?;
-    validate_required_enum(
-        object.get("status"),
-        &["completed", "cancelled", "failed"],
-        "normalized legacy turn.status",
-    )?;
-    validate_optional_strings(object, &["startedAt", "completedAt"], "turn")?;
-    let blocks = object
-        .get("blocks")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Session v2 public projection turn requires blocks".to_string())?;
-    let mut block_order = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let block_id = required_identity(block.get("id"), "block.id")?;
-        validate_legacy_block(block, &mut identities.block_ids)?;
-        block_order.push(block_id);
-    }
-    if !object
-        .get("workSegments")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-    {
-        return Err("Session v2 normalized legacy turn requires workSegments=[]".to_string());
-    }
-    let parts = object
-        .get("parts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Session v2 normalized legacy turn requires parts".to_string())?;
-    if parts.len() != block_order.len() {
-        return Err(
-            "Session v2 normalized legacy turn parts changed the original block order".to_string(),
-        );
-    }
-    for (part, expected_block_id) in parts.iter().zip(block_order) {
-        let part = part.as_object().ok_or_else(|| {
-            "Session v2 normalized legacy turn part must be an object".to_string()
-        })?;
-        let allowed = HashSet::from(["kind", "blockId"]);
-        reject_unknown_fields(
-            part.keys().map(String::as_str),
-            &allowed,
-            "normalized legacy block part",
-        )?;
-        if part.get("kind").and_then(Value::as_str) != Some("block")
-            || part.get("blockId").and_then(Value::as_str) != Some(expected_block_id)
-        {
-            return Err(
-                "Session v2 normalized legacy turn parts changed the original block order"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn validate_projection_identity(object: &Map<String, Value>) -> Result<(), String> {
@@ -423,11 +286,9 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         object.get("narrativeKind"),
         &[
             "user",
-            "assistantNarration",
             "assistantText",
             "plan",
             "permission",
-            "verification",
             "review",
             "diagnostic",
         ],
@@ -1230,11 +1091,9 @@ fn validate_task_projection(value: &Value, block_ids: &HashSet<&str>) -> Result<
             item.get("narrativeKind"),
             &[
                 "user",
-                "assistantNarration",
                 "assistantText",
                 "plan",
                 "permission",
-                "verification",
                 "review",
                 "diagnostic",
             ],
@@ -1838,209 +1697,6 @@ fn validate_language_binding(value: Option<&Value>, field: &str) -> Result<(), S
     validate_optional_safe_integer(object.get("revision"), &format!("{field}.revision"))?;
     if let Some(source_turn_id) = object.get("sourceTurnId") {
         required_identity(Some(source_turn_id), &format!("{field}.sourceTurnId"))?;
-    }
-    Ok(())
-}
-
-fn validate_legacy_flat_projection(timeline: &Value) -> Result<(), String> {
-    let object = timeline
-        .as_object()
-        .ok_or_else(|| "Session v2 public projection must be an object".to_string())?;
-    let allowed_root = HashSet::from([
-        "schemaVersion",
-        "sessionId",
-        "revision",
-        "sourceEventVersion",
-        "generatedAt",
-        "turns",
-        "eventCount",
-        "taskProjection",
-        "interactionProjection",
-        "runProjection",
-        "tokenUsageProjection",
-        "workspaceProjection",
-    ]);
-    reject_unknown_fields(
-        object.keys().map(String::as_str),
-        &allowed_root,
-        "legacy projection",
-    )?;
-    required_identity(object.get("sessionId"), "projection.sessionId")?;
-    required_identity(object.get("generatedAt"), "projection.generatedAt")?;
-    for field in ["revision", "sourceEventVersion", "eventCount"] {
-        required_safe_integer(object.get(field), field)?;
-    }
-    let session_id = required_identity(object.get("sessionId"), "projection.sessionId")?;
-    let turns = object
-        .get("turns")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Session v2 public projection requires turns".to_string())?;
-    let mut turn_ids = HashSet::new();
-    let mut block_ids = HashSet::new();
-    for turn in turns {
-        validate_legacy_turn(turn, session_id, &mut turn_ids, &mut block_ids)?;
-    }
-    Ok(())
-}
-
-fn validate_legacy_turn<'a>(
-    turn: &'a Value,
-    session_id: &str,
-    turn_ids: &mut HashSet<&'a str>,
-    block_ids: &mut HashSet<&'a str>,
-) -> Result<(), String> {
-    let object = turn
-        .as_object()
-        .ok_or_else(|| "Session v2 public projection turn must be an object".to_string())?;
-    let allowed = HashSet::from([
-        "id",
-        "sequence",
-        "sessionId",
-        "status",
-        "startedAt",
-        "completedAt",
-        "blocks",
-    ]);
-    reject_unknown_fields(object.keys().map(String::as_str), &allowed, "legacy turn")?;
-    let turn_id = required_identity(object.get("id"), "turn.id")?;
-    if !turn_ids.insert(turn_id) {
-        return Err(format!(
-            "Session v2 public projection repeats turn {turn_id}"
-        ));
-    }
-    if object.get("sessionId").and_then(Value::as_str) != Some(session_id) {
-        return Err("Session v2 public projection turn crosses Session identity".to_string());
-    }
-    validate_optional_safe_integer(object.get("sequence"), "turn.sequence")?;
-    validate_timeline_status(object.get("status"), "turn.status")?;
-    validate_optional_strings(object, &["startedAt", "completedAt"], "turn")?;
-    let blocks = object
-        .get("blocks")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Session v2 public projection turn requires blocks".to_string())?;
-    for block in blocks {
-        validate_legacy_block(block, block_ids)?;
-    }
-    Ok(())
-}
-
-fn validate_legacy_block<'a>(
-    block: &'a Value,
-    block_ids: &mut HashSet<&'a str>,
-) -> Result<(), String> {
-    let object = block
-        .as_object()
-        .ok_or_else(|| "Session v2 public projection block must be an object".to_string())?;
-    let allowed = HashSet::from([
-        "id",
-        "sequence",
-        "revision",
-        "deliveryMode",
-        "durability",
-        "kind",
-        "narrativeKind",
-        "entryRole",
-        "activity",
-        "title",
-        "summary",
-        "status",
-        "defaultCollapsed",
-        "bodyMarkdown",
-        "localizedContent",
-        "structuredProjection",
-        "decisionRequest",
-        "interaction",
-        "confirmable",
-        "attachments",
-        "displayHints",
-        "evidenceRefs",
-        "provenance",
-        "languageBinding",
-        "taskProjectionRef",
-    ]);
-    reject_unknown_fields(object.keys().map(String::as_str), &allowed, "legacy block")?;
-    let block_id = required_identity(object.get("id"), "block.id")?;
-    if !block_ids.insert(block_id) {
-        return Err(format!(
-            "Session v2 public projection repeats block {block_id}"
-        ));
-    }
-    required_identity(object.get("kind"), "block.kind")?;
-    required_identity(object.get("title"), "block.title")?;
-    if object.get("summary").and_then(Value::as_str).is_none()
-        || object
-            .get("defaultCollapsed")
-            .and_then(Value::as_bool)
-            .is_none()
-    {
-        return Err(format!(
-            "Session v2 public projection block {block_id} has invalid required fields"
-        ));
-    }
-    validate_required_enum(
-        object.get("durability"),
-        &["live", "committed"],
-        "block.durability",
-    )?;
-    validate_required_enum(
-        object.get("entryRole"),
-        &[
-            "userMessage",
-            "agentUpdate",
-            "activityGroup",
-            "evidence",
-            "interaction",
-            "finalAnswer",
-            "diagnostic",
-        ],
-        "block.entryRole",
-    )?;
-    validate_timeline_status(object.get("status"), "block.status")?;
-    if let Some(attachments) = object.get("attachments") {
-        deepcode_kernel_abi::decode_agent_input_attachments_v2(attachments).map_err(|error| {
-            format!(
-                "Session v2 public projection block {block_id} has invalid attachments: {}",
-                error.code
-            )
-        })?;
-    }
-    validate_legacy_provenance(object.get("provenance"))?;
-    validate_legacy_language_binding(object.get("languageBinding"))
-}
-
-fn validate_legacy_provenance(value: Option<&Value>) -> Result<(), String> {
-    let object = value
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Session v2 public projection block requires provenance".to_string())?;
-    if !matches!(
-        object.get("origin").and_then(Value::as_str),
-        Some("user" | "session" | "kernel" | "provider")
-    ) || !matches!(
-        object.get("authority").and_then(Value::as_str),
-        Some("user" | "session" | "kernel")
-    ) {
-        return Err("Session v2 public projection block provenance is invalid".to_string());
-    }
-    validate_string_array(
-        object.get("sourceEventRefs"),
-        "block.provenance.sourceEventRefs",
-    )?;
-    validate_string_array(object.get("factRefs"), "block.provenance.factRefs")?;
-    validate_string_array(object.get("evidenceRefs"), "block.provenance.evidenceRefs")
-}
-
-fn validate_legacy_language_binding(value: Option<&Value>) -> Result<(), String> {
-    let object = value
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Session v2 public projection block requires languageBinding".to_string())?;
-    if !matches!(
-        object.get("language").and_then(Value::as_str),
-        Some("neutral" | "zh-CN" | "en-US")
-    ) || !matches!(
-        object.get("status").and_then(Value::as_str),
-        Some("pending" | "resolved" | "fallback" | "superseded" | "unavailable")
-    ) {
-        return Err("Session v2 public projection block languageBinding is invalid".to_string());
     }
     Ok(())
 }

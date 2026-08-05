@@ -459,16 +459,15 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "agent", "projects", _, "rebind"])
         | ("POST", ["api", "agent", "sessions", _, "activate"])
         | ("POST", ["api", "agent", "sessions", _, "archive"])
-        | ("GET", ["api", "agent", "sessions", _, "events"])
         | ("POST", ["api", "agent", "sessions", _, "runs"])
         | ("GET", ["api", "agent", "sessions", _, "timeline"])
+        | ("GET", ["api", "agent", "sessions", _])
         | ("PATCH", ["api", "agent", "sessions", _])
         | ("DELETE", ["api", "agent", "sessions", _])
         | ("GET", ["api", "agent", "sessions", _, "runs", _])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "cancel"])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "guidance"])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "authority", "revoke"])
-        | ("GET", ["api", "agent", "sessions", _, "runs", _, "stream"])
         | ("GET", ["api", "agent", "sessions", _, "timeline", "stream"]) => true,
         _ => false,
     }

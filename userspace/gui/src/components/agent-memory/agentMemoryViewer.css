@@ -175,6 +175,52 @@
   gap: 9px;
 }
 
+.agent-memory-viewer__stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.agent-memory-viewer__stats > div,
+.agent-memory-viewer__entries article {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 11px 12px;
+}
+
+.agent-memory-viewer__stats > div,
+.agent-memory-viewer__entries article {
+  display: grid;
+  gap: 6px;
+}
+
+.agent-memory-viewer__stats strong,
+.agent-memory-viewer__entries strong {
+  color: var(--text-strong, var(--text, #fff));
+}
+
+.agent-memory-viewer__stats span,
+.agent-memory-viewer__entries span {
+  color: var(--text-muted, var(--muted, #a1a1aa));
+  font-size: 11px;
+}
+
+.agent-memory-viewer__entries article > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agent-memory-viewer__entries code {
+  max-width: 55%;
+  overflow: hidden;
+  color: var(--text-muted, var(--muted, #a1a1aa));
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-memory-entry,
 .agent-memory-viewer__sections article {
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));

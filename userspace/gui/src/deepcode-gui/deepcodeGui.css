@@ -691,21 +691,6 @@ button {
   padding: 0 11px 11px 30px;
 }
 
-.deepcode-gui-block__details--thinking {
-  color: var(--text);
-  font-size: 13px;
-  line-height: 1.65;
-}
-
-.deepcode-gui-block__details--thinking .agent-markdown {
-  display: grid;
-  gap: 8px;
-}
-
-.deepcode-gui-block__details--thinking .agent-markdown__paragraph {
-  margin: 0;
-}
-
 .deepcode-gui-review-accepted {
   display: flex;
   align-items: flex-start;
@@ -746,17 +731,17 @@ button {
   margin-bottom: 0;
 }
 
-.deepcode-gui-reasoning-stream {
+.deepcode-gui-markdown-stream {
   display: grid;
   gap: 8px;
 }
 
-.deepcode-gui-reasoning-stream__block .agent-markdown {
+.deepcode-gui-markdown-stream__block .agent-markdown {
   display: grid;
   gap: 8px;
 }
 
-.deepcode-gui-reasoning-stream__block--tail {
+.deepcode-gui-markdown-stream__block--tail {
   overflow-wrap: anywhere;
 }
 
@@ -788,90 +773,6 @@ button {
 
 .deepcode-gui-event__kind {
   color: var(--accent);
-}
-
-.agent-evidence-list {
-  display: grid;
-  gap: 7px;
-}
-
-.agent-evidence-item {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 50px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid #ebe3d7;
-  border-radius: 8px;
-  background: #fffdf9;
-  padding: 7px 9px;
-  color: #202124;
-  font-size: 12px;
-}
-
-.agent-evidence-item--failed {
-  border-color: rgba(220, 38, 38, 0.28);
-  background: rgba(220, 38, 38, 0.05);
-}
-
-.agent-evidence-item__verb {
-  color: #8c8c87;
-  font-size: 11px;
-}
-
-.agent-evidence-item__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 620;
-}
-
-.agent-evidence-item__detail,
-.agent-evidence-item__meta {
-  color: #777f88;
-  font-size: 11px;
-}
-
-.agent-evidence-item__meta {
-  grid-column: 2 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.agent-evidence-output {
-  grid-column: 2 / -1;
-}
-
-.agent-evidence-output summary {
-  cursor: pointer;
-  color: #777f88;
-  font-size: 11px;
-}
-
-.agent-evidence-output pre {
-  max-height: 160px;
-  overflow: auto;
-  margin: 7px 0 0;
-  border-radius: 8px;
-  background: #f5f2ec;
-  padding: 8px;
-  white-space: pre-wrap;
-}
-
-.agent-evidence-output__list {
-  margin: 7px 0 0;
-  padding-left: 18px;
-  color: #777f88;
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.agent-evidence-list__more {
-  color: #777f88;
-  font-size: 11px;
-  padding: 4px 2px 0;
 }
 
 .deepcode-gui-plan-actions {
@@ -1909,13 +1810,6 @@ button {
 
 .deepcode-gui-block--user {
   background: #ffffff;
-}
-
-.deepcode-gui-block--thinking,
-.deepcode-gui-block--stage,
-.deepcode-gui-block--activity,
-.deepcode-gui-block--turnActions {
-  background: #f8f6ef;
 }
 
 .deepcode-gui-block--permission {
@@ -3222,30 +3116,194 @@ button {
   margin: 0 0 7px;
 }
 
-.deepcode-gui-block--plan,
-.deepcode-gui-block--narrative-operationEvidence,
-.deepcode-gui-block--narrative-verification {
+.deepcode-gui-block--plan {
   padding: 0;
 }
 
-.deepcode-gui-block--activity {
-  padding: 0;
+.deepcode-gui-work-segment {
+  max-width: min(100%, 780px);
+  border: 1px solid #e6e8eb;
+  border-radius: 8px;
+  background: #fafbfc;
+  color: #424850;
 }
 
-.deepcode-gui-block--narrative-operationEvidence summary,
-.deepcode-gui-block--narrative-verification summary,
-.deepcode-gui-block--activity summary {
+.deepcode-gui-work-segment > summary {
   min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  list-style: none;
 }
 
-.deepcode-gui-block--narrative-operationEvidence .deepcode-gui-block__details,
-.deepcode-gui-block--narrative-verification .deepcode-gui-block__details,
-.deepcode-gui-block--activity .deepcode-gui-block__details {
-  padding-bottom: 9px;
+.deepcode-gui-work-segment > summary::-webkit-details-marker {
+  display: none;
 }
 
-.deepcode-gui-activity {
-  gap: 9px;
+.deepcode-gui-work-segment__status,
+.deepcode-gui-work-operation__status {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #9aa0a6;
+}
+
+.deepcode-gui-work-segment__status--active,
+.deepcode-gui-work-operation__status--preparing,
+.deepcode-gui-work-operation__status--queued,
+.deepcode-gui-work-operation__status--running {
+  background: #3b82f6;
+}
+
+.deepcode-gui-work-segment__status--completed,
+.deepcode-gui-work-operation__status--completed {
+  background: #2f8f67;
+}
+
+.deepcode-gui-work-segment__status--cancelled,
+.deepcode-gui-work-operation__status--cancelled,
+.deepcode-gui-work-operation__status--stale,
+.deepcode-gui-work-operation__status--unexecuted {
+  background: #9aa0a6;
+}
+
+.deepcode-gui-work-segment__status--failed,
+.deepcode-gui-work-operation__status--denied,
+.deepcode-gui-work-operation__status--failed,
+.deepcode-gui-work-operation__status--failedAfterObservedEffect,
+.deepcode-gui-work-operation__status--indeterminate {
+  background: #c2413a;
+}
+
+.deepcode-gui-work-operation__status--awaitingCapability {
+  background: #d18a18;
+}
+
+.deepcode-gui-work-segment__summary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-gui-work-segment__attention {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #edf1f5;
+  color: #68707b;
+  font-size: 10px;
+  font-weight: 620;
+}
+
+.deepcode-gui-work-segment__attention--unresolved {
+  background: #fff3df;
+  color: #9a620e;
+}
+
+.deepcode-gui-work-segment__details {
+  padding: 0 10px 9px 25px;
+}
+
+.deepcode-gui-work-segment__attention-summary {
+  margin: 0 0 7px;
+  color: #68707b;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.deepcode-gui-work-segment__attention-summary--unresolved {
+  color: #8b5a12;
+}
+
+.deepcode-gui-work-segment__operations {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.deepcode-gui-work-operation {
+  min-width: 0;
+  padding-top: 7px;
+  border-top: 1px solid #eceef1;
+}
+
+.deepcode-gui-work-operation__head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.deepcode-gui-work-operation__title {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: #343a42;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-gui-work-operation__state {
+  flex: 0 0 auto;
+  color: #7a818b;
+  font-size: 10px;
+}
+
+.deepcode-gui-work-operation__targets,
+.deepcode-gui-work-operation__effect {
+  margin: 4px 0 0 14px;
+  overflow-wrap: anywhere;
+  color: #666e78;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.deepcode-gui-work-operation__effect {
+  color: #4f5964;
+}
+
+.deepcode-gui-work-operation__attempts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 5px 0 0 14px;
+}
+
+.deepcode-gui-work-operation__attempts span {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #eef0f3;
+  color: #747b84;
+  font-size: 9px;
+}
+
+.deepcode-gui-current-activity {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 8px;
+  color: #747b84;
+  font-size: 11px;
+}
+
+.deepcode-gui-current-activity__dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #3b82f6;
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 12%);
 }
 
 .deepcode-gui-review-accepted {
@@ -3267,78 +3325,6 @@ button {
 
 .deepcode-gui-review-accepted__content {
   min-width: 0;
-}
-
-.deepcode-gui-activity__head {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-}
-
-.deepcode-gui-activity__kind,
-.deepcode-gui-activity__status {
-  min-width: 0;
-  max-width: 100%;
-  padding: 2px 7px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #eceff3;
-  color: #59616c;
-  font-size: 10px;
-  font-weight: 620;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.deepcode-gui-activity__kind--diagnostic,
-.deepcode-gui-activity__status--failed {
-  background: #fff0ef;
-  color: #b3342e;
-}
-
-.deepcode-gui-activity__status--completed {
-  background: #edf8f3;
-  color: #217452;
-}
-
-.deepcode-gui-activity__status--running {
-  background: #eef4ff;
-  color: #1e5bb8;
-}
-
-.deepcode-gui-activity__meta {
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.deepcode-gui-activity__chip {
-  display: inline-flex;
-  min-width: 0;
-  max-width: 100%;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 7px;
-  border: 1px solid #e2e6ec;
-  border-radius: 7px;
-  background: #ffffff;
-  color: #656d78;
-  font-size: 10px;
-}
-
-.deepcode-gui-activity__chip strong {
-  flex: 0 0 auto;
-  color: #3c434d;
-  font-weight: 640;
-}
-
-.deepcode-gui-activity__chip span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .deepcode-gui-block__label {

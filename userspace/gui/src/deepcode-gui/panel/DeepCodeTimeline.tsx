@@ -1,10 +1,13 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
-  AgentConversationActivity,
   AgentTimelineAttachment,
   AgentTimelineBlock,
+  AgentTimelineCurrentActivity,
   AgentTimelineResult,
   AgentTimelineTurn,
+  AgentTimelineWorkOperation,
+  AgentTimelineWorkOperationStatus,
+  AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
@@ -37,8 +40,6 @@ interface DeepCodeTimelineProps {
 
 type TypewriterSpeed = BufferedTypewriterSpeed;
 type TimelineFollowMode = 'following' | 'detached';
-const LIVE_REASONING_FAST_BACKLOG_CHARS = 4000;
-const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
 
 const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   timeline,
@@ -50,6 +51,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   onPlanResolve,
 }) => {
   const view = timeline;
+  const currentActivity = view.runProjection?.currentActivity ?? null;
   const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
     () => new Map()
   );
@@ -77,9 +79,6 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   );
   const timelineDensity = useSettingsStore((s) =>
     String(s.effectiveSettings['gui.timelineDensity'] ?? 'normal')
-  );
-  const collapseCompletedThinking = useSettingsStore((s) =>
-    Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
   );
   const typewriterBlockLengths = useMemo(
     () => collectTypewriterBlockLengths(viewWithActive, typewriterBlockIds),
@@ -361,17 +360,16 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             showActions={turn.id === actionBarTurnId}
             playbackVisibleBlockIds={playbackVisibleBlockIds}
             typewriterBlockIds={animatingBlockIds}
-            collapseCompletedThinking={collapseCompletedThinking}
             onLiveContentChange={scrollToTimelineEndIfFollowing}
             onTypewriterComplete={markTypewriterComplete}
             onPlanResolve={onPlanResolve}
           />
         ))}
-        {loading && (
-          <div className="deepcode-gui-live-indicator">
-            <span className="deepcode-gui-live-indicator__dot" />
-            {t(language, 'deepcodeGui.status.running')}
-          </div>
+        {(currentActivity || loading) && (
+          <CurrentActivityLine
+            activity={currentActivity}
+            language={language}
+          />
         )}
         <div ref={timelineEndRef} className="deepcode-gui-timeline__end" aria-hidden="true" />
       </div>
@@ -394,64 +392,6 @@ function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] 
   return view.turns.flatMap((turn) => turn.blocks);
 }
 
-
-function activityKindLabel(language: UiLanguage, kind: AgentConversationActivity['kind']): string {
-  return t(language, `deepcodeGui.activity.kind.${kind}`);
-}
-
-function activityBodyMarkdown(activity: AgentConversationActivity, language: UiLanguage): string {
-  const rows: string[] = [];
-  const summary = visibleActivitySummary(activity);
-  if (summary) rows.push(summary);
-  const targets = visibleActivityTargets(activity.targets ?? []);
-  if (targets.length) {
-    rows.push(`**${activityTargetsLabel(activity, language)}**: ${targets.join(', ')}`);
-  }
-  if (activity.toolName) {
-    rows.push(`**${t(language, 'deepcodeGui.activity.tool')}**: ${displayToolName(activity.toolName)}`);
-  }
-  if (activity.errorCode || activity.errorMessage) {
-    rows.push(`**${t(language, 'deepcodeGui.activity.error')}**: ${[activity.errorCode, activity.errorMessage].filter(Boolean).join(' - ')}`);
-  }
-  return rows.map((line) => `- ${line}`).join('\n');
-}
-
-function visibleActivitySummary(activity: AgentConversationActivity): string {
-  const summary = (activity.summary ?? '').trim();
-  if (!summary) return '';
-  if (activity.kind === 'diagnostic' || activity.status === 'failed') {
-    return summary;
-  }
-  return '';
-}
-
-function visibleActivityTargets(targets: string[]): string[] {
-  const visible: string[] = [];
-  for (const target of targets) {
-    const normalized = target.trim();
-    if (!normalized) continue;
-    if (visible.includes(normalized)) continue;
-    visible.push(normalized);
-  }
-  return visible;
-}
-
-function displayToolName(toolName: string): string {
-  return toolName.replace(/__/g, '.').trim();
-}
-
-function activityTargetsLabel(activity: AgentConversationActivity, language: UiLanguage): string {
-  if (activity.kind === 'resourceRead' || activity.kind === 'resourceSearch') {
-    return t(language, 'deepcodeGui.activity.filesRead');
-  }
-  if (
-    activity.kind === 'toolExecution'
-    && ['write', 'create', 'patch', 'rename', 'delete'].includes(activity.operation ?? '')
-  ) {
-    return t(language, 'deepcodeGui.activity.filesChanged');
-  }
-  return t(language, 'deepcodeGui.activity.targets');
-}
 
 function findTimelineScrollContainer(timelineElement: HTMLElement | null): HTMLElement | null {
   let element = timelineElement;
@@ -504,7 +444,14 @@ function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): s
       return `${block.id}:${block.kind}:${block.status}:${sourceCount}:${bodyLength}`;
     })
     .join('|');
-  return `${lastTurn.id}:${lastTurn.status}:${loading ? 'running' : 'idle'}:${blockSignature}`;
+  const workSignature = lastTurn.workSegments
+    .map((segment) => `${segment.id}:${segment.revision}:${segment.lifecycle}:${segment.operations.length}`)
+    .join('|');
+  const activity = view.runProjection?.currentActivity;
+  const activitySignature = activity
+    ? `${activity.code}:${activity.updatedAt}:${activity.operationId ?? ''}`
+    : 'none';
+  return `${lastTurn.id}:${lastTurn.status}:${loading ? 'running' : 'idle'}:${blockSignature}:${workSignature}:${activitySignature}`;
 }
 
 function useTypewriterBlockIds(
@@ -609,9 +556,7 @@ function usePlaybackVisibleBlockIds(
 
 function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
   if (!isBufferedDeliveryBlock(block)) return false;
-  return block.narrativeKind === 'thinking' ||
-    block.narrativeKind === 'assistantNarration' ||
-    block.narrativeKind === 'assistantText' ||
+  return block.narrativeKind === 'assistantText' ||
     block.narrativeKind === 'permission' ||
     block.narrativeKind === 'diagnostic' ||
     block.kind === 'plan' ||
@@ -623,11 +568,6 @@ function isBufferedDeliveryBlock(block: AgentTimelineBlock): boolean {
   return block.deliveryMode === 'buffered';
 }
 
-function typewriterSpeedForBlock(block: AgentTimelineBlock): TypewriterSpeed {
-  if (block.narrativeKind === 'thinking') return 'slow';
-  return 'normal';
-}
-
 const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
@@ -635,15 +575,31 @@ const TurnCard: React.FC<{
   showActions: boolean;
   playbackVisibleBlockIds: Set<string>;
   typewriterBlockIds: Set<string>;
-  collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ turn, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
   const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
-  if (blocks.length === 0) return null;
+  const blocksById = new Map(blocks.map((block) => [block.id, block]));
+  const workSegmentsById = new Map(
+    turn.workSegments.map((segment) => [segment.id, segment])
+  );
+  type RenderedTurnPart =
+    | { kind: 'block'; block: AgentTimelineBlock }
+    | { kind: 'workSegment'; workSegment: AgentTimelineWorkSegment };
+  const orderedParts = turn.parts.flatMap<RenderedTurnPart>((part) => {
+    if (part.kind === 'block') {
+      const block = blocksById.get(part.blockId);
+      return block ? [{ kind: 'block' as const, block }] : [];
+    }
+    const workSegment = workSegmentsById.get(part.workSegmentId);
+    return workSegment
+      ? [{ kind: 'workSegment' as const, workSegment }]
+      : [];
+  });
+  if (orderedParts.length === 0) return null;
   const actionsReady = showActions &&
     !transportPending &&
     blocks.length === visibleBlocks.length &&
@@ -657,22 +613,27 @@ const TurnCard: React.FC<{
           <span>{timelineStatusLabel(language, turn.status)}</span>
           {startedAtLabel && <span>{startedAtLabel}</span>}
         </div>
-        {blocks.map((block) => (
+        {orderedParts.map((part) => part.kind === 'block' ? (
           <TimelineBlock
-            key={block.id}
-            block={block}
+            key={part.block.id}
+            block={part.block}
             language={language}
-            animateAssistant={typewriterBlockIds.has(block.id)}
-            collapseCompletedThinking={collapseCompletedThinking}
+            animateAssistant={typewriterBlockIds.has(part.block.id)}
             interactionsEnabled={
               !transportPending &&
               turn.status !== 'running' &&
-              !typewriterBlockIds.has(block.id) &&
+              !typewriterBlockIds.has(part.block.id) &&
               !actionsReady
             }
             onLiveContentChange={onLiveContentChange}
             onTypewriterComplete={onTypewriterComplete}
             onPlanResolve={onPlanResolve}
+          />
+        ) : (
+          <WorkSegment
+            key={part.workSegment.id}
+            segment={part.workSegment}
+            language={language}
           />
         ))}
         {actionsReady && <TurnActionBar blocks={blocks} language={language} />}
@@ -680,6 +641,170 @@ const TurnCard: React.FC<{
     </section>
   );
 };
+
+const CurrentActivityLine: React.FC<{
+  activity: AgentTimelineCurrentActivity | null;
+  language: UiLanguage;
+}> = ({ activity, language }) => (
+  <div className="deepcode-gui-current-activity" role="status" aria-live="polite">
+    <span className="deepcode-gui-current-activity__dot" />
+    <span>{currentActivityLabel(activity, language)}</span>
+  </div>
+);
+
+const WorkSegment: React.FC<{
+  segment: AgentTimelineWorkSegment;
+  language: UiLanguage;
+}> = ({ segment, language }) => {
+  const forceOpen = segment.lifecycle === 'active'
+    || segment.attention?.status === 'unresolved';
+  const previousLifecycle = useRef(segment.lifecycle);
+  const [open, setOpen] = useState(forceOpen);
+
+  useEffect(() => {
+    const wasActive = previousLifecycle.current === 'active';
+    previousLifecycle.current = segment.lifecycle;
+    if (forceOpen) {
+      setOpen(true);
+    } else if (wasActive && segment.lifecycle !== 'active') {
+      setOpen(false);
+    }
+  }, [forceOpen, segment.lifecycle]);
+
+  return (
+    <details
+      className={`deepcode-gui-work-segment deepcode-gui-work-segment--${segment.lifecycle}`}
+      open={open}
+      onToggle={(event) => {
+        const requestedOpen = event.currentTarget.open;
+        setOpen(forceOpen ? true : requestedOpen);
+      }}
+    >
+      <summary>
+        <span className={`deepcode-gui-work-segment__status deepcode-gui-work-segment__status--${segment.lifecycle}`} />
+        <span className="deepcode-gui-work-segment__summary">
+          {workSegmentSummary(segment, language)}
+        </span>
+        {segment.attention && (
+          <span className={`deepcode-gui-work-segment__attention deepcode-gui-work-segment__attention--${segment.attention.status}`}>
+            {segment.attention.status === 'unresolved'
+              ? (language === 'zh-CN' ? '需要处理' : 'Needs attention')
+              : (language === 'zh-CN' ? '已处理' : 'Resolved')}
+          </span>
+        )}
+      </summary>
+      <div className="deepcode-gui-work-segment__details">
+        {segment.attention && (
+          <div className={`deepcode-gui-work-segment__attention-summary deepcode-gui-work-segment__attention-summary--${segment.attention.status}`}>
+            {segment.attention.summary}
+          </div>
+        )}
+        <ol className="deepcode-gui-work-segment__operations">
+          {segment.operations.map((operation) => (
+            <WorkOperation
+              key={operation.operationId}
+              operation={operation}
+              language={language}
+            />
+          ))}
+        </ol>
+      </div>
+    </details>
+  );
+};
+
+const WorkOperation: React.FC<{
+  operation: AgentTimelineWorkOperation;
+  language: UiLanguage;
+}> = ({ operation, language }) => {
+  const title = operation.displayName?.trim()
+    || operation.canonicalAction?.trim()
+    || operation.toolId;
+  return (
+    <li className={`deepcode-gui-work-operation deepcode-gui-work-operation--${operation.status}`}>
+      <div className="deepcode-gui-work-operation__head">
+        <span className={`deepcode-gui-work-operation__status deepcode-gui-work-operation__status--${operation.status}`} />
+        <span className="deepcode-gui-work-operation__title">{title}</span>
+        <span className="deepcode-gui-work-operation__state">
+          {workOperationStatusLabel(operation.status, language)}
+        </span>
+      </div>
+      {operation.targets && operation.targets.length > 0 && (
+        <div className="deepcode-gui-work-operation__targets">
+          {operation.targets.join(' · ')}
+        </div>
+      )}
+      {operation.effectSummary && (
+        <div className="deepcode-gui-work-operation__effect">
+          {operation.effectSummary}
+        </div>
+      )}
+      {operation.attempts && operation.attempts.length > 0 && (
+        <div className="deepcode-gui-work-operation__attempts">
+          {operation.attempts.map((attempt) => (
+            <span key={attempt.attemptId} title={attempt.attemptId}>
+              {workOperationStatusLabel(attempt.status ?? operation.status, language)}
+            </span>
+          ))}
+        </div>
+      )}
+    </li>
+  );
+};
+
+function currentActivityLabel(
+  activity: AgentTimelineCurrentActivity | null,
+  language: UiLanguage
+): string {
+  if (!activity) return t(language, 'deepcodeGui.status.running');
+  const labels: Record<string, readonly [string, string]> = {
+    'session.admitting': ['正在接收请求', 'Admitting request'],
+    'provider.awaitingFirstByte': ['正在等待模型响应', 'Waiting for model response'],
+    'provider.reasoning': ['模型正在思考', 'Model is reasoning'],
+    'provider.composing': ['正在组织回复', 'Composing response'],
+    'resource.resolving': ['正在解析资源', 'Resolving resources'],
+    'kernel.executing': ['正在执行工具', 'Executing tools'],
+    'session.validating': ['正在校验结果', 'Validating result'],
+    'session.persisting': ['正在保存会话', 'Saving session'],
+    'retry.backoff': ['正在等待重试', 'Waiting to retry'],
+  };
+  const known = labels[String(activity.code)];
+  if (!known) {
+    return language === 'zh-CN' ? '正在处理' : 'Working';
+  }
+  return activity.summary?.trim() || (language === 'zh-CN' ? known[0] : known[1]);
+}
+
+function workSegmentSummary(
+  segment: AgentTimelineWorkSegment,
+  language: UiLanguage
+): string {
+  const count = segment.operations.length;
+  if (language === 'zh-CN') return `工作 ${count} 项`;
+  return `${count} ${count === 1 ? 'operation' : 'operations'}`;
+}
+
+function workOperationStatusLabel(
+  status: AgentTimelineWorkOperationStatus,
+  language: UiLanguage
+): string {
+  const labels: Record<AgentTimelineWorkOperationStatus, readonly [string, string]> = {
+    preparing: ['准备中', 'Preparing'],
+    queued: ['已排队', 'Queued'],
+    running: ['执行中', 'Running'],
+    awaitingCapability: ['等待授权', 'Awaiting permission'],
+    completed: ['已完成', 'Completed'],
+    denied: ['已拒绝', 'Denied'],
+    failed: ['失败', 'Failed'],
+    failedAfterObservedEffect: ['执行后失败', 'Failed after effect'],
+    indeterminate: ['状态不确定', 'Indeterminate'],
+    cancelled: ['已取消', 'Cancelled'],
+    stale: ['已失效', 'Stale'],
+    unexecuted: ['未执行', 'Not executed'],
+  };
+  const label = labels[status];
+  return language === 'zh-CN' ? label[0] : label[1];
+}
 
 const TurnActionBar: React.FC<{
   blocks: AgentTimelineBlock[];
@@ -772,12 +897,11 @@ const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animateAssistant?: boolean;
-  collapseCompletedThinking?: boolean;
   interactionsEnabled: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, interactionsEnabled, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, interactionsEnabled, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   if (!isVisibleTimelineBlock(block)) return null;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
@@ -794,21 +918,6 @@ const TimelineBlock: React.FC<{
     );
   }
 
-  if (block.narrativeKind === 'assistantNarration') {
-    return (
-      <article className={`deepcode-gui-assistant-narration${narrativeClass}${densityClass}${phaseClassName(block)}`}>
-        <TypewriterMarkdown
-          content={visibleTypewriterMarkdown(block, language)}
-          animate={animateAssistant}
-          streaming={block.deliveryMode === 'live'}
-          speed={typewriterSpeedForBlock(block)}
-          onVisibleContentChange={onLiveContentChange}
-          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
-        />
-      </article>
-    );
-  }
-
   if (block.kind === 'assistant') {
     return (
       <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}${phaseClassName(block)}`}>
@@ -816,24 +925,11 @@ const TimelineBlock: React.FC<{
           content={visibleTypewriterMarkdown(block, language)}
           animate={animateAssistant}
           streaming={block.deliveryMode === 'live'}
-          speed={typewriterSpeedForBlock(block)}
+          speed="normal"
           onVisibleContentChange={onLiveContentChange}
           onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
         />
       </article>
-    );
-  }
-
-  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
-    return (
-      <ThinkingBlock
-        block={block}
-        language={language}
-        animate={animateAssistant}
-        collapseCompletedThinking={collapseCompletedThinking}
-        onLiveContentChange={onLiveContentChange}
-        onTypewriterComplete={onTypewriterComplete}
-      />
     );
   }
 
@@ -851,10 +947,6 @@ const TimelineBlock: React.FC<{
     );
   }
 
-  if (block.activity) {
-    return <ActivityBlock block={block} language={language} />;
-  }
-
   if (block.kind === 'review' || block.narrativeKind === 'review') {
     return (
       <ReviewBlock
@@ -866,10 +958,6 @@ const TimelineBlock: React.FC<{
         onTypewriterComplete={onTypewriterComplete}
       />
     );
-  }
-
-  if (block.narrativeKind === 'operationEvidence' || block.narrativeKind === 'verification') {
-    return <OperationEvidenceBlock block={block} language={language} />;
   }
 
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
@@ -885,7 +973,7 @@ const TimelineBlock: React.FC<{
             content={block.bodyMarkdown}
             animate={animateAssistant && shouldAnimateTimelineBlock(block)}
             streaming={block.deliveryMode === 'live'}
-            speed={typewriterSpeedForBlock(block)}
+            speed="normal"
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
@@ -894,64 +982,6 @@ const TimelineBlock: React.FC<{
     </details>
   );
 };
-
-const ActivityBlock: React.FC<{
-  block: AgentTimelineBlock;
-  language: UiLanguage;
-}> = ({ block, language }) => {
-  const activity = block.activity;
-  if (!activity) return null;
-  const title = activityDisplayTitle(activity, block, language);
-  const open = !block.defaultCollapsed || activity.status === 'running' || activity.status === 'waiting' || activity.status === 'failed';
-  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
-  const markdown = block.bodyMarkdown ?? activityBodyMarkdown(activity, language);
-
-  return (
-    <details
-      className={`deepcode-gui-block deepcode-gui-block--activity deepcode-gui-block--activity-${activity.kind} deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}${phaseClassName(block)}`}
-      open={open}
-    >
-      <summary>
-        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${activity.status}`} />
-        <span className="deepcode-gui-block__title">{title}</span>
-      </summary>
-      <div className="deepcode-gui-block__details deepcode-gui-activity">
-        <div className="deepcode-gui-activity__head">
-          <span className={`deepcode-gui-activity__kind deepcode-gui-activity__kind--${activity.kind}`}>
-            {activityKindLabel(language, activity.kind)}
-          </span>
-          <span className={`deepcode-gui-activity__status deepcode-gui-activity__status--${activity.status}`}>
-            {timelineStatusLabel(language, activity.status)}
-          </span>
-        </div>
-        {markdown && <MarkdownContent content={markdown} />}
-      </div>
-    </details>
-  );
-};
-
-function activityDisplayTitle(
-  activity: AgentConversationActivity,
-  block: AgentTimelineBlock,
-  language: UiLanguage
-): string {
-  const count = activity.itemCount ?? activity.targets?.length ?? 0;
-  const operation = activity.operation;
-  if (count > 0 && (operation === 'write' || operation === 'patch' || operation === 'create')) {
-    return t(language, 'deepcodeGui.activity.title.write', { count });
-  }
-  if (count > 0 && operation === 'delete') {
-    return t(language, 'deepcodeGui.activity.title.delete', { count });
-  }
-  if (count > 0 && (operation === 'read' || activity.kind === 'resourceRead')) {
-    return t(language, 'deepcodeGui.activity.title.read', { count });
-  }
-  if (count > 0 && (operation === 'list' || activity.kind === 'resourceSearch')) {
-    return t(language, 'deepcodeGui.activity.title.list', { count });
-  }
-  return activity.title || block.title || activityKindLabel(language, activity.kind);
-}
 
 const ReviewBlock: React.FC<{
   block: AgentTimelineBlock;
@@ -1006,7 +1036,7 @@ const ReviewBlock: React.FC<{
             projection={block.structuredProjection}
             language={language}
             animate={animate && shouldAnimateTimelineBlock(block)}
-            speed={typewriterSpeedForBlock(block)}
+            speed="normal"
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
           />
@@ -1015,7 +1045,7 @@ const ReviewBlock: React.FC<{
             content={markdown}
             animate={animate && shouldAnimateTimelineBlock(block)}
             streaming={block.deliveryMode === 'live'}
-            speed={typewriterSpeedForBlock(block)}
+            speed="normal"
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
           />
@@ -1029,173 +1059,15 @@ const ReviewBlock: React.FC<{
   );
 };
 
-const OperationEvidenceBlock: React.FC<{
-  block: AgentTimelineBlock;
-  language: UiLanguage;
-}> = ({ block, language }) => {
-  const title = localizedTimelineText(language, block.title);
-  const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
-  const status = block.status;
-  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
-  const markdown = block.bodyMarkdown ?? (block.activity ? activityBodyMarkdown(block.activity, language) : block.summary);
-
-  return (
-    <details
-      className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}${phaseClassName(block)}`}
-      open={open}
-    >
-      <summary>
-        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${status}`} />
-        <span className="deepcode-gui-block__title">{title}</span>
-      </summary>
-      <div className="deepcode-gui-block__details">
-        {markdown && <MarkdownContent content={markdown} />}
-      </div>
-    </details>
-  );
-};
-
-const ThinkingBlock: React.FC<{
-  block: AgentTimelineBlock;
-  language: UiLanguage;
-  animate?: boolean;
-  collapseCompletedThinking?: boolean;
-  onLiveContentChange?: () => void;
-  onTypewriterComplete: (blockId: string, textLength: number) => void;
-}> = ({ block, language, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined, onTypewriterComplete }) => {
-  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
-  const markdown = thinkingMarkdown(block);
-  const running = block.status === 'running' || block.status === 'waiting';
-  // Empty reasoning shells are hidden unless the provider is still streaming.
-  if (!markdown && !running) return null;
-  const initialOpen = running || animate
-    ? true
-    : collapseCompletedThinking
-      ? !block.defaultCollapsed
-      : true;
-  const [open, setOpen] = useState(initialOpen);
-
-  useEffect(() => {
-    setOpen(initialOpen);
-  }, [block.id, initialOpen]);
-
-  return (
-    <details
-      className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}${phaseClassName(block)}`}
-      open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-    >
-      <summary>
-        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
-        <span className="deepcode-gui-block__title">{t(language, 'deepcodeGui.timeline.thinking')}</span>
-      </summary>
-      <div className="deepcode-gui-block__details deepcode-gui-block__details--thinking">
-        {open && markdown && (
-          <ReasoningMarkdownStream
-            content={markdown}
-            animate={animate}
-            onVisibleContentChange={onLiveContentChange}
-            onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
-          />
-        )}
-      </div>
-    </details>
-  );
-};
-
-const ReasoningMarkdownStream: React.FC<{
-  content: string;
-  animate: boolean;
-  onVisibleContentChange: () => void;
-  onAnimationComplete?: () => void;
-}> = ({ content, animate, onVisibleContentChange, onAnimationComplete }) => {
-  const [visible, setVisible] = useState(() => (animate ? '' : content));
-  const visibleRef = useRef(visible);
-  const latestRef = useRef(content);
-  const timerRef = useRef<number | null>(null);
-  const onAnimationCompleteRef = useRef(onAnimationComplete);
-  const onVisibleContentChangeRef = useRef(onVisibleContentChange);
-
-  useEffect(() => {
-    visibleRef.current = visible;
-  }, [visible]);
-
-  useEffect(() => {
-    onAnimationCompleteRef.current = onAnimationComplete;
-  }, [onAnimationComplete]);
-
-  useEffect(() => {
-    onVisibleContentChangeRef.current = onVisibleContentChange;
-  }, [onVisibleContentChange]);
-
-  useEffect(() => {
-    latestRef.current = content;
-    if (!animate) {
-      visibleRef.current = content;
-      setVisible(content);
-      onAnimationCompleteRef.current?.();
-      window.requestAnimationFrame(onVisibleContentChangeRef.current);
-      return undefined;
-    }
-
-    const clearTimer = () => {
-      if (timerRef.current !== null) {
-        window.clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-
-    const commitVisible = (next: string) => {
-      visibleRef.current = next;
-      setVisible(next);
-      window.requestAnimationFrame(onVisibleContentChangeRef.current);
-    };
-
-    const tick = () => {
-      timerRef.current = null;
-      const latest = latestRef.current;
-      const current = visibleRef.current;
-      if (!latest.startsWith(current)) {
-        commitVisible(latest);
-        onAnimationCompleteRef.current?.();
-        return;
-      }
-      const backlog = latest.length - current.length;
-      if (backlog <= 0) {
-        onAnimationCompleteRef.current?.();
-        return;
-      }
-      if (backlog >= LIVE_REASONING_SNAP_BACKLOG_CHARS) {
-        commitVisible(latest);
-        onAnimationCompleteRef.current?.();
-        return;
-      }
-      const step = backlog >= LIVE_REASONING_FAST_BACKLOG_CHARS ? 360 : backlog >= 1000 ? 120 : 36;
-      const delayMs = backlog >= LIVE_REASONING_FAST_BACKLOG_CHARS ? 8 : 16;
-      commitVisible(latest.slice(0, Math.min(latest.length, current.length + step)));
-      timerRef.current = window.setTimeout(tick, delayMs);
-    };
-
-    if (timerRef.current === null) {
-      timerRef.current = window.setTimeout(tick, 24);
-    }
-    return clearTimer;
-  }, [animate, content]);
-
-  return <BufferedMarkdownStream content={animate ? visible : content} streaming={animate} />;
-};
-
 const BufferedMarkdownStream: React.FC<{
   content: string;
   streaming: boolean;
 }> = ({ content, streaming }) => {
-  const blocks = useMemo(() => segmentReasoningMarkdown(content, streaming), [content, streaming]);
+  const blocks = useMemo(() => segmentStreamingMarkdown(content, streaming), [content, streaming]);
   return (
-    <div className="deepcode-gui-reasoning-stream">
+    <div className="deepcode-gui-markdown-stream">
       {blocks.map((block, index) => (
-        <MemoizedReasoningMarkdownBlock
+        <MemoizedMarkdownStreamBlock
           key={`markdown-block-${index}`}
           content={block.content}
           sealed={block.sealed}
@@ -1205,16 +1077,16 @@ const BufferedMarkdownStream: React.FC<{
   );
 };
 
-const MemoizedReasoningMarkdownBlock = React.memo(
+const MemoizedMarkdownStreamBlock = React.memo(
   ({ content, sealed }: { content: string; sealed: boolean }) => (
-    <div className={`deepcode-gui-reasoning-stream__block${sealed ? ' deepcode-gui-reasoning-stream__block--sealed' : ' deepcode-gui-reasoning-stream__block--tail'}`}>
+    <div className={`deepcode-gui-markdown-stream__block${sealed ? ' deepcode-gui-markdown-stream__block--sealed' : ' deepcode-gui-markdown-stream__block--tail'}`}>
       <MarkdownContent content={content} />
     </div>
   ),
   (prev, next) => prev.content === next.content && prev.sealed === next.sealed
 );
 
-function segmentReasoningMarkdown(content: string, streaming: boolean): Array<{ content: string; sealed: boolean }> {
+function segmentStreamingMarkdown(content: string, streaming: boolean): Array<{ content: string; sealed: boolean }> {
   if (!content) return [];
   const lines = content.match(/[^\n]*\n|[^\n]+$/g) ?? [content];
   const blocks: Array<{ content: string; sealed: boolean }> = [];
@@ -1311,7 +1183,7 @@ const PlanBlock: React.FC<{
             projection={block.structuredProjection}
             language={language}
             animate={animate && shouldAnimateTimelineBlock(block)}
-            speed={typewriterSpeedForBlock(block)}
+            speed="normal"
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
           />
@@ -1573,10 +1445,6 @@ function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = '
   return structuredProjectionText(block.structuredProjection, language) || block.bodyMarkdown || block.summary;
 }
 
-function thinkingMarkdown(block: AgentTimelineBlock): string {
-  return (block.bodyMarkdown ?? '').trim();
-}
-
 function isActionableAgentOutputBlock(block: AgentTimelineBlock): boolean {
   if (block.kind === 'review' || block.narrativeKind === 'review') return true;
   if (block.narrativeKind) return block.narrativeKind === 'assistantText';
@@ -1593,10 +1461,8 @@ function turnCopyText(
 }
 
 function blockCopyText(block: AgentTimelineBlock, language: UiLanguage): string[] {
-  if (block.kind === 'turnActions') return [];
   const title = blockCopyTitle(block, language);
-  const activityBody = block.activity ? activityBodyMarkdown(block.activity, language) : '';
-  const body = blockCopyBody(block, activityBody, language);
+  const body = blockCopyBody(block, language);
   const attachmentText = block.kind === 'user'
     ? attachmentCopyText(blockAttachments(block), language)
     : '';
@@ -1607,31 +1473,22 @@ function blockCopyText(block: AgentTimelineBlock, language: UiLanguage): string[
   return attachmentText ? [attachmentText] : [];
 }
 
-function blockCopyBody(block: AgentTimelineBlock, activityBody: string, language: UiLanguage): string {
+function blockCopyBody(block: AgentTimelineBlock, language: UiLanguage): string {
   if (block.kind === 'review' || block.narrativeKind === 'review') {
     return reviewBlockMarkdown(block, language);
   }
-  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
-    return thinkingMarkdown(block);
-  }
-  if (block.activity) {
-    return (block.bodyMarkdown ?? activityBody).trim();
-  }
-  return (block.bodyMarkdown ?? block.summary ?? activityBody).trim();
+  return (block.bodyMarkdown ?? block.summary ?? '').trim();
 }
 
 function visibleTypewriterMarkdown(block: AgentTimelineBlock, language?: UiLanguage): string {
   if (block.kind === 'plan' || block.narrativeKind === 'plan') return planBlockMarkdown(block, language ?? 'zh-CN');
   if (block.kind === 'review' || block.narrativeKind === 'review') return reviewBlockMarkdown(block, language ?? 'zh-CN');
-  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') return thinkingMarkdown(block);
-  if (block.activity) return block.bodyMarkdown ?? '';
   return localizedTimelineText(language ?? 'zh-CN', (block.bodyMarkdown ?? block.summary ?? '').trim());
 }
 
 function blockCopyTitle(block: AgentTimelineBlock, language: UiLanguage): string {
   if (block.kind === 'user') return t(language, 'agent.copy.user');
   if (block.kind === 'assistant') return 'DeepCode';
-  if (block.kind === 'thinking') return t(language, 'agent.copy.thinking');
   if (block.kind === 'error') return t(language, 'agent.copy.error');
   return block.title || block.kind;
 }
@@ -1659,7 +1516,6 @@ async function copyText(text: string): Promise<void> {
 }
 
 function phaseClassName(block: AgentTimelineBlock): string {
-  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') return '';
   const phase = block.displayHints?.phase;
   return phase ? ` deepcode-gui-block--phase-${phase}` : '';
 }

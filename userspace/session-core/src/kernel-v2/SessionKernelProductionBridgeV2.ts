@@ -3618,7 +3618,7 @@ async function settleResponseFrameDurably(
   const readPath = [
     '/api/session-store',
     encodeURIComponent(response.sessionId),
-    'kernel-v3',
+    'session-runs',
     encodeURIComponent(response.runId),
     'records',
     encodeURIComponent(stored.recordId),

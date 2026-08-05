@@ -873,10 +873,7 @@ function validateQueueOrderedProviderResponseV2(
       item.kind !== 'toolCall'
       || finalStarted
       || item.ordinal !== orderedCalls.length + 1
-      || (
-        item.source !== 'providerNative'
-        && item.source !== 'textFrame'
-      )
+      || item.source !== 'providerNative'
     ) {
       throw invalidQueue();
     }
@@ -888,25 +885,7 @@ function validateQueueOrderedProviderResponseV2(
   if (!receiptMatchesSealedProviderItems(queue, orderedCalls)) {
     throw invalidQueue();
   }
-  const providerNativeCalls = orderedCalls.filter(
-    (item) => item.source === 'providerNative'
-  ).length;
-  const textFrameCalls = orderedCalls.filter(
-    (item) => item.source === 'textFrame'
-  ).length;
-  if (
-    (providerNativeCalls > 0 && textFrameCalls > 0)
-    || textFrameCalls > 1
-    || (
-      textFrameCalls === 1
-      && (
-        orderedCalls.length !== 1
-        || queue.orderedItems.length !== 1
-      )
-    )
-  ) {
-    throw invalidQueue();
-  }
+  const providerNativeCalls = orderedCalls.length;
   const native = completion.nativeCompletion;
   const expectedReasoningTransport =
     native.providerKind === 'openaiCompatible'

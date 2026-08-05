@@ -7,9 +7,6 @@ import {
 } from '@deepcode/protocol';
 import { assertProviderSafeToolContextV2, toolContextRefV2 } from './toolContext.js';
 
-export const SESSION_TOOL_INTENT_TEXT_FRAME_V2 =
-  'deepcode.session.tool-intent-frame.v2' as const;
-
 export interface ProviderNativeKernelToolCallV2 {
   source: 'providerNative';
   callId: string;
@@ -17,14 +14,8 @@ export interface ProviderNativeKernelToolCallV2 {
   arguments: unknown;
 }
 
-export interface ProviderTextKernelToolFrameV2 {
-  source: 'textFrame';
-  frame: string;
-}
-
 export type ProviderKernelToolSourceV2 =
-  | ProviderNativeKernelToolCallV2
-  | ProviderTextKernelToolFrameV2;
+  ProviderNativeKernelToolCallV2;
 
 export interface SessionToolIntentBindingV2 {
   runId: string;
@@ -36,28 +27,19 @@ export interface SessionToolIntentBindingV2 {
   deadline?: ToolIntentV2['deadline'];
 }
 
-interface DecodedProviderToolIntentFrameV2 {
-  schemaVersion: typeof SESSION_TOOL_INTENT_TEXT_FRAME_V2;
-  kind: 'toolIntent';
-  toolId: string;
-  arguments: RawToolArgumentsV2;
-}
-
 /**
- * Converts only provider-native calls or an exact standalone structured frame
- * into ToolIntent. It never scans narration for JSON, tags, names, or paths.
+ * Converts only provider-native calls into ToolIntent. Natural-language or
+ * JSON-shaped assistant text is never executable control data.
  */
 export function normalizeProviderKernelToolIntentV2(
   source: ProviderKernelToolSourceV2,
   binding: SessionToolIntentBindingV2
 ): ToolIntentV2 {
   assertProviderSafeToolContextV2(binding.toolContext);
-  const proposal = source.source === 'providerNative'
-    ? {
-        toolId: requiredToolId(source.toolId),
-        arguments: decodeProviderArguments(source.arguments),
-      }
-    : decodeProviderToolIntentTextFrameV2(source.frame);
+  const proposal = {
+    toolId: requiredToolId(source.toolId),
+    arguments: decodeProviderArguments(source.arguments),
+  };
   const descriptor = binding.toolContext.tools.find(
     (tool) => tool.toolId === proposal.toolId
   );
@@ -95,54 +77,6 @@ export function normalizeProviderKernelToolIntentV2(
   };
 }
 
-/**
- * Text-frame support is deliberately all-or-nothing JSON. Markdown fences,
- * leading narration, trailing narration, and embedded objects are rejected.
- */
-export function decodeProviderToolIntentTextFrameV2(
-  rawFrame: string
-): DecodedProviderToolIntentFrameV2 {
-  const trimmed = rawFrame.trim();
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
-    throw new SessionToolIntentError(
-      'session_tool_intent_text_not_structured',
-      'A text ToolIntent must be a standalone JSON frame.'
-    );
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    throw new SessionToolIntentError(
-      'session_tool_intent_text_invalid_json',
-      'The standalone text ToolIntent is not valid JSON.'
-    );
-  }
-  const frame = exactObject(
-    parsed,
-    ['schemaVersion', 'kind', 'toolId', 'arguments'],
-    'text ToolIntent frame'
-  );
-  if (frame.schemaVersion !== SESSION_TOOL_INTENT_TEXT_FRAME_V2) {
-    throw new SessionToolIntentError(
-      'session_tool_intent_text_version_unsupported',
-      'The text ToolIntent frame version is unsupported.'
-    );
-  }
-  if (frame.kind !== 'toolIntent') {
-    throw new SessionToolIntentError(
-      'session_tool_intent_text_kind_invalid',
-      'The text ToolIntent frame kind must be toolIntent.'
-    );
-  }
-  return {
-    schemaVersion: SESSION_TOOL_INTENT_TEXT_FRAME_V2,
-    kind: 'toolIntent',
-    toolId: requiredToolId(frame.toolId),
-    arguments: decodeRawToolArgumentsV2(frame.arguments),
-  };
-}
-
 function decodeProviderArguments(value: unknown): RawToolArgumentsV2 {
   if (typeof value !== 'string') return decodeRawToolArgumentsV2(value);
   let decoded: unknown;
@@ -168,33 +102,6 @@ function requiredToolId(value: unknown): string {
     );
   }
   return value;
-}
-
-function exactObject(
-  value: unknown,
-  allowedKeys: readonly string[],
-  label: string
-): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new SessionToolIntentError(
-      'session_tool_intent_frame_invalid',
-      `${label} must be an object.`
-    );
-  }
-  const record = value as Record<string, unknown>;
-  const unexpected = Object.keys(record).filter(
-    (key) => !allowedKeys.includes(key)
-  );
-  const missing = allowedKeys.filter(
-    (key) => !Object.prototype.hasOwnProperty.call(record, key)
-  );
-  if (unexpected.length > 0 || missing.length > 0) {
-    throw new SessionToolIntentError(
-      'session_tool_intent_frame_invalid',
-      `${label} has an invalid field set.`
-    );
-  }
-  return record;
 }
 
 export class SessionToolIntentError extends Error {

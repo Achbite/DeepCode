@@ -39,6 +39,7 @@ import type {
   UpdateAgentSessionRequest,
   ArchiveAgentSessionRequest,
   AgentSessionResult,
+  AgentTimelineStreamEvent,
   AgentTimelineResult,
   ShellEnvironmentStatus,
   TerminalCapability,
@@ -107,13 +108,11 @@ export interface AgentRunStatus {
   updatedAt: string;
   completedAt?: string;
   message?: string;
-  finalText?: string;
 }
 
 export interface AgentRunResult {
   run: AgentRunStatus;
   session: AgentSessionResult['session'];
-  events: AgentSessionResult['events'];
 }
 
 function endpointLabel(url: string): string {
@@ -314,23 +313,45 @@ async function sendReplayableHostMutation<T>(
   return sendJson<T>(url, 'POST', body);
 }
 
+interface SseStreamEvent {
+  event: string;
+  data: unknown;
+}
+
+export class AgentTimelineStreamProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentTimelineStreamProtocolError';
+  }
+}
+
 async function streamSse(
   url: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
+  eventNames: readonly string[],
+  onEvent: (event: SseStreamEvent) => void,
+  terminalEventNames: readonly string[] = [],
   signal?: AbortSignal
 ): Promise<void> {
   if (
     typeof EventSource !== 'undefined' &&
     Object.keys(getHostAdmissionHeaders()).length === 0
   ) {
-    return streamSseWithEventSource(url, onEvent, signal);
+    return streamSseWithEventSource(
+      url,
+      eventNames,
+      onEvent,
+      terminalEventNames,
+      signal
+    );
   }
   return streamSseWithFetch(url, onEvent, signal);
 }
 
 function streamSseWithEventSource(
   url: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
+  eventNames: readonly string[],
+  onEvent: (event: SseStreamEvent) => void,
+  terminalEventNames: readonly string[],
   signal?: AbortSignal
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -350,36 +371,34 @@ function streamSseWithEventSource(
       else resolve();
     };
     const onAbort = () => finish();
-    const handleMessage = (eventName: AgentRunStreamEvent['event'], event: Event) => {
+    const handleMessage = (eventName: string, event: Event) => {
       const message = event as MessageEvent<string>;
       if (typeof message.data !== 'string' || !message.data.trim()) {
         if (eventName === 'error') {
-          finish(new Error(`Agent run event stream disconnected (${endpointLabel(url)})`));
+          finish(new Error(`Agent stream disconnected (${endpointLabel(url)})`));
         }
         return;
       }
+      let data: unknown;
       try {
-        onEvent({ event: eventName, data: JSON.parse(message.data) as unknown });
+        data = JSON.parse(message.data) as unknown;
       } catch {
-        onEvent({
-          event: 'error',
-          data: {
-            code: 'invalid_sse_payload',
-            message: 'Agent run stream returned invalid JSON payload.',
-          },
-        });
+        data = {
+          code: 'invalid_sse_payload',
+          message: 'Agent stream returned invalid JSON payload.',
+        };
+        eventName = 'error';
       }
-      if (eventName === 'terminal') finish();
+      try {
+        onEvent({ event: eventName, data });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      if (terminalEventNames.includes(eventName)) finish();
     };
 
-    const eventNames: AgentRunStreamEvent['event'][] = [
-      'run',
-      'events',
-      'terminal',
-      'heartbeat',
-      'error',
-    ];
-    for (const eventName of eventNames) {
+    for (const eventName of new Set([...eventNames, 'error'])) {
       source.addEventListener(eventName, (event) => handleMessage(eventName, event));
     }
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -388,7 +407,7 @@ function streamSseWithEventSource(
 
 async function streamSseWithFetch(
   url: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
+  onEvent: (event: SseStreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(url, {
@@ -420,8 +439,8 @@ async function streamSseWithFetch(
   for (const event of consumed.items) onEvent(event);
 }
 
-function consumeSseEvents(buffer: string): { items: AgentRunStreamEvent[]; remaining: string } {
-  const items: AgentRunStreamEvent[] = [];
+function consumeSseEvents(buffer: string): { items: SseStreamEvent[]; remaining: string } {
+  const items: SseStreamEvent[] = [];
   let remaining = buffer;
   for (;;) {
     const boundary = remaining.search(/\r?\n\r?\n/);
@@ -429,22 +448,22 @@ function consumeSseEvents(buffer: string): { items: AgentRunStreamEvent[]; remai
     const raw = remaining.slice(0, boundary);
     const separator = remaining.slice(boundary).match(/^\r?\n\r?\n/);
     remaining = remaining.slice(boundary + (separator?.[0].length ?? 2));
-    const event = parseAgentRunSseEvent(raw);
+    const event = parseSseEvent(raw);
     if (event) items.push(event);
   }
   return { items, remaining };
 }
 
-function parseAgentRunSseEvent(raw: string): AgentRunStreamEvent | null {
+function parseSseEvent(raw: string): SseStreamEvent | null {
   if (!raw.trim()) return null;
-  let eventName: AgentRunStreamEvent['event'] = 'events';
+  let eventName = 'message';
   const data: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
     if (!line || line.startsWith(':')) continue;
     const separator = line.indexOf(':');
     const field = separator >= 0 ? line.slice(0, separator) : line;
     const value = separator >= 0 ? line.slice(separator + 1).replace(/^ /, '') : '';
-    if (field === 'event') eventName = value as AgentRunStreamEvent['event'];
+    if (field === 'event') eventName = value;
     if (field === 'data') data.push(value);
   }
   const payload = data.join('\n').trim();
@@ -456,7 +475,7 @@ function parseAgentRunSseEvent(raw: string): AgentRunStreamEvent | null {
       event: 'error',
       data: {
         code: 'invalid_sse_payload',
-        message: 'Agent run stream returned invalid JSON payload.',
+        message: 'Agent timeline stream returned invalid JSON payload.',
       },
     };
   }
@@ -772,22 +791,54 @@ export async function deleteAgentSession(
   return result;
 }
 
-export function getAgentSession(
-  sessionId: string,
-  signal?: AbortSignal
-): Promise<ApiResponse<AgentSessionResult>> {
-  return getJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`,
-    signal
-  );
-}
-
 export function getAgentTimeline(
   sessionId: string,
   signal?: AbortSignal
 ): Promise<ApiResponse<AgentTimelineResult>> {
   return getJson<AgentTimelineResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`,
+    signal
+  );
+}
+
+export function streamAgentTimeline(
+  sessionId: string,
+  onEvent: (event: AgentTimelineStreamEvent) => void,
+  cursor?: { afterRevision?: number },
+  signal?: AbortSignal
+): Promise<void> {
+  const qs = buildQuery({
+    afterRevision: cursor?.afterRevision === undefined
+      ? undefined
+      : String(cursor.afterRevision),
+  });
+  return streamSse(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline/stream${qs}`,
+    ['snapshot', 'delta'],
+    (event) => {
+      if (event.event === 'error') {
+        const detail = isRecord(event.data)
+          ? stringField(event.data, 'message') ?? stringField(event.data, 'code')
+          : null;
+        if (isRecord(event.data) && event.data.code === 'invalid_sse_payload') {
+          throw new AgentTimelineStreamProtocolError(
+            detail ?? 'Agent timeline stream returned invalid JSON.'
+          );
+        }
+        throw new Error(detail ?? 'Agent timeline stream disconnected');
+      }
+      if (
+        (event.event !== 'snapshot' && event.event !== 'delta')
+        || !isRecord(event.data)
+        || event.data.type !== event.event
+      ) {
+        throw new AgentTimelineStreamProtocolError(
+          'Agent timeline stream returned an invalid event envelope.'
+        );
+      }
+      onEvent(event.data as unknown as AgentTimelineStreamEvent);
+    },
+    [],
     signal
   );
 }
@@ -809,28 +860,6 @@ export function getAgentRun(
 ): Promise<ApiResponse<AgentRunResult>> {
   return getJson<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
-    signal
-  );
-}
-
-export interface AgentRunStreamEvent {
-  event: 'run' | 'events' | 'terminal' | 'heartbeat' | 'error';
-  data: unknown;
-}
-
-export function streamAgentRun(
-  sessionId: string,
-  runId: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
-  cursor?: { sinceEventCount?: number },
-  signal?: AbortSignal
-): Promise<void> {
-  const qs = buildQuery({
-    sinceEventCount: cursor?.sinceEventCount === undefined ? undefined : String(cursor.sinceEventCount),
-  });
-  return streamSse(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream${qs}`,
-    onEvent,
     signal
   );
 }

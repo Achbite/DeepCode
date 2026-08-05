@@ -16,6 +16,8 @@ use std::{
     time::Duration,
 };
 
+const EXIT_ACTION_REQUIRED: i32 = 5;
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse(env::args().skip(1).collect());
@@ -53,16 +55,25 @@ async fn main() {
         return;
     }
 
-    let result = if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        run_terminal(app).await
+    let terminal_mode = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let result = if terminal_mode {
+        run_terminal(app).await.map(|_| None)
     } else {
         run_plain(app).await
     };
 
-    if let Err(error) = result {
-        drop(bootstrap);
-        eprintln!("DeepCode-TUI failed: {error}");
-        std::process::exit(1);
+    match result {
+        Ok(Some(message)) => {
+            drop(bootstrap);
+            eprintln!("{message}");
+            std::process::exit(EXIT_ACTION_REQUIRED);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            drop(bootstrap);
+            eprintln!("DeepCode-TUI failed: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -150,7 +161,7 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
     Ok(())
 }
 
-async fn run_plain(mut app: TuiApp) -> io::Result<()> {
+async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
     print!("{}", app.renderer().render_plain(&app));
     let mut line = String::new();
     loop {
@@ -172,8 +183,11 @@ async fn run_plain(mut app: TuiApp) -> io::Result<()> {
             }
         }
         print!("{}", app.renderer().render_plain(&app));
+        if let Some(message) = app.take_action_required() {
+            return Ok(Some(message));
+        }
     }
-    Ok(())
+    Ok(None)
 }
 
 struct TerminalGuard;

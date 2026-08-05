@@ -17,6 +17,7 @@ use crate::AppState;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use deepcode_kernel_abi::v2_command::CapabilityScopePreviewRecordV2;
 use deepcode_kernel_abi::{RunCapabilityV2, ToolContextBundleV2, ToolContextRefV2};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1355,31 +1356,12 @@ impl SessionKernelV2Store {
     ) -> Result<PathBuf, HostV2StorageError> {
         validate_safe_session_identity(session_id)?;
         validate_bounded_identity(run_id, "runId", 512)?;
+        let session_directory = self.sessions_dir.join(session_id);
         let path_component = format!("{}.jsonl", sha256_path_component(run_id));
-        let legacy_path = self
-            .sessions_dir
-            .join(session_id)
-            .join("kernel-v2")
-            .join(&path_component);
-        match fs::metadata(&legacy_path) {
-            Ok(_) => {
-                return Err(HostV2StorageError::conflict(
-                    "UnsupportedHistorySchema",
-                    "Active Session persistence v2 cannot be resumed or extended by v3",
-                ))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(HostV2StorageError::io(
-                    "session_kernel_legacy_history_inspection_failed",
-                    format!("inspect legacy active Session persistence: {error}"),
-                ))
-            }
-        }
-        Ok(self
-            .sessions_dir
-            .join(session_id)
-            .join("kernel-v3")
+        reject_pre_cutover_session_layout(&session_directory)?;
+        let kernel_v2_directory = session_directory.join("kernel-v2");
+        Ok(kernel_v2_directory
+            .join("session-runs")
             .join(path_component))
     }
 }
@@ -4145,6 +4127,34 @@ struct SessionKernelProjectionEventV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum SessionKernelTimelineUpdateV2 {
+    Snapshot { snapshot: Value },
+    Delta { delta: SessionKernelTimelineDeltaV2 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionKernelTimelineDeltaV2 {
+    schema_version: String,
+    shape_version: String,
+    session_id: String,
+    base_revision: u64,
+    revision: u64,
+    source_event_version: u64,
+    generated_at: String,
+    event_count: u64,
+    turn_replacements: Vec<Value>,
+    removed_turn_ids: Vec<String>,
+    root_replacements: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SessionKernelHostProjectionRequestV2 {
     schema_version: String,
@@ -4154,7 +4164,7 @@ pub(crate) struct SessionKernelHostProjectionRequestV2 {
     projection_digest: String,
     event: SessionKernelProjectionEventV2,
     agent_event: Value,
-    timeline: Value,
+    timeline_update: SessionKernelTimelineUpdateV2,
 }
 
 #[derive(Debug, Serialize)]
@@ -4255,12 +4265,18 @@ impl SessionKernelProjectionSinkV2 {
         let path = self.projection_path(session_id, host_run_id)?;
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
         let replayed = with_storage_path_lock(&guard_path, || {
-            self.preflight_public_projection(session_id, &request)?;
+            let timeline = self.preflight_public_projection(session_id, &request)?;
             let replayed = if projection_request_replayed(&path, session_id, host_run_id, &request)?
             {
                 true
             } else {
-                self.preflight_public_projection_appends(session_id, host_run_id, &request, false)?;
+                self.preflight_public_projection_appends(
+                    session_id,
+                    host_run_id,
+                    &request,
+                    &timeline,
+                    false,
+                )?;
                 append_json_line_durable(
                     &path,
                     &serde_json::to_value(&request).map_err(|error| {
@@ -4273,10 +4289,16 @@ impl SessionKernelProjectionSinkV2 {
                 false
             };
             if replayed {
-                self.preflight_public_projection_appends(session_id, host_run_id, &request, true)?;
+                self.preflight_public_projection_appends(
+                    session_id,
+                    host_run_id,
+                    &request,
+                    &timeline,
+                    true,
+                )?;
             }
             self.publish_agent_event_locked(session_id, &request)?;
-            self.publish_timeline_locked(session_id, &request)?;
+            self.publish_timeline_locked(session_id, &request, &timeline)?;
             Ok(replayed)
         })?;
         self.remember_projection(session_id, host_run_id, &request)?;
@@ -4659,7 +4681,7 @@ impl SessionKernelProjectionSinkV2 {
         &self,
         session_id: &str,
         request: &SessionKernelHostProjectionRequestV2,
-    ) -> Result<(), HostV2StorageError> {
+    ) -> Result<Value, HostV2StorageError> {
         let incoming_event_id = public_agent_event_id(&request.agent_event)?;
         let events = read_session_kernel_v2_public_agent_events_unlocked(
             self.sessions_dir.as_ref(),
@@ -4686,21 +4708,28 @@ impl SessionKernelProjectionSinkV2 {
                 false,
             ),
         };
-        let incoming = public_timeline_record(request)?;
         let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
         let records = read_public_timeline_records(&path, session_id)?;
         if let Some(existing) = records
             .iter()
             .find(|record| record.projection_id == request.projection_id)
         {
-            if existing == &incoming && agent_event_replayed {
-                return Ok(());
+            if existing.projection_digest == request.projection_digest && agent_event_replayed {
+                validate_resolved_projection_digest(request, &existing.timeline)?;
+                return Ok(existing.timeline.clone());
             }
             return Err(HostV2StorageError::conflict(
                 "session_kernel_public_timeline_identity_conflict",
                 "Session public timeline projection has different durable content",
             ));
         }
+        let timeline = resolve_projection_timeline(
+            session_id,
+            request,
+            records.last().map(|record| &record.timeline),
+        )?;
+        validate_resolved_projection_digest(request, &timeline)?;
+        let incoming = public_timeline_record(request, &timeline)?;
         if incoming.source_event_version != anticipated_event_count {
             return Err(HostV2StorageError::conflict(
                 "session_kernel_public_timeline_event_gap",
@@ -4717,8 +4746,7 @@ impl SessionKernelProjectionSinkV2 {
                 ));
             }
         }
-        validate_preserved_legacy_prefix(&records, &request.timeline)?;
-        Ok(())
+        Ok(timeline)
     }
 
     fn preflight_public_projection_appends(
@@ -4726,6 +4754,7 @@ impl SessionKernelProjectionSinkV2 {
         session_id: &str,
         host_run_id: &str,
         request: &SessionKernelHostProjectionRequestV2,
+        timeline: &Value,
         host_projection_replayed: bool,
     ) -> Result<(), HostV2StorageError> {
         let projection_path = self.projection_path(session_id, host_run_id)?;
@@ -4775,7 +4804,7 @@ impl SessionKernelProjectionSinkV2 {
             preflight_projection_store_append(&agent_path, agent_values.len(), &agent_value)?;
         }
 
-        let timeline_record = public_timeline_record(request)?;
+        let timeline_record = public_timeline_record(request, timeline)?;
         let timeline_path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
         let timeline_records = read_public_timeline_records(&timeline_path, session_id)?;
         let timeline_replayed = timeline_records
@@ -4840,8 +4869,9 @@ impl SessionKernelProjectionSinkV2 {
         &self,
         session_id: &str,
         request: &SessionKernelHostProjectionRequestV2,
+        timeline: &Value,
     ) -> Result<(), HostV2StorageError> {
-        let record = public_timeline_record(request)?;
+        let record = public_timeline_record(request, timeline)?;
         let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
         let records = read_public_timeline_records(&path, session_id)?;
         if let Some(existing) = records
@@ -5069,7 +5099,6 @@ fn projection_request_replayed(
         if existing.projection_digest == request.projection_digest
             && existing.event == request.event
             && existing.agent_event == request.agent_event
-            && existing.timeline == request.timeline
         {
             return Ok(true);
         }
@@ -5126,7 +5155,6 @@ fn validate_projection_request(
             | "kernelFacts.reconciled"
             | "authorization.decided"
             | "review.revised"
-            | "planAction.skipped"
             | "planAction.completed"
             | "run.cancelled"
             | "wait.changed"
@@ -5137,6 +5165,7 @@ fn validate_projection_request(
             "Session Kernel projection kind is not supported",
         ));
     }
+    validate_private_projection_event_data(&request.event)?;
     let event = serde_json::to_value(&request.event).map_err(|error| {
         HostV2StorageError::invalid(
             "session_kernel_projection_record_invalid",
@@ -5147,31 +5176,1184 @@ fn validate_projection_request(
     validate_public_agent_event(
         &request.agent_event,
         session_id,
-        Some((&request.projection_id, &request.event.recorded_at)),
+        Some((
+            &request.projection_id,
+            &request.event.recorded_at,
+            &request.event.run_id,
+            &request.event.kind,
+        )),
     )?;
-    reject_transport_capabilities(&request.timeline)?;
+    let timeline_update = serde_json::to_value(&request.timeline_update).map_err(|error| {
+        HostV2StorageError::invalid(
+            "session_kernel_projection_record_invalid",
+            format!("encode Session timeline update: {error}"),
+        )
+    })?;
+    reject_transport_capabilities(&timeline_update)?;
+    validate_projection_timeline_update(request, session_id)?;
+    Ok(())
+}
+
+fn validate_projection_timeline_update(
+    request: &SessionKernelHostProjectionRequestV2,
+    session_id: &str,
+) -> Result<(), HostV2StorageError> {
+    match &request.timeline_update {
+        SessionKernelTimelineUpdateV2::Snapshot { snapshot } => {
+            validate_projection_snapshot(snapshot, session_id)
+        }
+        SessionKernelTimelineUpdateV2::Delta { delta } => {
+            if request.event.kind != "provider.composing" {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_timeline_delta_kind_invalid",
+                    "Only Provider composing projections may use a timeline delta",
+                ));
+            }
+            if delta.schema_version != "deepcode.shared-conversation-projection.v2"
+                || delta.shape_version != "deepcode.shared-conversation.work-segments.v1"
+                || delta.session_id != session_id
+            {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_timeline_delta_identity_invalid",
+                    "Session timeline delta has an unsupported schema, shape, or Session identity",
+                ));
+            }
+            for (field, value) in [
+                ("baseRevision", delta.base_revision),
+                ("revision", delta.revision),
+                ("sourceEventVersion", delta.source_event_version),
+                ("eventCount", delta.event_count),
+            ] {
+                if value > MAX_SAFE_INTEGER_V3 {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_delta_version_invalid",
+                        format!("Session timeline delta {field} is not a safe integer"),
+                    ));
+                }
+            }
+            validate_bounded_identity(&delta.generated_at, "generatedAt", 512)?;
+            if delta.generated_at != request.event.recorded_at {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_timeline_delta_time_mismatch",
+                    "Session timeline delta time does not match the projected event",
+                ));
+            }
+            let allowed_roots = HashSet::from([
+                "taskProjection",
+                "interactionProjection",
+                "runProjection",
+                "tokenUsageProjection",
+                "workspaceProjection",
+            ]);
+            if delta
+                .root_replacements
+                .keys()
+                .any(|key| !allowed_roots.contains(key.as_str()))
+            {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_timeline_delta_root_invalid",
+                    "Session timeline delta contains an unsupported root replacement",
+                ));
+            }
+            let mut replacement_ids = HashSet::new();
+            for turn in &delta.turn_replacements {
+                let turn_id = turn.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    HostV2StorageError::invalid(
+                        "session_kernel_timeline_delta_turn_invalid",
+                        "Session timeline delta replacement requires a turn identity",
+                    )
+                })?;
+                validate_bounded_identity(turn_id, "turnId", 512)?;
+                if !replacement_ids.insert(turn_id) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_delta_turn_invalid",
+                        "Session timeline delta repeats a turn replacement",
+                    ));
+                }
+            }
+            let mut removed_ids = HashSet::new();
+            for turn_id in &delta.removed_turn_ids {
+                validate_bounded_identity(turn_id, "removedTurnId", 512)?;
+                if !removed_ids.insert(turn_id.as_str())
+                    || replacement_ids.contains(turn_id.as_str())
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_delta_turn_invalid",
+                        "Session timeline delta repeats or conflicts with a removed turn",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_projection_snapshot(
+    snapshot: &Value,
+    session_id: &str,
+) -> Result<(), HostV2StorageError> {
+    reject_transport_capabilities(snapshot)?;
     crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
-        &request.timeline,
+        snapshot,
     )
     .map_err(|message| {
         HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
     })?;
-    if request.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+    if snapshot.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_identity_mismatch",
             "Session public timeline belongs to another Session",
         ));
     }
+    Ok(())
+}
+
+fn resolve_projection_timeline(
+    session_id: &str,
+    request: &SessionKernelHostProjectionRequestV2,
+    current: Option<&Value>,
+) -> Result<Value, HostV2StorageError> {
+    let timeline = match &request.timeline_update {
+        SessionKernelTimelineUpdateV2::Snapshot { snapshot } => snapshot.clone(),
+        SessionKernelTimelineUpdateV2::Delta { delta } => {
+            let current = current.ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_timeline_delta_base_missing",
+                    "Session timeline delta has no canonical base snapshot",
+                )
+            })?;
+            apply_projection_timeline_delta(current, delta)?
+        }
+    };
+    validate_projection_snapshot(&timeline, session_id)?;
+    if timeline.get("generatedAt").and_then(Value::as_str)
+        != Some(request.event.recorded_at.as_str())
+    {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_public_timeline_time_mismatch",
+            "Session public timeline time does not match the projected event",
+        ));
+    }
+    Ok(timeline)
+}
+
+fn apply_projection_timeline_delta(
+    current: &Value,
+    delta: &SessionKernelTimelineDeltaV2,
+) -> Result<Value, HostV2StorageError> {
+    let current_revision = timeline_u64(current, "revision")?;
+    let current_source_event_version = timeline_u64(current, "sourceEventVersion")?;
+    let current_event_count = timeline_u64(current, "eventCount")?;
+    if delta.base_revision != current_revision
+        || delta.revision
+            != current_revision.checked_add(1).ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_timeline_delta_version_exhausted",
+                    "Session timeline revision is exhausted",
+                )
+            })?
+        || delta.source_event_version
+            != current_source_event_version.checked_add(1).ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_timeline_delta_version_exhausted",
+                    "Session timeline source-event version is exhausted",
+                )
+            })?
+        || delta.event_count
+            != current_event_count.checked_add(1).ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_timeline_delta_version_exhausted",
+                    "Session timeline event count is exhausted",
+                )
+            })?
+    {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_timeline_delta_revision_gap",
+            "Session timeline delta does not extend the exact canonical revision",
+        ));
+    }
+    let current_object = current.as_object().ok_or_else(|| {
+        HostV2StorageError::conflict(
+            "session_kernel_public_timeline_history_corrupt",
+            "Canonical Session timeline is not an object",
+        )
+    })?;
+    let mut timeline = current_object.clone();
+    let current_turns = current_object
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline has no turn array",
+            )
+        })?;
+    let removed = delta
+        .removed_turn_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let replacements = delta
+        .turn_replacements
+        .iter()
+        .map(|turn| {
+            let turn_id = turn
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("timeline delta validated before application");
+            (turn_id, turn.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut known_turn_ids = HashSet::new();
+    let mut turns = Vec::new();
+    for turn in current_turns {
+        let turn_id = turn.get("id").and_then(Value::as_str).ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline turn has no identity",
+            )
+        })?;
+        if removed.contains(turn_id) {
+            continue;
+        }
+        turns.push(
+            replacements
+                .get(turn_id)
+                .cloned()
+                .unwrap_or_else(|| turn.clone()),
+        );
+        known_turn_ids.insert(turn_id);
+    }
+    for (turn_id, replacement) in &replacements {
+        if !known_turn_ids.contains(turn_id) {
+            turns.push(replacement.clone());
+        }
+    }
+    turns.sort_by_key(|turn| {
+        turn.get("sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
+    timeline.insert("schemaVersion".to_string(), json!(delta.schema_version));
+    timeline.insert("shapeVersion".to_string(), json!(delta.shape_version));
+    timeline.insert("sessionId".to_string(), json!(delta.session_id));
+    timeline.insert("revision".to_string(), json!(delta.revision));
+    timeline.insert(
+        "sourceEventVersion".to_string(),
+        json!(delta.source_event_version),
+    );
+    timeline.insert("generatedAt".to_string(), json!(delta.generated_at));
+    timeline.insert("eventCount".to_string(), json!(delta.event_count));
+    timeline.insert("turns".to_string(), Value::Array(turns));
+    for (field, replacement) in &delta.root_replacements {
+        if replacement.is_null() {
+            timeline.remove(field);
+        } else {
+            timeline.insert(field.clone(), replacement.clone());
+        }
+    }
+    Ok(Value::Object(timeline))
+}
+
+fn validate_resolved_projection_digest(
+    request: &SessionKernelHostProjectionRequestV2,
+    timeline: &Value,
+) -> Result<(), HostV2StorageError> {
+    let event = serde_json::to_value(&request.event).map_err(|error| {
+        HostV2StorageError::invalid(
+            "session_kernel_projection_record_invalid",
+            format!("encode Session Kernel projection event: {error}"),
+        )
+    })?;
     let projection_payload = json!({
         "event": event,
         "agentEvent": request.agent_event,
-        "timeline": request.timeline
+        "timeline": timeline,
     });
     if canonical_sha256(&projection_payload)? != request.projection_digest {
         return Err(HostV2StorageError::invalid(
             "session_kernel_projection_digest_mismatch",
             "Session Kernel projection failed digest verification",
         ));
+    }
+    Ok(())
+}
+
+fn validate_private_projection_event_data(
+    event: &SessionKernelProjectionEventV2,
+) -> Result<(), HostV2StorageError> {
+    let data = match event.kind.as_str() {
+        "wait.changed" if event.data.is_null() => return Ok(()),
+        _ => event.data.as_object().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_projection_data_invalid",
+                "Session private projection data must use the exact current object shape",
+            )
+        })?,
+    };
+
+    match event.kind.as_str() {
+        "input.persisted" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "inputId",
+                    "opaqueInputRef",
+                    "text",
+                    "attachments",
+                    "recordedAt",
+                    "controlEpoch",
+                ],
+                &[],
+                &["inputId", "opaqueInputRef", "recordedAt"],
+                &["text"],
+                &["attachments"],
+                &[],
+                &["controlEpoch"],
+                &[],
+            )?;
+            deepcode_kernel_abi::decode_agent_input_attachments_v2(
+                data.get("attachments").expect("required attachments"),
+            )
+            .map_err(|error| {
+                HostV2StorageError::invalid(
+                    "session_kernel_projection_data_invalid",
+                    format!(
+                        "Session private input attachments are invalid: {}",
+                        error.code
+                    ),
+                )
+            })?;
+        }
+        "plan.persisted" => {
+            validate_private_plan(data)?;
+            if data.get("runId").and_then(Value::as_str) != Some(event.run_id.as_str()) {
+                return Err(private_projection_data_invalid(
+                    "Plan runId does not match the private projection Run",
+                ));
+            }
+        }
+        "plan.decided" => {
+            validate_private_projection_fields(
+                data,
+                &["planRevision", "decision", "recordedAt"],
+                &["guidance"],
+                &["planRevision", "recordedAt"],
+                &["guidance"],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "decision", &["accept", "reject", "revise"])?;
+        }
+        "scope.previewed" => validate_private_scope_projection(data)?,
+        "provider.started" => {
+            if data.contains_key("currentActivityCode") {
+                validate_private_projection_fields(
+                    data,
+                    &[
+                        "providerTurnId",
+                        "controlEpoch",
+                        "activitySequence",
+                        "currentActivityCode",
+                    ],
+                    &[],
+                    &["providerTurnId"],
+                    &[],
+                    &[],
+                    &[],
+                    &["controlEpoch", "activitySequence"],
+                    &[],
+                )?;
+                require_private_enum(
+                    data,
+                    "currentActivityCode",
+                    &["provider.reasoning", "provider.composing"],
+                )?;
+            } else {
+                validate_private_projection_fields(
+                    data,
+                    &[
+                        "providerTurnId",
+                        "controlEpoch",
+                        "contextRef",
+                        "factProjection",
+                        "contextAssembly",
+                    ],
+                    &[],
+                    &["providerTurnId"],
+                    &[],
+                    &[],
+                    &["contextRef", "factProjection", "contextAssembly"],
+                    &["controlEpoch"],
+                    &[],
+                )?;
+            }
+        }
+        "provider.composing" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "controlEpoch",
+                    "streamSequence",
+                    "textOrdinal",
+                    "textDelta",
+                ],
+                &["providerPhase"],
+                &["providerTurnId"],
+                &["textDelta"],
+                &[],
+                &[],
+                &["controlEpoch", "streamSequence", "textOrdinal"],
+                &[],
+            )?;
+            if data.contains_key("providerPhase") {
+                require_private_enum(data, "providerPhase", &["commentary"])?;
+            }
+        }
+        "provider.completed" => validate_private_provider_completed(data)?,
+        "provider.stale" => validate_private_projection_fields(
+            data,
+            &["providerTurnId"],
+            &["controlEpoch"],
+            &["providerTurnId"],
+            &[],
+            &[],
+            &[],
+            &["controlEpoch"],
+            &[],
+        )?,
+        "toolIntent.submitted" => validate_private_tool_intent(data)?,
+        "capability.awaiting" => {
+            validate_private_projection_fields(
+                data,
+                &["operationId", "invocationId", "preview"],
+                &[],
+                &["operationId", "invocationId"],
+                &[],
+                &[],
+                &["preview"],
+                &[],
+                &[],
+            )?;
+            let preview = decode_private_scope_preview(
+                data.get("preview").expect("required preview"),
+                "capability.awaiting.preview",
+            )?;
+            if data.get("operationId").and_then(Value::as_str)
+                != Some(preview.operation_id.as_str())
+            {
+                return Err(private_projection_data_invalid(
+                    "Capability wait operationId does not match its canonical preview",
+                ));
+            }
+        }
+        "kernelFacts.reconciled" => validate_private_projection_fields(
+            data,
+            &[
+                "requestId",
+                "pageFactIds",
+                "pageFactCount",
+                "operationFacts",
+                "nextAfterLedgerSequence",
+                "snapshotHighWater",
+            ],
+            &[],
+            &["requestId"],
+            &[],
+            &["pageFactIds", "operationFacts"],
+            &[],
+            &[],
+            &[
+                "pageFactCount",
+                "nextAfterLedgerSequence",
+                "snapshotHighWater",
+            ],
+        )?,
+        "authorization.decided" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "factId",
+                    "factKind",
+                    "controlEpoch",
+                    "planActionIds",
+                    "operationId",
+                    "resourceIds",
+                    "details",
+                ],
+                &[
+                    "previewId",
+                    "toolId",
+                    "capabilityLease",
+                    "guidance",
+                    "scopeDelta",
+                ],
+                &["factId", "operationId", "previewId", "toolId"],
+                &["guidance"],
+                &["planActionIds", "resourceIds"],
+                &["details", "capabilityLease"],
+                &["controlEpoch"],
+                &[],
+            )?;
+            require_private_enum(
+                data,
+                "factKind",
+                &[
+                    "capabilityIssued",
+                    "capabilityDenied",
+                    "expansionAllowed",
+                    "expansionDenied",
+                ],
+            )?;
+        }
+        "review.revised" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "projectionVersion",
+                    "revision",
+                    "status",
+                    "planActionSettlementDigest",
+                    "snapshotHighWater",
+                    "planned",
+                    "scopeExpansions",
+                    "actualEffects",
+                    "unexecuted",
+                    "denied",
+                    "rejections",
+                    "completions",
+                    "cleanup",
+                    "indeterminate",
+                    "priorEpochLateFacts",
+                    "factCoverage",
+                    "factsQuery",
+                    "pendingCleanupCount",
+                    "createdAt",
+                ],
+                &[
+                    "workAuthority",
+                    "planRevision",
+                    "planDecision",
+                    "plan",
+                    "finalizedAt",
+                ],
+                &[
+                    "projectionVersion",
+                    "planActionSettlementDigest",
+                    "planRevision",
+                    "createdAt",
+                    "finalizedAt",
+                ],
+                &[],
+                &[
+                    "planned",
+                    "scopeExpansions",
+                    "actualEffects",
+                    "unexecuted",
+                    "denied",
+                    "rejections",
+                    "completions",
+                    "cleanup",
+                    "indeterminate",
+                    "priorEpochLateFacts",
+                ],
+                &[
+                    "workAuthority",
+                    "planDecision",
+                    "plan",
+                    "factCoverage",
+                    "factsQuery",
+                ],
+                &["revision"],
+                &["snapshotHighWater", "pendingCleanupCount"],
+            )?;
+            if data.get("projectionVersion").and_then(Value::as_str)
+                != Some("deepcode.session.kernel-review-projection.v2")
+            {
+                return Err(private_projection_data_invalid(
+                    "Review projectionVersion is not current",
+                ));
+            }
+            require_private_enum(data, "status", &["draft", "final"])?;
+        }
+        "planAction.completed" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "kind",
+                    "planActionId",
+                    "completionKind",
+                    "providerTurnId",
+                    "recordedAt",
+                ],
+                &[],
+                &["planActionId", "providerTurnId", "recordedAt"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "kind", &["completed"])?;
+            require_private_enum(data, "completionKind", &["answer", "noTool"])?;
+        }
+        "run.cancelled" => validate_private_projection_fields(
+            data,
+            &[
+                "callerRequestId",
+                "callerRequestDigest",
+                "cancelOperationId",
+                "controlEpoch",
+                "cancellation",
+                "facts",
+            ],
+            &[],
+            &[
+                "callerRequestId",
+                "callerRequestDigest",
+                "cancelOperationId",
+            ],
+            &[],
+            &[],
+            &["cancellation", "facts"],
+            &["controlEpoch"],
+            &[],
+        )?,
+        "wait.changed" => validate_private_wait(data)?,
+        "diagnostic" => validate_private_diagnostic(data)?,
+        _ => {
+            return Err(private_projection_data_invalid(
+                "Session private projection kind is not current",
+            ))
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_private_projection_fields(
+    data: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    identities: &[&str],
+    strings: &[&str],
+    arrays: &[&str],
+    objects: &[&str],
+    positive_integers: &[&str],
+    non_negative_integers: &[&str],
+) -> Result<(), HostV2StorageError> {
+    if data
+        .keys()
+        .any(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        || required
+            .iter()
+            .any(|field| !data.contains_key(*field) || data.get(*field) == Some(&Value::Null))
+    {
+        return Err(private_projection_data_invalid(
+            "Session private projection contains unknown fields or omits required current fields",
+        ));
+    }
+    for field in identities {
+        if let Some(value) = data.get(*field) {
+            let value = value.as_str().ok_or_else(|| {
+                private_projection_data_invalid("Session private projection identity is invalid")
+            })?;
+            validate_bounded_identity(value, "projectionDataIdentity", 64 * 1024)?;
+        }
+    }
+    for field in strings {
+        if data.get(*field).is_some_and(|value| !value.is_string()) {
+            return Err(private_projection_data_invalid(
+                "Session private projection string field is invalid",
+            ));
+        }
+    }
+    for field in arrays {
+        if data.get(*field).is_some_and(|value| !value.is_array()) {
+            return Err(private_projection_data_invalid(
+                "Session private projection array field is invalid",
+            ));
+        }
+    }
+    for field in objects {
+        if data.get(*field).is_some_and(|value| !value.is_object()) {
+            return Err(private_projection_data_invalid(
+                "Session private projection object field is invalid",
+            ));
+        }
+    }
+    for field in positive_integers {
+        if let Some(value) = data.get(*field) {
+            if value.as_u64().is_none_or(|value| value == 0) {
+                return Err(private_projection_data_invalid(
+                    "Session private projection positive integer is invalid",
+                ));
+            }
+        }
+    }
+    for field in non_negative_integers {
+        if let Some(value) = data.get(*field) {
+            if value.as_u64().is_none() {
+                return Err(private_projection_data_invalid(
+                    "Session private projection non-negative integer is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn private_projection_data_invalid(message: &'static str) -> HostV2StorageError {
+    HostV2StorageError::invalid("session_kernel_projection_data_invalid", message)
+}
+
+fn require_private_enum(
+    data: &serde_json::Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<(), HostV2StorageError> {
+    if !data
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| allowed.contains(&value))
+    {
+        return Err(private_projection_data_invalid(
+            "Session private projection discriminant is not current",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        data,
+        &[
+            "runId",
+            "inputId",
+            "planRevision",
+            "title",
+            "objective",
+            "narrative",
+            "actions",
+            "recordedAt",
+        ],
+        &[],
+        &["runId", "inputId", "planRevision", "recordedAt"],
+        &["title", "objective", "narrative"],
+        &["actions"],
+        &[],
+        &[],
+        &[],
+    )?;
+    if ["title", "objective", "narrative"].iter().any(|field| {
+        data.get(*field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    }) {
+        return Err(private_projection_data_invalid(
+            "Session private Plan text must be non-empty",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_private_scope_preview(
+    value: &Value,
+    _field: &'static str,
+) -> Result<CapabilityScopePreviewRecordV2, HostV2StorageError> {
+    let preview: CapabilityScopePreviewRecordV2 =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            private_projection_data_invalid(
+                "Session private scope preview must use the exact current ABI shape",
+            )
+        })?;
+    preview.validate().map_err(|_| {
+        private_projection_data_invalid(
+            "Session private scope preview violates its current ABI invariants",
+        )
+    })?;
+    Ok(preview)
+}
+
+fn validate_private_scope_preview(
+    value: &Value,
+    field: &'static str,
+) -> Result<(), HostV2StorageError> {
+    decode_private_scope_preview(value, field).map(|_| ())
+}
+
+fn validate_private_scope_projection(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        data,
+        &[
+            "kind",
+            "data",
+            "plan",
+            "scopePreviews",
+            "planRevision",
+            "planActionId",
+            "operationId",
+        ],
+        &[],
+        &["planRevision", "planActionId", "operationId"],
+        &[],
+        &["scopePreviews"],
+        &["data", "plan"],
+        &[],
+        &[],
+    )?;
+    let plan = data
+        .get("plan")
+        .and_then(Value::as_object)
+        .expect("required plan object");
+    validate_private_plan(plan)?;
+    let plan_revision = data
+        .get("planRevision")
+        .and_then(Value::as_str)
+        .expect("required plan revision");
+    if plan.get("planRevision").and_then(Value::as_str) != Some(plan_revision) {
+        return Err(private_projection_data_invalid(
+            "Scope projection Plan revision does not match its projection binding",
+        ));
+    }
+    let mut preview_ids = HashSet::new();
+    let mut preview_operations = HashSet::new();
+    for preview in data
+        .get("scopePreviews")
+        .and_then(Value::as_array)
+        .expect("required scope preview array")
+    {
+        let preview = decode_private_scope_preview(preview, "scopePreviews")?;
+        if preview.plan_revision.as_str() != plan_revision
+            || !preview_ids.insert(preview.preview_id.as_str().to_string())
+            || !preview_operations.insert(preview.operation_id.as_str().to_string())
+        {
+            return Err(private_projection_data_invalid(
+                "Scope preview list is not uniquely bound to its Plan revision",
+            ));
+        }
+    }
+    let reply = data
+        .get("data")
+        .and_then(Value::as_object)
+        .expect("required scope reply object");
+    match data.get("kind").and_then(Value::as_str) {
+        Some("previewed") => {
+            validate_private_projection_fields(
+                reply,
+                &["preview"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["preview"],
+                &[],
+                &[],
+            )?;
+            let preview = decode_private_scope_preview(
+                reply.get("preview").expect("required preview"),
+                "scope.previewed.data.preview",
+            )?;
+            if preview.plan_revision.as_str() != plan_revision
+                || data.get("planActionId").and_then(Value::as_str)
+                    != Some(preview.plan_action_id.as_str())
+                || data.get("operationId").and_then(Value::as_str)
+                    != Some(preview.operation_id.as_str())
+            {
+                return Err(private_projection_data_invalid(
+                    "Current scope preview does not match its PlanAction projection binding",
+                ));
+            }
+        }
+        Some("rejected") => validate_private_projection_fields(
+            reply,
+            &["toolId", "reason", "guidance"],
+            &[],
+            &["toolId", "reason"],
+            &["guidance"],
+            &[],
+            &[],
+            &[],
+            &[],
+        )?,
+        _ => {
+            return Err(private_projection_data_invalid(
+                "Session private scope reply kind is not current",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_provider_completed(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        data,
+        &[
+            "providerTurnId",
+            "controlEpoch",
+            "outputKind",
+            "terminalScope",
+            "orderedItems",
+            "providerOutcome",
+        ],
+        &["status", "result", "toolCallReceipt"],
+        &["providerTurnId"],
+        &[],
+        &["orderedItems"],
+        &["providerOutcome", "result", "toolCallReceipt"],
+        &["controlEpoch"],
+        &[],
+    )?;
+    require_private_enum(
+        data,
+        "outputKind",
+        &["plan", "answer", "noTool", "toolIntent"],
+    )?;
+    require_private_enum(data, "terminalScope", &["turn", "providerTurn"])?;
+    if data.contains_key("status") {
+        require_private_enum(data, "status", &["responseAccepted"])?;
+    }
+    if data.contains_key("status") == data.contains_key("result") {
+        return Err(private_projection_data_invalid(
+            "Session private Provider completion variant is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_tool_intent(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        data,
+        &[
+            "requestId",
+            "operationId",
+            "toolId",
+            "expectedControlEpoch",
+            "authorityKind",
+            "replyKind",
+        ],
+        &[
+            "planRevision",
+            "planActionId",
+            "invocationId",
+            "replyReason",
+        ],
+        &[
+            "requestId",
+            "operationId",
+            "toolId",
+            "planRevision",
+            "planActionId",
+            "invocationId",
+            "replyReason",
+        ],
+        &[],
+        &[],
+        &[],
+        &["expectedControlEpoch"],
+        &[],
+    )?;
+    require_private_enum(data, "authorityKind", &["planAction", "contextRead"])?;
+    require_private_enum(
+        data,
+        "replyKind",
+        &["admitted", "awaitingCapability", "rejected"],
+    )?;
+    let plan_authority = data.get("authorityKind").and_then(Value::as_str) == Some("planAction");
+    if plan_authority != data.contains_key("planRevision")
+        || plan_authority != data.contains_key("planActionId")
+    {
+        return Err(private_projection_data_invalid(
+            "Session private ToolIntent PlanAction binding is inconsistent",
+        ));
+    }
+    let rejected = data.get("replyKind").and_then(Value::as_str) == Some("rejected");
+    if rejected != data.contains_key("replyReason") || rejected == data.contains_key("invocationId")
+    {
+        return Err(private_projection_data_invalid(
+            "Session private ToolIntent reply fields are inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_wait(data: &serde_json::Map<String, Value>) -> Result<(), HostV2StorageError> {
+    match data.get("kind").and_then(Value::as_str) {
+        Some("capability") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "kind",
+                    "operationId",
+                    "invocationId",
+                    "previewId",
+                    "sinceHighWater",
+                ],
+                &["decisionHint", "denialGuidance"],
+                &["operationId", "invocationId", "previewId"],
+                &["denialGuidance"],
+                &[],
+                &[],
+                &[],
+                &["sinceHighWater"],
+            )?;
+            if data.contains_key("decisionHint") {
+                require_private_enum(data, "decisionHint", &["allow", "deny"])?;
+            }
+        }
+        Some("invocation") => validate_private_projection_fields(
+            data,
+            &["kind", "operationId", "invocationId", "sinceHighWater"],
+            &[],
+            &["operationId", "invocationId"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &["sinceHighWater"],
+        )?,
+        Some("backpressure") => {
+            validate_private_projection_fields(
+                data,
+                &["kind", "operationId", "reason", "retryAt", "guidance"],
+                &[],
+                &["operationId", "retryAt"],
+                &["guidance"],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "reason", &["runBusy", "capacityExceeded"])?;
+        }
+        Some("manualRecovery") => {
+            validate_private_projection_fields(
+                data,
+                &["kind", "operationId", "reason", "factIds"],
+                &["invocationId"],
+                &["operationId", "invocationId"],
+                &[],
+                &["factIds"],
+                &[],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "reason", &["indeterminate"])?;
+        }
+        _ => {
+            return Err(private_projection_data_invalid(
+                "Session private wait kind is not current",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_diagnostic(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    match data.get("stage").and_then(Value::as_str) {
+        Some("provider.toolCallQueue") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "status",
+                    "code",
+                    "stage",
+                    "reason",
+                    "orderedItems",
+                    "unexecutedOrdinals",
+                    "toolCallReceipt",
+                ],
+                &[],
+                &["providerTurnId", "code"],
+                &["reason"],
+                &["orderedItems", "unexecutedOrdinals"],
+                &["toolCallReceipt"],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "status", &["blocked"])?;
+        }
+        Some("provider.finalAnswer") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "stage",
+                    "status",
+                    "terminalScope",
+                    "code",
+                    "message",
+                    "physicalRequestCount",
+                    "controlEpoch",
+                    "reviewRevision",
+                    "snapshotHighWater",
+                ],
+                &["providerTurnId", "providerOutcome"],
+                &["providerTurnId", "code"],
+                &["message"],
+                &[],
+                &["providerOutcome"],
+                &["physicalRequestCount", "controlEpoch", "reviewRevision"],
+                &["snapshotHighWater"],
+            )?;
+            require_private_enum(data, "status", &["failed"])?;
+            require_private_enum(data, "terminalScope", &["turn"])?;
+        }
+        Some("provider.requestTurn" | "provider.outputValidation") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "status",
+                    "terminalScope",
+                    "code",
+                    "message",
+                    "stage",
+                ],
+                &["providerOutcome"],
+                &["providerTurnId", "code"],
+                &["message"],
+                &[],
+                &["providerOutcome"],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "status", &["failed"])?;
+            require_private_enum(data, "terminalScope", &["turn"])?;
+        }
+        Some("provider.outputAdmission") => validate_private_projection_fields(
+            data,
+            &[
+                "providerTurnId",
+                "code",
+                "message",
+                "stage",
+                "providerOutcome",
+            ],
+            &[],
+            &["providerTurnId", "code"],
+            &["message"],
+            &[],
+            &["providerOutcome"],
+            &[],
+            &[],
+        )?,
+        _ => {
+            return Err(private_projection_data_invalid(
+                "Session private diagnostic stage is not current",
+            ))
+        }
     }
     Ok(())
 }
@@ -5281,8 +6463,9 @@ fn public_projection_guard_path(
     session_id: &str,
 ) -> Result<PathBuf, HostV2StorageError> {
     validate_safe_session_identity(session_id)?;
-    Ok(sessions_dir
-        .join(session_id)
+    let session_directory = sessions_dir.join(session_id);
+    reject_pre_cutover_session_layout(&session_directory)?;
+    Ok(session_directory
         .join("kernel-v2")
         .join(".public-projection-v2.lock"))
 }
@@ -5292,10 +6475,10 @@ fn public_agent_event_path(
     session_id: &str,
 ) -> Result<PathBuf, HostV2StorageError> {
     validate_safe_session_identity(session_id)?;
-    Ok(sessions_dir
-        .join(session_id)
-        .join("kernel-v2")
-        .join("public-agent-events.jsonl"))
+    let session_directory = sessions_dir.join(session_id);
+    reject_pre_cutover_session_layout(&session_directory)?;
+    let kernel_v2 = session_directory.join("kernel-v2");
+    Ok(kernel_v2.join("public").join("agent-events.jsonl"))
 }
 
 fn public_timeline_path(
@@ -5303,10 +6486,55 @@ fn public_timeline_path(
     session_id: &str,
 ) -> Result<PathBuf, HostV2StorageError> {
     validate_safe_session_identity(session_id)?;
-    Ok(sessions_dir
-        .join(session_id)
-        .join("kernel-v2")
-        .join("public-timelines.jsonl"))
+    let session_directory = sessions_dir.join(session_id);
+    reject_pre_cutover_session_layout(&session_directory)?;
+    let kernel_v2 = session_directory.join("kernel-v2");
+    Ok(kernel_v2.join("public").join("timelines.jsonl"))
+}
+
+fn reject_pre_cutover_session_layout(session_directory: &FsPath) -> Result<(), HostV2StorageError> {
+    match fs::symlink_metadata(session_directory.join("kernel-v3")) {
+        Ok(_) => {
+            return Err(HostV2StorageError::conflict(
+                "UnsupportedHistorySchema",
+                "Pre-cutover Session persistence cannot be read, resumed, or extended",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostV2StorageError::io(
+                "session_kernel_pre_cutover_history_inspection_failed",
+                format!("inspect pre-cutover Session persistence: {error}"),
+            ))
+        }
+    }
+
+    let kernel_v2 = session_directory.join("kernel-v2");
+    let entries = match fs::read_dir(&kernel_v2) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(HostV2StorageError::io(
+                "session_kernel_pre_cutover_history_inspection_failed",
+                format!("inspect Session persistence root: {error}"),
+            ))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            HostV2StorageError::io(
+                "session_kernel_pre_cutover_history_inspection_failed",
+                format!("inspect Session persistence entry: {error}"),
+            )
+        })?;
+        if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+            return Err(HostV2StorageError::conflict(
+                "UnsupportedHistorySchema",
+                "Pre-cutover root-level Session persistence cannot be read, resumed, or extended",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_public_timeline_records(
@@ -5315,9 +6543,6 @@ fn read_public_timeline_records(
 ) -> Result<Vec<HostSessionPublicTimelineRecordV2>, HostV2StorageError> {
     let mut records: Vec<HostSessionPublicTimelineRecordV2> = Vec::new();
     let mut projections = HashMap::new();
-    let mut legacy_prefix: Option<Vec<Value>> = None;
-    let mut latest_flat_was_unsupported = false;
-    let mut work_segments_shape_seen = false;
     for value in read_bounded_json_lines(path)? {
         let record: HostSessionPublicTimelineRecordV2 =
             serde_json::from_value(value).map_err(|error| {
@@ -5335,65 +6560,22 @@ fn read_public_timeline_records(
             ));
         }
         reject_transport_capabilities(&record.timeline)?;
-        let timeline_kind =
-            crate::session_public_projection_v2::classify_shared_projection_timeline(
-                &record.timeline,
-            )
-            .map_err(|message| {
-                HostV2StorageError::conflict(
-                    "session_kernel_public_timeline_history_corrupt",
-                    message,
-                )
-            })?;
-        match timeline_kind {
-            crate::session_public_projection_v2::SharedProjectionTimelineKind::LegacyFlatV2 => {
-                if work_segments_shape_seen {
-                    return Err(HostV2StorageError::conflict(
-                        "session_kernel_public_timeline_history_corrupt",
-                        "Session public timeline cannot downgrade from work-segments to flat-v2",
-                    ));
-                }
-                latest_flat_was_unsupported = !legacy_flat_projection_is_terminal(&record.timeline);
-                legacy_prefix = if latest_flat_was_unsupported {
-                    None
-                } else {
-                    Some(normalized_turns_from_settled_flat(&record.timeline)?)
-                };
-            }
-            crate::session_public_projection_v2::SharedProjectionTimelineKind::NativeWorkSegmentsV1 => {
-                if latest_flat_was_unsupported {
-                    return Err(HostV2StorageError::conflict(
-                        "UnsupportedHistorySchema",
-                        "Active flat-v2 Session projection lacks ordered work segments and cannot be resumed",
-                    ));
-                }
-                let compatible_prefix_len =
-                    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
-                        &record.timeline,
-                    )
-                    .map_err(|message| {
-                        HostV2StorageError::conflict(
-                            "session_kernel_public_timeline_history_corrupt",
-                            message,
-                        )
-                    })?;
-                match legacy_prefix.as_deref() {
-                    Some(prefix) => ensure_legacy_turn_prefix(
-                        &record.timeline,
-                        prefix,
-                        compatible_prefix_len,
-                    )?,
-                    None if compatible_prefix_len > 0 => {
-                        return Err(HostV2StorageError::conflict(
-                            "session_kernel_public_timeline_history_corrupt",
-                            "Session public timeline created legacy-compatible turns without a settled flat-v2 source",
-                        ))
-                    }
-                    None => {}
-                }
-                work_segments_shape_seen = true;
-            }
+        if record.timeline.get("schemaVersion").and_then(Value::as_str)
+            != Some("deepcode.shared-conversation-projection.v2")
+            || record.timeline.get("shapeVersion").and_then(Value::as_str)
+                != Some("deepcode.shared-conversation.work-segments.v1")
+        {
+            return Err(HostV2StorageError::conflict(
+                "UnsupportedHistorySchema",
+                "Prior public Session projection uses an unsupported schema or shape",
+            ));
         }
+        crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+            &record.timeline,
+        )
+        .map_err(|message| {
+            HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
+        })?;
         if record.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id)
             || timeline_u64(&record.timeline, "revision")? != record.timeline_revision
             || timeline_u64(&record.timeline, "sourceEventVersion")? != record.source_event_version
@@ -5429,214 +6611,33 @@ fn read_public_timeline_records(
     Ok(records)
 }
 
-fn validate_preserved_legacy_prefix(
-    records: &[HostSessionPublicTimelineRecordV2],
-    incoming: &Value,
-) -> Result<(), HostV2StorageError> {
-    let compatible_prefix_len =
-        crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
-            incoming,
-        )
-        .map_err(|message| {
-            HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
-        })?;
-    let mut legacy_prefix = None;
-    let mut latest_flat_was_unsupported = false;
-    for record in records {
-        match crate::session_public_projection_v2::classify_shared_projection_timeline(
-            &record.timeline,
-        )
-        .map_err(|message| {
-            HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
-        })? {
-            crate::session_public_projection_v2::SharedProjectionTimelineKind::LegacyFlatV2 => {
-                latest_flat_was_unsupported = !legacy_flat_projection_is_terminal(&record.timeline);
-                legacy_prefix = if latest_flat_was_unsupported {
-                    None
-                } else {
-                    Some(normalized_turns_from_settled_flat(&record.timeline)?)
-                };
-            }
-            crate::session_public_projection_v2::SharedProjectionTimelineKind::NativeWorkSegmentsV1 => {
-                latest_flat_was_unsupported = false;
-            }
-        }
-    }
-    if latest_flat_was_unsupported {
-        return Err(HostV2StorageError::conflict(
-            "UnsupportedHistorySchema",
-            "Active flat-v2 Session projection lacks ordered work segments and cannot be resumed",
-        ));
-    }
-    match legacy_prefix.as_deref() {
-        Some(prefix) => ensure_legacy_turn_prefix(incoming, prefix, compatible_prefix_len),
-        None if compatible_prefix_len > 0 => Err(HostV2StorageError::invalid(
-            "session_kernel_public_timeline_legacy_source_missing",
-            "Session public timeline cannot create legacy-compatible turns without a settled flat-v2 source",
-        )),
-        None => Ok(()),
-    }
-}
-
-fn normalized_turns_from_settled_flat(timeline: &Value) -> Result<Vec<Value>, HostV2StorageError> {
-    let normalized = normalize_settled_legacy_flat_projection(timeline)?;
-    normalized
-        .get("turns")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| {
-            HostV2StorageError::conflict(
-                "session_kernel_public_timeline_history_corrupt",
-                "Settled flat-v2 Session projection does not contain turns",
-            )
-        })
-}
-
-fn ensure_legacy_turn_prefix(
-    timeline: &Value,
-    legacy_prefix: &[Value],
-    compatible_prefix_len: usize,
-) -> Result<(), HostV2StorageError> {
-    let turns = timeline
-        .get("turns")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            HostV2StorageError::invalid(
-                "session_kernel_public_timeline_invalid",
-                "Session public timeline does not contain turns",
-            )
-        })?;
-    if compatible_prefix_len != legacy_prefix.len()
-        || turns.len() < legacy_prefix.len()
-        || turns[..legacy_prefix.len()] != *legacy_prefix
+fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.shared-conversation-projection.v2")
+        || timeline.get("shapeVersion").and_then(Value::as_str)
+            != Some("deepcode.shared-conversation.work-segments.v1")
     {
         return Err(HostV2StorageError::conflict(
-            "session_kernel_public_timeline_legacy_prefix_changed",
-            "Session public timeline changed the immutable settled flat-v2 turn prefix",
+            "UnsupportedHistorySchema",
+            "Prior public Session projection uses an unsupported schema or shape",
         ));
     }
-    Ok(())
-}
-
-fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
-    match crate::session_public_projection_v2::classify_shared_projection_timeline(timeline)
-        .map_err(|message| {
-            HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
-        })? {
-        crate::session_public_projection_v2::SharedProjectionTimelineKind::NativeWorkSegmentsV1 => {
-            Ok(timeline.clone())
-        }
-        crate::session_public_projection_v2::SharedProjectionTimelineKind::LegacyFlatV2 => {
-            if !legacy_flat_projection_is_terminal(timeline) {
-                return Err(HostV2StorageError::conflict(
-                    "UnsupportedHistorySchema",
-                    "Active flat-v2 Session projection lacks ordered work segments and cannot be resumed",
-                ));
-            }
-            normalize_settled_legacy_flat_projection(timeline)
-        }
-    }
-}
-
-fn legacy_flat_projection_is_terminal(timeline: &Value) -> bool {
-    let turns = timeline
-        .get("turns")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let turns_are_terminal = turns.iter().all(|turn| {
-        matches!(
-            turn.get("status").and_then(Value::as_str),
-            Some("completed" | "cancelled" | "failed")
-        )
-    });
-    let run_is_terminal = timeline
-        .get("runProjection")
-        .and_then(Value::as_object)
-        .map(|run| {
-            run.get("phase").and_then(Value::as_str) == Some("settled")
-                && matches!(
-                    run.get("status").and_then(Value::as_str),
-                    Some("succeeded" | "failed" | "cancelled")
-                )
-        });
-    turns_are_terminal && run_is_terminal.unwrap_or(false)
-}
-
-fn normalize_settled_legacy_flat_projection(timeline: &Value) -> Result<Value, HostV2StorageError> {
-    let mut normalized = timeline.clone();
-    let root = normalized.as_object_mut().ok_or_else(|| {
-        HostV2StorageError::conflict(
-            "session_kernel_public_timeline_history_corrupt",
-            "Legacy Session projection root is not an object",
-        )
+    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+        timeline,
+    )
+    .map_err(|message| {
+        HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
     })?;
-    root.insert(
-        "shapeVersion".to_string(),
-        Value::String("deepcode.shared-conversation.work-segments.v1".to_string()),
-    );
-    if let Some(run) = root.get_mut("runProjection").and_then(Value::as_object_mut) {
-        run.remove("waitReason");
-        run.remove("activeInteractionId");
-        run.insert("currentActivity".to_string(), Value::Null);
-        run.insert("wait".to_string(), Value::Null);
-    }
-    let turns = root
-        .get_mut("turns")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| {
-            HostV2StorageError::conflict(
-                "session_kernel_public_timeline_history_corrupt",
-                "Legacy Session projection does not contain turns",
-            )
-        })?;
-    let legacy_prefix_turn_count = turns.len();
-    for turn in turns {
-        let turn = turn.as_object_mut().ok_or_else(|| {
-            HostV2StorageError::conflict(
-                "session_kernel_public_timeline_history_corrupt",
-                "Legacy Session projection contains an invalid turn",
-            )
-        })?;
-        let parts = turn
-            .get("blocks")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                HostV2StorageError::conflict(
-                    "session_kernel_public_timeline_history_corrupt",
-                    "Legacy Session projection turn does not contain blocks",
-                )
-            })?
-            .iter()
-            .map(|block| {
-                let block_id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
-                    HostV2StorageError::conflict(
-                        "session_kernel_public_timeline_history_corrupt",
-                        "Legacy Session projection contains a block without an identity",
-                    )
-                })?;
-                Ok(json!({
-                    "kind": "block",
-                    "blockId": block_id,
-                }))
-            })
-            .collect::<Result<Vec<_>, HostV2StorageError>>()?;
-        turn.insert("workSegments".to_string(), Value::Array(Vec::new()));
-        turn.insert("parts".to_string(), Value::Array(parts));
-    }
-    root.insert(
-        "legacyPrefixTurnCount".to_string(),
-        Value::from(legacy_prefix_turn_count),
-    );
-    Ok(normalized)
+    Ok(timeline.clone())
 }
 
 fn public_timeline_record(
     request: &SessionKernelHostProjectionRequestV2,
+    timeline: &Value,
 ) -> Result<HostSessionPublicTimelineRecordV2, HostV2StorageError> {
-    let timeline_revision = timeline_u64(&request.timeline, "revision")?;
-    let source_event_version = timeline_u64(&request.timeline, "sourceEventVersion")?;
-    if timeline_u64(&request.timeline, "eventCount")? > source_event_version {
+    let timeline_revision = timeline_u64(timeline, "revision")?;
+    let source_event_version = timeline_u64(timeline, "sourceEventVersion")?;
+    if timeline_u64(timeline, "eventCount")? > source_event_version {
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_version_mismatch",
             "Session public timeline eventCount exceeds sourceEventVersion",
@@ -5648,8 +6649,8 @@ fn public_timeline_record(
         projection_digest: request.projection_digest.clone(),
         timeline_revision,
         source_event_version,
-        timeline_digest: canonical_sha256(&request.timeline)?,
-        timeline: request.timeline.clone(),
+        timeline_digest: canonical_sha256(timeline)?,
+        timeline: timeline.clone(),
     })
 }
 
@@ -5690,7 +6691,7 @@ fn decode_public_agent_event_record(
 fn validate_public_agent_event(
     event: &Value,
     session_id: &str,
-    expected: Option<(&str, &str)>,
+    expected: Option<(&str, &str, &str, &str)>,
 ) -> Result<(), HostV2StorageError> {
     reject_transport_capabilities(event)?;
     let object = event.as_object().ok_or_else(|| {
@@ -5699,6 +6700,17 @@ fn validate_public_agent_event(
             "Session public AgentEvent must be an object",
         )
     })?;
+    const EVENT_FIELDS: &[&str] = &["id", "sessionId", "ts", "kind", "payload"];
+    if object.len() != EVENT_FIELDS.len()
+        || object
+            .keys()
+            .any(|field| !EVENT_FIELDS.contains(&field.as_str()))
+    {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_public_event_invalid",
+            "Session public AgentEvent must use the exact current envelope",
+        ));
+    }
     for field in ["id", "sessionId", "ts", "kind"] {
         let value = object.get(field).and_then(Value::as_str).ok_or_else(|| {
             HostV2StorageError::invalid(
@@ -5708,14 +6720,13 @@ fn validate_public_agent_event(
         })?;
         validate_bounded_identity(value, field, 64 * 1024)?;
     }
-    if object.get("sessionId").and_then(Value::as_str) != Some(session_id)
-        || !object.contains_key("payload")
-    {
+    if object.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_event_identity_mismatch",
-            "Session public AgentEvent does not match the Session or has no payload",
+            "Session public AgentEvent does not match the Session",
         ));
     }
+    validate_public_agent_event_payload(object, expected)?;
     if object.get("kind").and_then(Value::as_str) == Some("user_msg") {
         let attachments = object
             .get("payload")
@@ -5737,7 +6748,7 @@ fn validate_public_agent_event(
             )
         })?;
     }
-    if let Some((projection_id, recorded_at)) = expected {
+    if let Some((projection_id, recorded_at, _, _)) = expected {
         let expected_id = format!("kernel-v2:{projection_id}");
         if object.get("id").and_then(Value::as_str) != Some(expected_id.as_str())
             || object.get("ts").and_then(Value::as_str) != Some(recorded_at)
@@ -5756,6 +6767,2066 @@ fn validate_public_agent_event(
             "session_kernel_public_event_identity_mismatch",
             "Session public AgentEvent has an invalid v2 event identity",
         ));
+    }
+    Ok(())
+}
+
+fn validate_public_agent_event_payload(
+    event: &serde_json::Map<String, Value>,
+    expected: Option<(&str, &str, &str, &str)>,
+) -> Result<(), HostV2StorageError> {
+    const COMMON_FIELDS: &[&str] = &[
+        "schemaVersion",
+        "projectionId",
+        "runId",
+        "projectionKind",
+        "channel",
+        "visibility",
+    ];
+    let payload = event
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_public_event_payload_invalid",
+                "Session public AgentEvent payload must be an object",
+            )
+        })?;
+    let required_text = |field: &'static str| -> Result<&str, HostV2StorageError> {
+        payload
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                HostV2StorageError::invalid(
+                    "session_kernel_public_event_payload_invalid",
+                    format!("Session public AgentEvent payload requires {field}"),
+                )
+            })
+    };
+    if required_text("schemaVersion")? != "deepcode.session.kernel-public-projection.v2" {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Session public AgentEvent payload uses an unsupported schema",
+        ));
+    }
+    let projection_id = required_text("projectionId")?;
+    let run_id = required_text("runId")?;
+    let projection_kind = required_text("projectionKind")?;
+    let channel = required_text("channel")?;
+    let visibility = required_text("visibility")?;
+    let event_kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    for (field, value) in [
+        ("projectionId", projection_id),
+        ("runId", run_id),
+        ("projectionKind", projection_kind),
+        ("channel", channel),
+        ("visibility", visibility),
+    ] {
+        validate_bounded_identity(value, field, 512)?;
+    }
+
+    let (fields, required_fields): (&[&str], &[&str]) = match projection_kind {
+        "input.persisted" => (
+            &["content", "inputId", "attachments", "controlEpoch"],
+            &["content", "inputId", "attachments", "controlEpoch"],
+        ),
+        "plan.persisted" => (
+            &[
+                "planId",
+                "planRevision",
+                "title",
+                "summary",
+                "userPlan",
+                "status",
+                "confirmable",
+                "tasks",
+            ],
+            &[
+                "planId",
+                "planRevision",
+                "title",
+                "summary",
+                "userPlan",
+                "status",
+                "confirmable",
+                "tasks",
+            ],
+        ),
+        "plan.decided" => (
+            &[
+                "planId",
+                "planRevision",
+                "status",
+                "decision",
+                "guidance",
+                "confirmable",
+                "summary",
+            ],
+            &[
+                "planId",
+                "planRevision",
+                "status",
+                "decision",
+                "confirmable",
+                "summary",
+            ],
+        ),
+        "scope.previewed" if event_kind == "plan_review" => (
+            &[
+                "planId",
+                "planRevision",
+                "status",
+                "decision",
+                "guidance",
+                "confirmable",
+                "operationId",
+                "planActionId",
+                "summary",
+            ],
+            &[
+                "planId",
+                "planRevision",
+                "status",
+                "decision",
+                "confirmable",
+                "operationId",
+                "planActionId",
+                "summary",
+            ],
+        ),
+        "scope.previewed" => (
+            &[
+                "planId",
+                "planRevision",
+                "title",
+                "summary",
+                "userPlan",
+                "status",
+                "confirmable",
+                "tasks",
+                "scopePreviews",
+                "scopeApprovalView",
+                "readablePlan",
+            ],
+            &[
+                "planId",
+                "planRevision",
+                "title",
+                "summary",
+                "userPlan",
+                "status",
+                "confirmable",
+                "tasks",
+                "scopePreviews",
+                "scopeApprovalView",
+                "readablePlan",
+            ],
+        ),
+        "capability.awaiting" => (
+            &[
+                "id",
+                "permissionId",
+                "requestKind",
+                "operationId",
+                "invocationId",
+                "affectedOperationIds",
+                "toolId",
+                "toolName",
+                "riskLevel",
+                "summary",
+                "argumentsPreview",
+                "preview",
+                "status",
+            ],
+            &[
+                "id",
+                "permissionId",
+                "requestKind",
+                "operationId",
+                "invocationId",
+                "affectedOperationIds",
+                "toolId",
+                "toolName",
+                "riskLevel",
+                "summary",
+                "argumentsPreview",
+                "preview",
+                "status",
+            ],
+        ),
+        "toolIntent.submitted" => (
+            &[
+                "status",
+                "operationId",
+                "invocationId",
+                "requestId",
+                "toolId",
+                "replyReason",
+                "controlEpoch",
+                "authorityKind",
+                "planRevision",
+                "planActionId",
+                "summary",
+            ],
+            &[
+                "status",
+                "operationId",
+                "requestId",
+                "toolId",
+                "controlEpoch",
+                "authorityKind",
+                "summary",
+            ],
+        ),
+        "kernelFacts.reconciled" => (
+            &[
+                "status",
+                "factIds",
+                "operationFacts",
+                "snapshotHighWater",
+                "summary",
+            ],
+            &[
+                "status",
+                "factIds",
+                "operationFacts",
+                "snapshotHighWater",
+                "summary",
+            ],
+        ),
+        "authorization.decided" => (
+            &[
+                "id",
+                "permissionId",
+                "previewId",
+                "status",
+                "decision",
+                "factId",
+                "factKind",
+                "operationId",
+                "toolId",
+                "planActionIds",
+                "leaseId",
+                "leaseVersion",
+                "scopeDigest",
+                "scopeDelta",
+                "guidance",
+                "details",
+                "summary",
+            ],
+            &[
+                "id",
+                "permissionId",
+                "previewId",
+                "status",
+                "decision",
+                "factId",
+                "factKind",
+                "operationId",
+                "planActionIds",
+                "details",
+                "summary",
+            ],
+        ),
+        "review.revised" => (
+            &[
+                "reviewId",
+                "status",
+                "revision",
+                "snapshotHighWater",
+                "summary",
+                "review",
+            ],
+            &[
+                "reviewId",
+                "status",
+                "revision",
+                "snapshotHighWater",
+                "summary",
+                "review",
+            ],
+        ),
+        "planAction.completed" => (
+            &[
+                "status",
+                "planActionId",
+                "providerTurnId",
+                "completionKind",
+                "summary",
+            ],
+            &[
+                "status",
+                "planActionId",
+                "providerTurnId",
+                "completionKind",
+                "summary",
+            ],
+        ),
+        "provider.composing" => (
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "streamSequence",
+                "textOrdinal",
+                "providerPhase",
+                "content",
+            ],
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "streamSequence",
+                "textOrdinal",
+                "content",
+            ],
+        ),
+        "provider.completed" => (
+            &[
+                "status",
+                "orderedItems",
+                "terminalScope",
+                "outputKind",
+                "providerTurnId",
+                "controlEpoch",
+                "providerOutcome",
+            ],
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "terminalScope",
+                "outputKind",
+                "providerOutcome",
+            ],
+        ),
+        "provider.started" if payload.contains_key("currentActivityCode") => (
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "currentActivityCode",
+                "activitySequence",
+            ],
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "currentActivityCode",
+                "activitySequence",
+            ],
+        ),
+        "provider.started" => (
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "contextAssembly",
+                "summary",
+            ],
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "contextAssembly",
+                "summary",
+            ],
+        ),
+        "provider.stale" => (
+            &["status", "providerTurnId", "controlEpoch", "summary"],
+            &["status", "providerTurnId", "summary"],
+        ),
+        "run.cancelled" => (
+            &[
+                "status",
+                "reason",
+                "callerRequestId",
+                "cancelOperationId",
+                "controlEpoch",
+                "facts",
+                "summary",
+            ],
+            &[
+                "status",
+                "reason",
+                "callerRequestId",
+                "cancelOperationId",
+                "controlEpoch",
+                "facts",
+                "summary",
+            ],
+        ),
+        "wait.changed" if payload.get("status").and_then(Value::as_str) == Some("completed") => (
+            &["status", "reason", "summary"],
+            &["status", "reason", "summary"],
+        ),
+        "wait.changed" => (
+            &["status", "reason", "targetId", "decisionKind", "summary"],
+            &["status", "reason", "summary"],
+        ),
+        "diagnostic" if event_kind == "workflow_stage" => (
+            &["status", "code", "providerTurnId", "reason", "orderedItems"],
+            &["status", "code", "providerTurnId", "orderedItems"],
+        ),
+        "diagnostic" => (
+            &[
+                "status",
+                "code",
+                "providerTurnId",
+                "terminalScope",
+                "providerOutcome",
+                "message",
+            ],
+            &["status", "code", "message"],
+        ),
+        _ => {
+            return Err(HostV2StorageError::conflict(
+                "UnsupportedHistorySchema",
+                "Session public AgentEvent payload uses an unsupported projection kind",
+            ))
+        }
+    };
+    if payload
+        .keys()
+        .any(|field| !COMMON_FIELDS.contains(&field.as_str()) && !fields.contains(&field.as_str()))
+    {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Session public AgentEvent payload contains fields outside the current projection shape",
+        ));
+    }
+    if required_fields
+        .iter()
+        .any(|field| !payload.contains_key(*field) || payload.get(*field) == Some(&Value::Null))
+    {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Session public AgentEvent payload is missing fields required by the current projection shape",
+        ));
+    }
+    validate_public_projection_payload_types(projection_kind, event_kind, payload)?;
+
+    let payload_text = |field: &str| payload.get(field).and_then(Value::as_str);
+    let status = payload_text("status");
+    let decision = payload_text("decision");
+    let presentation_matches = match projection_kind {
+        "input.persisted" => {
+            event_kind == "user_msg" && channel == "user" && visibility == "conversation"
+        }
+        "plan.persisted" => event_kind == "plan_card" && channel == "task" && visibility == "both",
+        "plan.decided" => {
+            event_kind == "plan_review"
+                && visibility == "both"
+                && matches!(
+                    (decision, status, channel),
+                    (Some("accept"), Some("accepted"), "progress")
+                        | (Some("reject"), Some("rejected"), "task")
+                        | (Some("revise"), Some("needsRevision"), "task")
+                )
+        }
+        "scope.previewed" => {
+            visibility == "both"
+                && channel == "task"
+                && ((event_kind == "plan_card"
+                    && matches!(status, Some("running" | "awaitingUserApproval"))
+                    && decision.is_none())
+                    || (event_kind == "plan_review"
+                        && status == Some("needsRevision")
+                        && decision == Some("revise")))
+        }
+        "capability.awaiting" => {
+            event_kind == "permission_request"
+                && channel == "tool"
+                && visibility == "conversation"
+                && status == Some("awaitingUserDecision")
+                && payload_text("requestKind") == Some("scopeExpansion")
+                && payload_text("id") == payload_text("permissionId")
+        }
+        "toolIntent.submitted" => {
+            event_kind == "tool_call"
+                && channel == "tool"
+                && visibility == "both"
+                && matches!(status, Some("admitted" | "awaitingCapability" | "rejected"))
+                && matches!(
+                    payload_text("authorityKind"),
+                    Some("planAction" | "contextRead")
+                )
+                && match status {
+                    Some("admitted" | "awaitingCapability") => {
+                        payload.contains_key("invocationId") && !payload.contains_key("replyReason")
+                    }
+                    Some("rejected") => {
+                        payload.contains_key("replyReason") && !payload.contains_key("invocationId")
+                    }
+                    _ => false,
+                }
+                && match payload_text("authorityKind") {
+                    Some("planAction") => {
+                        payload.contains_key("planRevision") && payload.contains_key("planActionId")
+                    }
+                    Some("contextRead") => {
+                        !payload.contains_key("planRevision")
+                            && !payload.contains_key("planActionId")
+                    }
+                    _ => false,
+                }
+        }
+        "kernelFacts.reconciled" => {
+            event_kind == "tool_result"
+                && channel == "observation"
+                && visibility == "trace"
+                && status == Some("reconciled")
+        }
+        "authorization.decided" => {
+            event_kind == "permission_result"
+                && channel == "tool"
+                && visibility == "conversation"
+                && payload_text("id") == payload_text("permissionId")
+                && payload_text("id") == payload_text("previewId")
+                && match payload_text("factKind") {
+                    Some("capabilityIssued" | "expansionAllowed") => {
+                        status == Some("allowed")
+                            && decision == Some("allow")
+                            && payload.contains_key("leaseId")
+                            && payload.contains_key("leaseVersion")
+                            && payload.contains_key("scopeDigest")
+                    }
+                    Some("capabilityDenied" | "expansionDenied") => {
+                        status == Some("denied")
+                            && decision == Some("deny")
+                            && !payload.contains_key("leaseId")
+                            && !payload.contains_key("leaseVersion")
+                            && !payload.contains_key("scopeDigest")
+                    }
+                    _ => false,
+                }
+        }
+        "review.revised" => {
+            event_kind == "review_summary"
+                && channel == "final"
+                && visibility == "both"
+                && matches!(status, Some("completed" | "waitingUserReview"))
+        }
+        "planAction.completed" => {
+            event_kind == "workflow_stage"
+                && channel == "task"
+                && visibility == "both"
+                && status == Some("completed")
+                && matches!(payload_text("completionKind"), Some("answer" | "noTool"))
+        }
+        "provider.composing" => {
+            event_kind == "assistant_msg"
+                && channel == "progress"
+                && visibility == "conversation"
+                && status == Some("running")
+                && matches!(payload_text("providerPhase"), None | Some("commentary"))
+        }
+        "provider.completed" => {
+            status == Some("completed")
+                && visibility == "conversation"
+                && matches!(
+                    payload_text("outputKind"),
+                    Some("plan" | "toolIntent" | "answer" | "noTool")
+                )
+                && match payload_text("terminalScope") {
+                    Some("turn") => {
+                        event_kind == "assistant_msg"
+                            && channel == "final"
+                            && payload_text("outputKind") == Some("answer")
+                            && payload.contains_key("orderedItems")
+                    }
+                    Some("providerTurn") => event_kind == "workflow_stage" && channel == "progress",
+                    _ => false,
+                }
+        }
+        "provider.started" => {
+            event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "trace"
+                && status == Some("running")
+                && match payload_text("currentActivityCode") {
+                    Some("provider.reasoning" | "provider.composing") => {
+                        payload.contains_key("activitySequence")
+                            && !payload.contains_key("contextAssembly")
+                            && !payload.contains_key("summary")
+                    }
+                    None => {
+                        payload.contains_key("contextAssembly")
+                            && payload.contains_key("summary")
+                            && !payload.contains_key("activitySequence")
+                    }
+                    _ => false,
+                }
+        }
+        "provider.stale" => {
+            event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "trace"
+                && status == Some("cancelled")
+        }
+        "run.cancelled" => {
+            event_kind == "session_run_state"
+                && channel == "progress"
+                && visibility == "conversation"
+                && status == Some("cancelled")
+                && payload_text("reason") == Some("userRequested")
+        }
+        "wait.changed" => {
+            event_kind == "session_run_state"
+                && channel == "progress"
+                && visibility == "conversation"
+                && match status {
+                    Some("completed") => payload_text("reason") == Some("waitCleared"),
+                    Some("waiting") => {
+                        matches!(
+                            payload_text("reason"),
+                            Some("capability" | "invocation" | "backpressure" | "manualRecovery")
+                        ) && payload.contains_key("targetId")
+                    }
+                    _ => false,
+                }
+        }
+        "diagnostic" => {
+            (event_kind == "workflow_stage" && channel == "progress" && visibility == "trace")
+                && status == Some("blocked")
+                && payload_text("code") == Some("session_kernel_provider_tool_calls_aborted")
+                || (event_kind == "error"
+                    && channel == "error"
+                    && visibility == "conversation"
+                    && status == Some("failed"))
+        }
+        _ => false,
+    };
+    if !presentation_matches {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Session public AgentEvent presentation does not match its current projection kind",
+        ));
+    }
+
+    let expected_event_id = format!("kernel-v2:{projection_id}");
+    if event.get("id").and_then(Value::as_str) != Some(expected_event_id.as_str()) {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_public_event_identity_mismatch",
+            "Session public AgentEvent id does not match payload projectionId",
+        ));
+    }
+    if let Some((expected_projection_id, _, expected_run_id, expected_projection_kind)) = expected {
+        if projection_id != expected_projection_id
+            || run_id != expected_run_id
+            || projection_kind != expected_projection_kind
+        {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_public_event_identity_mismatch",
+                "Session public AgentEvent payload does not match its private projection",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_projection_payload_types(
+    projection_kind: &str,
+    event_kind: &str,
+    payload: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    match projection_kind {
+        "input.persisted" => {
+            public_string(payload, "content", false)?;
+            public_string(payload, "inputId", true)?;
+            public_array(payload, "attachments")?;
+            public_integer(payload, "controlEpoch", true)?;
+        }
+        "plan.persisted" => {
+            public_plan_fields(payload, false)?;
+            if public_boolean(payload, "confirmable")? {
+                return Err(public_projection_shape_invalid(
+                    "Persisted Plan cannot be confirmable before scope preview",
+                ));
+            }
+        }
+        "plan.decided" => {
+            for field in ["planId", "planRevision"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "decision", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            public_optional_string(payload, "guidance", false)?;
+            if public_boolean(payload, "confirmable")? {
+                return Err(public_projection_shape_invalid(
+                    "Plan decision cannot remain confirmable",
+                ));
+            }
+        }
+        "scope.previewed" if event_kind == "plan_review" => {
+            for field in ["planId", "planRevision", "operationId", "planActionId"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "decision", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            public_optional_string(payload, "guidance", false)?;
+            if public_boolean(payload, "confirmable")? {
+                return Err(public_projection_shape_invalid(
+                    "Rejected scope preview cannot be confirmable",
+                ));
+            }
+        }
+        "scope.previewed" => {
+            public_plan_fields(payload, true)?;
+            let scope_previews = public_array(payload, "scopePreviews")?;
+            for preview in scope_previews {
+                validate_private_scope_preview(preview, "public.scopePreviews").map_err(|_| {
+                    public_projection_shape_invalid("Public scope preview is invalid")
+                })?;
+            }
+            validate_public_scope_preview_bindings(payload, scope_previews)?;
+            validate_public_scope_approval_view(
+                payload
+                    .get("scopeApprovalView")
+                    .expect("required scope approval view"),
+                public_string(payload, "planRevision", true)?,
+                scope_previews,
+            )?;
+            validate_public_readable_plan(
+                payload.get("readablePlan").expect("required readable Plan"),
+                payload,
+                scope_previews,
+            )?;
+        }
+        "capability.awaiting" => {
+            for field in [
+                "id",
+                "permissionId",
+                "operationId",
+                "invocationId",
+                "toolId",
+                "toolName",
+            ] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["requestKind", "riskLevel", "summary", "status"] {
+                public_string(payload, field, false)?;
+            }
+            validate_public_identity_array(
+                payload
+                    .get("affectedOperationIds")
+                    .expect("required affected operation ids"),
+                "affectedOperationIds",
+            )?;
+            let arguments_preview = public_object(payload, "argumentsPreview")?;
+            let preview_value = payload.get("preview").expect("required preview");
+            let preview = decode_private_scope_preview(preview_value, "public.permission.preview")
+                .map_err(|_| {
+                    public_projection_shape_invalid("Public permission preview is invalid")
+                })?;
+            if Value::Object(arguments_preview.clone()) != *preview_value {
+                return Err(public_projection_shape_invalid(
+                    "Permission argumentsPreview differs from its canonical preview",
+                ));
+            }
+            let operation_id = public_string(payload, "operationId", true)?;
+            let preview_id = preview.preview_id.as_str();
+            let tool_id = preview.tool_id.as_str();
+            let expected_affected_operations = vec![Value::String(operation_id.to_string())];
+            if public_string(payload, "id", true)? != preview_id
+                || public_string(payload, "permissionId", true)? != preview_id
+                || operation_id != preview.operation_id.as_str()
+                || public_string(payload, "toolId", true)? != tool_id
+                || public_string(payload, "toolName", true)? != tool_id
+                || payload.get("riskLevel") != preview_value.get("risk")
+                || payload.get("affectedOperationIds")
+                    != Some(&Value::Array(expected_affected_operations))
+            {
+                return Err(public_projection_shape_invalid(
+                    "Permission request fields do not match their canonical scope preview",
+                ));
+            }
+        }
+        "toolIntent.submitted" => {
+            for field in ["operationId", "requestId", "toolId"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "authorityKind", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            for field in [
+                "invocationId",
+                "replyReason",
+                "planRevision",
+                "planActionId",
+            ] {
+                public_optional_string(payload, field, true)?;
+            }
+            public_integer(payload, "controlEpoch", true)?;
+        }
+        "kernelFacts.reconciled" => {
+            for field in ["status", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            validate_public_identity_array(
+                payload.get("factIds").expect("required fact ids"),
+                "factIds",
+            )?;
+            validate_public_operation_facts(
+                payload
+                    .get("operationFacts")
+                    .expect("required operation facts"),
+            )?;
+            public_integer(payload, "snapshotHighWater", false)?;
+        }
+        "authorization.decided" => {
+            for field in ["id", "permissionId", "previewId", "factId", "operationId"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "decision", "factKind", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            for field in ["toolId", "leaseId", "scopeDigest"] {
+                public_optional_string(payload, field, true)?;
+            }
+            public_optional_string(payload, "guidance", false)?;
+            if payload.contains_key("leaseVersion") {
+                public_integer(payload, "leaseVersion", true)?;
+            }
+            validate_public_identity_array(
+                payload
+                    .get("planActionIds")
+                    .expect("required PlanAction ids"),
+                "planActionIds",
+            )?;
+            public_object(payload, "details")?;
+            if payload.contains_key("scopeDelta") {
+                public_object(payload, "scopeDelta")?;
+            }
+        }
+        "review.revised" => {
+            public_string(payload, "reviewId", true)?;
+            for field in ["status", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            public_integer(payload, "revision", true)?;
+            public_integer(payload, "snapshotHighWater", false)?;
+            validate_public_review(payload.get("review").expect("required review"))?;
+        }
+        "planAction.completed" => {
+            for field in ["planActionId", "providerTurnId"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "completionKind", "summary"] {
+                public_string(payload, field, false)?;
+            }
+        }
+        "provider.composing" => {
+            public_string(payload, "providerTurnId", true)?;
+            public_integer(payload, "controlEpoch", true)?;
+            public_integer(payload, "streamSequence", true)?;
+            public_integer(payload, "textOrdinal", true)?;
+            public_optional_string(payload, "providerPhase", false)?;
+            for field in ["status", "content"] {
+                public_string(payload, field, false)?;
+            }
+        }
+        "provider.completed" => {
+            public_string(payload, "providerTurnId", true)?;
+            for field in ["status", "terminalScope", "outputKind"] {
+                public_string(payload, field, false)?;
+            }
+            public_integer(payload, "controlEpoch", true)?;
+            if payload.contains_key("orderedItems") {
+                validate_public_ordered_items(
+                    payload.get("orderedItems").expect("present ordered items"),
+                )?;
+            }
+            validate_public_provider_outcome(
+                payload
+                    .get("providerOutcome")
+                    .expect("required provider outcome"),
+            )?;
+        }
+        "provider.started" => {
+            public_string(payload, "providerTurnId", true)?;
+            public_string(payload, "status", false)?;
+            public_integer(payload, "controlEpoch", true)?;
+            if payload.contains_key("currentActivityCode") {
+                public_string(payload, "currentActivityCode", false)?;
+                public_integer(payload, "activitySequence", true)?;
+            } else {
+                public_object(payload, "contextAssembly")?;
+                public_string(payload, "summary", false)?;
+            }
+        }
+        "provider.stale" => {
+            public_string(payload, "providerTurnId", true)?;
+            for field in ["status", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            if payload.contains_key("controlEpoch") {
+                public_integer(payload, "controlEpoch", true)?;
+            }
+        }
+        "run.cancelled" => {
+            for field in ["callerRequestId", "cancelOperationId"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "reason", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            public_integer(payload, "controlEpoch", true)?;
+            validate_public_cancellation_facts(payload.get("facts").expect("required facts"))?;
+        }
+        "wait.changed" => {
+            for field in ["status", "reason", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            public_optional_string(payload, "targetId", true)?;
+            public_optional_string(payload, "decisionKind", false)?;
+        }
+        "diagnostic" if event_kind == "workflow_stage" => {
+            public_string(payload, "providerTurnId", true)?;
+            for field in ["status", "code"] {
+                public_string(payload, field, false)?;
+            }
+            public_optional_string(payload, "reason", false)?;
+            validate_public_ordered_items(
+                payload.get("orderedItems").expect("required ordered items"),
+            )?;
+        }
+        "diagnostic" => {
+            for field in ["status", "code", "message"] {
+                public_string(payload, field, false)?;
+            }
+            public_optional_string(payload, "providerTurnId", true)?;
+            public_optional_string(payload, "terminalScope", false)?;
+            if payload.contains_key("providerOutcome") {
+                validate_public_provider_outcome(
+                    payload
+                        .get("providerOutcome")
+                        .expect("present provider outcome"),
+                )?;
+            }
+        }
+        _ => {
+            return Err(public_projection_shape_invalid(
+                "Public projection kind is not current",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn public_projection_shape_invalid(message: impl Into<String>) -> HostV2StorageError {
+    HostV2StorageError::conflict("UnsupportedHistorySchema", message)
+}
+
+fn public_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    identity: bool,
+) -> Result<&'a str, HostV2StorageError> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be a string")))?;
+    if identity {
+        validate_bounded_identity(value, "publicProjectionIdentity", 64 * 1024)
+            .map_err(|_| public_projection_shape_invalid(format!("{field} is not an identity")))?;
+    }
+    Ok(value)
+}
+
+fn public_optional_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    identity: bool,
+) -> Result<(), HostV2StorageError> {
+    if object.contains_key(field) {
+        public_string(object, field, identity)?;
+    }
+    Ok(())
+}
+
+fn public_boolean(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<bool, HostV2StorageError> {
+    object
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be boolean")))
+}
+
+fn public_integer(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    positive: bool,
+) -> Result<u64, HostV2StorageError> {
+    const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+    let value = object
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_SAFE_JSON_INTEGER)
+        .ok_or_else(|| {
+            public_projection_shape_invalid(format!("{field} must be a safe integer"))
+        })?;
+    if positive && value == 0 {
+        return Err(public_projection_shape_invalid(format!(
+            "{field} must be positive"
+        )));
+    }
+    Ok(value)
+}
+
+fn public_array<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a Vec<Value>, HostV2StorageError> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be an array")))
+}
+
+fn public_object<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>, HostV2StorageError> {
+    object
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be an object")))
+}
+
+fn public_exact_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    optional: &[&str],
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>, HostV2StorageError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be an object")))?;
+    public_exact_map(object, required, optional, field)
+}
+
+fn public_exact_map<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>, HostV2StorageError> {
+    if object
+        .keys()
+        .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+        || required
+            .iter()
+            .any(|key| !object.contains_key(*key) || object.get(*key) == Some(&Value::Null))
+        || optional
+            .iter()
+            .any(|key| object.get(*key) == Some(&Value::Null))
+    {
+        return Err(public_projection_shape_invalid(format!(
+            "{field} is not an exact current object"
+        )));
+    }
+    Ok(object)
+}
+
+fn validate_public_identity_array(value: &Value, field: &str) -> Result<(), HostV2StorageError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be an array")))?;
+    for item in values {
+        let identity = item.as_str().ok_or_else(|| {
+            public_projection_shape_invalid(format!("{field} must contain identities"))
+        })?;
+        validate_bounded_identity(identity, "publicProjectionIdentity", 64 * 1024).map_err(
+            |_| public_projection_shape_invalid(format!("{field} contains an invalid identity")),
+        )?;
+    }
+    Ok(())
+}
+
+fn public_plan_fields(
+    payload: &serde_json::Map<String, Value>,
+    scoped: bool,
+) -> Result<(), HostV2StorageError> {
+    for field in ["planId", "planRevision"] {
+        public_string(payload, field, true)?;
+    }
+    for field in ["title", "summary", "userPlan", "status"] {
+        public_string(payload, field, false)?;
+    }
+    public_boolean(payload, "confirmable")?;
+    validate_public_plan_tasks(payload.get("tasks").expect("required tasks"), scoped)
+}
+
+fn validate_public_plan_tasks(value: &Value, scoped: bool) -> Result<(), HostV2StorageError> {
+    let tasks = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid("Plan tasks must be an array"))?;
+    for task in tasks {
+        let optional = if scoped {
+            &["scopePreview", "approvalView"][..]
+        } else {
+            &[][..]
+        };
+        let task = public_exact_object(
+            task,
+            &[
+                "taskId",
+                "manifest",
+                "previewArguments",
+                "idempotencyKey",
+                "deadline",
+            ],
+            optional,
+            "Plan task",
+        )?;
+        for field in ["taskId", "idempotencyKey"] {
+            public_string(task, field, true)?;
+        }
+        validate_public_scope_manifest(task.get("manifest").expect("required manifest"))?;
+        public_object(task, "previewArguments")?;
+        validate_public_deadline(task.get("deadline").expect("required deadline"))?;
+        if task.contains_key("scopePreview") {
+            let preview = task.get("scopePreview").expect("present scope preview");
+            validate_private_scope_preview(preview, "public.task.scopePreview")
+                .map_err(|_| public_projection_shape_invalid("Task scope preview is invalid"))?;
+            let approval = task
+                .get("approvalView")
+                .ok_or_else(|| public_projection_shape_invalid("Task approvalView is missing"))?;
+            if preview.get("approvalView") != Some(approval) {
+                return Err(public_projection_shape_invalid(
+                    "Task approvalView differs from its scope preview",
+                ));
+            }
+        } else if task.contains_key("approvalView") {
+            return Err(public_projection_shape_invalid(
+                "Task approvalView has no scope preview",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_scope_manifest(value: &Value) -> Result<(), HostV2StorageError> {
+    let manifest = public_exact_object(
+        value,
+        &[
+            "planRevision",
+            "planActionId",
+            "operationId",
+            "toolId",
+            "requestedResources",
+        ],
+        &[],
+        "Scope manifest",
+    )?;
+    for field in ["planRevision", "planActionId", "operationId", "toolId"] {
+        public_string(manifest, field, true)?;
+    }
+    let resources = public_array(manifest, "requestedResources")?;
+    for resource in resources {
+        let resource = public_exact_object(resource, &["kind", "data"], &[], "Requested resource")?;
+        let kind = public_string(resource, "kind", false)?;
+        let data = public_object(resource, "data")?;
+        match kind {
+            "workspacePath" => {
+                let data = public_exact_map(data, &["path", "access"], &[], "Workspace resource")?;
+                public_string(data, "path", false)?;
+                if !matches!(public_string(data, "access", false)?, "read" | "write") {
+                    return Err(public_projection_shape_invalid(
+                        "Workspace resource access is invalid",
+                    ));
+                }
+            }
+            "repository" => {
+                let data = public_exact_map(data, &["area"], &[], "Repository resource")?;
+                if !matches!(
+                    public_string(data, "area", false)?,
+                    "state" | "index" | "history"
+                ) {
+                    return Err(public_projection_shape_invalid(
+                        "Repository resource area is invalid",
+                    ));
+                }
+            }
+            "networkUrl" | "networkQuery" | "exactInvocation" => {
+                let field = match kind {
+                    "networkUrl" => "url",
+                    "networkQuery" => "query",
+                    _ => "invocationDigest",
+                };
+                let data = public_exact_map(data, &[field], &[], "Requested resource data")?;
+                public_string(data, field, false)?;
+            }
+            _ => {
+                return Err(public_projection_shape_invalid(
+                    "Requested resource kind is not current",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_deadline(value: &Value) -> Result<(), HostV2StorageError> {
+    let deadline = public_exact_object(value, &["kind", "data"], &[], "Deadline")?;
+    let kind = public_string(deadline, "kind", false)?;
+    let data = public_object(deadline, "data")?;
+    match kind {
+        "contractDefault" if data.is_empty() => Ok(()),
+        "exactMilliseconds" => {
+            let data = public_exact_map(data, &["value"], &[], "Exact deadline")?;
+            public_integer(data, "value", true)?;
+            Ok(())
+        }
+        _ => Err(public_projection_shape_invalid(
+            "Deadline kind or data is not current",
+        )),
+    }
+}
+
+fn validate_public_scope_preview_bindings(
+    payload: &serde_json::Map<String, Value>,
+    previews: &[Value],
+) -> Result<(), HostV2StorageError> {
+    let plan_id = public_string(payload, "planId", true)?;
+    let plan_revision = public_string(payload, "planRevision", true)?;
+    if plan_id != plan_revision {
+        return Err(public_projection_shape_invalid(
+            "Public Plan identity differs from its current Plan revision",
+        ));
+    }
+    let tasks = public_array(payload, "tasks")?;
+    let mut preview_ids = HashSet::new();
+    let mut preview_operations = HashSet::new();
+    for preview_value in previews {
+        let preview = decode_private_scope_preview(preview_value, "public.scopePreviews")
+            .map_err(|_| public_projection_shape_invalid("Public scope preview is invalid"))?;
+        if preview.plan_revision.as_str() != plan_revision
+            || !preview_ids.insert(preview.preview_id.as_str().to_string())
+            || !preview_operations.insert(preview.operation_id.as_str().to_string())
+        {
+            return Err(public_projection_shape_invalid(
+                "Public scope previews are not uniquely bound to the current Plan revision",
+            ));
+        }
+        let mut matching_tasks = tasks.iter().filter(|task| {
+            task.get("manifest")
+                .and_then(|manifest| manifest.get("operationId"))
+                .and_then(Value::as_str)
+                == Some(preview.operation_id.as_str())
+        });
+        let task = matching_tasks.next().ok_or_else(|| {
+            public_projection_shape_invalid("Public scope preview has no matching PlanAction task")
+        })?;
+        if matching_tasks.next().is_some() {
+            return Err(public_projection_shape_invalid(
+                "Public scope preview matches more than one PlanAction task",
+            ));
+        }
+        let manifest = task
+            .get("manifest")
+            .and_then(Value::as_object)
+            .expect("validated Plan task manifest");
+        if manifest.get("planRevision").and_then(Value::as_str) != Some(plan_revision)
+            || manifest.get("planActionId").and_then(Value::as_str)
+                != Some(preview.plan_action_id.as_str())
+            || manifest.get("toolId").and_then(Value::as_str) != Some(preview.tool_id.as_str())
+            || task.get("scopePreview") != Some(preview_value)
+        {
+            return Err(public_projection_shape_invalid(
+                "Public scope preview differs from its PlanAction manifest binding",
+            ));
+        }
+    }
+    let scoped_task_count = tasks
+        .iter()
+        .filter(|task| task.get("scopePreview").is_some())
+        .count();
+    if scoped_task_count != previews.len() {
+        return Err(public_projection_shape_invalid(
+            "PlanAction scope previews differ from the canonical preview list",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_scope_approval_view(
+    value: &Value,
+    plan_revision: &str,
+    previews: &[Value],
+) -> Result<(), HostV2StorageError> {
+    let expected_previews = previews
+        .iter()
+        .map(|preview| {
+            let preview = preview.as_object().expect("validated scope preview");
+            json!({
+                "previewId": preview.get("previewId").expect("validated previewId"),
+                "planActionId": preview.get("planActionId").expect("validated planActionId"),
+                "operationId": preview.get("operationId").expect("validated operationId"),
+                "toolId": preview.get("toolId").expect("validated toolId"),
+                "authorizationDigest": preview
+                    .get("authorizationDigest")
+                    .expect("validated authorizationDigest"),
+                "approvalView": preview.get("approvalView").expect("validated approvalView"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected = json!({
+        "planRevision": plan_revision,
+        "previews": expected_previews,
+    });
+    if *value != expected {
+        return Err(public_projection_shape_invalid(
+            "Scope approval view differs from its canonical scope previews",
+        ));
+    }
+    Ok(())
+}
+
+fn public_readable_plan_resource_refs(manifest: &serde_json::Map<String, Value>) -> Vec<String> {
+    manifest
+        .get("requestedResources")
+        .and_then(Value::as_array)
+        .expect("validated requested resources")
+        .iter()
+        .map(|resource| {
+            let resource = resource.as_object().expect("validated requested resource");
+            let kind = resource
+                .get("kind")
+                .and_then(Value::as_str)
+                .expect("validated requested resource kind");
+            let data = resource
+                .get("data")
+                .and_then(Value::as_object)
+                .expect("validated requested resource data");
+            let target = ["path", "url", "query", "invocationDigest", "area"]
+                .iter()
+                .find_map(|field| data.get(*field).and_then(Value::as_str));
+            match target.filter(|target| !target.is_empty()) {
+                Some(target) => format!("{kind}:{target}"),
+                None => kind.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn validate_public_readable_plan(
+    value: &Value,
+    payload: &serde_json::Map<String, Value>,
+    previews: &[Value],
+) -> Result<(), HostV2StorageError> {
+    let plan_id = public_string(payload, "planId", true)?;
+    let title = public_string(payload, "title", false)?;
+    let summary = public_string(payload, "summary", false)?;
+    let user_plan = public_string(payload, "userPlan", false)?;
+    let mut readable_tasks = Vec::new();
+    let mut task_items = Vec::new();
+    for task in public_array(payload, "tasks")? {
+        let task = task.as_object().expect("validated Plan task");
+        let task_id = task
+            .get("taskId")
+            .and_then(Value::as_str)
+            .expect("validated taskId");
+        let manifest = task
+            .get("manifest")
+            .and_then(Value::as_object)
+            .expect("validated Plan task manifest");
+        let operation_id = manifest
+            .get("operationId")
+            .and_then(Value::as_str)
+            .expect("validated operationId");
+        let tool_id = manifest
+            .get("toolId")
+            .and_then(Value::as_str)
+            .expect("validated toolId");
+        let objective = format!("operationId={operation_id}");
+        let targets = public_readable_plan_resource_refs(manifest);
+        readable_tasks.push(json!({
+            "taskId": task_id,
+            "title": tool_id,
+            "objective": objective,
+            "targets": targets,
+            "acceptance": [],
+            "failure": [],
+            "intentKind": tool_id,
+        }));
+        task_items.push(json!({
+            "itemId": task_id,
+            "kind": "task",
+            "text": tool_id,
+            "targetRefs": targets,
+            "metadata": {
+                "objective": objective,
+                "acceptance": [],
+                "failure": [],
+            },
+        }));
+    }
+    let scope_items = previews
+        .iter()
+        .map(|preview| {
+            let preview = preview.as_object().expect("validated scope preview");
+            let approval = preview
+                .get("approvalView")
+                .and_then(Value::as_object)
+                .expect("validated approval view");
+            let preview_id = preview
+                .get("previewId")
+                .and_then(Value::as_str)
+                .expect("validated previewId");
+            let tool_id = preview
+                .get("toolId")
+                .and_then(Value::as_str)
+                .expect("validated toolId");
+            let risk = approval
+                .get("risk")
+                .and_then(Value::as_str)
+                .expect("validated risk");
+            let effect_class = approval
+                .get("effectClass")
+                .and_then(Value::as_str)
+                .expect("validated effectClass");
+            let effect_scope = approval
+                .get("effectScope")
+                .and_then(Value::as_str)
+                .expect("validated effectScope");
+            let scope_digest = approval
+                .get("scopeDigest")
+                .and_then(Value::as_str)
+                .expect("validated scopeDigest");
+            let authorization_digest = preview
+                .get("authorizationDigest")
+                .and_then(Value::as_str)
+                .expect("validated authorizationDigest");
+            let plan_action_id = preview
+                .get("planActionId")
+                .and_then(Value::as_str)
+                .expect("validated planActionId");
+            let operation_id = preview
+                .get("operationId")
+                .and_then(Value::as_str)
+                .expect("validated operationId");
+            let approval_summary = approval
+                .get("summary")
+                .and_then(Value::as_str)
+                .expect("validated approval summary");
+            json!({
+                "itemId": preview_id,
+                "kind": "permission",
+                "text": format!(
+                    "{tool_id}: {approval_summary} [risk={risk}; effect={effect_class}/{effect_scope}; scopeDigest={scope_digest}]"
+                ),
+                "status": preview.get("disposition").expect("validated disposition"),
+                "targetRefs": approval
+                    .get("canonicalTargets")
+                    .expect("validated canonicalTargets"),
+                "auditRefs": [preview_id, scope_digest, authorization_digest],
+                "metadata": {
+                    "objective": format!(
+                        "planActionId={plan_action_id}; operationId={operation_id}; authorizationDigest={authorization_digest}"
+                    ),
+                    "acceptance": approval.get("scopeDelta").expect("validated scopeDelta"),
+                    "failure": [],
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected = json!({
+        "schemaVersion": "deepcode.session.readable-plan.v2",
+        "titleKey": "session.projection.plan.title",
+        "title": title,
+        "summary": summary,
+        "sourceRefs": {
+            "planRevision": plan_id,
+        },
+        "tasks": readable_tasks,
+        "sections": [
+            {
+                "sectionId": "summary",
+                "titleKey": "session.projection.plan.section.summary",
+                "items": [{
+                    "itemId": "summary",
+                    "kind": "text",
+                    "text": user_plan,
+                }],
+            },
+            {
+                "sectionId": "tasks",
+                "titleKey": "session.projection.plan.section.tasks",
+                "emptyMessageKey": "session.projection.plan.empty.tasks",
+                "items": task_items,
+            },
+            {
+                "sectionId": "scopeApproval",
+                "titleKey": "session.projection.plan.section.permissionBundles",
+                "emptyMessageKey": "session.projection.plan.empty.permissionBundles",
+                "items": scope_items,
+            },
+        ],
+    });
+    if *value != expected {
+        return Err(public_projection_shape_invalid(
+            "Readable Plan differs from the exact canonical v2 projection",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageError> {
+    let facts = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid("operationFacts must be an array"))?;
+    for fact in facts {
+        let fact = public_exact_object(
+            fact,
+            &["factId", "domain", "factKind", "recordedAt", "resourceIds"],
+            &[
+                "operationId",
+                "invocationId",
+                "attemptId",
+                "effectId",
+                "toolId",
+                "canonicalAction",
+                "targets",
+                "effectSummary",
+            ],
+            "Operation fact",
+        )?;
+        for field in ["factId", "factKind", "recordedAt"] {
+            public_string(fact, field, true)?;
+        }
+        if !matches!(
+            public_string(fact, "domain", false)?,
+            "control" | "authorization" | "invocation" | "effect" | "resource" | "cleanup"
+        ) {
+            return Err(public_projection_shape_invalid(
+                "Operation fact domain is not current",
+            ));
+        }
+        for field in [
+            "operationId",
+            "invocationId",
+            "attemptId",
+            "effectId",
+            "toolId",
+            "canonicalAction",
+        ] {
+            public_optional_string(fact, field, true)?;
+        }
+        public_optional_string(fact, "effectSummary", false)?;
+        validate_public_identity_array(
+            fact.get("resourceIds").expect("required resource ids"),
+            "operationFact.resourceIds",
+        )?;
+        if let Some(targets) = fact.get("targets") {
+            validate_public_identity_array(targets, "operationFact.targets")?;
+        }
+        if fact.contains_key("toolId") != fact.contains_key("canonicalAction")
+            || (fact.contains_key("toolId")
+                && fact.get("toolId").and_then(Value::as_str)
+                    != fact.get("canonicalAction").and_then(Value::as_str))
+        {
+            return Err(public_projection_shape_invalid(
+                "Operation fact canonicalAction differs from toolId",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError> {
+    let items = value
+        .as_array()
+        .filter(|items| items.len() <= 96)
+        .ok_or_else(|| public_projection_shape_invalid("orderedItems is invalid"))?;
+    let mut previous_text_ordinal = 0;
+    let mut previous_tool_ordinal = 0;
+    for item in items {
+        let kind = item.get("kind").and_then(Value::as_str);
+        match kind {
+            Some("text") => {
+                let item = public_exact_object(
+                    item,
+                    &["kind", "phase", "text", "textOrdinal"],
+                    &[],
+                    "Provider text item",
+                )?;
+                if !matches!(
+                    public_string(item, "phase", false)?,
+                    "commentary" | "final_answer" | "unknown"
+                ) {
+                    return Err(public_projection_shape_invalid(
+                        "Provider text phase is not current",
+                    ));
+                }
+                public_string(item, "text", false)?;
+                let ordinal = public_integer(item, "textOrdinal", true)?;
+                if ordinal <= previous_text_ordinal {
+                    return Err(public_projection_shape_invalid(
+                        "Provider text ordinal is not strictly ordered",
+                    ));
+                }
+                previous_text_ordinal = ordinal;
+            }
+            Some("toolCall") => {
+                let item = public_exact_object(
+                    item,
+                    &["kind", "ordinal", "callId", "toolName", "toolId"],
+                    &[
+                        "operationId",
+                        "status",
+                        "invocationId",
+                        "terminalFactId",
+                        "terminalFactKind",
+                        "settlementReason",
+                    ],
+                    "Provider tool item",
+                )?;
+                let ordinal = public_integer(item, "ordinal", true)?;
+                if ordinal <= previous_tool_ordinal {
+                    return Err(public_projection_shape_invalid(
+                        "Provider tool ordinal is not strictly ordered",
+                    ));
+                }
+                previous_tool_ordinal = ordinal;
+                for field in ["callId", "toolName", "toolId"] {
+                    public_string(item, field, true)?;
+                }
+                for field in [
+                    "operationId",
+                    "invocationId",
+                    "terminalFactId",
+                    "terminalFactKind",
+                    "settlementReason",
+                ] {
+                    public_optional_string(item, field, true)?;
+                }
+                if item.contains_key("status")
+                    && !matches!(
+                        public_string(item, "status", false)?,
+                        "pending"
+                            | "submitting"
+                            | "awaitingCapability"
+                            | "awaitingInvocation"
+                            | "completed"
+                            | "aborted"
+                            | "unexecuted"
+                    )
+                {
+                    return Err(public_projection_shape_invalid(
+                        "Provider tool status is not current",
+                    ));
+                }
+            }
+            _ => {
+                return Err(public_projection_shape_invalid(
+                    "Provider ordered item kind is not current",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_provider_outcome(value: &Value) -> Result<(), HostV2StorageError> {
+    let outcome = public_exact_object(
+        value,
+        &["providerProfileId", "provider", "model"],
+        &["usage"],
+        "Provider outcome",
+    )?;
+    for field in ["providerProfileId", "provider", "model"] {
+        public_string(outcome, field, true)?;
+    }
+    if outcome.contains_key("usage") {
+        let usage = public_object(outcome, "usage")?;
+        let mut visited = 0usize;
+        validate_public_provider_usage(usage, 0, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn validate_public_provider_usage(
+    usage: &serde_json::Map<String, Value>,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<(), HostV2StorageError> {
+    if depth > 5 || (depth == 5 && !usage.is_empty()) {
+        return Err(public_projection_shape_invalid(
+            "Provider usage nesting is invalid",
+        ));
+    }
+    for (key, value) in usage {
+        *visited += 1;
+        let key_is_current = key.len() <= 128
+            && key
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic())
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if *visited > 256 || !key_is_current {
+            return Err(public_projection_shape_invalid(
+                "Provider usage key is invalid",
+            ));
+        }
+        if let Some(counter) = value.as_u64() {
+            if counter > 1_000_000_000_000 {
+                return Err(public_projection_shape_invalid(
+                    "Provider usage counter is invalid",
+                ));
+            }
+            continue;
+        }
+        let nested = value
+            .as_object()
+            .ok_or_else(|| public_projection_shape_invalid("Provider usage value is invalid"))?;
+        validate_public_provider_usage(nested, depth + 1, visited)?;
+    }
+    Ok(())
+}
+
+fn validate_public_cancellation_facts(value: &Value) -> Result<(), HostV2StorageError> {
+    let facts = public_exact_object(
+        value,
+        &[
+            "afterLedgerSequence",
+            "snapshotHighWater",
+            "runSequenceHighWater",
+            "caughtUp",
+            "pendingFactBarrierCount",
+        ],
+        &[],
+        "Run cancellation facts",
+    )?;
+    for field in [
+        "afterLedgerSequence",
+        "snapshotHighWater",
+        "runSequenceHighWater",
+        "pendingFactBarrierCount",
+    ] {
+        public_integer(facts, field, false)?;
+    }
+    if facts.get("caughtUp").and_then(Value::as_bool) != Some(true)
+        || facts.get("pendingFactBarrierCount").and_then(Value::as_u64) != Some(0)
+    {
+        return Err(public_projection_shape_invalid(
+            "Run cancellation facts are not caught up",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_review(value: &Value) -> Result<(), HostV2StorageError> {
+    let review = public_exact_object(
+        value,
+        &[
+            "projectionVersion",
+            "revision",
+            "status",
+            "planActionSettlementDigest",
+            "snapshotHighWater",
+            "planned",
+            "scopeExpansions",
+            "actualEffects",
+            "unexecuted",
+            "denied",
+            "rejections",
+            "completions",
+            "cleanup",
+            "indeterminate",
+            "priorEpochLateFacts",
+            "factCoverage",
+            "factsQuery",
+            "pendingCleanupCount",
+            "createdAt",
+        ],
+        &[
+            "workAuthority",
+            "planRevision",
+            "planDecision",
+            "plan",
+            "finalizedAt",
+        ],
+        "Review",
+    )?;
+    if public_string(review, "projectionVersion", false)?
+        != "deepcode.session.kernel-review-projection.v2"
+        || !matches!(public_string(review, "status", false)?, "draft" | "final")
+    {
+        return Err(public_projection_shape_invalid(
+            "Review version or status is invalid",
+        ));
+    }
+    for field in ["planActionSettlementDigest", "createdAt"] {
+        public_string(review, field, true)?;
+    }
+    for field in ["planRevision", "finalizedAt"] {
+        public_optional_string(review, field, true)?;
+    }
+    public_integer(review, "revision", true)?;
+    public_integer(review, "snapshotHighWater", false)?;
+    public_integer(review, "pendingCleanupCount", false)?;
+    for field in ["planned", "unexecuted"] {
+        validate_public_planned_actions(review.get(field).expect("required planned actions"))?;
+    }
+    for field in [
+        "scopeExpansions",
+        "actualEffects",
+        "denied",
+        "rejections",
+        "cleanup",
+        "indeterminate",
+        "priorEpochLateFacts",
+    ] {
+        validate_public_review_fact_refs(review.get(field).expect("required review facts"))?;
+    }
+    validate_public_review_completions(review.get("completions").expect("required completions"))?;
+    validate_public_review_coverage(review.get("factCoverage").expect("required coverage"))?;
+    validate_public_review_query(review.get("factsQuery").expect("required facts query"))?;
+    if let Some(plan) = review.get("plan") {
+        let plan = public_exact_object(
+            plan,
+            &["title", "objective", "narrative", "recordedAt"],
+            &[],
+            "Review Plan",
+        )?;
+        for field in ["title", "objective", "narrative"] {
+            public_string(plan, field, false)?;
+        }
+        public_string(plan, "recordedAt", true)?;
+    }
+    if let Some(decision) = review.get("planDecision") {
+        let decision = public_exact_object(
+            decision,
+            &["planRevision", "decision", "recordedAt"],
+            &["guidance"],
+            "Review Plan decision",
+        )?;
+        for field in ["planRevision", "recordedAt"] {
+            public_string(decision, field, true)?;
+        }
+        if !matches!(
+            public_string(decision, "decision", false)?,
+            "accept" | "reject" | "revise"
+        ) {
+            return Err(public_projection_shape_invalid(
+                "Review Plan decision is invalid",
+            ));
+        }
+        public_optional_string(decision, "guidance", false)?;
+    }
+    if let Some(authority) = review.get("workAuthority") {
+        validate_public_work_authority(authority)?;
+    }
+    Ok(())
+}
+
+fn validate_public_planned_actions(value: &Value) -> Result<(), HostV2StorageError> {
+    let actions = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid("Review actions must be an array"))?;
+    for action in actions {
+        let action = public_exact_object(
+            action,
+            &["taskId", "planActionId", "operationId", "toolId"],
+            &[],
+            "Review action",
+        )?;
+        for field in ["taskId", "planActionId", "operationId", "toolId"] {
+            public_string(action, field, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_review_fact_refs(value: &Value) -> Result<(), HostV2StorageError> {
+    let facts = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid("Review facts must be an array"))?;
+    for fact in facts {
+        let fact = public_exact_object(
+            fact,
+            &[
+                "factId",
+                "ledgerSequence",
+                "domain",
+                "factKind",
+                "planActionIds",
+                "resourceIds",
+                "details",
+            ],
+            &[
+                "controlEpoch",
+                "sessionPlanActionId",
+                "operationId",
+                "invocationId",
+                "effectId",
+            ],
+            "Review fact",
+        )?;
+        for field in ["factId", "factKind"] {
+            public_string(fact, field, true)?;
+        }
+        if !matches!(
+            public_string(fact, "domain", false)?,
+            "control" | "authorization" | "invocation" | "effect" | "resource" | "cleanup"
+        ) {
+            return Err(public_projection_shape_invalid(
+                "Review fact domain is invalid",
+            ));
+        }
+        public_integer(fact, "ledgerSequence", true)?;
+        if fact.contains_key("controlEpoch") {
+            public_integer(fact, "controlEpoch", true)?;
+        }
+        for field in [
+            "sessionPlanActionId",
+            "operationId",
+            "invocationId",
+            "effectId",
+        ] {
+            public_optional_string(fact, field, true)?;
+        }
+        validate_public_identity_array(
+            fact.get("planActionIds").expect("required PlanAction ids"),
+            "reviewFact.planActionIds",
+        )?;
+        validate_public_identity_array(
+            fact.get("resourceIds").expect("required resource ids"),
+            "reviewFact.resourceIds",
+        )?;
+        public_object(fact, "details")?;
+    }
+    Ok(())
+}
+
+fn validate_public_review_completions(value: &Value) -> Result<(), HostV2StorageError> {
+    let completions = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid("Review completions must be an array"))?;
+    for completion in completions {
+        let completion = public_exact_object(
+            completion,
+            &[
+                "kind",
+                "planActionId",
+                "completionKind",
+                "providerTurnId",
+                "recordedAt",
+            ],
+            &[],
+            "Review completion",
+        )?;
+        if public_string(completion, "kind", false)? != "completed"
+            || !matches!(
+                public_string(completion, "completionKind", false)?,
+                "answer" | "noTool"
+            )
+        {
+            return Err(public_projection_shape_invalid(
+                "Review completion kind is invalid",
+            ));
+        }
+        for field in ["planActionId", "providerTurnId", "recordedAt"] {
+            public_string(completion, field, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_review_coverage(value: &Value) -> Result<(), HostV2StorageError> {
+    const CATEGORIES: &[&str] = &[
+        "scopeExpansions",
+        "actualEffects",
+        "denied",
+        "rejections",
+        "cleanup",
+        "indeterminate",
+        "priorEpochLateFacts",
+    ];
+    let coverage = public_exact_object(value, CATEGORIES, &[], "Review fact coverage")?;
+    for category in CATEGORIES {
+        let counts = public_exact_object(
+            coverage.get(*category).expect("required coverage category"),
+            &["totalCount", "retainedCount", "omittedCount"],
+            &[],
+            "Review coverage category",
+        )?;
+        let total = public_integer(counts, "totalCount", false)?;
+        let retained = public_integer(counts, "retainedCount", false)?;
+        let omitted = public_integer(counts, "omittedCount", false)?;
+        if retained.saturating_add(omitted) != total {
+            return Err(public_projection_shape_invalid(
+                "Review fact coverage counts are inconsistent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_review_query(value: &Value) -> Result<(), HostV2StorageError> {
+    let query = public_exact_object(
+        value,
+        &[
+            "runId",
+            "controlEpoch",
+            "afterLedgerSequence",
+            "snapshotHighWater",
+        ],
+        &[],
+        "Review facts query",
+    )?;
+    public_string(query, "runId", true)?;
+    public_integer(query, "controlEpoch", true)?;
+    public_integer(query, "afterLedgerSequence", false)?;
+    public_integer(query, "snapshotHighWater", false)?;
+    Ok(())
+}
+
+fn validate_public_work_authority(value: &Value) -> Result<(), HostV2StorageError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| public_projection_shape_invalid("Review authority must be an object"))?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("plan") => {
+            let object = public_exact_object(
+                value,
+                &["kind", "planRevision"],
+                &[],
+                "Review Plan authority",
+            )?;
+            public_string(object, "planRevision", true)?;
+        }
+        Some("contextRead") => {
+            let object = public_exact_object(
+                value,
+                &["kind", "operationIds", "digest"],
+                &[],
+                "Review context authority",
+            )?;
+            public_string(object, "digest", true)?;
+            validate_public_identity_array(
+                object.get("operationIds").expect("required operation ids"),
+                "reviewAuthority.operationIds",
+            )?;
+        }
+        _ => {
+            return Err(public_projection_shape_invalid(
+                "Review authority kind is not current",
+            ))
+        }
     }
     Ok(())
 }
@@ -5801,7 +8872,7 @@ fn session_private_write_unavailable_response(
     None
 }
 
-pub(crate) async fn session_kernel_v3_store_get(
+pub(crate) async fn session_run_store_get(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -5810,7 +8881,7 @@ pub(crate) async fn session_kernel_v3_store_get(
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_persistence_origin_forbidden",
-            "Session Kernel v3 persistence accepts only trusted local clients",
+            "Session persistence accepts only trusted local clients",
         );
     }
     let io_guard = crate::session_private_io_lock(&session_id)
@@ -5850,7 +8921,7 @@ pub(crate) async fn session_kernel_v3_store_get(
     }
 }
 
-pub(crate) async fn session_kernel_v3_store_append(
+pub(crate) async fn session_run_store_append(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -5860,7 +8931,7 @@ pub(crate) async fn session_kernel_v3_store_append(
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_persistence_origin_forbidden",
-            "Session Kernel v3 persistence accepts only trusted local clients",
+            "Session persistence accepts only trusted local clients",
         );
     }
     let io_guard = crate::session_private_io_lock(&session_id)
@@ -5902,7 +8973,7 @@ pub(crate) async fn session_kernel_v3_store_append(
     }
 }
 
-pub(crate) async fn session_kernel_v3_store_record_get(
+pub(crate) async fn session_run_store_record_get(
     State(state): State<AppState>,
     Path((session_id, run_id, record_id)): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -5911,7 +8982,7 @@ pub(crate) async fn session_kernel_v3_store_record_get(
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_persistence_origin_forbidden",
-            "Session Kernel v3 persistence accepts only trusted local clients",
+            "Session persistence accepts only trusted local clients",
         );
     }
     let io_guard = crate::session_private_io_lock(&session_id)

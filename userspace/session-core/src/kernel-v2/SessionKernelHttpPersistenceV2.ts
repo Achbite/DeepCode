@@ -77,14 +77,14 @@ import {
   validateSessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
-  decodeProviderToolIntentTextFrameV2,
-} from './toolIntent.js';
-import {
   decodeCompletedProviderTerminalV3,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
 } from './SessionKernelProviderAdapterV2.js';
+import {
+  validateCurrentSessionKernelProjectionEventV2,
+} from './SessionKernelHttpProjectionV2.js';
 
 export const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA =
   'deepcode.session.kernel-persistence.v3' as const;
@@ -149,7 +149,7 @@ type SessionKernelWritablePersistenceRecordV3 = Omit<
   recordKind: SessionKernelWritablePersistenceRecordKindV3;
 };
 
-/** GET /api/session-store/:sessionId/kernel-v3/:runId response data. */
+/** GET /api/session-store/:sessionId/session-runs/:runId response data. */
 export interface SessionKernelPersistenceListReplyV2 {
   schemaVersion:
     typeof SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA;
@@ -158,7 +158,7 @@ export interface SessionKernelPersistenceListReplyV2 {
   records: SessionKernelPersistenceRecordV3[];
 }
 
-/** POST /api/session-store/:sessionId/kernel-v3/:runId request body. */
+/** POST /api/session-store/:sessionId/session-runs/:runId request body. */
 export interface SessionKernelPersistenceAppendRequestV2 {
   schemaVersion:
     typeof SESSION_KERNEL_PERSISTENCE_APPEND_REQUEST_V2_SCHEMA;
@@ -167,7 +167,7 @@ export interface SessionKernelPersistenceAppendRequestV2 {
   record: SessionKernelWritablePersistenceRecordV3;
 }
 
-/** POST /api/session-store/:sessionId/kernel-v3/:runId response data. */
+/** POST /api/session-store/:sessionId/session-runs/:runId response data. */
 export interface SessionKernelPersistenceAppendReplyV2 {
   schemaVersion:
     typeof SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA;
@@ -302,7 +302,7 @@ interface SessionKernelPublicRequestSettlementV3 {
 }
 
 /**
- * Strict client for the Host-owned `kernel-v3/<runId>.jsonl` stream.
+ * Strict client for the Host-owned per-Run Session persistence stream.
  * This endpoint must not alias transcript, wire-ledger, or projection files.
  * Host owns atomic append, fsync, file handles, and recordId/digest replay.
  */
@@ -328,7 +328,7 @@ implements SessionKernelAppendOnlyRecordStoreV3 {
       normalizeApiBase(apiBase),
       'api/session-store',
       encodeURIComponent(sessionId),
-      'kernel-v3',
+      'session-runs',
       encodeURIComponent(runId),
     ].join('/');
   }
@@ -964,6 +964,7 @@ implements SessionKernelPersistencePortV2 {
   persistProjection(
     event: SessionKernelProjectionEventV2
   ): Promise<void> {
+    validateCurrentSessionKernelProjectionEventV2(event);
     return this.append(
       'projection',
       `projection:${event.projectionId}`,
@@ -1541,7 +1542,7 @@ implements SessionKernelPersistencePortV2 {
 export interface SessionKernelHostProjectionSinkV2 {
   publish(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: SessionKernelProjectionEventV2[]
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
   ): Promise<SessionKernelProjectionReceiptV2>;
 }
 
@@ -1560,7 +1561,7 @@ implements SessionKernelProjectionPortV2 {
     if (this.sink) {
       const receipt = await this.sink.publish(
         cloneJson(event),
-        await this.projectionHistoryThrough(event.projectionId)
+        () => this.projectionHistoryThrough(event.projectionId)
       );
       await this.persistence.persistProjectionDelivered(event);
       return receipt;
@@ -1580,7 +1581,7 @@ implements SessionKernelProjectionPortV2 {
     ) {
       await this.sink.publish(
         cloneJson(event),
-        await this.projectionHistoryThrough(event.projectionId)
+        () => this.projectionHistoryThrough(event.projectionId)
       );
       await this.persistence.persistProjectionDelivered(event);
     }
@@ -1664,6 +1665,7 @@ function decodeProjectionEvent(
     kind: record.kind as SessionKernelProjectionEventV2['kind'],
     data: cloneJson(record.data),
   };
+  validateCurrentSessionKernelProjectionEventV2(event);
   assertNoTransportCapabilities(event.data);
   return event;
 }
@@ -5315,38 +5317,6 @@ function materializeTerminalOrderedItemsV3(
   rawItems: readonly SessionProviderTerminalOrderedItemV3[],
   queue: SessionKernelCompactProviderQueueV3 | undefined
 ): import('./types.js').SessionProviderOrderedItemV2[] {
-  if (
-    rawItems.length === 1
-    && rawItems[0]?.kind === 'text'
-    && rawItems[0].phase === 'unknown'
-    && queue?.calls.length === 1
-  ) {
-    try {
-      const frame = decodeProviderToolIntentTextFrameV2(rawItems[0].text);
-      const call = queue.calls[0]!;
-      if (
-        frame.toolId !== call.intent.toolId
-        || canonicalJson(frame.arguments)
-          !== canonicalJson(call.intent.rawArguments)
-      ) {
-        throw new UnsupportedHistorySchemaError(
-          'provider-text-frame-queue-mismatch'
-        );
-      }
-      return [{
-        kind: 'toolCall',
-        source: 'textFrame',
-        ordinal: 1,
-        callId: `text-${sha256Hash(rawItems[0].text.trim())
-          .slice('sha256:'.length)}`,
-        toolName: frame.toolId,
-        toolId: frame.toolId,
-        arguments: cloneJson(frame.arguments),
-      }];
-    } catch (error) {
-      if (error instanceof UnsupportedHistorySchemaError) throw error;
-    }
-  }
   let callIndex = 0;
   return rawItems.map((raw) => {
     if (raw.kind === 'text') return cloneJson(raw);
@@ -5698,7 +5668,7 @@ async function persistenceHttpError(
     const error = objectRecord(body?.error);
     if (error?.code === 'UnsupportedHistorySchema') {
       return new UnsupportedHistorySchemaError(
-        'legacy-active-history'
+        'pre-cutover-history'
       );
     }
   } catch {

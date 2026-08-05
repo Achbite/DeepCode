@@ -415,7 +415,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
                             "Kernel–Session v2 Run start requires recovery: {}",
                             error.message
                         )),
-                        None,
                     );
                     AgentKernelV2Error::from_storage(error)
                 }
@@ -443,7 +442,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
                             "Kernel–Session v2 RunOpen failed: {}",
                             error.message
                         )),
-                        None,
                     );
                     match cleanup {
                         Ok(()) => AgentKernelV2Error::from_storage(error),
@@ -532,7 +530,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
                     "Kernel–Session v2 Run admission found a conflicting live drive owner."
                         .to_string(),
                 ),
-                None,
             );
             settle_caller_error_outcome_v2(state, &failure_binding, &error, true)?;
             return Err(error);
@@ -546,7 +543,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
                     "Kernel–Session v2 Run admission requires recovery: {}",
                     error.code
                 )),
-                None,
             );
             settle_caller_error_outcome_v2(state, &failure_binding, &error, true)?;
             return Err(error);
@@ -573,7 +569,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
                 "Kernel–Session v2 caller admission requires recovery: {}",
                 error.code
             )),
-            None,
         );
         let _ = settle_caller_error_outcome_v2(state, &failure_binding, &error, true);
         return Err(error);
@@ -732,7 +727,6 @@ async fn admit_and_spawn_agent_decision_v2(
                 &background_active.host_run_id,
                 "running",
                 Some("Applying trusted Kernel–Session v2 decision.".to_string()),
-                None,
             );
             let result = execute_prepared_agent_decision_v2(
                 &background_state,
@@ -1033,7 +1027,6 @@ async fn finish_owned_caller_drive_v2(
                         "Caller completion persistence requires recovery: {}",
                         error.code
                     )),
-                    None,
                 );
             }
         }
@@ -1066,7 +1059,6 @@ async fn finish_owned_caller_drive_v2(
                         "Caller handoff persistence requires recovery: {}",
                         error.code
                     )),
-                    None,
                 );
                 return;
             }
@@ -1479,7 +1471,6 @@ async fn execute_bound_user_input_v2(
         &active.host_run_id,
         "running",
         Some("New user input is advancing the control epoch.".to_string()),
-        None,
     );
     let settlement = state
         .kernel_session_v2
@@ -1672,7 +1663,6 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
         &active.host_run_id,
         "cancelled",
         Some("Kernel–Session v2 Run cancelled and its owned resources were retired.".to_string()),
-        None,
     );
     settle_caller_run_outcome_v2(state, &binding, &active.host_run_id)?;
     Ok(Some(active.host_run_id))
@@ -1742,7 +1732,6 @@ pub(crate) async fn retire_agent_kernel_run_v2(
         &host_run_id,
         terminal_status,
         Some(message.to_string()),
-        None,
     );
     Ok(Some(host_run_id))
 }
@@ -2949,7 +2938,6 @@ async fn handle_owned_drive_error_v2(
                 "Kernel–Session v2 owned Run drive ended without a live continuation owner and requires explicit recovery: {}",
                 error.code
             )),
-            None,
         ),
         OwnedDriveErrorDispositionV2::IndeterminateManual => mark_agent_drive_v2(
             context,
@@ -2959,7 +2947,6 @@ async fn handle_owned_drive_error_v2(
                 "Kernel–Session v2 owned Run drive is indeterminate and requires explicit manual recovery: {}",
                 error.code
             )),
-            None,
         ),
         OwnedDriveErrorDispositionV2::FailedAndRetire => {
             let retirement = context
@@ -2987,7 +2974,6 @@ async fn handle_owned_drive_error_v2(
                 &active.host_run_id,
                 lifecycle,
                 Some(message),
-                None,
             );
         }
     }
@@ -3021,7 +3007,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     } else {
                         format!("Kernel–Session v2 operation requires replay-safe recovery: {error_code}")
                     }),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Failure {
                     error: AgentKernelV2Error::invalid(
@@ -3050,7 +3035,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                             "Kernel–Session v2 terminal failure requires durable retirement recovery after {}: {}",
                             error_code, retirement_error.code
                         )),
-                        None,
                     );
                     return Err(retirement_error);
                 }
@@ -3059,7 +3043,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     &active.host_run_id,
                     "failed",
                     Some(format!("Kernel–Session v2 operation failed: {error_code}")),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Failure {
                     error: AgentKernelV2Error::invalid(
@@ -3162,7 +3145,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                         &active.host_run_id,
                         "waiting",
                         Some("Waiting for new canonical Kernel facts.".to_string()),
-                        None,
                     );
                     return Ok(AgentKernelDriveBoundaryV2::KernelWait(
                         AgentKernelFactWaitV2 {
@@ -3181,9 +3163,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                 if continuation_kind == "terminalFinalAnswer" {
                     validate_final_answer_continuation_binding_v2(&settlement)?;
                 }
-                let final_text = success_response_v2(&settlement)
-                    .ok()
-                    .and_then(extract_terminal_text_v2);
                 context
                     .kernel_session_v2
                     .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
@@ -3203,7 +3182,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                         }
                         _ => "Kernel–Session v2 provider turn completed.".to_string(),
                     }),
-                    final_text,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
@@ -3222,7 +3200,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     Some(format!(
                         "Kernel–Session v2 final answer failed without retry: {error_code}"
                     )),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
@@ -3268,7 +3245,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                             "Applying the persisted auto-plan setting through exact Kernel trust."
                                 .to_string(),
                         ),
-                        None,
                     );
                     let decided = context
                         .kernel_session_v2
@@ -3310,7 +3286,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     &active.host_run_id,
                     "waiting",
                     Some("Waiting for exact Plan confirmation.".to_string()),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
@@ -3320,7 +3295,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     &active.host_run_id,
                     "waiting",
                     Some("Waiting for an exact capability scope decision.".to_string()),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
@@ -3330,7 +3304,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     &active.host_run_id,
                     "waiting",
                     Some("Waiting for a canonical Kernel wake fact.".to_string()),
-                    None,
                 );
                 let observed_high_water = success_response_v2(&settlement)?
                     .pointer("/state/factsRunSequenceHighWater")
@@ -3358,7 +3331,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     Some(format!(
                         "Kernel–Session v2 requires explicit recovery at {continuation_kind}."
                     )),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
@@ -3368,7 +3340,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     &active.host_run_id,
                     "waiting",
                     Some("The previous provider turn was superseded by newer input.".to_string()),
-                    None,
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
@@ -3387,7 +3358,6 @@ async fn drive_agent_kernel_until_boundary_v2(
             Some(format!(
                 "Advancing Kernel–Session v2 continuation {continuation_kind}."
             )),
-            None,
         );
         settlement = context
             .kernel_session_v2
@@ -3405,7 +3375,6 @@ async fn drive_agent_kernel_until_boundary_v2(
         &active.host_run_id,
         "waiting",
         Some("Automatic Session continuation budget exhausted.".to_string()),
-        None,
     );
     Err(AgentKernelV2Error::invalid(
         "session_kernel_automatic_step_budget_exhausted",
@@ -3489,7 +3458,6 @@ async fn drive_owned_agent_kernel_wait_v2(
                             "Canonical Kernel facts resumed the owned Session continuation."
                                 .to_string(),
                         ),
-                        None,
                     );
                 },
             )
@@ -3840,7 +3808,6 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                             "RunOpen crossed a durable execution boundary before caller admission; the exact Run is retained for explicit recovery."
                                 .to_string(),
                         ),
-                        None,
                     );
                     blocked_runs.insert(key);
                 } else if matches!(
@@ -3856,7 +3823,6 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                             "An unadmitted zero-effect caller was closed; a new request may continue the Run."
                                 .to_string(),
                         ),
-                        None,
                     );
                 } else {
                     settle_caller_error_outcome_v2(state, &binding, &error, true)?;
@@ -3868,7 +3834,6 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                             "An unsupported unadmitted caller is retained for explicit recovery."
                                 .to_string(),
                         ),
-                        None,
                     );
                     blocked_runs.insert(key);
                 }
@@ -3885,7 +3850,6 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                         "An indeterminate caller drive is held for explicit manual recovery."
                             .to_string(),
                     ),
-                    None,
                 );
                 blocked_runs.insert(key);
                 continue;
@@ -3910,13 +3874,7 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                 "Daemon restart found an admitted caller with an unresolved Session dispatch; automatic replay is unsafe.",
             );
             settle_caller_error_outcome_v2(state, &binding, &error, true)?;
-            mark_agent_run_v2(
-                state,
-                &active.host_run_id,
-                "waiting",
-                Some(error.message),
-                None,
-            );
+            mark_agent_run_v2(state, &active.host_run_id, "waiting", Some(error.message));
             blocked_runs.insert(key);
             continue;
         }
@@ -4868,7 +4826,6 @@ async fn recover_or_resume_driving_cancel_v2(
             "Kernel–Session v2 Run cancellation was recovered from canonical Session evidence."
                 .to_string(),
         ),
-        None,
     );
     settle_caller_run_outcome_v2(state, &evidence.binding, &host_run_id)?;
     Ok(host_run_id)
@@ -4966,7 +4923,6 @@ fn recovered_run_snapshot_v2(
                 host_run_id,
                 "cancelled",
                 "Recovered exact caller-correlated cancellation.",
-                None,
             )
         }));
     }
@@ -4993,7 +4949,6 @@ fn recovered_run_snapshot_v2(
             host_run_id,
             "waiting",
             &format!("Recovered operation requires recovery: {error_code}"),
-            None,
         ))),
         (
             Some(HostKernelStoredRunLifecycleV2::Active),
@@ -5013,7 +4968,6 @@ fn recovered_run_snapshot_v2(
             host_run_id,
             "waiting",
             "Recovered durable Session wait without replaying the caller request.",
-            None,
         ))),
         (
             Some(HostKernelStoredRunLifecycleV2::Retired),
@@ -5024,7 +4978,6 @@ fn recovered_run_snapshot_v2(
             host_run_id,
             "failed",
             &format!("Recovered terminal Session failure: {error_code}"),
-            None,
         ))),
         (
             Some(HostKernelStoredRunLifecycleV2::Retired),
@@ -5035,9 +4988,6 @@ fn recovered_run_snapshot_v2(
             host_run_id,
             "completed",
             "Recovered terminal Session result from durable settlement and retirement.",
-            success_response_v2(latest)
-                .ok()
-                .and_then(extract_terminal_text_v2),
         ))),
         (
             Some(HostKernelStoredRunLifecycleV2::Retired),
@@ -5048,7 +4998,6 @@ fn recovered_run_snapshot_v2(
             host_run_id,
             "failed",
             "Recovered terminal final-answer failure from durable settlement and retirement.",
-            None,
         ))),
         _ => Ok(None),
     }
@@ -5116,7 +5065,6 @@ fn recovered_agent_run_state_v2(
     host_run_id: String,
     status: &str,
     message: &str,
-    final_text: Option<String>,
 ) -> AgentRunState {
     let started_at = evidence
         .run_recorded_at
@@ -5143,7 +5091,6 @@ fn recovered_agent_run_state_v2(
         updated_at: updated_at.clone(),
         completed_at: matches!(status, "completed" | "failed" | "cancelled").then_some(updated_at),
         message: Some(message.to_string()),
-        final_text,
     }
 }
 
@@ -5704,7 +5651,6 @@ async fn safety_retire_failed_cancel_v2(
             "Run cancellation is indeterminate and cannot be reported as cancelled: {}",
             final_error.message
         )),
-        None,
     );
     if retirement.is_ok() {
         settle_caller_error_outcome_v2(state, binding, &final_error, true)?;
@@ -5940,26 +5886,13 @@ fn ensure_agent_run_cache_v2(
             updated_at: now_text(),
             completed_at: None,
             message: Some("Recovered durable Kernel–Session v2 Run.".to_string()),
-            final_text: None,
         },
     );
     Ok(())
 }
 
-fn mark_agent_run_v2(
-    state: &AppState,
-    host_run_id: &str,
-    status: &str,
-    message: Option<String>,
-    final_text: Option<String>,
-) {
-    mark_agent_run_state_v2(
-        &state.session_runs,
-        host_run_id,
-        status,
-        message,
-        final_text,
-    );
+fn mark_agent_run_v2(state: &AppState, host_run_id: &str, status: &str, message: Option<String>) {
+    mark_agent_run_state_v2(&state.session_runs, host_run_id, status, message);
 }
 
 fn mark_agent_drive_v2(
@@ -5967,15 +5900,8 @@ fn mark_agent_drive_v2(
     host_run_id: &str,
     status: &str,
     message: Option<String>,
-    final_text: Option<String>,
 ) {
-    mark_agent_run_state_v2(
-        &context.session_runs,
-        host_run_id,
-        status,
-        message,
-        final_text,
-    );
+    mark_agent_run_state_v2(&context.session_runs, host_run_id, status, message);
 }
 
 fn mark_agent_run_state_v2(
@@ -5983,7 +5909,6 @@ fn mark_agent_run_state_v2(
     host_run_id: &str,
     status: &str,
     message: Option<String>,
-    final_text: Option<String>,
 ) {
     let mut runs = session_runs.lock().expect("session run state lock");
     let Some(run) = runs.get_mut(host_run_id) else {
@@ -5999,20 +5924,6 @@ fn mark_agent_run_state_v2(
     run.status = status.to_string();
     run.updated_at = now_text();
     run.message = message;
-    if final_text.is_some() {
-        run.final_text = final_text;
-    }
     run.completed_at =
         matches!(status, "completed" | "failed" | "cancelled").then(|| run.updated_at.clone());
-}
-
-fn extract_terminal_text_v2(response: &Value) -> Option<String> {
-    ["/outcome/result/text", "/outcome/step/result/text"]
-        .into_iter()
-        .find_map(|pointer| {
-            response
-                .pointer(pointer)
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
 }

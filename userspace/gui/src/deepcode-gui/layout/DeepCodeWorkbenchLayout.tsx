@@ -444,7 +444,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
-  const events = useAgentSessionStore((s) => s.events);
   const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
@@ -563,11 +562,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       byId.set(activeSession.id, {
         ...byId.get(activeSession.id),
         ...activeSession,
-        eventCount: Math.max(activeSession.eventCount ?? 0, events.length),
+        eventCount: Math.max(activeSession.eventCount ?? 0, timeline?.eventCount ?? 0),
       });
     }
     return Array.from(byId.values());
-  }, [activeSession, events.length, knownSessions, sessions]);
+  }, [activeSession, knownSessions, sessions, timeline?.eventCount]);
   const activeSessionRunning = Boolean(
     activeSession?.id
     && (
@@ -578,15 +577,15 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   );
   const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
-    || (events.length === 0 && !loadingSession && !activeSessionRunning);
+    || ((timeline?.turns.length ?? 0) === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
     () => displaySessions.filter((item) => {
       if (item.archivedAt) return false;
       if (assignedProjectSessionIds.has(item.id)) return false;
-      const currentWithEvents = item.id === activeSession?.id && events.length > 0;
+      const currentWithEvents = item.id === activeSession?.id && (timeline?.turns.length ?? 0) > 0;
       return shouldShowSidebarSession(item) || currentWithEvents;
     }),
-    [activeSession?.id, assignedProjectSessionIds, displaySessions, events.length]
+    [activeSession?.id, assignedProjectSessionIds, displaySessions, timeline?.turns.length]
   );
   const projectArchiveGroups = useMemo(
     () => deriveProjectArchiveGroups(displaySessions, projectRecords),
@@ -1052,7 +1051,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <div className="agent-memory-sheet" onMouseDown={(event) => event.stopPropagation()}>
             <AgentMemoryViewer
               language={language}
-              events={events}
+              timeline={timeline}
               sessionId={activeSession?.id}
               refreshing={memoryRefreshing}
               onRefresh={async () => {

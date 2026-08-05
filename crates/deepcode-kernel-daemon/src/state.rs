@@ -62,8 +62,6 @@ pub(crate) struct AgentRunState {
     pub(crate) completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) final_text: Option<String>,
 }
 
 impl AgentRunState {
@@ -85,7 +83,6 @@ impl AgentRunState {
             updated_at: now,
             completed_at: None,
             message: None,
-            final_text: None,
         }
     }
 }
@@ -95,8 +92,11 @@ impl GuiState {
         let paths = HostPaths::new();
         let user_settings =
             read_json_file(&paths.settings_path).unwrap_or_else(default_user_settings);
-        let llm_profiles =
-            read_json_file(&paths.llm_profiles_path).unwrap_or_else(default_llm_profiles);
+        let llm_profiles = if paths.llm_profiles_path.exists() {
+            read_json_file(&paths.llm_profiles_path).unwrap_or(Value::Null)
+        } else {
+            default_llm_profiles()
+        };
         let projects = restore_agent_projects(&paths.projects_path);
         let (sessions, session_metadata_error) =
             match crate::session_metadata_v2::restore_session_index(&paths) {
