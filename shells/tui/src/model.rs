@@ -525,3 +525,69 @@ fn timeline_status_label(status: AgentTimelineStatus) -> &'static str {
         AgentTimelineStatus::Failed => "失败",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Supporting development contract only; real TUI rendering remains a
+    // user-experience acceptance path over the packaged application.
+    #[test]
+    fn tui_review_renders_counts_and_hides_lifecycle_noise() {
+        let readable: AgentTimelineStructuredProjection = serde_json::from_value(json!({
+            "kind": "review",
+            "schemaVersion": "deepcode.shared-conversation.readable-review.v2",
+            "summaryKey": "session.projection.review.summary.counts",
+            "messageArgs": {
+                "planned": "3",
+                "effects": "1",
+                "unexecuted": "2",
+                "rejected": "0",
+                "cleanup": "0",
+                "indeterminate": "0"
+            },
+            "sections": [{
+                "sectionId": "actualEffects",
+                "titleKey": "session.projection.review.section.actualEffects",
+                "items": [{
+                    "itemId": "fact-review-tui-raw",
+                    "kind": "actualEffects",
+                    "messageKey": "session.projection.review.item.actualEffect",
+                    "messageArgs": {
+                        "tool": "fs.write",
+                        "fact": "toolCompleted"
+                    },
+                    "status": "actualEffects",
+                    "auditRefs": [
+                        "fact-review-tui-raw",
+                        "invocation-review-tui-raw",
+                        "provider.started:raw-lifecycle",
+                        "wait.changed:raw-lifecycle",
+                        "workflow_stage:raw-lifecycle"
+                    ]
+                }]
+            }]
+        }))
+        .expect("exact typed readable Review projection");
+        let rendered = render_readable_projection(&readable);
+
+        assert!(rendered.contains(
+            "计划 3 项；实际效果 1 项；未执行 2 项；拒绝 0 项；清理 0 项；不确定 0 项。"
+        ));
+        assert!(rendered.contains("fs.write：toolCompleted"));
+        for private in [
+            "fact-review-tui-raw",
+            "invocation-review-tui-raw",
+            "provider.started",
+            "wait.changed",
+            "workflow_stage",
+            "auditRef",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "TUI readable Review leaked audit or lifecycle identity {private}: {rendered}"
+            );
+        }
+    }
+}

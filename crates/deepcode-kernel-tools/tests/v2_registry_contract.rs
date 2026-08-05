@@ -1,5 +1,10 @@
 use deepcode_kernel_abi::{RawToolArgumentsV2, ToolAvailabilityV2, ToolContextVersionV2, ToolIdV2};
-use deepcode_kernel_tools::{KernelToolRegistry, KernelToolRegistryErrorV2};
+use deepcode_kernel_tools::{
+    kernel_internal::{
+        validate_canonical_invocation, KernelCanonicalInvocation, KernelDeleteTarget,
+    },
+    KernelToolRegistry, KernelToolRegistryErrorV2,
+};
 use std::collections::BTreeMap;
 
 fn tool_id(value: &str) -> ToolIdV2 {
@@ -149,5 +154,139 @@ fn disabled_and_removed_tool_ids_fail_with_distinct_typed_errors() {
         assert!(registry
             .kernel_internal_execution_adapter(removed)
             .is_none());
+    }
+}
+
+#[test]
+fn fs_delete_public_schema_round_trips_file_and_directory_tree() {
+    let registry = KernelToolRegistry::new();
+    let delete_id = tool_id("fs.delete");
+    let descriptor = registry
+        .descriptor_v2(&delete_id)
+        .expect("fs.delete must remain registered");
+    let schema = descriptor.input_schema.as_value();
+
+    assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
+    let branches = schema
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("fs.delete must publish two mutually exclusive public branches");
+    assert_eq!(branches.len(), 2);
+    assert_eq!(
+        branches[0].pointer("/properties/targetKind/const"),
+        Some(&serde_json::json!("file"))
+    );
+    assert_eq!(
+        branches[1].pointer("/properties/targetKind/const"),
+        Some(&serde_json::json!("directory"))
+    );
+    assert_eq!(
+        branches[1].pointer("/properties/recursive/const"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        branches
+            .iter()
+            .map(|branch| branch.get("additionalProperties"))
+            .collect::<Vec<_>>(),
+        vec![
+            Some(&serde_json::json!(false)),
+            Some(&serde_json::json!(false))
+        ]
+    );
+
+    let file = registry
+        .canonicalize_v2(
+            &delete_id,
+            RawToolArgumentsV2::new(serde_json::json!({
+                "path": "notes/old.txt",
+                "targetKind": "file"
+            }))
+            .expect("public file arguments are an object"),
+        )
+        .expect("public file arguments must canonicalize");
+    assert_eq!(
+        file.arguments,
+        serde_json::json!({"kind":"file","data":{"path":"notes/old.txt"}})
+    );
+    let file_invocation = file.into_kernel_invocation();
+    assert_eq!(
+        file_invocation,
+        KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::File {
+            path: "notes/old.txt".to_owned(),
+        })
+    );
+    validate_canonical_invocation(&file_invocation)
+        .expect("canonical file deletion must round-trip through the private adapter");
+
+    let directory = registry
+        .canonicalize_v2(
+            &delete_id,
+            RawToolArgumentsV2::new(serde_json::json!({
+                "path": "build/generated",
+                "targetKind": "directory",
+                "recursive": true
+            }))
+            .expect("public directory arguments are an object"),
+        )
+        .expect("explicit recursive directory arguments must canonicalize");
+    assert_eq!(
+        directory.arguments,
+        serde_json::json!({
+            "kind":"directoryTree",
+            "data":{"path":"build/generated"}
+        })
+    );
+    let directory_invocation = directory.into_kernel_invocation();
+    assert_eq!(
+        directory_invocation,
+        KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::DirectoryTree {
+            path: "build/generated".to_owned(),
+        })
+    );
+    validate_canonical_invocation(&directory_invocation)
+        .expect("canonical directory-tree deletion must round-trip through the private adapter");
+}
+
+#[test]
+fn fs_delete_public_schema_rejects_ambiguous_or_unsafe_targets() {
+    let registry = KernelToolRegistry::new();
+    let delete_id = tool_id("fs.delete");
+    let invalid = [
+        serde_json::json!({"path":"notes/old.txt"}),
+        serde_json::json!({
+            "path":"notes/old.txt",
+            "targetKind":"file",
+            "recursive":true
+        }),
+        serde_json::json!({"path":"build/generated","targetKind":"directory"}),
+        serde_json::json!({
+            "path":"build/generated",
+            "targetKind":"directory",
+            "recursive":false
+        }),
+        serde_json::json!({
+            "path":"notes/old.txt",
+            "targetKind":"file",
+            "unexpected":true
+        }),
+        serde_json::json!({"kind":"file","data":{"path":"notes/old.txt"}}),
+        serde_json::json!({"path":"../outside.txt","targetKind":"file"}),
+        serde_json::json!({"path":"/tmp/outside.txt","targetKind":"file"}),
+        serde_json::json!({"path":"","targetKind":"file"}),
+        serde_json::json!({"path":"notes\\old.txt","targetKind":"file"}),
+    ];
+
+    for arguments in invalid {
+        let raw = RawToolArgumentsV2::new(arguments.clone())
+            .expect("each invalid case is still an object-shaped wire payload");
+        assert!(
+            matches!(
+                registry.canonicalize_v2(&delete_id, raw),
+                Err(KernelToolRegistryErrorV2::InvalidArguments { tool_id, .. })
+                    if tool_id == "fs.delete"
+            ),
+            "fs.delete must reject ambiguous, internal, or unsafe public arguments: {arguments}"
+        );
     }
 }

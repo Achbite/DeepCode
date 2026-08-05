@@ -4,6 +4,7 @@ import {
   corpusFact,
   createInput,
   createPlan,
+  createProviderCompletionReceipt,
   createPreview,
   openSessionHarness,
   providerAnswer,
@@ -11,6 +12,9 @@ import {
   providerToolIntents,
 } from './harness.mjs';
 import {
+  SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+  StrictSessionKernelProviderAdapterV2,
   canonicalJson,
   sha256Hash,
 } from '../../dist/index.js';
@@ -31,6 +35,14 @@ export const contractCases = [
   {
     id: 'plan_acceptance_requires_every_canonical_scope_preview',
     run: planAcceptanceRequiresEveryCanonicalScopePreview,
+  },
+  {
+    id: 'plan_action_turn_requires_one_accepted_current_plan_revision',
+    run: planActionTurnRequiresOneAcceptedCurrentPlanRevision,
+  },
+  {
+    id: 'plan_confirmation_requires_every_current_canonical_preview',
+    run: planConfirmationRequiresEveryCurrentCanonicalPreview,
   },
 ];
 
@@ -663,6 +675,445 @@ async function planAcceptanceRequiresEveryCanonicalScopePreview() {
     0,
     'Plan acceptance records authority intent but executes nothing'
   );
+}
+
+async function planConfirmationRequiresEveryCurrentCanonicalPreview() {
+  const incomplete = await openSessionHarness();
+  const incompletePlan = await runSealedPlanningTurn(
+    incomplete,
+    twoActionPlanDraft(),
+    'I will inspect the exact requested scopes before asking for approval.'
+  );
+  assert.equal(
+    incomplete.store.projectionEvents.some(
+      (event) => event.kind === 'plan.commentaryReleased'
+        || event.kind === 'plan.confirmationReady'
+    ),
+    false,
+    'planning commentary and confirmation must remain private until settlement'
+  );
+  await assert.rejects(
+    incomplete.loop.publishPlanConfirmationReady(
+      incompletePlan.planRevision
+    ),
+    (error) =>
+      error?.code
+        === 'session_kernel_plan_confirmation_preview_incomplete'
+  );
+  assert.equal(incomplete.store.planDecisions.size, 0);
+  assert.equal(incomplete.calls('submitToolIntent').length, 0);
+
+  incomplete.enqueueKernel(
+    'previewCapability',
+    (request) => ({
+      kind: 'previewed',
+      data: {
+        preview: dynamicPlanPreview(
+          request,
+          incomplete.initial.runId
+        ),
+      },
+    })
+  );
+  await incomplete.loop.previewPlanAction(
+    incompletePlan.actions[0].manifest.planActionId,
+    incompletePlan.planRevision
+  );
+  await assert.rejects(
+    incomplete.loop.publishPlanConfirmationReady(
+      incompletePlan.planRevision
+    ),
+    (error) =>
+      error?.code
+        === 'session_kernel_plan_confirmation_preview_incomplete'
+  );
+  assert.equal(incomplete.store.planDecisions.size, 0);
+
+  const mismatches = [
+    ['plan revision', (preview) => {
+      preview.planRevision = 'plan-revision-from-another-plan';
+    }],
+    ['PlanAction', (preview) => {
+      preview.planActionId = 'plan-action-from-another-plan';
+    }],
+    ['operation', (preview) => {
+      preview.operationId = 'operation-from-another-plan';
+    }],
+    ['tool', (preview) => {
+      preview.toolId = 'fs.edit';
+    }],
+  ];
+  for (const [label, mutatePreview] of mismatches) {
+    const mismatched = await openSessionHarness();
+    const mismatchedPlan = await runSealedPlanningTurn(
+      mismatched,
+      oneActionPlanDraft(),
+      `I will verify the requested file scope and ${label} binding.`
+    );
+    mismatched.enqueueKernel(
+      'previewCapability',
+      (request) => {
+        const preview = dynamicPlanPreview(
+          request,
+          mismatched.initial.runId
+        );
+        mutatePreview(preview);
+        return { kind: 'previewed', data: { preview } };
+      }
+    );
+    await mismatched.loop.previewPlanAction(
+      mismatchedPlan.actions[0].manifest.planActionId,
+      mismatchedPlan.planRevision
+    );
+    await assert.rejects(
+      mismatched.loop.publishPlanConfirmationReady(
+        mismatchedPlan.planRevision
+      ),
+      (error) =>
+        error?.code
+          === 'session_kernel_plan_confirmation_preview_incomplete',
+      `${label} mismatch must fail closed before Plan confirmation`
+    );
+    assert.equal(mismatched.store.planDecisions.size, 0);
+    assert.equal(mismatched.calls('submitToolIntent').length, 0);
+  }
+
+  const complete = await openSessionHarness();
+  const completePlan = await runSealedPlanningTurn(
+    complete,
+    twoActionPlanDraft(),
+    'I will verify both requested file scopes before asking for approval.'
+  );
+  for (const action of completePlan.actions) {
+    complete.enqueueKernel(
+      'previewCapability',
+      (request) => ({
+        kind: 'previewed',
+        data: {
+          preview: dynamicPlanPreview(
+            request,
+            complete.initial.runId
+          ),
+        },
+      })
+    );
+    await complete.loop.previewPlanAction(
+      action.manifest.planActionId,
+      completePlan.planRevision
+    );
+  }
+  assert.equal(complete.store.planDecisions.size, 0);
+  await assert.rejects(
+    complete.loop.decidePlan({
+      planRevision: completePlan.planRevision,
+      decision: 'accept',
+    }),
+    (error) =>
+      error?.code === 'session_kernel_plan_confirmation_required',
+    'canonical previews alone cannot replace the published confirmation boundary'
+  );
+  const ready = await complete.loop.publishPlanConfirmationReady(
+    completePlan.planRevision
+  );
+  const readyReplay = await complete.loop.publishPlanConfirmationReady(
+    completePlan.planRevision
+  );
+  assert.equal(ready.planRevision, completePlan.planRevision);
+  assert.deepEqual(
+    readyReplay,
+    ready,
+    'the exact confirmation publication must replay one durable projection identity'
+  );
+  assert.deepEqual(
+    complete.store.projectionEvents
+      .filter((event) =>
+        event.kind === 'plan.commentaryReleased'
+        || event.kind === 'plan.confirmationReady'
+      )
+      .map((event) => event.kind),
+    ['plan.commentaryReleased', 'plan.confirmationReady'],
+    'one sealed commentary projection must precede one confirmation-ready projection'
+  );
+  const decision = await complete.loop.decidePlan({
+    planRevision: completePlan.planRevision,
+    decision: 'accept',
+  });
+  const replay = await complete.loop.decidePlan({
+    planRevision: completePlan.planRevision,
+    decision: 'accept',
+  });
+  assert.deepEqual(replay, decision);
+  assert.equal(complete.store.planDecisions.size, 1);
+  assert.equal(
+    complete.store.projectionEvents.filter(
+      (event) => event.kind === 'plan.decided'
+    ).length,
+    1,
+    'exact decision replay must not duplicate public history'
+  );
+  assert.equal(
+    complete.calls('submitToolIntent').length,
+    0,
+    'acceptance records authority but cannot itself execute a tool'
+  );
+
+  await assert.rejects(
+    complete.loop.publishPlanConfirmationReady(
+      completePlan.planRevision
+    ),
+    (error) =>
+      error?.code === 'session_kernel_plan_confirmation_ready_stale',
+    'a durable decision must stale the prior confirmation boundary'
+  );
+}
+
+async function planActionTurnRequiresOneAcceptedCurrentPlanRevision() {
+  const pending = await openSessionHarness();
+  const { plan: pendingPlan } = await prepareConfirmablePlan(
+    pending,
+    oneActionPlanDraft(),
+    'I will request approval before starting the planned action.'
+  );
+  const pendingProviderInputCount = pending.providerInputs.length;
+  await assert.rejects(
+    pending.loop.runProviderTurn({
+      reason: 'planExecution',
+      target: {
+        kind: 'planAction',
+        planActionId: pendingPlan.actions[0].manifest.planActionId,
+      },
+      remainingToolCallBudget: 1,
+    }),
+    (error) => error?.code === 'session_kernel_plan_acceptance_required'
+  );
+  assert.equal(
+    pending.providerInputs.length,
+    pendingProviderInputCount,
+    'a pending Plan decision must stop before another Provider request'
+  );
+  assert.equal(pending.calls('submitToolIntent').length, 0);
+
+  const accepted = await pending.loop.decidePlan({
+    planRevision: pendingPlan.planRevision,
+    decision: 'accept',
+  });
+  assert.equal(accepted.decision, 'accept');
+  assert.equal(pending.calls('submitToolIntent').length, 0);
+
+  pending.enqueueProvider(providerAnswer('accepted action completed'));
+  const completed = await pending.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: pendingPlan.actions[0].manifest.planActionId,
+    },
+    remainingToolCallBudget: 1,
+  });
+  assert.deepEqual(completed, {
+    kind: 'answer',
+    text: 'accepted action completed',
+  });
+
+  for (const decision of ['reject', 'revise']) {
+    const denied = await openSessionHarness();
+    const { plan: deniedPlan } = await prepareConfirmablePlan(
+      denied,
+      oneActionPlanDraft(),
+      `I will wait for the user to ${decision} or approve this Plan.`
+    );
+    const deniedProviderInputCount = denied.providerInputs.length;
+    const deniedDecision = await denied.loop.decidePlan({
+      planRevision: deniedPlan.planRevision,
+      decision,
+      guidance: decision === 'reject'
+        ? 'Do not modify the workspace.'
+        : 'Revise the requested workspace change.',
+    });
+    assert.equal(deniedDecision.decision, decision);
+    await assert.rejects(
+      denied.loop.runProviderTurn({
+        reason: 'planExecution',
+        target: {
+          kind: 'planAction',
+          planActionId: deniedPlan.actions[0].manifest.planActionId,
+        },
+        remainingToolCallBudget: 1,
+      }),
+      (error) => error?.code === 'session_kernel_plan_acceptance_required'
+    );
+    await assert.rejects(
+      denied.loop.publishPlanConfirmationReady(
+        deniedPlan.planRevision
+      ),
+      (error) =>
+        error?.code === 'session_kernel_plan_confirmation_ready_stale',
+      `${decision} must make the prior confirmation boundary unusable`
+    );
+    assert.equal(
+      denied.providerInputs.length,
+      deniedProviderInputCount,
+      `${decision} must stop before another Provider request`
+    );
+    assert.equal(denied.calls('submitToolIntent').length, 0);
+  }
+}
+
+async function prepareConfirmablePlan(harness, draft, commentary) {
+  const plan = await runSealedPlanningTurn(harness, draft, commentary);
+  for (const action of plan.actions) {
+    harness.enqueueKernel(
+      'previewCapability',
+      (request) => ({
+        kind: 'previewed',
+        data: {
+          preview: dynamicPlanPreview(
+            request,
+            harness.initial.runId
+          ),
+        },
+      })
+    );
+    await harness.loop.previewPlanAction(
+      action.manifest.planActionId,
+      plan.planRevision
+    );
+  }
+  const confirmation = await harness.loop.publishPlanConfirmationReady(
+    plan.planRevision
+  );
+  return { plan, confirmation };
+}
+
+async function runSealedPlanningTurn(harness, draft, commentary) {
+  const proposalArguments = {
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+    plan: draft,
+  };
+  const proposalCallId = 'provider-plan-proposal-contract';
+  const responseDigest = sha256Hash(canonicalJson({
+    commentary,
+    proposalArguments,
+  }));
+  const backendOutput = {
+    kind: 'plan',
+    plan: draft,
+    planProposal: {
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+      callId: proposalCallId,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+      argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
+    },
+    items: [{ kind: 'text', phase: 'commentary', text: commentary }],
+    completion: createProviderCompletionReceipt(responseDigest, {
+      hasToolCalls: true,
+    }),
+    providerResult: {
+      providerProfileId: 'provider-profile-v2-contract',
+      provider: 'contract-provider',
+      model: 'contract-model',
+    },
+    responseDigest,
+  };
+  const adapter = new StrictSessionKernelProviderAdapterV2(
+    {
+      async requestTurn() {
+        return JSON.parse(JSON.stringify(backendOutput));
+      },
+    },
+    { now: () => '2026-07-29T00:00:00.000Z' }
+  );
+  const originalSet = harness.store.providerEvidence.set.bind(
+    harness.store.providerEvidence
+  );
+  harness.store.providerEvidence.set = (providerTurnId, evidence) => {
+    const terminal = evidence.terminal;
+    terminal.data.orderedItems.push({
+      kind: 'toolCall',
+      index: terminal.data.orderedItems.length,
+      callId: proposalCallId,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+      arguments: canonicalJson(proposalArguments),
+    });
+    terminal.ref.recordDigest = sha256Hash(canonicalJson(terminal.data));
+    return originalSet(providerTurnId, evidence);
+  };
+  try {
+    harness.enqueueProvider((input) => adapter.requestTurn(input));
+    const result = await harness.loop.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+    });
+    assert.equal(result.kind, 'plan');
+    return result.plan;
+  } finally {
+    harness.store.providerEvidence.set = originalSet;
+  }
+}
+
+function oneActionPlanDraft() {
+  return {
+    title: 'Write reviewed output',
+    objective: 'Write one file inside the workspace.',
+    narrative: 'Use the approved PlanAction and report canonical facts.',
+    actions: [{
+      toolId: 'fs.write',
+      requestedResources: [{
+        kind: 'workspacePath',
+        data: { path: 'output.txt', access: 'write' },
+      }],
+      previewArguments: {
+        path: 'output.txt',
+        content: 'contract output',
+      },
+    }],
+  };
+}
+
+function twoActionPlanDraft() {
+  const first = oneActionPlanDraft();
+  return {
+    ...first,
+    title: 'Write two reviewed outputs',
+    objective: 'Write two files inside the workspace.',
+    actions: [
+      first.actions[0],
+      {
+        toolId: 'fs.write',
+        requestedResources: [{
+          kind: 'workspacePath',
+          data: { path: 'second.txt', access: 'write' },
+        }],
+        previewArguments: { path: 'second.txt', content: 'second' },
+      },
+    ],
+  };
+}
+
+function dynamicPlanPreview(request, runId) {
+  const second = request.rawArguments.path === 'second.txt';
+  const templateRequest = {
+    ...request,
+    manifest: {
+      planRevision: 'plan-two-actions',
+      planActionId: second
+        ? 'plan-action-write-second'
+        : 'plan-action-write-first',
+      operationId: second
+        ? 'planned-operation-write-second'
+        : 'planned-operation-write-first',
+      toolId: 'fs.write',
+      requestedResources: request.manifest.requestedResources,
+    },
+  };
+  const preview = createPreview(templateRequest, runId);
+  return {
+    ...preview,
+    previewId: `preview-${request.manifest.operationId}`,
+    planRevision: request.manifest.planRevision,
+    planActionId: request.manifest.planActionId,
+    operationId: request.manifest.operationId,
+    toolId: request.manifest.toolId,
+  };
 }
 
 function assertOrdered(trace, predicates) {

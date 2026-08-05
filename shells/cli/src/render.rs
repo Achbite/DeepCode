@@ -624,6 +624,71 @@ fn normalize_render_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Supporting development contract only; packaged CLI output remains the
+    // user-experience acceptance path.
+    #[test]
+    fn cli_review_renders_counts_and_hides_raw_audit_ids() {
+        let readable: deepcode_kernel_client::AgentTimelineStructuredProjection =
+            serde_json::from_value(json!({
+                "kind": "review",
+                "schemaVersion": "deepcode.shared-conversation.readable-review.v2",
+                "summaryKey": "session.projection.review.summary.counts",
+                "messageArgs": {
+                    "planned": "2",
+                    "effects": "1",
+                    "unexecuted": "1",
+                    "rejected": "0",
+                    "cleanup": "0",
+                    "indeterminate": "0"
+                },
+                "sections": [{
+                    "sectionId": "actualEffects",
+                    "titleKey": "session.projection.review.section.actualEffects",
+                    "items": [{
+                        "itemId": "fact-review-cli-raw",
+                        "kind": "actualEffects",
+                        "messageKey": "session.projection.review.item.actualEffect",
+                        "messageArgs": {
+                            "tool": "fs.write",
+                            "fact": "toolCompleted"
+                        },
+                        "status": "actualEffects",
+                        "auditRefs": [
+                            "fact-review-cli-raw",
+                            "invocation-review-cli-raw",
+                            "provider.started:raw-lifecycle",
+                            "wait.changed:raw-lifecycle"
+                        ]
+                    }]
+                }]
+            }))
+            .expect("exact typed readable Review projection");
+        let rendered = render_readable_projection(&readable);
+
+        assert!(rendered.contains(
+            "2 planned; 1 effects; 1 unexecuted; 0 rejected; 0 cleanup; 0 indeterminate."
+        ));
+        assert!(rendered.contains("fs.write: toolCompleted"));
+        for private in [
+            "fact-review-cli-raw",
+            "invocation-review-cli-raw",
+            "provider.started",
+            "wait.changed",
+            "auditRef",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "CLI readable Review leaked audit or lifecycle identity {private}: {rendered}"
+            );
+        }
+    }
+}
+
 pub(crate) fn session_id(session: &Value) -> Option<&str> {
     session.get("id").and_then(Value::as_str)
 }

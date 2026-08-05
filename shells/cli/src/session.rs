@@ -1998,3 +1998,107 @@ pub(crate) async fn resolve_permission(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Supporting development contracts only. Real CLI behavior remains the
+    // user-experience acceptance path through the packaged binary.
+
+    fn waiting_snapshot(revision: u64, interaction_id: &str) -> AgentTimelineSnapshot {
+        serde_json::from_value(json!({
+            "schemaVersion": "deepcode.shared-conversation-projection.v2",
+            "shapeVersion": "deepcode.shared-conversation.work-segments.v1",
+            "sessionId": "session-cli-decision-contract",
+            "revision": revision,
+            "sourceEventVersion": revision,
+            "generatedAt": "2026-08-05T00:00:00.000Z",
+            "turns": [{
+                "id": "turn-cli-decision-contract",
+                "sequence": 0,
+                "sessionId": "session-cli-decision-contract",
+                "status": "waiting",
+                "startedAt": "2026-08-05T00:00:00.000Z",
+                "blocks": [],
+                "workSegments": [],
+                "parts": []
+            }],
+            "eventCount": revision,
+            "runProjection": {
+                "runId": "kernel-run-cli-decision-contract",
+                "turnId": "turn-cli-decision-contract",
+                "revision": revision,
+                "status": "waitingUser",
+                "phase": "waiting",
+                "currentActivity": null,
+                "wait": {
+                    "kind": "user",
+                    "reason": "Review the exact Plan scope.",
+                    "interactionId": interaction_id
+                },
+                "languageBinding": {
+                    "language": "neutral",
+                    "status": "unavailable"
+                }
+            }
+        }))
+        .expect("exact typed decision timeline")
+    }
+
+    fn decision_request() -> StartAgentRunRequest {
+        let mut request = StartAgentRunRequest::resolve_decision(
+            "plan",
+            "accept",
+            "cli-decision-contract-request",
+        );
+        request.run_id = Some("kernel-run-cli-decision-contract".to_string());
+        request.target_id = Some("interaction-baseline".to_string());
+        request
+    }
+
+    fn bound_cursor(baseline: &AgentTimelineSnapshot) -> LiveProjectionCursor {
+        let mut cursor =
+            LiveProjectionCursor::from_baseline(Some(baseline), &decision_request(), false)
+                .expect("decision baseline must bind exact Run, turn, and interaction identities");
+        cursor.live_run_id = Some("kernel-run-cli-decision-contract".to_string());
+        cursor.live_turn_id = Some("turn-cli-decision-contract".to_string());
+        cursor
+    }
+
+    #[test]
+    fn decision_cli_ignores_baseline_interaction_until_revision_advances() {
+        let baseline = waiting_snapshot(10, "interaction-baseline");
+        let mut cursor = bound_cursor(&baseline);
+        assert_eq!(cursor.bound_action_required("host-run-decision"), None);
+
+        cursor
+            .observe(&waiting_snapshot(11, "interaction-baseline"))
+            .expect("same baseline interaction may advance projection metadata");
+        assert_eq!(
+            cursor.bound_action_required("host-run-decision"),
+            None,
+            "the interaction being resolved cannot immediately re-trigger exit code 5"
+        );
+    }
+
+    #[test]
+    fn decision_cli_reports_only_a_new_action_required_interaction() {
+        let baseline = waiting_snapshot(20, "interaction-baseline");
+        let mut cursor = bound_cursor(&baseline);
+        cursor
+            .observe(&waiting_snapshot(21, "interaction-baseline"))
+            .expect("baseline interaction replay is valid");
+        assert_eq!(cursor.bound_action_required("host-run-decision"), None);
+
+        cursor
+            .observe(&waiting_snapshot(22, "interaction-next"))
+            .expect("a later exact interaction revision is valid");
+        let message = cursor
+            .bound_action_required("host-run-decision")
+            .expect("only a different post-baseline interaction requires user action");
+        assert!(message.contains("host-run-decision"));
+        assert!(message.contains("Review the exact Plan scope."));
+    }
+}

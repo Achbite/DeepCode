@@ -11,6 +11,7 @@ import {
 import {
   admittedReply,
   assert,
+  createPlan,
   createProviderCompletionReceipt,
   openSessionHarness,
   providerToolIntent,
@@ -28,6 +29,14 @@ export const contractCases = [
   {
     id: 'provider_composing_archives_before_publish_and_admits_zero_tools_on_stale_or_projection_failure',
     run: providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOrProjectionFailure,
+  },
+  {
+    id: 'preview_rejection_marks_only_target_needs_revision_and_creates_no_work_segment',
+    run: previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegment,
+  },
+  {
+    id: 'task_projection_tracks_plan_authority_without_queued_fallback',
+    run: taskProjectionTracksPlanAuthorityWithoutQueuedFallback,
   },
 ];
 
@@ -604,6 +613,209 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
     0,
     'projection failure must stop before any Kernel tool admission'
   );
+}
+
+async function previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegment() {
+  const sessionId = 'session-preview-rejection-contract';
+  const runId = 'run-preview-rejection-contract';
+  const plan = threeActionPlan(runId);
+  const rejectedAction = plan.actions[0];
+  const events = [
+    planInputEvent(sessionId, runId, 1),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      2,
+      'plan.persisted',
+      plan
+    ),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      3,
+      'scope.previewed',
+      {
+        kind: 'rejected',
+        data: {
+          toolId: rejectedAction.manifest.toolId,
+          reason: 'settingsDenied',
+          guidance: 'Revise only the first action scope.',
+        },
+        plan,
+        scopePreviews: [],
+        planRevision: plan.planRevision,
+        planActionId: rejectedAction.manifest.planActionId,
+        operationId: rejectedAction.manifest.operationId,
+      }
+    ),
+  ];
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events,
+  });
+  assertSharedConversationProjectionV2(projection);
+  assert.deepEqual(
+    projection.taskProjection.items.map((item) => ({
+      id: item.id,
+      status: item.status,
+    })),
+    [
+      {
+        id: rejectedAction.taskId,
+        status: 'needsRevision',
+      },
+      { id: plan.actions[1].taskId, status: 'planned' },
+      { id: plan.actions[2].taskId, status: 'planned' },
+    ],
+    'a rejected canonical preview may revise only its exact PlanAction'
+  );
+  assert.equal(
+    projection.taskProjection.items.some((item) =>
+      item.status === 'running' || item.status === 'completed'
+    ),
+    false
+  );
+  assert.equal(
+    projection.turns.flatMap((turn) => turn.workSegments).length,
+    0,
+    'a preview rejection has no invocation and therefore no WorkSegment'
+  );
+}
+
+async function taskProjectionTracksPlanAuthorityWithoutQueuedFallback() {
+  const sessionId = 'session-plan-authority-contract';
+  const runId = 'run-plan-authority-contract';
+  const plan = threeActionPlan(runId);
+  const firstAction = plan.actions[0];
+  const events = [
+    planInputEvent(sessionId, runId, 1),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      2,
+      'plan.persisted',
+      plan
+    ),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      3,
+      'plan.commentaryReleased',
+      {
+        planRevision: plan.planRevision,
+        providerTurnId: 'provider-turn-plan-authority',
+        controlEpoch: 1,
+        orderedItems: [{
+          kind: 'text',
+          phase: 'commentary',
+          text: 'Narration may say queued, running, or completed without changing task facts.',
+        }],
+        recordedAt: timestamp(3),
+      }
+    ),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      4,
+      'plan.decided',
+      {
+        planRevision: plan.planRevision,
+        decision: 'accept',
+        recordedAt: timestamp(4),
+      }
+    ),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      5,
+      'authorization.decided',
+      {
+        factId: 'fact-plan-authority-only',
+        factKind: 'capabilityIssued',
+        controlEpoch: 1,
+        planActionIds: [firstAction.manifest.planActionId],
+        operationId: firstAction.manifest.operationId,
+        resourceIds: [],
+        details: {},
+      }
+    ),
+  ];
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events,
+  });
+  assertSharedConversationProjectionV2(projection);
+  assert.deepEqual(
+    projection.taskProjection.items.map((item) => item.status),
+    ['authorized', 'authorized', 'authorized'],
+    'accepted Plan authority remains authorized until invocation or facts establish another status'
+  );
+  assert.equal(
+    projection.taskProjection.items.some((item) =>
+      item.status === 'running' || item.status === 'completed'
+    ),
+    false,
+    'narration and capability facts cannot imply execution'
+  );
+  assert.equal(
+    projection.turns.flatMap((turn) => turn.workSegments).length,
+    0,
+    'authority without an invocation cannot manufacture a WorkSegment'
+  );
+}
+
+function planInputEvent(sessionId, runId, sequence) {
+  return publicProjectionEvent(
+    sessionId,
+    runId,
+    sequence,
+    'input.persisted',
+    {
+      inputId: `input-${runId}`,
+      opaqueInputRef: `opaque-${runId}`,
+      text: 'Prepare a reviewed three-action plan.',
+      attachments: [],
+      recordedAt: timestamp(sequence),
+      controlEpoch: 1,
+    }
+  );
+}
+
+function threeActionPlan(runId) {
+  const first = createPlan({ runId });
+  const action = (ordinal, path) => ({
+    taskId: `task-plan-authority-${ordinal}`,
+    manifest: {
+      planRevision: first.planRevision,
+      planActionId: `plan-action-authority-${ordinal}`,
+      operationId: `operation-authority-${ordinal}`,
+      toolId: 'fs.write',
+      requestedResources: [{
+        kind: 'workspacePath',
+        data: { path, access: 'write' },
+      }],
+    },
+    previewArguments: { path, content: `content-${ordinal}` },
+    idempotencyKey: `idempotency-authority-${ordinal}`,
+    deadline: { kind: 'contractDefault', data: {} },
+  });
+  return {
+    ...first,
+    actions: [
+      {
+        ...first.actions[0],
+        taskId: 'task-plan-authority-1',
+        manifest: {
+          ...first.actions[0].manifest,
+          planActionId: 'plan-action-authority-1',
+          operationId: 'operation-authority-1',
+        },
+        idempotencyKey: 'idempotency-authority-1',
+      },
+      action(2, 'second.txt'),
+      action(3, 'third.txt'),
+    ],
+  };
 }
 
 function publicProjectionEvent(

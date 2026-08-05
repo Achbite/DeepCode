@@ -9,6 +9,7 @@ import {
   reconcileSessionKernelFactsPageV2,
   recordSessionPlanDecisionV2,
   recordSessionPlanV2,
+  sessionKernelAgentEventV2,
   sha256Hash,
 } from '../../dist/index.js';
 
@@ -59,6 +60,14 @@ export const contractCases = [
   {
     id: 'provider_token_usage_projection_is_canonical_digest_safe',
     run: providerTokenUsageProjectionIsCanonicalDigestSafe,
+  },
+  {
+    id: 'draft_review_stays_private_and_final_review_projects_once',
+    run: draftReviewStaysPrivateAndFinalReviewProjectsOnce,
+  },
+  {
+    id: 'readable_review_keeps_raw_identities_only_in_audit_refs',
+    run: readableReviewKeepsRawIdentitiesOnlyInAuditRefs,
   },
 ];
 
@@ -980,6 +989,212 @@ async function indeterminateOrUnsettledCleanupBlocksFinalReview() {
     (error) =>
       error?.code === 'session_kernel_review_not_finalizable'
   );
+}
+
+async function draftReviewStaysPrivateAndFinalReviewProjectsOnce() {
+  const sessionId = 'session-review-publication-contract';
+  const runId = RUN_ID;
+  const state = acceptedPlanState();
+  const draft = buildSessionKernelReviewV2(
+    state,
+    '2026-07-29T00:50:00.000Z'
+  );
+  assert.equal(draft.status, 'draft');
+  assert.throws(
+    () => reviewProjectionEvent(
+      sessionId,
+      runId,
+      1,
+      draft
+    ),
+    (error) =>
+      error?.code === 'session_kernel_projection_data_invalid',
+    'a draft Review is durable Session state but not a public conversation event'
+  );
+
+  const final = finalizeSessionKernelReviewV2(
+    state,
+    '2026-07-29T00:50:01.000Z'
+  );
+  assert.equal(final.status, 'final');
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [
+      agentEvent(
+        sessionId,
+        'event-review-publication-user',
+        'user_msg',
+        runId,
+        {
+          inputId: 'input-review-publication',
+          text: 'Finish the reviewed batch.',
+          attachments: [],
+        },
+        0
+      ),
+      reviewProjectionEvent(sessionId, runId, 2, final),
+      reviewProjectionEvent(sessionId, runId, 3, final),
+    ],
+  });
+  const reviewBlocks = projection.turns.flatMap((turn) =>
+    turn.blocks.filter((block) => block.kind === 'review')
+  );
+  assert.equal(
+    reviewBlocks.length,
+    1,
+    'replaying the same final Review revision must update one logical block rather than append duplicates'
+  );
+  assert.equal(reviewBlocks[0].structuredProjection.kind, 'review');
+  assert.equal(
+    projection.turns.flatMap((turn) => turn.parts).filter(
+      (part) => part.kind === 'block'
+        && part.blockId === reviewBlocks[0].id
+    ).length,
+    1
+  );
+}
+
+async function readableReviewKeepsRawIdentitiesOnlyInAuditRefs() {
+  const sessionId = 'session-readable-review-contract';
+  const plan = createPlan();
+  let state = acceptedPlanState(plan);
+  state.planActionSettlements[plan.actions[0].manifest.planActionId] = {
+    kind: 'completed',
+    planActionId: plan.actions[0].manifest.planActionId,
+    completionKind: 'answer',
+    providerTurnId: 'provider-turn-readable-review',
+    recordedAt: '2026-07-29T00:51:00.000Z',
+  };
+  const rawIds = {
+    factId: 'fact-readable-review-effect',
+    invocationId: 'invocation-readable-review',
+    effectId: 'effect-readable-review',
+    operationId: plan.actions[0].manifest.operationId,
+    planActionId: plan.actions[0].manifest.planActionId,
+    resourceId: 'resource-readable-review',
+  };
+  state = reconcileSessionKernelFactsPageV2(
+    state,
+    createFactsPage([
+      corpusFact('effectExpandedToolObserved', {
+        factId: rawIds.factId,
+        ledgerSequence: 1,
+        runSequence: 1,
+        identities: {
+          runId: RUN_ID,
+          planRevision: plan.planRevision,
+          planActionId: rawIds.planActionId,
+          expandedOperationId: rawIds.operationId,
+          expandedInvocationId: rawIds.invocationId,
+          expandedAttemptId: 'attempt-readable-review',
+          expandedEffectId: rawIds.effectId,
+          expandedResourceId: rawIds.resourceId,
+        },
+      }),
+    ], {
+      requestedAfterLedgerSequence: 0,
+      snapshotHighWater: 1,
+    })
+  ).state;
+  const review = finalizeSessionKernelReviewV2(
+    state,
+    '2026-07-29T00:51:01.000Z'
+  );
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [
+      agentEvent(
+        sessionId,
+        'event-readable-review-user',
+        'user_msg',
+        RUN_ID,
+        {
+          inputId: 'input-readable-review',
+          text: 'Show the readable Review.',
+          attachments: [],
+        },
+        0
+      ),
+      reviewProjectionEvent(sessionId, RUN_ID, 1, review),
+    ],
+  });
+  const block = projection.turns[0].blocks.find(
+    (candidate) => candidate.kind === 'review'
+  );
+  assert.ok(block?.structuredProjection);
+  const readable = block.structuredProjection;
+  assert.deepEqual(readable.messageArgs, {
+    planned: String(review.planned.length),
+    effects: String(review.actualEffects.length),
+    unexecuted: String(review.unexecuted.length),
+    rejected: String(review.denied.length + review.rejections.length),
+    cleanup: String(review.cleanup.length),
+    indeterminate: String(review.indeterminate.length),
+  });
+  const categoryNames = [
+    'scopeExpansions',
+    'actualEffects',
+    'unexecuted',
+    'denied',
+    'rejections',
+    'cleanup',
+    'indeterminate',
+  ];
+  assert.deepEqual(
+    readable.sections.map((section) => section.sectionId),
+    categoryNames.filter((name) => review[name].length > 0),
+    'empty Review categories must be omitted from the readable projection'
+  );
+  const readableSurface = {
+    title: readable.title,
+    summary: readable.summary,
+    summaryKey: readable.summaryKey,
+    messageArgs: readable.messageArgs,
+    sections: readable.sections.map((section) => ({
+      sectionId: section.sectionId,
+      titleKey: section.titleKey,
+      titleArgs: section.titleArgs,
+      emptyMessageKey: section.emptyMessageKey,
+      items: section.items.map((item) => ({
+        kind: item.kind,
+        text: item.text,
+        messageKey: item.messageKey,
+        messageArgs: item.messageArgs,
+        status: item.status,
+        targetRefs: item.targetRefs,
+      })),
+    })),
+  };
+  const readableJson = JSON.stringify(readableSurface);
+  for (const rawId of Object.values(rawIds)) {
+    assert.equal(
+      readableJson.includes(rawId),
+      false,
+      `raw identity ${rawId} must not enter readable Review text or message arguments`
+    );
+  }
+  const auditRefs = readable.sections.flatMap((section) =>
+    section.items.flatMap((item) => item.auditRefs ?? [])
+  );
+  for (const rawId of Object.values(rawIds)) {
+    assert.equal(
+      auditRefs.includes(rawId),
+      true,
+      `raw identity ${rawId} must remain available through auditRefs`
+    );
+  }
+}
+
+function reviewProjectionEvent(sessionId, runId, sequence, review) {
+  return sessionKernelAgentEventV2(sessionId, {
+    projectionId: `review-projection-${sequence}-${review.revision}`,
+    runId,
+    recordedAt: new Date(
+      Date.parse('2026-07-29T00:52:00.000Z') + sequence * 1_000
+    ).toISOString(),
+    kind: 'review.revised',
+    data: review,
+  });
 }
 
 function acceptedPlanState(plan = createPlan()) {

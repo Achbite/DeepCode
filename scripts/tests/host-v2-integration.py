@@ -57,6 +57,16 @@ CLI_TOOL_PROMPT = (
 CLI_TOOL_FINAL_TEXT = (
     "README.md was read through the real Session and Kernel v2 tool chain."
 )
+CLI_DELETE_PLAN_PROMPT = (
+    "Propose one PlanAction to delete host-delete-preview-owned.txt, but do "
+    "not execute it without explicit user confirmation."
+)
+CLI_DELETE_REPLAN_TEXT = (
+    "The rejected deletion Plan will not be replaced or executed."
+)
+CLI_DELETE_FINAL_TEXT = (
+    "The deletion Plan was rejected and the test-owned file remains unchanged."
+)
 FIXED_TOOL_REASONING = (
     "Use only the exposed read tool, then rely on canonical Kernel facts."
 )
@@ -64,6 +74,42 @@ FIXED_TOOL_CALL_ID = "call-host-v2-read-readme"
 FIXED_TOOL_ID = "fs.read"
 FIXED_PROVIDER_TOOL_NAME = "dcv2_66732e72656164"
 FIXED_TOOL_ARGUMENTS = {"path": "README.md"}
+DELETE_TARGET_RELATIVE_PATH = "host-delete-preview-owned.txt"
+DELETE_PLAN_REASONING = (
+    "The requested mutation requires an explicit Plan and canonical Kernel scope preview."
+)
+DELETE_PLAN_CALL_ID = "call-host-v2-delete-plan"
+DELETE_TOOL_ID = "fs.delete"
+DELETE_PROVIDER_TOOL_NAME = "dcv2_66732e64656c657465"
+SESSION_PLAN_PROPOSAL_TOOL_NAME = "deepcode_session_plan_propose_v2"
+DELETE_PLAN_ARGUMENTS = {
+    "schemaVersion": "deepcode.session.plan-proposal.v2",
+    "plan": {
+        "title": "Delete the test-owned file",
+        "objective": "Delete exactly one test-owned workspace file after approval.",
+        "narrative": (
+            "Preview the exact file deletion scope and wait for the user's decision."
+        ),
+        "actions": [
+            {
+                "toolId": DELETE_TOOL_ID,
+                "requestedResources": [
+                    {
+                        "kind": "workspacePath",
+                        "data": {
+                            "path": DELETE_TARGET_RELATIVE_PATH,
+                            "access": "write",
+                        },
+                    }
+                ],
+                "previewArguments": {
+                    "path": DELETE_TARGET_RELATIVE_PATH,
+                    "targetKind": "file",
+                },
+            }
+        ],
+    },
+}
 TEST_API_KEY = "host-v2-integration-key"
 EXEC_DAEMON_ARGUMENT = "--exec-owned-daemon"
 CLEANUP_OWNERS_ARGUMENT = "--cleanup-owned-resources"
@@ -341,6 +387,41 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
                 chunks = provider_tool_call_chunks(
                     reasoning=FIXED_TOOL_REASONING,
                 )
+        elif current_input == CLI_DELETE_PLAN_PROMPT:
+            target_kind = provider_current_input_target_kind(request)
+            guidance = provider_current_input_guidance(request)
+            if target_kind == "finalAnswer":
+                require(
+                    not request.get("tools"),
+                    "delete Plan finalAnswer request exposed Provider tools",
+                )
+                chunks = provider_final_chunks(
+                    CLI_DELETE_FINAL_TEXT,
+                    reasoning=DELETE_PLAN_REASONING,
+                )
+            elif guidance:
+                require(
+                    target_kind == "planning",
+                    "delete Plan rejection did not re-enter a planning turn",
+                )
+                chunks = provider_final_chunks(
+                    CLI_DELETE_REPLAN_TEXT,
+                    reasoning=DELETE_PLAN_REASONING,
+                )
+            else:
+                require(
+                    target_kind == "planning"
+                    and provider_request_exposes_tool(
+                        request,
+                        SESSION_PLAN_PROPOSAL_TOOL_NAME,
+                    )
+                    and not provider_request_exposes_tool(
+                        request,
+                        DELETE_PROVIDER_TOOL_NAME,
+                    ),
+                    "delete Plan request did not expose only the Session Plan control boundary",
+                )
+                chunks = provider_plan_proposal_chunks()
         else:
             chunks = provider_final_chunks(FINAL_TEXT)
         frames = [
@@ -456,6 +537,58 @@ def provider_tool_call_chunks(
     ]
 
 
+def provider_plan_proposal_chunks() -> list[dict[str, Any]]:
+    request_id = "chatcmpl-host-v2-integration-delete-plan"
+    return [
+        provider_reasoning_chunk(
+            request_id,
+            reasoning=DELETE_PLAN_REASONING,
+        ),
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "host-v2-integration-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": DELETE_PLAN_CALL_ID,
+                                "type": "function",
+                                "function": {
+                                    "name": SESSION_PLAN_PROPOSAL_TOOL_NAME,
+                                    "arguments": json.dumps(
+                                        DELETE_PLAN_ARGUMENTS,
+                                        separators=(",", ":"),
+                                    ),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "host-v2-integration-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+        provider_usage_chunk(request_id),
+    ]
+
+
 def provider_reasoning_chunk(
     request_id: str,
     *,
@@ -540,6 +673,22 @@ def provider_current_input_target_kind(
     target = current_inputs[0].get("target")
     kind = target.get("kind") if isinstance(target, dict) else None
     return kind if isinstance(kind, str) else None
+
+
+def provider_current_input_guidance(
+    request: dict[str, Any],
+) -> list[str]:
+    current_inputs = provider_current_input_payloads(request)
+    if len(current_inputs) != 1:
+        return []
+    guidance = current_inputs[0].get("guidance")
+    if not isinstance(guidance, list):
+        return []
+    return [
+        value
+        for value in guidance
+        if isinstance(value, str) and value.strip()
+    ]
 
 
 def provider_canonical_fact_payloads(
@@ -2485,6 +2634,201 @@ def delete_session_and_require_private_storage_released(
     )
 
 
+def read_agent_timeline(
+    daemon: OwnedDaemon,
+    session_id: str,
+) -> dict[str, Any]:
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        f"/api/agent/sessions/{urllib.parse.quote(session_id, safe='')}/timeline",
+        host_capability=daemon.host_capability,
+    )
+    timeline = require_api_ok(status, body, "Shared Conversation Projection")
+    require(
+        isinstance(timeline, dict)
+        and timeline.get("schemaVersion")
+        == "deepcode.shared-conversation-projection.v2"
+        and timeline.get("shapeVersion")
+        == "deepcode.shared-conversation.work-segments.v1",
+        "Session timeline did not use the exact Shared Projection v2 shape",
+    )
+    return timeline
+
+
+def current_timeline_turn(timeline: dict[str, Any]) -> dict[str, Any]:
+    run_projection = timeline.get("runProjection")
+    turn_id = (
+        run_projection.get("turnId")
+        if isinstance(run_projection, dict)
+        else None
+    )
+    turns = timeline.get("turns")
+    turn = next(
+        (
+            candidate
+            for candidate in turns
+            if isinstance(candidate, dict) and candidate.get("id") == turn_id
+        ),
+        None,
+    ) if isinstance(turns, list) else None
+    require(
+        isinstance(turn, dict),
+        "Shared Projection omitted the current typed turn",
+    )
+    return turn
+
+
+def require_delete_plan_waiting_projection(
+    timeline: dict[str, Any],
+) -> tuple[str, str]:
+    run_projection = timeline.get("runProjection")
+    require(
+        isinstance(run_projection, dict)
+        and run_projection.get("status") == "waitingUser"
+        and run_projection.get("phase") == "waiting"
+        and isinstance(run_projection.get("wait"), dict)
+        and run_projection["wait"].get("kind") == "user",
+        "delete Plan did not stop at the typed waitingUser boundary",
+    )
+    kernel_run_id = run_projection.get("runId")
+    require(
+        isinstance(kernel_run_id, str) and kernel_run_id,
+        "delete Plan waiting projection omitted the exact Kernel Run",
+    )
+    interaction = timeline.get("interactionProjection")
+    pending = (
+        interaction.get("pending")
+        if isinstance(interaction, dict)
+        else None
+    )
+    require(
+        isinstance(pending, dict)
+        and pending.get("kind") == "plan"
+        and pending.get("runId") == kernel_run_id
+        and pending.get("targetId") == pending.get("planId"),
+        "delete Plan did not expose one exact pending Plan interaction",
+    )
+    plan_revision = pending.get("targetId")
+    require(
+        isinstance(plan_revision, str) and plan_revision,
+        "delete Plan interaction omitted its exact revision",
+    )
+
+    turn = current_timeline_turn(timeline)
+    require(
+        turn.get("workSegments") == [],
+        "scope preview created a WorkSegment before any ToolIntent admission",
+    )
+    blocks = turn.get("blocks")
+    plan_blocks = [
+        block
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("kind") == "plan"
+        and block.get("confirmable") is True
+        and isinstance(block.get("interaction"), dict)
+        and block["interaction"].get("targetId") == plan_revision
+    ] if isinstance(blocks, list) else []
+    require(
+        len(plan_blocks) == 1,
+        "delete Plan did not publish one confirmable Plan block",
+    )
+    structured = plan_blocks[0].get("structuredProjection")
+    sections = (
+        structured.get("sections")
+        if isinstance(structured, dict)
+        else None
+    )
+    scope_sections = [
+        section
+        for section in sections
+        if isinstance(section, dict)
+        and section.get("sectionId") == "scopeApproval"
+    ] if isinstance(sections, list) else []
+    require(
+        len(scope_sections) == 1,
+        "delete Plan omitted its canonical scope approval section",
+    )
+    scope_items = scope_sections[0].get("items")
+    require(
+        isinstance(scope_items, list)
+        and len(scope_items) == 1
+        and isinstance(scope_items[0], dict)
+        and scope_items[0].get("targetRefs")
+        == [f"workspace:Write:{DELETE_TARGET_RELATIVE_PATH}"],
+        "delete Plan canonical scope was not exactly the test-owned relative file",
+    )
+    task_projection = timeline.get("taskProjection")
+    task_items = (
+        task_projection.get("items")
+        if isinstance(task_projection, dict)
+        else None
+    )
+    require(
+        isinstance(task_items, list)
+        and len(task_items) == 1
+        and isinstance(task_items[0], dict)
+        and task_items[0].get("status") == "awaitingApproval",
+        "delete Plan task did not remain awaitingApproval before user confirmation",
+    )
+    return kernel_run_id, plan_revision
+
+
+def require_delete_plan_rejected_projection(
+    timeline: dict[str, Any],
+) -> None:
+    run_projection = timeline.get("runProjection")
+    require(
+        isinstance(run_projection, dict)
+        and run_projection.get("status") == "succeeded"
+        and run_projection.get("phase") == "settled",
+        "rejected delete Plan did not reach a terminal typed projection",
+    )
+    interaction = timeline.get("interactionProjection")
+    require(
+        interaction is None
+        or (
+            isinstance(interaction, dict)
+            and interaction.get("pending") is None
+        ),
+        "rejected delete Plan retained a pending interaction",
+    )
+    task_projection = timeline.get("taskProjection")
+    task_items = (
+        task_projection.get("items")
+        if isinstance(task_projection, dict)
+        else None
+    )
+    require(
+        isinstance(task_items, list)
+        and len(task_items) == 1
+        and isinstance(task_items[0], dict)
+        and task_items[0].get("status") == "unexecuted",
+        "rejected delete Plan was not projected as one unexecuted task",
+    )
+    turn = current_timeline_turn(timeline)
+    require(
+        turn.get("workSegments") == [],
+        "rejected delete Plan synthesized tool work without an invocation",
+    )
+    blocks = turn.get("blocks")
+    committed_finals = [
+        block
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("kind") == "assistant"
+        and block.get("entryRole") == "finalAnswer"
+        and block.get("durability") == "committed"
+        and block.get("status") == "completed"
+        and block.get("bodyMarkdown") == CLI_DELETE_FINAL_TEXT
+    ] if isinstance(blocks, list) else []
+    require(
+        len(committed_finals) == 1,
+        "rejected delete Plan lost its one bound committed finalAnswer",
+    )
+
+
 @dataclass(frozen=True)
 class CanonicalRunSnapshot:
     run_id: str
@@ -2494,6 +2838,61 @@ class CanonicalRunSnapshot:
 
 def kernel_fact_store(config_root: pathlib.Path) -> pathlib.Path:
     return config_root / "kernel" / "kernel-v2.sqlite3"
+
+
+def require_no_execution_fact_domains(
+    config_root: pathlib.Path,
+    run_id: str,
+    context: str,
+) -> None:
+    database = kernel_fact_store(config_root)
+    require(database.is_file(), f"{context} canonical fact store is missing")
+    try:
+        with sqlite3.connect(
+            f"file:{database}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        ) as connection:
+            rows = connection.execute(
+                "SELECT ledger_sequence, envelope_json FROM kernel_facts "
+                "WHERE run_id = ?1 ORDER BY ledger_sequence",
+                (run_id,),
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise IntegrationFailure(
+            f"{context} canonical fact query failed: {safe_diagnostic(error)}"
+        ) from error
+    decoded: list[tuple[int, str, str]] = []
+    for sequence, envelope_json in rows:
+        try:
+            envelope = json.loads(envelope_json)
+            payload = envelope["payload"]
+            domain = payload["domain"]
+            fact_kind = payload["fact"]["kind"]
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise IntegrationFailure(
+                f"{context} canonical fact envelope is invalid"
+            ) from error
+        require(
+            isinstance(domain, str) and isinstance(fact_kind, str),
+            f"{context} canonical fact domain or kind is invalid",
+        )
+        decoded.append((int(sequence), domain, fact_kind))
+    require(
+        any(domain == "control" and fact_kind == "runOpened"
+            for _, domain, fact_kind in decoded),
+        f"{context} omitted the canonical runOpened fact",
+    )
+    forbidden = [
+        (sequence, domain, fact_kind)
+        for sequence, domain, fact_kind in decoded
+        if domain in {"invocation", "effect", "resource", "cleanup"}
+    ]
+    require(
+        not forbidden,
+        f"{context} created execution facts before authorization: "
+        + json.dumps(forbidden, separators=(",", ":")),
+    )
 
 
 def host_operation_store(config_root: pathlib.Path) -> pathlib.Path:
@@ -2834,6 +3233,222 @@ def require_fixed_read_canonical_facts(
         and truncation.get("kind") == "complete",
         "fixed fs.read completion did not retain one complete UTF-8 result",
     )
+
+
+def validate_fs_delete_plan_preview_rejection_without_effect(
+    daemon: OwnedDaemon,
+    config_root: pathlib.Path,
+    workspace: pathlib.Path,
+    provider: ProviderServer,
+) -> None:
+    target = workspace / DELETE_TARGET_RELATIVE_PATH
+    target.write_bytes(b"owned delete preview sentinel\n")
+    before_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    session_id = create_session(daemon)
+    provider_count_before = provider.request_count()
+
+    plan_cli = run_cli(
+        daemon.base_url,
+        daemon.host_capability,
+        [
+            "--print",
+            "--session",
+            session_id,
+            "--workspace",
+            str(workspace),
+            "ask",
+            CLI_DELETE_PLAN_PROMPT,
+        ],
+        expect_success=False,
+    )
+    require(
+        plan_cli.returncode == 5,
+        "delete Plan CLI did not use the dedicated action-required exit code",
+    )
+    require(
+        not plan_cli.stdout.strip(),
+        "delete Plan CLI printed a final answer before the user decision",
+    )
+    provider_count_waiting = provider.request_count()
+    require(
+        provider_count_waiting == provider_count_before + 1,
+        "delete Plan proposal did not use exactly one initial Provider request",
+    )
+    initial_request = provider.request_snapshot()[provider_count_before]
+    assert_provider_received_current_input(
+        initial_request,
+        CLI_DELETE_PLAN_PROMPT,
+    )
+    require(
+        provider_current_input_target_kind(initial_request) == "planning"
+        and not provider_current_input_guidance(initial_request)
+        and provider_request_exposes_tool(
+            initial_request,
+            SESSION_PLAN_PROPOSAL_TOOL_NAME,
+        )
+        and not provider_request_exposes_tool(
+            initial_request,
+            DELETE_PROVIDER_TOOL_NAME,
+        ),
+        "initial delete Plan request crossed the Session Plan-control boundary",
+    )
+
+    waiting_timeline = read_agent_timeline(daemon, session_id)
+    kernel_run_id, plan_revision = require_delete_plan_waiting_projection(
+        waiting_timeline
+    )
+    require_no_execution_fact_domains(
+        config_root,
+        kernel_run_id,
+        "delete Plan preview",
+    )
+    require(
+        target.is_file()
+        and hashlib.sha256(target.read_bytes()).hexdigest() == before_digest,
+        "delete Plan preview changed the test-owned file before confirmation",
+    )
+
+    try:
+        rejected = run_cli(
+            daemon.base_url,
+            daemon.host_capability,
+            [
+                "--session",
+                session_id,
+                "decision",
+                "plan",
+                "reject",
+                kernel_run_id,
+                plan_revision,
+            ],
+            expect_success=True,
+        )
+    except subprocess.TimeoutExpired as error:
+        requests_after_timeout = provider.request_snapshot()[
+            provider_count_before:
+        ]
+        timeline_after_timeout = read_agent_timeline(daemon, session_id)
+        run_after_timeout = timeline_after_timeout.get("runProjection")
+        task_after_timeout = timeline_after_timeout.get("taskProjection")
+        interaction_after_timeout = timeline_after_timeout.get(
+            "interactionProjection"
+        )
+        raise IntegrationFailure(
+            "delete Plan rejection timed out; safe state="
+            + json.dumps(
+                {
+                    "providerTurns": [
+                        {
+                            "targetKind": provider_current_input_target_kind(request),
+                            "guidanceCount": len(
+                                provider_current_input_guidance(request)
+                            ),
+                            "toolCount": len(request.get("tools", []))
+                            if isinstance(request.get("tools"), list)
+                            else None,
+                        }
+                        for request in requests_after_timeout
+                    ],
+                    "run": {
+                        "status": run_after_timeout.get("status"),
+                        "phase": run_after_timeout.get("phase"),
+                        "waitKind": (
+                            run_after_timeout.get("wait", {}).get("kind")
+                            if isinstance(run_after_timeout.get("wait"), dict)
+                            else None
+                        ),
+                    }
+                    if isinstance(run_after_timeout, dict)
+                    else None,
+                    "taskStatuses": [
+                        item.get("status")
+                        for item in task_after_timeout.get("items", [])
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(task_after_timeout, dict)
+                    else None,
+                    "pendingInteraction": (
+                        interaction_after_timeout.get("pending", {}).get("kind")
+                        if isinstance(interaction_after_timeout, dict)
+                        and isinstance(
+                            interaction_after_timeout.get("pending"),
+                            dict,
+                        )
+                        else None
+                    ),
+                },
+                separators=(",", ":"),
+            )
+        ) from error
+    require(
+        CLI_DELETE_FINAL_TEXT in rejected.stdout,
+        "delete Plan rejection did not print its bound committed finalAnswer",
+    )
+    provider_count_rejected = provider.request_count()
+    require(
+        provider_count_rejected == provider_count_before + 3,
+        "delete Plan rejection did not use proposal, replan, and finalAnswer Provider turns",
+    )
+    requests = provider.request_snapshot()[
+        provider_count_before:provider_count_rejected
+    ]
+    require(
+        len(requests) == 3,
+        "delete Plan Provider request snapshot changed during validation",
+    )
+    replan_request = requests[1]
+    final_request = requests[2]
+    for request in requests:
+        assert_provider_received_current_input(
+            request,
+            CLI_DELETE_PLAN_PROMPT,
+        )
+    require(
+        provider_current_input_target_kind(replan_request) == "planning"
+        and bool(provider_current_input_guidance(replan_request))
+        and provider_request_exposes_tool(
+            replan_request,
+            SESSION_PLAN_PROPOSAL_TOOL_NAME,
+        )
+        and provider_current_input_target_kind(final_request) == "finalAnswer"
+        and not final_request.get("tools"),
+        "delete Plan rejection did not preserve the replan and no-tools finalAnswer boundaries",
+    )
+
+    host_run_id = read_cli_ask_host_run_identity(config_root, session_id)
+    terminal_snapshot = canonical_run_snapshot(
+        config_root,
+        session_id,
+        host_run_id,
+    )
+    require(
+        terminal_snapshot.run_id == kernel_run_id,
+        "delete Plan rejection changed the exact Kernel Run identity",
+    )
+    require_no_execution_fact_domains(
+        config_root,
+        kernel_run_id,
+        "rejected delete Plan",
+    )
+    require_delete_plan_rejected_projection(
+        read_agent_timeline(daemon, session_id)
+    )
+    require(
+        target.is_file()
+        and hashlib.sha256(target.read_bytes()).hexdigest() == before_digest,
+        "rejected delete Plan changed or removed the test-owned file",
+    )
+    delete_session_and_require_private_storage_released(
+        daemon,
+        config_root,
+        session_id,
+    )
+    target.unlink()
+    require(
+        not target.exists(),
+        "delete Plan contract did not release its test-owned sentinel",
+    )
+    provider.require_healthy()
 
 
 def read_stable_current_session_run_store(
@@ -4844,6 +5459,17 @@ def run() -> None:
         passed(
             "Supporting evidence: fixed CLI instruction reached Session, Kernel fs.read, "
             "canonical facts, planning continuation, and bound finalAnswer; not final acceptance"
+        )
+
+        validate_fs_delete_plan_preview_rejection_without_effect(
+            owned,
+            config_root,
+            workspace,
+            provider,
+        )
+        passed(
+            "fs_delete_plan_preview_requires_user_action_and_rejects_without_effect "
+            "(supporting evidence only)"
         )
 
         provider_profile_quarantine_requires_explicit_reenable_intent(
