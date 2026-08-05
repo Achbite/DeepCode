@@ -214,6 +214,7 @@ pub(crate) struct HostCallerRequestDriveClaimReceiptV2 {
 pub(crate) struct HostCallerRequestRecoveryEvidenceV2 {
     pub(crate) binding: HostCallerRequestBindingReceiptV2,
     pub(crate) run_lifecycle: Option<HostKernelStoredRunLifecycleV2>,
+    pub(crate) kernel_run_id: Option<String>,
     pub(crate) provider_profile_id: Option<String>,
     pub(crate) run_recorded_at: Option<String>,
     pub(crate) retired_at: Option<String>,
@@ -1771,6 +1772,7 @@ impl HostKernelOperationStoreV2 {
             }
             let (
                 run_lifecycle,
+                kernel_run_id,
                 provider_profile_id,
                 run_recorded_at,
                 retired_at,
@@ -1781,6 +1783,7 @@ impl HostKernelOperationStoreV2 {
                     let opening = decode_opening_record(run)?;
                     (
                         Some(opening.lifecycle),
+                        run.run_id.clone(),
                         Some(opening.provider_profile.provider_profile_id),
                         Some(opening.opening_recorded_at),
                         run.retired_at.clone(),
@@ -1788,7 +1791,7 @@ impl HostKernelOperationStoreV2 {
                         run.retirement_request_digest.clone(),
                     )
                 }
-                None => (None, None, None, None, None, None),
+                None => (None, None, None, None, None, None, None),
             };
             if let (Some(expected_run_id), Some(run)) = (
                 binding
@@ -1883,6 +1886,7 @@ impl HostKernelOperationStoreV2 {
             Ok(HostCallerRequestRecoveryEvidenceV2 {
                 binding,
                 run_lifecycle,
+                kernel_run_id,
                 provider_profile_id,
                 run_recorded_at,
                 retired_at,

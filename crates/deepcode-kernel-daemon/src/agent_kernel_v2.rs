@@ -5077,12 +5077,7 @@ fn recovered_agent_run_state_v2(
         .unwrap_or_else(|| evidence.binding.recorded_at.clone());
     AgentRunState {
         run_id: host_run_id,
-        kernel_run_id: evidence
-            .binding
-            .response_identity
-            .get("runId")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        kernel_run_id: evidence.kernel_run_id.clone(),
         session_id: evidence.binding.session_id.clone(),
         profile_id: evidence.provider_profile_id.clone(),
         status: status.to_string(),
@@ -5367,6 +5362,7 @@ fn restore_caller_run_outcome_v2(
             "Durable Host caller request Run snapshot has conflicting identities.",
         ));
     }
+    let run = reconcile_replayed_run_open_outcome_v2(state, binding, run)?;
     let mut runs = state.session_runs.lock().expect("session run state lock");
     match runs.get(&host_run_id) {
         Some(current) if current.session_id != binding.session_id => {
@@ -5381,6 +5377,56 @@ fn restore_caller_run_outcome_v2(
         }
     }
     Ok(Some(host_run_id))
+}
+
+fn reconcile_replayed_run_open_outcome_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    run: AgentRunState,
+) -> Result<AgentRunState, AgentKernelV2Error> {
+    if binding.request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2
+        || matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+    {
+        return Ok(run);
+    }
+    let evidence = state
+        .host_services
+        .kernel_operations_v2
+        // A retired Run no longer has live drive ownership. Terminal replay still
+        // validates the immutable caller, Run, and first-operation correlations.
+        .caller_control_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let Some(mut recovered) = recovered_run_snapshot_v2(&evidence)? else {
+        return Ok(run);
+    };
+    if !matches!(
+        recovered.status.as_str(),
+        "completed" | "failed" | "cancelled"
+    ) {
+        return Ok(run);
+    }
+    if recovered.run_id != run.run_id
+        || recovered.session_id != run.session_id
+        || recovered.kernel_run_id != run.kernel_run_id
+        || (recovered.profile_id.is_some()
+            && run.profile_id.is_some()
+            && recovered.profile_id != run.profile_id)
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_caller_request_outcome_conflict",
+            "Recovered terminal Run state conflicts with the immutable caller outcome identity.",
+        ));
+    }
+    recovered.start_event_count = run.start_event_count;
+    if run.profile_id.is_some() {
+        recovered.profile_id = run.profile_id;
+    }
+    Ok(recovered)
 }
 
 fn settle_caller_run_outcome_v2(
