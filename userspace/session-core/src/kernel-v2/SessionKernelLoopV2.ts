@@ -53,6 +53,7 @@ import {
   publicSessionProviderOrderedItemsV2,
   publicSessionProviderToolCallQueueItemsV2,
   reconcileSessionProviderToolCallQueueV2,
+  settledSessionProviderToolCallsV2,
 } from './providerToolCallQueue.js';
 import {
   toolContextRefV2,
@@ -1496,6 +1497,7 @@ export class SessionKernelLoopV2 {
         status: queue.status,
         settledAt: queue.settledAt,
       },
+      toolCalls: settledSessionProviderToolCallsV2(queue),
       providerResult: cloneJson(queue.providerResult),
     } as const;
     if (queue.status === 'completed') {

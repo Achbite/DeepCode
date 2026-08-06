@@ -27,6 +27,9 @@ import {
 import {
   sessionPlanProposalToolV2,
 } from './SessionKernelProviderAdapterV2.js';
+import {
+  sessionProviderToolObservationsV1,
+} from './toolObservation.js';
 
 const PROVIDER_TURN_CURRENT_INPUT_V2_SCHEMA =
   'deepcode.session.provider-current-input.v2';
@@ -36,8 +39,6 @@ const PROVIDER_TURN_REVIEW_V2_SCHEMA =
   'deepcode.session.provider-review.v2';
 const PROVIDER_TURN_OUTCOMES_V2_SCHEMA =
   'deepcode.session.provider-outcomes.v2';
-const PROVIDER_TURN_FACTS_V2_SCHEMA =
-  'deepcode.session.provider-canonical-facts.v2';
 const PROVIDER_TURN_CONVERSATION_MEMORY_V2_SCHEMA =
   'deepcode.session.provider-conversation-memory.v2';
 const TOKEN_ESTIMATOR = 'utf8-bytes-upper-bound.v2' as const;
@@ -154,9 +155,10 @@ export function buildSessionProviderContextV2(
     input.providerOutcomeOmittedCount,
     []
   );
-  const emptyCanonicalFacts = canonicalFactsWithSelectedFacts(
+  const emptyCanonicalFacts = toolObservationsWithSelectedFacts(
     input.kernelFacts,
-    []
+    [],
+    input.providerOutcomes
   );
   const emptyMemoryTokens =
     estimateTokens(canonicalJson(emptyConversationMemory));
@@ -230,9 +232,10 @@ export function buildSessionProviderContextV2(
   const facts = selectNewestSectionWithinTokenBudget(
     input.kernelFacts.facts,
     factsBudget,
-    (selected) => canonicalFactsWithSelectedFacts(
+    (selected) => toolObservationsWithSelectedFacts(
       input.kernelFacts,
-      selected
+      selected,
+      input.providerOutcomes
     )
   );
   const providerOutcomes = outcomes.section;
@@ -579,24 +582,18 @@ function providerOutcomesWithSelectedRecords(
   };
 }
 
-function canonicalFactsWithSelectedFacts(
+function toolObservationsWithSelectedFacts(
   facts: SessionProviderTurnInputV2['kernelFacts'],
   selected: ReadonlyArray<
     SessionProviderTurnInputV2['kernelFacts']['facts'][number]
-  >
-): {
-  schemaVersion: typeof PROVIDER_TURN_FACTS_V2_SCHEMA;
-  snapshotHighWater: number;
-  omittedCount: number;
-  facts: SessionProviderTurnInputV2['kernelFacts']['facts'];
-} {
-  return {
-    schemaVersion: PROVIDER_TURN_FACTS_V2_SCHEMA,
-    snapshotHighWater: facts.snapshotHighWater,
-    omittedCount:
-      facts.omittedCount + facts.facts.length - selected.length,
-    facts: selected.map(cloneJson),
-  };
+  >,
+  outcomes: readonly SessionProviderOutcomeRecordV2[]
+) {
+  return sessionProviderToolObservationsV1({
+    facts,
+    selectedFacts: selected,
+    providerOutcomes: outcomes,
+  });
 }
 
 function selectNewestSectionWithinTokenBudget<T, TSection>(

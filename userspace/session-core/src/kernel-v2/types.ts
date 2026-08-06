@@ -477,6 +477,40 @@ interface SessionProviderOutcomeRecordBaseV2 {
   providerResult: SessionProviderResultMetadataV2;
 }
 
+/**
+ * Session-owned relation between distinct tool operations. This relation is
+ * descriptive only: it neither reuses Kernel invocation/attempt identity nor
+ * grants authority.
+ */
+export interface SessionToolCorrectionV2 {
+  retryGroupId: string;
+  predecessorOperationId: string;
+  retryOrdinal: number;
+}
+
+export interface SessionProviderToolRejectionV2 {
+  reason: import('@deepcode/protocol').ToolIntentRejectionReasonV2;
+  guidance: string;
+  rejectionFactId: string;
+}
+
+/**
+ * Safe, settled call identity retained with a Provider outcome. Raw arguments
+ * remain only in the private queue/trace and are never copied here.
+ */
+export interface SessionProviderSettledToolCallV2 {
+  ordinal: number;
+  operationId: string;
+  toolId: string;
+  status: 'completed' | 'aborted' | 'unexecuted';
+  invocationId?: string;
+  terminalFactId?: string;
+  terminalFactKind?: string;
+  settlementReason?: string;
+  rejection?: SessionProviderToolRejectionV2;
+  correction?: SessionToolCorrectionV2;
+}
+
 export interface SessionProviderToolSettlementV2 {
   status: 'completed' | 'aborted';
   settledAt: string;
@@ -487,6 +521,7 @@ export type SessionProviderOutcomeRecordV2 =
       outputKind: 'toolIntent';
       toolCallReceipt: SessionProviderToolCallReceiptV2;
       toolSettlement: SessionProviderToolSettlementV2;
+      toolCalls: SessionProviderSettledToolCallV2[];
     })
   | (SessionProviderOutcomeRecordBaseV2 & {
       outputKind: Exclude<
@@ -627,6 +662,12 @@ export interface SessionProviderTurnRecordV2 {
    * deterministically admitted after Session restart.
    */
   remainingToolCallBudget?: number;
+  /**
+   * Durable Session-only candidate captured before the prior settled queue is
+   * released. If this turn returns tools, only its first operation may consume
+   * the relation.
+   */
+  correction?: SessionToolCorrectionV2;
   controlEpoch: number;
   contextRef: ToolContextRefV2;
   factProjection: SessionProviderFactProjectionReceiptV2;

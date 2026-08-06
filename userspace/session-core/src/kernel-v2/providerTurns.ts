@@ -51,6 +51,7 @@ import {
   prepareSessionProviderToolCallSubmissionV2,
   publicSessionProviderOrderedItemsV2,
   publicSessionProviderToolCallQueueItemsV2,
+  sessionToolCorrectionForNextTurnV2,
   type SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
@@ -394,6 +395,12 @@ export class SessionKernelProviderTurnsV2 {
         state,
         request.target
       );
+      const correction = sessionToolCorrectionForNextTurnV2({
+        queue: state.providerToolCallQueue,
+        runId: state.runId,
+        controlEpoch: state.controlEpoch,
+        nextTarget: request.target,
+      });
       const providerInput = {
         providerTurnId,
         purpose: request.target.kind === 'finalAnswer'
@@ -477,6 +484,7 @@ export class SessionKernelProviderTurnsV2 {
                   request.remainingToolCallBudget,
               }
             : {}),
+          ...(correction ? { correction } : {}),
           controlEpoch: state.controlEpoch,
           contextRef: binding.contextRef,
           factProjection: {
@@ -902,6 +910,9 @@ export class SessionKernelProviderTurnsV2 {
         orderedItems: output.items,
         completion: output.completion,
         intents,
+        ...(latest.providerTurn?.correction
+          ? { correction: latest.providerTurn.correction }
+          : {}),
       });
     latest.providerTurn!.status = 'awaitingTools';
     await this.host.saveCheckpoint();

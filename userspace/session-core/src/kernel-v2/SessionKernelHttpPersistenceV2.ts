@@ -74,6 +74,7 @@ import type {
   SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
+  settledSessionProviderToolCallsV2,
   validateSessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
@@ -198,6 +199,7 @@ interface SessionKernelCompactProviderReservationV3 {
   target: SessionProviderTurnTargetV2;
   planRevision?: string;
   remainingToolCallBudget?: number;
+  correction?: import('./types.js').SessionToolCorrectionV2;
   controlEpoch: number;
   contextRef: import('@deepcode/protocol').ToolContextRefV2;
   factProjection: SessionProviderTurnRecordV2['factProjection'];
@@ -3081,6 +3083,7 @@ function decodeCompactProviderReservationV3(
     [
       'remainingToolCallBudget',
       'planRevision',
+      'correction',
       'cancellationReason',
       'dispatchRef',
       'terminalRef',
@@ -3167,6 +3170,13 @@ function decodeCompactProviderReservationV3(
     ...(remainingToolCallBudget === undefined
       ? {}
       : { remainingToolCallBudget }),
+    ...(record.correction === undefined
+      ? {}
+      : {
+          correction: decodeSessionToolCorrectionV3(
+            record.correction
+          ),
+        }),
     controlEpoch: positiveSafeIntegerV3(
       record.controlEpoch,
       'controlEpoch'
@@ -3280,6 +3290,36 @@ function decodeProviderTurnTargetV3(
         'session_kernel_provider_target_invalid'
       );
   }
+}
+
+function decodeSessionToolCorrectionV3(
+  value: unknown
+): import('./types.js').SessionToolCorrectionV2 {
+  const record = exactObject(
+    value,
+    ['retryGroupId', 'predecessorOperationId', 'retryOrdinal'],
+    'session_kernel_tool_correction_invalid'
+  );
+  const retryOrdinal = positiveSafeIntegerV3(
+    record.retryOrdinal,
+    'retryOrdinal'
+  );
+  if (retryOrdinal < 2) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_tool_correction_invalid'
+    );
+  }
+  return {
+    retryGroupId: requiredIdentity(
+      record.retryGroupId,
+      'retryGroupId'
+    ),
+    predecessorOperationId: requiredIdentity(
+      record.predecessorOperationId,
+      'predecessorOperationId'
+    ),
+    retryOrdinal,
+  };
 }
 
 function decodeDeadlineRequestV3(value: unknown): DeadlineRequestV2 {
@@ -4155,6 +4195,9 @@ function compactProviderReservationV3(
       : {
           remainingToolCallBudget: turn.remainingToolCallBudget,
         }),
+    ...(turn.correction === undefined
+      ? {}
+      : { correction: cloneJson(turn.correction) }),
     controlEpoch: turn.controlEpoch,
     contextRef: cloneJson(turn.contextRef),
     factProjection: cloneJson(turn.factProjection),
@@ -5182,6 +5225,7 @@ function materializeToolProviderOutcomeV3(
       status: compactQueue.status,
       settledAt: compactQueue.settledAt,
     },
+    toolCalls: settledSessionProviderToolCallsV2(queue),
     providerResult: cloneJson(output.providerResult),
   };
 }
@@ -5276,6 +5320,9 @@ function materializeProviderReservationV3(
           remainingToolCallBudget:
             reservation.remainingToolCallBudget,
         }),
+    ...(reservation.correction === undefined
+      ? {}
+      : { correction: cloneJson(reservation.correction) }),
     controlEpoch: reservation.controlEpoch,
     contextRef: cloneJson(reservation.contextRef),
     factProjection: cloneJson(reservation.factProjection),

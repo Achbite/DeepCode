@@ -1,5 +1,6 @@
 import type {
   KernelFactProjectionV2,
+  ToolIntentRejectionReasonV2,
   ToolIntentSubmitReplyV2,
   ToolIntentV2,
 } from '@deepcode/protocol';
@@ -18,7 +19,10 @@ import {
   type SessionProviderOutcomeRecordV2,
   type SessionProviderOrderedItemV2,
   type SessionProviderResultMetadataV2,
+  type SessionProviderSettledToolCallV2,
+  type SessionProviderToolRejectionV2,
   type SessionProviderToolCallReceiptV2,
+  type SessionToolCorrectionV2,
   type SessionProviderTurnTargetV2,
 } from './types.js';
 
@@ -59,6 +63,8 @@ export interface SessionProviderToolCallQueueItemV2 {
   terminalFactId?: string;
   terminalFactKind?: string;
   settlementReason?: string;
+  rejection?: SessionProviderToolRejectionV2;
+  correction?: SessionToolCorrectionV2;
 }
 
 export interface SessionProviderToolCallQueueV2 {
@@ -171,6 +177,7 @@ export function createSessionProviderToolCallQueueV2(input: {
   orderedItems: SessionProviderOrderedItemV2[];
   completion: SessionProviderCompletionReceiptV1;
   intents: ToolIntentV2[];
+  correction?: SessionToolCorrectionV2;
 }): SessionProviderToolCallQueueV2 {
   const queue: SessionProviderToolCallQueueV2 = {
     providerTurnId: input.providerTurnId,
@@ -184,6 +191,9 @@ export function createSessionProviderToolCallQueueV2(input: {
       ordinal: index + 1,
       intent: cloneJson(intent),
       status: 'pending',
+      ...(index === 0 && input.correction
+        ? { correction: cloneJson(input.correction) }
+        : {}),
     })),
     status: 'active',
     outcomeRecorded: false,
@@ -252,6 +262,7 @@ export function validateSessionProviderToolCallQueueV2(
   const callIds = new Set<string>();
   const operationIds = new Set<string>();
   const requestIds = new Set<string>();
+  let correctionCount = 0;
   let firstUnsettled = -1;
   let planRevision: string | undefined;
   for (let index = 0; index < queue.calls.length; index += 1) {
@@ -338,6 +349,28 @@ export function validateSessionProviderToolCallQueueV2(
     if (item.settlementReason) {
       requiredIdentity(item.settlementReason, 'settlementReason');
     }
+    if (item.correction) {
+      correctionCount += 1;
+      requiredIdentity(
+        item.correction.retryGroupId,
+        'correction.retryGroupId'
+      );
+      requiredIdentity(
+        item.correction.predecessorOperationId,
+        'correction.predecessorOperationId'
+      );
+      if (
+        !Number.isSafeInteger(item.correction.retryOrdinal)
+        || item.correction.retryOrdinal < 2
+        || item.correction.predecessorOperationId
+          === item.intent.operationId
+      ) {
+        throw invalidQueue();
+      }
+    }
+    if (item.rejection) {
+      validateProviderToolRejectionV2(item.rejection);
+    }
     if (
       item.status === 'pending'
       && (
@@ -419,6 +452,15 @@ export function validateSessionProviderToolCallQueueV2(
         (item.status === 'aborted' || item.status === 'unexecuted')
           !== (item.settlementReason !== undefined)
       )
+      || (
+        item.rejection !== undefined
+        && (
+          item.status !== 'aborted'
+          || item.settlementReason !== 'kernelRejected'
+          || item.invocationId !== undefined
+          || terminalIdentityComplete
+        )
+      )
     ) {
       throw invalidQueue();
     }
@@ -485,6 +527,11 @@ export function validateSessionProviderToolCallQueueV2(
       queue.status === 'aborted'
       && (queue.settledAt === undefined || queue.abortReason === undefined)
     )
+    || correctionCount > 1
+    || queue.calls.some((item) =>
+      item.correction !== undefined
+      && operationIds.has(item.correction.predecessorOperationId)
+    )
     || jsonByteLength(queue) > MAX_PROVIDER_TOOL_CALL_QUEUE_BYTES
   ) {
     throw invalidQueue();
@@ -528,6 +575,17 @@ export function markSessionProviderToolCallSubmittedV2(
       item.invocationId = input.reply.data.invocationId;
       return true;
     case 'rejected':
+      if (
+        input.reply.data.reason !== 'runBusy'
+        && input.reply.data.reason !== 'capacityExceeded'
+        && input.reply.data.reason !== 'indeterminateRecoveryRequired'
+      ) {
+        item.rejection = {
+          reason: input.reply.data.reason,
+          guidance: input.reply.data.guidance,
+          rejectionFactId: input.reply.data.rejectionFactId,
+        };
+      }
       abortSessionProviderToolCallQueueV2(
         state,
         input.reply.data.reason === 'runBusy'
@@ -543,6 +601,76 @@ export function markSessionProviderToolCallSubmittedV2(
     default:
       throw invalidQueue();
   }
+}
+
+export function sessionToolCorrectionForNextTurnV2(input: {
+  queue?: SessionProviderToolCallQueueV2;
+  runId: string;
+  controlEpoch: number;
+  nextTarget: SessionProviderTurnTargetV2;
+}): SessionToolCorrectionV2 | undefined {
+  const queue = input.queue;
+  if (
+    !queue
+    || queue.status !== 'aborted'
+    || !queue.outcomeRecorded
+    || queue.abortReason !== 'kernelRejected'
+    || queue.controlEpoch !== input.controlEpoch
+    || !correctionTargetsMatch(queue.target, input.nextTarget)
+  ) {
+    return undefined;
+  }
+  const predecessor = queue.calls.find((call) =>
+    call.status === 'aborted' && call.rejection !== undefined
+  );
+  if (!predecessor) return undefined;
+  const existing = predecessor.correction;
+  return {
+    retryGroupId: existing?.retryGroupId ?? `retry-group-${sha256Hash(
+      canonicalJson({
+        schemaVersion: 'deepcode.session.tool-retry-group.v1',
+        runId: input.runId,
+        controlEpoch: input.controlEpoch,
+        initialOperationId: predecessor.intent.operationId,
+      })
+    ).replace(/^sha256:/u, '')}`,
+    predecessorOperationId: predecessor.intent.operationId,
+    retryOrdinal: (existing?.retryOrdinal ?? 1) + 1,
+  };
+}
+
+export function settledSessionProviderToolCallsV2(
+  queue: SessionProviderToolCallQueueV2
+): SessionProviderSettledToolCallV2[] {
+  if (queue.status === 'active' || !queue.settledAt) {
+    throw invalidQueue();
+  }
+  validateSessionProviderToolCallQueueV2(queue, {
+    runId: queue.calls[0]?.intent.runId,
+    controlEpoch: queue.controlEpoch,
+  });
+  return queue.calls.map((call) => ({
+    ordinal: call.ordinal,
+    operationId: call.intent.operationId,
+    toolId: call.intent.toolId,
+    status: call.status as SessionProviderSettledToolCallV2['status'],
+    ...(call.invocationId ? { invocationId: call.invocationId } : {}),
+    ...(call.terminalFactId
+      ? { terminalFactId: call.terminalFactId }
+      : {}),
+    ...(call.terminalFactKind
+      ? { terminalFactKind: call.terminalFactKind }
+      : {}),
+    ...(call.settlementReason
+      ? { settlementReason: call.settlementReason }
+      : {}),
+    ...(call.rejection
+      ? { rejection: cloneJson(call.rejection) }
+      : {}),
+    ...(call.correction
+      ? { correction: cloneJson(call.correction) }
+      : {}),
+  }));
 }
 
 export function prepareSessionProviderToolCallSubmissionV2(
@@ -944,7 +1072,7 @@ function validateExactSessionProviderOutcomeRecordV2(
       'recordedAt',
       'providerResult',
     ],
-    ['summary', 'toolCallReceipt', 'toolSettlement']
+    ['summary', 'toolCallReceipt', 'toolSettlement', 'toolCalls']
   );
   const providerTurnId = requiredIdentity(
     record.providerTurnId,
@@ -1013,6 +1141,7 @@ function validateExactSessionProviderOutcomeRecordV2(
     ) {
       throw invalidQueue();
     }
+    const receiptCalls = receipt.calls as unknown[];
     requiredDigest(
       receipt.responseDigest,
       'providerOutcome.responseDigest'
@@ -1022,7 +1151,7 @@ function validateExactSessionProviderOutcomeRecordV2(
       'providerOutcome.receipt.recordedAt'
     );
     const callIds = new Set<string>();
-    receipt.calls.forEach((candidate, index) => {
+    receiptCalls.forEach((candidate, index) => {
       const call = exactOutcomeObject(candidate, [
         'ordinal',
         'callId',
@@ -1070,6 +1199,81 @@ function validateExactSessionProviderOutcomeRecordV2(
     ) {
       throw invalidQueue();
     }
+    if (
+      !Array.isArray(record.toolCalls)
+      || record.toolCalls.length !== receipt.callCount
+    ) {
+      throw invalidQueue();
+    }
+    const operationIds = new Set<string>();
+    let correctionCount = 0;
+    record.toolCalls.forEach((candidate, index) => {
+      const call = exactOutcomeObject(
+        candidate,
+        ['ordinal', 'operationId', 'toolId', 'status'],
+        [
+          'invocationId',
+          'terminalFactId',
+          'terminalFactKind',
+          'settlementReason',
+          'rejection',
+          'correction',
+        ]
+      );
+      const operationId = requiredIdentity(
+        call.operationId,
+        'providerOutcome.toolCalls.operationId'
+      );
+      if (
+        call.ordinal !== index + 1
+        || operationIds.has(operationId)
+        || call.toolId !== (receiptCalls[index] as Record<string, unknown>).toolId
+        || (
+          call.status !== 'completed'
+          && call.status !== 'aborted'
+          && call.status !== 'unexecuted'
+        )
+      ) {
+        throw invalidQueue();
+      }
+      operationIds.add(operationId);
+      for (const field of [
+        'invocationId',
+        'terminalFactId',
+        'terminalFactKind',
+        'settlementReason',
+      ] as const) {
+        if (call[field] !== undefined) {
+          requiredIdentity(
+            call[field],
+            `providerOutcome.toolCalls.${field}`
+          );
+        }
+      }
+      if (call.rejection !== undefined) {
+        validateProviderToolRejectionV2(
+          call.rejection as SessionProviderToolRejectionV2
+        );
+      }
+      if (call.correction !== undefined) {
+        correctionCount += 1;
+        validateSessionToolCorrectionV2(
+          call.correction as SessionToolCorrectionV2,
+          operationId
+        );
+      }
+    });
+    if (
+      correctionCount > 1
+      || record.toolCalls.some((candidate) => {
+        const correction = (candidate as Record<string, unknown>)
+          .correction as SessionToolCorrectionV2 | undefined;
+        return correction !== undefined
+          && operationIds.has(correction.predecessorOperationId);
+      })
+    ) {
+      throw invalidQueue();
+    }
     return;
   }
 
@@ -1083,9 +1287,79 @@ function validateExactSessionProviderOutcomeRecordV2(
   if (
     Object.prototype.hasOwnProperty.call(record, 'toolCallReceipt')
     || Object.prototype.hasOwnProperty.call(record, 'toolSettlement')
+    || Object.prototype.hasOwnProperty.call(record, 'toolCalls')
   ) {
     throw invalidQueue();
   }
+}
+
+function validateProviderToolRejectionV2(
+  value: SessionProviderToolRejectionV2
+): void {
+  const record = exactOutcomeObject(
+    value,
+    ['reason', 'guidance', 'rejectionFactId']
+  );
+  const reasons: readonly ToolIntentRejectionReasonV2[] = [
+    'toolNotRegistered',
+    'toolUnavailable',
+    'invalidArguments',
+    'staleToolContext',
+    'staleControlEpoch',
+    'planActionRequired',
+    'capabilityLeaseStale',
+    'capabilityScopeMismatch',
+    'settingsDenied',
+  ];
+  if (
+    !reasons.includes(record.reason as ToolIntentRejectionReasonV2)
+    || typeof record.guidance !== 'string'
+    || !record.guidance.trim()
+    || new TextEncoder().encode(record.guidance).byteLength > 64 * 1024
+  ) {
+    throw invalidQueue();
+  }
+  requiredIdentity(
+    record.rejectionFactId,
+    'rejection.rejectionFactId'
+  );
+}
+
+function validateSessionToolCorrectionV2(
+  value: SessionToolCorrectionV2,
+  operationId: string
+): void {
+  const record = exactOutcomeObject(
+    value,
+    ['retryGroupId', 'predecessorOperationId', 'retryOrdinal']
+  );
+  requiredIdentity(record.retryGroupId, 'correction.retryGroupId');
+  const predecessorOperationId = requiredIdentity(
+    record.predecessorOperationId,
+    'correction.predecessorOperationId'
+  );
+  if (
+    predecessorOperationId === operationId
+    || !Number.isSafeInteger(record.retryOrdinal)
+    || Number(record.retryOrdinal) < 2
+  ) {
+    throw invalidQueue();
+  }
+}
+
+function correctionTargetsMatch(
+  previous: SessionProviderTurnTargetV2,
+  next: SessionProviderTurnTargetV2
+): boolean {
+  if (previous.kind === 'finalAnswer' || next.kind === 'finalAnswer') {
+    return false;
+  }
+  if (previous.kind === 'planAction' || next.kind === 'planAction') {
+    return previous.kind === 'planAction'
+      && next.kind === 'planAction'
+      && previous.planActionId === next.planActionId;
+  }
+  return true;
 }
 
 function exactOutcomeObject(

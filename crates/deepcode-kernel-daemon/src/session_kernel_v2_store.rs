@@ -401,6 +401,8 @@ struct SessionKernelCompactProviderReservationV3 {
     plan_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remaining_tool_call_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correction: Option<SessionKernelToolCorrectionV3>,
     control_epoch: u64,
     context_ref: ToolContextRefV2,
     fact_projection: Value,
@@ -413,6 +415,14 @@ struct SessionKernelCompactProviderReservationV3 {
     dispatch_ref: Option<SessionProviderTurnRecordRefV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_ref: Option<SessionProviderTurnRecordRefV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionKernelToolCorrectionV3 {
+    retry_group_id: String,
+    predecessor_operation_id: String,
+    retry_ordinal: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3176,6 +3186,21 @@ fn validate_provider_reservation(
     validate_bounded_identity(&reservation.status, "providerStatus", 128)?;
     if let Some(reason) = &reservation.cancellation_reason {
         validate_bounded_identity(reason, "cancellationReason", 128)?;
+    }
+    if let Some(correction) = &reservation.correction {
+        validate_bounded_identity(
+            &correction.retry_group_id,
+            "correction.retryGroupId",
+            512,
+        )?;
+        validate_bounded_identity(
+            &correction.predecessor_operation_id,
+            "correction.predecessorOperationId",
+            512,
+        )?;
+        if correction.retry_ordinal < 2 || correction.retry_ordinal > MAX_SAFE_INTEGER_V3 {
+            return Err(provider_turn_admission_invalid());
+        }
     }
     if let Some(dispatch_ref) = &reservation.dispatch_ref {
         validate_record_ref(dispatch_ref, "dispatchRef")?;
