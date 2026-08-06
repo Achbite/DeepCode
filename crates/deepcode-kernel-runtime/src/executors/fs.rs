@@ -338,9 +338,7 @@ impl KernelToolExecutor for FsDiffExecutor {
             .content;
         let new_content =
             get_string_allow_empty(&invocation.input, "proposedContent").ok_or_else(|| {
-                KernelError::InvalidCommand(
-                    "fs.diff requires proposedContent from contentBlockId".to_string(),
-                )
+                KernelError::InvalidCommand("fs.diff requires proposedContent".to_string())
             })?;
         let changed_ranges = changed_line_ranges(&old_content, &new_content);
         Ok(ok(

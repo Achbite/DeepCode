@@ -2,7 +2,7 @@ use crate::invocation_types::{
     KernelCanonicalInvocation, KernelDeleteTarget, KernelGitDiffScope, KernelToolKind,
 };
 use deepcode_kernel_abi::v2::{PlatformV2, V2ValidationError};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
@@ -22,12 +22,10 @@ fn invalid_arguments(tool_id: &'static str) -> InvocationNormalizationError {
 
 pub fn canonicalize_invocation(
     tool_id: KernelToolKind,
-    mut arguments: Value,
+    arguments: Value,
 ) -> Result<KernelCanonicalInvocation, InvocationNormalizationError> {
     use KernelToolKind as Tool;
-    if tool_id == Tool::FsDelete {
-        arguments = canonicalize_delete_arguments(&arguments)?;
-    }
+    let mut arguments = adapt_public_arguments(tool_id, arguments)?;
     let fields = arguments
         .as_object_mut()
         .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
@@ -35,17 +33,14 @@ pub fn canonicalize_invocation(
         fields.entry(name.to_owned()).or_insert(value);
     };
     match tool_id {
-        Tool::FsRead => materialize("range", json!({"kind":"whole","data":{}})),
         Tool::FsList => {
             materialize("depth", json!(2));
             materialize("includeHidden", json!(false));
         }
         Tool::FsGlob => {
-            materialize("root", json!("."));
             materialize("maxResults", json!(500));
         }
         Tool::CodeGrep => {
-            materialize("root", json!("."));
             materialize("include", json!([]));
             materialize("exclude", json!([]));
             materialize("strategy", json!("literal"));
@@ -53,7 +48,6 @@ pub fn canonicalize_invocation(
             materialize("maxResults", json!(200));
         }
         Tool::FsCreate => materialize("executable", json!(false)),
-        Tool::DocumentRead => materialize("pages", json!({"kind":"all","data":{}})),
         Tool::GitDiff => {
             materialize("scope", json!({"kind":"repository","data":{}}));
             materialize("staged", json!(false));
@@ -67,7 +61,14 @@ pub fn canonicalize_invocation(
         "arguments":arguments,
     }))
     .map_err(|_| invalid_arguments(tool_id.as_str()))?;
-    match &mut invocation {
+    normalize_invocation(&mut invocation)?;
+    Ok(invocation)
+}
+
+fn normalize_invocation(
+    invocation: &mut KernelCanonicalInvocation,
+) -> Result<(), InvocationNormalizationError> {
+    match invocation {
         KernelCanonicalInvocation::FsRead { path, .. }
         | KernelCanonicalInvocation::FsDiff { path, .. }
         | KernelCanonicalInvocation::FsCreate { path, .. }
@@ -121,33 +122,105 @@ pub fn canonicalize_invocation(
         _ => {}
     }
     invocation.validate()?;
-    Ok(invocation)
+    Ok(())
 }
 
 pub fn validate_canonical_invocation(
     invocation: &KernelCanonicalInvocation,
 ) -> Result<(), InvocationNormalizationError> {
-    invocation.validate()?;
-    let encoded = serde_json::to_value(invocation)
-        .map_err(|_| invalid_arguments(invocation.tool_id().as_str()))?;
-    let arguments = match invocation {
-        KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::File { path }) => {
-            json!({"path":path,"targetKind":"file"})
-        }
-        KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => {
-            json!({"path":path,"targetKind":"directory","recursive":true})
-        }
-        _ => encoded
-            .as_object()
-            .and_then(|value| value.get("arguments"))
-            .cloned()
-            .ok_or_else(|| invalid_arguments(invocation.tool_id().as_str()))?,
-    };
-    let normalized = canonicalize_invocation(invocation.tool_id(), arguments)?;
+    let mut normalized = invocation.clone();
+    normalize_invocation(&mut normalized)?;
     if normalized != *invocation {
         return Err(InvocationNormalizationError::NotCanonical {
             tool_id: invocation.tool_id().as_str(),
         });
+    }
+    Ok(())
+}
+
+fn adapt_public_arguments(
+    tool_id: KernelToolKind,
+    mut arguments: Value,
+) -> Result<Value, InvocationNormalizationError> {
+    use KernelToolKind as Tool;
+    if tool_id == Tool::FsDelete {
+        return canonicalize_delete_arguments(&arguments);
+    }
+    let fields = arguments
+        .as_object_mut()
+        .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
+    match tool_id {
+        Tool::FsRead => {
+            ensure_allowed_fields(fields, &["path", "startLine", "endLine"], tool_id)?;
+            let start_line = fields.remove("startLine");
+            let end_line = fields.remove("endLine");
+            let range = match (start_line, end_line) {
+                (None, None) => json!({"kind":"whole","data":{}}),
+                (Some(start_line), Some(end_line)) => json!({
+                    "kind":"lines",
+                    "data":{"startLine":start_line,"endLine":end_line}
+                }),
+                _ => return Err(invalid_arguments(tool_id.as_str())),
+            };
+            fields.insert("range".to_owned(), range);
+        }
+        Tool::FsList => {
+            ensure_allowed_fields(fields, &["path", "depth", "includeHidden"], tool_id)?;
+            fields
+                .entry("path".to_owned())
+                .or_insert_with(|| json!("."));
+        }
+        Tool::FsGlob => {
+            ensure_allowed_fields(fields, &["pattern", "path", "maxResults"], tool_id)?;
+            let root = fields.remove("path").unwrap_or_else(|| json!("."));
+            fields.insert("root".to_owned(), root);
+        }
+        Tool::CodeGrep => {
+            ensure_allowed_fields(
+                fields,
+                &[
+                    "query",
+                    "include",
+                    "exclude",
+                    "path",
+                    "strategy",
+                    "contextLines",
+                    "maxResults",
+                ],
+                tool_id,
+            )?;
+            let root = fields.remove("path").unwrap_or_else(|| json!("."));
+            fields.insert("root".to_owned(), root);
+        }
+        Tool::DocumentRead => {
+            ensure_allowed_fields(fields, &["path", "startPage", "endPage"], tool_id)?;
+            let start_page = fields.remove("startPage");
+            let end_page = fields.remove("endPage");
+            let pages = match (start_page, end_page) {
+                (None, None) => json!({"kind":"all","data":{}}),
+                (Some(start_page), Some(end_page)) => json!({
+                    "kind":"range",
+                    "data":{"startPage":start_page,"endPage":end_page}
+                }),
+                _ => return Err(invalid_arguments(tool_id.as_str())),
+            };
+            fields.insert("pages".to_owned(), pages);
+        }
+        _ => {}
+    }
+    Ok(arguments)
+}
+
+fn ensure_allowed_fields(
+    fields: &Map<String, Value>,
+    allowed: &[&str],
+    tool_id: KernelToolKind,
+) -> Result<(), InvocationNormalizationError> {
+    if fields
+        .keys()
+        .any(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(invalid_arguments(tool_id.as_str()));
     }
     Ok(())
 }

@@ -785,6 +785,10 @@ const SUPPORTED_TOOL_SCHEMA_KEYWORDS_V2 = new Set([
   'items',
   'enum',
   'minimum',
+  'maximum',
+  'minLength',
+  'minItems',
+  'maxItems',
   'const',
   'oneOf',
 ]);
@@ -871,16 +875,46 @@ function validateToolSchemaValueV2(
       return validateToolSchemaObjectV2(value, schema, path);
     case 'array':
       if (!Array.isArray(value)) return `${path} must be an array`;
+      if ('minItems' in schema) {
+        if (!Number.isSafeInteger(schema.minItems) || Number(schema.minItems) < 0) {
+          throw new UnsupportedToolSchemaV2(
+            `${path}.minItems must be a non-negative safe integer`
+          );
+        }
+        if (value.length < Number(schema.minItems)) {
+          return `${path} must contain at least ${String(schema.minItems)} items`;
+        }
+      }
+      if ('maxItems' in schema) {
+        if (!Number.isSafeInteger(schema.maxItems) || Number(schema.maxItems) < 0) {
+          throw new UnsupportedToolSchemaV2(
+            `${path}.maxItems must be a non-negative safe integer`
+          );
+        }
+        if (value.length > Number(schema.maxItems)) {
+          return `${path} must contain at most ${String(schema.maxItems)} items`;
+        }
+      }
       if (!('items' in schema)) return undefined;
       return firstSchemaMismatchV2(
         value.map((item, index) =>
           validateToolSchemaValueV2(item, schema.items, `${path}[${index}]`)
         )
       );
-    case 'string':
-      return typeof value === 'string'
-        ? undefined
-        : `${path} must be a string`;
+    case 'string': {
+      if (typeof value !== 'string') return `${path} must be a string`;
+      if ('minLength' in schema) {
+        if (!Number.isSafeInteger(schema.minLength) || Number(schema.minLength) < 0) {
+          throw new UnsupportedToolSchemaV2(
+            `${path}.minLength must be a non-negative safe integer`
+          );
+        }
+        if ([...value].length < Number(schema.minLength)) {
+          return `${path} must contain at least ${String(schema.minLength)} characters`;
+        }
+      }
+      return undefined;
+    }
     case 'integer':
       if (!Number.isSafeInteger(value)) {
         return `${path} must be a cross-language safe integer`;
@@ -893,6 +927,16 @@ function validateToolSchemaValueV2(
         }
         if (Number(value) < Number(schema.minimum)) {
           return `${path} must be at least ${String(schema.minimum)}`;
+        }
+      }
+      if ('maximum' in schema) {
+        if (!Number.isSafeInteger(schema.maximum)) {
+          throw new UnsupportedToolSchemaV2(
+            `${path}.maximum must be a safe integer`
+          );
+        }
+        if (Number(value) > Number(schema.maximum)) {
+          return `${path} must be at most ${String(schema.maximum)}`;
         }
       }
       return undefined;

@@ -5,20 +5,40 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
     match operation_kind {
         KernelToolKind::FsRead => serde_json::json!({
             "type": "object",
-            "required": ["path"],
-            "properties": {
-                "path": { "type": "string" },
-                "startLine": { "type": "integer", "minimum": 1 },
-                "endLine": { "type": "integer", "minimum": 1 }
-            },
-            "additionalProperties": false
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "required": ["path", "startLine", "endLine"],
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 },
+                        "startLine": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": u32::MAX
+                        },
+                        "endLine": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": u32::MAX
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            ]
         }),
         KernelToolKind::FsList => serde_json::json!({
             "type": "object",
-            "required": ["path"],
             "properties": {
-                "path": { "type": "string" },
-                "depth": { "type": "integer", "minimum": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "depth": { "type": "integer", "minimum": 1, "maximum": 16 },
                 "includeHidden": { "type": "boolean" }
             },
             "additionalProperties": false
@@ -27,18 +47,18 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "type": "object",
             "required": ["pattern"],
             "properties": {
-                "pattern": { "type": "string" },
-                "path": { "type": "string" },
-                "maxResults": { "type": "integer", "minimum": 1 }
+                "pattern": { "type": "string", "minLength": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "maxResults": { "type": "integer", "minimum": 1, "maximum": 5000 }
             },
             "additionalProperties": false
         }),
         KernelToolKind::FsDiff => serde_json::json!({
             "type": "object",
-            "required": ["path", "contentBlockId"],
+            "required": ["path", "proposedContent"],
             "properties": {
-                "path": { "type": "string" },
-                "contentBlockId": { "type": "string" }
+                "path": { "type": "string", "minLength": 1 },
+                "proposedContent": { "type": "string" }
             },
             "additionalProperties": false
         }),
@@ -49,7 +69,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                     "type": "object",
                     "required": ["path", "targetKind"],
                     "properties": {
-                        "path": { "type": "string" },
+                        "path": { "type": "string", "minLength": 1 },
                         "targetKind": { "const": "file" }
                     },
                     "additionalProperties": false
@@ -58,7 +78,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                     "type": "object",
                     "required": ["path", "targetKind", "recursive"],
                     "properties": {
-                        "path": { "type": "string" },
+                        "path": { "type": "string", "minLength": 1 },
                         "targetKind": { "const": "directory" },
                         "recursive": { "const": true }
                     },
@@ -70,34 +90,40 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "type": "object",
             "required": ["query"],
             "properties": {
-                "query": { "type": "string" },
-                "include": { "type": "array", "items": { "type": "string" } },
-                "exclude": { "type": "array", "items": { "type": "string" } },
-                "path": { "type": "string" },
+                "query": { "type": "string", "minLength": 1 },
+                "include": {
+                    "type": "array",
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1 }
+                },
+                "exclude": {
+                    "type": "array",
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1 }
+                },
+                "path": { "type": "string", "minLength": 1 },
                 "strategy": { "type": "string", "enum": ["literal", "regex"] },
-                "contextLines": { "type": "integer", "minimum": 0 },
-                "maxResults": { "type": "integer", "minimum": 1 }
+                "contextLines": { "type": "integer", "minimum": 0, "maximum": 5 },
+                "maxResults": { "type": "integer", "minimum": 1, "maximum": 500 }
             },
             "additionalProperties": false
         }),
         KernelToolKind::FsCreate => serde_json::json!({
             "type": "object",
-            "required": ["path", "contentBlockId"],
+            "required": ["path", "content"],
             "properties": {
-                "path": { "type": "string" },
-                "contentBlockId": { "type": "string" },
-                "temporary": { "type": "boolean" },
+                "path": { "type": "string", "minLength": 1 },
+                "content": { "type": "string" },
                 "executable": { "type": "boolean" }
             },
             "additionalProperties": false
         }),
         KernelToolKind::FsWrite => serde_json::json!({
             "type": "object",
-            "required": ["path", "contentBlockId"],
+            "required": ["path", "content"],
             "properties": {
-                "path": { "type": "string" },
-                "contentBlockId": { "type": "string" },
-                "temporary": { "type": "boolean" }
+                "path": { "type": "string", "minLength": 1 },
+                "content": { "type": "string" }
             },
             "additionalProperties": false
         }),
@@ -105,7 +131,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "type": "object",
             "required": ["path"],
             "properties": {
-                "path": { "type": "string" }
+                "path": { "type": "string", "minLength": 1 }
             },
             "additionalProperties": false
         }),
@@ -113,7 +139,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "type": "object",
             "required": ["path", "matcher", "replacement"],
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "minLength": 1 },
                 "matcher": {
                     "oneOf": [
                         {
@@ -125,7 +151,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                                     "type": "object",
                                     "required": ["text"],
                                     "properties": {
-                                        "text": { "type": "string" }
+                                        "text": { "type": "string", "minLength": 1 }
                                     },
                                     "additionalProperties": false
                                 }
@@ -142,7 +168,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                                     "required": ["before", "target", "after"],
                                     "properties": {
                                         "before": { "type": "string" },
-                                        "target": { "type": "string" },
+                                        "target": { "type": "string", "minLength": 1 },
                                         "after": { "type": "string" }
                                     },
                                     "additionalProperties": false
@@ -159,8 +185,16 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                                     "type": "object",
                                     "required": ["startLine", "endLine", "precondition"],
                                     "properties": {
-                                        "startLine": { "type": "integer", "minimum": 1 },
-                                        "endLine": { "type": "integer", "minimum": 1 },
+                                        "startLine": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": u32::MAX
+                                        },
+                                        "endLine": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": u32::MAX
+                                        },
                                         "precondition": {
                                             "oneOf": [
                                                 {
@@ -172,7 +206,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                                                             "type": "object",
                                                             "required": ["digest"],
                                                             "properties": {
-                                                                "digest": { "type": "string" }
+                                                                "digest": { "type": "string", "minLength": 1 }
                                                             },
                                                             "additionalProperties": false
                                                         }
@@ -188,7 +222,7 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                                                             "type": "object",
                                                             "required": ["text"],
                                                             "properties": {
-                                                                "text": { "type": "string" }
+                                                                "text": { "type": "string", "minLength": 1 }
                                                             },
                                                             "additionalProperties": false
                                                         }
@@ -220,13 +254,34 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
         }),
         KernelToolKind::DocumentRead => serde_json::json!({
             "type": "object",
-            "required": ["path"],
-            "properties": {
-                "path": { "type": "string" },
-                "startPage": { "type": "integer", "minimum": 1 },
-                "endPage": { "type": "integer", "minimum": 1 }
-            },
-            "additionalProperties": false
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 }
+                    },
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "required": ["path", "startPage", "endPage"],
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 },
+                        "startPage": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": u32::MAX
+                        },
+                        "endPage": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": u32::MAX
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            ]
         }),
         KernelToolKind::GitStatus => {
             serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
@@ -259,8 +314,8 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "type": "object",
             "required": ["query"],
             "properties": {
-                "query": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 1 }
+                "query": { "type": "string", "minLength": 1 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 10 }
             },
             "additionalProperties": false
         }),
@@ -268,8 +323,8 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "type": "object",
             "required": ["url"],
             "properties": {
-                "url": { "type": "string" },
-                "maxBytes": { "type": "integer", "minimum": 1 }
+                "url": { "type": "string", "minLength": 1 },
+                "maxBytes": { "type": "integer", "minimum": 1024, "maximum": 262144 }
             },
             "additionalProperties": false
         }),
