@@ -61,6 +61,11 @@ interface MutableTurn {
   workSegments: AgentTimelineWorkSegment[];
   parts: AgentTimelineTurnPart[];
   activeWorkSegmentId?: string;
+  openWorkGroupId?: string;
+  nextWorkGroupOrdinal: number;
+  workGroupIdByOperationId: Map<string, string>;
+  workGroupAnchorBlockIdById: Map<string, string>;
+  providerOperationIds: Map<string, Set<string>>;
   providerStreamSequences: Map<string, number>;
   terminalEvent?: AgentEvent;
 }
@@ -129,6 +134,7 @@ export function buildNarrativeTimelineProjection(
       updateTurnStatus(turn, event, payload, block);
       if (block.providerPhase === 'commentary') {
         turn.activeWorkSegmentId = undefined;
+        turn.openWorkGroupId = undefined;
       }
     } else {
       updateTurnStatusFromEvent(turn, event, payload);
@@ -2127,6 +2133,10 @@ function createProjectionTurn(
     blocks: [],
     workSegments: [],
     parts: [],
+    nextWorkGroupOrdinal: 0,
+    workGroupIdByOperationId: new Map(),
+    workGroupAnchorBlockIdById: new Map(),
+    providerOperationIds: new Map(),
     providerStreamSequences: new Map(),
   };
   context.turns.push(turn);
@@ -2216,8 +2226,13 @@ function projectProviderOutputIntoTurn(
   const desiredParts: AgentTimelineTurnPart[] = [];
   const relatedBlockIds = new Set<string>();
   const relatedSegmentIds = new Set<string>();
-  let providerGroupIndex = 0;
-  let activeProviderSegment: AgentTimelineWorkSegment | undefined;
+  let boundaryBlockId: string | undefined;
+  let activeProviderGroupId = turn.openWorkGroupId;
+  let activeProviderSegment = activeProviderGroupId
+    ? turn.workSegments.find((segment) =>
+        segment.id === activeProviderGroupId
+      )
+    : undefined;
 
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index]!;
@@ -2322,8 +2337,11 @@ function projectProviderOutputIntoTurn(
         desiredParts.push({ kind: 'block', blockId });
       }
       if (settledRole === 'commentary') {
+        boundaryBlockId = blockId;
+        activeProviderGroupId = undefined;
         activeProviderSegment = undefined;
         turn.activeWorkSegmentId = undefined;
+        turn.openWorkGroupId = undefined;
       }
       index = lastIndex;
       continue;
@@ -2333,16 +2351,36 @@ function projectProviderOutputIntoTurn(
     const operationId = stringValue(item.operationId);
     const toolId = stringValue(item.toolId);
     if (!operationId || !toolId) continue;
+    let providerOperationIds = turn.providerOperationIds.get(providerTurnId);
+    if (!providerOperationIds) {
+      providerOperationIds = new Set<string>();
+      turn.providerOperationIds.set(providerTurnId, providerOperationIds);
+    }
+    providerOperationIds.add(operationId);
+    const existingWorkGroupId = turn.workGroupIdByOperationId.get(
+      operationId
+    );
+    const workGroupId = existingWorkGroupId
+      ?? activeProviderGroupId
+      ?? allocateWorkGroup(turn, boundaryBlockId);
+    if (!existingWorkGroupId) {
+      turn.workGroupIdByOperationId.set(operationId, workGroupId);
+    }
+    activeProviderGroupId = workGroupId;
+    turn.openWorkGroupId = workGroupId;
     const admitted = providerOperationInTurn(turn, operationId);
     if (!admitted) continue;
-    if (!activeProviderSegment) {
-      providerGroupIndex += 1;
-      activeProviderSegment = providerWorkSegment(
+    if (
+      !activeProviderSegment
+      || activeProviderSegment.id !== workGroupId
+    ) {
+      activeProviderSegment = workSegmentForGroup(
         turn,
-        providerTurnId,
-        providerGroupIndex,
+        workGroupId,
         event
       );
+    }
+    if (!relatedSegmentIds.has(activeProviderSegment.id)) {
       relatedSegmentIds.add(activeProviderSegment.id);
       desiredParts.push({
         kind: 'workSegment',
@@ -2492,6 +2530,7 @@ function projectProviderComposingIntoTurn(
   turn.status = 'running';
   turn.completedAt = undefined;
   turn.activeWorkSegmentId = undefined;
+  turn.openWorkGroupId = undefined;
   return true;
 }
 
@@ -2533,13 +2572,23 @@ function providerTextSettledRoles(
   return roles;
 }
 
-function providerWorkSegment(
+function allocateWorkGroup(
   turn: MutableTurn,
-  providerTurnId: string,
-  groupIndex: number,
+  anchorBlockId?: string
+): string {
+  turn.nextWorkGroupOrdinal += 1;
+  const id = `work:${turn.id}:${turn.nextWorkGroupOrdinal}`;
+  if (anchorBlockId) {
+    turn.workGroupAnchorBlockIdById.set(id, anchorBlockId);
+  }
+  return id;
+}
+
+function workSegmentForGroup(
+  turn: MutableTurn,
+  id: string,
   event: AgentEvent
 ): AgentTimelineWorkSegment {
-  const id = `work:${turn.id}:provider:${providerTurnId}:${groupIndex}`;
   const existing = turn.workSegments.find((segment) => segment.id === id);
   if (existing) return existing;
   const segment: AgentTimelineWorkSegment = {
@@ -2560,7 +2609,22 @@ function providerWorkSegment(
     factRefs: [],
   };
   turn.workSegments.push(segment);
-  turn.parts.push({ kind: 'workSegment', workSegmentId: id });
+  const part: AgentTimelineTurnPart = {
+    kind: 'workSegment',
+    workSegmentId: id,
+  };
+  const anchorBlockId = turn.workGroupAnchorBlockIdById.get(id);
+  const anchorIndex = anchorBlockId
+    ? turn.parts.findIndex((candidate) =>
+        candidate.kind === 'block'
+        && candidate.blockId === anchorBlockId
+      )
+    : -1;
+  if (anchorIndex >= 0) {
+    turn.parts.splice(anchorIndex + 1, 0, part);
+  } else {
+    turn.parts.push(part);
+  }
   return segment;
 }
 
@@ -2678,6 +2742,9 @@ function pruneEmptyWorkSegments(turn: MutableTurn): void {
     && removed.has(turn.activeWorkSegmentId)
   ) {
     turn.activeWorkSegmentId = undefined;
+  }
+  if (turn.openWorkGroupId && removed.has(turn.openWorkGroupId)) {
+    turn.openWorkGroupId = undefined;
   }
 }
 
@@ -2817,6 +2884,7 @@ function projectWorkEventIntoTurn(
       touchWorkSegment(segment, event, []);
     }
     turn.activeWorkSegmentId = undefined;
+    turn.openWorkGroupId = undefined;
     return;
   }
 
@@ -2868,34 +2936,15 @@ function segmentForOperation(
       return segment;
     }
   }
-  const active = turn.activeWorkSegmentId
-    ? turn.workSegments.find(
-        (segment) => segment.id === turn.activeWorkSegmentId
-      )
-    : undefined;
-  if (active) return active;
-  const segment: AgentTimelineWorkSegment = {
-    id: `work:${turn.id}:${turn.workSegments.length + 1}`,
-    revision: 1,
-    sequence: turn.workSegments.length,
-    lifecycle: 'active',
-    attention: null,
-    operations: [],
-    startedAt: event.ts,
-    provenance: {
-      origin: 'session',
-      authority: 'kernel',
-      sourceEventRefs: [event.id],
-      factRefs: [],
-      evidenceRefs: [],
-    },
-    factRefs: [],
-  };
-  turn.workSegments.push(segment);
-  turn.parts.push({
-    kind: 'workSegment',
-    workSegmentId: segment.id,
-  });
+  const mappedWorkGroupId = turn.workGroupIdByOperationId.get(operationId);
+  const workGroupId = mappedWorkGroupId
+    ?? turn.openWorkGroupId
+    ?? allocateWorkGroup(turn);
+  if (!mappedWorkGroupId) {
+    turn.workGroupIdByOperationId.set(operationId, workGroupId);
+  }
+  const segment = workSegmentForGroup(turn, workGroupId, event);
+  turn.openWorkGroupId = workGroupId;
   turn.activeWorkSegmentId = segment.id;
   return segment;
 }
@@ -3274,12 +3323,16 @@ function finalizeTurnWorkSegments(
       && operations.every((operation) =>
         terminalWorkOperationStatus(operation.status)
       );
+    const groupClosed =
+      turn.openWorkGroupId !== segment.id
+      || terminalTimelineStatus(turn.status);
     let lifecycle: AgentTimelineWorkSegment['lifecycle'] =
       segment.lifecycle === 'active'
-        ? allTerminal ? 'completed' : 'active'
+        ? allTerminal && groupClosed ? 'completed' : 'active'
         : segment.lifecycle;
     if (
       allTerminal
+      && groupClosed
       && operations.every((operation) =>
         operation.status === 'cancelled'
         || operation.status === 'stale'
@@ -3601,25 +3654,21 @@ function settleProviderTurnArtifacts(
     }
     settleTimelineBlock(block, event, 'cancelled');
   }
-  const segmentMarker = `:provider:${providerTurnId}:`;
+  const operationIds = turn.providerOperationIds.get(providerTurnId);
+  if (!operationIds) return;
   for (const segment of turn.workSegments) {
-    if (
-      segment.lifecycle !== 'active'
-      || !segment.id.includes(segmentMarker)
-    ) {
-      continue;
+    let changed = false;
+    for (const operation of segment.operations) {
+      if (
+        operationIds.has(operation.operationId)
+        && !terminalWorkOperationStatus(operation.status)
+      ) {
+        operation.status = 'stale';
+        operation.completedAt = event.ts;
+        changed = true;
+      }
     }
-    if (
-      segment.operations.length > 0
-      && segment.operations.every((operation) =>
-        terminalWorkOperationStatus(operation.status)
-      )
-    ) {
-      continue;
-    }
-    segment.lifecycle = 'cancelled';
-    segment.completedAt = event.ts;
-    touchWorkSegment(segment, event, []);
+    if (changed) touchWorkSegment(segment, event, []);
   }
 }
 
@@ -3628,6 +3677,8 @@ function settleTerminalTurnArtifacts(
   event: AgentEvent
 ): void {
   if (!terminalTimelineStatus(turn.status)) return;
+  turn.activeWorkSegmentId = undefined;
+  turn.openWorkGroupId = undefined;
   for (const block of turn.blocks) {
     if (
       terminalTimelineStatus(block.status)

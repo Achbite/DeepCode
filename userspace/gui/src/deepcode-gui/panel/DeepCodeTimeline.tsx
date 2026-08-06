@@ -355,6 +355,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
           <TurnCard
             key={turn.id}
             turn={turn}
+            currentActivity={currentActivity}
             language={language}
             transportPending={loading && turnIndex === viewWithActive.turns.length - 1}
             showActions={turn.id === actionBarTurnId}
@@ -570,6 +571,7 @@ function isBufferedDeliveryBlock(block: AgentTimelineBlock): boolean {
 
 const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
+  currentActivity: AgentTimelineCurrentActivity | null;
   language: UiLanguage;
   transportPending: boolean;
   showActions: boolean;
@@ -578,7 +580,7 @@ const TurnCard: React.FC<{
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ turn, currentActivity, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
   const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
@@ -633,6 +635,7 @@ const TurnCard: React.FC<{
           <WorkSegment
             key={part.workSegment.id}
             segment={part.workSegment}
+            currentActivity={currentActivity}
             language={language}
           />
         ))}
@@ -654,22 +657,15 @@ const CurrentActivityLine: React.FC<{
 
 const WorkSegment: React.FC<{
   segment: AgentTimelineWorkSegment;
+  currentActivity: AgentTimelineCurrentActivity | null;
   language: UiLanguage;
-}> = ({ segment, language }) => {
-  const forceOpen = segment.lifecycle === 'active'
-    || segment.attention?.status === 'unresolved';
-  const previousLifecycle = useRef(segment.lifecycle);
+}> = ({ segment, currentActivity, language }) => {
+  const forceOpen = segment.attention?.status === 'unresolved';
   const [open, setOpen] = useState(forceOpen);
 
   useEffect(() => {
-    const wasActive = previousLifecycle.current === 'active';
-    previousLifecycle.current = segment.lifecycle;
-    if (forceOpen) {
-      setOpen(true);
-    } else if (wasActive && segment.lifecycle !== 'active') {
-      setOpen(false);
-    }
-  }, [forceOpen, segment.lifecycle]);
+    if (forceOpen) setOpen(true);
+  }, [forceOpen]);
 
   return (
     <details
@@ -677,13 +673,18 @@ const WorkSegment: React.FC<{
       open={open}
       onToggle={(event) => {
         const requestedOpen = event.currentTarget.open;
-        setOpen(forceOpen ? true : requestedOpen);
+        if (forceOpen) {
+          event.currentTarget.open = true;
+          setOpen(true);
+          return;
+        }
+        setOpen(requestedOpen);
       }}
     >
       <summary>
         <span className={`deepcode-gui-work-segment__status deepcode-gui-work-segment__status--${segment.lifecycle}`} />
         <span className="deepcode-gui-work-segment__summary">
-          {workSegmentSummary(segment, language)}
+          {workSegmentSummary(segment, currentActivity, language)}
         </span>
         {segment.attention && (
           <span className={`deepcode-gui-work-segment__attention deepcode-gui-work-segment__attention--${segment.attention.status}`}>
@@ -787,11 +788,47 @@ function currentActivityLabel(
 
 function workSegmentSummary(
   segment: AgentTimelineWorkSegment,
+  currentActivity: AgentTimelineCurrentActivity | null,
   language: UiLanguage
 ): string {
   const count = segment.operations.length;
-  if (language === 'zh-CN') return `工作 ${count} 项`;
-  return `${count} ${count === 1 ? 'operation' : 'operations'}`;
+  const currentOperation = currentWorkOperation(segment, currentActivity);
+  if (segment.lifecycle === 'active' && currentOperation) {
+    const title = currentOperation.displayName?.trim()
+      || currentOperation.canonicalAction?.trim()
+      || currentOperation.toolId;
+    const targets = currentOperation.targets
+      ?.map((target) => target.trim())
+      .filter(Boolean)
+      .join(' · ');
+    const task = targets ? `${title} · ${targets}` : title;
+    return `${task} · ${workOperationStatusLabel(currentOperation.status, language)}`;
+  }
+  const labels: Record<AgentTimelineWorkSegment['lifecycle'], readonly [string, string]> = {
+    active: ['正在处理', 'Working'],
+    completed: ['已完成', 'Completed'],
+    cancelled: ['已取消', 'Cancelled'],
+    failed: ['失败', 'Failed'],
+  };
+  const label = labels[segment.lifecycle];
+  const state = language === 'zh-CN' ? label[0] : label[1];
+  if (language === 'zh-CN') return `${state} · ${count} 项`;
+  return `${state} · ${count} ${count === 1 ? 'operation' : 'operations'}`;
+}
+
+function currentWorkOperation(
+  segment: AgentTimelineWorkSegment,
+  currentActivity: AgentTimelineCurrentActivity | null
+): AgentTimelineWorkOperation | undefined {
+  if (
+    currentActivity?.operationId
+    && currentActivity.workSegmentId === segment.id
+  ) {
+    return segment.operations.find((operation) =>
+      operation.operationId === currentActivity.operationId
+    );
+  }
+  return undefined;
 }
 
 function workOperationStatusLabel(
