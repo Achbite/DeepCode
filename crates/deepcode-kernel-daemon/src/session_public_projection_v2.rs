@@ -270,9 +270,11 @@ fn validate_turn_retry_relations(
                         .and_then(|value| value.checked_add(1))
                         == Some(retry_ordinal) => {}
             None if retry_ordinal == 2 => {}
-            _ => return Err(format!(
+            _ => {
+                return Err(format!(
                 "Session v2 public projection operation {operation_id} has an invalid retry chain"
-            )),
+            ))
+            }
         }
     }
     Ok(())
