@@ -53,6 +53,15 @@ Each registration owns:
 - canonicalizer, policy metadata, executor binding, verification, cleanup, and
   cancellation behavior.
 
+The public JSON Schema, raw-argument decoder, canonicalizer, and canonical
+invocation validator are one contract. Every shape admitted by the public
+schema must be mechanically canonicalizable, and every publicly accepted field
+must keep the same name and meaning through the adapter. Resource existence,
+workspace binding, policy, and authorization may still reject a structurally
+valid request later, but a schema/adapter mismatch is a registry defect. It
+must never be repaired with Provider prompting, Session aliases, or
+tool-specific fallback parsing.
+
 `RunOpen` returns a safe `ToolContextBundle` containing the ready projection,
 catalog and context versions, digests, schemas, and the compiled prompt block.
 It never contains a run capability, user-decision capability, lease, secret, or
@@ -116,6 +125,19 @@ Kernel fixedPrompt bytes
 → bounded prior provider outcomes
 → canonical Kernel facts
 ```
+
+The effective output budget has one identity for a Provider turn. Session
+context reservation, the durable context receipt, ProviderTurn dispatch, and
+the actual outbound request must all use the same value derived from the exact
+Profile revision and the statically selected provider/model capability. There
+is no provider-generic silent output cap. An unsupported or inconsistent
+budget fails before network dispatch with a typed configuration error; it is
+never silently reduced by a transport adapter.
+
+Provider transport, trace storage, tool-contract correction, and retry
+projection changes do not alter the frozen context-section ordering, trimming
+policy, cache key, cache-hit identity, or cache receipt. Any future change to
+those boundaries requires a separate protocol decision.
 
 The Kernel prompt bytes and tool semantics are not rewritten. Each
 Provider lifecycle record retains the profile binding, input budget, memory
@@ -362,6 +384,13 @@ arguments are never streamed publicly. Only catalog-validated tool identity,
 Kernel-canonical targets, resource references, facts, and effect summaries may
 populate a public operation.
 
+When Session requests a corrected operation after a pre-effect validation or
+admission failure, the new operation must carry an explicit typed predecessor
+or retry-group relation. The relation is produced by Session from its ordered
+response/admission state and preserved by the projector; shells never infer
+retries from tool names, arguments, timing, or localized text. A retry relation
+does not reuse Kernel invocation or attempt identity and grants no authority.
+
 The replaceable run projection carries `currentActivity` and `wait`. Current
 activity codes are limited to:
 
@@ -449,11 +478,22 @@ capabilities, and leases are excluded before trace serialization.
 
 Trace publication follows archive-before-publication. Buffered data is flushed
 after 250 ms or 16 KiB, whichever occurs first, and at request, response, and
-terminal boundaries. Raw upstream source bytes have a 1 MiB soft per-turn
-limit: the complete envelope that crosses the limit is archived once, then the
-turn terminates without tool admission. One raw envelope and one outbound
-request each have an independent 16 MiB hard limit. Trace directories use mode
-0700 and files use 0600.
+terminal boundaries. Cumulative raw upstream source bytes are monotonic
+telemetry and have no authority to terminate an otherwise valid Provider turn.
+They may drive storage admission, retention, compaction, and operator
+diagnostics outside Provider semantic completion, but are not a completion or
+tool-admission gate.
+
+Raw envelopes are archived in bounded chunks with per-chunk sequence, source
+byte count, digest, and final turn seal so that token-granular SSE framing does
+not require one base64 JSON record per delta. The exact upstream envelopes and
+their order remain recoverable from the sealed trace. One raw envelope and one
+outbound request each retain an independent 16 MiB structural hard limit.
+Crossing either hard limit terminates before tool admission with a typed
+`limitExceeded` terminal. Failure to durably archive because of actual I/O,
+quota, or storage-admission failure is a distinct trace-persistence failure;
+archive-before-publication still forbids publishing or admitting unarchived
+content. Trace directories use mode 0700 and files use 0600.
 
 Archived Sessions retain traces. Explicit Session deletion uses visible,
 retryable two-stage deletion. It does not claim cryptographic erasure or
