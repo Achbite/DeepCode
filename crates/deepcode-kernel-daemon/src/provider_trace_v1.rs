@@ -16,7 +16,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) const PROVIDER_TRACE_SCHEMA_V1: &str = "deepcode.session.provider-trace.v1";
 pub(crate) const PROVIDER_TRACE_FLUSH_INTERVAL_V1: Duration = Duration::from_millis(250);
 pub(crate) const PROVIDER_TRACE_FLUSH_BYTES_V1: usize = 16 * 1024;
-pub(crate) const PROVIDER_TRACE_RAW_SOURCE_SOFT_LIMIT_V1: usize = 1024 * 1024;
 pub(crate) const PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1: usize = 16 * 1024 * 1024;
 pub(crate) const PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1: usize = 16 * 1024 * 1024;
 const PROVIDER_TRACE_EXPORT_CAPABILITY_LIMIT_V1: usize = 1024;
@@ -178,17 +177,6 @@ impl ProviderTraceTerminalV1 {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProviderTraceRawAppendV1 {
-    Archived {
-        raw_source_bytes: usize,
-    },
-    LimitExceeded {
-        raw_source_bytes: usize,
-        soft_limit_bytes: usize,
-    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -373,7 +361,11 @@ impl ProviderTraceStoreV1 {
             pending_bytes: 0,
             last_durable_flush: Instant::now(),
             raw_source_bytes: 0,
-            raw_limit_exceeded: false,
+            pending_response_items: Vec::new(),
+            pending_response_item_bytes: 0,
+            pending_response_raw_envelope_count: 0,
+            pending_response_raw_source_bytes: 0,
+            next_response_item_ordinal: 1,
             response_started: false,
             sealed: false,
             poisoned: false,
@@ -1082,7 +1074,11 @@ fn reopen_exact_request_only_trace(
         pending_bytes: 0,
         last_durable_flush: Instant::now(),
         raw_source_bytes: 0,
-        raw_limit_exceeded: false,
+        pending_response_items: Vec::new(),
+        pending_response_item_bytes: 0,
+        pending_response_raw_envelope_count: 0,
+        pending_response_raw_source_bytes: 0,
+        next_response_item_ordinal: 1,
         response_started: false,
         sealed: false,
         poisoned: false,
@@ -1176,6 +1172,10 @@ fn verify_provider_trace_path_until(
     let mut request_identity: Option<ProviderTraceIdentityV1> = None;
     let mut request_digest: Option<String> = None;
     let mut verified_raw_source_bytes = 0usize;
+    let mut response_boundary_seen = false;
+    let mut expected_response_item_ordinal = 1u64;
+    let mut terminal_seen = false;
+    let mut seal_seen = false;
     let mut penultimate_record: Option<ProviderTraceTailRecordV1> = None;
     let mut last_record: Option<ProviderTraceTailRecordV1> = None;
 
@@ -1220,12 +1220,43 @@ fn verify_provider_trace_path_until(
                 "Provider trace record must be an object",
             )
         })?;
+        if !object_has_exact_keys(
+            object,
+            &[
+                "schemaVersion",
+                "traceId",
+                "sequence",
+                "previousDigest",
+                "recordedAt",
+                "recordKind",
+                "payload",
+                "digest",
+            ],
+        ) {
+            return Err(ProviderTraceErrorV1::invalid(
+                "provider_trace_record_invalid",
+                "Provider trace record envelope is not canonical",
+            ));
+        }
         if object.get("schemaVersion").and_then(Value::as_str) != Some(PROVIDER_TRACE_SCHEMA_V1)
             || object.get("sequence").and_then(Value::as_u64) != Some(expected_sequence)
         {
             return Err(ProviderTraceErrorV1::invalid(
                 "provider_trace_sequence_invalid",
                 "Provider trace schema or sequence is invalid",
+            ));
+        }
+        let recorded_at = object
+            .get("recordedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if recorded_at.is_empty()
+            || recorded_at.len() > 32
+            || !recorded_at.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(ProviderTraceErrorV1::invalid(
+                "provider_trace_record_invalid",
+                "Provider trace recordedAt is invalid",
             ));
         }
         let current_trace_id = object
@@ -1276,111 +1307,219 @@ fn verify_provider_trace_path_until(
             ));
         }
 
-        let record_kind = record.get("recordKind").and_then(Value::as_str);
-        if expected_sequence == 1 {
-            if record_kind != Some("request") {
-                return Err(ProviderTraceErrorV1::invalid(
-                    "provider_trace_request_missing",
-                    "Provider trace first record is not the request",
-                ));
-            }
-            let payload = record
-                .get("payload")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    ProviderTraceErrorV1::invalid(
-                        "provider_trace_request_invalid",
-                        "Provider trace request payload is invalid",
-                    )
-                })?;
-            let exact_request_body = decode_trace_bytes(
-                payload,
-                "bodyEncoding",
-                "bodyBase64",
-                "byteLength",
-                "requestDigest",
-                PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1,
-                "provider_trace_request_invalid",
-            )?;
-            if exact_request_body.is_empty() {
-                return Err(ProviderTraceErrorV1::invalid(
-                    "provider_trace_request_invalid",
-                    "Provider trace request body must not be empty",
-                ));
-            }
-            let identity = payload.get("identity").cloned().ok_or_else(|| {
+        let record_kind = record
+            .get("recordKind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
                 ProviderTraceErrorV1::invalid(
-                    "provider_trace_identity_missing",
-                    "Provider trace request has no identity",
+                    "provider_trace_record_invalid",
+                    "Provider trace recordKind is missing",
                 )
             })?;
-            let identity: ProviderTraceIdentityV1 =
-                serde_json::from_value(identity).map_err(|error| {
-                    ProviderTraceErrorV1::invalid(
-                        "provider_trace_identity_invalid",
-                        format!("Decode Provider trace identity: {error}"),
-                    )
-                })?;
-            identity.validate()?;
-            if trace_id.as_deref() != Some(identity.provider_turn_id.as_str()) {
-                return Err(ProviderTraceErrorV1::invalid(
-                    "provider_trace_identity_mismatch",
-                    "Provider traceId does not match providerTurnId",
-                ));
-            }
-            let digest = payload
-                .get("requestDigest")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ProviderTraceErrorV1::invalid(
-                        "provider_trace_request_digest_missing",
-                        "Provider trace request has no requestDigest",
-                    )
-                })?
-                .to_string();
-            if sha256_prefixed(&exact_request_body) != digest {
-                return Err(ProviderTraceErrorV1::invalid(
-                    "provider_trace_request_digest_mismatch",
-                    "Provider trace request bytes do not match requestDigest",
-                ));
-            }
-            validate_sha256_digest(&digest, "requestDigest")?;
-            request_identity = Some(identity);
-            request_digest = Some(digest);
+        if seal_seen {
+            return Err(ProviderTraceErrorV1::invalid(
+                "provider_trace_archive_changed",
+                "Provider trace contains records after its seal",
+            ));
         }
-
-        if record_kind == Some("rawUpstreamEnvelope") {
-            let payload = record
-                .get("payload")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
+        match record_kind {
+            "request" => {
+                if expected_sequence != 1 {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_request_invalid",
+                        "Provider trace request must be its first and only request record",
+                    ));
+                }
+                let payload = record
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_request_invalid",
+                            "Provider trace request payload is invalid",
+                        )
+                    })?;
+                if !object_has_exact_keys(
+                    payload,
+                    &[
+                        "identity",
+                        "bodyEncoding",
+                        "bodyBase64",
+                        "byteLength",
+                        "requestDigest",
+                    ],
+                ) {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_request_invalid",
+                        "Provider trace request payload is not canonical",
+                    ));
+                }
+                let exact_request_body = decode_trace_bytes(
+                    payload,
+                    "bodyEncoding",
+                    "bodyBase64",
+                    "byteLength",
+                    "requestDigest",
+                    PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1,
+                    "provider_trace_request_invalid",
+                )?;
+                if exact_request_body.is_empty() {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_request_invalid",
+                        "Provider trace request body must not be empty",
+                    ));
+                }
+                let identity = payload.get("identity").cloned().ok_or_else(|| {
                     ProviderTraceErrorV1::invalid(
-                        "provider_trace_raw_envelope_invalid",
-                        "Provider trace raw upstream envelope payload is invalid",
+                        "provider_trace_identity_missing",
+                        "Provider trace request has no identity",
                     )
                 })?;
-            let source = decode_trace_bytes(
-                payload,
-                "sourceEncoding",
-                "sourceBase64",
-                "sourceByteLength",
-                "sourceDigest",
-                PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1,
-                "provider_trace_raw_envelope_invalid",
-            )?;
-            verified_raw_source_bytes = verified_raw_source_bytes
-                .checked_add(source.len())
-                .ok_or_else(|| {
+                let identity: ProviderTraceIdentityV1 =
+                    serde_json::from_value(identity).map_err(|error| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_identity_invalid",
+                            format!("Decode Provider trace identity: {error}"),
+                        )
+                    })?;
+                identity.validate()?;
+                if trace_id.as_deref() != Some(identity.provider_turn_id.as_str()) {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_identity_mismatch",
+                        "Provider traceId does not match providerTurnId",
+                    ));
+                }
+                let digest = payload
+                    .get("requestDigest")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_request_digest_missing",
+                            "Provider trace request has no requestDigest",
+                        )
+                    })?
+                    .to_string();
+                if sha256_prefixed(&exact_request_body) != digest {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_request_digest_mismatch",
+                        "Provider trace request bytes do not match requestDigest",
+                    ));
+                }
+                validate_sha256_digest(&digest, "requestDigest")?;
+                request_identity = Some(identity);
+                request_digest = Some(digest);
+            }
+            "responseBoundary" => {
+                if expected_sequence == 1 || response_boundary_seen || terminal_seen {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_response_boundary_invalid",
+                        "Provider trace response boundary is missing, duplicated, or out of order",
+                    ));
+                }
+                let payload = record
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_response_boundary_invalid",
+                            "Provider trace response boundary payload is invalid",
+                        )
+                    })?;
+                let keys_are_canonical = object_has_exact_keys(payload, &["statusCode"])
+                    || object_has_exact_keys(payload, &["statusCode", "contentType"]);
+                if !keys_are_canonical {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_response_boundary_invalid",
+                        "Provider trace response boundary payload is not canonical",
+                    ));
+                }
+                let boundary = serde_json::from_value::<ProviderTraceResponseBoundaryV1>(
+                    Value::Object(payload.clone()),
+                )
+                .map_err(|error| {
                     ProviderTraceErrorV1::invalid(
-                        "provider_trace_source_size_overflow",
-                        "Provider trace raw source byte count overflowed",
+                        "provider_trace_response_boundary_invalid",
+                        format!("Decode Provider trace response boundary: {error}"),
                     )
                 })?;
+                boundary.validate()?;
+                response_boundary_seen = true;
+            }
+            "responseChunk" => {
+                if !response_boundary_seen || terminal_seen {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_response_chunk_invalid",
+                        "Provider trace response chunk is not inside its response boundary",
+                    ));
+                }
+                let payload = record
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_response_chunk_invalid",
+                            "Provider trace response chunk payload is invalid",
+                        )
+                    })?;
+                let chunk = decode_provider_trace_response_chunk(payload)?;
+                if chunk.first_item_ordinal != expected_response_item_ordinal {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_response_item_ordinal_invalid",
+                        "Provider trace response item ordinals are not contiguous",
+                    ));
+                }
+                let item_count = u64::try_from(chunk.items.len()).map_err(|_| {
+                    ProviderTraceErrorV1::invalid(
+                        "provider_trace_response_chunk_overflow",
+                        "Provider trace response chunk item count overflowed",
+                    )
+                })?;
+                expected_response_item_ordinal = expected_response_item_ordinal
+                    .checked_add(item_count)
+                    .ok_or_else(|| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_response_chunk_overflow",
+                            "Provider trace response item ordinal overflowed",
+                        )
+                    })?;
+                verified_raw_source_bytes = verified_raw_source_bytes
+                    .checked_add(chunk.raw_source_bytes)
+                    .ok_or_else(|| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_source_size_overflow",
+                            "Provider trace raw source byte count overflowed",
+                        )
+                    })?;
+            }
+            "terminal" => {
+                if expected_sequence == 1 || terminal_seen {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_terminal_invalid",
+                        "Provider trace terminal is duplicated or out of order",
+                    ));
+                }
+                terminal_seen = true;
+            }
+            "seal" => {
+                if !terminal_seen {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_seal_invalid",
+                        "Provider trace seal precedes its terminal",
+                    ));
+                }
+                seal_seen = true;
+            }
+            _ => {
+                return Err(ProviderTraceErrorV1::invalid(
+                    "provider_trace_record_kind_unsupported",
+                    "Provider trace contains a record kind outside the exact current schema",
+                ));
+            }
         }
 
         let tail_kind = match record_kind {
-            Some("terminal") => ProviderTraceTailKindV1::Terminal,
-            Some("seal") => ProviderTraceTailKindV1::Seal,
+            "terminal" => ProviderTraceTailKindV1::Terminal,
+            "seal" => ProviderTraceTailKindV1::Seal,
             _ => ProviderTraceTailKindV1::Other,
         };
         let payload = matches!(
@@ -1469,6 +1608,21 @@ fn verify_provider_trace_path_until(
                 "Provider trace seal payload is invalid",
             )
         })?;
+    if !object_has_exact_keys(
+        seal_payload,
+        &[
+            "terminalSequence",
+            "terminalDigest",
+            "recordCountBeforeSeal",
+            "rawSourceBytes",
+            "requestDigest",
+        ],
+    ) {
+        return Err(ProviderTraceErrorV1::invalid(
+            "provider_trace_seal_invalid",
+            "Provider trace seal payload is not canonical",
+        ));
+    }
     if seal_payload.get("terminalSequence").and_then(Value::as_u64) != Some(terminal.sequence)
         || seal_payload.get("terminalDigest").and_then(Value::as_str)
             != Some(terminal_digest.as_str())
@@ -1498,23 +1652,10 @@ fn verify_provider_trace_path_until(
                 "Provider trace seal has an invalid rawSourceBytes",
             )
         })?;
-    let maximum_raw_source_bytes = PROVIDER_TRACE_RAW_SOURCE_SOFT_LIMIT_V1
-        .checked_add(PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1)
-        .expect("Provider trace limits fit usize");
-    if verified_raw_source_bytes != raw_source_bytes
-        || verified_raw_source_bytes > maximum_raw_source_bytes
-    {
+    if verified_raw_source_bytes != raw_source_bytes {
         return Err(ProviderTraceErrorV1::invalid(
             "provider_trace_raw_source_size_mismatch",
-            "Provider trace seal rawSourceBytes does not match its decoded raw envelopes",
-        ));
-    }
-    if (verified_raw_source_bytes > PROVIDER_TRACE_RAW_SOURCE_SOFT_LIMIT_V1)
-        != (terminal_value.kind == ProviderTraceTerminalKindV1::LimitExceeded)
-    {
-        return Err(ProviderTraceErrorV1::invalid(
-            "provider_trace_limit_terminal_invalid",
-            "Provider trace terminal does not match its decoded raw source byte count",
+            "Provider trace seal rawSourceBytes does not match its decoded response chunks",
         ));
     }
 
@@ -1584,6 +1725,8 @@ fn recover_verified_provider_trace_terminal(
     let mut reasoning = String::new();
     let mut raw_upstream_envelopes = Vec::new();
     let mut recovered_raw_source_bytes = 0usize;
+    let mut last_response_item_ordinal = 0u64;
+    let mut completed_item_ordinal: Option<u64> = None;
     loop {
         let Some(mut line) = read_bounded_provider_trace_line(&mut reader)? else {
             break;
@@ -1617,107 +1760,110 @@ fn recover_verified_provider_trace_terminal(
                     "provider_trace_recovery_invalid",
                 )?);
             }
-            Some("rawUpstreamEnvelope") => {
+            Some("responseChunk") => {
                 let payload = record
                     .get("payload")
                     .and_then(Value::as_object)
                     .ok_or_else(provider_trace_completed_recovery_invalid)?;
-                let envelope = decode_trace_bytes(
-                    payload,
-                    "sourceEncoding",
-                    "sourceBase64",
-                    "sourceByteLength",
-                    "sourceDigest",
-                    PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1,
-                    "provider_trace_recovery_invalid",
-                )?;
-                recovered_raw_source_bytes = recovered_raw_source_bytes
-                    .checked_add(envelope.len())
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?;
-                raw_upstream_envelopes.push(envelope);
-            }
-            Some("normalizedEvent") => {
-                let event = record
-                    .get("payload")
-                    .and_then(|payload| payload.get("event"))
-                    .ok_or_else(|| {
-                        ProviderTraceErrorV1::invalid(
-                            "provider_trace_recovery_invalid",
-                            "Provider trace normalized event is missing its event payload",
-                        )
-                    })?;
-                reject_structured_trace_secrets(event)?;
-                if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
-                    let content = event
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .ok_or_else(provider_trace_completed_recovery_invalid)?;
-                    reasoning.push_str(content);
-                    continue;
-                }
-                if event.get("type").and_then(Value::as_str) != Some("validatedTerminal") {
-                    continue;
-                }
-                if completed.is_some() {
-                    return Err(ProviderTraceErrorV1::invalid(
-                        "provider_trace_recovery_invalid",
-                        "Provider trace contains more than one validated terminal event",
-                    ));
-                }
-                let reasoning_present = event
-                    .get("reasoningPresent")
-                    .and_then(Value::as_bool)
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?;
-                let reasoning_transport = event
-                    .get("reasoningTransport")
-                    .and_then(Value::as_str)
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?
-                    .to_string();
-                validate_bounded_identity(&reasoning_transport, "reasoningTransport", 128)?;
-                let reasoning_digest = event
-                    .get("reasoningDigest")
-                    .and_then(Value::as_str)
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?
-                    .to_string();
-                validate_sha256_digest(&reasoning_digest, "reasoningDigest")?;
-                let response_digest = event
-                    .get("responseDigest")
-                    .and_then(Value::as_str)
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?
-                    .to_string();
-                validate_sha256_digest(&response_digest, "responseDigest")?;
-                let native_completion = event
-                    .get("nativeCompletion")
-                    .filter(|value| value.is_object())
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?
-                    .clone();
-                let provider_result = event
-                    .get("providerResult")
-                    .filter(|value| value.is_object())
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?
-                    .clone();
-                let ordered_items = event
-                    .get("orderedItems")
-                    .and_then(Value::as_array)
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?
-                    .clone();
+                let chunk = decode_provider_trace_response_chunk(payload)?;
                 let sequence = record
                     .get("sequence")
                     .and_then(Value::as_u64)
                     .ok_or_else(provider_trace_completed_recovery_invalid)?;
-                completed = Some(ProviderTraceCompletedTerminalRecoveryV1 {
-                    exact_request_body: Vec::new(),
-                    reasoning: String::new(),
-                    raw_upstream_envelopes: Vec::new(),
-                    native_completion,
-                    reasoning_present,
-                    reasoning_transport,
-                    reasoning_digest,
-                    response_digest,
-                    provider_result,
-                    ordered_items,
-                });
-                completed_sequence = Some(sequence);
+                for (index, item) in chunk.items.into_iter().enumerate() {
+                    let offset = u64::try_from(index)
+                        .map_err(|_| provider_trace_completed_recovery_invalid())?;
+                    let item_ordinal = chunk
+                        .first_item_ordinal
+                        .checked_add(offset)
+                        .ok_or_else(provider_trace_completed_recovery_invalid)?;
+                    last_response_item_ordinal = item_ordinal;
+                    match item {
+                        ProviderTraceResponseItemV1::RawUpstreamEnvelope(envelope) => {
+                            recovered_raw_source_bytes = recovered_raw_source_bytes
+                                .checked_add(envelope.len())
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?;
+                            raw_upstream_envelopes.push(envelope);
+                        }
+                        ProviderTraceResponseItemV1::NormalizedEvent(event) => {
+                            if event.get("type").and_then(Value::as_str) == Some("reasoning_delta")
+                            {
+                                let content = event
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(provider_trace_completed_recovery_invalid)?;
+                                reasoning.push_str(content);
+                                continue;
+                            }
+                            if event.get("type").and_then(Value::as_str)
+                                != Some("validatedTerminal")
+                            {
+                                continue;
+                            }
+                            if completed.is_some() {
+                                return Err(ProviderTraceErrorV1::invalid(
+                                    "provider_trace_recovery_invalid",
+                                    "Provider trace contains more than one validated terminal event",
+                                ));
+                            }
+                            let reasoning_present = event
+                                .get("reasoningPresent")
+                                .and_then(Value::as_bool)
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?;
+                            let reasoning_transport = event
+                                .get("reasoningTransport")
+                                .and_then(Value::as_str)
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                .to_string();
+                            validate_bounded_identity(
+                                &reasoning_transport,
+                                "reasoningTransport",
+                                128,
+                            )?;
+                            let reasoning_digest = event
+                                .get("reasoningDigest")
+                                .and_then(Value::as_str)
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                .to_string();
+                            validate_sha256_digest(&reasoning_digest, "reasoningDigest")?;
+                            let response_digest = event
+                                .get("responseDigest")
+                                .and_then(Value::as_str)
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                .to_string();
+                            validate_sha256_digest(&response_digest, "responseDigest")?;
+                            let native_completion = event
+                                .get("nativeCompletion")
+                                .filter(|value| value.is_object())
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                .clone();
+                            let provider_result = event
+                                .get("providerResult")
+                                .filter(|value| value.is_object())
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                .clone();
+                            let ordered_items = event
+                                .get("orderedItems")
+                                .and_then(Value::as_array)
+                                .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                .clone();
+                            completed = Some(ProviderTraceCompletedTerminalRecoveryV1 {
+                                exact_request_body: Vec::new(),
+                                reasoning: String::new(),
+                                raw_upstream_envelopes: Vec::new(),
+                                native_completion,
+                                reasoning_present,
+                                reasoning_transport,
+                                reasoning_digest,
+                                response_digest,
+                                provider_result,
+                                ordered_items,
+                            });
+                            completed_sequence = Some(sequence);
+                            completed_item_ordinal = Some(item_ordinal);
+                        }
+                    }
+                }
             }
             Some("terminal") => {
                 if terminal.is_some() {
@@ -1769,6 +1915,7 @@ fn recover_verified_provider_trace_terminal(
                 || !completed_evidence.reasoning_present
                 || completed_sequence.and_then(|sequence| sequence.checked_add(2))
                     != Some(metadata.record_count)
+                || completed_item_ordinal != Some(last_response_item_ordinal)
                 || sha256_prefixed(&request_body) != metadata.request_digest
                 || recovered_raw_source_bytes != metadata.raw_source_bytes
                 || reasoning.trim().is_empty()
@@ -1940,6 +2087,179 @@ fn decode_trace_bytes(
     Ok(decoded)
 }
 
+#[derive(Debug)]
+enum ProviderTraceResponseItemV1 {
+    RawUpstreamEnvelope(Vec<u8>),
+    NormalizedEvent(Value),
+}
+
+#[derive(Debug)]
+struct ProviderTraceResponseChunkV1 {
+    first_item_ordinal: u64,
+    items: Vec<ProviderTraceResponseItemV1>,
+    raw_source_bytes: usize,
+}
+
+fn decode_provider_trace_response_chunk(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<ProviderTraceResponseChunkV1, ProviderTraceErrorV1> {
+    if !object_has_exact_keys(
+        payload,
+        &[
+            "firstItemOrdinal",
+            "itemCount",
+            "rawEnvelopeCount",
+            "rawSourceBytes",
+            "items",
+        ],
+    ) {
+        return Err(ProviderTraceErrorV1::invalid(
+            "provider_trace_response_chunk_invalid",
+            "Provider trace response chunk payload is not canonical",
+        ));
+    }
+    let first_item_ordinal = payload
+        .get("firstItemOrdinal")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_chunk_invalid",
+                "Provider trace response chunk has an invalid firstItemOrdinal",
+            )
+        })?;
+    let declared_item_count = payload
+        .get("itemCount")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_chunk_invalid",
+                "Provider trace response chunk has an invalid itemCount",
+            )
+        })?;
+    let declared_raw_envelope_count = payload
+        .get("rawEnvelopeCount")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_chunk_invalid",
+                "Provider trace response chunk has an invalid rawEnvelopeCount",
+            )
+        })?;
+    let declared_raw_source_bytes = payload
+        .get("rawSourceBytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_chunk_invalid",
+                "Provider trace response chunk has an invalid rawSourceBytes",
+            )
+        })?;
+    let encoded_items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == declared_item_count)
+        .ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_chunk_invalid",
+                "Provider trace response chunk items do not match itemCount",
+            )
+        })?;
+
+    let mut items = Vec::with_capacity(encoded_items.len());
+    let mut raw_envelope_count = 0usize;
+    let mut raw_source_bytes = 0usize;
+    for encoded_item in encoded_items {
+        let item = encoded_item.as_object().ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_item_invalid",
+                "Provider trace response chunk item must be an object",
+            )
+        })?;
+        match item.get("kind").and_then(Value::as_str) {
+            Some("rawUpstreamEnvelope") => {
+                if !object_has_exact_keys(
+                    item,
+                    &[
+                        "kind",
+                        "sourceEncoding",
+                        "sourceBase64",
+                        "sourceByteLength",
+                        "sourceDigest",
+                    ],
+                ) {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_raw_envelope_invalid",
+                        "Provider trace raw envelope item is not canonical",
+                    ));
+                }
+                let source = decode_trace_bytes(
+                    item,
+                    "sourceEncoding",
+                    "sourceBase64",
+                    "sourceByteLength",
+                    "sourceDigest",
+                    PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1,
+                    "provider_trace_raw_envelope_invalid",
+                )?;
+                raw_envelope_count = raw_envelope_count.checked_add(1).ok_or_else(|| {
+                    ProviderTraceErrorV1::invalid(
+                        "provider_trace_response_chunk_overflow",
+                        "Provider trace raw envelope count overflowed",
+                    )
+                })?;
+                raw_source_bytes = raw_source_bytes.checked_add(source.len()).ok_or_else(|| {
+                    ProviderTraceErrorV1::invalid(
+                        "provider_trace_source_size_overflow",
+                        "Provider trace raw source byte count overflowed",
+                    )
+                })?;
+                items.push(ProviderTraceResponseItemV1::RawUpstreamEnvelope(source));
+            }
+            Some("normalizedEvent") => {
+                if !object_has_exact_keys(item, &["kind", "event"]) {
+                    return Err(ProviderTraceErrorV1::invalid(
+                        "provider_trace_normalized_event_invalid",
+                        "Provider trace normalized event item is not canonical",
+                    ));
+                }
+                let event = item.get("event").cloned().ok_or_else(|| {
+                    ProviderTraceErrorV1::invalid(
+                        "provider_trace_normalized_event_invalid",
+                        "Provider trace normalized event is missing its event payload",
+                    )
+                })?;
+                reject_structured_trace_secrets(&event)?;
+                items.push(ProviderTraceResponseItemV1::NormalizedEvent(event));
+            }
+            _ => {
+                return Err(ProviderTraceErrorV1::invalid(
+                    "provider_trace_response_item_invalid",
+                    "Provider trace response chunk contains an unsupported item kind",
+                ));
+            }
+        }
+    }
+    if raw_envelope_count != declared_raw_envelope_count
+        || raw_source_bytes != declared_raw_source_bytes
+    {
+        return Err(ProviderTraceErrorV1::invalid(
+            "provider_trace_response_chunk_invalid",
+            "Provider trace response chunk raw telemetry does not match its decoded items",
+        ));
+    }
+
+    Ok(ProviderTraceResponseChunkV1 {
+        first_item_ordinal,
+        items,
+        raw_source_bytes,
+    })
+}
+
 fn decode_base64_bounded(encoded: &str, maximum_bytes: usize) -> Result<Vec<u8>, &'static str> {
     if encoded.len() % 4 != 0 {
         return Err("base64 length is not a multiple of four");
@@ -2018,7 +2338,11 @@ pub(crate) struct ProviderTraceWriterV1 {
     pending_bytes: usize,
     last_durable_flush: Instant,
     raw_source_bytes: usize,
-    raw_limit_exceeded: bool,
+    pending_response_items: Vec<Value>,
+    pending_response_item_bytes: usize,
+    pending_response_raw_envelope_count: usize,
+    pending_response_raw_source_bytes: usize,
+    next_response_item_ordinal: u64,
     response_started: bool,
     sealed: bool,
     poisoned: bool,
@@ -2050,14 +2374,15 @@ impl ProviderTraceWriterV1 {
         self.flush_durable()
     }
 
-    /// Archives one complete upstream envelope without interpreting its body.
-    ///
-    /// The soft-limit result is returned only after the crossing envelope has
-    /// been fully appended and durably flushed.
+    /// Queues one complete upstream envelope without interpreting its body.
+    /// Its exact bytes remain ordered with normalized events in the same
+    /// bounded response-chunk stream. Aggregate source bytes are telemetry;
+    /// only the per-envelope structural limit can reject an otherwise valid
+    /// Provider turn.
     pub(crate) fn append_raw_upstream_envelope(
         &mut self,
         exact_source_bytes: &[u8],
-    ) -> Result<ProviderTraceRawAppendV1, ProviderTraceErrorV1> {
+    ) -> Result<(), ProviderTraceErrorV1> {
         self.ensure_response_writable()?;
         if exact_source_bytes.len() > PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1 {
             return Err(ProviderTraceErrorV1::invalid(
@@ -2070,36 +2395,14 @@ impl ProviderTraceWriterV1 {
             ));
         }
 
-        let next_raw_source_bytes = self
-            .raw_source_bytes
-            .checked_add(exact_source_bytes.len())
-            .ok_or_else(|| {
-                ProviderTraceErrorV1::invalid(
-                    "provider_trace_source_size_overflow",
-                    "Provider trace raw source byte count overflowed",
-                )
-            })?;
-        let payload = json!({
+        let item = json!({
+            "kind": "rawUpstreamEnvelope",
             "sourceEncoding": "base64",
             "sourceBase64": encode_base64(exact_source_bytes),
             "sourceByteLength": exact_source_bytes.len(),
             "sourceDigest": sha256_prefixed(exact_source_bytes),
         });
-        self.append_record("rawUpstreamEnvelope", payload)?;
-        self.raw_source_bytes = next_raw_source_bytes;
-
-        if self.raw_source_bytes > PROVIDER_TRACE_RAW_SOURCE_SOFT_LIMIT_V1 {
-            self.raw_limit_exceeded = true;
-            self.flush_durable()?;
-            return Ok(ProviderTraceRawAppendV1::LimitExceeded {
-                raw_source_bytes: self.raw_source_bytes,
-                soft_limit_bytes: PROVIDER_TRACE_RAW_SOURCE_SOFT_LIMIT_V1,
-            });
-        }
-        self.flush_if_policy_due(Instant::now())?;
-        Ok(ProviderTraceRawAppendV1::Archived {
-            raw_source_bytes: self.raw_source_bytes,
-        })
+        self.queue_response_item(item, 1, exact_source_bytes.len())
     }
 
     pub(crate) fn append_normalized_event(
@@ -2108,9 +2411,14 @@ impl ProviderTraceWriterV1 {
     ) -> Result<(), ProviderTraceErrorV1> {
         self.ensure_response_writable()?;
         reject_structured_trace_secrets(&event)?;
-        self.append_record("normalizedEvent", json!({ "event": event }))?;
-        self.flush_if_policy_due(Instant::now())?;
-        Ok(())
+        self.queue_response_item(
+            json!({
+                "kind": "normalizedEvent",
+                "event": event,
+            }),
+            0,
+            0,
+        )
     }
 
     pub(crate) fn flush_if_due(
@@ -2118,16 +2426,18 @@ impl ProviderTraceWriterV1 {
         now: Instant,
     ) -> Result<Option<ProviderTraceArchiveCheckpointV1>, ProviderTraceErrorV1> {
         self.ensure_writable()?;
-        if self.pending_bytes == 0
-            || now.duration_since(self.last_durable_flush) < PROVIDER_TRACE_FLUSH_INTERVAL_V1
-        {
+        if self.pending_bytes == 0 && self.pending_response_items.is_empty() {
+            return Ok(None);
+        }
+        if now.duration_since(self.last_durable_flush) < PROVIDER_TRACE_FLUSH_INTERVAL_V1 {
             return Ok(None);
         }
         self.flush_durable().map(Some)
     }
 
     pub(crate) fn next_flush_deadline(&self) -> Option<Instant> {
-        (self.pending_bytes > 0).then(|| self.last_durable_flush + PROVIDER_TRACE_FLUSH_INTERVAL_V1)
+        (self.pending_bytes > 0 || !self.pending_response_items.is_empty())
+            .then(|| self.last_durable_flush + PROVIDER_TRACE_FLUSH_INTERVAL_V1)
     }
 
     pub(crate) fn archive_before_publication<T>(
@@ -2145,18 +2455,7 @@ impl ProviderTraceWriterV1 {
     ) -> Result<ProviderTraceMetadataV1, ProviderTraceErrorV1> {
         self.ensure_writable()?;
         terminal.validate()?;
-        if self.raw_limit_exceeded && terminal.kind != ProviderTraceTerminalKindV1::LimitExceeded {
-            return Err(ProviderTraceErrorV1::invalid(
-                "provider_trace_limit_terminal_required",
-                "A Provider trace that crossed the raw source limit must terminate as limitExceeded",
-            ));
-        }
-        if !self.raw_limit_exceeded && terminal.kind == ProviderTraceTerminalKindV1::LimitExceeded {
-            return Err(ProviderTraceErrorV1::invalid(
-                "provider_trace_limit_terminal_invalid",
-                "limitExceeded terminal requires an archived envelope that crossed the soft limit",
-            ));
-        }
+        self.flush_pending_response_chunk_record()?;
 
         let terminal_kind = terminal.kind;
         self.append_record(
@@ -2230,12 +2529,116 @@ impl ProviderTraceWriterV1 {
                 "Provider response boundary must be archived before response events",
             ));
         }
-        if self.raw_limit_exceeded {
-            return Err(ProviderTraceErrorV1::invalid(
-                "provider_trace_limit_exceeded",
-                "Provider trace crossed the raw source soft limit and cannot publish or append more response data",
-            ));
+        Ok(())
+    }
+
+    fn queue_response_item(
+        &mut self,
+        item: Value,
+        raw_envelope_count: usize,
+        raw_source_bytes: usize,
+    ) -> Result<(), ProviderTraceErrorV1> {
+        self.ensure_response_writable()?;
+        let item_bytes = serde_json::to_vec(&item)
+            .map_err(|error| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_encode_failed",
+                    format!("Encode Provider trace response item: {error}"),
+                )
+            })?
+            .len();
+        let next_chunk_bytes = self
+            .pending_response_item_bytes
+            .checked_add(item_bytes)
+            .ok_or_else(|| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_response_chunk_overflow",
+                    "Provider trace response chunk size overflowed",
+                )
+            })?;
+        if !self.pending_response_items.is_empty()
+            && next_chunk_bytes > PROVIDER_TRACE_FLUSH_BYTES_V1
+        {
+            self.flush_durable()?;
         }
+        let pending_response_item_bytes = self
+            .pending_response_item_bytes
+            .checked_add(item_bytes)
+            .ok_or_else(|| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_response_chunk_overflow",
+                    "Provider trace response chunk size overflowed",
+                )
+            })?;
+        let pending_response_raw_envelope_count = self
+            .pending_response_raw_envelope_count
+            .checked_add(raw_envelope_count)
+            .ok_or_else(|| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_response_chunk_overflow",
+                    "Provider trace response chunk raw envelope count overflowed",
+                )
+            })?;
+        let pending_response_raw_source_bytes = self
+            .pending_response_raw_source_bytes
+            .checked_add(raw_source_bytes)
+            .ok_or_else(|| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_source_size_overflow",
+                    "Provider trace response chunk raw source byte count overflowed",
+                )
+            })?;
+        let total_raw_source_bytes = self
+            .raw_source_bytes
+            .checked_add(raw_source_bytes)
+            .ok_or_else(|| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_source_size_overflow",
+                    "Provider trace raw source byte count overflowed",
+                )
+            })?;
+        self.pending_response_item_bytes = pending_response_item_bytes;
+        self.pending_response_raw_envelope_count = pending_response_raw_envelope_count;
+        self.pending_response_raw_source_bytes = pending_response_raw_source_bytes;
+        self.raw_source_bytes = total_raw_source_bytes;
+        self.pending_response_items.push(item);
+        self.flush_if_policy_due(Instant::now())
+    }
+
+    fn flush_pending_response_chunk_record(&mut self) -> Result<(), ProviderTraceErrorV1> {
+        if self.pending_response_items.is_empty() {
+            return Ok(());
+        }
+        let item_count = u64::try_from(self.pending_response_items.len()).map_err(|_| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_response_chunk_overflow",
+                "Provider trace response chunk item count overflowed",
+            )
+        })?;
+        let next_item_ordinal = self
+            .next_response_item_ordinal
+            .checked_add(item_count)
+            .ok_or_else(|| {
+                ProviderTraceErrorV1::invalid(
+                    "provider_trace_response_chunk_overflow",
+                    "Provider trace response item ordinal overflowed",
+                )
+            })?;
+        let payload = json!({
+            "firstItemOrdinal": self.next_response_item_ordinal,
+            "itemCount": item_count,
+            "rawEnvelopeCount": self.pending_response_raw_envelope_count,
+            "rawSourceBytes": self.pending_response_raw_source_bytes,
+            "items": std::mem::take(&mut self.pending_response_items),
+        });
+        self.pending_response_item_bytes = 0;
+        self.pending_response_raw_envelope_count = 0;
+        self.pending_response_raw_source_bytes = 0;
+        if let Err(error) = self.append_record("responseChunk", payload) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.next_response_item_ordinal = next_item_ordinal;
         Ok(())
     }
 
@@ -2293,7 +2696,8 @@ impl ProviderTraceWriterV1 {
     }
 
     fn flush_if_policy_due(&mut self, now: Instant) -> Result<(), ProviderTraceErrorV1> {
-        if self.pending_bytes >= PROVIDER_TRACE_FLUSH_BYTES_V1
+        if self.pending_response_item_bytes >= PROVIDER_TRACE_FLUSH_BYTES_V1
+            || self.pending_bytes >= PROVIDER_TRACE_FLUSH_BYTES_V1
             || now.duration_since(self.last_durable_flush) >= PROVIDER_TRACE_FLUSH_INTERVAL_V1
         {
             self.flush_durable()?;
@@ -2303,6 +2707,7 @@ impl ProviderTraceWriterV1 {
 
     fn flush_durable(&mut self) -> Result<ProviderTraceArchiveCheckpointV1, ProviderTraceErrorV1> {
         self.ensure_writable()?;
+        self.flush_pending_response_chunk_record()?;
         if let Err(error) = self
             .writer
             .flush()
@@ -2336,17 +2741,12 @@ impl Drop for ProviderTraceWriterV1 {
         if self.sealed || self.poisoned {
             return;
         }
+        if self.flush_pending_response_chunk_record().is_err() {
+            return;
+        }
         let terminal = ProviderTraceTerminalV1 {
-            kind: if self.raw_limit_exceeded {
-                ProviderTraceTerminalKindV1::LimitExceeded
-            } else {
-                ProviderTraceTerminalKindV1::Cancelled
-            },
-            reason_code: Some(if self.raw_limit_exceeded {
-                "provider_trace_raw_limit_exceeded".to_string()
-            } else {
-                "provider_stream_consumer_cancelled".to_string()
-            }),
+            kind: ProviderTraceTerminalKindV1::Cancelled,
+            reason_code: Some("provider_stream_consumer_cancelled".to_string()),
         };
         let _ = self.append_record(
             "terminal",

@@ -1273,8 +1273,9 @@ function providerPublicErrorMessage(code: string): string {
       return 'Provider response did not contain the required plaintext reasoning.';
     case 'provider_final_answer_tool_call_forbidden':
       return 'Provider returned a tool call during a no-tools finalAnswer turn.';
-    case 'provider_trace_raw_limit_exceeded':
-      return 'Provider response crossed the private trace source-byte limit.';
+    case 'provider_trace_envelope_too_large':
+    case 'provider_error_body_too_large':
+      return 'Provider response exceeded the per-envelope structural size limit.';
     case 'provider_retryable_no_mutation':
       return 'Provider transport ended before a validated response was committed.';
     default:

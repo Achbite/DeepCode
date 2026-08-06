@@ -49,6 +49,9 @@ pub(crate) fn ollama_stream_request_body(
         "stream": true,
         "think": profile.thinking.as_deref() == Some("enabled"),
     });
+    if let Some(max_output_tokens) = profile.max_output_tokens.filter(|value| *value > 0) {
+        body["options"] = json!({ "num_predict": max_output_tokens });
+    }
     if !tools.is_empty() {
         body["tools"] = json!(tools
             .iter()

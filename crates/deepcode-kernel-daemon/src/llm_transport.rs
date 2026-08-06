@@ -48,7 +48,6 @@ pub(crate) struct LlmChatOutput {
     pub(crate) usage: Option<Value>,
 }
 
-const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
 const LLM_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn local_secret_ref_key(secret_ref: &str) -> Option<&str> {
@@ -923,6 +922,21 @@ struct ProviderEnvelopeFramerV1 {
     buffer: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct ProviderEnvelopeFramerErrorV1 {
+    code: &'static str,
+    message: String,
+}
+
+impl ProviderEnvelopeFramerErrorV1 {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LlmNativeStreamProbeResultV1 {
     pub(crate) provider_kind: &'static str,
@@ -968,6 +982,9 @@ impl ProviderNativeStreamTransportErrorV1 {
             "provider_request_too_large" => {
                 "Provider probe request exceeded the transport size limit."
             }
+            "provider_trace_envelope_too_large" => {
+                "Provider response envelope exceeded the structural size limit."
+            }
             "provider_request_secret_forbidden" => {
                 "Provider request contains forbidden structured secret or capability material."
             }
@@ -990,9 +1007,6 @@ impl ProviderNativeStreamTransportErrorV1 {
             "provider_transport_failed" => {
                 "Provider transport ended before a validated response was committed."
             }
-            "provider_stream_raw_limit_exceeded" => {
-                "Provider response crossed the source-byte limit."
-            }
             _ => "Provider probe failed before a validated native streaming completion.",
         }
     }
@@ -1012,7 +1026,10 @@ impl ProviderEnvelopeFramerV1 {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderWireEnvelopeV1>, String> {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<ProviderWireEnvelopeV1>, ProviderEnvelopeFramerErrorV1> {
         self.buffer.extend_from_slice(chunk);
         let mut envelopes = Vec::new();
         match self.kind {
@@ -1021,7 +1038,12 @@ impl ProviderEnvelopeFramerV1 {
                 while let Some((end, delimiter_len)) = sse_envelope_boundary(&self.buffer) {
                     let raw = self.buffer.drain(..end + delimiter_len).collect::<Vec<_>>();
                     ensure_provider_envelope_size(&raw)?;
-                    let payload = sse_data_payload(&raw)?;
+                    let payload = sse_data_payload(&raw).map_err(|message| {
+                        ProviderEnvelopeFramerErrorV1::new(
+                            "provider_stream_envelope_invalid",
+                            message,
+                        )
+                    })?;
                     envelopes.push(ProviderWireEnvelopeV1 { raw, payload });
                 }
             }
@@ -1035,15 +1057,12 @@ impl ProviderEnvelopeFramerV1 {
             }
         }
         if self.buffer.len() > PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1 {
-            return Err(format!(
-                "Provider envelope exceeded the {} byte hard limit",
-                PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1
-            ));
+            return Err(provider_envelope_too_large());
         }
         Ok(envelopes)
     }
 
-    fn finish(&mut self) -> Result<Vec<ProviderWireEnvelopeV1>, String> {
+    fn finish(&mut self) -> Result<Vec<ProviderWireEnvelopeV1>, ProviderEnvelopeFramerErrorV1> {
         if self.buffer.iter().all(u8::is_ascii_whitespace) {
             return Ok(Vec::new());
         }
@@ -1055,31 +1074,40 @@ impl ProviderEnvelopeFramerV1 {
                 Ok(vec![ProviderWireEnvelopeV1 { raw, payload }])
             }
             ProviderNativeStreamKindV1::OpenAiCompatible
-            | ProviderNativeStreamKindV1::Anthropic => {
-                Err("Provider SSE stream ended with an incomplete source envelope".to_string())
-            }
+            | ProviderNativeStreamKindV1::Anthropic => Err(ProviderEnvelopeFramerErrorV1::new(
+                "provider_stream_envelope_incomplete",
+                "Provider SSE stream ended with an incomplete source envelope",
+            )),
         }
     }
 
-    fn ensure_empty_after_terminal(&mut self) -> Result<(), String> {
+    fn ensure_empty_after_terminal(&mut self) -> Result<(), ProviderEnvelopeFramerErrorV1> {
         if self.buffer.iter().all(u8::is_ascii_whitespace) {
             self.buffer.clear();
             Ok(())
         } else {
-            Err(
+            Err(ProviderEnvelopeFramerErrorV1::new(
+                "provider_stream_data_after_terminal",
                 "Provider emitted an incomplete envelope after its native terminal marker"
                     .to_string(),
-            )
+            ))
         }
     }
 }
 
-fn ensure_provider_envelope_size(raw: &[u8]) -> Result<(), String> {
-    if raw.len() > PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1 {
-        return Err(format!(
+fn provider_envelope_too_large() -> ProviderEnvelopeFramerErrorV1 {
+    ProviderEnvelopeFramerErrorV1::new(
+        "provider_trace_envelope_too_large",
+        format!(
             "Provider envelope exceeded the {} byte hard limit",
             PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1
-        ));
+        ),
+    )
+}
+
+fn ensure_provider_envelope_size(raw: &[u8]) -> Result<(), ProviderEnvelopeFramerErrorV1> {
+    if raw.len() > PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1 {
+        return Err(provider_envelope_too_large());
     }
     Ok(())
 }
@@ -2401,19 +2429,18 @@ async fn probe_llm_profile_native_stream_inner(
     let mut response = response;
     let mut framer = ProviderEnvelopeFramerV1::new(provider_kind);
     let mut accumulator = ProviderNativeStreamAccumulatorV1::new(provider_kind);
-    let mut source_bytes = 0usize;
     loop {
         let (envelopes, reached_eof) = match response.chunk().await {
             Ok(Some(chunk)) => (
-                framer.push(&chunk).map_err(|_| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_stream_envelope_invalid")
-                })?,
+                framer
+                    .push(&chunk)
+                    .map_err(|error| ProviderNativeStreamTransportErrorV1::new(error.code))?,
                 false,
             ),
             Ok(None) => (
-                framer.finish().map_err(|_| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_stream_envelope_incomplete")
-                })?,
+                framer
+                    .finish()
+                    .map_err(|error| ProviderNativeStreamTransportErrorV1::new(error.code))?,
                 true,
             ),
             Err(_) => {
@@ -2423,12 +2450,6 @@ async fn probe_llm_profile_native_stream_inner(
             }
         };
         for envelope in envelopes {
-            source_bytes = source_bytes.saturating_add(envelope.raw.len());
-            if source_bytes > PROVIDER_TRACE_RAW_SOURCE_SOFT_LIMIT_V1 {
-                return Err(ProviderNativeStreamTransportErrorV1::new(
-                    "provider_stream_raw_limit_exceeded",
-                ));
-            }
             let Some(payload) = envelope.payload else {
                 continue;
             };
@@ -2437,9 +2458,9 @@ async fn probe_llm_profile_native_stream_inner(
                 .map_err(|error| ProviderNativeStreamTransportErrorV1::new(error.code))?;
         }
         if accumulator.source_done() {
-            framer.ensure_empty_after_terminal().map_err(|_| {
-                ProviderNativeStreamTransportErrorV1::new("provider_stream_data_after_terminal")
-            })?;
+            framer
+                .ensure_empty_after_terminal()
+                .map_err(|error| ProviderNativeStreamTransportErrorV1::new(error.code))?;
             break;
         }
         if reached_eof {
@@ -2662,34 +2683,47 @@ pub(crate) fn llm_stream_response(
                                 &mut trace,
                                 "provider_error_body_too_large",
                             );
-                            break;
+                            yield Ok(Bytes::from(provider_public_error_event(
+                                &request_id,
+                                "provider_error_body_too_large",
+                                "Provider error body exceeded the per-envelope structural limit",
+                            )));
+                            return;
                         }
                         error_body.extend_from_slice(&chunk);
                     }
                     Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-            let raw_limit_exceeded = if error_body.is_empty() {
-                false
-            } else {
-                match trace.append_raw_upstream_envelope(&error_body) {
-                    Ok(ProviderTraceRawAppendV1::Archived { .. }) => false,
-                    Ok(ProviderTraceRawAppendV1::LimitExceeded { .. }) => {
-                        let _ = finish_provider_trace_limit(&mut trace);
-                        true
+                    Err(_) => {
+                        let _ = finish_provider_trace_failure(
+                            &mut trace,
+                            "provider_retryable_no_mutation",
+                        );
+                        yield Ok(Bytes::from(provider_public_error_event(
+                            &request_id,
+                            "provider_retryable_no_mutation",
+                            "Provider error response ended before its body was archived",
+                        )));
+                        return;
                     }
-                    Err(_) => false,
                 }
-            };
-            if !raw_limit_exceeded {
-                let reason_code = if (500..=599).contains(&status.as_u16()) {
-                    "provider_retryable_no_mutation"
-                } else {
-                    "ProviderHttpStatusFailed"
-                };
-                let _ = finish_provider_trace_failure(&mut trace, reason_code);
             }
+            if !error_body.is_empty() {
+                if let Err(error) = trace.append_raw_upstream_envelope(&error_body) {
+                    let _ = finish_provider_trace_failure(&mut trace, error.code);
+                    yield Ok(Bytes::from(provider_public_error_event(
+                        &request_id,
+                        error.code,
+                        error.message,
+                    )));
+                    return;
+                }
+            }
+            let reason_code = if (500..=599).contains(&status.as_u16()) {
+                "provider_retryable_no_mutation"
+            } else {
+                "ProviderHttpStatusFailed"
+            };
+            let _ = finish_provider_trace_failure(&mut trace, reason_code);
             yield Ok(Bytes::from(provider_public_error_event(
                 &request_id,
                 if (500..=599).contains(&status.as_u16()) {
@@ -2772,44 +2806,25 @@ pub(crate) fn llm_stream_response(
                 Ok(Some(chunk)) => {
                     let envelopes = match framer.push(&chunk) {
                         Ok(envelopes) => envelopes,
-                        Err(message) => {
-                            let _ = finish_provider_trace_failure(
-                                &mut trace,
-                                "provider_stream_envelope_invalid",
-                            );
+                        Err(error) => {
+                            let _ = finish_provider_trace_failure(&mut trace, error.code);
                             yield Ok(Bytes::from(provider_public_error_event(
                                 &request_id,
-                                "provider_stream_envelope_invalid",
-                                message,
+                                error.code,
+                                error.message,
                             )));
                             return;
                         }
                     };
                     for envelope in envelopes {
-                        let raw_result = trace.append_raw_upstream_envelope(&envelope.raw);
-                        match raw_result {
-                            Ok(ProviderTraceRawAppendV1::Archived { .. }) => {}
-                            Ok(ProviderTraceRawAppendV1::LimitExceeded { .. }) => {
-                                let _ = finish_provider_trace_limit(&mut trace);
-                                yield Ok(Bytes::from(provider_public_error_event(
-                                    &request_id,
-                                    "provider_trace_raw_limit_exceeded",
-                                    "Provider trace crossed the 1 MiB raw source limit",
-                                )));
-                                return;
-                            }
-                            Err(error) => {
-                                let _ = finish_provider_trace_failure(
-                                    &mut trace,
-                                    "provider_trace_raw_archive_failed",
-                                );
-                                yield Ok(Bytes::from(provider_public_error_event(
-                                    &request_id,
-                                    error.code,
-                                    error.message,
-                                )));
-                                return;
-                            }
+                        if let Err(error) = trace.append_raw_upstream_envelope(&envelope.raw) {
+                            let _ = finish_provider_trace_failure(&mut trace, error.code);
+                            yield Ok(Bytes::from(provider_public_error_event(
+                                &request_id,
+                                error.code,
+                                error.message,
+                            )));
+                            return;
                         }
                         let Some(payload) = envelope.payload else {
                             continue;
@@ -2886,15 +2901,12 @@ pub(crate) fn llm_stream_response(
                         }
                     }
                     if accumulator.source_done() {
-                        if let Err(message) = framer.ensure_empty_after_terminal() {
-                            let _ = finish_provider_trace_failure(
-                                &mut trace,
-                                "provider_stream_data_after_terminal",
-                            );
+                        if let Err(error) = framer.ensure_empty_after_terminal() {
+                            let _ = finish_provider_trace_failure(&mut trace, error.code);
                             yield Ok(Bytes::from(provider_public_error_event(
                                 &request_id,
-                                "provider_stream_data_after_terminal",
-                                message,
+                                error.code,
+                                error.message,
                             )));
                             return;
                         }
@@ -2904,43 +2916,25 @@ pub(crate) fn llm_stream_response(
                 Ok(None) => {
                     let envelopes = match framer.finish() {
                         Ok(envelopes) => envelopes,
-                        Err(message) => {
-                            let _ = finish_provider_trace_failure(
-                                &mut trace,
-                                "provider_stream_envelope_incomplete",
-                            );
+                        Err(error) => {
+                            let _ = finish_provider_trace_failure(&mut trace, error.code);
                             yield Ok(Bytes::from(provider_public_error_event(
                                 &request_id,
-                                "provider_stream_envelope_incomplete",
-                                message,
+                                error.code,
+                                error.message,
                             )));
                             return;
                         }
                     };
                     for envelope in envelopes {
-                        match trace.append_raw_upstream_envelope(&envelope.raw) {
-                            Ok(ProviderTraceRawAppendV1::Archived { .. }) => {}
-                            Ok(ProviderTraceRawAppendV1::LimitExceeded { .. }) => {
-                                let _ = finish_provider_trace_limit(&mut trace);
-                                yield Ok(Bytes::from(provider_public_error_event(
-                                    &request_id,
-                                    "provider_trace_raw_limit_exceeded",
-                                    "Provider trace crossed the 1 MiB raw source limit",
-                                )));
-                                return;
-                            }
-                            Err(error) => {
-                                let _ = finish_provider_trace_failure(
-                                    &mut trace,
-                                    "provider_trace_raw_archive_failed",
-                                );
-                                yield Ok(Bytes::from(provider_public_error_event(
-                                    &request_id,
-                                    error.code,
-                                    error.message,
-                                )));
-                                return;
-                            }
+                        if let Err(error) = trace.append_raw_upstream_envelope(&envelope.raw) {
+                            let _ = finish_provider_trace_failure(&mut trace, error.code);
+                            yield Ok(Bytes::from(provider_public_error_event(
+                                &request_id,
+                                error.code,
+                                error.message,
+                            )));
+                            return;
                         }
                         let Some(payload) = envelope.payload else {
                             continue;
@@ -3218,16 +3212,6 @@ fn finish_provider_trace_failure(
     )
 }
 
-fn finish_provider_trace_limit(
-    trace: &mut DurableProviderTurnTraceV3,
-) -> Result<ProviderTraceMetadataV1, ProviderTraceErrorV1> {
-    trace.finish_noncompleted(
-        SessionProviderTurnTerminalKindV3::LimitExceeded,
-        ProviderTraceTerminalKindV1::LimitExceeded,
-        "provider_trace_raw_limit_exceeded",
-    )
-}
-
 pub(crate) fn provider_public_error_event(
     request_id: &str,
     code: &str,
@@ -3264,8 +3248,8 @@ pub(crate) fn provider_public_error_event(
         "provider_final_answer_tool_call_forbidden" => {
             "Provider returned a tool call during a no-tools finalAnswer turn."
         }
-        "provider_trace_raw_limit_exceeded" => {
-            "Provider response crossed the private trace source-byte limit."
+        "provider_trace_envelope_too_large" | "provider_error_body_too_large" => {
+            "Provider response exceeded the per-envelope structural size limit."
         }
         "llm_chat_failed" => "Provider returned a non-success response.",
         _ => "Provider stream failed before a validated terminal receipt.",
@@ -3289,10 +3273,7 @@ fn response_format_is_json_object(response_format: Option<&Value>) -> bool {
 }
 
 pub(crate) fn effective_openai_compatible_max_tokens(profile: &ResolvedLlmProfile) -> Option<u32> {
-    profile
-        .max_output_tokens
-        .filter(|tokens| *tokens > 0)
-        .map(|tokens| tokens.min(OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP))
+    profile.max_output_tokens.filter(|tokens| *tokens > 0)
 }
 
 fn token_limit_u32(value: &Value) -> Option<u32> {
