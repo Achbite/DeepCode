@@ -2164,6 +2164,13 @@ function upsertTurnBlock(
   };
 }
 
+function removeTurnBlock(turn: MutableTurn, blockId: string): void {
+  turn.blocks = turn.blocks.filter((block) => block.id !== blockId);
+  turn.parts = turn.parts.filter((part) =>
+    part.kind !== 'block' || part.blockId !== blockId
+  );
+}
+
 function projectProviderOutputIntoTurn(
   turn: MutableTurn,
   event: AgentEvent,
@@ -2195,6 +2202,11 @@ function projectProviderOutputIntoTurn(
 
   const hasTools = items.some((item) => item.kind === 'toolCall');
   const terminalScope = stringValue(payload?.terminalScope);
+  const privatePlanningDraft =
+    projectionKind === 'provider.completed'
+    && !hasTools
+    && stringValue(payload?.outputKind) === 'answer'
+    && terminalScope === 'providerTurn';
   const textRoles = providerTextSettledRoles(
     items,
     hasTools,
@@ -2212,6 +2224,15 @@ function projectProviderOutputIntoTurn(
     if (item.kind === 'text') {
       const phase = stringValue(item.phase);
       const text = textContentValue(item.text);
+      const textOrdinal = nonnegativeIntegerValue(item.textOrdinal)
+        ?? index + 1;
+      const blockId = [
+        'provider',
+        stringValue(payload?.runId) ?? 'run',
+        providerTurnId,
+        'text',
+        textOrdinal,
+      ].join(':');
       if (
         !text
         || (
@@ -2219,7 +2240,11 @@ function projectProviderOutputIntoTurn(
           && phase !== 'final_answer'
           && phase !== 'unknown'
         )
+        || (privatePlanningDraft && phase !== 'commentary')
       ) {
+        if (privatePlanningDraft && phase !== 'commentary') {
+          removeTurnBlock(turn, blockId);
+        }
         continue;
       }
       const settledRole = textRoles.get(index) ?? 'commentary';
@@ -2248,15 +2273,6 @@ function projectProviderOutputIntoTurn(
           if (nextPhase !== explicitPhase) explicitPhase = undefined;
         }
       }
-      const textOrdinal = nonnegativeIntegerValue(item.textOrdinal)
-        ?? index + 1;
-      const blockId = [
-        'provider',
-        stringValue(payload?.runId) ?? 'run',
-        providerTurnId,
-        'text',
-        textOrdinal,
-      ].join(':');
       const syntheticPayload: Record<string, unknown> = {
         runId: payload?.runId,
         providerTurnId,
@@ -2317,6 +2333,8 @@ function projectProviderOutputIntoTurn(
     const operationId = stringValue(item.operationId);
     const toolId = stringValue(item.toolId);
     if (!operationId || !toolId) continue;
+    const admitted = providerOperationInTurn(turn, operationId);
+    if (!admitted) continue;
     if (!activeProviderSegment) {
       providerGroupIndex += 1;
       activeProviderSegment = providerWorkSegment(
@@ -2331,14 +2349,19 @@ function projectProviderOutputIntoTurn(
         workSegmentId: activeProviderSegment.id,
       });
     }
-    const operation = moveOrEnsureProviderOperation(
-      turn,
+    const operation = moveProviderOperation(
+      admitted,
       activeProviderSegment,
-      operationId,
-      toolId,
-      event.ts
+      toolId
     );
-    const retry = providerQueueOperationRetry(item, operationId);
+    const candidateRetry = providerQueueOperationRetry(item, operationId);
+    const retry = candidateRetry
+      && providerOperationInTurn(
+        turn,
+        candidateRetry.predecessorOperationId
+      )
+        ? candidateRetry
+        : undefined;
     if (
       operation.retry
       && (
@@ -2541,51 +2564,57 @@ function providerWorkSegment(
   return segment;
 }
 
-function moveOrEnsureProviderOperation(
+function providerOperationInTurn(
   turn: MutableTurn,
-  target: AgentTimelineWorkSegment,
-  operationId: string,
-  toolId: string,
-  startedAt: string
-): AgentTimelineWorkOperation {
-  const source = turn.workSegments.find((segment) =>
-    segment.operations.some((operation) =>
-      operation.operationId === operationId
-    )
-  );
-  const existing = source?.operations.find((operation) =>
-    operation.operationId === operationId
-  );
-  if (!source || !existing || source === target) {
-    return ensureWorkOperation(
-      target,
-      operationId,
-      toolId,
-      startedAt,
-      'preparing'
+  operationId: string
+): {
+  segment: AgentTimelineWorkSegment;
+  operation: AgentTimelineWorkOperation;
+} | undefined {
+  for (const segment of turn.workSegments) {
+    const operation = segment.operations.find((candidate) =>
+      candidate.operationId === operationId
     );
+    if (operation) return { segment, operation };
   }
+  return undefined;
+}
+
+function moveProviderOperation(
+  admitted: {
+    segment: AgentTimelineWorkSegment;
+    operation: AgentTimelineWorkOperation;
+  },
+  target: AgentTimelineWorkSegment,
+  toolId: string
+): AgentTimelineWorkOperation {
+  const { segment: source, operation } = admitted;
+  if (operation.toolId === 'kernel.tool' && toolId !== 'kernel.tool') {
+    operation.toolId = toolId;
+    operation.displayName = toolId;
+  }
+  if (source === target) return operation;
   source.operations = source.operations.filter((operation) =>
-    operation.operationId !== operationId
+    operation.operationId !== admitted.operation.operationId
   );
-  if (source.attention?.operationId === operationId) {
+  if (source.attention?.operationId === admitted.operation.operationId) {
     target.attention = source.attention;
     source.attention = null;
   }
-  target.operations.push(existing);
+  target.operations.push(operation);
   target.provenance.sourceEventRefs = appendUniqueStrings(
     target.provenance.sourceEventRefs,
     source.provenance.sourceEventRefs
   );
   target.provenance.factRefs = appendUniqueStrings(
     target.provenance.factRefs,
-    existing.factRefs
+    operation.factRefs
   );
   target.factRefs = appendUniqueStrings(
     target.factRefs,
-    existing.factRefs
+    operation.factRefs
   );
-  return existing;
+  return operation;
 }
 
 function providerQueueOperationStatus(
@@ -2679,16 +2708,24 @@ function projectWorkEventIntoTurn(
   if (event.kind === 'tool_call') {
     const operationId = stringValue(payload?.operationId);
     if (!operationId) return;
-    const segment = segmentForOperation(turn, operationId, event);
     const replyKind = stringValue(payload?.status);
     const replyReason = stringValue(payload?.replyReason);
+    if (
+      replyKind !== 'admitted'
+      && replyKind !== 'awaitingCapability'
+      && !(
+        replyKind === 'rejected'
+        && replyReason === 'indeterminateRecoveryRequired'
+      )
+    ) {
+      return;
+    }
+    const segment = segmentForOperation(turn, operationId, event);
     const status: AgentTimelineWorkOperationStatus =
       replyKind === 'admitted' ? 'queued'
         : replyKind === 'awaitingCapability'
           ? 'awaitingCapability'
-          : replyKind === 'rejected'
-            ? rejectedOperationStatus(replyReason)
-            : 'preparing';
+          : 'indeterminate';
     const operation = ensureWorkOperation(
       segment,
       operationId,
@@ -2710,19 +2747,11 @@ function projectWorkEventIntoTurn(
         operationId,
         []
       );
-    } else if (status === 'denied') {
+    } else if (status === 'indeterminate') {
       segment.attention = workAttention(
-        'denial',
-        'resolved',
-        'Kernel rejected the operation before execution.',
-        operationId,
-        []
-      );
-    } else if (status === 'failed') {
-      segment.attention = workAttention(
-        'failure',
-        'resolved',
-        'Kernel rejected the operation before execution.',
+        'indeterminate',
+        'unresolved',
+        'Kernel reports that the prior effect state is indeterminate.',
         operationId,
         []
       );
@@ -2967,6 +2996,7 @@ function applyCanonicalWorkFact(
   const factId = stringValue(fact.factId);
   if (!operationId || !factId) return;
   const factKind = stringValue(fact.factKind) ?? 'unknown';
+  const nextStatus = workStatusForFactKind(factKind);
   const existingSegment = turn.workSegments.find((candidate) =>
     candidate.operations.some((operation) =>
       operation.operationId === operationId
@@ -2974,7 +3004,7 @@ function applyCanonicalWorkFact(
   );
   if (
     !existingSegment
-    && authorizationFactDoesNotStartWork(fact)
+    && factDoesNotStartWork(fact, nextStatus)
   ) {
     return;
   }
@@ -2986,9 +3016,8 @@ function applyCanonicalWorkFact(
     operationId,
     toolId,
     stringValue(fact.recordedAt) ?? sourceEvent.ts,
-    workStatusForFactKind(factKind)
+    nextStatus
   );
-  const nextStatus = workStatusForFactKind(factKind);
   if (
     nextStatus !== 'preparing'
     || operation.status === 'preparing'
@@ -3118,11 +3147,15 @@ function applyCanonicalWorkFact(
   touchWorkSegment(segment, sourceEvent, [factId]);
 }
 
-function authorizationFactDoesNotStartWork(
-  fact: Record<string, unknown>
+function factDoesNotStartWork(
+  fact: Record<string, unknown>,
+  status: AgentTimelineWorkOperationStatus
 ): boolean {
-  return stringValue(fact.domain) === 'authorization'
-    && !stringValue(fact.invocationId);
+  return status === 'preparing'
+    || (
+      stringValue(fact.domain) === 'authorization'
+      && !stringValue(fact.invocationId)
+    );
 }
 
 function touchWorkSegment(
@@ -3159,22 +3192,6 @@ function workAttention(
     ...(operationId ? { operationId } : {}),
     factRefs: [...new Set(factRefs)],
   };
-}
-
-function rejectedOperationStatus(
-  reason: string | undefined
-): AgentTimelineWorkOperationStatus {
-  if (
-    reason === 'runBusy'
-    || reason === 'capacityExceeded'
-  ) {
-    return 'queued';
-  }
-  if (reason === 'staleControlEpoch') return 'stale';
-  if (reason === 'indeterminateRecoveryRequired') {
-    return 'indeterminate';
-  }
-  return 'unexecuted';
 }
 
 function workStatusForFactKind(
@@ -3334,12 +3351,6 @@ function projectionBlock(
   committed: boolean
 ): AgentTimelineBlock | null {
   if (!semanticHistoryBlockEvent(event)) return null;
-  if (
-    event.kind === 'review_summary'
-    && stringValue(recordValue(payload?.review)?.status) !== 'final'
-  ) {
-    return null;
-  }
   const kind = String(event.kind);
   const runId = stringValue(payload?.runId);
   const blockId = logicalBlockId(event, payload);
@@ -3428,7 +3439,6 @@ function semanticHistoryBlockEvent(event: AgentEvent): boolean {
     || event.kind === 'assistant_msg'
     || event.kind === 'plan_card'
     || event.kind === 'permission_request'
-    || event.kind === 'review_summary'
     || event.kind === 'error';
 }
 

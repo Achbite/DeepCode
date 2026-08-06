@@ -334,16 +334,40 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
       case 'nativeToolCalls': {
-        const sources = output.calls.map((call) => {
+        const sources = [];
+        for (let index = 0; index < output.calls.length; index += 1) {
+          const call = output.calls[index]!;
           const nativeToolId = requiredToolId(call.toolId);
-          requirePermittedTool(input, nativeToolId);
-          return {
+          const descriptor = requirePermittedTool(input, nativeToolId);
+          const mismatch = toolArgumentsSchemaMismatchV2(
+            call.arguments,
+            descriptor.inputSchema,
+            nativeToolId,
+            'arguments'
+          );
+          if (mismatch) {
+            return {
+              kind: 'noTool',
+              ...completionFields,
+              guidance: providerToolArgumentRepairGuidanceV2(
+                nativeToolId,
+                mismatch
+              ),
+              repair: {
+                kind: 'toolArguments',
+                toolId: nativeToolId,
+                callOrdinal: index + 1,
+              },
+              providerResult: output.providerResult,
+            };
+          }
+          sources.push({
             source: 'providerNative' as const,
             callId: requiredIdentity(call.callId, 'callId'),
             toolId: nativeToolId,
             arguments: cloneJson(call.arguments),
-          };
-        });
+          });
+        }
         return {
           kind: 'toolIntent',
           ...completionFields,
@@ -647,7 +671,7 @@ function requiredDigest(value: string, field: string): string {
 function requirePermittedTool(
   input: SessionKernelProviderAdapterInputV2,
   toolId: string
-): void {
+): SessionKernelProviderAdapterInputV2['toolContext']['tools'][number] {
   const descriptor = input.toolContext.tools.find(
     (tool) => tool.toolId === toolId
   );
@@ -666,6 +690,7 @@ function requirePermittedTool(
       'A planning turn cannot invoke a mutation without a confirmed PlanAction.'
     );
   }
+  return descriptor;
 }
 
 export function materializeProviderPlanV2(
@@ -800,12 +825,31 @@ function assertToolArgumentsMatchSchemaV2(
   schema: unknown,
   toolId: string
 ): void {
-  let mismatch: string | undefined;
+  const mismatch = toolArgumentsSchemaMismatchV2(
+    argumentsValue,
+    schema,
+    toolId,
+    'previewArguments'
+  );
+  if (mismatch) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_arguments_invalid',
+      `Provider Plan previewArguments for ${toolId} do not match the immutable ToolContext JSON Schema: ${mismatch}`
+    );
+  }
+}
+
+function toolArgumentsSchemaMismatchV2(
+  argumentsValue: unknown,
+  schema: unknown,
+  toolId: string,
+  path: string
+): string | undefined {
   try {
-    mismatch = validateToolSchemaValueV2(
+    return validateToolSchemaValueV2(
       argumentsValue,
       schema,
-      'previewArguments'
+      path
     );
   } catch (error) {
     if (error instanceof UnsupportedToolSchemaV2) {
@@ -816,12 +860,17 @@ function assertToolArgumentsMatchSchemaV2(
     }
     throw error;
   }
-  if (mismatch) {
-    throw new SessionKernelProviderAdapterError(
-      'session_kernel_provider_plan_arguments_invalid',
-      `Provider Plan previewArguments for ${toolId} do not match the immutable ToolContext JSON Schema: ${mismatch}`
-    );
-  }
+}
+
+function providerToolArgumentRepairGuidanceV2(
+  toolId: string,
+  mismatch: string
+): string {
+  return [
+    `Tool arguments for ${toolId} do not match the immutable ToolContext JSON Schema: ${mismatch}.`,
+    'Correct the arguments and submit a new tool call.',
+    'For a workspace-root path use "." (or omit an optional path field); never send an empty path string.',
+  ].join(' ');
 }
 
 function validateToolSchemaValueV2(

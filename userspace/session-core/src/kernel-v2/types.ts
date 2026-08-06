@@ -549,6 +549,11 @@ export type SessionProviderTurnOutputV2 = (
   | {
       kind: 'noTool';
       guidance?: string;
+      repair?: {
+        kind: 'toolArguments';
+        toolId: string;
+        callOrdinal: number;
+      };
     }
 ) & {
   items: SessionProviderOrderedItemV2[];

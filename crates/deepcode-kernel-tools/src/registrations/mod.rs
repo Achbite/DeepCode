@@ -461,6 +461,9 @@ fn tool_prompt_v2(tool: KernelToolKind) -> &'static str {
         KernelToolKind::WebSearch | KernelToolKind::WebFetch => {
             "Use only when network access is in Settings and the active PlanAction scope."
         }
+        KernelToolKind::FsList | KernelToolKind::FsGlob => {
+            "Provide only schema-defined arguments and workspace-relative paths. Use \".\" for the workspace root (or omit an optional path); never send an empty path string."
+        }
         _ => "Provide only the arguments defined by this schema; paths are workspace-relative.",
     }
 }

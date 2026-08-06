@@ -519,21 +519,21 @@ export class SessionKernelProviderTurnsV2 {
       let output: SessionProviderTurnOutputV2;
       let completedTerminalRecordedAt: string | undefined;
       try {
-        const deferPublicTextUntilTerminalValidation =
-          request.target.kind === 'planning';
+        const publishPublicTextDeltas =
+          request.target.kind === 'finalAnswer';
         const liveOutput = await this.ports.provider.requestTurn({
           ...providerInput,
           contextAssembly,
-          ...(deferPublicTextUntilTerminalValidation
-            ? {}
-            : {
+          ...(publishPublicTextDeltas
+            ? {
                 publicTextObserver: this.publicTextObserverForTurn(
                   reservation,
                   generation,
                   providerTurnId,
                   state.controlEpoch
                 ),
-              }),
+              }
+            : {}),
           publicActivityObserver: this.publicActivityObserverForTurn(
             reservation,
             generation,
@@ -867,6 +867,29 @@ export class SessionKernelProviderTurnsV2 {
       };
     }
     if (output.kind === 'noTool') {
+      if (output.repair) {
+        if (!output.guidance?.trim()) {
+          throw new SessionKernelProviderTurnError(
+            'session_kernel_provider_tool_repair_guidance_missing',
+            'A rejected Provider tool proposal requires deterministic repair guidance.'
+          );
+        }
+        if (!acceptingState.pendingGuidance.includes(output.guidance)) {
+          acceptingState.pendingGuidance.push(output.guidance);
+        }
+        await this.host.saveCheckpoint();
+        return {
+          result: {
+            kind: 'rejected',
+            operationId: providerRepairOperationIdV2(
+              providerTurnId,
+              output.repair
+            ),
+            guidance: output.guidance,
+          },
+          queuedToolIntents: false,
+        };
+      }
       return {
         result: {
           kind: 'noTool',
@@ -945,6 +968,7 @@ export class SessionKernelProviderTurnsV2 {
     if (
       request.target.kind === 'planAction'
       && (output.kind === 'answer' || output.kind === 'noTool')
+      && result.kind !== 'rejected'
     ) {
       planActionSettlement = this.host.settlePlanActionCompleted(
         request.target.planActionId,
@@ -2240,6 +2264,21 @@ function providerOutcomeSummary(
     };
   }
   return {};
+}
+
+function providerRepairOperationIdV2(
+  providerTurnId: string,
+  repair: NonNullable<
+    Extract<
+      SessionProviderTurnOutputV2,
+      { kind: 'noTool' }
+    >['repair']
+  >
+): string {
+  return `provider-repair-${sha256Hash(canonicalJson({
+    providerTurnId,
+    repair,
+  })).slice('sha256:'.length)}`;
 }
 
 function bindProviderEvidenceV3(
