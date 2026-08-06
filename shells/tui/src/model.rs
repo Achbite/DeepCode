@@ -242,6 +242,12 @@ impl WorkOperationModel {
         {
             details.push(format!("attempts {}", attempts.len()));
         }
+        if let Some(retry) = &operation.retry {
+            details.push(format!(
+                "第 {} 次尝试 · 前序 {}",
+                retry.retry_ordinal, retry.predecessor_operation_id
+            ));
+        }
         Self {
             title: operation
                 .display_name

@@ -591,7 +591,8 @@
 }
 
 .agent-projection-operation__targets,
-.agent-projection-operation__effect {
+.agent-projection-operation__effect,
+.agent-projection-operation__retry {
   padding-left: 14px;
   overflow-wrap: anywhere;
   line-height: 1.45;
@@ -601,6 +602,11 @@
   color: var(--text-muted, #a1a1aa);
   font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
   font-size: 11px;
+}
+
+.agent-projection-operation__retry {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
 }
 
 .agent-projection-operation__effect {

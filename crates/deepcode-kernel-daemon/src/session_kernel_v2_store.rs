@@ -3188,11 +3188,7 @@ fn validate_provider_reservation(
         validate_bounded_identity(reason, "cancellationReason", 128)?;
     }
     if let Some(correction) = &reservation.correction {
-        validate_bounded_identity(
-            &correction.retry_group_id,
-            "correction.retryGroupId",
-            512,
-        )?;
+        validate_bounded_identity(&correction.retry_group_id, "correction.retryGroupId", 512)?;
         validate_bounded_identity(
             &correction.predecessor_operation_id,
             "correction.predecessorOperationId",
@@ -9096,6 +9092,7 @@ fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError
                         "terminalFactId",
                         "terminalFactKind",
                         "settlementReason",
+                        "retry",
                     ],
                     "Provider tool item",
                 )?;
@@ -9133,6 +9130,24 @@ fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError
                     return Err(public_projection_shape_invalid(
                         "Provider tool status is not current",
                     ));
+                }
+                if let Some(retry) = item.get("retry") {
+                    let retry = public_exact_object(
+                        retry,
+                        &["retryGroupId", "predecessorOperationId", "retryOrdinal"],
+                        &[],
+                        "Provider tool retry",
+                    )?;
+                    public_string(retry, "retryGroupId", true)?;
+                    let predecessor = public_string(retry, "predecessorOperationId", true)?;
+                    let retry_ordinal = public_integer(retry, "retryOrdinal", true)?;
+                    if retry_ordinal < 2
+                        || item.get("operationId").and_then(Value::as_str) == Some(predecessor)
+                    {
+                        return Err(public_projection_shape_invalid(
+                            "Provider tool retry identity is invalid",
+                        ));
+                    }
                 }
             }
             _ => {

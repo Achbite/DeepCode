@@ -17,6 +17,7 @@ import type {
   AgentTimelineTurnPart,
   AgentTimelineWorkAttention,
   AgentTimelineWorkOperation,
+  AgentTimelineWorkOperationRetry,
   AgentTimelineWorkOperationStatus,
   AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
@@ -751,6 +752,7 @@ function assertSharedConversationProjection(
     ) {
       throw new Error('session_projection_v2_part_reference_incomplete');
     }
+    assertTurnWorkOperationRetryRelations(turn);
   }
   if (
     value.taskProjection !== undefined
@@ -1730,6 +1732,13 @@ function validWorkOperation(value: unknown): value is AgentTimelineWorkOperation
       operation.attempts !== undefined
       && !Array.isArray(operation.attempts)
     )
+    || (
+      operation.retry !== undefined
+      && !validWorkOperationRetry(
+        operation.retry,
+        operation.operationId as string
+      )
+    )
     || containsPrivateProjectionData(operation)
   ) {
     return false;
@@ -1738,6 +1747,7 @@ function validWorkOperation(value: unknown): value is AgentTimelineWorkOperation
     'operationId',
     'invocationId',
     'attempts',
+    'retry',
     'toolId',
     'displayName',
     'status',
@@ -1783,6 +1793,80 @@ function validWorkOperation(value: unknown): value is AgentTimelineWorkOperation
     attemptIds.add(attempt.attemptId);
     return true;
   });
+}
+
+function validWorkOperationRetry(
+  value: unknown,
+  operationId: string
+): value is AgentTimelineWorkOperationRetry {
+  const retry = recordValue(value);
+  return Boolean(
+    retry
+    && exactKeys(
+      retry,
+      ['retryGroupId', 'predecessorOperationId', 'retryOrdinal']
+    )
+    && nonemptyString(retry.retryGroupId)
+    && nonemptyString(retry.predecessorOperationId)
+    && retry.predecessorOperationId !== operationId
+    && Number.isSafeInteger(retry.retryOrdinal)
+    && Number(retry.retryOrdinal) >= 2
+  );
+}
+
+function assertTurnWorkOperationRetryRelations(
+  turn: AgentTimelineTurn
+): void {
+  const segments = new Map(
+    turn.workSegments.map((segment) => [segment.id, segment] as const)
+  );
+  const orderedOperations: AgentTimelineWorkOperation[] = [];
+  for (const part of turn.parts) {
+    if (part.kind !== 'workSegment') continue;
+    const segment = segments.get(part.workSegmentId);
+    if (!segment) {
+      throw new Error('session_projection_v2_retry_segment_missing');
+    }
+    orderedOperations.push(...segment.operations);
+  }
+  const operationIndex = new Map(
+    orderedOperations.map((operation, index) => [
+      operation.operationId,
+      { operation, index },
+    ] as const)
+  );
+  const correctedPredecessors = new Set<string>();
+  for (const [index, operation] of orderedOperations.entries()) {
+    const retry = operation.retry;
+    if (!retry) continue;
+    const predecessor = operationIndex.get(retry.predecessorOperationId);
+    if (
+      !predecessor
+      || predecessor.index >= index
+      || correctedPredecessors.has(retry.predecessorOperationId)
+      || !retryableWorkOperationStatus(predecessor.operation.status)
+    ) {
+      throw new Error('session_projection_v2_retry_relation_invalid');
+    }
+    const predecessorRetry = predecessor.operation.retry;
+    if (
+      predecessorRetry
+        ? predecessorRetry.retryGroupId !== retry.retryGroupId
+          || predecessorRetry.retryOrdinal + 1 !== retry.retryOrdinal
+        : retry.retryOrdinal !== 2
+    ) {
+      throw new Error('session_projection_v2_retry_chain_invalid');
+    }
+    correctedPredecessors.add(retry.predecessorOperationId);
+  }
+}
+
+function retryableWorkOperationStatus(
+  status: AgentTimelineWorkOperationStatus
+): boolean {
+  return status === 'denied'
+    || status === 'failed'
+    || status === 'unexecuted';
 }
 
 function validWorkAttention(value: unknown): boolean {
@@ -2254,6 +2338,20 @@ function projectProviderOutputIntoTurn(
       toolId,
       event.ts
     );
+    const retry = providerQueueOperationRetry(item, operationId);
+    if (
+      operation.retry
+      && (
+        !retry
+        || operation.retry.retryGroupId !== retry.retryGroupId
+        || operation.retry.predecessorOperationId
+          !== retry.predecessorOperationId
+        || operation.retry.retryOrdinal !== retry.retryOrdinal
+      )
+    ) {
+      throw new Error('session_projection_provider_retry_conflict');
+    }
+    if (retry) operation.retry = retry;
     const status = providerQueueOperationStatus(item);
     if (
       !terminalWorkOperationStatus(operation.status)
@@ -2514,6 +2612,21 @@ function providerQueueOperationStatus(
   if (reason === 'controlEpochSuperseded') return 'stale';
   if (reason === 'indeterminate') return 'indeterminate';
   return 'failed';
+}
+
+function providerQueueOperationRetry(
+  item: Record<string, unknown>,
+  operationId: string
+): AgentTimelineWorkOperationRetry | undefined {
+  if (item.retry === undefined) return undefined;
+  if (!validWorkOperationRetry(item.retry, operationId)) {
+    throw new Error('session_projection_provider_retry_invalid');
+  }
+  return {
+    retryGroupId: item.retry.retryGroupId,
+    predecessorOperationId: item.retry.predecessorOperationId,
+    retryOrdinal: item.retry.retryOrdinal,
+  };
 }
 
 function pruneEmptyWorkSegments(turn: MutableTurn): void {
@@ -3134,6 +3247,9 @@ function finalizeTurnWorkSegments(
         : {}),
       ...(operation.attempts
         ? { attempts: operation.attempts.map((attempt) => ({ ...attempt })) }
+        : {}),
+      ...(operation.retry
+        ? { retry: { ...operation.retry } }
         : {}),
     }));
     const allTerminal =

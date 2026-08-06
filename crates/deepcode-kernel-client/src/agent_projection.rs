@@ -542,12 +542,22 @@ pub struct AgentTimelineWorkOperationAttempt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTimelineWorkOperationRetry {
+    pub retry_group_id: String,
+    pub predecessor_operation_id: String,
+    pub retry_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTimelineWorkOperation {
     pub operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<Vec<AgentTimelineWorkOperationAttempt>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<AgentTimelineWorkOperationRetry>,
     pub tool_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -1587,6 +1597,75 @@ fn validate_turn<'a>(
             turn.id
         )));
     }
+    validate_turn_retry_relations(turn)?;
+    Ok(())
+}
+
+fn validate_turn_retry_relations(
+    turn: &AgentTimelineTurn,
+) -> Result<(), AgentProjectionValidationError> {
+    let segments = turn
+        .work_segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment))
+        .collect::<HashMap<_, _>>();
+    let mut ordered_operations = Vec::new();
+    for part in &turn.parts {
+        let AgentTimelineTurnPart::WorkSegment { work_segment_id } = part else {
+            continue;
+        };
+        let segment = segments.get(work_segment_id.as_str()).ok_or_else(|| {
+            AgentProjectionValidationError::new("retry relation references a missing work segment")
+        })?;
+        ordered_operations.extend(segment.operations.iter());
+    }
+    let operation_positions = ordered_operations
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| (operation.operation_id.as_str(), (index, *operation)))
+        .collect::<HashMap<_, _>>();
+    let mut corrected_predecessors = HashSet::new();
+    for (index, operation) in ordered_operations.iter().enumerate() {
+        let Some(retry) = &operation.retry else {
+            continue;
+        };
+        let Some((predecessor_index, predecessor)) = operation_positions
+            .get(retry.predecessor_operation_id.as_str())
+            .copied()
+        else {
+            return Err(AgentProjectionValidationError::new(format!(
+                "operation {} retry predecessor is missing",
+                operation.operation_id
+            )));
+        };
+        if predecessor_index >= index
+            || !corrected_predecessors.insert(retry.predecessor_operation_id.as_str())
+            || !matches!(
+                predecessor.status,
+                AgentTimelineWorkOperationStatus::Denied
+                    | AgentTimelineWorkOperationStatus::Failed
+                    | AgentTimelineWorkOperationStatus::Unexecuted
+            )
+        {
+            return Err(AgentProjectionValidationError::new(format!(
+                "operation {} has an invalid retry predecessor",
+                operation.operation_id
+            )));
+        }
+        match &predecessor.retry {
+            Some(predecessor_retry)
+                if predecessor_retry.retry_group_id == retry.retry_group_id
+                    && predecessor_retry.retry_ordinal.checked_add(1)
+                        == Some(retry.retry_ordinal) => {}
+            None if retry.retry_ordinal == 2 => {}
+            _ => {
+                return Err(AgentProjectionValidationError::new(format!(
+                    "operation {} has an invalid retry chain",
+                    operation.operation_id
+                )))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1778,6 +1857,20 @@ fn validate_work_operation(
     validate_identity_array(&operation.resource_refs, "operation.resourceRefs")?;
     validate_identity_array(&operation.fact_refs, "operation.factRefs")?;
     validate_identity_array(&operation.effect_refs, "operation.effectRefs")?;
+    if let Some(retry) = &operation.retry {
+        validate_identity(&retry.retry_group_id, "operation.retry.retryGroupId")?;
+        validate_identity(
+            &retry.predecessor_operation_id,
+            "operation.retry.predecessorOperationId",
+        )?;
+        validate_safe_integer(retry.retry_ordinal, "operation.retry.retryOrdinal")?;
+        if retry.retry_ordinal < 2 || retry.predecessor_operation_id == operation.operation_id {
+            return Err(AgentProjectionValidationError::new(format!(
+                "operation {} has an invalid retry identity",
+                operation.operation_id
+            )));
+        }
+    }
     for target in operation.targets.iter().flatten() {
         validate_identity(target, "operation.targets")?;
     }

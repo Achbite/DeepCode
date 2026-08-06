@@ -729,6 +729,16 @@ const WorkOperation: React.FC<{
           {workOperationStatusLabel(operation.status, language)}
         </span>
       </div>
+      {operation.retry && (
+        <div
+          className="deepcode-gui-work-operation__retry"
+          title={operation.retry.predecessorOperationId}
+        >
+          {language === 'zh-CN'
+            ? `第 ${operation.retry.retryOrdinal} 次尝试 · 纠正前序操作`
+            : `Attempt ${operation.retry.retryOrdinal} · corrects prior operation`}
+        </div>
+      )}
       {operation.targets && operation.targets.length > 0 && (
         <div className="deepcode-gui-work-operation__targets">
           {operation.targets.join(' · ')}

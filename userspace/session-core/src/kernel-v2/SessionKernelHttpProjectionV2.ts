@@ -2899,6 +2899,7 @@ function publicOrderedProviderItems(
       'terminalFactId',
       'terminalFactKind',
       'settlementReason',
+      'retry',
     ]);
     const ordinal = item.ordinal;
     const status = textField(item, 'status');
@@ -2922,20 +2923,18 @@ function publicOrderedProviderItems(
         `Provider tool item ${index + 1} is invalid.`
       );
     }
+    const operationId = item.operationId === undefined
+      ? undefined
+      : requiredIdentity(item.operationId, 'operationId');
+    const retry = publicToolRetry(item.retry, operationId, index);
     return {
       kind: 'toolCall',
       ordinal,
       callId: requiredIdentity(item.callId, 'callId'),
       toolName: requiredIdentity(item.toolName, 'toolName'),
       toolId: requiredIdentity(item.toolId, 'toolId'),
-      ...(item.operationId === undefined
-        ? {}
-        : {
-            operationId: requiredIdentity(
-              item.operationId,
-              'operationId'
-            ),
-          }),
+      ...(operationId ? { operationId } : {}),
+      ...(retry ? { retry } : {}),
       ...(status ? { status } : {}),
       ...(item.invocationId === undefined
         ? {}
@@ -2971,6 +2970,53 @@ function publicOrderedProviderItems(
           }),
     };
   });
+}
+
+function publicToolRetry(
+  value: unknown,
+  operationId: string | undefined,
+  itemIndex: number
+): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  const retry = objectRecord(value);
+  const permitted = new Set([
+    'retryGroupId',
+    'predecessorOperationId',
+    'retryOrdinal',
+  ]);
+  const retryOrdinal = retry?.retryOrdinal;
+  if (
+    !retry
+    || Object.keys(retry).length !== permitted.size
+    || Object.keys(retry).some((key) => !permitted.has(key))
+    || !operationId
+    || !Number.isSafeInteger(retryOrdinal)
+    || Number(retryOrdinal) < 2
+  ) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_provider_items_invalid',
+      `Provider tool item ${itemIndex + 1} has an invalid retry relation.`
+    );
+  }
+  const retryGroupId = requiredIdentity(
+    retry.retryGroupId,
+    'retryGroupId'
+  );
+  const predecessorOperationId = requiredIdentity(
+    retry.predecessorOperationId,
+    'predecessorOperationId'
+  );
+  if (predecessorOperationId === operationId) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_provider_items_invalid',
+      `Provider tool item ${itemIndex + 1} cannot retry itself.`
+    );
+  }
+  return {
+    retryGroupId,
+    predecessorOperationId,
+    retryOrdinal,
+  };
 }
 
 function exactTerminalAnswerText(

@@ -151,6 +151,9 @@ export function publicSessionProviderToolCallQueueItemsV2(
       toolName: item.toolName,
       toolId: item.toolId,
       operationId: call.intent.operationId,
+      ...(call.correction
+        ? { retry: cloneJson(call.correction) }
+        : {}),
       status: mode === 'response' ? 'pending' : call.status,
       ...(mode === 'settlement' && call.invocationId
         ? { invocationId: call.invocationId }

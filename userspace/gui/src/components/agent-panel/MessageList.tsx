@@ -154,6 +154,16 @@ function WorkOperation({
           {workOperationStatusLabel(operation.status, language)}
         </span>
       </div>
+      {operation.retry && (
+        <div
+          className="agent-projection-operation__retry"
+          title={operation.retry.predecessorOperationId}
+        >
+          {language === 'zh-CN'
+            ? `第 ${operation.retry.retryOrdinal} 次尝试 · 纠正前序操作`
+            : `Attempt ${operation.retry.retryOrdinal} · corrects prior operation`}
+        </div>
+      )}
       {operation.targets && operation.targets.length > 0 && (
         <div className="agent-projection-operation__targets">
           {operation.targets.join(' · ')}

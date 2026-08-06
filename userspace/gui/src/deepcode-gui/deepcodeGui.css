@@ -3261,7 +3261,8 @@ button {
 }
 
 .deepcode-gui-work-operation__targets,
-.deepcode-gui-work-operation__effect {
+.deepcode-gui-work-operation__effect,
+.deepcode-gui-work-operation__retry {
   margin: 4px 0 0 14px;
   overflow-wrap: anywhere;
   color: #666e78;
@@ -3271,6 +3272,10 @@ button {
 
 .deepcode-gui-work-operation__effect {
   color: #4f5964;
+}
+
+.deepcode-gui-work-operation__retry {
+  color: #7a818b;
 }
 
 .deepcode-gui-work-operation__attempts {

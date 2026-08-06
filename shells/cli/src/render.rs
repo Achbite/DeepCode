@@ -108,6 +108,12 @@ fn render_timeline_work_segment(segment: &deepcode_kernel_client::AgentTimelineW
             "    {name}: {}",
             work_operation_status_label(operation.status)
         );
+        if let Some(retry) = &operation.retry {
+            println!(
+                "      retry: #{} after {}",
+                retry.retry_ordinal, retry.predecessor_operation_id
+            );
+        }
         if let Some(action) = operation
             .canonical_action
             .as_deref()

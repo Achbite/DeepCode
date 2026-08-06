@@ -455,10 +455,17 @@ export interface AgentTimelineWorkOperationAttempt {
   completedAt?: string;
 }
 
+export interface AgentTimelineWorkOperationRetry {
+  retryGroupId: string;
+  predecessorOperationId: string;
+  retryOrdinal: number;
+}
+
 export interface AgentTimelineWorkOperation {
   operationId: string;
   invocationId?: string;
   attempts?: AgentTimelineWorkOperationAttempt[];
+  retry?: AgentTimelineWorkOperationRetry;
   toolId: string;
   displayName?: string;
   status: AgentTimelineWorkOperationStatus;

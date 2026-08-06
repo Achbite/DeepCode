@@ -1440,8 +1440,18 @@ impl LiveProjectionCursor {
                                 .filter(|summary| !summary.trim().is_empty())
                                 .map(|summary| format!(" — {summary}"))
                                 .unwrap_or_default();
+                            let retry = operation
+                                .retry
+                                .as_ref()
+                                .map(|retry| {
+                                    format!(
+                                        " — retry #{} after {}",
+                                        retry.retry_ordinal, retry.predecessor_operation_id
+                                    )
+                                })
+                                .unwrap_or_default();
                             self.render_replaceable_line(format!(
-                                "[work] {name} {}{target}{effect}",
+                                "[work] {name} {}{retry}{target}{effect}",
                                 work_operation_status(operation.status)
                             ))?;
                             self.operation_state
@@ -1555,9 +1565,20 @@ fn timeline_block_body_v2(block: &deepcode_kernel_client::AgentTimelineBlock) ->
 }
 
 fn work_operation_key(operation: &deepcode_kernel_client::AgentTimelineWorkOperation) -> String {
+    let retry = operation
+        .retry
+        .as_ref()
+        .map(|retry| {
+            format!(
+                "{}:{}:{}",
+                retry.retry_group_id, retry.predecessor_operation_id, retry.retry_ordinal
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{:?}|{}|{}|{}",
+        "{:?}|{}|{}|{}|{}",
         operation.status,
+        retry,
         operation.canonical_action.as_deref().unwrap_or_default(),
         operation
             .targets

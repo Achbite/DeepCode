@@ -171,7 +171,111 @@ fn validate_native_turn<'a>(
         object.get("parts"),
         &local_block_ids,
         &local_work_segment_ids,
-    )
+    )?;
+    validate_turn_retry_relations(work_segments, object.get("parts"))
+}
+
+fn validate_turn_retry_relations(
+    work_segments: &[Value],
+    parts: Option<&Value>,
+) -> Result<(), String> {
+    let segments = work_segments
+        .iter()
+        .filter_map(|segment| {
+            let object = segment.as_object()?;
+            Some((object.get("id")?.as_str()?, object))
+        })
+        .collect::<HashMap<_, _>>();
+    let parts = parts
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Session v2 public projection turn requires parts".to_string())?;
+    let mut ordered_operations = Vec::new();
+    for part in parts {
+        let Some(work_segment_id) = part
+            .as_object()
+            .filter(|part| part.get("kind").and_then(Value::as_str) == Some("workSegment"))
+            .and_then(|part| part.get("workSegmentId"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let segment = segments
+            .get(work_segment_id)
+            .ok_or_else(|| "Session v2 public projection retry segment is missing".to_string())?;
+        let operations = segment
+            .get("operations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                "Session v2 public projection retry segment has no operations".to_string()
+            })?;
+        for operation in operations {
+            ordered_operations.push(operation.as_object().ok_or_else(|| {
+                "Session v2 public projection retry operation is invalid".to_string()
+            })?);
+        }
+    }
+    let operation_positions = ordered_operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Some((operation.get("operationId")?.as_str()?, (index, *operation)))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut corrected_predecessors = HashSet::new();
+    for (index, operation) in ordered_operations.iter().enumerate() {
+        let Some(retry_value) = operation.get("retry") else {
+            continue;
+        };
+        let retry = retry_value
+            .as_object()
+            .ok_or_else(|| "Session v2 public projection retry is invalid".to_string())?;
+        let operation_id =
+            required_identity(operation.get("operationId"), "operation.operationId")?;
+        let retry_group_id =
+            required_identity(retry.get("retryGroupId"), "operation.retry.retryGroupId")?;
+        let predecessor_id = required_identity(
+            retry.get("predecessorOperationId"),
+            "operation.retry.predecessorOperationId",
+        )?;
+        let retry_ordinal =
+            required_safe_integer(retry.get("retryOrdinal"), "operation.retry.retryOrdinal")?;
+        let Some((predecessor_index, predecessor)) =
+            operation_positions.get(predecessor_id).copied()
+        else {
+            return Err(format!(
+                "Session v2 public projection operation {operation_id} retry predecessor is missing"
+            ));
+        };
+        let predecessor_status = predecessor
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if predecessor_index >= index
+            || !corrected_predecessors.insert(predecessor_id)
+            || !matches!(predecessor_status, "denied" | "failed" | "unexecuted")
+        {
+            return Err(format!(
+                "Session v2 public projection operation {operation_id} has an invalid retry predecessor"
+            ));
+        }
+        match predecessor.get("retry").and_then(Value::as_object) {
+            Some(predecessor_retry)
+                if predecessor_retry
+                    .get("retryGroupId")
+                    .and_then(Value::as_str)
+                    == Some(retry_group_id)
+                    && predecessor_retry
+                        .get("retryOrdinal")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| value.checked_add(1))
+                        == Some(retry_ordinal) => {}
+            None if retry_ordinal == 2 => {}
+            _ => return Err(format!(
+                "Session v2 public projection operation {operation_id} has an invalid retry chain"
+            )),
+        }
+    }
+    Ok(())
 }
 
 fn validate_native_turn_invariants(turn: &Value, expected_sequence: u64) -> Result<(), String> {
@@ -876,6 +980,7 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
         "operationId",
         "invocationId",
         "attempts",
+        "retry",
         "toolId",
         "displayName",
         "status",
@@ -895,6 +1000,9 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
     validate_string_array(object.get("resourceRefs"), "operation.resourceRefs")?;
     validate_string_array(object.get("factRefs"), "operation.factRefs")?;
     validate_string_array(object.get("effectRefs"), "operation.effectRefs")?;
+    if let Some(retry) = object.get("retry") {
+        validate_work_retry(retry, operation_id)?;
+    }
     validate_optional_strings(
         object,
         &[
@@ -920,6 +1028,32 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
         }
     }
     Ok(operation_id)
+}
+
+fn validate_work_retry(retry: &Value, operation_id: &str) -> Result<(), String> {
+    let object = retry
+        .as_object()
+        .ok_or_else(|| "Session v2 public projection retry must be an object".to_string())?;
+    let allowed = HashSet::from(["retryGroupId", "predecessorOperationId", "retryOrdinal"]);
+    reject_unknown_fields(
+        object.keys().map(String::as_str),
+        &allowed,
+        "operation retry",
+    )?;
+    let retry_group_id =
+        required_identity(object.get("retryGroupId"), "operation.retry.retryGroupId")?;
+    let predecessor_id = required_identity(
+        object.get("predecessorOperationId"),
+        "operation.retry.predecessorOperationId",
+    )?;
+    let retry_ordinal =
+        required_safe_integer(object.get("retryOrdinal"), "operation.retry.retryOrdinal")?;
+    if retry_group_id.trim().is_empty() || predecessor_id == operation_id || retry_ordinal < 2 {
+        return Err(format!(
+            "Session v2 public projection operation {operation_id} has an invalid retry identity"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_work_attempt<'a>(
