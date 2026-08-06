@@ -8,7 +8,7 @@ use crate::host_kernel_operation_store_v2::{
     HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
     HostKernelOperationStoreV2, HostKernelPendingOperationV2, HostKernelPendingRequestLaneV2,
     HostKernelRunOpeningInputV2, HostKernelRunOpeningRecordV2, HostKernelStartupCancelRecoveryV2,
-    HostKernelStoredRunLifecycleV2,
+    HostKernelStoredRunLifecycleV2, HostRunCallerDriveRecoveryV2,
 };
 use crate::host_run_broker_v2::{
     HostActiveRunBrokerV2, HostActiveRunRecordV2, HostActiveRunRegistrationV2,
@@ -581,6 +581,7 @@ impl HostKernelRunCoordinatorV2 {
             run_id,
             RunRetirementReasonCodeV2::SessionEnded,
             None,
+            false,
         )
         .await
     }
@@ -603,6 +604,7 @@ impl HostKernelRunCoordinatorV2 {
                 run_id,
                 RunRetirementReasonCodeV2::HostRequested,
                 None,
+                true,
             )
             .await
         {
@@ -627,6 +629,7 @@ impl HostKernelRunCoordinatorV2 {
         run_id: &str,
         retirement_reason: RunRetirementReasonCodeV2,
         caller_correlation: Option<(&str, &str)>,
+        settle_superseded_drive: bool,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
         let turn = self
             .host_services
@@ -640,6 +643,7 @@ impl HostKernelRunCoordinatorV2 {
             run_id,
             retirement_reason,
             caller_correlation,
+            settle_superseded_drive,
         )
     }
 
@@ -651,6 +655,7 @@ impl HostKernelRunCoordinatorV2 {
         run_id: &str,
         retirement_reason: RunRetirementReasonCodeV2,
         caller_correlation: Option<(&str, &str)>,
+        settle_superseded_drive: bool,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
         let bootstrap = self
             .host_services
@@ -662,6 +667,14 @@ impl HostKernelRunCoordinatorV2 {
                 "Run retirement does not match the exact durable bootstrap",
             ));
         }
+        if settle_superseded_drive {
+            self.settle_superseded_run_drive_before_retirement(
+                session_id,
+                host_run_id,
+                caller_correlation,
+                retirement_reason,
+            )?;
+        }
         let receipt = self.host_services.retire_kernel_run_with_turn_v2(
             turn,
             host_run_id,
@@ -671,9 +684,9 @@ impl HostKernelRunCoordinatorV2 {
         )?;
         match caller_correlation {
             Some((caller_request_id, request_digest)) => {
-                self.host_services
-                    .kernel_operations_v2
-                    .retire_active_for_caller(
+                let operations = &self.host_services.kernel_operations_v2;
+                if settle_superseded_drive {
+                    operations.retire_active_for_caller_after_superseded_drive(
                         session_id,
                         host_run_id,
                         run_id,
@@ -682,15 +695,37 @@ impl HostKernelRunCoordinatorV2 {
                         caller_request_id,
                         request_digest,
                     )?;
+                } else {
+                    operations.retire_active_for_caller(
+                        session_id,
+                        host_run_id,
+                        run_id,
+                        &bootstrap.bootstrap_digest,
+                        &crate::utils::now_text(),
+                        caller_request_id,
+                        request_digest,
+                    )?;
+                }
             }
             None => {
-                self.host_services.kernel_operations_v2.retire_active(
-                    session_id,
-                    host_run_id,
-                    run_id,
-                    &bootstrap.bootstrap_digest,
-                    &crate::utils::now_text(),
-                )?;
+                let operations = &self.host_services.kernel_operations_v2;
+                if settle_superseded_drive {
+                    operations.retire_active_after_superseded_drive(
+                        session_id,
+                        host_run_id,
+                        run_id,
+                        &bootstrap.bootstrap_digest,
+                        &crate::utils::now_text(),
+                    )?;
+                } else {
+                    operations.retire_active(
+                        session_id,
+                        host_run_id,
+                        run_id,
+                        &bootstrap.bootstrap_digest,
+                        &crate::utils::now_text(),
+                    )?;
+                }
             }
         }
         self.remove_live_bridge(&HostKernelLiveRunKeyV2 {
@@ -699,6 +734,87 @@ impl HostKernelRunCoordinatorV2 {
             run_id: run_id.to_string(),
         })?;
         Ok(receipt)
+    }
+
+    fn settle_superseded_run_drive_before_retirement(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        retirement_caller: Option<(&str, &str)>,
+        retirement_reason: RunRetirementReasonCodeV2,
+    ) -> Result<(), HostV2StorageError> {
+        let binding = match self
+            .host_services
+            .kernel_operations_v2
+            .caller_drive_recovery_for_run(session_id, host_run_id)?
+        {
+            HostRunCallerDriveRecoveryV2::NoDrive
+            | HostRunCallerDriveRecoveryV2::Indeterminate(_) => return Ok(()),
+            HostRunCallerDriveRecoveryV2::Unadmitted(binding)
+            | HostRunCallerDriveRecoveryV2::Admitted(binding) => binding,
+        };
+        if retirement_caller
+            .map(|(caller_request_id, request_digest)| {
+                caller_request_id == binding.caller_request_id
+                    && request_digest == binding.request_digest
+            })
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let (code, message) = if retirement_reason == RunRetirementReasonCodeV2::HostRequested {
+            (
+                "host_caller_request_superseded_by_run_cancellation",
+                "The admitted Host caller was superseded by explicit Run cancellation; its exact effects must be reviewed before retry.",
+            )
+        } else {
+            (
+                "host_caller_request_superseded_by_run_retirement",
+                "The admitted Host caller was superseded by explicit Run retirement; its exact effects must be reviewed before retry.",
+            )
+        };
+        let outcome = json!({
+            "schemaVersion": "deepcode.host.agent-run-outcome.v2",
+            "disposition": "indeterminate",
+            "hostRunId": host_run_id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        });
+        let owner_instance_id = binding.drive_owner_instance_id.as_deref().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_caller_request_owner_missing",
+                "Superseded Run drive has no exact Host owner instance",
+            )
+        })?;
+        if let Some(admission_digest) = binding.admission_digest.as_deref() {
+            self.host_services
+                .kernel_operations_v2
+                .settle_owned_caller_request(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                    owner_instance_id,
+                    admission_digest,
+                    outcome,
+                    crate::utils::now_rfc3339_text(),
+                )?;
+        } else {
+            self.host_services
+                .kernel_operations_v2
+                .settle_unadmitted_owned_caller_indeterminate(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                    owner_instance_id,
+                    outcome,
+                    crate::utils::now_rfc3339_text(),
+                )?;
+        }
+        Ok(())
     }
 
     /// Owns the complete first-turn transition. Durable Opening precedes the
@@ -960,6 +1076,7 @@ impl HostKernelRunCoordinatorV2 {
             operation_request_id,
             operation,
             None,
+            None,
             || {},
         )
         .await?
@@ -992,9 +1109,41 @@ impl HostKernelRunCoordinatorV2 {
                 expected_bootstrap_digest,
                 expected_settlement_digest,
             )),
+            None,
             dispatched,
         )
         .await
+    }
+
+    pub(crate) async fn submit_user_input_for_caller(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        operation_request_id: &str,
+        caller_request_id: &str,
+        caller_request_digest: &str,
+        operation: HostKernelBridgeOperationV2,
+    ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
+        self.submit_operation_guarded(
+            session_id,
+            host_run_id,
+            operation_request_id,
+            operation,
+            None,
+            Some(HostKernelOperationCallerCorrelationV2 {
+                caller_request_id: caller_request_id.to_string(),
+                request_kind: "agent.run.user-input.v2".to_string(),
+                request_digest: caller_request_digest.to_string(),
+            }),
+            || {},
+        )
+        .await?
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_kernel_user_input_unexpected_stale",
+                "Caller-correlated user input became stale before dispatch",
+            )
+        })
     }
 
     async fn submit_operation_guarded(
@@ -1004,6 +1153,7 @@ impl HostKernelRunCoordinatorV2 {
         operation_request_id: &str,
         operation: HostKernelBridgeOperationV2,
         expected_predecessor: Option<(&str, &str, &str)>,
+        caller_correlation: Option<HostKernelOperationCallerCorrelationV2>,
         dispatched: impl FnOnce(),
     ) -> Result<Option<HostKernelOperationSettlementReceiptV2>, HostV2StorageError> {
         let turn = self
@@ -1085,7 +1235,7 @@ impl HostKernelRunCoordinatorV2 {
                     .clone(),
             ),
             operation_request_id: operation_request_id.to_string(),
-            caller_correlation: None,
+            caller_correlation: caller_correlation.clone(),
             production_frame: frame.clone(),
             recorded_at: crate::utils::now_text(),
         };
@@ -1242,6 +1392,7 @@ impl HostKernelRunCoordinatorV2 {
             run_id,
             RunRetirementReasonCodeV2::HostRequested,
             Some((caller_request_id, caller_request_digest)),
+            true,
         )?;
         Ok(())
     }
@@ -2808,6 +2959,7 @@ impl HostKernelRunCoordinatorV2 {
             &bootstrap.run_id,
             retirement_reason,
             None,
+            true,
         )?;
         Ok(())
     }
@@ -2858,6 +3010,7 @@ impl HostKernelRunCoordinatorV2 {
                         &recovery.binding.caller_request_id,
                         &recovery.binding.request_digest,
                     )),
+                    true,
                 )
                 .map_err(|error| {
                     HostV2StorageError::io(
@@ -2878,6 +3031,7 @@ impl HostKernelRunCoordinatorV2 {
                     &recovery.bootstrap.run_id,
                     RunRetirementReasonCodeV2::HostRequested,
                     None,
+                    true,
                 )
                 .map_err(|retirement_error| {
                     HostV2StorageError::io(

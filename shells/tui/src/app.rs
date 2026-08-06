@@ -836,13 +836,12 @@ impl TuiApp {
                 return;
             }
         };
+        let mut request = AgentRunGuidanceRequest::new(input, caller_request_id);
+        request.workspace_path = self.workspace_path();
+        request.no_workspace = Some(self.host.no_workspace);
         match self
             .client
-            .submit_agent_run_guidance(
-                session_id,
-                run_id,
-                AgentRunGuidanceRequest::new(input, caller_request_id),
-            )
+            .submit_agent_run_guidance(session_id, run_id, request)
             .await
         {
             Ok(result) => {

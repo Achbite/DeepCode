@@ -48,6 +48,11 @@ export interface AgentSession {
   updatedAt: string;
 }
 
+export interface AgentHostCallerMutationErrorV2 {
+  schemaVersion: 'deepcode.host.caller-mutation-error.v2';
+  disposition: 'rejected' | 'pending' | 'indeterminate';
+}
+
 export interface AgentTimelineAttachment {
   readonly kind: 'file' | 'directory';
   readonly path: string;
@@ -615,6 +620,8 @@ export type StartAgentRunRequest =
 
 export interface AgentRunGuidanceRequest {
   guidance: string;
+  workspacePath?: string;
+  noWorkspace?: boolean;
   attachments?: AgentInputAttachmentV2[];
   callerRequestId: string;
 }

@@ -13,8 +13,12 @@ interface DeepCodeConversationShellProps {
   projectTitle: string | null;
   projectWorkspaceBinding?: AgentWorkspaceBinding;
   projectContext: boolean;
+  submissionScopeId?: string | null;
   onBeforeSend: () => boolean | Promise<boolean>;
-  onAfterSend: () => void | Promise<void>;
+  onAfterSend: (
+    submissionScopeId: string | null,
+    submittedDraftCleared: boolean
+  ) => void | Promise<void>;
 }
 
 const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
@@ -24,6 +28,7 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
   projectTitle,
   projectWorkspaceBinding,
   projectContext,
+  submissionScopeId,
   onBeforeSend,
   onAfterSend,
 }) => (
@@ -35,6 +40,7 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
       homeProjectTitle={projectTitle}
       projectWorkspaceBinding={projectWorkspaceBinding}
       projectContext={projectContext}
+      submissionScopeId={submissionScopeId}
       suppressPendingDecision={forceHome}
       onBeforeSend={onBeforeSend}
       onAfterSend={onAfterSend}

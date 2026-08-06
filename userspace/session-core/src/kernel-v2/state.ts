@@ -974,6 +974,8 @@ export function checkpointSessionKernelStateV2(
   savedAt: string
 ): SessionKernelCheckpointV2 {
   const next = cloneSessionKernelLoopStateV2(state);
+  const consumedThroughLedgerSequence =
+    next.lineage.cursor.afterLedgerSequence;
   next.checkpointRevision += 1;
   validateOperationPlanActionBindings(
     next.operationPlanActionBindings,
@@ -995,6 +997,12 @@ export function checkpointSessionKernelStateV2(
     state.reviewFacts.coverageAfterLedgerSequence
   );
   next.lineage = rebuildSessionKernelLineageV2(next);
+  // Compact checkpoints drop replayable fact bodies and lineage details, but
+  // the wire cursor still records exactly how far the live state had consumed.
+  // Recovery separately rewinds to the Review coverage boundary to rebuild the
+  // dropped projection without weakening checkpoint authority evidence.
+  next.lineage.cursor.afterLedgerSequence =
+    consumedThroughLedgerSequence;
   for (const barrier of Object.values(next.factBarriers)) {
     barrier.observedFactIds = [];
   }

@@ -599,7 +599,9 @@ interface SessionKernelProductionActorReceiptV2 {
 
 interface SessionKernelProductionActiveOperationV2 {
   token: symbol;
+  operationGeneration: number;
   controller: AbortController;
+  quiescence: Promise<void>;
   superseded: boolean;
   supersededProviderTurnId?: string;
 }
@@ -756,14 +758,19 @@ export class SessionKernelProductionActorV2 {
     const operationGeneration = ++this.operationSequence;
     const authorityGeneration =
       this.authorityGeneration;
+    let resolveDurableQuiescence!: () => void;
+    const durableQuiescence = new Promise<void>((resolve) => {
+      resolveDurableQuiescence = resolve;
+    });
     let execution: Promise<SessionKernelProductionSuccessV2>;
     try {
       execution = this.schedule(
         request,
         frame.operationRequestId,
         {
-        operationGeneration,
-        authorityGeneration,
+          operationGeneration,
+          authorityGeneration,
+          durableQuiescence,
         }
       );
     } catch (error) {
@@ -789,7 +796,16 @@ export class SessionKernelProductionActorV2 {
             )
           )
         )
-      );
+      )
+      .finally(() => {
+        if (
+          this.activeOrdinary?.operationGeneration
+            === operationGeneration
+        ) {
+          this.activeOrdinary = undefined;
+        }
+        resolveDurableQuiescence();
+      });
     return this.storeReceipt(
       frame.operationRequestId,
       digest,
@@ -803,6 +819,7 @@ export class SessionKernelProductionActorV2 {
     generation: {
       operationGeneration: number;
       authorityGeneration: number;
+      durableQuiescence: Promise<void>;
     }
   ): Promise<SessionKernelProductionSuccessV2> {
     const runner = this.runnerFor(request);
@@ -871,7 +888,9 @@ export class SessionKernelProductionActorV2 {
       const token = Symbol('productionOperation');
       const active: SessionKernelProductionActiveOperationV2 = {
         token,
+        operationGeneration: generation.operationGeneration,
         controller: new AbortController(),
+        quiescence: generation.durableQuiescence,
         superseded: false,
       };
       this.activeOrdinary = active;
@@ -882,49 +901,42 @@ export class SessionKernelProductionActorV2 {
         superseded: false,
       };
       try {
-        try {
-          return await executeProductionRequestWithRunner(
-            activeRunner,
-            request,
-            context,
-            active.controller.signal,
-            () => ({
-              superseded: active.superseded,
-              providerTurnId:
-                active.supersededProviderTurnId,
-            })
-          );
-        } catch (error) {
-          if (!active.superseded) throw error;
-          return buildProductionSuccess(
-            activeRunner,
-            request,
-            {
-              ...context,
-              superseded: true,
-              ...(active.supersededProviderTurnId
-                ? {
-                    supersededProviderTurnId:
-                      active.supersededProviderTurnId,
-                  }
-                : {}),
-            },
-            {
-              kind: 'ordinaryOperationSuperseded',
-              errorCode: safeProductionErrorCode(error),
-            }
-          );
-        }
-      } finally {
-        if (this.activeOrdinary?.token === token) {
-          this.activeOrdinary = undefined;
-        }
+        return await executeProductionRequestWithRunner(
+          activeRunner,
+          request,
+          context,
+          active.controller.signal,
+          () => ({
+            superseded: active.superseded,
+            providerTurnId:
+              active.supersededProviderTurnId,
+          })
+        );
+      } catch (error) {
+        if (!active.superseded) throw error;
+        return buildProductionSuccess(
+          activeRunner,
+          request,
+          {
+            ...context,
+            superseded: true,
+            ...(active.supersededProviderTurnId
+              ? {
+                  supersededProviderTurnId:
+                    active.supersededProviderTurnId,
+                }
+              : {}),
+          },
+          {
+            kind: 'ordinaryOperationSuperseded',
+            errorCode: safeProductionErrorCode(error),
+          }
+        );
       }
     });
-    this.ordinaryTail = execution.then(
-      () => undefined,
-      () => undefined
-    );
+    // A later ordinary operation or authority transition must not race this
+    // operation's immutable persistence records after execution has returned.
+    this.ordinaryTail = generation.durableQuiescence;
     return execution;
   }
 
@@ -951,9 +963,11 @@ export class SessionKernelProductionActorV2 {
     }
     this.terminalCancellation = identity;
     const authorityGeneration = ++this.authorityGeneration;
-    this.markActiveOrdinarySuperseded('userRequested');
+    const ordinaryQuiescence =
+      this.markActiveOrdinarySuperseded('userRequested');
     const predecessor = this.inputTransitionTail;
     const transition = predecessor.then(async () => {
+      await ordinaryQuiescence;
       const activeRunner = await runner;
       const durableCancellation =
         activeRunner.snapshot().runCancellation;
@@ -1076,8 +1090,12 @@ export class SessionKernelProductionActorV2 {
           request.operation.data.input
         );
       const authorityGeneration = ++this.authorityGeneration;
-      this.markActiveOrdinarySuperseded('userInput');
-      this.ordinaryTail = Promise.resolve();
+      const ordinaryQuiescence =
+        this.markActiveOrdinarySuperseded('userInput');
+      // Wait only for the operation that held actor authority at the fence.
+      // Older queued operations stay ordered and self-supersede after the
+      // input transition releases userInputDrain.
+      await ordinaryQuiescence;
       await activeRunner.applyFencedUserInput(
         request.operation.data.input,
         fenceGeneration
@@ -1155,17 +1173,18 @@ export class SessionKernelProductionActorV2 {
 
   private markActiveOrdinarySuperseded(
     reason: 'userInput' | 'userRequested'
-  ): void {
+  ): Promise<void> {
     const active = this.activeOrdinary;
     const turn = this.runnerSnapshot()?.providerTurn;
     if (!active) {
-      return;
+      return Promise.resolve();
     }
     active.superseded = true;
     active.controller.abort(reason);
     if (turn?.status === 'active') {
       active.supersededProviderTurnId = turn.providerTurnId;
     }
+    return active.quiescence;
   }
 
   private runnerSnapshot(): SessionKernelLoopStateV2 | undefined {

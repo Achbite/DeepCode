@@ -37,6 +37,8 @@ pub(crate) struct AgentRunCallerMutationRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentRunGuidanceMutationRequest {
     pub(crate) guidance: String,
+    pub(crate) workspace_path: Option<String>,
+    pub(crate) no_workspace: Option<bool>,
     pub(crate) attachments: Option<Vec<AgentInputAttachmentV2>>,
     pub(crate) caller_request_id: String,
 }
@@ -62,6 +64,67 @@ pub(crate) struct AgentAuthorityRevokeRequestV2 {
 }
 
 fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiResponse> {
+    run_response_with_input_admission(state, session_id, run_id, None)
+}
+
+const HOST_CALLER_MUTATION_ERROR_SCHEMA_V2: &str = "deepcode.host.caller-mutation-error.v2";
+
+fn caller_mutation_error_data(disposition: &str) -> Value {
+    json!({
+        "schemaVersion": HOST_CALLER_MUTATION_ERROR_SCHEMA_V2,
+        "disposition": disposition,
+    })
+}
+
+fn caller_mutation_rejection(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Json<ApiResponse> {
+    ApiResponse::error_with_data(code, message, caller_mutation_error_data("rejected"))
+}
+
+fn caller_mutation_rejection_response(mut response: Json<ApiResponse>) -> Json<ApiResponse> {
+    if !response.0.ok && response.0.data.is_none() {
+        response.0.data = Some(caller_mutation_error_data("rejected"));
+    }
+    response
+}
+
+fn caller_mutation_error_response(error: AgentKernelV2Error) -> Json<ApiResponse> {
+    let code = error.code;
+    let disposition = if matches!(
+        code.as_str(),
+        "host_caller_request_in_progress" | "host_user_input_admission_pending"
+    ) {
+        "pending"
+    } else if code.contains("indeterminate")
+        || matches!(
+            code.as_str(),
+            "host_user_input_projection_missing"
+                | "host_initial_input_projection_missing"
+                | "host_caller_request_recovery_required"
+                | "host_caller_request_outcome_missing"
+                | "host_caller_request_owner_missing"
+                | "host_caller_request_user_input_admission_missing"
+                | "host_user_input_admission_missing"
+                | "host_run_open_admission_incomplete"
+                | "host_run_open_startup_binding_lost"
+                | "host_kernel_caller_drive_owner_lost_before_admission"
+        )
+    {
+        "indeterminate"
+    } else {
+        "rejected"
+    };
+    ApiResponse::error_with_data(code, error.message, caller_mutation_error_data(disposition))
+}
+
+fn run_response_with_input_admission(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    input_id: Option<&str>,
+) -> Json<ApiResponse> {
     let run = {
         let runs = state.session_runs.lock().expect("session run state lock");
         runs.get(run_id)
@@ -76,7 +139,8 @@ fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiRes
     };
     ApiResponse::ok(json!({
         "run": run,
-        "session": session
+        "session": session,
+        "inputId": input_id,
     }))
 }
 
@@ -98,7 +162,12 @@ fn run_admission_response(
             "Durable Run admission does not match its exact Host and Kernel Run identity.",
         );
     }
-    run_response(state, session_id, &admission.host_run_id)
+    run_response_with_input_admission(
+        state,
+        session_id,
+        &admission.host_run_id,
+        Some(&admission.input_id),
+    )
 }
 
 fn require_verified_selectable_session(
@@ -232,50 +301,53 @@ pub(crate) async fn agent_session_run_start(
     if let Some(response) =
         crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
-        return response;
+        return caller_mutation_rejection_response(response);
     }
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
-        return response;
+        return caller_mutation_rejection_response(response);
     }
     let Some(session) = session_metadata_payload(&state, &session_id) else {
-        return ApiResponse::error("agent_session_not_found", "agent session not found");
+        return caller_mutation_rejection("agent_session_not_found", "agent session not found");
     };
     if !session_schema_is_current(&session) {
-        return unsupported_session_schema_response();
+        return caller_mutation_rejection_response(unsupported_session_schema_response());
     }
     match body.op.as_str() {
         "resolveDecision" => {
             let mutation_lock = session_run_admission_lock(&session_id);
             let _mutation_guard = mutation_lock.lock_owned().await;
             if let Err(response) = require_verified_selectable_session(&state, &session_id) {
-                return response;
+                return caller_mutation_rejection_response(response);
             }
             if body.content.is_some()
                 || body.workspace_path.is_some()
                 || body.no_workspace.is_some()
                 || body.attachments.is_some()
             {
-                return ApiResponse::error(
+                return caller_mutation_rejection(
                     "session_operation_v2_invalid",
                     "A decision cannot alter Run content, attachments, or workspace identity.",
                 );
             }
             return match resolve_agent_kernel_decision_v2(&state, &session_id, &body).await {
                 Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
-                Err(error) => ApiResponse::error(error.code, error.message),
+                Err(error) => caller_mutation_error_response(error),
             };
         }
         "ask" => {
             let run_start_lock = session_run_admission_lock(&session_id);
             let _run_start_guard = run_start_lock.lock_owned().await;
             if let Err(response) = require_verified_selectable_session(&state, &session_id) {
-                return response;
+                return caller_mutation_rejection_response(response);
             }
             let Some(session) = session_metadata_payload(&state, &session_id) else {
-                return ApiResponse::error("agent_session_not_found", "agent session not found");
+                return caller_mutation_rejection(
+                    "agent_session_not_found",
+                    "agent session not found",
+                );
             };
             if !session_schema_is_current(&session) {
-                return unsupported_session_schema_response();
+                return caller_mutation_rejection_response(unsupported_session_schema_response());
             }
             if body.decision_kind.is_some()
                 || body.decision.is_some()
@@ -283,7 +355,7 @@ pub(crate) async fn agent_session_run_start(
                 || body.run_id.is_some()
                 || body.target_id.is_some()
             {
-                return ApiResponse::error(
+                return caller_mutation_rejection(
                     "session_operation_v2_invalid",
                     "A new ask cannot carry decision or active Run identity.",
                 );
@@ -291,7 +363,7 @@ pub(crate) async fn agent_session_run_start(
             return agent_session_run_open_admitted(&state, &session_id, &body, &session).await;
         }
         _ => {
-            return ApiResponse::error(
+            return caller_mutation_rejection(
                 "session_operation_v2_unsupported",
                 "Only a new ask or an exact Plan/capability decision can enter the v2 Run path.",
             )
@@ -308,11 +380,11 @@ async fn agent_session_run_open_admitted(
     match preadmit_open_agent_kernel_run_v2(state, session_id, body).await {
         Ok(Some(admission)) => return run_admission_response(state, session_id, admission),
         Ok(None) => {}
-        Err(error) => return ApiResponse::error(error.code, error.message),
+        Err(error) => return caller_mutation_error_response(error),
     }
     let project_context = match authoritative_project_run_context(state, session, false) {
         Ok(context) => context,
-        Err(error) => return ApiResponse::error(error.code, error.message),
+        Err(error) => return caller_mutation_rejection(error.code, error.message),
     };
     if let Some(binding) = project_context
         .as_ref()
@@ -326,21 +398,21 @@ async fn agent_session_run_open_admitted(
             stored_session["updatedAt"] = json!(now_text());
         }
         if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
-            return ApiResponse::error("agent_session_persist_failed", error);
+            return caller_mutation_rejection("agent_session_persist_failed", error);
         }
     }
     let profile_id = {
         let mut gui = state.gui.lock().expect("gui state lock");
         let llm_profiles = gui.llm_profiles.clone();
         let Some(stored_session) = session_mut(&mut gui, session_id) else {
-            return ApiResponse::error("agent_session_not_found", "agent session not found");
+            return caller_mutation_rejection("agent_session_not_found", "agent session not found");
         };
         let stored_profile_id = stored_session
             .get("profileId")
             .and_then(Value::as_str)
             .map(str::to_string);
         let Some(profile_id) = stored_profile_id else {
-            return ApiResponse::error(
+            return caller_mutation_rejection(
                 "llm_profile_unavailable",
                 "this Session has no selected LLM Profile; select one before starting a Run",
             );
@@ -352,14 +424,14 @@ async fn agent_session_run_open_admitted(
         ) {
             Ok(available) => available,
             Err(error) => {
-                return ApiResponse::error(
+                return caller_mutation_rejection(
                     error.code,
                     "Provider Profile availability could not be verified before starting the Session Run",
                 )
             }
         };
         if !profile_available {
-            return ApiResponse::error(
+            return caller_mutation_rejection(
                 "llm_profile_unavailable",
                 "the Session's selected LLM Profile does not exist, is disabled, or its exact revision is unavailable; select or re-enable it explicitly",
             );
@@ -376,7 +448,7 @@ async fn agent_session_run_open_admitted(
             .clone();
         match read_session_kernel_v2_public_agent_events(&sessions_dir, session_id) {
             Ok(events) => events.len(),
-            Err(error) => return ApiResponse::error(error.code, error.message),
+            Err(error) => return caller_mutation_rejection(error.code, error.message),
         }
     };
     match open_agent_kernel_run_v2(
@@ -390,7 +462,7 @@ async fn agent_session_run_open_admitted(
     .await
     {
         Ok(admission) => run_admission_response(state, session_id, admission),
-        Err(error) => ApiResponse::error(error.code, error.message),
+        Err(error) => caller_mutation_error_response(error),
     }
 }
 
@@ -415,6 +487,41 @@ pub(crate) async fn agent_session_run_get(
     }
 }
 
+pub(crate) async fn agent_session_active_run(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
+    let active = match state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(&session_id)
+    {
+        Ok(active) => active,
+        Err(error) => {
+            return ApiResponse::error(error.code, error.message);
+        }
+    };
+    let Some(active) = active else {
+        return ApiResponse::ok(Value::Null);
+    };
+    if !run_belongs_to_session(&state, &session_id, &active.host_run_id) {
+        if let Err(error) =
+            restore_agent_kernel_run_cache_v2(&state, &session_id, &active.host_run_id)
+        {
+            return ApiResponse::error(error.code, error.message);
+        }
+    }
+    run_response(&state, &session_id, &active.host_run_id)
+}
+
 pub(crate) async fn agent_session_run_cancel(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
@@ -423,17 +530,15 @@ pub(crate) async fn agent_session_run_cancel(
     if let Some(response) =
         crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
-        return response;
+        return caller_mutation_rejection_response(response);
     }
-    let mutation_lock = session_run_admission_lock(&session_id);
-    let _mutation_guard = mutation_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
-        return response;
+        return caller_mutation_rejection_response(response);
     }
     match cancel_agent_kernel_run_v2(&state, &session_id, &run_id, &body.caller_request_id).await {
         Ok(Some(host_run_id)) => run_response(&state, &session_id, &host_run_id),
-        Ok(None) => ApiResponse::error("agent_run_not_found", "agent run not found"),
-        Err(error) => ApiResponse::error(error.code, error.message),
+        Ok(None) => caller_mutation_rejection("agent_run_not_found", "agent run not found"),
+        Err(error) => caller_mutation_error_response(error),
     }
 }
 
@@ -445,25 +550,102 @@ pub(crate) async fn agent_session_run_guidance(
     if let Some(response) =
         crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
-        return response;
+        return caller_mutation_rejection_response(response);
     }
     let mutation_lock = session_run_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
     if let Err(response) = require_verified_selectable_session(&state, &session_id) {
-        return response;
+        return caller_mutation_rejection_response(response);
     }
-    match submit_agent_kernel_user_input_v2(
+    let Some(session) = session_metadata_payload(&state, &session_id) else {
+        return caller_mutation_rejection("agent_session_not_found", "agent session not found");
+    };
+    let project_context = match authoritative_project_run_context(&state, &session, true) {
+        Ok(context) => context,
+        Err(error) => return caller_mutation_rejection(error.code, error.message),
+    };
+    let (workspace_path, no_workspace) = if let Some(project_context) = project_context.as_ref() {
+        if project_context.get("kind").and_then(Value::as_str) == Some("blank") {
+            if body.workspace_path.is_some() || body.no_workspace == Some(false) {
+                return caller_mutation_rejection(
+                    "agent_guidance_project_workspace_conflict",
+                    "The authoritative project has no workspace, but guidance requested a workspace-bound continuation.",
+                );
+            }
+            (None, true)
+        } else {
+            if body.no_workspace == Some(true) {
+                return caller_mutation_rejection(
+                    "agent_guidance_project_workspace_conflict",
+                    "The authoritative project is workspace-bound and cannot continue in no-workspace mode.",
+                );
+            }
+            let Some(authoritative_path) = project_context
+                .pointer("/workspaceBinding/openPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            else {
+                return caller_mutation_rejection(
+                    "agent_guidance_workspace_required",
+                    "Project-backed guidance has no authoritative workspace path.",
+                );
+            };
+            let requested_path = body
+                .workspace_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            (
+                Some(requested_path.unwrap_or(authoritative_path).to_string()),
+                false,
+            )
+        }
+    } else if body.no_workspace == Some(true) {
+        if body.workspace_path.is_some() {
+            return caller_mutation_rejection(
+                "agent_guidance_workspace_conflict",
+                "Guidance cannot request both a workspace path and no-workspace mode.",
+            );
+        }
+        (None, true)
+    } else {
+        let Some(path) = body
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            return caller_mutation_rejection(
+                "agent_guidance_workspace_required",
+                "Guidance for a workspace-bound Run requires the current workspace path.",
+            );
+        };
+        (Some(path.to_string()), false)
+    };
+    let admission = submit_agent_kernel_user_input_v2(
         &state,
         &session_id,
         &run_id,
         &body.guidance,
+        workspace_path.as_deref(),
+        no_workspace,
         body.attachments.as_deref(),
         &body.caller_request_id,
     )
-    .await
-    {
-        Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
-        Err(error) => ApiResponse::error(error.code, error.message),
+    .await;
+    let result = match admission {
+        Ok(admission) => await_agent_kernel_user_input_admission_v2(admission).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(receipt) => run_response_with_input_admission(
+            &state,
+            &session_id,
+            &receipt.host_run_id,
+            Some(&receipt.input_id),
+        ),
+        Err(error) => caller_mutation_error_response(error),
     }
 }
 

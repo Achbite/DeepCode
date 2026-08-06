@@ -1,5 +1,11 @@
 use crate::*;
+use deepcode_kernel_client::{HostCallerMutationDispositionV2, KernelClientError};
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub(crate) async fn run_interactive(
     client: HttpKernelClient,
@@ -88,13 +94,22 @@ pub(crate) async fn ask(
     let mut request = StartAgentRunRequest::ask(prompt, caller_request_id);
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
-    let (result, final_text) =
-        match start_and_wait_for_run(client, &session_id, request, !plain).await? {
-            StartedRunOutcome::Settled { result, final_text } => (result, final_text),
-            StartedRunOutcome::ActionRequired(message) => {
-                return Ok(CliCommandOutcome::ActionRequired(message));
-            }
-        };
+    let (result, final_text) = match start_and_wait_for_run(client, &session_id, request, !plain)
+        .await?
+    {
+        StartedRunOutcome::Settled { result, final_text } => (result, final_text),
+        StartedRunOutcome::ActionRequired(message) => {
+            return Ok(CliCommandOutcome::ActionRequired(message));
+        }
+        StartedRunOutcome::Superseded {
+            host_run_id,
+            new_turn_id,
+        } => {
+            return Ok(CliCommandOutcome::ActionRequired(format!(
+                "shared session run {host_run_id} continued with newer user input in turn {new_turn_id}; this CLI request was superseded and did not produce its own committed finalAnswer"
+            )));
+        }
+    };
     if plain {
         println!("{final_text}");
         return Ok(CliCommandOutcome::Completed);
@@ -194,13 +209,22 @@ pub(crate) async fn resolve_session_decision(
     request.run_id = Some(pending.run_id);
     request.target_id = Some(pending.target_id);
     request.guidance = guidance;
-    let (result, final_text) =
-        match start_and_wait_for_run(client, &session_id, request, true).await? {
-            StartedRunOutcome::Settled { result, final_text } => (result, final_text),
-            StartedRunOutcome::ActionRequired(message) => {
-                return Ok(CliCommandOutcome::ActionRequired(message));
-            }
-        };
+    let (result, final_text) = match start_and_wait_for_run(client, &session_id, request, true)
+        .await?
+    {
+        StartedRunOutcome::Settled { result, final_text } => (result, final_text),
+        StartedRunOutcome::ActionRequired(message) => {
+            return Ok(CliCommandOutcome::ActionRequired(message));
+        }
+        StartedRunOutcome::Superseded {
+            host_run_id,
+            new_turn_id,
+        } => {
+            return Ok(CliCommandOutcome::ActionRequired(format!(
+                "shared session run {host_run_id} continued with newer user input in turn {new_turn_id}; this CLI decision was superseded and did not produce its own committed finalAnswer"
+            )));
+        }
+    };
     eprintln!("session: {}", result.run.session_id);
     println!("{final_text}");
     Ok(CliCommandOutcome::Completed)
@@ -212,6 +236,10 @@ enum StartedRunOutcome {
         final_text: String,
     },
     ActionRequired(String),
+    Superseded {
+        host_run_id: String,
+        new_turn_id: String,
+    },
 }
 
 async fn reconcile_terminal_projection(
@@ -373,6 +401,207 @@ async fn cancel_exact_run_before_cli_exit(
     }
 }
 
+async fn settle_admitted_run_after_cli_failure(
+    client: &HttpKernelClient,
+    admitted: &AgentRunResult,
+    failure: String,
+    run_deadline: Option<Instant>,
+) -> Result<StartedRunOutcome, String> {
+    const STATUS_PROBE_FAILURE_WINDOW: Duration = Duration::from_secs(4);
+    let expected_turn_id = admitted_input_turn_id(admitted).ok();
+    let mut superseding_turn_id = None;
+    let mut last_successful_host_probe = Instant::now();
+    let mut last_probe_error = None;
+
+    loop {
+        match client
+            .agent_timeline_v2_optional(&admitted.run.session_id)
+            .await
+        {
+            Ok(Some(snapshot)) => {
+                if let Some(expected_turn_id) = expected_turn_id.as_deref() {
+                    match admitted_turn_supersession(&snapshot, admitted, expected_turn_id) {
+                        Ok(Some(turn_id)) => superseding_turn_id = Some(turn_id),
+                        Ok(None) => {}
+                        Err(error) => last_probe_error = Some(error),
+                    }
+                }
+            }
+            Ok(None) => {
+                last_probe_error = Some(
+                    "the admitted Session no longer has a typed Shared Projection snapshot"
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                last_probe_error = Some(format!(
+                    "failed to inspect the admitted turn before CLI exit: {error}"
+                ));
+            }
+        }
+
+        match client
+            .get_agent_run(&admitted.run.session_id, &admitted.run.run_id)
+            .await
+        {
+            Ok(current) => {
+                last_successful_host_probe = Instant::now();
+                if current.run.session_id != admitted.run.session_id
+                    || current.run.run_id != admitted.run.run_id
+                    || current.run.kernel_run_id != admitted.run.kernel_run_id
+                {
+                    return Err(format!(
+                        "{failure}; Host Run identity changed while preserving its admitted owner"
+                    ));
+                }
+                if current.run.is_terminal() || current.run.status == "waiting" {
+                    if superseding_turn_id.is_none() {
+                        if let (Some(expected_turn_id), Ok(Some(snapshot))) = (
+                            expected_turn_id.as_deref(),
+                            client
+                                .agent_timeline_v2_optional(&admitted.run.session_id)
+                                .await,
+                        ) {
+                            if let Ok(Some(turn_id)) =
+                                admitted_turn_supersession(&snapshot, admitted, expected_turn_id)
+                            {
+                                superseding_turn_id = Some(turn_id);
+                            }
+                        }
+                    }
+                    if let Some(new_turn_id) = superseding_turn_id {
+                        return Ok(StartedRunOutcome::Superseded {
+                            host_run_id: current.run.run_id,
+                            new_turn_id,
+                        });
+                    }
+                    if current.run.is_terminal() {
+                        return Err(failure);
+                    }
+                }
+                if current.run.status == "waiting" && superseding_turn_id.is_none() {
+                    return Err(format!(
+                        "{failure}; shared session run {} is durably waiting for user action and was not cancelled",
+                        current.run.run_id
+                    ));
+                }
+            }
+            Err(error) => {
+                last_probe_error = Some(format!(
+                    "failed to inspect admitted Host Run {} before CLI exit: {error}",
+                    admitted.run.run_id
+                ));
+            }
+        }
+
+        if superseding_turn_id.is_none()
+            && Instant::now().duration_since(last_successful_host_probe)
+                >= STATUS_PROBE_FAILURE_WINDOW
+        {
+            return Err(format!(
+                "{failure}; {}",
+                last_probe_error.unwrap_or_else(|| {
+                    "the admitted Host Run could not be reconciled before CLI exit".to_string()
+                })
+            ));
+        }
+
+        tokio::select! {
+            _ = wait_for_cli_interrupt() => {
+                return match cancel_exact_run_before_cli_exit(client, admitted).await {
+                    Ok(()) => Err(format!(
+                        "CLI was interrupted while preserving admitted Host Run {} after: {failure}",
+                        admitted.run.run_id
+                    )),
+                    Err(cleanup) => Err(format!(
+                        "CLI was interrupted while preserving admitted Host Run {} after: {failure}; {cleanup}",
+                        admitted.run.run_id
+                    )),
+                };
+            }
+            _ = wait_for_optional_deadline(run_deadline) => {
+                return Err(format!(
+                    "{failure}; the admitted Host Run {} did not reach a quiescent boundary before the configured CLI deadline",
+                    admitted.run.run_id
+                ));
+            }
+            _ = tokio::time::sleep(RUN_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+fn admitted_input_turn_id(admitted: &AgentRunResult) -> Result<String, String> {
+    let kernel_run_id = admitted
+        .run
+        .kernel_run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Host Run {} has no Kernel Run identity after input admission",
+                admitted.run.run_id
+            )
+        })?;
+    let input_id = admitted
+        .input_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Host Run {} has no input identity after input admission",
+                admitted.run.run_id
+            )
+        })?;
+    Ok(format!("turn:{kernel_run_id}:input:{input_id}"))
+}
+
+fn admitted_turn_supersession(
+    snapshot: &AgentTimelineSnapshot,
+    admitted: &AgentRunResult,
+    expected_turn_id: &str,
+) -> Result<Option<String>, String> {
+    if snapshot.session_id != admitted.run.session_id {
+        return Err(format!(
+            "Shared Projection session {} does not match admitted Session {}",
+            snapshot.session_id, admitted.run.session_id
+        ));
+    }
+    let projection = snapshot.run_projection.as_ref().ok_or_else(|| {
+        format!(
+            "Shared Projection for admitted Host Run {} has no runProjection",
+            admitted.run.run_id
+        )
+    })?;
+    let kernel_run_id = admitted.run.kernel_run_id.as_deref().ok_or_else(|| {
+        format!(
+            "Host Run {} has no Kernel Run identity after input admission",
+            admitted.run.run_id
+        )
+    })?;
+    if projection.run_id != kernel_run_id {
+        return Err(format!(
+            "Shared Projection advanced from admitted Kernel Run {kernel_run_id} to {}",
+            projection.run_id
+        ));
+    }
+    if !snapshot
+        .turns
+        .iter()
+        .any(|turn| turn.id == expected_turn_id)
+    {
+        return Err(format!(
+            "Shared Projection does not contain exact admitted turn {expected_turn_id}"
+        ));
+    }
+    Ok(projection
+        .turn_id
+        .as_ref()
+        .filter(|turn_id| turn_id.as_str() != expected_turn_id)
+        .cloned())
+}
+
 fn new_cli_request_id(prefix: &str) -> Result<String, String> {
     Ok(format!(
         "cli-{prefix}-{}-{}",
@@ -382,6 +611,265 @@ fn new_cli_request_id(prefix: &str) -> Result<String, String> {
             .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
             .as_nanos()
     ))
+}
+
+const CLI_PENDING_SUBMISSION_SCHEMA_V1: &str = "deepcode.cli.pending-host-submission.v1";
+const CLI_PENDING_SUBMISSION_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+fn cli_env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn cli_config_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    if cli_env_truthy("DEEPCODE_PORTABLE") {
+        return std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("config")
+            .join("user")
+            .join("local");
+    }
+    if cfg!(windows) {
+        if let Some(path) = std::env::var_os("APPDATA") {
+            return PathBuf::from(path).join("DeepCode");
+        }
+    } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join("deepcode");
+    }
+    if let Some(path) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
+        let path = PathBuf::from(path);
+        return if cfg!(windows) {
+            path.join("AppData").join("Roaming").join("DeepCode")
+        } else {
+            path.join(".config").join("deepcode")
+        };
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".deepcode-user")
+}
+
+fn cli_pending_submission_path(session_id: &str) -> Result<PathBuf, String> {
+    if session_id.is_empty()
+        || session_id.len() > 512
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("Session id cannot be used for durable CLI submission recovery".to_string());
+    }
+    let directory = cli_config_root()
+        .join("cli")
+        .join("pending-host-submissions");
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "failed to create durable CLI submission directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        format!(
+            "failed to restrict durable CLI submission directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory.join(format!("{session_id}.json")))
+}
+
+fn cli_submission_semantics(request: &StartAgentRunRequest) -> Result<Value, String> {
+    let mut value = serde_json::to_value(request)
+        .map_err(|error| format!("failed to encode durable CLI submission: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "durable CLI submission is not a JSON object".to_string())?;
+    object.remove("callerRequestId");
+    Ok(value)
+}
+
+fn read_cli_pending_submission(
+    path: &Path,
+    expected_session_id: &str,
+) -> Result<StartAgentRunRequest, String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect durable CLI submission {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.len() > CLI_PENDING_SUBMISSION_MAX_BYTES {
+        return Err(format!(
+            "durable CLI submission {} exceeds its {} byte limit",
+            path.display(),
+            CLI_PENDING_SUBMISSION_MAX_BYTES
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "durable CLI submission {} is not private (expected mode 0600)",
+            path.display()
+        ));
+    }
+    let value: Value = serde_json::from_slice(&fs::read(path).map_err(|error| {
+        format!(
+            "failed to read durable CLI submission {}: {error}",
+            path.display()
+        )
+    })?)
+    .map_err(|error| {
+        format!(
+            "durable CLI submission {} is invalid JSON: {error}",
+            path.display()
+        )
+    })?;
+    if value.get("schemaVersion").and_then(Value::as_str) != Some(CLI_PENDING_SUBMISSION_SCHEMA_V1)
+        || value.get("sessionId").and_then(Value::as_str) != Some(expected_session_id)
+    {
+        return Err(format!(
+            "durable CLI submission {} has an unsupported identity",
+            path.display()
+        ));
+    }
+    let request = serde_json::from_value::<StartAgentRunRequest>(
+        value
+            .get("request")
+            .cloned()
+            .ok_or_else(|| "durable CLI submission has no request".to_string())?,
+    )
+    .map_err(|error| format!("durable CLI submission request is invalid: {error}"))?;
+    if request.caller_request_id.trim().is_empty()
+        || request.caller_request_id.len() > 512
+        || !request.caller_request_id.starts_with("cli-")
+    {
+        return Err("durable CLI submission has an invalid caller identity".to_string());
+    }
+    Ok(request)
+}
+
+fn recover_or_record_cli_submission(
+    session_id: &str,
+    candidate: StartAgentRunRequest,
+) -> Result<StartAgentRunRequest, String> {
+    let path = cli_pending_submission_path(session_id)?;
+    if path.exists() {
+        let stored = read_cli_pending_submission(&path, session_id)?;
+        if cli_submission_semantics(&stored)? != cli_submission_semantics(&candidate)? {
+            return Err(format!(
+                "Session {session_id} has a different CLI submission with an unknown outcome; retry the exact original command before sending new content"
+            ));
+        }
+        return Ok(stored);
+    }
+    let envelope = serde_json::json!({
+        "schemaVersion": CLI_PENDING_SUBMISSION_SCHEMA_V1,
+        "sessionId": session_id,
+        "request": &candidate,
+    });
+    let encoded = serde_json::to_vec(&envelope)
+        .map_err(|error| format!("failed to encode durable CLI submission: {error}"))?;
+    if encoded.len() as u64 > CLI_PENDING_SUBMISSION_MAX_BYTES {
+        return Err(format!(
+            "durable CLI submission exceeds its {} byte limit",
+            CLI_PENDING_SUBMISSION_MAX_BYTES
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(&path) {
+        Ok(mut file) => {
+            if let Err(error) =
+                std::io::Write::write_all(&mut file, &encoded).and_then(|()| file.sync_all())
+            {
+                let _ = fs::remove_file(&path);
+                return Err(format!(
+                    "failed to persist durable CLI submission {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stored = read_cli_pending_submission(&path, session_id)?;
+            if cli_submission_semantics(&stored)? != cli_submission_semantics(&candidate)? {
+                return Err(format!(
+                    "Session {session_id} acquired a different pending CLI submission concurrently"
+                ));
+            }
+            return Ok(stored);
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to create durable CLI submission {}: {error}",
+                path.display()
+            ))
+        }
+    }
+    Ok(candidate)
+}
+
+fn settle_cli_submission_identity(session_id: &str, caller_request_id: &str) -> Result<(), String> {
+    let path = cli_pending_submission_path(session_id)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let stored = read_cli_pending_submission(&path, session_id)?;
+    if stored.caller_request_id != caller_request_id {
+        return Err(format!(
+            "durable CLI submission {} changed before settlement",
+            path.display()
+        ));
+    }
+    fs::remove_file(&path).map_err(|error| {
+        format!(
+            "failed to settle durable CLI submission {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn caller_mutation_was_rejected(error: &KernelClientError) -> bool {
+    matches!(
+        error,
+        KernelClientError::HostCallerMutation {
+            disposition: Some(HostCallerMutationDispositionV2::Rejected),
+            ..
+        }
+    )
+}
+
+fn settle_cli_admission_response(
+    session_id: &str,
+    caller_request_id: &str,
+    result: deepcode_kernel_client::KernelClientResult<AgentRunResult>,
+) -> Result<AgentRunResult, String> {
+    match result {
+        Ok(result) => {
+            settle_cli_submission_identity(session_id, caller_request_id)?;
+            Ok(result)
+        }
+        Err(error) if caller_mutation_was_rejected(&error) => {
+            settle_cli_submission_identity(session_id, caller_request_id)?;
+            Err(format!("failed to start shared session run: {error}"))
+        }
+        Err(error) => Err(format!(
+            "failed to start shared session run: {error}; the exact CLI submission identity was retained for same-request replay"
+        )),
+    }
 }
 
 async fn session_id_for_turn(
@@ -442,9 +930,25 @@ async fn start_and_wait_for_run(
         }
     };
     drop(baseline_request);
-    let mut live_projection =
-        LiveProjectionCursor::from_baseline(baseline.as_ref(), &request, show_progress)?;
-    let mut start = Box::pin(client.start_agent_run(session_id, request));
+    let guidance_target =
+        active_guidance_target_v2(client, session_id, &request, baseline.as_ref()).await?;
+    let request = recover_or_record_cli_submission(session_id, request)?;
+    let caller_request_id = request.caller_request_id.clone();
+    let expects_input_admission = request.op == "ask";
+    let mut live_projection = LiveProjectionCursor::from_baseline(
+        baseline.as_ref(),
+        &request,
+        guidance_target
+            .as_ref()
+            .map(|target| target.kernel_run_id.as_str()),
+        show_progress,
+    )?;
+    let mut start = Box::pin(admit_cli_turn_v2(
+        client,
+        session_id,
+        request,
+        guidance_target,
+    ));
     let admission_started = Instant::now();
     let admission_deadline = bounded_cli_stage_deadline(run_deadline, RUN_ADMISSION_WINDOW);
     let admission_budget = admission_deadline.saturating_duration_since(admission_started);
@@ -454,19 +958,21 @@ async fn start_and_wait_for_run(
     let mut result = 'start: loop {
         tokio::select! {
             result = &mut start => {
-                break 'start result.map_err(|error| {
-                    format!("failed to start shared session run: {error}")
-                })?;
+                break 'start settle_cli_admission_response(
+                    session_id,
+                    &caller_request_id,
+                    result,
+                )?;
             }
             _ = wait_for_cli_interrupt() => {
                 return Err(
-                    "CLI was interrupted before the daemon returned an exact Run identity; the owned Kernel guard will be reclaimed"
+                    "CLI was interrupted before the daemon returned an exact Run identity; the exact submission identity remains durable for replay and the owned Kernel guard will be reclaimed"
                         .to_string(),
                 );
             }
             _ = wait_for_optional_deadline(Some(admission_deadline)) => {
                 return Err(format!(
-                    "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available",
+                    "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available; the exact submission identity remains durable for replay",
                     admission_budget.as_millis()
                 ));
             }
@@ -474,19 +980,21 @@ async fn start_and_wait_for_run(
                 let mut projection = Box::pin(client.agent_timeline_v2_optional(session_id));
                 tokio::select! {
                     result = &mut start => {
-                        break 'start result.map_err(|error| {
-                            format!("failed to start shared session run: {error}")
-                        })?;
+                        break 'start settle_cli_admission_response(
+                            session_id,
+                            &caller_request_id,
+                            result,
+                        )?;
                     }
                     _ = wait_for_cli_interrupt() => {
                         return Err(
-                            "CLI was interrupted before the daemon returned an exact Run identity; the owned Kernel guard will be reclaimed"
+                            "CLI was interrupted before the daemon returned an exact Run identity; the exact submission identity remains durable for replay and the owned Kernel guard will be reclaimed"
                                 .to_string(),
                         );
                     }
                     _ = wait_for_optional_deadline(Some(admission_deadline)) => {
                         return Err(format!(
-                            "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available",
+                            "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available; the exact submission identity remains durable for replay",
                             admission_budget.as_millis()
                         ));
                     }
@@ -502,9 +1010,11 @@ async fn start_and_wait_for_run(
                                 );
                                 tokio::select! {
                                     result = &mut start => {
-                                        break 'start result.map_err(|error| {
-                                            format!("failed to start shared session run: {error}")
-                                        })?;
+                                        break 'start settle_cli_admission_response(
+                                            session_id,
+                                            &caller_request_id,
+                                            result,
+                                        )?;
                                     }
                                     mapped = &mut mapping => match mapped {
                                         Ok(mapped) => {
@@ -522,13 +1032,13 @@ async fn start_and_wait_for_run(
                                     },
                                     _ = wait_for_cli_interrupt() => {
                                         return Err(
-                                            "CLI was interrupted before the daemon returned an exact Run identity; the owned Kernel guard will be reclaimed"
+                                            "CLI was interrupted before the daemon returned an exact Run identity; the exact submission identity remains durable for replay and the owned Kernel guard will be reclaimed"
                                                 .to_string(),
                                         );
                                     }
                                     _ = wait_for_optional_deadline(Some(admission_deadline)) => {
                                         return Err(format!(
-                                            "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available",
+                                            "shared Session Run admission exceeded its bounded phase window of {} ms before an exact Run identity was available; the exact submission identity remains durable for replay",
                                             admission_budget.as_millis()
                                         ));
                                     }
@@ -544,6 +1054,12 @@ async fn start_and_wait_for_run(
             }
         }
     };
+    if expects_input_admission {
+        if let Err(error) = live_projection.bind_input_admission(&result) {
+            return settle_admitted_run_after_cli_failure(client, &result, error, run_deadline)
+                .await;
+        }
+    }
     let mut binding = Box::pin(bind_live_projection_to_host_result(
         client,
         &result,
@@ -561,10 +1077,7 @@ async fn start_and_wait_for_run(
     };
     drop(binding);
     if let Err(error) = binding_result {
-        return match cancel_exact_run_before_cli_exit(client, &result).await {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(format!("{error}; {cleanup}")),
-        };
+        return settle_admitted_run_after_cli_failure(client, &result, error, run_deadline).await;
     }
     match wait_for_started_run(
         client,
@@ -576,11 +1089,82 @@ async fn start_and_wait_for_run(
     .await
     {
         Ok(outcome) => Ok(outcome),
-        Err(error) => match cancel_exact_run_before_cli_exit(client, &result).await {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(format!("{error}; {cleanup}")),
-        },
+        Err(error) => {
+            settle_admitted_run_after_cli_failure(client, &result, error, run_deadline).await
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveGuidanceTargetV2 {
+    host_run_id: String,
+    kernel_run_id: String,
+}
+
+async fn active_guidance_target_v2(
+    client: &HttpKernelClient,
+    session_id: &str,
+    request: &StartAgentRunRequest,
+    baseline: Option<&AgentTimelineSnapshot>,
+) -> Result<Option<ActiveGuidanceTargetV2>, String> {
+    if request.op != "ask" {
+        return Ok(None);
+    }
+    let Some(mapped) = client
+        .active_agent_run(session_id)
+        .await
+        .map_err(|error| format!("failed to resolve the authoritative active Host Run: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if mapped.run.is_terminal() {
+        return Err(format!(
+            "authoritative active Host Run {} is already {}; refresh before sending a new input",
+            mapped.run.run_id, mapped.run.status
+        ));
+    }
+    let kernel_run_id = mapped.run.kernel_run_id.clone().ok_or_else(|| {
+        format!(
+            "active Host Run {} has no explicit Kernel Run identity",
+            mapped.run.run_id
+        )
+    })?;
+    if let Some(projection) = baseline
+        .and_then(|snapshot| snapshot.run_projection.as_ref())
+        .filter(|projection| !projection.status.is_terminal())
+    {
+        if projection.run_id != kernel_run_id {
+            return Err(format!(
+                "authoritative active Kernel Run {kernel_run_id} conflicts with typed Shared Projection Run {}",
+                projection.run_id
+            ));
+        }
+    }
+    Ok(Some(ActiveGuidanceTargetV2 {
+        host_run_id: mapped.run.run_id,
+        kernel_run_id,
+    }))
+}
+
+async fn admit_cli_turn_v2(
+    client: &HttpKernelClient,
+    session_id: &str,
+    request: StartAgentRunRequest,
+    guidance_target: Option<ActiveGuidanceTargetV2>,
+) -> deepcode_kernel_client::KernelClientResult<AgentRunResult> {
+    let Some(target) = guidance_target else {
+        return client.start_agent_run(session_id, request).await;
+    };
+    let mut guidance = AgentRunGuidanceRequest::new(
+        request.content.unwrap_or_default(),
+        request.caller_request_id,
+    );
+    guidance.workspace_path = request.workspace_path;
+    guidance.no_workspace = request.no_workspace;
+    guidance.attachments = request.attachments;
+    client
+        .submit_agent_run_guidance(session_id, &target.host_run_id, guidance)
+        .await
 }
 
 async fn bind_live_projection_to_host_result(
@@ -689,6 +1273,40 @@ async fn wait_for_started_run(
     maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     maintenance_tick.tick().await;
     loop {
+        if let Some(new_turn_id) = live_projection.superseded_turn_id().map(ToOwned::to_owned) {
+            let session_id = result.run.session_id.clone();
+            let host_run_id = result.run.run_id.clone();
+            let mut refresh = Box::pin(client.get_agent_run(&session_id, &host_run_id));
+            tokio::select! {
+                refreshed = &mut refresh => {
+                    if let Ok(refreshed) = refreshed {
+                        *result = refreshed;
+                        if result.run.is_terminal() || result.run.status == "waiting" {
+                            live_projection.finish_commentary_line()?;
+                            return Ok(StartedRunOutcome::Superseded {
+                                host_run_id: result.run.run_id.clone(),
+                                new_turn_id,
+                            });
+                        }
+                    }
+                }
+                _ = wait_for_cli_interrupt() => {
+                    return Err(format!(
+                        "shared session run {} was interrupted by the CLI user while its input was superseded by {new_turn_id}",
+                        result.run.run_id
+                    ));
+                }
+                _ = wait_for_optional_deadline(run_deadline) => {
+                    return Err(format!(
+                        "shared session run {} continued with newer input in turn {new_turn_id} but did not reach a quiescent boundary before the configured CLI deadline of {} ms",
+                        result.run.run_id,
+                        run_timeout.map(|limit| limit.as_millis()).unwrap_or_default()
+                    ));
+                }
+                _ = maintenance_tick.tick() => {}
+            }
+            continue;
+        }
         if let Some(projection_status) = live_projection.bound_run_terminal() {
             *result =
                 reconcile_host_terminal_after_projection(client, result, projection_status).await?;
@@ -699,6 +1317,7 @@ async fn wait_for_started_run(
             live_projection.finish_commentary_line()?;
             return Ok(StartedRunOutcome::ActionRequired(message));
         }
+        let effective_run_deadline = run_deadline;
         tokio::select! {
             stream_event = next_live_projection_event(&mut projection_stream) => {
                 match stream_event {
@@ -708,14 +1327,14 @@ async fn wait_for_started_run(
                                 client,
                                 &result.run.session_id,
                                 &mut live_projection,
-                                run_deadline,
+                                effective_run_deadline,
                             )
                             .await?;
                             projection_stream = reopen_live_projection_stream(
                                 client,
                                 &result,
                                 &live_projection,
-                                run_deadline,
+                                effective_run_deadline,
                             )
                             .await?;
                         }
@@ -725,7 +1344,7 @@ async fn wait_for_started_run(
                             client,
                             &result.run.session_id,
                             &mut live_projection,
-                            run_deadline,
+                            effective_run_deadline,
                         )
                         .await?;
                         projection_stream = None;
@@ -736,7 +1355,7 @@ async fn wait_for_started_run(
                             client,
                             &result.run.session_id,
                             &mut live_projection,
-                            run_deadline,
+                            effective_run_deadline,
                         )
                         .await?;
                         projection_stream = None;
@@ -749,7 +1368,7 @@ async fn wait_for_started_run(
                     result.run.run_id
                 ));
             }
-            _ = wait_for_optional_deadline(run_deadline) => {
+            _ = wait_for_optional_deadline(effective_run_deadline) => {
                 return Err(format!(
                     "shared session run {} is still {} after {} ms",
                     result.run.run_id,
@@ -765,15 +1384,23 @@ async fn wait_for_started_run(
                         client,
                         &result,
                         &live_projection,
-                        run_deadline,
+                        effective_run_deadline,
                     )
                     .await?;
                 }
             }
         }
     }
+    let reconciled_final =
+        reconcile_terminal_projection(client, &result, &mut live_projection).await?;
+    if let Some(new_turn_id) = live_projection.superseded_turn_id().map(ToOwned::to_owned) {
+        live_projection.finish_commentary_line()?;
+        return Ok(StartedRunOutcome::Superseded {
+            host_run_id: result.run.run_id.clone(),
+            new_turn_id,
+        });
+    }
     if matches!(result.run.status.as_str(), "failed" | "cancelled") {
-        let _ = reconcile_terminal_projection(client, &result, &mut live_projection).await?;
         live_projection.finish_commentary_line()?;
         let message = result
             .run
@@ -786,14 +1413,12 @@ async fn wait_for_started_run(
             result.run.run_id, result.run.status
         ));
     }
-    let final_text = reconcile_terminal_projection(client, &result, &mut live_projection)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "shared session run {} succeeded without a committed finalAnswer",
-                result.run.run_id
-            )
-        })?;
+    let final_text = reconciled_final.ok_or_else(|| {
+        format!(
+            "shared session run {} succeeded without a committed finalAnswer",
+            result.run.run_id
+        )
+    })?;
     live_projection.finish_commentary_line()?;
     Ok(StartedRunOutcome::Settled {
         result: result.clone(),
@@ -1005,10 +1630,16 @@ enum LiveProjectionExpectation {
     NewTurn {
         baseline_run_id: Option<String>,
         baseline_turn_ids: std::collections::HashSet<String>,
+        expected_turn_id: Option<String>,
     },
     ExistingRun {
         run_id: String,
         turn_id: String,
+    },
+    ExistingRunNewTurn {
+        run_id: String,
+        baseline_turn_ids: std::collections::HashSet<String>,
+        expected_turn_id: Option<String>,
     },
 }
 
@@ -1020,6 +1651,7 @@ struct LiveProjectionCursor {
     expectation: LiveProjectionExpectation,
     live_run_id: Option<String>,
     live_turn_id: Option<String>,
+    superseded_by_turn_id: Option<String>,
     emit_updates: bool,
     block_text: std::collections::HashMap<String, String>,
     operation_state: std::collections::HashMap<String, String>,
@@ -1040,6 +1672,7 @@ impl LiveProjectionCursor {
     fn from_baseline(
         snapshot: Option<&AgentTimelineSnapshot>,
         request: &StartAgentRunRequest,
+        continuing_run_id: Option<&str>,
         emit_updates: bool,
     ) -> Result<Self, String> {
         let expectation = if request.op == "resolveDecision" {
@@ -1063,6 +1696,14 @@ impl LiveProjectionCursor {
                     "resolveDecision live projection requires an exact baseline turn".to_string()
                 })?,
             }
+        } else if let Some(continuing_run_id) = continuing_run_id {
+            LiveProjectionExpectation::ExistingRunNewTurn {
+                run_id: continuing_run_id.to_string(),
+                baseline_turn_ids: snapshot
+                    .map(|snapshot| snapshot.turns.iter().map(|turn| turn.id.clone()).collect())
+                    .unwrap_or_default(),
+                expected_turn_id: None,
+            }
         } else {
             LiveProjectionExpectation::NewTurn {
                 baseline_run_id: snapshot
@@ -1071,6 +1712,7 @@ impl LiveProjectionCursor {
                 baseline_turn_ids: snapshot
                     .map(|snapshot| snapshot.turns.iter().map(|turn| turn.id.clone()).collect())
                     .unwrap_or_default(),
+                expected_turn_id: None,
             }
         };
         let ignored_action_interaction_id = match &expectation {
@@ -1084,7 +1726,8 @@ impl LiveProjectionCursor {
                             .to_string()
                     })?,
             ),
-            LiveProjectionExpectation::NewTurn { .. } => None,
+            LiveProjectionExpectation::NewTurn { .. }
+            | LiveProjectionExpectation::ExistingRunNewTurn { .. } => None,
         };
         let mut cursor = Self {
             last_revision: snapshot.map(|snapshot| snapshot.revision).unwrap_or(0),
@@ -1094,6 +1737,7 @@ impl LiveProjectionCursor {
             expectation,
             live_run_id: None,
             live_turn_id: None,
+            superseded_by_turn_id: None,
             emit_updates,
             block_text: std::collections::HashMap::new(),
             operation_state: std::collections::HashMap::new(),
@@ -1113,6 +1757,69 @@ impl LiveProjectionCursor {
             }
         }
         Ok(cursor)
+    }
+
+    fn bind_input_admission(&mut self, result: &AgentRunResult) -> Result<(), String> {
+        let kernel_run_id = result.run.kernel_run_id.as_deref().ok_or_else(|| {
+            format!(
+                "Host Run {} has no explicit Kernel Run identity for input admission",
+                result.run.run_id
+            )
+        })?;
+        let input_id = result
+            .input_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|input_id| !input_id.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "Host Run {} admission has no exact input identity",
+                    result.run.run_id
+                )
+            })?;
+        let turn_id = format!("turn:{kernel_run_id}:input:{input_id}");
+        match &mut self.expectation {
+            LiveProjectionExpectation::NewTurn {
+                baseline_run_id,
+                baseline_turn_ids,
+                expected_turn_id,
+            } => {
+                if baseline_run_id.as_deref() == Some(kernel_run_id) {
+                    return Err(format!(
+                        "new input admission reused baseline Kernel Run {kernel_run_id}"
+                    ));
+                }
+                if baseline_turn_ids.contains(&turn_id) {
+                    return Err(format!(
+                        "input admission {input_id} already exists in the baseline projection"
+                    ));
+                }
+                *expected_turn_id = Some(turn_id);
+            }
+            LiveProjectionExpectation::ExistingRunNewTurn {
+                run_id,
+                baseline_turn_ids,
+                expected_turn_id,
+            } => {
+                if kernel_run_id != run_id {
+                    return Err(format!(
+                        "guidance admission returned Kernel Run {kernel_run_id}, expected {run_id}"
+                    ));
+                }
+                if baseline_turn_ids.contains(&turn_id) {
+                    return Err(format!(
+                        "guidance admission input {input_id} already exists in the baseline projection"
+                    ));
+                }
+                *expected_turn_id = Some(turn_id);
+            }
+            LiveProjectionExpectation::ExistingRun { .. } => {
+                return Err(
+                    "input admission cannot bind a decision projection expectation".to_string(),
+                )
+            }
+        }
+        Ok(())
     }
 
     fn record_candidate(
@@ -1177,8 +1884,25 @@ impl LiveProjectionCursor {
                 result.run.run_id
             ));
         }
+        let bound_turn_id = match &self.expectation {
+            LiveProjectionExpectation::NewTurn {
+                expected_turn_id, ..
+            }
+            | LiveProjectionExpectation::ExistingRunNewTurn {
+                expected_turn_id, ..
+            } => expected_turn_id.clone().ok_or_else(|| {
+                format!(
+                    "Host Run {} has no exact admitted input turn identity",
+                    result.run.run_id
+                )
+            })?,
+            LiveProjectionExpectation::ExistingRun { turn_id, .. } => turn_id.clone(),
+        };
         self.live_run_id = Some(projection.run_id.clone());
-        self.live_turn_id = projection.turn_id.clone();
+        self.live_turn_id = Some(bound_turn_id.clone());
+        if projection.turn_id.as_deref() != Some(bound_turn_id.as_str()) {
+            self.superseded_by_turn_id = projection.turn_id.clone();
+        }
         self.observe(&candidate.snapshot)
     }
 
@@ -1221,10 +1945,12 @@ impl LiveProjectionCursor {
                 ));
             }
             if self.live_turn_id.as_deref() != projection.turn_id.as_deref() {
-                return Err(format!(
-                    "typed Shared Projection v2 changed turn identity during one CLI request: {:?} -> {:?}",
-                    self.live_turn_id, projection.turn_id
-                ));
+                if let Some(new_turn_id) = projection.turn_id.as_ref() {
+                    self.superseded_by_turn_id = Some(new_turn_id.clone());
+                    self.last_revision = snapshot.revision;
+                    self.snapshot = Some(snapshot.clone());
+                }
+                return Ok(());
             }
         } else if !self.accepts_unbound_projection(snapshot, projection)? {
             return Ok(());
@@ -1281,6 +2007,13 @@ impl LiveProjectionCursor {
     }
 
     fn bound_run_terminal(&self) -> Option<AgentTimelineRunStatus> {
+        if self.superseded_by_turn_id.is_some() {
+            return None;
+        }
+        self.shared_run_terminal()
+    }
+
+    fn shared_run_terminal(&self) -> Option<AgentTimelineRunStatus> {
         let run = self.snapshot.as_ref()?.run_projection.as_ref()?;
         if self.live_run_id.as_deref() == Some(run.run_id.as_str()) && run.status.is_terminal() {
             Some(run.status)
@@ -1290,6 +2023,9 @@ impl LiveProjectionCursor {
     }
 
     fn bound_action_required(&self, host_run_id: &str) -> Option<String> {
+        if self.superseded_by_turn_id.is_some() {
+            return None;
+        }
         if self.last_revision <= self.action_required_after_revision {
             return None;
         }
@@ -1316,6 +2052,10 @@ impl LiveProjectionCursor {
         ))
     }
 
+    fn superseded_turn_id(&self) -> Option<&str> {
+        self.superseded_by_turn_id.as_deref()
+    }
+
     fn accepts_unbound_projection(
         &self,
         snapshot: &AgentTimelineSnapshot,
@@ -1325,30 +2065,45 @@ impl LiveProjectionCursor {
             LiveProjectionExpectation::ExistingRun { run_id, turn_id } => Ok(projection.run_id
                 == *run_id
                 && projection.turn_id.as_deref() == Some(turn_id.as_str())),
+            LiveProjectionExpectation::ExistingRunNewTurn {
+                run_id,
+                expected_turn_id,
+                ..
+            } => {
+                if projection.run_id != *run_id {
+                    return Ok(false);
+                }
+                let Some(expected_turn_id) = expected_turn_id.as_deref() else {
+                    return Ok(false);
+                };
+                Ok(snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == expected_turn_id))
+            }
             LiveProjectionExpectation::NewTurn {
                 baseline_run_id,
                 baseline_turn_ids,
+                expected_turn_id,
             } => {
-                let Some(turn_id) = projection.turn_id.as_deref() else {
+                let Some(expected_turn_id) = expected_turn_id.as_deref() else {
                     return Ok(false);
                 };
                 if baseline_run_id.as_deref() == Some(projection.run_id.as_str()) {
                     return Ok(false);
                 }
-                let new_turn_ids = snapshot
-                    .turns
-                    .iter()
-                    .filter(|turn| !baseline_turn_ids.contains(&turn.id))
-                    .map(|turn| turn.id.as_str())
-                    .collect::<Vec<_>>();
-                if new_turn_ids.is_empty() {
-                    return Ok(false);
-                }
-                if !new_turn_ids.contains(&turn_id) {
+                if baseline_turn_ids.contains(expected_turn_id) {
                     return Err(
-                        "typed Shared Projection v2 mapped Run does not reference a new turn"
+                        "typed Shared Projection v2 admitted input already exists in the baseline"
                             .to_string(),
                     );
+                }
+                if !snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == expected_turn_id)
+                {
+                    return Ok(false);
                 }
                 Ok(true)
             }

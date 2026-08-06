@@ -9,10 +9,17 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 type OwnedWakeFutureV2 = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HostKernelWakeLaneV2 {
+    Drive,
+    Interrupt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct HostKernelWakeKeyV2 {
     pub(crate) session_id: String,
     pub(crate) host_run_id: String,
     pub(crate) run_id: String,
+    pub(crate) lane: HostKernelWakeLaneV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,21 +36,20 @@ pub(crate) enum HostKernelWakeRegisterOutcomeV2 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HostKernelWakeHandoffOutcomeV2 {
-    Registered,
-    Replaced,
-    SupersededByRunCancellation,
-    PreviousOwnerPanicked,
-    OwnerConflict,
-    ReplacementKeyMismatch,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostKernelWakeRetagOutcomeV2 {
     Retagged,
     Missing,
     OwnerConflict,
     ReplacementKeyMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostKernelWakeTransferOutcomeV2 {
+    Transferred,
+    Missing,
+    OwnerConflict,
+    DestinationConflict,
+    RunIdentityMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,35 +117,6 @@ impl HostKernelWakeSupervisorV2 {
         })
     }
 
-    pub(crate) async fn replace_exact_or_register_missing<F>(
-        &self,
-        expected_owner: HostKernelWakeOwnerV2,
-        replacement_owner: HostKernelWakeOwnerV2,
-        future: F,
-    ) -> Result<HostKernelWakeHandoffOutcomeV2, HostKernelWakeSupervisorErrorV2>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(HostKernelWakeCommandV2::ReplaceExactOrRegisterMissing {
-                expected_owner,
-                replacement_owner,
-                future: Box::pin(future),
-                reply,
-            })
-            .map_err(|_| {
-                HostKernelWakeSupervisorErrorV2::unavailable(
-                    "Host Kernel wake supervisor is not accepting exact handoffs",
-                )
-            })?;
-        response.await.map_err(|_| {
-            HostKernelWakeSupervisorErrorV2::unavailable(
-                "Host Kernel wake supervisor ended before exact handoff completed",
-            )
-        })
-    }
-
     pub(crate) async fn retag_exact(
         &self,
         expected_owner: HostKernelWakeOwnerV2,
@@ -179,6 +156,30 @@ impl HostKernelWakeSupervisorV2 {
         response.await.map_err(|_| {
             HostKernelWakeSupervisorErrorV2::unavailable(
                 "Host Kernel wake supervisor ended before cancellation completed",
+            )
+        })
+    }
+
+    pub(crate) async fn transfer_exact(
+        &self,
+        expected_owner: HostKernelWakeOwnerV2,
+        replacement_owner: HostKernelWakeOwnerV2,
+    ) -> Result<HostKernelWakeTransferOutcomeV2, HostKernelWakeSupervisorErrorV2> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(HostKernelWakeCommandV2::TransferExact {
+                expected_owner,
+                replacement_owner,
+                reply,
+            })
+            .map_err(|_| {
+                HostKernelWakeSupervisorErrorV2::unavailable(
+                    "Host Kernel wake supervisor is not accepting exact ownership transfers",
+                )
+            })?;
+        response.await.map_err(|_| {
+            HostKernelWakeSupervisorErrorV2::unavailable(
+                "Host Kernel wake supervisor ended before exact ownership transfer completed",
             )
         })
     }
@@ -263,16 +264,15 @@ enum HostKernelWakeCommandV2 {
         future: OwnedWakeFutureV2,
         reply: oneshot::Sender<HostKernelWakeRegisterOutcomeV2>,
     },
-    ReplaceExactOrRegisterMissing {
-        expected_owner: HostKernelWakeOwnerV2,
-        replacement_owner: HostKernelWakeOwnerV2,
-        future: OwnedWakeFutureV2,
-        reply: oneshot::Sender<HostKernelWakeHandoffOutcomeV2>,
-    },
     RetagExact {
         expected_owner: HostKernelWakeOwnerV2,
         replacement_owner: HostKernelWakeOwnerV2,
         reply: oneshot::Sender<HostKernelWakeRetagOutcomeV2>,
+    },
+    TransferExact {
+        expected_owner: HostKernelWakeOwnerV2,
+        replacement_owner: HostKernelWakeOwnerV2,
+        reply: oneshot::Sender<HostKernelWakeTransferOutcomeV2>,
     },
     Cancel {
         key: HostKernelWakeKeyV2,
@@ -299,7 +299,6 @@ struct HostKernelWakeEntryV2 {
 }
 
 struct HostKernelWakeCompletionV2 {
-    key: HostKernelWakeKeyV2,
     generation: u64,
 }
 
@@ -310,25 +309,12 @@ struct HostKernelWakeQuiescingV2 {
 }
 
 enum HostKernelWakeAfterQuiescenceV2 {
-    Replace {
-        replacement_owner: HostKernelWakeOwnerV2,
-        future: OwnedWakeFutureV2,
-        reply: oneshot::Sender<HostKernelWakeHandoffOutcomeV2>,
-    },
     Cancel {
         reply: oneshot::Sender<bool>,
-        superseded_handoff_reply: Option<oneshot::Sender<HostKernelWakeHandoffOutcomeV2>>,
     },
     CancelOwner {
         reply: oneshot::Sender<HostKernelWakeCancelOutcomeV2>,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostKernelWakeTaskExitV2 {
-    Completed,
-    Cancelled,
-    Panicked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,10 +348,9 @@ fn spawn_host_kernel_wake_v2(
 ) {
     let generation = *next_generation;
     *next_generation = next_generation.wrapping_add(1).max(1);
-    let key = owner.key.clone();
     let abort_handle = tasks.spawn(async move {
         future.await;
-        HostKernelWakeCompletionV2 { key, generation }
+        HostKernelWakeCompletionV2 { generation }
     });
     let task_id = abort_handle.id();
     entries.insert(
@@ -379,42 +364,9 @@ fn spawn_host_kernel_wake_v2(
     );
 }
 
-fn finish_host_kernel_wake_quiescence_v2(
-    key: HostKernelWakeKeyV2,
-    quiescing: HostKernelWakeQuiescingV2,
-    task_exit: HostKernelWakeTaskExitV2,
-    tasks: &mut JoinSet<HostKernelWakeCompletionV2>,
-    entries: &mut HashMap<HostKernelWakeKeyV2, HostKernelWakeEntryV2>,
-    next_generation: &mut u64,
-) {
+fn finish_host_kernel_wake_quiescence_v2(quiescing: HostKernelWakeQuiescingV2) {
     match quiescing.after_quiescence {
-        HostKernelWakeAfterQuiescenceV2::Replace {
-            replacement_owner,
-            future,
-            reply,
-        } => {
-            debug_assert_eq!(key, replacement_owner.key);
-            if task_exit == HostKernelWakeTaskExitV2::Panicked {
-                let _ = reply.send(HostKernelWakeHandoffOutcomeV2::PreviousOwnerPanicked);
-            } else {
-                spawn_host_kernel_wake_v2(
-                    tasks,
-                    entries,
-                    next_generation,
-                    replacement_owner,
-                    future,
-                );
-                let _ = reply.send(HostKernelWakeHandoffOutcomeV2::Replaced);
-            }
-        }
-        HostKernelWakeAfterQuiescenceV2::Cancel {
-            reply,
-            superseded_handoff_reply,
-        } => {
-            if let Some(handoff_reply) = superseded_handoff_reply {
-                let _ =
-                    handoff_reply.send(HostKernelWakeHandoffOutcomeV2::SupersededByRunCancellation);
-            }
+        HostKernelWakeAfterQuiescenceV2::Cancel { reply } => {
             let _ = reply.send(true);
         }
         HostKernelWakeAfterQuiescenceV2::CancelOwner { reply } => {
@@ -475,86 +427,6 @@ async fn run_host_kernel_wake_supervisor_v2(
                         );
                         let _ = reply.send(HostKernelWakeRegisterOutcomeV2::Registered);
                     }
-                    HostKernelWakeCommandV2::ReplaceExactOrRegisterMissing {
-                        expected_owner,
-                        replacement_owner,
-                        future,
-                        reply,
-                    } => {
-                        if expected_owner.key != replacement_owner.key {
-                            let _ = reply.send(
-                                HostKernelWakeHandoffOutcomeV2::ReplacementKeyMismatch,
-                            );
-                            continue;
-                        }
-                        if quiescing.contains_key(&expected_owner.key) {
-                            let _ = reply.send(
-                                HostKernelWakeHandoffOutcomeV2::OwnerConflict,
-                            );
-                            continue;
-                        }
-                        match host_kernel_wake_exact_state_v2(
-                            &entries,
-                            &expected_owner,
-                        ) {
-                            HostKernelWakeExactStateV2::Exact => {
-                                let entry = entries
-                                    .remove(&expected_owner.key)
-                                    .expect("checked exact wake owner must remain present");
-                                let HostKernelWakeEntryV2 {
-                                    generation,
-                                    task_id,
-                                    abort_handle,
-                                    ..
-                                } = entry;
-                                abort_handle.abort();
-                                let previous = quiescing.insert(
-                                    expected_owner.key,
-                                    HostKernelWakeQuiescingV2 {
-                                        generation,
-                                        task_id,
-                                        after_quiescence:
-                                            HostKernelWakeAfterQuiescenceV2::Replace {
-                                                replacement_owner,
-                                                future,
-                                                reply,
-                                            },
-                                    },
-                                );
-                                debug_assert!(previous.is_none());
-                            }
-                            HostKernelWakeExactStateV2::Missing => {
-                                spawn_host_kernel_wake_v2(
-                                    &mut tasks,
-                                    &mut entries,
-                                    &mut next_generation,
-                                    replacement_owner,
-                                    future,
-                                );
-                                let _ = reply.send(
-                                    HostKernelWakeHandoffOutcomeV2::Registered,
-                                );
-                            }
-                            HostKernelWakeExactStateV2::Finished => {
-                                entries.remove(&expected_owner.key);
-                                spawn_host_kernel_wake_v2(
-                                    &mut tasks,
-                                    &mut entries,
-                                    &mut next_generation,
-                                    replacement_owner,
-                                    future,
-                                );
-                                let _ = reply.send(
-                                    HostKernelWakeHandoffOutcomeV2::Registered,
-                                );
-                            }
-                            HostKernelWakeExactStateV2::OwnerConflict => {
-                                let _ = reply.send(
-                                    HostKernelWakeHandoffOutcomeV2::OwnerConflict,
-                                );
-                            }
-                        }
-                    }
                     HostKernelWakeCommandV2::RetagExact {
                         expected_owner,
                         replacement_owner,
@@ -596,28 +468,62 @@ async fn run_host_kernel_wake_supervisor_v2(
                         };
                         let _ = reply.send(outcome);
                     }
-                    HostKernelWakeCommandV2::Cancel { key, reply } => {
-                        if let Some(mut reservation) = quiescing.remove(&key) {
-                            match reservation.after_quiescence {
-                                HostKernelWakeAfterQuiescenceV2::Replace {
-                                    reply: handoff_reply,
-                                    ..
-                                } => {
-                                    reservation.after_quiescence =
-                                        HostKernelWakeAfterQuiescenceV2::Cancel {
-                                            reply,
-                                            superseded_handoff_reply: Some(handoff_reply),
-                                        };
-                                    let previous = quiescing.insert(key, reservation);
-                                    debug_assert!(previous.is_none());
-                                }
-                                after_quiescence => {
-                                    reservation.after_quiescence = after_quiescence;
-                                    let previous = quiescing.insert(key, reservation);
-                                    debug_assert!(previous.is_none());
-                                    let _ = reply.send(false);
-                                }
+                    HostKernelWakeCommandV2::TransferExact {
+                        expected_owner,
+                        replacement_owner,
+                        reply,
+                    } => {
+                        let same_run = expected_owner.key.session_id
+                            == replacement_owner.key.session_id
+                            && expected_owner.key.host_run_id
+                                == replacement_owner.key.host_run_id
+                            && expected_owner.key.run_id == replacement_owner.key.run_id;
+                        if !same_run || expected_owner.key.lane == replacement_owner.key.lane {
+                            let _ = reply.send(
+                                HostKernelWakeTransferOutcomeV2::RunIdentityMismatch,
+                            );
+                            continue;
+                        }
+                        if quiescing.contains_key(&expected_owner.key) {
+                            let _ = reply.send(HostKernelWakeTransferOutcomeV2::OwnerConflict);
+                            continue;
+                        }
+                        if quiescing.contains_key(&replacement_owner.key)
+                            || entries.contains_key(&replacement_owner.key)
+                        {
+                            let _ = reply.send(
+                                HostKernelWakeTransferOutcomeV2::DestinationConflict,
+                            );
+                            continue;
+                        }
+                        let outcome = match host_kernel_wake_exact_state_v2(
+                            &entries,
+                            &expected_owner,
+                        ) {
+                            HostKernelWakeExactStateV2::Exact => {
+                                let mut entry = entries
+                                    .remove(&expected_owner.key)
+                                    .expect("checked exact wake owner must remain present");
+                                entry.identity_digest = replacement_owner.identity_digest;
+                                entries.insert(replacement_owner.key, entry);
+                                HostKernelWakeTransferOutcomeV2::Transferred
                             }
+                            HostKernelWakeExactStateV2::Missing => {
+                                HostKernelWakeTransferOutcomeV2::Missing
+                            }
+                            HostKernelWakeExactStateV2::Finished => {
+                                entries.remove(&expected_owner.key);
+                                HostKernelWakeTransferOutcomeV2::Missing
+                            }
+                            HostKernelWakeExactStateV2::OwnerConflict => {
+                                HostKernelWakeTransferOutcomeV2::OwnerConflict
+                            }
+                        };
+                        let _ = reply.send(outcome);
+                    }
+                    HostKernelWakeCommandV2::Cancel { key, reply } => {
+                        if quiescing.contains_key(&key) {
+                            let _ = reply.send(false);
                             continue;
                         }
                         let Some(entry) = entries.remove(&key) else {
@@ -640,10 +546,7 @@ async fn run_host_kernel_wake_supervisor_v2(
                             HostKernelWakeQuiescingV2 {
                                 generation,
                                 task_id,
-                                after_quiescence: HostKernelWakeAfterQuiescenceV2::Cancel {
-                                    reply,
-                                    superseded_handoff_reply: None,
-                                },
+                                after_quiescence: HostKernelWakeAfterQuiescenceV2::Cancel { reply },
                             },
                         );
                         debug_assert!(previous.is_none());
@@ -716,39 +619,30 @@ async fn run_host_kernel_wake_supervisor_v2(
             completion = tasks.join_next(), if !tasks.is_empty() => {
                 match completion {
                     Some(Ok(completion)) => {
-                        if quiescing.get(&completion.key).is_some_and(|entry| {
-                            entry.generation == completion.generation
-                        }) {
+                        let quiescing_key = quiescing.iter().find_map(|(key, entry)| {
+                            (entry.generation == completion.generation).then(|| key.clone())
+                        });
+                        if let Some(key) = quiescing_key {
                             let transition = quiescing
-                                .remove(&completion.key)
+                                .remove(&key)
                                 .expect("matched quiescing wake must remain present");
                             finish_host_kernel_wake_quiescence_v2(
-                                completion.key,
                                 transition,
-                                HostKernelWakeTaskExitV2::Completed,
-                                &mut tasks,
-                                &mut entries,
-                                &mut next_generation,
                             );
-                        } else if entries.get(&completion.key).is_some_and(|entry| {
-                            entry.generation == completion.generation
-                        }) {
-                            entries.remove(&completion.key);
+                        } else {
+                            entries.retain(|_, entry| {
+                                entry.generation != completion.generation
+                            });
                         }
                     }
                     Some(Err(error)) => {
                         let task_id = error.id();
-                        let task_exit = if error.is_cancelled() {
-                            HostKernelWakeTaskExitV2::Cancelled
-                        } else if error.is_panic() {
-                            HostKernelWakeTaskExitV2::Panicked
-                        } else {
+                        if !error.is_cancelled() && !error.is_panic() {
                             debug_assert!(
                                 false,
                                 "Tokio JoinError must be cancelled or panicked"
                             );
-                            HostKernelWakeTaskExitV2::Panicked
-                        };
+                        }
                         let quiescing_key = quiescing.iter().find_map(|(key, entry)| {
                             (entry.task_id == task_id).then(|| key.clone())
                         });
@@ -757,12 +651,7 @@ async fn run_host_kernel_wake_supervisor_v2(
                                 .remove(&key)
                                 .expect("matched quiescing wake must remain present");
                             finish_host_kernel_wake_quiescence_v2(
-                                key,
                                 transition,
-                                task_exit,
-                                &mut tasks,
-                                &mut entries,
-                                &mut next_generation,
                             );
                         } else {
                             entries.retain(|_, entry| entry.task_id != task_id);

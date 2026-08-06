@@ -113,6 +113,7 @@ export interface AgentRunStatus {
 export interface AgentRunResult {
   run: AgentRunStatus;
   session: AgentSessionResult['session'];
+  inputId?: string;
 }
 
 function endpointLabel(url: string): string {
@@ -884,6 +885,8 @@ export function submitAgentRunGuidance(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/guidance`,
     {
       guidance: request.guidance,
+      workspacePath: request.workspacePath,
+      noWorkspace: request.noWorkspace,
       attachments: request.attachments,
       callerRequestId: request.callerRequestId,
     }

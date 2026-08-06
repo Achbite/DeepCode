@@ -101,6 +101,35 @@ impl HostWorkspaceService {
         Ok(workspace_binding_from_root(&root))
     }
 
+    pub(crate) fn validate_requested_run_workspace(
+        &self,
+        path: &str,
+        workspace_binding_ref: &WorkspaceBindingRefV2,
+        expected_workspace_identity: &str,
+    ) -> Result<(), KernelErrorEnvelope> {
+        let requested = resolve_workspace_root(path)?;
+        preflight_workspace_root_readable(&requested.root)?;
+        let active =
+            self.resolve_exact_run_binding(workspace_binding_ref, expected_workspace_identity)?;
+        let active_root = active
+            .open_path
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                host_service_error(
+                    "host_run_workspace_unverifiable",
+                    "The immutable Run workspace has no canonical root.",
+                )
+            })?;
+        if active_root != requested.root {
+            return Err(host_service_error(
+                "host_run_workspace_mismatch",
+                "The requested workspace does not match the immutable active Run workspace.",
+            ));
+        }
+        Ok(())
+    }
+
     fn unregister_exact_managed_root_if_present_v2(
         &self,
         workspace_binding_ref: &WorkspaceBindingRefV2,

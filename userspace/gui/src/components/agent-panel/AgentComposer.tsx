@@ -41,7 +41,18 @@ interface AgentComposerProps {
   allowGlobalAttachmentWorkspaceFallback: boolean;
   language: UiLanguage;
   loading: boolean;
-  onSend: (content: string) => void | Promise<void>;
+  onSend: (content: string) => Promise<boolean>;
+  pendingSubmissionRetry?: AgentComposerPendingSubmissionRetry | null;
+  onRetryPendingSubmission?: (
+    clearOriginalMessageAttachments: boolean
+  ) => Promise<boolean>;
+  onSubmissionSettled?: (
+    admitted: boolean,
+    submissionScopeId: string | null,
+    submittedDraftCleared: boolean
+  ) => void | Promise<void>;
+  submissionScopeId?: string | null;
+  canCancelCurrentRun?: boolean;
   onStop: () => void;
   onAddAttachment: (attachment: AgentInputAttachmentV2) => void;
   onRemoveAttachment: (
@@ -55,6 +66,12 @@ interface AgentComposerProps {
   pendingDecision?: AgentComposerPendingDecision | null;
   onDecisionSubmit?: (guidance?: string, action?: 'accept' | 'revise') => void | Promise<void>;
   onDecisionReject?: () => void | Promise<void>;
+}
+
+export interface AgentComposerPendingSubmissionRetry {
+  content: string;
+  messageAttachments: AgentInputAttachmentV2[];
+  callerRequestId: string;
 }
 
 interface AgentModifiedFileView {
@@ -73,6 +90,15 @@ function attachmentLabel(attachment: AgentInputAttachmentV2, language: UiLanguag
     ? t(language, 'agent.attachmentDialog.sessionScope')
     : t(language, 'agent.attachmentDialog.messageScope');
   return `${kind} · ${scope} · ${attachment.path}`;
+}
+
+function sameMessageAttachments(
+  current: AgentInputAttachmentV2[],
+  pending: AgentInputAttachmentV2[]
+): boolean {
+  if (current.length !== pending.length) return false;
+  const pendingInstances = new Set(pending);
+  return current.every((attachment) => pendingInstances.has(attachment));
 }
 
 function AttachmentIcon({ kind }: Pick<AgentInputAttachmentV2, 'kind'>): React.ReactElement {
@@ -227,6 +253,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   language,
   loading,
   onSend,
+  pendingSubmissionRetry,
+  onRetryPendingSubmission,
+  onSubmissionSettled,
+  submissionScopeId = null,
+  canCancelCurrentRun = false,
   onStop,
   onAddAttachment,
   onRemoveAttachment,
@@ -243,6 +274,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [changesOpen, setChangesOpen] = useState(true);
   const [decisionCopyStatus, setDecisionCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [submissionPending, setSubmissionPending] = useState(false);
+  const [pendingSubmissionCancellable, setPendingSubmissionCancellable] = useState(false);
+  const draftRevisionRef = useRef(0);
+  const pendingSubmissionRef = useRef<string | null>(null);
+  const submissionScopeRef = useRef(submissionScopeId);
+  const previousSubmissionScopeRef = useRef(submissionScopeId);
+  submissionScopeRef.current = submissionScopeId;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const defaultDecisionOptionRef = useRef<HTMLButtonElement | null>(null);
   const focusedOptionClickConfirmRef = useRef<string | null>(null);
@@ -267,8 +305,19 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     focusedOptionClickConfirmRef.current = null;
   }, [decisionKey]);
 
+  useEffect(() => {
+    if (previousSubmissionScopeRef.current === submissionScopeId) return;
+    previousSubmissionScopeRef.current = submissionScopeId;
+    draftRevisionRef.current += 1;
+    pendingSubmissionRef.current = null;
+    setSubmissionPending(false);
+    setPendingSubmissionCancellable(false);
+    setValue('');
+  }, [submissionScopeId]);
+
   const send = () => {
     const nextValue = value;
+    if (submissionPending || pendingSubmissionRef.current) return;
     if (pendingDecision) {
       if (pendingDecision.resolving) return;
       const normalized = normalizeDecisionInput(pendingDecision, nextValue);
@@ -282,8 +331,103 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     }
     if (sendBlocked) return;
     if (!nextValue.trim()) return;
-    setValue('');
-    void onSend(nextValue);
+    const submittedRevision = draftRevisionRef.current;
+    const submittedScopeId = submissionScopeId;
+    const submissionToken = globalThis.crypto.randomUUID();
+    pendingSubmissionRef.current = submissionToken;
+    setPendingSubmissionCancellable(canCancelCurrentRun);
+    setSubmissionPending(true);
+    void (async () => {
+      let admitted = false;
+      let submittedDraftCleared = false;
+      try {
+        admitted = await onSend(nextValue);
+        if (
+          admitted
+          && submissionScopeRef.current === submittedScopeId
+          && draftRevisionRef.current === submittedRevision
+        ) {
+          draftRevisionRef.current += 1;
+          setValue('');
+          submittedDraftCleared = true;
+        }
+      } catch {
+        // The store owns user-visible error projection; an unacknowledged
+        // submission deliberately retains the exact draft.
+      } finally {
+        if (pendingSubmissionRef.current === submissionToken) {
+          pendingSubmissionRef.current = null;
+          setSubmissionPending(false);
+          setPendingSubmissionCancellable(false);
+        }
+        if (onSubmissionSettled) {
+          void Promise.resolve(
+            onSubmissionSettled(
+              admitted,
+              submittedScopeId,
+              submittedDraftCleared
+            )
+          ).catch(() => undefined);
+        }
+      }
+    })();
+  };
+
+  const retryPendingSubmission = () => {
+    if (
+      !pendingSubmissionRetry
+      || !onRetryPendingSubmission
+      || submissionPending
+      || pendingSubmissionRef.current
+    ) {
+      return;
+    }
+    const submittedRevision = draftRevisionRef.current;
+    const submittedScopeId = submissionScopeId;
+    const submittedDraftMatches =
+      value.trim() === pendingSubmissionRetry.content
+      && sameMessageAttachments(
+        messageAttachments,
+        pendingSubmissionRetry.messageAttachments
+      );
+    const submissionToken = `retry:${pendingSubmissionRetry.callerRequestId}`;
+    pendingSubmissionRef.current = submissionToken;
+    setPendingSubmissionCancellable(canCancelCurrentRun);
+    setSubmissionPending(true);
+    void (async () => {
+      let admitted = false;
+      let submittedDraftCleared = false;
+      try {
+        admitted = await onRetryPendingSubmission(submittedDraftMatches);
+        if (
+          admitted
+          && submittedDraftMatches
+          && submissionScopeRef.current === submittedScopeId
+          && draftRevisionRef.current === submittedRevision
+        ) {
+          draftRevisionRef.current += 1;
+          setValue('');
+          submittedDraftCleared = true;
+        }
+      } catch {
+        // The store owns the durable retry identity and user-visible error.
+      } finally {
+        if (pendingSubmissionRef.current === submissionToken) {
+          pendingSubmissionRef.current = null;
+          setSubmissionPending(false);
+          setPendingSubmissionCancellable(false);
+        }
+        if (onSubmissionSettled) {
+          void Promise.resolve(
+            onSubmissionSettled(
+              admitted,
+              submittedScopeId,
+              submittedDraftCleared
+            )
+          ).catch(() => undefined);
+        }
+      }
+    })();
   };
 
   useEffect(() => {
@@ -319,12 +463,14 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   }, [value]);
 
   const updateValue = (nextValue: string) => {
+    draftRevisionRef.current += 1;
     setValue(nextValue);
     setAttachmentError(null);
   };
 
   const pickAttachment = (attachment: AgentInputAttachmentV2) => {
     setAttachmentError(null);
+    draftRevisionRef.current += 1;
     onAddAttachment(attachment);
     if (mention) {
       setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.length)}`);
@@ -341,14 +487,21 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   );
   const decisionText = pendingDecision ? composerDecisionText(pendingDecision, language) : null;
   const decisionResolving = Boolean(pendingDecision?.resolving);
-  const sendDisabled = loading
+  const cancellable = loading && (
+    submissionPending ? pendingSubmissionCancellable : canCancelCurrentRun
+  );
+  const sendDisabled = cancellable
     ? false
-    : pendingDecision
-      ? decisionResolving
-      : sendBlocked || !value.trim();
+    : submissionPending
+      ? true
+      : loading
+        ? false
+        : pendingDecision
+          ? decisionResolving
+          : submissionPending || sendBlocked || !value.trim();
   const sendLabel = decisionResolving
     ? t(language, 'agent.composer.decision.resolving')
-    : loading
+    : cancellable
     ? t(language, 'agent.composer.stop')
     : pendingDecision
       ? decisionSubmitLabel(pendingDecision, value, language)
@@ -414,6 +567,22 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   return (
     <div className={`agent-composer${inputFocused ? ' agent-composer--input-focused' : ''}${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
+      {pendingSubmissionRetry && (
+        <div className="agent-composer__pending-submission" role="status">
+          <span>
+            {language === 'zh-CN'
+              ? '上次发送的结果尚未确认。请使用原请求身份安全重试。'
+              : 'The previous send has an unknown outcome. Retry with its original request identity.'}
+          </span>
+          <button
+            type="button"
+            disabled={submissionPending}
+            onClick={retryPendingSubmission}
+          >
+            {language === 'zh-CN' ? '重试上次发送' : 'Retry previous send'}
+          </button>
+        </div>
+      )}
       {decisionText && (
         <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">
@@ -496,11 +665,14 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${attachment.kind}`}
               className={`agent-chip agent-chip--${attachment.scope} agent-chip--${attachment.kind}`}
               title={attachmentLabel(attachment, language)}
-              onClick={() => onRemoveAttachment(
-                attachment.path,
-                attachment.scope,
-                attachment.folderId
-              )}
+              onClick={() => {
+                draftRevisionRef.current += 1;
+                onRemoveAttachment(
+                  attachment.path,
+                  attachment.scope,
+                  attachment.folderId
+                );
+              }}
               type="button"
             >
               <span className="agent-chip__icon">
@@ -630,11 +802,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         <div className="agent-composer__footer-right">
           {footerControls}
           <button
-            className={loading ? 'agent-composer__send-button--stop' : undefined}
-            onClick={loading ? onStop : send}
+            className={cancellable ? 'agent-composer__send-button--stop' : undefined}
+            onClick={cancellable ? onStop : send}
             disabled={sendDisabled}
             type="button"
-            title={loading
+            title={cancellable
               ? t(language, 'agent.composer.stopTitle')
               : sendBlockedTitle ?? t(language, 'agent.composer.sendTitle')}
           >

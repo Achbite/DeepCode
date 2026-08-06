@@ -33,6 +33,9 @@ const AgentPanel: React.FC = () => {
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
+  const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
+  const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
@@ -65,6 +68,10 @@ const AgentPanel: React.FC = () => {
   const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
+  const pendingSubmissionRetry = session?.id
+    && pendingSubmissionSessionIds.includes(session.id)
+    ? pendingSubmissionRetryView(session.id)
+    : null;
   const attachmentWorkspaceBinding = session?.workspaceBinding;
   const allowGlobalAttachmentWorkspaceFallback = !session?.projectId;
 
@@ -132,7 +139,11 @@ const AgentPanel: React.FC = () => {
         />
       )}
 
-      {errorMessage && <div className="agent-panel-error">{errorMessage}</div>}
+      {errorMessage && (
+        <div className="agent-panel-error">
+          <span>{errorMessage}</span>
+        </div>
+      )}
 
       <AgentComposer
         messageAttachments={messageAttachments}
@@ -141,7 +152,13 @@ const AgentPanel: React.FC = () => {
         allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         language={language}
         loading={agentBusy}
-        onSend={(content) => void sendMessage(content)}
+        onSend={sendMessage}
+        pendingSubmissionRetry={pendingSubmissionRetry}
+        onRetryPendingSubmission={retryPendingSubmission}
+        submissionScopeId={session?.id ?? null}
+        canCancelCurrentRun={Boolean(
+          session?.id && activeRunSessionIds.includes(session.id)
+        )}
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}

@@ -917,6 +917,147 @@ impl HostKernelOperationStoreV2 {
         })
     }
 
+    pub(crate) fn driving_interrupt_callers(
+        &self,
+        recoverable_session_ids: &HashSet<String>,
+    ) -> Result<Vec<HostCallerRequestBindingReceiptV2>, HostV2StorageError> {
+        for session_id in recoverable_session_ids {
+            validate_safe_session_identity(session_id)?;
+        }
+        if recoverable_session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT {} FROM host_caller_requests
+                     WHERE request_kind IN (?1, ?2)
+                       AND drive_state = 'Driving'
+                       AND outcome_json IS NULL
+                     ORDER BY session_id, caller_request_id",
+                    CALLER_REQUEST_COLUMNS
+                ))
+                .map_err(|error| database_error("host_interrupt_startup_query_failed", error))?;
+            let rows = statement
+                .query_map(
+                    params![HOST_USER_INPUT_REQUEST_KIND_V2, HOST_CANCEL_REQUEST_KIND_V2],
+                    StoredCallerRequestV2::from_row,
+                )
+                .map_err(|error| database_error("host_interrupt_startup_query_failed", error))?;
+            let mut bindings = Vec::new();
+            for row in rows {
+                let stored = row.map_err(|error| {
+                    database_error("host_interrupt_startup_query_failed", error)
+                })?;
+                if !recoverable_session_ids.contains(&stored.session_id) {
+                    continue;
+                }
+                let request_kind = stored.request_kind.clone();
+                let request_digest = stored.request_digest.clone();
+                let binding =
+                    decode_caller_request_binding(stored, &request_kind, &request_digest, true)?;
+                if binding.drive_state != HostCallerRequestDriveStateV2::Driving
+                    || binding.outcome.is_some()
+                {
+                    return Err(corrupt(
+                        "Interrupt startup query returned an invalid caller boundary",
+                    ));
+                }
+                if binding.admission.is_some() {
+                    let host_run_id = binding
+                        .response_identity
+                        .get("hostRunId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            corrupt(
+                                "Admitted interrupt startup recovery has no exact Host Run identity",
+                            )
+                        })?;
+                    let run = stored_run_by_session_host(connection, &binding.session_id, host_run_id)?
+                        .ok_or_else(|| {
+                            corrupt(
+                                "Admitted interrupt startup recovery references a missing Host Run",
+                            )
+                        })?;
+                    if parse_run_lifecycle(&run.lifecycle)?
+                        != HostKernelStoredRunLifecycleV2::Retired
+                    {
+                        // Active admitted callers are recovered by the ordinary
+                        // active-Run owner restoration below. This query only
+                        // adds the retained Retired+drive crash marker.
+                        continue;
+                    }
+                    if run.drive_caller_request_id.as_deref()
+                        != Some(binding.caller_request_id.as_str())
+                        || run.drive_request_digest.as_deref()
+                            != Some(binding.request_digest.as_str())
+                    {
+                        return Err(corrupt(
+                            "Retired admitted interrupt lost its exact Run drive correlation",
+                        ));
+                    }
+                }
+                bindings.push(binding);
+            }
+            Ok(bindings)
+        })
+    }
+
+    pub(crate) fn pending_interrupt_caller(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<HostCallerRequestBindingReceiptV2>, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT {} FROM host_caller_requests
+                     WHERE session_id = ?1 AND request_kind IN (?2, ?3)
+                       AND drive_state = 'Driving'
+                       AND admission_json IS NULL
+                       AND outcome_json IS NULL
+                     ORDER BY caller_request_id",
+                    CALLER_REQUEST_COLUMNS
+                ))
+                .map_err(|error| database_error("host_interrupt_mailbox_query_failed", error))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        session_id,
+                        HOST_USER_INPUT_REQUEST_KIND_V2,
+                        HOST_CANCEL_REQUEST_KIND_V2,
+                    ],
+                    StoredCallerRequestV2::from_row,
+                )
+                .map_err(|error| database_error("host_interrupt_mailbox_query_failed", error))?;
+            let mut pending = None;
+            for row in rows {
+                let stored = row.map_err(|error| {
+                    database_error("host_interrupt_mailbox_query_failed", error)
+                })?;
+                if pending.is_some() {
+                    return Err(corrupt(
+                        "A Session has more than one pending durable Host mutation",
+                    ));
+                }
+                let request_kind = stored.request_kind.clone();
+                let request_digest = stored.request_digest.clone();
+                let binding =
+                    decode_caller_request_binding(stored, &request_kind, &request_digest, true)?;
+                if binding.drive_state != HostCallerRequestDriveStateV2::Driving
+                    || binding.admission.is_some()
+                    || binding.outcome.is_some()
+                {
+                    return Err(corrupt(
+                        "Pending interrupt query returned an invalid caller boundary",
+                    ));
+                }
+                pending = Some(binding);
+            }
+            Ok(pending)
+        })
+    }
+
     pub(crate) fn reclaim_admitted_caller_request_drive(
         &self,
         binding: &HostCallerRequestBindingReceiptV2,
@@ -1060,7 +1201,7 @@ impl HostKernelOperationStoreV2 {
     /// Claims a high-priority control request without replacing the ordinary
     /// semantic caller that may still be driving the Run. The exact control
     /// operation is correlated separately when it is prepared.
-    pub(crate) fn claim_caller_request_control_drive(
+    pub(crate) fn claim_caller_request_interrupt_drive(
         &self,
         session_id: &str,
         caller_request_id: &str,
@@ -1069,6 +1210,15 @@ impl HostKernelOperationStoreV2 {
         owner_instance_id: &str,
         started_at: &str,
     ) -> Result<HostCallerRequestDriveClaimReceiptV2, HostV2StorageError> {
+        if !matches!(
+            request_kind,
+            HOST_USER_INPUT_REQUEST_KIND_V2 | HOST_CANCEL_REQUEST_KIND_V2
+        ) {
+            return Err(HostV2StorageError::invalid(
+                "host_interrupt_request_kind_invalid",
+                "Only user input or exact cancellation may enter the Host interrupt mailbox",
+            ));
+        }
         validate_caller_request_identity(
             session_id,
             caller_request_id,
@@ -1094,6 +1244,29 @@ impl HostKernelOperationStoreV2 {
                     binding: existing,
                     acquired: false,
                 });
+            }
+            let pending_interrupt_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM host_caller_requests
+                     WHERE session_id = ?1 AND caller_request_id != ?2
+                       AND request_kind IN (?3, ?4)
+                       AND drive_state = 'Driving'
+                       AND admission_json IS NULL
+                       AND outcome_json IS NULL",
+                    params![
+                        session_id,
+                        caller_request_id,
+                        HOST_USER_INPUT_REQUEST_KIND_V2,
+                        HOST_CANCEL_REQUEST_KIND_V2,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| database_error("host_interrupt_mailbox_query_failed", error))?;
+            if pending_interrupt_count != 0 {
+                return Err(HostV2StorageError::conflict(
+                    "host_interrupt_mailbox_busy",
+                    "This Session already has one pending durable Host mutation",
+                ));
             }
             let host_run_id = existing
                 .response_identity
@@ -1164,6 +1337,235 @@ impl HostKernelOperationStoreV2 {
                 )?,
                 acquired: true,
             })
+        })
+    }
+
+    pub(crate) fn handoff_run_drive_to_interrupt_caller(
+        &self,
+        binding: &HostCallerRequestBindingReceiptV2,
+        owner_instance_id: &str,
+        superseded_outcome: Value,
+        transferred_at: &str,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        if binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2 {
+            return Err(HostV2StorageError::invalid(
+                "host_interrupt_drive_handoff_kind_invalid",
+                "Only an exact user-input interrupt may take over an active Run drive",
+            ));
+        }
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_bounded_identity(transferred_at, "transferredAt", 1024)?;
+        reject_transport_capabilities(&superseded_outcome)?;
+        if superseded_outcome
+            .get("disposition")
+            .and_then(Value::as_str)
+            != Some("indeterminate")
+        {
+            return Err(HostV2StorageError::invalid(
+                "host_interrupt_drive_handoff_outcome_invalid",
+                "Superseded Run drive ownership requires an indeterminate caller outcome",
+            ));
+        }
+        let superseded_outcome_json = canonical_json_string(&superseded_outcome)?;
+        if superseded_outcome_json.len() > MAX_RESPONSE_BYTES {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_outcome_too_large",
+                "Superseded Host caller request outcome exceeds its bounded size",
+            ));
+        }
+        let superseded_outcome_digest = canonical_sha256(&superseded_outcome)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "host_caller_request_not_found",
+                    "Interrupt Run drive handoff requires an exact durable caller binding",
+                )
+            })?;
+            let current = decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                true,
+            )?;
+            if current.drive_state != HostCallerRequestDriveStateV2::Driving
+                || current.drive_owner_instance_id.as_deref() != Some(owner_instance_id)
+                || current.admission.is_some()
+                || current.outcome.is_some()
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_interrupt_drive_handoff_owner_conflict",
+                    "Only the exact unsettled interrupt owner may take over the Run drive",
+                ));
+            }
+            let host_run_id = current
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Interrupt Run drive handoff has no exact Host Run identity",
+                    )
+                })?;
+            let run_id = current
+                .response_identity
+                .get("runId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Interrupt Run drive handoff has no exact Kernel Run identity",
+                    )
+                })?;
+            if superseded_outcome.get("hostRunId").and_then(Value::as_str) != Some(host_run_id) {
+                return Err(HostV2StorageError::conflict(
+                    "host_interrupt_drive_handoff_outcome_conflict",
+                    "Superseded caller outcome belongs to a different Host Run",
+                ));
+            }
+            let run = stored_run_by_session_host(transaction, &binding.session_id, host_run_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_run_not_found",
+                        "Interrupt Run drive handoff is bound to a missing Run",
+                    )
+                })?;
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+                || run.run_id.as_deref() != Some(run_id)
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_run_not_active",
+                    "Interrupt Run drive handoff requires the exact active Run",
+                ));
+            }
+
+            match (
+                run.drive_caller_request_id.as_deref(),
+                run.drive_request_digest.as_deref(),
+            ) {
+                (Some(current_id), Some(current_digest))
+                    if current_id == current.caller_request_id
+                        && current_digest == current.request_digest => {}
+                (None, None) => {
+                    let changed = transaction
+                        .execute(
+                            "UPDATE host_kernel_runs
+                             SET drive_caller_request_id = ?1, drive_request_digest = ?2
+                             WHERE id = ?3 AND lifecycle = 'Active'
+                               AND drive_caller_request_id IS NULL
+                               AND drive_request_digest IS NULL",
+                            params![current.caller_request_id, current.request_digest, run.id,],
+                        )
+                        .map_err(|error| {
+                            database_error("host_interrupt_run_drive_handoff_failed", error)
+                        })?;
+                    if changed != 1 {
+                        return Err(HostV2StorageError::conflict(
+                            "host_interrupt_run_drive_handoff_conflict",
+                            "Host Run drive changed before interrupt takeover",
+                        ));
+                    }
+                }
+                (Some(previous_id), Some(previous_digest)) => {
+                    let previous_stored =
+                        stored_caller_request(transaction, &binding.session_id, previous_id)?
+                            .ok_or_else(|| {
+                                HostV2StorageError::conflict(
+                                    "host_interrupt_previous_drive_missing",
+                                    "The superseded Host Run drive references a missing caller",
+                                )
+                            })?;
+                    let previous_kind = previous_stored.request_kind.clone();
+                    let previous = decode_caller_request_binding(
+                        previous_stored,
+                        &previous_kind,
+                        previous_digest,
+                        true,
+                    )?;
+                    if previous.drive_state != HostCallerRequestDriveStateV2::Driving
+                        || previous.outcome.is_some()
+                    {
+                        return Err(HostV2StorageError::conflict(
+                            "host_interrupt_previous_drive_conflict",
+                            "The superseded Host Run caller is not an unsettled drive owner",
+                        ));
+                    }
+                    let settled = transaction
+                        .execute(
+                            "UPDATE host_caller_requests
+                             SET outcome_json = ?1, outcome_digest = ?2, settled_at = ?3
+                             WHERE session_id = ?4 AND caller_request_id = ?5
+                               AND request_digest = ?6 AND drive_state = 'Driving'
+                               AND outcome_json IS NULL",
+                            params![
+                                superseded_outcome_json,
+                                superseded_outcome_digest,
+                                transferred_at,
+                                binding.session_id,
+                                previous_id,
+                                previous_digest,
+                            ],
+                        )
+                        .map_err(|error| {
+                            database_error("host_interrupt_previous_drive_settle_failed", error)
+                        })?;
+                    if settled != 1 {
+                        return Err(HostV2StorageError::conflict(
+                            "host_interrupt_previous_drive_settle_conflict",
+                            "The superseded Host Run caller changed before interrupt takeover",
+                        ));
+                    }
+                    let changed = transaction
+                        .execute(
+                            "UPDATE host_kernel_runs
+                             SET drive_caller_request_id = ?1, drive_request_digest = ?2
+                             WHERE id = ?3 AND lifecycle = 'Active'
+                               AND drive_caller_request_id = ?4
+                               AND drive_request_digest = ?5",
+                            params![
+                                current.caller_request_id,
+                                current.request_digest,
+                                run.id,
+                                previous_id,
+                                previous_digest,
+                            ],
+                        )
+                        .map_err(|error| {
+                            database_error("host_interrupt_run_drive_handoff_failed", error)
+                        })?;
+                    if changed != 1 {
+                        return Err(HostV2StorageError::conflict(
+                            "host_interrupt_run_drive_handoff_conflict",
+                            "Host Run drive changed before interrupt takeover",
+                        ));
+                    }
+                }
+                _ => return Err(corrupt(
+                    "Active Host Run has a partial caller drive identity during interrupt takeover",
+                )),
+            }
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::io(
+                    "host_interrupt_drive_handoff_lost",
+                    "Interrupt caller disappeared before Run drive handoff commit",
+                )
+            })?;
+            decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                false,
+            )
         })
     }
 
@@ -1330,6 +1732,36 @@ impl HostKernelOperationStoreV2 {
             outcome,
             settled_at,
             "succeeded",
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn settle_unadmitted_owned_user_input_failure(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        if request_kind != HOST_USER_INPUT_REQUEST_KIND_V2 {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_user_input_failure_kind_invalid",
+                "Only an exact user-input interrupt may persist this control failure outcome",
+            ));
+        }
+        self.settle_unadmitted_owned_caller_request_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            owner_instance_id,
+            outcome,
+            settled_at,
+            "failed",
             false,
             false,
         )
@@ -2209,6 +2641,26 @@ impl HostKernelOperationStoreV2 {
             bootstrap_digest,
             retired_at,
             None,
+            false,
+        )
+    }
+
+    pub(crate) fn retire_active_after_superseded_drive(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        bootstrap_digest: &str,
+        retired_at: &str,
+    ) -> Result<bool, HostV2StorageError> {
+        self.retire_active_with_caller_correlation(
+            session_id,
+            host_run_id,
+            run_id,
+            bootstrap_digest,
+            retired_at,
+            None,
+            true,
         )
     }
 
@@ -2231,9 +2683,35 @@ impl HostKernelOperationStoreV2 {
             bootstrap_digest,
             retired_at,
             Some((caller_request_id, request_digest)),
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn retire_active_for_caller_after_superseded_drive(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        bootstrap_digest: &str,
+        retired_at: &str,
+        caller_request_id: &str,
+        request_digest: &str,
+    ) -> Result<bool, HostV2StorageError> {
+        validate_bounded_identity(caller_request_id, "retirementCallerRequestId", 512)?;
+        validate_sha256_digest(request_digest, "retirementRequestDigest")?;
+        self.retire_active_with_caller_correlation(
+            session_id,
+            host_run_id,
+            run_id,
+            bootstrap_digest,
+            retired_at,
+            Some((caller_request_id, request_digest)),
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn retire_active_with_caller_correlation(
         &self,
         session_id: &str,
@@ -2242,6 +2720,7 @@ impl HostKernelOperationStoreV2 {
         bootstrap_digest: &str,
         retired_at: &str,
         caller_correlation: Option<(&str, &str)>,
+        clear_superseded_drive: bool,
     ) -> Result<bool, HostV2StorageError> {
         validate_safe_session_identity(session_id)?;
         for (field, value) in [
@@ -2275,14 +2754,26 @@ impl HostKernelOperationStoreV2 {
                             (Some(caller_request_id), Some(request_digest))
                         })
                         .unwrap_or((None, None));
+                    let retirement_sql = if clear_superseded_drive {
+                        "UPDATE host_kernel_runs
+                         SET lifecycle = 'Retired', retired_at = ?1,
+                             retirement_caller_request_id = ?2,
+                             retirement_request_digest = ?3,
+                             workspace_canonical_root = NULL,
+                             drive_caller_request_id = NULL,
+                             drive_request_digest = NULL
+                         WHERE id = ?4 AND lifecycle = 'Active'"
+                    } else {
+                        "UPDATE host_kernel_runs
+                         SET lifecycle = 'Retired', retired_at = ?1,
+                             retirement_caller_request_id = ?2,
+                             retirement_request_digest = ?3,
+                             workspace_canonical_root = NULL
+                         WHERE id = ?4 AND lifecycle = 'Active'"
+                    };
                     transaction
                         .execute(
-                            "UPDATE host_kernel_runs
-                             SET lifecycle = 'Retired', retired_at = ?1,
-                                 retirement_caller_request_id = ?2,
-                                 retirement_request_digest = ?3,
-                                 workspace_canonical_root = NULL
-                             WHERE id = ?4 AND lifecycle = 'Active'",
+                            retirement_sql,
                             params![retired_at, caller_request_id, request_digest, stored.id],
                         )
                         .map_err(|error| {
@@ -6654,7 +7145,11 @@ fn secure_sqlite_files(path: &Path) -> Result<(), HostV2StorageError> {
             value.push(suffix);
             PathBuf::from(value)
         };
-        for candidate in [path.to_path_buf(), sidecar("-wal"), sidecar("-shm")] {
+        for (candidate, required) in [
+            (path.to_path_buf(), true),
+            (sidecar("-wal"), false),
+            (sidecar("-shm"), false),
+        ] {
             match fs::symlink_metadata(&candidate) {
                 Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                     return Err(HostV2StorageError::io(
@@ -6662,14 +7157,21 @@ fn secure_sqlite_files(path: &Path) -> Result<(), HostV2StorageError> {
                         "Host Kernel v2 SQLite files must be private regular files",
                     ));
                 }
-                Ok(_) => fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600))
-                    .map_err(|error| {
-                        HostV2StorageError::io(
+                Ok(_) => match fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    // SQLite creates and removes WAL/SHM sidecars as
+                    // connections overlap. A sidecar may legitimately vanish
+                    // between the metadata check and chmod; the primary
+                    // database is never optional.
+                    Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(HostV2StorageError::io(
                             "host_kernel_store_permissions_failed",
                             format!("secure SQLite Host Kernel v2 file: {error}"),
-                        )
-                    })?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        ));
+                    }
+                },
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(HostV2StorageError::io(
                         "host_kernel_store_permissions_failed",

@@ -129,6 +129,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(agent_session_run_start),
         )
         .route(
+            "/api/agent/sessions/:session_id/active-run",
+            get(agent_session_active_run),
+        )
+        .route(
             "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projections",
             post(session_kernel_v2_projection_append).layer(DefaultBodyLimit::max(
                 SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,

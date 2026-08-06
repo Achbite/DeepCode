@@ -1358,6 +1358,10 @@ export class SessionKernelLoopV2 {
   private async advancePendingInput(
     oldInvocationId?: string
   ): Promise<void> {
+    if (this.state.pendingEpochInput) {
+      await this.settleProviderToolCallQueue();
+      this.providers.retireSupersededForEpochAdvance();
+    }
     const replayed = await this.requests.replay('control');
     if (replayed?.kind === 'controlEpochAdvance') {
       await this.ensureEpochCancellation(

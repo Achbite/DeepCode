@@ -11,9 +11,9 @@ use crate::host_kernel_run_v2::{
     HostKernelRunWorkspaceV2, HostKernelStartupContinuationRunV2, HostKernelWaitKindV2,
 };
 use crate::host_kernel_wake_v2::{
-    HostKernelWakeCancelOutcomeV2, HostKernelWakeHandoffOutcomeV2, HostKernelWakeKeyV2,
+    HostKernelWakeCancelOutcomeV2, HostKernelWakeKeyV2, HostKernelWakeLaneV2,
     HostKernelWakeOwnerV2, HostKernelWakeRegisterOutcomeV2, HostKernelWakeRetagOutcomeV2,
-    HostKernelWakeSupervisorErrorV2,
+    HostKernelWakeSupervisorErrorV2, HostKernelWakeTransferOutcomeV2,
 };
 use crate::host_run_broker_v2::{
     HostActiveRunRecordV2, HostRunSettingsCeilingV2, HostRunWorkspaceKindV2,
@@ -44,12 +44,15 @@ use std::time::Duration;
 const MAX_AUTOMATIC_SESSION_STEPS_V2: usize = 128;
 const PLAN_ACTION_PROVIDER_CALL_BUDGET_V2: u16 = 32;
 const KERNEL_FACT_WAKE_POLL_INTERVAL_V2: Duration = Duration::from_millis(50);
+const HOST_CALLER_SETTLEMENT_RETRY_INTERVAL_V2: Duration = Duration::from_millis(100);
+const HOST_INPUT_PROJECTION_SETTLEMENT_GRACE_CHECKS_V2: u8 = 40;
+const HOST_INPUT_ADMISSION_WAIT_CHECKS_V2: u16 = 1_200;
 const HOST_RUN_OPEN_REQUEST_KIND_V2: &str = "agent.run.open.v2";
 const HOST_USER_INPUT_REQUEST_KIND_V2: &str = "agent.run.user-input.v2";
 const HOST_DECISION_REQUEST_KIND_V2: &str = "agent.run.decision.v2";
 const HOST_AUTHORITY_REVOKE_REQUEST_KIND_V2: &str = "agent.run.authority-revoke.v2";
 const HOST_CANCEL_REQUEST_KIND_V2: &str = "agent.run.cancel.v2";
-const HOST_CALLER_RUN_ADMISSION_SCHEMA_V2: &str = "deepcode.host.agent-run-admission.v2";
+const HOST_CALLER_RUN_ADMISSION_SCHEMA_V2: &str = "deepcode.host.agent-run-admission.v3";
 const HOST_CALLER_RUN_OUTCOME_SCHEMA_V2: &str = "deepcode.host.agent-run-outcome.v2";
 const HOST_AUTHORITY_REVOKE_OUTCOME_SCHEMA_V2: &str = "deepcode.host.authority-revoke-outcome.v2";
 
@@ -234,6 +237,95 @@ struct PreparedOpenCallerRequestV2 {
 pub(crate) struct AgentKernelRunAdmissionV2 {
     pub(crate) host_run_id: String,
     pub(crate) kernel_run_id: String,
+    pub(crate) input_id: String,
+}
+
+pub(crate) struct AgentKernelUserInputAdmissionReceiptV2 {
+    pub(crate) host_run_id: String,
+    pub(crate) input_id: String,
+}
+
+pub(crate) enum AgentKernelUserInputAdmissionV2 {
+    Ready(AgentKernelUserInputAdmissionReceiptV2),
+    Pending {
+        state: AppState,
+        binding: HostCallerRequestBindingReceiptV2,
+        host_run_id: String,
+        input_id: String,
+        persisted: Option<tokio::sync::oneshot::Receiver<Result<(), AgentKernelV2Error>>>,
+    },
+}
+
+pub(crate) async fn await_agent_kernel_user_input_admission_v2(
+    admission: AgentKernelUserInputAdmissionV2,
+) -> Result<AgentKernelUserInputAdmissionReceiptV2, AgentKernelV2Error> {
+    match admission {
+        AgentKernelUserInputAdmissionV2::Ready(receipt) => Ok(receipt),
+        AgentKernelUserInputAdmissionV2::Pending {
+            state,
+            binding,
+            host_run_id,
+            input_id,
+            mut persisted,
+        } => {
+            for _ in 0..HOST_INPUT_ADMISSION_WAIT_CHECKS_V2 {
+                if let Some(receiver) = persisted.as_mut() {
+                    match receiver.try_recv() {
+                        Ok(Ok(())) => persisted = None,
+                        Ok(Err(error)) => return Err(error),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                            persisted = None;
+                        }
+                    }
+                }
+                let current = state
+                    .host_services
+                    .kernel_operations_v2
+                    .caller_request_binding(
+                        &binding.session_id,
+                        &binding.caller_request_id,
+                        &binding.request_kind,
+                        &binding.request_digest,
+                    )
+                    .map_err(AgentKernelV2Error::from_storage)?
+                    .ok_or_else(|| {
+                        AgentKernelV2Error::invalid(
+                            "host_caller_request_not_found",
+                            "The durable user-input caller disappeared before admission completed.",
+                        )
+                    })?;
+                if let Some(restored_host_run_id) = restore_caller_run_outcome_v2(&state, &current)?
+                {
+                    let receipt =
+                        user_input_admission_receipt_v2(&state, &current, restored_host_run_id)?;
+                    if receipt.host_run_id != host_run_id || receipt.input_id != input_id {
+                        return Err(AgentKernelV2Error::invalid(
+                            "host_user_input_admission_identity_conflict",
+                            "Durable user-input outcome does not match the exact pending admission identity.",
+                        ));
+                    }
+                    return Ok(receipt);
+                }
+                if let Some(restored_host_run_id) = restore_caller_run_admission_v2(&current)? {
+                    let receipt =
+                        user_input_admission_receipt_v2(&state, &current, restored_host_run_id)?;
+                    if receipt.host_run_id != host_run_id || receipt.input_id != input_id {
+                        return Err(AgentKernelV2Error::invalid(
+                            "host_user_input_admission_identity_conflict",
+                            "Durable user-input admission does not match the exact pending identity.",
+                        ));
+                    }
+                    return Ok(receipt);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(AgentKernelV2Error::invalid(
+                "host_user_input_admission_pending",
+                "The exact user input is still pending durable admission; retry the same callerRequestId to query its outcome.",
+            ))
+        }
+    }
 }
 
 pub(crate) async fn preadmit_open_agent_kernel_run_v2(
@@ -243,15 +335,17 @@ pub(crate) async fn preadmit_open_agent_kernel_run_v2(
 ) -> Result<Option<AgentKernelRunAdmissionV2>, AgentKernelV2Error> {
     let prepared = prepare_open_caller_request_v2(session_id, body)?;
     let binding = bind_open_caller_request_v2(state, session_id, &prepared)?;
+    let input_id = caller_binding_string_v2(&binding, "inputId")?;
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
-        return exact_agent_run_admission_v2(state, session_id, &host_run_id).map(Some);
+        require_initial_input_projection_v2(state, &binding)?;
+        return exact_agent_run_admission_v2(state, session_id, &host_run_id, &input_id).map(Some);
     }
     if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
         if let Some(admission) = current_owned_open_admission_v2(state, &binding).await? {
             return Ok(Some(admission));
         }
-        let host_run_id = recover_driving_caller_request_v2(state, &binding)?;
-        return exact_agent_run_admission_v2(state, session_id, &host_run_id).map(Some);
+        let host_run_id = recover_driving_run_open_v2(state, &binding)?;
+        return exact_agent_run_admission_v2(state, session_id, &host_run_id, &input_id).map(Some);
     }
     Ok(None)
 }
@@ -277,14 +371,20 @@ pub(crate) async fn open_agent_kernel_run_v2(
     let run_open_request_id = caller_binding_string_v2(&binding, "runOpenRequestId")?;
     let operation_request_id = caller_binding_string_v2(&binding, "operationRequestId")?;
     if let Some(replayed_host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
-        return exact_agent_run_admission_v2(state, session_id, &replayed_host_run_id);
+        require_initial_input_projection_v2(state, &binding)?;
+        return exact_agent_run_admission_v2(
+            state,
+            session_id,
+            &replayed_host_run_id,
+            input_id.as_str(),
+        );
     }
     if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
         if let Some(admission) = current_owned_open_admission_v2(state, &binding).await? {
             return Ok(admission);
         }
-        let host_run_id = recover_driving_caller_request_v2(state, &binding)?;
-        return exact_agent_run_admission_v2(state, session_id, &host_run_id);
+        let host_run_id = recover_driving_run_open_v2(state, &binding)?;
+        return exact_agent_run_admission_v2(state, session_id, &host_run_id, input_id.as_str());
     }
     if let Some(active) = state
         .host_services
@@ -333,7 +433,7 @@ pub(crate) async fn open_agent_kernel_run_v2(
     let binding = match claim_caller_drive_or_restore_v2(state, binding).await? {
         CallerDriveAdmissionV2::Acquired(binding) => binding,
         CallerDriveAdmissionV2::Replayed(host_run_id) => {
-            return exact_agent_run_admission_v2(state, session_id, &host_run_id)
+            return exact_agent_run_admission_v2(state, session_id, &host_run_id, input_id.as_str())
         }
     };
     let prepared_workspace =
@@ -471,6 +571,7 @@ pub(crate) async fn open_agent_kernel_run_v2(
     let admission = AgentKernelRunAdmissionV2 {
         host_run_id: host_run_id.clone(),
         kernel_run_id: opened.active_run.run_id.clone(),
+        input_id: input_id.as_str().to_string(),
     };
     let owner =
         host_kernel_initial_drive_owner_v2(&opened.active_run, &binding, &operation_request_id)?;
@@ -484,31 +585,69 @@ pub(crate) async fn open_agent_kernel_run_v2(
     let admission_state = state.clone();
     let admission_binding = binding.clone();
     let admission_host_run_id = host_run_id.clone();
+    let admission_input_id = input_id.as_str().to_string();
     let (admission_sender, admission_receiver) =
         tokio::sync::oneshot::channel::<Result<(), AgentKernelV2Error>>();
     let registered = state
         .kernel_wake_v2
         .register_exclusive(owner, async move {
-            match settle_caller_run_outcome_v2(
-                &admission_state,
-                &admission_binding,
-                &admission_host_run_id,
-            ) {
-                Ok(()) => {
-                    let _ = admission_sender.send(Ok(()));
-                }
-                Err(error) => {
-                    let _ = admission_sender.send(Err(error));
-                    return;
-                }
-            }
-            drive_admitted_agent_kernel_run_v2(
+            let mut drive = Box::pin(drive_admitted_agent_kernel_run_v2(
                 context,
                 supervisor_for_drive,
                 owner_for_drive,
                 opened,
-            )
-            .await;
+            ));
+            let mut drive_completed = false;
+            let admission_result = loop {
+                tokio::select! {
+                    _ = &mut drive => {
+                        drive_completed = true;
+                        match user_input_is_projected_v2(
+                            &admission_state,
+                            &admission_binding.session_id,
+                            &admission_input_id,
+                        ) {
+                            Ok(true) => break settle_caller_run_outcome_v2(
+                                &admission_state,
+                                &admission_binding,
+                                &admission_host_run_id,
+                            ),
+                            Ok(false) => break Err(AgentKernelV2Error::invalid(
+                                "host_initial_input_projection_missing",
+                                "The initial Session drive ended before its exact input.persisted projection became durable.",
+                            )),
+                            Err(error) => break Err(error),
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                        match user_input_is_projected_v2(
+                            &admission_state,
+                            &admission_binding.session_id,
+                            &admission_input_id,
+                        ) {
+                            Ok(true) => break settle_caller_run_outcome_v2(
+                                &admission_state,
+                                &admission_binding,
+                                &admission_host_run_id,
+                            ),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
+                }
+            };
+            if let Err(error) = &admission_result {
+                let _ = settle_caller_error_outcome_v2(
+                    &admission_state,
+                    &admission_binding,
+                    error,
+                    true,
+                );
+            }
+            let _ = admission_sender.send(admission_result);
+            if !drive_completed {
+                drive.await;
+            }
         })
         .await
         .map_err(AgentKernelV2Error::from_wake_supervisor);
@@ -559,7 +698,7 @@ pub(crate) async fn open_agent_kernel_run_v2(
     if let Err(error) = admission_result {
         let _ = state
             .kernel_wake_v2
-            .cancel_owner_exact(owner_for_cleanup)
+            .cancel_exact(owner_for_cleanup.key)
             .await;
         mark_agent_drive_v2(
             &failure_context,
@@ -770,129 +909,444 @@ async fn admit_and_spawn_user_input_v2(
     binding: HostCallerRequestBindingReceiptV2,
     input: HostKernelInitialInputV2,
     request_id: String,
-) -> Result<String, AgentKernelV2Error> {
-    let owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
-    let expected_wait = current_kernel_wait_v2(state, &active)?;
-    let owner_for_drive = owner.clone();
+) -> Result<AgentKernelUserInputAdmissionV2, AgentKernelV2Error> {
+    let owner = host_kernel_interrupt_owner_v2(&active, &binding)?;
+    let continuation_owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
     let background_state = state.clone();
     let background_active = active.clone();
     let background_binding = binding.clone();
-    let (admission_sender, admission_receiver) =
+    let projected_input_id = input.input_id.as_str().to_string();
+    let admission_input_id = projected_input_id.clone();
+    let (persisted_sender, persisted_receiver) =
         tokio::sync::oneshot::channel::<Result<(), AgentKernelV2Error>>();
+    let interrupt_owner = owner.clone();
     let future = async move {
-        let admitted_binding = match persist_caller_admission_v2(
-            &background_state,
-            &background_active,
-            &background_binding,
-            &owner_for_drive,
-        ) {
-            Ok(admitted_binding) => {
-                let _ = admission_sender.send(Ok(()));
-                admitted_binding
+        let mut persisted_sender = Some(persisted_sender);
+        let dispatch_binding = match background_state
+            .host_services
+            .kernel_operations_v2
+            .caller_request_binding(
+                &background_binding.session_id,
+                &background_binding.caller_request_id,
+                &background_binding.request_kind,
+                &background_binding.request_digest,
+            )
+            .map_err(AgentKernelV2Error::from_storage)
+        {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                let error = AgentKernelV2Error::invalid(
+                    "host_caller_request_not_found",
+                    "The durable user-input caller disappeared after interrupt ownership registration.",
+                );
+                if let Some(sender) = persisted_sender.take() {
+                    let _ = sender.send(Err(error));
+                }
+                return;
             }
             Err(error) => {
-                let _ = admission_sender.send(Err(error));
+                if let Some(sender) = persisted_sender.take() {
+                    let _ = sender.send(Err(error));
+                }
                 return;
             }
         };
-        let result =
-            execute_bound_user_input_v2(&background_state, &background_active, input, &request_id)
-                .await;
-        finish_owned_caller_drive_v2(
+        match restore_caller_run_outcome_v2(&background_state, &dispatch_binding) {
+            Ok(Some(_)) => {
+                if let Some(sender) = persisted_sender.take() {
+                    let _ = sender.send(Ok(()));
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(sender) = persisted_sender.take() {
+                    let _ = sender.send(Err(error));
+                }
+                return;
+            }
+        }
+        let exact_interrupt_owned = caller_binding_string_v2(&dispatch_binding, "hostRunId")
+            .and_then(|host_run_id| {
+                caller_binding_string_v2(&dispatch_binding, "runId")
+                    .map(|run_id| (host_run_id, run_id))
+            })
+            .and_then(|(host_run_id, run_id)| {
+                if host_run_id != background_active.host_run_id
+                    || run_id != background_active.run_id
+                {
+                    return Err(AgentKernelV2Error::invalid(
+                        "host_caller_request_run_conflict",
+                        "Registered user input no longer belongs to the exact active Run.",
+                    ));
+                }
+                Ok(())
+            });
+        let exact_interrupt_owned = match exact_interrupt_owned {
+            Ok(()) => {
+                current_owned_user_input_interrupt_v2(&background_state, &dispatch_binding).await
+            }
+            Err(error) => Err(error),
+        };
+        match exact_interrupt_owned {
+            Ok(true) => {}
+            Ok(false) => {
+                let error = AgentKernelV2Error::invalid(
+                    "host_interrupt_mailbox_owner_lost_before_dispatch",
+                    "The exact durable interrupt owner was lost before Session user-input dispatch.",
+                );
+                let _ = settle_caller_error_outcome_v2(
+                    &background_state,
+                    &dispatch_binding,
+                    &error,
+                    false,
+                );
+                if let Some(sender) = persisted_sender.take() {
+                    let _ = sender.send(Err(error));
+                }
+                return;
+            }
+            Err(error) => {
+                let _ = settle_caller_error_outcome_v2(
+                    &background_state,
+                    &dispatch_binding,
+                    &error,
+                    false,
+                );
+                if let Some(sender) = persisted_sender.take() {
+                    let _ = sender.send(Err(error));
+                }
+                return;
+            }
+        }
+        let mut operation = Box::pin(submit_bound_user_input_v2(
             &background_state,
             &background_active,
-            &admitted_binding,
-            owner_for_drive,
-            result,
-        )
-        .await;
-    };
-    let (registration, replaced_wait, recovery_wait) = match expected_wait {
-        Some((expected_owner, wait)) => {
-            let registration = state
-                .kernel_wake_v2
-                .replace_exact_or_register_missing(expected_owner, owner.clone(), future)
-                .await;
-            match registration {
-                Ok(HostKernelWakeHandoffOutcomeV2::Registered) => (true, None, None),
-                Ok(HostKernelWakeHandoffOutcomeV2::Replaced) => {
-                    (true, Some(wait.clone()), Some(wait))
-                }
-                Ok(HostKernelWakeHandoffOutcomeV2::SupersededByRunCancellation) => {
-                    drop(admission_receiver);
-                    let error = AgentKernelV2Error::invalid(
-                        "host_kernel_caller_drive_superseded_by_run_cancellation",
-                        "Run cancellation superseded this user-input drive before durable admission.",
-                    );
-                    abandon_unadmitted_caller_v2(state, &binding, &error)?;
-                    return Err(error);
-                }
-                Ok(HostKernelWakeHandoffOutcomeV2::PreviousOwnerPanicked) => {
-                    drop(admission_receiver);
-                    let error = AgentKernelV2Error::invalid(
-                        "host_kernel_caller_drive_previous_owner_panicked",
-                        "The previous Run drive owner panicked before user-input handoff completed.",
-                    );
-                    settle_caller_error_outcome_v2(state, &binding, &error, true)?;
-                    return Err(error);
-                }
-                Ok(
-                    HostKernelWakeHandoffOutcomeV2::OwnerConflict
-                    | HostKernelWakeHandoffOutcomeV2::ReplacementKeyMismatch,
-                ) => (false, None, Some(wait)),
-                Err(supervisor_error) => {
-                    drop(admission_receiver);
-                    let error = AgentKernelV2Error::from_wake_supervisor(supervisor_error);
-                    cleanup_unadmitted_caller_registration_v2(
-                        state,
-                        &binding,
-                        owner,
-                        Some(wait),
-                        &error,
+            &dispatch_binding,
+            input,
+            &request_id,
+        ));
+        let mut operation_result = None;
+        let mut post_operation_checks = 0_u8;
+        loop {
+            match projected_user_input_ready_v2(
+                &background_state,
+                &dispatch_binding,
+                &projected_input_id,
+            ) {
+                Ok(true) => {
+                    let cleanup =
+                        cancel_owned_agent_kernel_drive_v2(&background_state, &background_active)
+                            .await;
+                    if let Err(error) = cleanup {
+                        handle_owned_drive_error_v2(
+                            &AgentKernelDriveContextV2::from_state(&background_state),
+                            &background_active,
+                            &error,
+                        )
+                        .await;
+                        let _ = settle_caller_error_outcome_v2(
+                            &background_state,
+                            &dispatch_binding,
+                            &error,
+                            true,
+                        );
+                        if let Some(sender) = persisted_sender.take() {
+                            let _ = sender.send(Err(error));
+                        }
+                        return;
+                    }
+                    let owner_instance_id = match dispatch_binding
+                        .drive_owner_instance_id
+                        .as_deref()
+                    {
+                        Some(owner_instance_id) => owner_instance_id,
+                        None => {
+                            let error = AgentKernelV2Error::invalid(
+                                "host_caller_request_owner_missing",
+                                "User-input Run drive handoff requires its exact durable owner instance.",
+                            );
+                            let _ = settle_caller_error_outcome_v2(
+                                &background_state,
+                                &dispatch_binding,
+                                &error,
+                                true,
+                            );
+                            if let Some(sender) = persisted_sender.take() {
+                                let _ = sender.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    let superseded_outcome = json!({
+                        "schemaVersion": HOST_CALLER_RUN_OUTCOME_SCHEMA_V2,
+                        "disposition": "indeterminate",
+                        "hostRunId": background_active.host_run_id,
+                        "error": {
+                            "code": "host_caller_request_superseded_by_user_input",
+                            "message": "A newer durable user input superseded this caller after its owned Run drive was quiesced.",
+                        },
+                        "causation": {
+                            "supersedingCallerRequestId": dispatch_binding.caller_request_id,
+                            "supersedingRequestDigest": dispatch_binding.request_digest,
+                        },
+                    });
+                    let handed_off_binding = match background_state
+                        .host_services
+                        .kernel_operations_v2
+                        .handoff_run_drive_to_interrupt_caller(
+                            &dispatch_binding,
+                            owner_instance_id,
+                            superseded_outcome,
+                            &crate::utils::now_rfc3339_text(),
+                        )
+                        .map_err(AgentKernelV2Error::from_storage)
+                    {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            handle_owned_drive_error_v2(
+                                &AgentKernelDriveContextV2::from_state(&background_state),
+                                &background_active,
+                                &error,
+                            )
+                            .await;
+                            let _ = settle_caller_error_outcome_v2(
+                                &background_state,
+                                &dispatch_binding,
+                                &error,
+                                true,
+                            );
+                            if let Some(sender) = persisted_sender.take() {
+                                let _ = sender.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    let transfer = background_state
+                        .kernel_wake_v2
+                        .transfer_exact(interrupt_owner, continuation_owner.clone())
+                        .await;
+                    if !matches!(transfer, Ok(HostKernelWakeTransferOutcomeV2::Transferred)) {
+                        let error = match transfer {
+                            Err(supervisor_error) => {
+                                AgentKernelV2Error::from_wake_supervisor(supervisor_error)
+                            }
+                            Ok(outcome) => AgentKernelV2Error::invalid(
+                                "host_interrupt_continuation_transfer_failed",
+                                format!(
+                                    "Durable user input could not transfer its exact interrupt owner to the Session continuation lane: {outcome:?}"
+                                ),
+                            ),
+                        };
+                        handle_owned_drive_error_v2(
+                            &AgentKernelDriveContextV2::from_state(&background_state),
+                            &background_active,
+                            &error,
+                        )
+                        .await;
+                        let _ = settle_caller_error_outcome_v2(
+                            &background_state,
+                            &handed_off_binding,
+                            &error,
+                            true,
+                        );
+                        if let Some(sender) = persisted_sender.take() {
+                            let _ = sender.send(Err(error));
+                        }
+                        return;
+                    }
+                    let admitted_binding = match persist_caller_admission_v2(
+                        &background_state,
+                        &background_active,
+                        &handed_off_binding,
+                        &continuation_owner,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            handle_owned_drive_error_v2(
+                                &AgentKernelDriveContextV2::from_state(&background_state),
+                                &background_active,
+                                &error,
+                            )
+                            .await;
+                            let _ = settle_caller_error_outcome_v2(
+                                &background_state,
+                                &handed_off_binding,
+                                &error,
+                                true,
+                            );
+                            if let Some(sender) = persisted_sender.take() {
+                                let _ = sender.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    if let Some(sender) = persisted_sender.take() {
+                        let _ = sender.send(Ok(()));
+                    }
+                    let result = match operation_result.take() {
+                        Some(result) => result,
+                        None => operation.await,
+                    };
+                    let result = match result {
+                        Ok(settlement) => {
+                            drive_agent_kernel_until_boundary_v2(
+                                &AgentKernelDriveContextV2::from_state(&background_state),
+                                &background_active,
+                                settlement,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    finish_owned_caller_drive_v2(
+                        &background_state,
+                        &background_active,
+                        &admitted_binding,
+                        continuation_owner,
+                        result,
                     )
-                    .await?;
-                    return Err(error);
+                    .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = settle_caller_error_outcome_v2(
+                        &background_state,
+                        &dispatch_binding,
+                        &error,
+                        true,
+                    );
+                    if let Some(sender) = persisted_sender.take() {
+                        let _ = sender.send(Err(error));
+                    }
+                    return;
+                }
+            }
+            if operation_result.is_some() {
+                post_operation_checks = post_operation_checks.saturating_add(1);
+                if post_operation_checks >= HOST_INPUT_PROJECTION_SETTLEMENT_GRACE_CHECKS_V2 {
+                    let context = AgentKernelDriveContextV2::from_state(&background_state);
+                    let (error, indeterminate) = match operation_result.take() {
+                        Some(Err(error)) => {
+                            let disposition =
+                                handle_owned_drive_error_v2(&context, &background_active, &error)
+                                    .await;
+                            (
+                                error,
+                                matches!(
+                                    disposition,
+                                    OwnedDriveErrorDispositionV2::RecoveryWaiting
+                                        | OwnedDriveErrorDispositionV2::IndeterminateManual
+                                ),
+                            )
+                        }
+                        Some(Ok(settlement))
+                            if !matches!(
+                                &settlement.settlement,
+                                HostKernelOperationSettlementV2::Succeeded { .. }
+                            ) =>
+                        {
+                            match drive_agent_kernel_until_boundary_v2(
+                                &context,
+                                &background_active,
+                                settlement,
+                            )
+                            .await
+                            {
+                                Ok(AgentKernelDriveBoundaryV2::Failure {
+                                    error,
+                                    indeterminate,
+                                }) => (error, indeterminate),
+                                Ok(
+                                    AgentKernelDriveBoundaryV2::Complete
+                                    | AgentKernelDriveBoundaryV2::KernelWait(_),
+                                ) => {
+                                    let error = AgentKernelV2Error::invalid(
+                                        "host_user_input_projection_settlement_invalid",
+                                        "A failed Session user input operation reached a non-failure drive boundary before its exact input.persisted projection became durable.",
+                                    );
+                                    handle_owned_drive_error_v2(
+                                        &context,
+                                        &background_active,
+                                        &error,
+                                    )
+                                    .await;
+                                    (error, true)
+                                }
+                                Err(error) => {
+                                    let disposition = handle_owned_drive_error_v2(
+                                        &context,
+                                        &background_active,
+                                        &error,
+                                    )
+                                    .await;
+                                    (
+                                        error,
+                                        matches!(
+                                            disposition,
+                                            OwnedDriveErrorDispositionV2::RecoveryWaiting
+                                                | OwnedDriveErrorDispositionV2::IndeterminateManual
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                        Some(Ok(_)) | None => {
+                            let error = AgentKernelV2Error::invalid(
+                                "host_user_input_projection_missing",
+                                "Session user input operation ended before its exact input.persisted projection became durable.",
+                            );
+                            handle_owned_drive_error_v2(&context, &background_active, &error).await;
+                            (error, true)
+                        }
+                    };
+                    let _ = settle_caller_error_outcome_v2(
+                        &background_state,
+                        &dispatch_binding,
+                        &error,
+                        indeterminate,
+                    );
+                    if let Some(sender) = persisted_sender.take() {
+                        let _ = sender.send(Err(error));
+                    }
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                result = &mut operation, if operation_result.is_none() => {
+                    operation_result = Some(result);
                 }
             }
         }
-        None => match state
-            .kernel_wake_v2
-            .register_exclusive(owner.clone(), future)
-            .await
-        {
-            Ok(HostKernelWakeRegisterOutcomeV2::Registered) => (true, None, None),
-            Ok(
-                HostKernelWakeRegisterOutcomeV2::AlreadyExact
-                | HostKernelWakeRegisterOutcomeV2::OwnerConflict,
-            ) => (false, None, None),
-            Err(supervisor_error) => {
-                drop(admission_receiver);
-                let error = AgentKernelV2Error::from_wake_supervisor(supervisor_error);
-                cleanup_unadmitted_caller_registration_v2(state, &binding, owner, None, &error)
-                    .await?;
-                return Err(error);
-            }
-        },
     };
-    if !registration {
-        drop(admission_receiver);
+    let registration = state.kernel_wake_v2.register_exclusive(owner, future).await;
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(supervisor_error) => {
+            drop(persisted_receiver);
+            let error = AgentKernelV2Error::from_wake_supervisor(supervisor_error);
+            settle_caller_error_outcome_v2(state, &binding, &error, false)?;
+            return Err(error);
+        }
+    };
+    if registration != HostKernelWakeRegisterOutcomeV2::Registered {
+        drop(persisted_receiver);
         let error = AgentKernelV2Error::invalid(
-            "host_kernel_caller_drive_owner_conflict",
-            "The exact user-input caller could not acquire or replace the expected Run drive owner.",
+            "host_interrupt_mailbox_busy",
+            "This Session already has one pending Host interrupt mutation; wait for its durable input admission before submitting another.",
         );
-        cleanup_unadmitted_caller_registration_v2(state, &binding, owner, recovery_wait, &error)
-            .await?;
+        settle_caller_error_outcome_v2(state, &binding, &error, false)?;
         return Err(error);
     }
-    complete_caller_admission_v2(
-        state,
-        &active,
+    Ok(AgentKernelUserInputAdmissionV2::Pending {
+        state: state.clone(),
         binding,
-        owner,
-        admission_receiver,
-        replaced_wait,
-    )
-    .await
+        host_run_id: active.host_run_id,
+        input_id: admission_input_id,
+        persisted: Some(persisted_receiver),
+    })
 }
 
 async fn complete_caller_admission_v2(
@@ -950,8 +1404,22 @@ fn persist_caller_admission_v2(
             "Claimed caller request has no durable owner instance identity.",
         )
     })?;
-    let admission = json!({
+    let (admission_boundary, input_id) =
+        match binding.request_kind.as_str() {
+            HOST_USER_INPUT_REQUEST_KIND_V2 => {
+                let input_id = caller_binding_string_v2(binding, "inputId")?;
+                require_user_input_admission_projection_v2(state, binding)?;
+                ("input.persisted", Some(input_id))
+            }
+            HOST_DECISION_REQUEST_KIND_V2 => ("decision.admitted", None),
+            _ => return Err(AgentKernelV2Error::invalid(
+                "host_caller_request_admission_kind_conflict",
+                "Only exact decision and user-input callers may persist an ordinary Run admission.",
+            )),
+        };
+    let mut admission = json!({
         "schemaVersion": HOST_CALLER_RUN_ADMISSION_SCHEMA_V2,
+        "admissionBoundary": admission_boundary,
         "sessionId": binding.session_id,
         "hostRunId": active.host_run_id,
         "runId": active.run_id,
@@ -959,6 +1427,12 @@ fn persist_caller_admission_v2(
         "requestDigest": binding.request_digest,
         "ownerDigest": owner.identity_digest,
     });
+    if let Some(input_id) = input_id {
+        admission
+            .as_object_mut()
+            .expect("caller admission JSON object")
+            .insert("inputId".to_string(), Value::String(input_id));
+    }
     state
         .host_services
         .kernel_operations_v2
@@ -1016,23 +1490,16 @@ async fn finish_owned_caller_drive_v2(
 ) {
     match result {
         Ok(AgentKernelDriveBoundaryV2::Complete) => {
-            if let Err(error) = settle_caller_run_outcome_v2(state, binding, &active.host_run_id) {
-                mark_agent_run_v2(
-                    state,
-                    &active.host_run_id,
-                    "waiting",
-                    Some(format!(
-                        "Caller completion persistence requires recovery: {}",
-                        error.code
-                    )),
-                );
-            }
+            settle_caller_run_outcome_while_owned_v2(state, active, binding).await;
         }
         Ok(AgentKernelDriveBoundaryV2::KernelWait(wait)) => {
             let wait_owner = match host_kernel_wake_owner_v2(&wait) {
                 Ok(wait_owner) => wait_owner,
                 Err(error) => {
-                    let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                    settle_caller_error_outcome_while_owned_v2(
+                        state, active, binding, &error, true,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -1045,21 +1512,11 @@ async fn finish_owned_caller_drive_v2(
                     "host_kernel_wake_owner_retag_conflict",
                     "Caller drive could not transfer exact ownership to its Kernel facts wait.",
                 );
-                let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                settle_caller_error_outcome_while_owned_v2(state, active, binding, &error, true)
+                    .await;
                 return;
             }
-            if let Err(error) = settle_caller_run_outcome_v2(state, binding, &active.host_run_id) {
-                mark_agent_run_v2(
-                    state,
-                    &active.host_run_id,
-                    "waiting",
-                    Some(format!(
-                        "Caller handoff persistence requires recovery: {}",
-                        error.code
-                    )),
-                );
-                return;
-            }
+            settle_caller_run_outcome_while_owned_v2(state, active, binding).await;
             let context = AgentKernelDriveContextV2::from_state(state);
             if let Err(error) =
                 drive_owned_agent_kernel_wait_v2(&context, &state.kernel_wake_v2, wait_owner, wait)
@@ -1072,26 +1529,113 @@ async fn finish_owned_caller_drive_v2(
             error,
             indeterminate,
         }) => {
-            let _ = settle_caller_error_outcome_v2(state, binding, &error, indeterminate);
+            settle_caller_error_outcome_while_owned_v2(
+                state,
+                active,
+                binding,
+                &error,
+                indeterminate,
+            )
+            .await;
         }
         Err(error) => {
             let context = AgentKernelDriveContextV2::from_state(state);
-            let disposition = classify_owned_drive_error_v2(&error);
-            handle_owned_drive_error_v2(&context, active, &error).await;
+            let disposition = handle_owned_drive_error_v2(&context, active, &error).await;
             match disposition {
                 OwnedDriveErrorDispositionV2::RecoveryWaiting => {
-                    let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                    settle_caller_error_outcome_while_owned_v2(
+                        state, active, binding, &error, true,
+                    )
+                    .await;
                 }
                 OwnedDriveErrorDispositionV2::IndeterminateManual => {
-                    let _ = settle_caller_error_outcome_v2(state, binding, &error, true);
+                    settle_caller_error_outcome_while_owned_v2(
+                        state, active, binding, &error, true,
+                    )
+                    .await;
                 }
                 OwnedDriveErrorDispositionV2::FailedAndRetire
                 | OwnedDriveErrorDispositionV2::StaleStop => {
-                    let _ = settle_caller_error_outcome_v2(state, binding, &error, false);
+                    settle_caller_error_outcome_while_owned_v2(
+                        state, active, binding, &error, false,
+                    )
+                    .await;
                 }
             }
         }
     }
+}
+
+async fn settle_caller_run_outcome_while_owned_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+) {
+    let mut reported_error_code = None;
+    loop {
+        match settle_caller_run_outcome_v2(state, binding, &active.host_run_id) {
+            Ok(()) => return,
+            Err(error) => {
+                if reported_error_code.as_deref() != Some(error.code.as_str()) {
+                    mark_caller_settlement_retry_v2(
+                        state,
+                        active,
+                        format!(
+                            "Caller outcome persistence is retrying while exact Run ownership remains live: {}",
+                            error.code
+                        ),
+                    );
+                    reported_error_code = Some(error.code);
+                }
+                tokio::time::sleep(HOST_CALLER_SETTLEMENT_RETRY_INTERVAL_V2).await;
+            }
+        }
+    }
+}
+
+async fn settle_caller_error_outcome_while_owned_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+    drive_error: &AgentKernelV2Error,
+    indeterminate: bool,
+) {
+    let mut reported_error_code = None;
+    loop {
+        match settle_caller_error_outcome_v2(state, binding, drive_error, indeterminate) {
+            Ok(()) => return,
+            Err(error) => {
+                if reported_error_code.as_deref() != Some(error.code.as_str()) {
+                    mark_caller_settlement_retry_v2(
+                        state,
+                        active,
+                        format!(
+                            "Caller failure persistence is retrying while exact Run ownership remains live: {}",
+                            error.code
+                        ),
+                    );
+                    reported_error_code = Some(error.code);
+                }
+                tokio::time::sleep(HOST_CALLER_SETTLEMENT_RETRY_INTERVAL_V2).await;
+            }
+        }
+    }
+}
+
+fn mark_caller_settlement_retry_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    message: String,
+) {
+    let lifecycle = state
+        .session_runs
+        .lock()
+        .expect("session run state lock")
+        .get(&active.host_run_id)
+        .filter(|run| run.session_id == active.session_id)
+        .map(|run| run.status.clone())
+        .unwrap_or_else(|| "waiting".to_string());
+    mark_agent_run_v2(state, &active.host_run_id, &lifecycle, Some(message));
 }
 
 pub(crate) fn revoke_agent_kernel_authority_v2(
@@ -1337,9 +1881,11 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
     session_id: &str,
     route_run_id: &str,
     guidance: &str,
+    workspace_path: Option<&str>,
+    no_workspace: bool,
     attachments: Option<&[AgentInputAttachmentV2]>,
     caller_request_id: &str,
-) -> Result<String, AgentKernelV2Error> {
+) -> Result<AgentKernelUserInputAdmissionV2, AgentKernelV2Error> {
     let text = Some(guidance)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1355,6 +1901,8 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         "routeRunId": route_run_id,
         "callerRequestId": caller_request_id,
         "text": text,
+        "workspacePath": workspace_path,
+        "noWorkspace": no_workspace,
         "attachments": attachments,
     });
     let request_digest =
@@ -1371,24 +1919,37 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         .map_err(AgentKernelV2Error::from_storage)?;
     if let Some(binding) = existing.as_ref() {
         if let Some(replayed_host_run_id) = restore_caller_run_outcome_v2(state, binding)? {
-            return Ok(replayed_host_run_id);
+            return user_input_admission_receipt_v2(state, binding, replayed_host_run_id)
+                .map(AgentKernelUserInputAdmissionV2::Ready);
         }
         if let Some(admitted_host_run_id) =
             current_owned_caller_admission_v2(state, binding).await?
         {
-            return Ok(admitted_host_run_id);
+            return user_input_admission_receipt_v2(state, binding, admitted_host_run_id)
+                .map(AgentKernelUserInputAdmissionV2::Ready);
         }
         if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
-            return recover_or_resume_driving_user_input_v2(state, binding).await;
+            if current_owned_user_input_interrupt_v2(state, binding).await? {
+                return Ok(AgentKernelUserInputAdmissionV2::Pending {
+                    state: state.clone(),
+                    binding: binding.clone(),
+                    host_run_id: caller_binding_string_v2(binding, "hostRunId")?,
+                    input_id: caller_binding_string_v2(binding, "inputId")?,
+                    persisted: None,
+                });
+            }
+            let host_run_id = recover_or_resume_driving_user_input_v2(state, binding).await?;
+            return user_input_admission_receipt_v2(state, binding, host_run_id)
+                .map(AgentKernelUserInputAdmissionV2::Ready);
         }
     }
     let active = require_active_agent_kernel_run_v2(state, session_id, Some(route_run_id))?;
+    validate_active_run_workspace_request_v2(state, &active, workspace_path, no_workspace)?;
     validate_active_run_attachment_binding_v2(state, &active, &attachments)?;
     ensure_agent_run_cache_v2(state, &active)?;
     let binding = match existing {
         Some(binding) => binding,
         None => {
-            let previous = latest_settlement_v2(state, &active)?;
             let recorded_at = crate::utils::now_rfc3339_text();
             let material = json!({
                 "schemaVersion": "deepcode.host.agent-input.v2",
@@ -1413,8 +1974,17 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
                 input: identity_input.clone(),
                 guidance: Vec::new(),
             };
-            let operation_request_id =
-                next_operation_request_id_v2(&previous, &identity_operation)?;
+            // A semantic user input is the durable interrupt boundary itself.
+            // It may arrive while the current Session operation is still
+            // pending, so it cannot depend on a settlement that does not yet
+            // exist. The immutable Run bootstrap plus the exact semantic input
+            // provides a stable replay identity without weakening the later
+            // handoff, projection, or caller-correlation checks.
+            let operation_request_id = stable_operation_request_id_v2(
+                "user-input-interrupt",
+                &active.bootstrap_digest,
+                &identity_operation,
+            )?;
             state
                 .host_services
                 .kernel_operations_v2
@@ -1426,7 +1996,6 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
                     response_identity: json!({
                         "hostRunId": active.host_run_id,
                         "runId": active.run_id,
-                        "predecessorSettlementDigest": previous.settlement_digest,
                         "inputId": input_id.as_str(),
                         "opaqueInputRef": opaque_input_ref,
                         "operationRequestId": operation_request_id,
@@ -1447,9 +2016,19 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
     }
     let input = durable_user_input_from_binding_v2(&binding)?;
     let request_id = caller_binding_string_v2(&binding, "operationRequestId")?;
-    let binding = match claim_user_input_drive_or_restore_v2(state, binding).await? {
-        CallerDriveAdmissionV2::Acquired(binding) => binding,
-        CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(host_run_id),
+    let bound_before_claim = binding.clone();
+    let claim = claim_user_input_drive_or_restore_v2(state, binding).await;
+    let binding = match claim {
+        Err(error) if error.code == "host_interrupt_mailbox_busy" => {
+            settle_caller_error_outcome_v2(state, &bound_before_claim, &error, false)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+        Ok(CallerDriveAdmissionV2::Acquired(binding)) => binding,
+        Ok(CallerDriveAdmissionV2::Replayed(host_run_id)) => {
+            return user_input_admission_receipt_v2(state, &bound_before_claim, host_run_id)
+                .map(AgentKernelUserInputAdmissionV2::Ready);
+        }
     };
     admit_and_spawn_user_input_v2(state, active, binding, input, request_id).await
 }
@@ -1457,9 +2036,26 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
 async fn execute_bound_user_input_v2(
     state: &AppState,
     active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
     input: HostKernelInitialInputV2,
     request_id: &str,
 ) -> Result<AgentKernelDriveBoundaryV2, AgentKernelV2Error> {
+    let settlement = submit_bound_user_input_v2(state, active, binding, input, request_id).await?;
+    drive_agent_kernel_until_boundary_v2(
+        &AgentKernelDriveContextV2::from_state(state),
+        active,
+        settlement,
+    )
+    .await
+}
+
+async fn submit_bound_user_input_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+    input: HostKernelInitialInputV2,
+    request_id: &str,
+) -> Result<HostKernelOperationSettlementReceiptV2, AgentKernelV2Error> {
     let operation = HostKernelBridgeOperationV2::UserInput {
         input,
         guidance: Vec::new(),
@@ -1472,20 +2068,158 @@ async fn execute_bound_user_input_v2(
     );
     let settlement = state
         .kernel_session_v2
-        .submit_operation(
+        .submit_user_input_for_caller(
             &active.session_id,
             &active.host_run_id,
             request_id,
+            &binding.caller_request_id,
+            &binding.request_digest,
             operation,
         )
         .await
         .map_err(AgentKernelV2Error::from_storage)?;
-    drive_agent_kernel_until_boundary_v2(
-        &AgentKernelDriveContextV2::from_state(state),
-        active,
-        settlement,
-    )
-    .await
+    Ok(settlement)
+}
+
+fn validate_active_run_workspace_request_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    workspace_path: Option<&str>,
+    no_workspace: bool,
+) -> Result<(), AgentKernelV2Error> {
+    let workspace_path = workspace_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    match active.workspace_kind {
+        HostRunWorkspaceKindV2::Empty => {
+            if !no_workspace || workspace_path.is_some() {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_run_workspace_mismatch",
+                    "The immutable active Run has no workspace, but guidance requested a workspace-bound continuation.",
+                ));
+            }
+            Ok(())
+        }
+        HostRunWorkspaceKindV2::Bound => {
+            if no_workspace {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_run_workspace_mismatch",
+                    "The immutable active Run is workspace-bound and cannot continue in no-workspace mode.",
+                ));
+            }
+            let workspace_path = workspace_path.ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "agent_guidance_workspace_required",
+                    "Guidance for a workspace-bound Run requires an exact workspace path.",
+                )
+            })?;
+            let workspace_binding_ref =
+                WorkspaceBindingRefV2::new(active.workspace_binding_ref.clone()).map_err(|_| {
+                    AgentKernelV2Error::invalid(
+                        "host_run_workspace_unverifiable",
+                        "The immutable active Run has an invalid workspace binding reference.",
+                    )
+                })?;
+            state
+                .host_services
+                .workspace
+                .validate_requested_run_workspace(
+                    workspace_path,
+                    &workspace_binding_ref,
+                    &active.workspace_binding_identity,
+                )
+                .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))
+        }
+    }
+}
+
+fn user_input_is_projected_v2(
+    state: &AppState,
+    session_id: &str,
+    input_id: &str,
+) -> Result<bool, AgentKernelV2Error> {
+    let sessions_dir = state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .paths
+        .sessions_dir
+        .clone();
+    let events = read_session_kernel_v2_public_agent_events(&sessions_dir, session_id)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    Ok(events.iter().any(|event| {
+        event
+            .pointer("/payload/projectionKind")
+            .and_then(Value::as_str)
+            == Some("input.persisted")
+            && event.pointer("/payload/inputId").and_then(Value::as_str) == Some(input_id)
+    }))
+}
+
+fn projected_user_input_ready_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    input_id: &str,
+) -> Result<bool, AgentKernelV2Error> {
+    if !user_input_is_projected_v2(state, &binding.session_id, input_id)? {
+        return Ok(false);
+    }
+    let evidence = state
+        .host_services
+        .kernel_operations_v2
+        .caller_control_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    if !evidence.first_operation_present {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn require_user_input_admission_projection_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<(), AgentKernelV2Error> {
+    if binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2 {
+        return Err(AgentKernelV2Error::invalid(
+            "host_user_input_admission_kind_conflict",
+            "The input.persisted admission boundary requires an exact user-input caller.",
+        ));
+    }
+    let input_id = caller_binding_string_v2(binding, "inputId")?;
+    if projected_user_input_ready_v2(state, binding, &input_id)? {
+        Ok(())
+    } else {
+        Err(AgentKernelV2Error::invalid(
+            "host_user_input_projection_missing",
+            "User-input admission requires its exact input.persisted projection and caller-correlated Session dispatch.",
+        ))
+    }
+}
+
+fn require_initial_input_projection_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<(), AgentKernelV2Error> {
+    if binding.request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2 {
+        return Err(AgentKernelV2Error::invalid(
+            "host_initial_input_request_kind_conflict",
+            "Initial input projection validation requires an exact RunOpen caller.",
+        ));
+    }
+    let input_id = caller_binding_string_v2(binding, "inputId")?;
+    if user_input_is_projected_v2(state, &binding.session_id, &input_id)? {
+        Ok(())
+    } else {
+        Err(AgentKernelV2Error::invalid(
+            "host_initial_input_projection_missing",
+            "RunOpen cannot acknowledge the initial user input before its exact input.persisted projection is durable.",
+        ))
+    }
 }
 
 fn durable_user_input_from_binding_v2(
@@ -1587,6 +2321,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
     };
     require_route_run_identity_v2(&active, route_run_id)?;
     ensure_agent_run_cache_v2(state, &active)?;
+    supersede_pending_user_input_for_cancel_v2(state, &active).await?;
     let cancel_operation_id = stable_identity_v2(
         "operation-cancel",
         &json!({
@@ -1628,9 +2363,16 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
             "Durable Host cancellation is bound to a different Run.",
         ));
     }
-    let binding = match claim_cancel_drive_or_restore_v2(state, binding).await? {
-        CallerDriveAdmissionV2::Acquired(binding) => binding,
-        CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(Some(host_run_id)),
+    let bound_before_claim = binding.clone();
+    let claim = claim_cancel_drive_or_restore_v2(state, binding).await;
+    let binding = match claim {
+        Err(error) if error.code == "host_interrupt_mailbox_busy" => {
+            settle_caller_error_outcome_v2(state, &bound_before_claim, &error, false)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+        Ok(CallerDriveAdmissionV2::Acquired(binding)) => binding,
+        Ok(CallerDriveAdmissionV2::Replayed(host_run_id)) => return Ok(Some(host_run_id)),
     };
     cancel_owned_agent_kernel_wait_v2(state, &active).await?;
     if let Err(error) = state
@@ -1698,6 +2440,18 @@ pub(crate) async fn retire_agent_kernel_run_v2(
     }
     let host_run_id = host_run_id.to_string();
     if let HostKernelLiveRunForDeletionV2::Active(active) = &live_run {
+        let active_record = require_active_agent_kernel_run_v2(
+            state,
+            &active.session_id,
+            Some(&active.host_run_id),
+        )?;
+        settle_pending_user_input_before_control_v2(
+            state,
+            &active_record,
+            "host_user_input_superseded_by_retirement",
+            "The pending user input was superseded by explicit Run retirement and was not replayed.",
+        )
+        .await?;
         cancel_owned_agent_kernel_wait_identity_v2(
             state,
             &active.session_id,
@@ -2925,32 +3679,39 @@ async fn handle_owned_drive_error_v2(
     context: &AgentKernelDriveContextV2,
     active: &HostActiveRunRecordV2,
     error: &AgentKernelV2Error,
-) {
+) -> OwnedDriveErrorDispositionV2 {
     match classify_owned_drive_error_v2(error) {
-        OwnedDriveErrorDispositionV2::StaleStop => {}
-        OwnedDriveErrorDispositionV2::RecoveryWaiting => mark_agent_drive_v2(
-            context,
-            &active.host_run_id,
-            "waiting",
-            Some(format!(
-                "Kernel–Session v2 owned Run drive ended without a live continuation owner and requires explicit recovery: {}",
-                error.code
-            )),
-        ),
-        OwnedDriveErrorDispositionV2::IndeterminateManual => mark_agent_drive_v2(
-            context,
-            &active.host_run_id,
-            "waiting",
-            Some(format!(
-                "Kernel–Session v2 owned Run drive is indeterminate and requires explicit manual recovery: {}",
-                error.code
-            )),
-        ),
+        OwnedDriveErrorDispositionV2::StaleStop => OwnedDriveErrorDispositionV2::StaleStop,
+        OwnedDriveErrorDispositionV2::RecoveryWaiting => {
+            mark_agent_drive_v2(
+                context,
+                &active.host_run_id,
+                "waiting",
+                Some(format!(
+                    "Kernel–Session v2 owned Run drive ended without a live continuation owner and requires explicit recovery: {}",
+                    error.code
+                )),
+            );
+            OwnedDriveErrorDispositionV2::RecoveryWaiting
+        }
+        OwnedDriveErrorDispositionV2::IndeterminateManual => {
+            mark_agent_drive_v2(
+                context,
+                &active.host_run_id,
+                "waiting",
+                Some(format!(
+                    "Kernel–Session v2 owned Run drive is indeterminate and requires explicit manual recovery: {}",
+                    error.code
+                )),
+            );
+            OwnedDriveErrorDispositionV2::IndeterminateManual
+        }
         OwnedDriveErrorDispositionV2::FailedAndRetire => {
             let retirement = context
                 .kernel_session_v2
                 .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
                 .await;
+            let retirement_succeeded = retirement.is_ok();
             let (lifecycle, message) = match retirement {
                 Ok(_) => (
                     "failed",
@@ -2967,12 +3728,12 @@ async fn handle_owned_drive_error_v2(
                     ),
                 ),
             };
-            mark_agent_drive_v2(
-                context,
-                &active.host_run_id,
-                lifecycle,
-                Some(message),
-            );
+            mark_agent_drive_v2(context, &active.host_run_id, lifecycle, Some(message));
+            if retirement_succeeded {
+                OwnedDriveErrorDispositionV2::FailedAndRetire
+            } else {
+                OwnedDriveErrorDispositionV2::RecoveryWaiting
+            }
         }
     }
 }
@@ -3572,6 +4333,7 @@ fn host_kernel_wake_owner_v2(
         session_id: wait.active.session_id.clone(),
         host_run_id: wait.active.host_run_id.clone(),
         run_id: wait.active.run_id.clone(),
+        lane: HostKernelWakeLaneV2::Drive,
     };
     let identity_digest = canonical_sha256(&json!({
         "schemaVersion": "deepcode.host.kernel-wake-owner.v2",
@@ -3607,6 +4369,7 @@ fn host_kernel_initial_drive_owner_v2(
         session_id: active.session_id.clone(),
         host_run_id: active.host_run_id.clone(),
         run_id: active.run_id.clone(),
+        lane: HostKernelWakeLaneV2::Drive,
     };
     let identity_digest = canonical_sha256(&json!({
         "schemaVersion": "deepcode.host.kernel-initial-drive-owner.v2",
@@ -3639,26 +4402,42 @@ fn host_kernel_caller_drive_owner_v2(
         ));
     }
     let operation_request_id = caller_binding_string_v2(binding, "operationRequestId")?;
-    let predecessor_settlement_digest =
-        caller_binding_string_v2(binding, "predecessorSettlementDigest")?;
     let key = HostKernelWakeKeyV2 {
         session_id: active.session_id.clone(),
         host_run_id: active.host_run_id.clone(),
         run_id: active.run_id.clone(),
+        lane: HostKernelWakeLaneV2::Drive,
     };
-    let identity_digest = canonical_sha256(&json!({
-        "schemaVersion": "deepcode.host.kernel-caller-drive-owner.v2",
-        "sessionId": key.session_id,
-        "hostRunId": key.host_run_id,
-        "runId": key.run_id,
-        "bootstrapDigest": active.bootstrap_digest,
-        "callerRequestId": binding.caller_request_id,
-        "requestKind": binding.request_kind,
-        "callerRequestDigest": binding.request_digest,
-        "operationRequestId": operation_request_id,
-        "predecessorSettlementDigest": predecessor_settlement_digest,
-    }))
-    .map_err(AgentKernelV2Error::from_storage)?;
+    let owner_identity = if binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2 {
+        json!({
+            "schemaVersion": "deepcode.host.kernel-user-input-drive-owner.v1",
+            "sessionId": key.session_id,
+            "hostRunId": key.host_run_id,
+            "runId": key.run_id,
+            "bootstrapDigest": active.bootstrap_digest,
+            "callerRequestId": binding.caller_request_id,
+            "callerRequestDigest": binding.request_digest,
+            "inputId": caller_binding_string_v2(binding, "inputId")?,
+            "operationRequestId": operation_request_id,
+        })
+    } else {
+        let predecessor_settlement_digest =
+            caller_binding_string_v2(binding, "predecessorSettlementDigest")?;
+        json!({
+            "schemaVersion": "deepcode.host.kernel-caller-drive-owner.v2",
+            "sessionId": key.session_id,
+            "hostRunId": key.host_run_id,
+            "runId": key.run_id,
+            "bootstrapDigest": active.bootstrap_digest,
+            "callerRequestId": binding.caller_request_id,
+            "requestKind": binding.request_kind,
+            "callerRequestDigest": binding.request_digest,
+            "operationRequestId": operation_request_id,
+            "predecessorSettlementDigest": predecessor_settlement_digest,
+        })
+    };
+    let identity_digest =
+        canonical_sha256(&owner_identity).map_err(AgentKernelV2Error::from_storage)?;
     if let Some(admission) = binding.admission.as_ref() {
         if admission.get("ownerDigest").and_then(Value::as_str) != Some(identity_digest.as_str()) {
             return Err(AgentKernelV2Error::invalid(
@@ -3673,40 +4452,43 @@ fn host_kernel_caller_drive_owner_v2(
     })
 }
 
-fn current_kernel_wait_v2(
-    state: &AppState,
+fn host_kernel_interrupt_owner_v2(
     active: &HostActiveRunRecordV2,
-) -> Result<Option<(HostKernelWakeOwnerV2, AgentKernelFactWaitV2)>, AgentKernelV2Error> {
-    let predecessor = latest_settlement_v2(state, active)?;
-    if !matches!(
-        predecessor.settlement,
-        HostKernelOperationSettlementV2::Succeeded { .. }
-    ) {
-        return Ok(None);
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<HostKernelWakeOwnerV2, AgentKernelV2Error> {
+    if binding.session_id != active.session_id
+        || binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2
+        || caller_binding_string_v2(binding, "hostRunId")? != active.host_run_id
+        || caller_binding_string_v2(binding, "runId")? != active.run_id
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_kernel_interrupt_identity_conflict",
+            "Interrupt owner does not match its exact durable user input and Run identity.",
+        ));
     }
-    let observed_high_water = match continuation_kind_v2(&predecessor) {
-        Some("awaitingKernelFacts") => {
-            continuation_u64_field_v2(&predecessor, "observedHighWater")?
-        }
-        Some("awaitingKernelWake") => success_response_v2(&predecessor)?
-            .pointer("/state/factsRunSequenceHighWater")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                AgentKernelV2Error::invalid(
-                    "session_kernel_facts_high_water_missing",
-                    "Current Kernel wake has no exact facts run-sequence high-water.",
-                )
-            })?,
-        _ => return Ok(None),
+    let operation_request_id = caller_binding_string_v2(binding, "operationRequestId")?;
+    let key = HostKernelWakeKeyV2 {
+        session_id: active.session_id.clone(),
+        host_run_id: active.host_run_id.clone(),
+        run_id: active.run_id.clone(),
+        lane: HostKernelWakeLaneV2::Interrupt,
     };
-    let wait = AgentKernelFactWaitV2 {
-        active: active.clone(),
-        predecessor,
-        observed_high_water,
-    };
-    kernel_wait_operation_v2(&wait.predecessor, wait.observed_high_water)?;
-    let owner = host_kernel_wake_owner_v2(&wait)?;
-    Ok(Some((owner, wait)))
+    let identity_digest = canonical_sha256(&json!({
+        "schemaVersion": "deepcode.host.kernel-interrupt-owner.v2",
+        "sessionId": key.session_id,
+        "hostRunId": key.host_run_id,
+        "runId": key.run_id,
+        "bootstrapDigest": active.bootstrap_digest,
+        "callerRequestId": binding.caller_request_id,
+        "callerRequestDigest": binding.request_digest,
+        "inputId": caller_binding_string_v2(binding, "inputId")?,
+        "operationRequestId": operation_request_id,
+    }))
+    .map_err(AgentKernelV2Error::from_storage)?;
+    Ok(HostKernelWakeOwnerV2 {
+        key,
+        identity_digest,
+    })
 }
 
 fn latest_drive_settlement_v2(
@@ -3792,11 +4574,74 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
         .unadmitted_driving_run_open_callers(recoverable_session_ids)
         .map_err(AgentKernelV2Error::from_storage)?;
     for binding in stranded_run_open_callers {
-        let error = AgentKernelV2Error::invalid(
-            "host_run_open_admission_indeterminate",
-            "Daemon restart found a RunOpen caller after execution ownership began but before durable caller admission.",
-        );
-        settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+        if let Err(error) = recover_driving_run_open_v2(state, &binding) {
+            let recovered = state
+                .host_services
+                .kernel_operations_v2
+                .caller_request_binding(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                )
+                .map_err(AgentKernelV2Error::from_storage)?
+                .ok_or_else(|| {
+                    AgentKernelV2Error::invalid(
+                        "host_run_open_startup_binding_lost",
+                        "Recovered RunOpen binding disappeared before startup settlement.",
+                    )
+                })?;
+            if recovered.outcome.is_none() {
+                return Err(error);
+            }
+        }
+    }
+    let stranded_interrupt_callers = state
+        .host_services
+        .kernel_operations_v2
+        .driving_interrupt_callers(recoverable_session_ids)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    for binding in stranded_interrupt_callers {
+        let host_run_id = caller_binding_string_v2(&binding, "hostRunId")?;
+        let result = match binding.request_kind.as_str() {
+            HOST_USER_INPUT_REQUEST_KIND_V2 => {
+                recover_or_resume_driving_user_input_v2(state, &binding).await
+            }
+            HOST_CANCEL_REQUEST_KIND_V2 => {
+                recover_or_resume_driving_cancel_v2(state, &binding).await
+            }
+            _ => unreachable!("interrupt startup query returns only frozen control kinds"),
+        };
+        if let Err(error) = result {
+            let recovered = state
+                .host_services
+                .kernel_operations_v2
+                .caller_request_binding(
+                    &binding.session_id,
+                    &binding.caller_request_id,
+                    &binding.request_kind,
+                    &binding.request_digest,
+                )
+                .map_err(AgentKernelV2Error::from_storage)?
+                .ok_or_else(|| {
+                    AgentKernelV2Error::invalid(
+                        "host_interrupt_startup_binding_lost",
+                        "Recovered Host interrupt binding disappeared before startup settlement.",
+                    )
+                })?;
+            if recovered.outcome.is_none() {
+                return Err(error);
+            }
+            mark_agent_run_v2(
+                state,
+                &host_run_id,
+                "waiting",
+                Some(format!(
+                    "A durable Host interrupt was closed during startup recovery: {}",
+                    error.code
+                )),
+            );
+        }
     }
     let active_runs = state
         .host_services
@@ -3808,6 +4653,7 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
             session_id: active.session_id.clone(),
             host_run_id: active.host_run_id.clone(),
             run_id: active.run_id.clone(),
+            lane: HostKernelWakeLaneV2::Drive,
         };
         let drive = state
             .host_services
@@ -3864,6 +4710,9 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
             }
             HostRunCallerDriveRecoveryV2::Indeterminate(binding) => {
                 restore_caller_run_admission_v2(&binding)?;
+                if binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2 {
+                    require_user_input_admission_projection_v2(state, &binding)?;
+                }
                 ensure_agent_run_cache_v2(state, &active)?;
                 mark_agent_run_v2(
                     state,
@@ -3880,6 +4729,9 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
             HostRunCallerDriveRecoveryV2::Admitted(binding) => binding,
         };
         restore_caller_run_admission_v2(&binding)?;
+        if binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2 {
+            require_user_input_admission_projection_v2(state, &binding)?;
+        }
         ensure_agent_run_cache_v2(state, &active)?;
         let evidence = state
             .host_services
@@ -3955,6 +4807,7 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                         execute_bound_user_input_v2(
                             &background_state,
                             &background_active,
+                            &reclaimed,
                             input,
                             &operation_request_id,
                         )
@@ -4007,6 +4860,7 @@ pub(crate) async fn restore_agent_kernel_wait_owners_v2(
             session_id: active.session_id.clone(),
             host_run_id: active.host_run_id.clone(),
             run_id: active.run_id.clone(),
+            lane: HostKernelWakeLaneV2::Drive,
         };
         if caller_owned_runs.contains(&key)
             || !matches!(
@@ -4071,21 +4925,139 @@ async fn cancel_owned_agent_kernel_wait_v2(
     .await
 }
 
+async fn cancel_owned_agent_kernel_drive_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+) -> Result<bool, AgentKernelV2Error> {
+    state
+        .kernel_wake_v2
+        .cancel_exact(HostKernelWakeKeyV2 {
+            session_id: active.session_id.clone(),
+            host_run_id: active.host_run_id.clone(),
+            run_id: active.run_id.clone(),
+            lane: HostKernelWakeLaneV2::Drive,
+        })
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)
+}
+
 async fn cancel_owned_agent_kernel_wait_identity_v2(
     state: &AppState,
     session_id: &str,
     host_run_id: &str,
     run_id: &str,
 ) -> Result<bool, AgentKernelV2Error> {
-    state
+    let drive_cancelled = state
         .kernel_wake_v2
         .cancel_exact(HostKernelWakeKeyV2 {
             session_id: session_id.to_string(),
             host_run_id: host_run_id.to_string(),
             run_id: run_id.to_string(),
+            lane: HostKernelWakeLaneV2::Drive,
         })
         .await
-        .map_err(AgentKernelV2Error::from_wake_supervisor)
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+    let interrupt_cancelled = state
+        .kernel_wake_v2
+        .cancel_exact(HostKernelWakeKeyV2 {
+            session_id: session_id.to_string(),
+            host_run_id: host_run_id.to_string(),
+            run_id: run_id.to_string(),
+            lane: HostKernelWakeLaneV2::Interrupt,
+        })
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+    Ok(drive_cancelled || interrupt_cancelled)
+}
+
+async fn supersede_pending_user_input_for_cancel_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+) -> Result<(), AgentKernelV2Error> {
+    settle_pending_user_input_before_control_v2(
+        state,
+        active,
+        "host_user_input_superseded_by_cancel",
+        "The pending user input was superseded by an explicit Run cancellation and was not replayed.",
+    )
+    .await
+}
+
+async fn settle_pending_user_input_before_control_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    failure_code: &str,
+    failure_message: &str,
+) -> Result<(), AgentKernelV2Error> {
+    let Some(binding) = state
+        .host_services
+        .kernel_operations_v2
+        .pending_interrupt_caller(&active.session_id)
+        .map_err(AgentKernelV2Error::from_storage)?
+    else {
+        return Ok(());
+    };
+    if binding.request_kind == HOST_CANCEL_REQUEST_KIND_V2 {
+        return Err(AgentKernelV2Error::invalid(
+            "host_interrupt_mailbox_busy",
+            "This Session already has a pending durable cancellation.",
+        ));
+    }
+    if binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2
+        || caller_binding_string_v2(&binding, "hostRunId")? != active.host_run_id
+        || caller_binding_string_v2(&binding, "runId")? != active.run_id
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_interrupt_mailbox_identity_conflict",
+            "The pending Host mutation does not belong to the exact active Run.",
+        ));
+    }
+    let interrupt_owner = host_kernel_interrupt_owner_v2(active, &binding)?;
+    let continuation_owner = host_kernel_caller_drive_owner_v2(active, &binding)?;
+    let interrupt_cancelled = state
+        .kernel_wake_v2
+        .cancel_owner_exact(interrupt_owner)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+    let continuation_cancelled = state
+        .kernel_wake_v2
+        .cancel_owner_exact(continuation_owner)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+    if !matches!(
+        interrupt_cancelled,
+        HostKernelWakeCancelOutcomeV2::Cancelled | HostKernelWakeCancelOutcomeV2::Missing
+    ) || !matches!(
+        continuation_cancelled,
+        HostKernelWakeCancelOutcomeV2::Cancelled | HostKernelWakeCancelOutcomeV2::Missing
+    ) {
+        return Err(AgentKernelV2Error::invalid(
+            "host_interrupt_mailbox_owner_conflict",
+            "Cancellation could not acquire the exact pending Host interrupt owner.",
+        ));
+    }
+    let evidence = state
+        .host_services
+        .kernel_operations_v2
+        .caller_control_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    if evidence.binding.outcome.is_some() {
+        return Ok(());
+    }
+    let input_id = caller_binding_string_v2(&binding, "inputId")?;
+    let input_projected = user_input_is_projected_v2(state, &binding.session_id, &input_id)?;
+    let error = AgentKernelV2Error::invalid(failure_code, failure_message);
+    settle_caller_error_outcome_v2(
+        state,
+        &evidence.binding,
+        &error,
+        input_projected || evidence.first_operation_present || evidence.binding.admission.is_some(),
+    )
 }
 
 fn require_active_agent_kernel_run_v2(
@@ -4500,9 +5472,77 @@ fn caller_binding_string_v2(
         })
 }
 
+fn user_input_admission_receipt_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    host_run_id: String,
+) -> Result<AgentKernelUserInputAdmissionReceiptV2, AgentKernelV2Error> {
+    if binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2
+        || caller_binding_string_v2(binding, "hostRunId")? != host_run_id
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "host_user_input_admission_identity_conflict",
+            "User-input admission does not match its exact durable caller and Host Run identity.",
+        ));
+    }
+    let admitted_host_run_id = restore_caller_run_admission_v2(binding)?.ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "host_user_input_admission_missing",
+            "User-input response cannot be acknowledged without its exact durable input.persisted admission.",
+        )
+    })?;
+    if admitted_host_run_id != host_run_id {
+        return Err(AgentKernelV2Error::invalid(
+            "host_user_input_admission_identity_conflict",
+            "User-input admission is bound to a different durable Host Run identity.",
+        ));
+    }
+    let input_id = caller_binding_string_v2(binding, "inputId")?;
+    require_user_input_admission_projection_v2(state, binding)?;
+    Ok(AgentKernelUserInputAdmissionReceiptV2 {
+        host_run_id,
+        input_id,
+    })
+}
+
 enum CallerDriveAdmissionV2 {
     Acquired(HostCallerRequestBindingReceiptV2),
     Replayed(String),
+}
+
+async fn current_owned_user_input_interrupt_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<bool, AgentKernelV2Error> {
+    if binding.request_kind != HOST_USER_INPUT_REQUEST_KIND_V2
+        || binding.drive_state != HostCallerRequestDriveStateV2::Driving
+        || binding.outcome.is_some()
+        || binding.drive_owner_instance_id.as_deref()
+            != Some(
+                state
+                    .host_services
+                    .active_runs_v2
+                    .owner_instance_id()
+                    .as_str(),
+            )
+    {
+        return Ok(false);
+    }
+    let host_run_id = caller_binding_string_v2(binding, "hostRunId")?;
+    let Some(active) = state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(&binding.session_id)
+        .map_err(AgentKernelV2Error::from_storage)?
+        .filter(|active| active.host_run_id == host_run_id)
+    else {
+        return Ok(false);
+    };
+    state
+        .kernel_wake_v2
+        .owns_exact(host_kernel_interrupt_owner_v2(&active, binding)?)
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)
 }
 
 async fn claim_user_input_drive_or_restore_v2(
@@ -4523,7 +5563,7 @@ async fn claim_user_input_drive_or_restore_v2(
     let claim = state
         .host_services
         .kernel_operations_v2
-        .claim_caller_request_drive(
+        .claim_caller_request_interrupt_drive(
             &binding.session_id,
             &binding.caller_request_id,
             &binding.request_kind,
@@ -4561,7 +5601,7 @@ async fn claim_cancel_drive_or_restore_v2(
     let claim = state
         .host_services
         .kernel_operations_v2
-        .claim_caller_request_control_drive(
+        .claim_caller_request_interrupt_drive(
             &binding.session_id,
             &binding.caller_request_id,
             &binding.request_kind,
@@ -4626,7 +5666,7 @@ async fn recover_or_resume_driving_user_input_v2(
     let evidence = state
         .host_services
         .kernel_operations_v2
-        .caller_request_recovery_evidence(
+        .caller_control_request_recovery_evidence(
             &binding.session_id,
             &binding.caller_request_id,
             &binding.request_kind,
@@ -4636,27 +5676,149 @@ async fn recover_or_resume_driving_user_input_v2(
     if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &evidence.binding)? {
         return Ok(host_run_id);
     }
-    if let Some(host_run_id) = current_owned_caller_admission_v2(state, &evidence.binding).await? {
+    let host_run_id = caller_binding_string_v2(&evidence.binding, "hostRunId")?;
+    if restore_caller_run_admission_v2(&evidence.binding)?.is_some() {
+        require_user_input_admission_projection_v2(state, &evidence.binding)?;
+        if evidence.run_lifecycle != Some(HostKernelStoredRunLifecycleV2::Active) {
+            // Normal terminal retirement intentionally retains the exact
+            // caller drive until its outcome is committed. If the daemon
+            // stopped between those commits, recover the bounded terminal Run
+            // snapshot and atomically persist the caller outcome + release.
+            return recover_driving_caller_request_v2(state, &evidence.binding);
+        }
+        let active = require_active_agent_kernel_run_v2(
+            state,
+            &evidence.binding.session_id,
+            Some(&host_run_id),
+        )?;
+        ensure_agent_run_cache_v2(state, &active)?;
+        resume_admitted_user_input_drive_v2(state, active, evidence).await?;
         return Ok(host_run_id);
     }
-    if evidence.binding.admission.is_some() {
-        return recover_driving_caller_request_v2(state, &evidence.binding);
+    let input_id = caller_binding_string_v2(&evidence.binding, "inputId")?;
+    let input_projected =
+        user_input_is_projected_v2(state, &evidence.binding.session_id, &input_id)?;
+    if input_projected && evidence.first_operation_present {
+        let error = AgentKernelV2Error::invalid(
+            "host_caller_request_indeterminate",
+            "The user input was durably projected without a durable Run-drive transfer admission; automatic success recovery is unsafe.",
+        );
+        settle_caller_error_outcome_v2(state, &evidence.binding, &error, true)?;
+        return Err(error);
     }
     let current_owner_instance_id = state.host_services.active_runs_v2.owner_instance_id();
     if evidence.binding.drive_owner_instance_id.as_deref()
         == Some(current_owner_instance_id.as_str())
     {
-        return Err(AgentKernelV2Error::invalid(
-            "host_caller_request_in_progress",
-            "The exact user-input request is still being driven by this Host instance; retry with the same callerRequestId to query its durable outcome.",
-        ));
+        if let Some(active) = state
+            .host_services
+            .active_runs_v2
+            .resolve_session_active_run(&evidence.binding.session_id)
+            .map_err(AgentKernelV2Error::from_storage)?
+            .filter(|active| active.host_run_id == host_run_id)
+        {
+            let owner = host_kernel_interrupt_owner_v2(&active, &evidence.binding)?;
+            if state
+                .kernel_wake_v2
+                .owns_exact(owner)
+                .await
+                .map_err(AgentKernelV2Error::from_wake_supervisor)?
+            {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_caller_request_in_progress",
+                    "The exact user-input request is still being driven by this Host instance; retry with the same callerRequestId to query its durable outcome.",
+                ));
+            }
+        }
     }
+    let indeterminate = evidence.first_operation_present;
     let error = AgentKernelV2Error::invalid(
-        "host_caller_request_admission_incomplete",
-        "A prior Host instance ended before this user input obtained durable admission; submit a new caller request.",
+        if indeterminate {
+            "host_caller_request_indeterminate"
+        } else {
+            "host_caller_request_admission_incomplete"
+        },
+        if input_projected {
+            "A prior Host instance durably persisted the user input but ended without a recoverable caller-correlated Session settlement; the request was not replayed."
+        } else if indeterminate {
+            "A prior Host instance ended after caller-correlated user-input dispatch but before durable input.persisted admission; the request was not replayed."
+        } else {
+            "A prior Host instance ended before this user input reached durable input.persisted admission; submit a new caller request."
+        },
     );
-    settle_caller_error_outcome_v2(state, &evidence.binding, &error, false)?;
+    settle_caller_error_outcome_v2(state, &evidence.binding, &error, indeterminate)?;
     Err(error)
+}
+
+async fn resume_admitted_user_input_drive_v2(
+    state: &AppState,
+    active: HostActiveRunRecordV2,
+    evidence: HostCallerRequestRecoveryEvidenceV2,
+) -> Result<(), AgentKernelV2Error> {
+    let current_owner_instance_id = state.host_services.active_runs_v2.owner_instance_id();
+    let first_operation_pending = evidence.first_operation_pending;
+    let evidence_binding = evidence.binding;
+    let binding = if evidence_binding.drive_owner_instance_id.as_deref()
+        == Some(current_owner_instance_id.as_str())
+    {
+        evidence_binding
+    } else {
+        state
+            .host_services
+            .kernel_operations_v2
+            .reclaim_admitted_caller_request_drive(
+                &evidence_binding,
+                &current_owner_instance_id,
+                &crate::utils::now_rfc3339_text(),
+            )
+            .map_err(AgentKernelV2Error::from_storage)?
+    };
+    if first_operation_pending {
+        let error = AgentKernelV2Error::invalid(
+            "host_caller_request_indeterminate",
+            "The admitted user-input dispatch has an unresolved Session operation; automatic replay is unsafe.",
+        );
+        settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+        return Err(error);
+    }
+    let input = durable_user_input_from_binding_v2(&binding)?;
+    validate_active_run_attachment_binding_v2(state, &active, &input.attachments)?;
+    let operation_request_id = caller_binding_string_v2(&binding, "operationRequestId")?;
+    let owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
+    let owner_for_drive = owner.clone();
+    let background_state = state.clone();
+    let background_active = active.clone();
+    let background_binding = binding.clone();
+    let outcome = state
+        .kernel_wake_v2
+        .register_exclusive(owner, async move {
+            let result = execute_bound_user_input_v2(
+                &background_state,
+                &background_active,
+                &background_binding,
+                input,
+                &operation_request_id,
+            )
+            .await;
+            finish_owned_caller_drive_v2(
+                &background_state,
+                &background_active,
+                &background_binding,
+                owner_for_drive,
+                result,
+            )
+            .await;
+        })
+        .await
+        .map_err(AgentKernelV2Error::from_wake_supervisor)?;
+    match outcome {
+        HostKernelWakeRegisterOutcomeV2::Registered
+        | HostKernelWakeRegisterOutcomeV2::AlreadyExact => Ok(()),
+        HostKernelWakeRegisterOutcomeV2::OwnerConflict => Err(AgentKernelV2Error::invalid(
+            "host_kernel_caller_restore_owner_conflict",
+            "The admitted user-input caller could not restore its exact live Run owner.",
+        )),
+    }
 }
 
 async fn recover_or_resume_driving_cancel_v2(
@@ -4901,6 +6063,20 @@ fn recover_driving_caller_request_v2(
             "The exact caller request is still establishing durable admission in this Host instance.",
         ));
     }
+    if evidence.run_lifecycle == Some(HostKernelStoredRunLifecycleV2::Retired) {
+        if let Some(HostKernelOperationSettlementReceiptV2 {
+            settlement: HostKernelOperationSettlementV2::FailedTerminal { error_code, .. },
+            ..
+        }) = evidence.latest_settlement.as_ref()
+        {
+            let error = AgentKernelV2Error::invalid(
+                error_code.clone(),
+                "Session reported a terminal operation failure.",
+            );
+            settle_caller_error_outcome_v2(state, &evidence.binding, &error, false)?;
+            return Err(error);
+        }
+    }
     match recovered_run_snapshot_v2(&evidence)? {
         Some(run) => {
             let host_run_id = run.run_id.clone();
@@ -4941,6 +6117,58 @@ fn recover_driving_caller_request_v2(
             Err(error)
         }
     }
+}
+
+fn recover_driving_run_open_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<String, AgentKernelV2Error> {
+    if binding.request_kind != HOST_RUN_OPEN_REQUEST_KIND_V2 {
+        return Err(AgentKernelV2Error::invalid(
+            "host_run_open_recovery_kind_conflict",
+            "RunOpen recovery requires an exact RunOpen caller binding.",
+        ));
+    }
+    let evidence = state
+        .host_services
+        .kernel_operations_v2
+        .caller_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &evidence.binding)? {
+        return Ok(host_run_id);
+    }
+    let host_run_id = caller_binding_string_v2(&evidence.binding, "hostRunId")?;
+    let input_id = caller_binding_string_v2(&evidence.binding, "inputId")?;
+    if user_input_is_projected_v2(state, &evidence.binding.session_id, &input_id)? {
+        let active = require_active_agent_kernel_run_v2(
+            state,
+            &evidence.binding.session_id,
+            Some(&host_run_id),
+        )?;
+        ensure_agent_run_cache_v2(state, &active)?;
+        settle_caller_run_outcome_v2(state, &evidence.binding, &host_run_id)?;
+        return Ok(host_run_id);
+    }
+    let dispatched = evidence.first_operation_present;
+    let error = AgentKernelV2Error::invalid(
+        if dispatched {
+            "host_run_open_admission_indeterminate"
+        } else {
+            "host_run_open_admission_incomplete"
+        },
+        if dispatched {
+            "RunOpen dispatched its initial Session operation but ended before exact input.persisted admission; the request was not replayed."
+        } else {
+            "RunOpen ended before dispatching its initial Session operation or persisting exact input.persisted admission."
+        },
+    );
+    settle_caller_error_outcome_v2(state, &evidence.binding, &error, dispatched)?;
+    Err(error)
 }
 
 fn recovered_run_snapshot_v2(
@@ -5138,6 +6366,7 @@ fn exact_agent_run_admission_v2(
     state: &AppState,
     session_id: &str,
     host_run_id: &str,
+    input_id: &str,
 ) -> Result<AgentKernelRunAdmissionV2, AgentKernelV2Error> {
     let kernel_run_id = {
         let runs = state.session_runs.lock().expect("session run state lock");
@@ -5149,6 +6378,7 @@ fn exact_agent_run_admission_v2(
         return Ok(AgentKernelRunAdmissionV2 {
             host_run_id: host_run_id.to_string(),
             kernel_run_id,
+            input_id: input_id.to_string(),
         });
     }
     let active = state
@@ -5161,6 +6391,7 @@ fn exact_agent_run_admission_v2(
     Ok(AgentKernelRunAdmissionV2 {
         host_run_id: host_run_id.to_string(),
         kernel_run_id: active.run_id,
+        input_id: input_id.to_string(),
     })
 }
 
@@ -5192,6 +6423,7 @@ async fn current_owned_open_admission_v2(
         .kernel_operations_v2
         .live_run_has_supported_history_schema(&binding.session_id, &host_run_id)
         .map_err(AgentKernelV2Error::from_storage)?;
+    require_initial_input_projection_v2(state, binding)?;
     let operation_request_id = caller_binding_string_v2(binding, "operationRequestId")?;
     let owner = host_kernel_initial_drive_owner_v2(&active, binding, &operation_request_id)?;
     if !state
@@ -5207,6 +6439,7 @@ async fn current_owned_open_admission_v2(
     Ok(Some(AgentKernelRunAdmissionV2 {
         host_run_id,
         kernel_run_id: active.run_id,
+        input_id: caller_binding_string_v2(binding, "inputId")?,
     }))
 }
 
@@ -5247,6 +6480,9 @@ async fn current_owned_caller_admission_v2(
         .kernel_operations_v2
         .live_run_has_supported_history_schema(&binding.session_id, &host_run_id)
         .map_err(AgentKernelV2Error::from_storage)?;
+    if binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2 {
+        require_user_input_admission_projection_v2(state, binding)?;
+    }
     let owner = host_kernel_caller_drive_owner_v2(&active, binding)?;
     if !state
         .kernel_wake_v2
@@ -5270,8 +6506,8 @@ fn restore_caller_run_admission_v2(
         != Some(HOST_CALLER_RUN_ADMISSION_SCHEMA_V2)
     {
         return Err(AgentKernelV2Error::invalid(
-            "host_caller_request_admission_invalid",
-            "Durable Host caller request has an unsupported admission schema.",
+            "UnsupportedHistorySchema",
+            "Durable Host caller request uses an unsupported admission schema; old live admission semantics are not decoded.",
         ));
     }
     let required = |field: &'static str| {
@@ -5288,6 +6524,33 @@ fn restore_caller_run_admission_v2(
     };
     let host_run_id = required("hostRunId")?;
     required("ownerDigest")?;
+    let admission_boundary = required("admissionBoundary")?;
+    match binding.request_kind.as_str() {
+        HOST_USER_INPUT_REQUEST_KIND_V2 => {
+            if admission_boundary != "input.persisted"
+                || required("inputId")? != caller_binding_string_v2(binding, "inputId")?
+            {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_caller_request_admission_conflict",
+                    "Durable user-input admission does not bind its exact input.persisted boundary.",
+                ));
+            }
+        }
+        HOST_DECISION_REQUEST_KIND_V2 => {
+            if admission_boundary != "decision.admitted" || admission.get("inputId").is_some() {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_caller_request_admission_conflict",
+                    "Durable decision admission has an invalid boundary or user-input identity.",
+                ));
+            }
+        }
+        _ => {
+            return Err(AgentKernelV2Error::invalid(
+                "host_caller_request_admission_kind_conflict",
+                "Durable ordinary caller admission belongs to an unsupported request kind.",
+            ))
+        }
+    }
     if required("sessionId")? != binding.session_id
         || host_run_id != caller_binding_string_v2(binding, "hostRunId")?
         || required("runId")? != caller_binding_string_v2(binding, "runId")?
@@ -5508,7 +6771,10 @@ fn settle_caller_run_snapshot_v2(
         ));
     }
     let operation_store = &state.host_services.kernel_operations_v2;
-    let evidence = if binding.request_kind == HOST_CANCEL_REQUEST_KIND_V2 {
+    let evidence = if matches!(
+        binding.request_kind.as_str(),
+        HOST_CANCEL_REQUEST_KIND_V2 | HOST_USER_INPUT_REQUEST_KIND_V2
+    ) {
         operation_store.caller_control_request_recovery_evidence(
             &binding.session_id,
             &binding.caller_request_id,
@@ -5524,12 +6790,27 @@ fn settle_caller_run_snapshot_v2(
         )
     }
     .map_err(AgentKernelV2Error::from_storage)?;
-    let first_operation = evidence.first_settlement.as_ref().map(|settlement| {
-        json!({
-            "operationRequestId": settlement.operation_request_id,
-            "settlementDigest": settlement.settlement_digest,
+    let first_operation = evidence
+        .first_settlement
+        .as_ref()
+        .map(|settlement| {
+            json!({
+                "operationRequestId": settlement.operation_request_id,
+                "settlementDigest": settlement.settlement_digest,
+            })
         })
-    });
+        .or_else(|| {
+            (binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2
+                && evidence.first_operation_present)
+                .then(|| {
+                    json!({
+                        "operationRequestId": binding.response_identity
+                            .get("operationRequestId")
+                            .and_then(Value::as_str),
+                        "settlementDigest": null,
+                    })
+                })
+        });
     let terminal_operation = evidence.latest_settlement.as_ref().map(|settlement| {
         json!({
             "operationRequestId": settlement.operation_request_id,
@@ -5669,6 +6950,12 @@ fn persist_caller_outcome_v2(
                         outcome,
                         crate::utils::now_rfc3339_text(),
                     ),
+                Some("succeeded") if binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2 => {
+                    Err(crate::host_v2_storage::HostV2StorageError::conflict(
+                        "host_caller_request_user_input_admission_missing",
+                        "User-input success requires durable Run-drive transfer admission",
+                    ))
+                }
                 Some("succeeded") => store.settle_unadmitted_owned_run_open_success(
                     &binding.session_id,
                     &binding.caller_request_id,
@@ -5678,6 +6965,16 @@ fn persist_caller_outcome_v2(
                     outcome,
                     crate::utils::now_rfc3339_text(),
                 ),
+                Some("failed") if binding.request_kind == HOST_USER_INPUT_REQUEST_KIND_V2 => store
+                    .settle_unadmitted_owned_user_input_failure(
+                        &binding.session_id,
+                        &binding.caller_request_id,
+                        &binding.request_kind,
+                        &binding.request_digest,
+                        owner_instance_id,
+                        outcome,
+                        crate::utils::now_rfc3339_text(),
+                    ),
                 Some("failed") => store.settle_unadmitted_owned_caller_request(
                     &binding.session_id,
                     &binding.caller_request_id,

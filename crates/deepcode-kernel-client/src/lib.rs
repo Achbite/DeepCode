@@ -121,6 +121,12 @@ pub enum KernelClientError {
     Http(#[from] reqwest::Error),
     #[error("daemon returned error: {0}")]
     Api(String),
+    #[error("daemon returned error: {code}: {message}")]
+    HostCallerMutation {
+        code: String,
+        message: String,
+        disposition: Option<HostCallerMutationDispositionV2>,
+    },
     #[error("daemon response decode failed: {0}")]
     Decode(#[from] serde_json::Error),
     #[error(
@@ -135,6 +141,13 @@ pub enum KernelClientError {
     DaemonUnavailable { base_url: String, reason: String },
     #[error("kernel bootstrap failed: {0}")]
     Bootstrap(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCallerMutationDispositionV2 {
+    Rejected,
+    Pending,
+    Indeterminate,
 }
 
 pub type KernelClientResult<T> = Result<T, KernelClientError>;
@@ -550,6 +563,21 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
+    pub async fn active_agent_run(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<Option<AgentRunResult>> {
+        let value = self
+            .http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/active-run")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
     pub async fn cancel_agent_run_by_id(
         &self,
         session_id: &str,
@@ -623,7 +651,26 @@ fn decode_api_data_with_code<T: DeserializeOwned>(value: Value) -> KernelClientR
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown daemon error");
-        return Err(KernelClientError::Api(format!("{code}: {message}")));
+        let disposition = match (
+            value.pointer("/data/schemaVersion").and_then(Value::as_str),
+            value.pointer("/data/disposition").and_then(Value::as_str),
+        ) {
+            (Some("deepcode.host.caller-mutation-error.v2"), Some("rejected")) => {
+                Some(HostCallerMutationDispositionV2::Rejected)
+            }
+            (Some("deepcode.host.caller-mutation-error.v2"), Some("pending")) => {
+                Some(HostCallerMutationDispositionV2::Pending)
+            }
+            (Some("deepcode.host.caller-mutation-error.v2"), Some("indeterminate")) => {
+                Some(HostCallerMutationDispositionV2::Indeterminate)
+            }
+            _ => None,
+        };
+        return Err(KernelClientError::HostCallerMutation {
+            code: code.to_string(),
+            message: message.to_string(),
+            disposition,
+        });
     }
     decode_api_data(value)
 }

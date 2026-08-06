@@ -37,7 +37,7 @@ pub struct AgentSessionResult {
     pub session: Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartAgentRunRequest {
     pub op: String,
@@ -205,6 +205,10 @@ impl AgentRunCallerRequest {
 pub struct AgentRunGuidanceRequest {
     pub guidance: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_workspace: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<AgentInputAttachmentV2>>,
     pub caller_request_id: String,
 }
@@ -213,6 +217,8 @@ impl AgentRunGuidanceRequest {
     pub fn new(guidance: impl Into<String>, caller_request_id: impl Into<String>) -> Self {
         Self {
             guidance: guidance.into(),
+            workspace_path: None,
+            no_workspace: None,
             attachments: None,
             caller_request_id: caller_request_id.into(),
         }
@@ -226,6 +232,12 @@ impl AgentRunGuidanceRequest {
             ));
         }
         validate_agent_input_attachments_v2(self.attachments.as_deref())?;
+        if self.no_workspace == Some(true) && self.workspace_path.is_some() {
+            return Err(KernelClientError::Api(
+                "agent_guidance_workspace_conflict: guidance cannot request both a workspace path and no-workspace mode"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -266,6 +278,8 @@ impl AgentRunStatus {
 pub struct AgentRunResult {
     pub run: AgentRunStatus,
     pub session: Value,
+    #[serde(default)]
+    pub input_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

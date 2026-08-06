@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import type {
+  ApiResponse,
+  AgentHostCallerMutationErrorV2,
   AgentInputAttachmentV2,
+  AskAgentRunRequest,
   AgentSession,
   AgentTimelinePermissionRequestView,
   AgentTimelineResult,
@@ -78,6 +81,7 @@ interface AgentSessionState {
   runningSessionIds: string[];
   activeRunSessionIds: string[];
   cancellingSessionIds: string[];
+  pendingSubmissionSessionIds: string[];
   errorMessage: string | null;
   messageAttachments: AgentInputAttachmentV2[];
   sessionAttachments: AgentInputAttachmentV2[];
@@ -105,7 +109,9 @@ interface AgentSessionActions {
   ) => void;
   clearMessageAttachments: () => void;
   synchronizeAttachmentRoot: (folderId?: string | null) => void;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, options?: AgentSendMessageOptions) => Promise<boolean>;
+  pendingSubmissionRetryView: (sessionId?: string) => PendingSubmissionRetryView | null;
+  retryPendingSubmission: (clearOriginalMessageAttachments: boolean) => Promise<boolean>;
   cancelCurrentRun: () => Promise<void>;
   acceptPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   rejectPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
@@ -113,6 +119,17 @@ interface AgentSessionActions {
 }
 
 type Store = AgentSessionState & AgentSessionActions;
+
+interface AgentSendMessageOptions {
+  retryCallerRequestId?: string;
+  clearOriginalMessageAttachments?: boolean;
+}
+
+export interface PendingSubmissionRetryView {
+  content: string;
+  messageAttachments: AgentInputAttachmentV2[];
+  callerRequestId: string;
+}
 
 interface ActiveAgentRunIdentity {
   hostRunId: string;
@@ -140,6 +157,231 @@ const canonicalTimelineFetches =
 const canonicalTimelineStaleSessions = new Set<string>();
 const canonicalTimelineFailClosedSessions = new Set<string>();
 const canonicalTimelineGenerations = new Map<string, number>();
+const pendingHostMutationOwners = new Map<string, string>();
+type PendingHostSubmission =
+  | {
+      kind: 'ask';
+      fingerprint: string;
+      callerRequestId: string;
+      messageAttachmentInstances: AgentInputAttachmentV2[];
+      request: AskAgentRunRequest;
+    }
+  | {
+      kind: 'input';
+      fingerprint: string;
+      callerRequestId: string;
+      messageAttachmentInstances: AgentInputAttachmentV2[];
+      runId: string;
+      request: {
+        guidance: string;
+        workspacePath?: string;
+        noWorkspace?: boolean;
+        attachments?: AgentInputAttachmentV2[];
+        callerRequestId: string;
+      };
+    };
+const PENDING_HOST_SUBMISSIONS_STORAGE_KEY =
+  'deepcode.host.pending-submissions.v2';
+const PENDING_HOST_SUBMISSIONS_SCHEMA_V2 =
+  'deepcode.host.pending-submissions.v2';
+const MAX_PENDING_HOST_SUBMISSIONS_STORAGE_BYTES = 4 * 1024 * 1024;
+const MAX_PENDING_HOST_SUBMISSIONS = 64;
+
+function boundedStoredString(value: unknown, maxBytes: number): string | null {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.trim() === value
+    && new TextEncoder().encode(value).byteLength <= maxBytes
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    ? value
+    : null;
+}
+
+function decodeStoredHostAttachment(value: unknown): AgentInputAttachmentV2 | null {
+  if (!isRecord(value)) return null;
+  const path = decodeDurableWorkspaceRelativePath(value.path);
+  const folderId = value.folderId === undefined
+    ? undefined
+    : boundedStoredString(value.folderId, 512) ?? null;
+  const resourceId = value.resourceId === undefined
+    ? undefined
+    : boundedStoredString(value.resourceId, 512) ?? null;
+  if (
+    !path
+    || (value.kind !== 'file' && value.kind !== 'directory')
+    || (value.scope !== 'message' && value.scope !== 'session')
+    || folderId === null
+    || resourceId === null
+  ) {
+    return null;
+  }
+  return {
+    kind: value.kind,
+    path,
+    scope: value.scope,
+    ...(folderId ? { folderId } : {}),
+    ...(resourceId ? { resourceId } : {}),
+  };
+}
+
+function decodeStoredHostAttachments(value: unknown): AgentInputAttachmentV2[] | null {
+  if (!Array.isArray(value) || value.length > MAX_AGENT_INPUT_ATTACHMENTS_V2) return null;
+  const decoded = value.map(decodeStoredHostAttachment);
+  return decoded.some((attachment) => attachment === null)
+    ? null
+    : decoded as AgentInputAttachmentV2[];
+}
+
+function decodePendingHostSubmission(value: unknown): PendingHostSubmission | null {
+  if (!isRecord(value)) return null;
+  const callerRequestId = boundedStoredString(value.callerRequestId, 512);
+  const fingerprint = boundedStoredString(
+    value.fingerprint,
+    MAX_PENDING_HOST_SUBMISSIONS_STORAGE_BYTES
+  );
+  const messageAttachmentInstances = decodeStoredHostAttachments(
+    value.messageAttachmentInstances
+  );
+  const request = value.request;
+  if (!callerRequestId || !fingerprint || !messageAttachmentInstances || !isRecord(request)) {
+    return null;
+  }
+  const requestCallerRequestId = boundedStoredString(request.callerRequestId, 512);
+  const attachments = request.attachments === undefined
+    ? []
+    : decodeStoredHostAttachments(request.attachments);
+  if (requestCallerRequestId !== callerRequestId || !attachments) return null;
+  const attachmentKeys = new Set(attachments.map(attachmentKey));
+  if (messageAttachmentInstances.some((attachment) => !attachmentKeys.has(attachmentKey(attachment)))) {
+    return null;
+  }
+  if (value.kind === 'ask') {
+    const content = typeof request.content === 'string' ? request.content.trim() : '';
+    if (!content || request.op !== 'ask') return null;
+    const workspacePath = request.workspacePath === undefined
+      ? undefined
+      : boundedStoredString(request.workspacePath, 16 * 1024) ?? null;
+    if (workspacePath === null || (
+      request.noWorkspace !== undefined && typeof request.noWorkspace !== 'boolean'
+    )) {
+      return null;
+    }
+    if (fingerprint !== hostSubmissionFingerprint(content, attachments)) return null;
+    return {
+      kind: 'ask',
+      fingerprint,
+      callerRequestId,
+      messageAttachmentInstances,
+      request: {
+        op: 'ask',
+        content,
+        ...(workspacePath ? { workspacePath } : {}),
+        ...(typeof request.noWorkspace === 'boolean'
+          ? { noWorkspace: request.noWorkspace }
+          : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
+        callerRequestId,
+      },
+    };
+  }
+  if (value.kind === 'input') {
+    const runId = boundedStoredString(value.runId, 512);
+    const guidance = typeof request.guidance === 'string' ? request.guidance.trim() : '';
+    const workspacePath = request.workspacePath === undefined
+      ? undefined
+      : boundedStoredString(request.workspacePath, 16 * 1024) ?? null;
+    if (
+      !runId
+      || !guidance
+      || workspacePath === null
+      || (request.noWorkspace !== undefined && typeof request.noWorkspace !== 'boolean')
+      || fingerprint !== hostSubmissionFingerprint(guidance, attachments)
+    ) {
+      return null;
+    }
+    return {
+      kind: 'input',
+      fingerprint,
+      callerRequestId,
+      messageAttachmentInstances,
+      runId,
+      request: {
+        guidance,
+        ...(workspacePath ? { workspacePath } : {}),
+        ...(typeof request.noWorkspace === 'boolean'
+          ? { noWorkspace: request.noWorkspace }
+          : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
+        callerRequestId,
+      },
+    };
+  }
+  return null;
+}
+
+function loadPendingHostSubmissions(): {
+  submissions: Map<string, PendingHostSubmission>;
+  invalid: boolean;
+} {
+  const submissions = new Map<string, PendingHostSubmission>();
+  if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') {
+    return { submissions, invalid: false };
+  }
+  try {
+    const raw = window.localStorage.getItem(PENDING_HOST_SUBMISSIONS_STORAGE_KEY);
+    if (!raw) return { submissions, invalid: false };
+    if (new TextEncoder().encode(raw).byteLength > MAX_PENDING_HOST_SUBMISSIONS_STORAGE_BYTES) {
+      return { submissions, invalid: true };
+    }
+    const stored: unknown = JSON.parse(raw);
+    if (
+      !isRecord(stored)
+      || stored.schemaVersion !== PENDING_HOST_SUBMISSIONS_SCHEMA_V2
+      || !Array.isArray(stored.submissions)
+      || stored.submissions.length > MAX_PENDING_HOST_SUBMISSIONS
+    ) {
+      return { submissions, invalid: true };
+    }
+    for (const entry of stored.submissions) {
+      if (!isRecord(entry)) return { submissions: new Map(), invalid: true };
+      const sessionId = boundedStoredString(entry.sessionId, 512);
+      const submission = decodePendingHostSubmission(entry.submission);
+      if (!sessionId || !submission || submissions.has(sessionId)) {
+        return { submissions: new Map(), invalid: true };
+      }
+      submissions.set(sessionId, submission);
+    }
+    return { submissions, invalid: false };
+  } catch {
+    return { submissions: new Map(), invalid: true };
+  }
+}
+
+function persistPendingHostSubmissions(
+  submissions: Map<string, PendingHostSubmission>
+): boolean {
+  if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') return true;
+  try {
+    const serialized = JSON.stringify({
+      schemaVersion: PENDING_HOST_SUBMISSIONS_SCHEMA_V2,
+      submissions: [...submissions].map(([sessionId, submission]) => ({
+        sessionId,
+        submission,
+      })),
+    });
+    if (new TextEncoder().encode(serialized).byteLength > MAX_PENDING_HOST_SUBMISSIONS_STORAGE_BYTES) {
+      return false;
+    }
+    window.localStorage.setItem(PENDING_HOST_SUBMISSIONS_STORAGE_KEY, serialized);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const loadedPendingHostSubmissions = loadPendingHostSubmissions();
+const pendingHostSubmissionIdentities = loadedPendingHostSubmissions.submissions;
+let pendingHostSubmissionStorageInvalid = loadedPendingHostSubmissions.invalid;
 let agentSessionActivationGeneration = 0;
 let settledAgentSessionActivationGeneration = 0;
 let agentSessionActivationQueue: Promise<void> = Promise.resolve();
@@ -315,6 +557,99 @@ function mergeAttachments(
     ...existing.filter((candidate) => attachmentKey(candidate) !== key),
     attachment,
   ];
+}
+
+function retainUnsubmittedMessageAttachments(
+  current: AgentInputAttachmentV2[],
+  submitted: AgentInputAttachmentV2[]
+): AgentInputAttachmentV2[] {
+  const submittedInstances = new Set(submitted);
+  return current.filter((attachment) => !submittedInstances.has(attachment));
+}
+
+function claimPendingHostMutation(sessionId: string): string | null {
+  if (pendingHostMutationOwners.has(sessionId)) return null;
+  const ownerToken = globalThis.crypto.randomUUID();
+  pendingHostMutationOwners.set(sessionId, ownerToken);
+  return ownerToken;
+}
+
+function releasePendingHostMutation(sessionId: string, ownerToken: string): void {
+  if (pendingHostMutationOwners.get(sessionId) === ownerToken) {
+    pendingHostMutationOwners.delete(sessionId);
+  }
+}
+
+function hostSubmissionFingerprint(
+  content: string,
+  attachments: AgentInputAttachmentV2[]
+): string {
+  return JSON.stringify({ content, attachments });
+}
+
+function unresolvedHostSubmission(sessionId: string): PendingHostSubmission | null {
+  return pendingHostSubmissionIdentities.get(sessionId) ?? null;
+}
+
+function pendingHostSubmissionContent(submission: PendingHostSubmission): string {
+  return submission.kind === 'ask'
+    ? submission.request.content
+    : submission.request.guidance;
+}
+
+function pendingHostSubmissionAttachments(
+  submission: PendingHostSubmission
+): AgentInputAttachmentV2[] {
+  return [...(submission.request.attachments ?? [])];
+}
+
+function rememberHostSubmission<T extends PendingHostSubmission>(
+  sessionId: string,
+  submission: T
+): T | null {
+  const previous = pendingHostSubmissionIdentities.get(sessionId);
+  pendingHostSubmissionIdentities.set(sessionId, submission);
+  if (!persistPendingHostSubmissions(pendingHostSubmissionIdentities)) {
+    if (previous) {
+      pendingHostSubmissionIdentities.set(sessionId, previous);
+    } else {
+      pendingHostSubmissionIdentities.delete(sessionId);
+    }
+    pendingHostSubmissionStorageInvalid = true;
+    return null;
+  }
+  useAgentSessionStore.setState((state) => ({
+    pendingSubmissionSessionIds: state.pendingSubmissionSessionIds.includes(sessionId)
+      ? state.pendingSubmissionSessionIds
+      : [...state.pendingSubmissionSessionIds, sessionId],
+  }));
+  return submission;
+}
+
+function settleHostSubmissionIdentity(sessionId: string, callerRequestId: string): boolean {
+  const submission = pendingHostSubmissionIdentities.get(sessionId);
+  if (submission?.callerRequestId !== callerRequestId) return true;
+  pendingHostSubmissionIdentities.delete(sessionId);
+  if (!persistPendingHostSubmissions(pendingHostSubmissionIdentities)) {
+    pendingHostSubmissionIdentities.set(sessionId, submission);
+    pendingHostSubmissionStorageInvalid = true;
+    return false;
+  }
+  useAgentSessionStore.setState((state) => ({
+    pendingSubmissionSessionIds: state.pendingSubmissionSessionIds.filter(
+      (candidate) => candidate !== sessionId
+    ),
+  }));
+  return true;
+}
+
+function messageAttachmentInstancesEqual(
+  left: AgentInputAttachmentV2[],
+  right: AgentInputAttachmentV2[]
+): boolean {
+  if (left.length !== right.length) return false;
+  const rightInstances = new Set(right);
+  return left.every((attachment) => rightInstances.has(attachment));
 }
 
 function outboundAttachments(state: Store): AgentInputAttachmentV2[] | undefined {
@@ -983,14 +1318,45 @@ function newHostCallerRequestId(kind: string): string {
   return `host-ui-${kind}-${globalThis.crypto.randomUUID()}`;
 }
 
+class HostMutationRejectedError extends Error {}
+
+function hostCallerMutationDisposition(
+  response: Pick<ApiResponse<unknown>, 'ok' | 'data'>
+): AgentHostCallerMutationErrorV2['disposition'] | null {
+  if (response.ok) return null;
+  if (
+    isRecord(response.data)
+    && response.data.schemaVersion === 'deepcode.host.caller-mutation-error.v2'
+    && (
+      response.data.disposition === 'rejected'
+      || response.data.disposition === 'pending'
+      || response.data.disposition === 'indeterminate'
+    )
+  ) {
+    return response.data.disposition;
+  }
+  return 'indeterminate';
+}
+
+function isAuthoritativeHostMutationRejection(
+  response: Pick<ApiResponse<unknown>, 'ok' | 'data'>
+): boolean {
+  return hostCallerMutationDisposition(response) === 'rejected';
+}
+
 async function startAndWaitAgentRun(
   sessionId: string,
-  request: StartAgentRunRequest
+  request: StartAgentRunRequest,
+  admitted?: () => void
 ): Promise<AgentRunResult> {
   const timelineRevisionFloor = currentTimelineRevision(sessionId);
   const started = await startAgentRun(sessionId, request);
   if (!started.ok || !started.data) {
-    throw new Error(started.message ?? started.error ?? 'Shared session run start failed');
+    const message = started.message ?? started.error ?? 'Shared session run start failed';
+    if (isAuthoritativeHostMutationRejection(started)) {
+      throw new HostMutationRejectedError(message);
+    }
+    throw new Error(message);
   }
   let result = started.data;
   const runId = result.run.runId;
@@ -1003,6 +1369,7 @@ async function startAndWaitAgentRun(
       timelineRevisionFloor
     )
   );
+  admitted?.();
   try {
     while (
       !isQuiescentRunStatus(result.run.status)
@@ -1061,6 +1428,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   runningSessionIds: [],
   activeRunSessionIds: [],
   cancellingSessionIds: [],
+  pendingSubmissionSessionIds: [...pendingHostSubmissionIdentities.keys()],
   errorMessage: null,
   messageAttachments: [],
   sessionAttachments: [],
@@ -1565,18 +1933,85 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         : state;
     });
   },
-  sendMessage: async (content) => {
+  pendingSubmissionRetryView: (sessionId) => {
+    if (!sessionId) return null;
+    const pending = unresolvedHostSubmission(sessionId);
+    if (!pending) return null;
+    return {
+      content: pendingHostSubmissionContent(pending),
+      messageAttachments: [...pending.messageAttachmentInstances],
+      callerRequestId: pending.callerRequestId,
+    };
+  },
+  retryPendingSubmission: async (clearOriginalMessageAttachments) => {
+    const sessionId = get().session?.id;
+    if (!sessionId) return false;
+    const pending = unresolvedHostSubmission(sessionId);
+    if (!pending) return false;
+    return get().sendMessage(pendingHostSubmissionContent(pending), {
+      retryCallerRequestId: pending.callerRequestId,
+      clearOriginalMessageAttachments,
+    });
+  },
+  sendMessage: async (content, options) => {
     const trimmed = content.trim();
-    if (!trimmed) return;
+    if (!trimmed) return false;
+    if (pendingHostSubmissionStorageInvalid) {
+      set({
+        errorMessage:
+          'Pending Host submission recovery storage is unavailable or corrupt; reload after repairing local application storage before sending.',
+      });
+      return false;
+    }
     if (!get().session) await get().loadOrCreate();
     const session = get().session;
-    if (!session) return;
-    const attachments = outboundAttachments(get());
+    if (!session) return false;
+    const unresolvedAtStart = unresolvedHostSubmission(session.id);
+    const retryCallerRequestId = options?.retryCallerRequestId;
+    const replaySubmission = retryCallerRequestId !== undefined
+      && unresolvedAtStart?.callerRequestId === retryCallerRequestId
+      ? unresolvedAtStart
+      : null;
+    if (retryCallerRequestId && !replaySubmission) {
+      set({
+        errorMessage:
+          'The previous submission identity is no longer pending; refresh the Session before sending again.',
+      });
+      return false;
+    }
+    const savedMessageAttachments = replaySubmission
+      ? replaySubmission.messageAttachmentInstances
+      : [];
+    const currentMessageAttachments = get().messageAttachments;
+    const clearOriginalMessageAttachments = Boolean(
+      replaySubmission
+      && options?.clearOriginalMessageAttachments
+      && messageAttachmentInstancesEqual(currentMessageAttachments, savedMessageAttachments)
+    );
+    const submittedMessageAttachments = replaySubmission
+      ? clearOriginalMessageAttachments
+        ? [...currentMessageAttachments]
+        : []
+      : [...currentMessageAttachments];
+    const attachments = replaySubmission
+      ? pendingHostSubmissionAttachments(replaySubmission)
+      : outboundAttachments(get());
     if (!attachments) {
       set({
         errorMessage: agentSessionMessage('agent.attachment.invalidWorkspacePath'),
       });
-      return;
+      return false;
+    }
+    const submissionFingerprint = replaySubmission
+      ? replaySubmission.fingerprint
+      : hostSubmissionFingerprint(trimmed, attachments);
+    const unresolvedSubmission = unresolvedHostSubmission(session.id);
+    if (unresolvedSubmission && !replaySubmission) {
+      set({
+        errorMessage:
+          'A previous submission has an unknown outcome. Retry the exact original draft before sending a different message.',
+      });
+      return false;
     }
     if (canonicalTimelineStaleSessions.has(session.id)) {
       const refreshed = await refreshCanonicalTimeline(
@@ -1591,18 +2026,88 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
                 'Canonical Session timeline is unavailable; refresh before sending guidance.',
             }
           : state);
-        return;
+        return false;
       }
     }
-    if (get().session?.id !== session.id) return;
+    if (get().session?.id !== session.id) return false;
+    const replayAfterRefresh = retryCallerRequestId
+      ? unresolvedHostSubmission(session.id)
+      : null;
+    if (
+      retryCallerRequestId
+      && replayAfterRefresh?.callerRequestId !== retryCallerRequestId
+    ) {
+      set({
+        errorMessage:
+          'The previous submission was settled while this view refreshed; refresh the Session before sending again.',
+      });
+      return false;
+    }
+    const replaySubmissionAfterRefresh = replayAfterRefresh;
+    const unresolvedAfterRefresh = unresolvedHostSubmission(session.id);
+    if (unresolvedAfterRefresh && !replaySubmissionAfterRefresh) {
+      set({
+        errorMessage:
+          'A previous submission has an unknown outcome. Retry the exact original draft before sending a different message.',
+      });
+      return false;
+    }
+    const durableReplaySubmission = replaySubmissionAfterRefresh;
+    const guidanceWorkspacePath = session.projectId
+      ? undefined
+      : currentWorkspacePath();
+    const guidanceWorkspaceRequest = session.projectId
+      ? {}
+      : {
+          workspacePath: guidanceWorkspacePath,
+          noWorkspace: !guidanceWorkspacePath,
+        };
 
     const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
-    const interactionRunId = activeInteraction?.kind === 'permission'
-      ? permissionRequestRunId(activeInteraction.request)
-      : activeInteraction?.kind === 'plan'
-        ? activeInteraction.runId
-        : null;
+    const replayInput = durableReplaySubmission?.kind === 'input'
+      ? durableReplaySubmission
+      : null;
+    const interactionRunId = replayInput?.runId ?? (
+      durableReplaySubmission
+        ? null
+        : activeInteraction?.kind === 'permission'
+          ? permissionRequestRunId(activeInteraction.request)
+          : activeInteraction?.kind === 'plan'
+            ? activeInteraction.runId
+            : null
+    );
     if (interactionRunId) {
+      const mutationOwner = claimPendingHostMutation(session.id);
+      if (!mutationOwner) {
+        set({
+          errorMessage:
+            'Another Host mutation is still awaiting a durable outcome for this Session.',
+        });
+        return false;
+      }
+      const callerIdentity = newHostCallerRequestId('input');
+      const submission = replayInput ?? rememberHostSubmission(session.id, {
+        kind: 'input',
+        fingerprint: submissionFingerprint,
+        callerRequestId: callerIdentity,
+        messageAttachmentInstances: submittedMessageAttachments,
+        runId: interactionRunId,
+        request: {
+          guidance: trimmed,
+          ...guidanceWorkspaceRequest,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          callerRequestId: callerIdentity,
+        },
+      });
+      if (!submission) {
+        releasePendingHostMutation(session.id, mutationOwner);
+        set({
+          errorMessage:
+            'The exact Host submission identity could not be persisted; no request was sent.',
+        });
+        return false;
+      }
+      const callerRequestId = submission.callerRequestId;
       const observedIdentity = activeAgentRunIds.get(session.id);
       set((state) => ({
         runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
@@ -1610,12 +2115,19 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }));
       const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
       try {
-        const result = await submitAgentRunGuidance(session.id, interactionRunId, {
-          guidance: trimmed,
-          ...(attachments.length > 0 ? { attachments } : {}),
-          callerRequestId: newHostCallerRequestId('input'),
-        });
+        const result = await submitAgentRunGuidance(
+          session.id,
+          submission.runId,
+          submission.request
+        );
         if (result.ok && result.data) {
+          if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
+            set({
+              errorMessage:
+                'The Host accepted this input, but its local replay identity could not be settled safely.',
+            });
+            return false;
+          }
           if (isTerminalRunStatus(result.data.run.status)) {
             clearActiveAgentRunIdentityByHostRunId(
               session.id,
@@ -1644,19 +2156,29 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
               session: result.data!.session,
               sessions,
               currentSessionId: result.data!.session.id,
-              messageAttachments: [],
+              messageAttachments: retainUnsubmittedMessageAttachments(
+                state.messageAttachments,
+                submittedMessageAttachments
+              ),
               errorMessage: null,
             };
           });
           markCanonicalTimelineStale(result.data.session.id);
           void refreshCanonicalTimeline(result.data.session.id, true, true);
+          return true;
         } else {
+          const rejected = isAuthoritativeHostMutationRejection(result);
+          const identitySettled = !rejected
+            || settleHostSubmissionIdentity(session.id, callerRequestId);
           set((state) => state.session?.id === session.id
             ? {
                 errorMessage:
-                  result.message ?? 'New user input append failed',
+                  identitySettled
+                    ? result.message ?? 'New user input append failed'
+                    : 'The Host rejected this input, but its local replay identity could not be settled safely.',
               }
             : state);
+          return false;
         }
       } catch (error) {
         set((state) => state.session?.id === session.id
@@ -1665,33 +2187,72 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
                 error instanceof Error ? error.message : String(error),
             }
           : state);
+        return false;
       } finally {
+        releasePendingHostMutation(session.id, mutationOwner);
         void stopProgressWatcher();
         set((state) => ({
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
         }));
       }
-      return;
     }
-    if (activeInteraction?.kind === 'permission') {
+    if (!durableReplaySubmission && activeInteraction?.kind === 'permission') {
       set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
-      return;
+      return false;
     }
 
     const activeRun = activeAgentRunIds.get(session.id);
-    if (activeRun) {
+    if (!durableReplaySubmission && activeRun) {
+      const mutationOwner = claimPendingHostMutation(session.id);
+      if (!mutationOwner) {
+        set({
+          errorMessage:
+            'Another Host mutation is still awaiting a durable outcome for this Session.',
+        });
+        return false;
+      }
+      const callerIdentity = newHostCallerRequestId('input');
+      const submission = rememberHostSubmission(session.id, {
+        kind: 'input',
+        fingerprint: submissionFingerprint,
+        callerRequestId: callerIdentity,
+        messageAttachmentInstances: submittedMessageAttachments,
+        runId: activeRun.hostRunId,
+        request: {
+          guidance: trimmed,
+          ...guidanceWorkspaceRequest,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          callerRequestId: callerIdentity,
+        },
+      });
+      if (!submission) {
+        releasePendingHostMutation(session.id, mutationOwner);
+        set({
+          errorMessage:
+            'The exact Host submission identity could not be persisted; no request was sent.',
+        });
+        return false;
+      }
+      const callerRequestId = submission.callerRequestId;
       set((state) => ({
         runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
         errorMessage: null,
       }));
       const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
       try {
-        const result = await submitAgentRunGuidance(session.id, activeRun.hostRunId, {
-          guidance: trimmed,
-          ...(attachments.length > 0 ? { attachments } : {}),
-          callerRequestId: newHostCallerRequestId('input'),
-        });
+        const result = await submitAgentRunGuidance(
+          session.id,
+          submission.runId,
+          submission.request
+        );
         if (result.ok && result.data) {
+          if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
+            set({
+              errorMessage:
+                'The Host accepted this input, but its local replay identity could not be settled safely.',
+            });
+            return false;
+          }
           if (isTerminalRunStatus(result.data.run.status)) {
             clearActiveAgentRunIdentityByHostRunId(
               session.id,
@@ -1720,19 +2281,29 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
               session: result.data!.session,
               sessions,
               currentSessionId: result.data!.session.id,
-              messageAttachments: [],
+              messageAttachments: retainUnsubmittedMessageAttachments(
+                state.messageAttachments,
+                submittedMessageAttachments
+              ),
               errorMessage: null,
             };
           });
           markCanonicalTimelineStale(result.data.session.id);
           void refreshCanonicalTimeline(result.data.session.id, true, true);
+          return true;
         } else {
+          const rejected = isAuthoritativeHostMutationRejection(result);
+          const identitySettled = !rejected
+            || settleHostSubmissionIdentity(session.id, callerRequestId);
           set((state) => state.session?.id === session.id
             ? {
                 errorMessage:
-                  result.message ?? 'User guidance append failed',
+                  identitySettled
+                    ? result.message ?? 'User guidance append failed'
+                    : 'The Host rejected this input, but its local replay identity could not be settled safely.',
               }
             : state);
+          return false;
         }
       } catch (error) {
         set((state) => state.session?.id === session.id
@@ -1741,63 +2312,131 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
                 error instanceof Error ? error.message : String(error),
             }
           : state);
+        return false;
       } finally {
+        releasePendingHostMutation(session.id, mutationOwner);
         void stopProgressWatcher();
         set((state) => ({
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
         }));
       }
-      return;
     }
-    if (get().runningSessionIds.includes(session.id)) {
+    if (!durableReplaySubmission && get().runningSessionIds.includes(session.id)) {
       set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
-      return;
+      return false;
     }
 
+    const mutationOwner = claimPendingHostMutation(session.id);
+    if (!mutationOwner) {
+      set({
+        errorMessage:
+          'Another Host mutation is still awaiting a durable outcome for this Session.',
+      });
+      return false;
+    }
+    const workspacePath = session.projectId ? undefined : currentWorkspacePath();
+    const callerIdentity = newHostCallerRequestId('ask');
+    const askSubmission = durableReplaySubmission?.kind === 'ask'
+      ? durableReplaySubmission
+      : rememberHostSubmission(session.id, {
+        kind: 'ask',
+        fingerprint: submissionFingerprint,
+        callerRequestId: callerIdentity,
+        messageAttachmentInstances: submittedMessageAttachments,
+        request: {
+          op: 'ask',
+          content: trimmed,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          workspacePath,
+          noWorkspace: session.projectId ? undefined : !workspacePath,
+          callerRequestId: callerIdentity,
+        },
+      });
+    if (!askSubmission) {
+      releasePendingHostMutation(session.id, mutationOwner);
+      set({
+        errorMessage:
+          'The exact Host submission identity could not be persisted; no request was sent.',
+      });
+      return false;
+    }
+    const callerRequestId = askSubmission.callerRequestId;
     set((state) => ({
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
 
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
-
-    try {
-      const workspacePath = session.projectId ? undefined : currentWorkspacePath();
-      const result = await startAndWaitAgentRun(session.id, {
-        op: 'ask',
-        content: trimmed,
-        ...(attachments.length > 0 ? { attachments } : {}),
-        workspacePath,
-        noWorkspace: session.projectId ? undefined : !workspacePath,
-        callerRequestId: newHostCallerRequestId('ask'),
-      });
-      const data = { session: result.session };
-      set((state) => {
-        const nextState: Partial<Store> = {
-          sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
-          resolvingPermission: null,
-          resolvingPlan: null,
-        };
-        if (state.session?.id === data.session.id) {
-          nextState.session = data.session;
-          nextState.currentSessionId = data.session.id;
-          nextState.messageAttachments = [];
+    return new Promise<boolean>((resolve) => {
+      let admissionSettled = false;
+      const settleAdmission = (admitted: boolean) => {
+        if (admissionSettled) return;
+        admissionSettled = true;
+        releasePendingHostMutation(session.id, mutationOwner);
+        resolve(admitted);
+      };
+      void (async () => {
+        try {
+          const result = await startAndWaitAgentRun(
+            session.id,
+            askSubmission.request,
+            () => {
+              if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
+                set({
+                  errorMessage:
+                    'The Host accepted this input, but its local replay identity could not be settled safely.',
+                });
+                settleAdmission(false);
+                return;
+              }
+              set((state) => state.session?.id === session.id
+                ? {
+                    messageAttachments: retainUnsubmittedMessageAttachments(
+                      state.messageAttachments,
+                      submittedMessageAttachments
+                    ),
+                    errorMessage: null,
+                  }
+                : state);
+              settleAdmission(true);
+            }
+          );
+          const data = { session: result.session };
+          set((state) => {
+            const nextState: Partial<Store> = {
+              sessions: [
+                data.session,
+                ...state.sessions.filter((item) => item.id !== data.session.id),
+              ],
+              runningSessionIds: removeRunningSessionId(
+                state.runningSessionIds,
+                data.session.id
+              ),
+            };
+            if (state.session?.id === data.session.id) {
+              nextState.session = data.session;
+              nextState.currentSessionId = data.session.id;
+            }
+            return nextState;
+          });
+          markCanonicalTimelineStale(data.session.id);
+          void refreshCanonicalTimeline(data.session.id, true, true);
+        } catch (err) {
+          if (err instanceof HostMutationRejectedError) {
+            settleHostSubmissionIdentity(session.id, callerRequestId);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          set((state) => ({
+            errorMessage: state.session?.id === session.id ? message : state.errorMessage,
+            runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+          }));
+          settleAdmission(false);
+        } finally {
+          releasePendingHostMutation(session.id, mutationOwner);
+          void stopProgressWatcher();
         }
-        return nextState;
-      });
-      markCanonicalTimelineStale(data.session.id);
-      void refreshCanonicalTimeline(data.session.id, true, true);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      set((state) => ({
-        errorMessage: state.session?.id === session.id ? message : state.errorMessage,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-      }));
-    } finally {
-      void stopProgressWatcher();
-    }
-
+      })();
+    });
   },
 
   cancelCurrentRun: async () => {

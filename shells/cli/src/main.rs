@@ -1,8 +1,9 @@
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunCallerRequest, AgentRunResult, AgentTimelineDurability,
-    AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot, AgentTimelineStatus,
-    AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient, KernelBootstrap,
-    KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
+    AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot,
+    AgentTimelineStatus, AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;

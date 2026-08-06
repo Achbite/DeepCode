@@ -235,6 +235,50 @@ export class SessionKernelProviderTurnsV2 {
     return generation === this.authorityGeneration;
   }
 
+  /**
+   * Removes only the active-checkpoint representation of Provider work that
+   * was superseded by a durable user input. Immutable dispatch, terminal and
+   * outcome records remain in the persistence history. The next control epoch
+   * must never inherit an active reservation or queue from the prior epoch.
+   */
+  retireSupersededForEpochAdvance(): void {
+    const state = this.host.readState();
+    const queue = state.providerToolCallQueue;
+    if (
+      queue
+      && (
+        queue.controlEpoch !== state.controlEpoch
+        || queue.status === 'active'
+        || !queue.outcomeRecorded
+      )
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_queue_epoch_retirement_blocked',
+        'A prior-epoch Provider tool queue must be durably settled before the control epoch can advance.'
+      );
+    }
+    const turn = state.providerTurn;
+    if (
+      turn
+      && (
+        turn.controlEpoch !== state.controlEpoch
+        || turn.status === 'active'
+        || turn.status === 'awaitingTools'
+        || (
+          queue !== undefined
+          && queue.providerTurnId !== turn.providerTurnId
+        )
+      )
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_turn_epoch_retirement_blocked',
+        'A prior-epoch Provider turn must be quiescent before the control epoch can advance.'
+      );
+    }
+    state.providerToolCallQueue = undefined;
+    state.providerTurn = undefined;
+  }
+
   async run(
     request: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {

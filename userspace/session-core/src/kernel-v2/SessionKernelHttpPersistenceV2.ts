@@ -408,12 +408,6 @@ implements SessionKernelAppendOnlyRecordStoreV3 {
       if (httpError instanceof UnsupportedHistorySchemaError) {
         throw httpError;
       }
-      if (response.status === 409) {
-        throw new SessionKernelPersistenceError(
-          'session_kernel_persistence_identity_conflict',
-          `Persistence record ${record.recordId} conflicts with durable content.`
-        );
-      }
       throw httpError;
     }
     const envelope = exactObject(
@@ -5832,6 +5826,8 @@ async function persistenceHttpError(
   operation: 'read' | 'append',
   response: Response
 ): Promise<SessionKernelPersistenceError | UnsupportedHistorySchemaError> {
+  let hostErrorCode: string | undefined;
+  let hostErrorMessage: string | undefined;
   try {
     const body = objectRecord(await response.json());
     const error = objectRecord(body?.error);
@@ -5840,13 +5836,33 @@ async function persistenceHttpError(
         'pre-cutover-history'
       );
     }
+    if (
+      typeof error?.code === 'string'
+      && /^[A-Za-z][A-Za-z0-9_.-]{0,80}$/u.test(error.code)
+    ) {
+      hostErrorCode = error.code;
+    }
+    if (
+      typeof error?.message === 'string'
+      && error.message.length > 0
+      && error.message.length <= 1024
+      && error.message.trim() === error.message
+    ) {
+      hostErrorMessage = error.message;
+    }
   } catch {
     // Preserve the typed transport failure when the Host error body is absent
     // or malformed. The status remains sufficient for a bounded diagnostic.
   }
+  const baseCode =
+    `session_kernel_persistence_http_${operation}_failed`;
   return new SessionKernelPersistenceError(
-    `session_kernel_persistence_http_${operation}_failed`,
-    `Dedicated Session v3 persistence ${operation} failed with HTTP ${response.status}.`
+    hostErrorCode ? `${baseCode}.${hostErrorCode}` : baseCode,
+    [
+      `Dedicated Session v3 persistence ${operation} failed with HTTP ${response.status}`,
+      hostErrorCode ? ` (${hostErrorCode})` : '',
+      hostErrorMessage ? `: ${hostErrorMessage}` : '.',
+    ].join('')
   );
 }
 

@@ -23,9 +23,13 @@ interface DeepCodeAgentPanelProps {
   homeProjectTitle?: string | null;
   projectWorkspaceBinding?: AgentWorkspaceBinding;
   projectContext?: boolean;
+  submissionScopeId?: string | null;
   suppressPendingDecision?: boolean;
   onBeforeSend?: () => Promise<boolean | void> | boolean | void;
-  onAfterSend?: () => Promise<void> | void;
+  onAfterSend?: (
+    submissionScopeId: string | null,
+    submittedDraftCleared: boolean
+  ) => Promise<void> | void;
 }
 
 function displaySessionTitle(language: UiLanguage, title?: string): string {
@@ -43,6 +47,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   homeProjectTitle,
   projectWorkspaceBinding,
   projectContext = false,
+  submissionScopeId,
   suppressPendingDecision = false,
   onBeforeSend,
   onAfterSend,
@@ -59,6 +64,9 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
+  const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
+  const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
@@ -158,6 +166,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   );
   const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
   const profileLocked = sessionRunning || Boolean(timeline.interactionProjection?.pending);
+  const pendingSubmissionRetry = !forceHome && session?.id
+    && pendingSubmissionSessionIds.includes(session.id)
+    ? pendingSubmissionRetryView(session.id)
+    : null;
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
@@ -171,12 +183,34 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
       language={language}
       loading={composerRunning}
+      submissionScopeId={submissionScopeId ?? session?.id ?? null}
+      canCancelCurrentRun={Boolean(
+        !forceHome && session?.id && activeRunSessionIds.includes(session.id)
+      )}
       onSend={async (content) => {
         requestFollowLatest();
         const shouldContinue = await onBeforeSend?.();
-        if (shouldContinue === false) return;
-        await sendMessage(content);
-        await onAfterSend?.();
+        if (shouldContinue === false) return false;
+        return sendMessage(content);
+      }}
+      pendingSubmissionRetry={pendingSubmissionRetry}
+      onRetryPendingSubmission={async (clearOriginalMessageAttachments) => {
+        requestFollowLatest();
+        return retryPendingSubmission(clearOriginalMessageAttachments);
+      }}
+      onSubmissionSettled={(
+        admitted,
+        settledSubmissionScopeId,
+        submittedDraftCleared
+      ) => {
+        if (admitted && onAfterSend) {
+          void Promise.resolve()
+            .then(() => onAfterSend(
+              settledSubmissionScopeId,
+              submittedDraftCleared
+            ))
+            .catch(() => undefined);
+        }
       }}
       onStop={() => void cancelCurrentRun()}
       onAddAttachment={addAttachment}
@@ -221,44 +255,43 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     />
   );
 
-  if (showHome) {
-    return (
-      <div className="deepcode-gui-agent-panel deepcode-gui-agent-panel--home">
-        <div className="deepcode-gui-home-panel">
-          <h1>{homePrompt}</h1>
-          {composer}
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="deepcode-gui-agent-panel">
-      <header className="deepcode-gui-agent-panel__header">
-        <div>
-          <div className="deepcode-gui-agent-panel__title">{activeSessionTitle}</div>
-          <div className="deepcode-gui-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
-        </div>
-        <button type="button" aria-label={t(language, 'deepcodeGui.session.actions')}>...</button>
-      </header>
+    <div className={`deepcode-gui-agent-panel${showHome ? ' deepcode-gui-agent-panel--home' : ''}`}>
+      {!showHome && (
+        <header className="deepcode-gui-agent-panel__header">
+          <div>
+            <div className="deepcode-gui-agent-panel__title">{activeSessionTitle}</div>
+            <div className="deepcode-gui-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
+          </div>
+          <button type="button" aria-label={t(language, 'deepcodeGui.session.actions')}>...</button>
+        </header>
+      )}
 
-      <DeepCodeTimeline
-        timeline={timeline}
-        loading={sessionRunning}
-        language={language}
-        followLatestSignal={followLatestSignal}
-        scrollWatchElement={bottomChromeElement}
-        onTypewriterBlocksChange={(blockIds) => {
-          setTimelineTypewriterBlockIds(blockIds);
-        }}
-        onPlanResolve={(runId, planId, decision, guidance) => {
-          requestFollowLatest();
-          void resolvePlan(runId, planId, decision, guidance);
-        }}
-      />
+      {!showHome && (
+        <DeepCodeTimeline
+          timeline={timeline}
+          loading={sessionRunning}
+          language={language}
+          followLatestSignal={followLatestSignal}
+          scrollWatchElement={bottomChromeElement}
+          onTypewriterBlocksChange={(blockIds) => {
+            setTimelineTypewriterBlockIds(blockIds);
+          }}
+          onPlanResolve={(runId, planId, decision, guidance) => {
+            requestFollowLatest();
+            void resolvePlan(runId, planId, decision, guidance);
+          }}
+        />
+      )}
 
-      <div ref={setBottomChromeElement}>
-        {pendingPermissionRequest && (
+      <div
+        key="composer-region"
+        ref={setBottomChromeElement}
+        className={showHome ? 'deepcode-gui-home-panel' : undefined}
+      >
+        {showHome && <h1>{homePrompt}</h1>}
+
+        {!showHome && pendingPermissionRequest && (
           <PermissionRequestBubble
             request={pendingPermissionRequest}
             language={language}
@@ -279,8 +312,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           />
         )}
 
-        {errorMessage && (
-          <div className="deepcode-gui-agent-panel__error">{errorMessage}</div>
+        {!showHome && errorMessage && (
+          <div className="deepcode-gui-agent-panel__error">
+            <span>{errorMessage}</span>
+          </div>
         )}
 
         {composer}

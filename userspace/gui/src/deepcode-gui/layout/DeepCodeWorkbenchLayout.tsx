@@ -86,6 +86,7 @@ interface DeepCodeTextInputDialog {
 interface PendingProjectSession {
   projectId: string;
   sessionId: string;
+  submissionScopeId: string;
 }
 
 function basename(path?: string | null): string {
@@ -420,6 +421,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [projectRecords, setProjectRecords] = useState<DeepCodeGuiProject[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [draftTargetProjectId, setDraftTargetProjectId] = useState<string | null>(null);
+  const [draftSubmissionScopeId, setDraftSubmissionScopeId] = useState<string | null>(null);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [sessionMenu, setSessionMenu] = useState<DeepCodeSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<DeepCodeProjectContextMenu | null>(null);
@@ -613,6 +615,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     pendingProjectSendRef.current = null;
     setActiveProjectId(null);
     setDraftTargetProjectId(targetProjectId);
+    setDraftSubmissionScopeId(
+      targetProjectId
+        ? `project-draft:${targetProjectId}:${globalThis.crypto.randomUUID()}`
+        : null
+    );
     if (targetProjectId) {
       return;
     }
@@ -648,6 +655,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
 
   const prepareProjectDraftSession = async () => {
     if (!draftTargetProjectId) return true;
+    if (!draftSubmissionScopeId) return false;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
     const nextSession = await createNewSession({
@@ -661,6 +669,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     pendingProjectSendRef.current = {
       projectId: targetProjectId,
       sessionId: nextSession.id,
+      submissionScopeId: draftSubmissionScopeId,
     };
     upsertKnownSession(nextSession);
     setActiveProjectId(targetProjectId);
@@ -668,16 +677,22 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     return true;
   };
 
-  const commitDraftProjectSession = async () => {
+  const commitDraftProjectSession = async (
+    submissionScopeId: string | null,
+    submittedDraftCleared: boolean
+  ) => {
     const pending = pendingProjectSendRef.current;
-    if (!pending) return;
-    pendingProjectSendRef.current = null;
+    if (!pending || pending.submissionScopeId !== submissionScopeId) return;
     const state = useAgentSessionStore.getState();
     const updatedSession = state.session?.id === pending.sessionId
       ? state.session
       : state.sessions.find((item) => item.id === pending.sessionId);
     if (updatedSession) {
       upsertKnownSession(updatedSession);
+    }
+    if (submittedDraftCleared && pendingProjectSendRef.current === pending) {
+      pendingProjectSendRef.current = null;
+      setDraftSubmissionScopeId(null);
     }
   };
 
@@ -722,6 +737,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     setProjectRecords((current) => [project, ...current.filter((item) => item.id !== project.id)]);
     setActiveProjectId(null);
     setDraftTargetProjectId(project.id);
+    setDraftSubmissionScopeId(
+      `project-draft:${project.id}:${globalThis.crypto.randomUUID()}`
+    );
   };
 
   const commitProjectFolderPath = async (projectFolderPath: string) => {
@@ -854,6 +872,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       setActiveProjectId(projectId);
     }
     setDraftTargetProjectId(null);
+    setDraftSubmissionScopeId(null);
   };
 
   const handleDeleteProject = async (project: DeepCodeGuiProject) => {
@@ -868,8 +887,18 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     ));
     setCollapsedProjectIds((current) => current.filter((id) => id !== project.id));
     if (activeProjectId === project.id) setActiveProjectId(null);
-    if (draftTargetProjectId === project.id) setDraftTargetProjectId(null);
+    if (draftTargetProjectId === project.id) {
+      setDraftTargetProjectId(null);
+      setDraftSubmissionScopeId(null);
+    }
   };
+
+  const pendingProjectSend = pendingProjectSendRef.current;
+  const composerSubmissionScopeId = projectDraftActive
+    ? draftSubmissionScopeId
+    : pendingProjectSend && pendingProjectSend.sessionId === activeSession?.id
+      ? pendingProjectSend.submissionScopeId
+      : activeSession?.id ?? null;
 
   return (
     <div className="deepcode-gui-workbench">
@@ -907,6 +936,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               pendingProjectSendRef.current = null;
               setActiveProjectId(projectId);
               setDraftTargetProjectId(null);
+              setDraftSubmissionScopeId(null);
               await activateSession(session.id);
             });
           }}
@@ -927,6 +957,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             draftProject?.workspaceBinding ?? activeProject?.workspaceBinding
           }
           projectContext={Boolean(draftProject ?? activeProject)}
+          submissionScopeId={composerSubmissionScopeId}
           onBeforeSend={prepareProjectDraftSession}
           onAfterSend={commitDraftProjectSession}
         />
