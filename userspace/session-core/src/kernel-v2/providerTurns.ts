@@ -436,7 +436,17 @@ export class SessionKernelProviderTurnsV2 {
         toolContext: binding,
       };
       const contextAssembly = buildSessionProviderContextV2(
-        providerInput
+        {
+          ...providerInput,
+          planActionSettlementOutcomes: Object.fromEntries(
+            Object.entries(state.planActionSettlements).map(
+              ([planActionId, settlement]) => [
+                planActionId,
+                settlement.outcome,
+              ]
+            )
+          ),
+        }
       );
       const startCommit = this.beginAdmissionCommit(
         reservation,

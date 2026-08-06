@@ -261,6 +261,7 @@ export class SessionKernelHostRunnerV2 {
     requireAcceptedPlanRevision(state);
     requireExactPlanRevision(state, expectedPlanRevision);
     requirePlanActionUnsettled(state, planActionId);
+    requireNextPlanAction(state, planActionId);
     return this.runProviderTurn({
       reason: 'planExecution',
       target: { kind: 'planAction', planActionId },
@@ -366,6 +367,7 @@ export class SessionKernelHostRunnerV2 {
     requireAcceptedPlanRevision(initialState);
     requireExactPlanRevision(initialState, expectedPlanRevision);
     requirePlanActionUnsettled(initialState, planActionId);
+    requireNextPlanAction(initialState, planActionId);
     const budget = normalizeProviderCallBudget(
       options.providerCallBudget
     );
@@ -792,6 +794,22 @@ function requirePlanActionUnsettled(
     throw new SessionKernelHostRunnerError(
       'session_kernel_plan_action_already_settled',
       `PlanAction ${planActionId} is already settled.`
+    );
+  }
+}
+
+function requireNextPlanAction(
+  state: SessionKernelLoopStateV2,
+  planActionId: string
+): void {
+  const next = state.plan?.actions.find(
+    (action) =>
+      !state.planActionSettlements[action.manifest.planActionId]
+  );
+  if (!next || next.manifest.planActionId !== planActionId) {
+    throw new SessionKernelHostRunnerError(
+      'session_kernel_plan_action_sequence_mismatch',
+      'PlanAction execution must drive the first unsettled action in the persisted Plan sequence.'
     );
   }
 }

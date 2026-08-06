@@ -305,6 +305,7 @@ export type SessionKernelProviderAdapterInputV2 = Pick<
   | 'runId'
   | 'currentInput'
   | 'providerProfile'
+  | 'plan'
   | 'target'
   | 'toolContext'
 >;
@@ -378,6 +379,19 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
       case 'nativeToolCalls': {
+        const ownershipRepair = planActionOwnershipRepairV2(
+          input,
+          output.calls
+        );
+        if (ownershipRepair) {
+          return {
+            kind: 'noTool',
+            ...completionFields,
+            guidance: ownershipRepair.guidance,
+            repair: ownershipRepair.repair,
+            providerResult: output.providerResult,
+          };
+        }
         const sources = [];
         for (let index = 0; index < output.calls.length; index += 1) {
           const call = output.calls[index]!;
@@ -475,6 +489,77 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
     }
+}
+
+function planActionOwnershipRepairV2(
+  input: SessionKernelProviderAdapterInputV2,
+  calls: Readonly<Extract<
+    SessionKernelProviderBackendOutputV2,
+    { kind: 'nativeToolCalls' }
+  >['calls']>
+): {
+  guidance: string;
+  repair: Extract<
+    NonNullable<
+      Extract<
+        SessionProviderTurnOutputV2,
+        { kind: 'noTool' }
+      >['repair']
+    >,
+    { kind: 'planActionOwnership' }
+  >;
+} | undefined {
+  if (input.target.kind !== 'planAction') return undefined;
+  const plan = input.plan;
+  const currentPlanActionId = input.target.planActionId;
+  const currentIndex = plan?.actions.findIndex(
+    (action) =>
+      action.manifest.planActionId === currentPlanActionId
+  ) ?? -1;
+  if (!plan || currentIndex < 0) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_action_missing',
+      'PlanAction output admission requires its exact persisted Plan action.'
+    );
+  }
+  const current = plan.actions[currentIndex]!;
+  for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
+    const call = calls[callIndex]!;
+    const toolId = requiredToolId(call.toolId);
+    const argumentDigest = canonicalJson(call.arguments);
+    const matchesCurrent =
+      current.manifest.toolId === toolId
+      && canonicalJson(current.previewArguments) === argumentDigest;
+    if (matchesCurrent) continue;
+    const siblingIndexes = plan.actions.flatMap(
+      (action, index) =>
+        index > currentIndex
+        && action.manifest.toolId === toolId
+        && canonicalJson(action.previewArguments) === argumentDigest
+          ? [index]
+          : []
+    );
+    if (siblingIndexes.length !== 1) continue;
+    const siblingIndex = siblingIndexes[0]!;
+    const currentSequence = currentIndex + 1;
+    const siblingSequence = siblingIndex + 1;
+    return {
+      guidance: [
+        `Provider call ${String(callIndex + 1)} matches pending Plan action sequence ${String(siblingSequence)}`,
+        `while sequence ${String(currentSequence)} is current.`,
+        'No Kernel ToolIntent was created.',
+        'Replan the current work before any further execution; do not start the later action under the current PlanAction authority.',
+      ].join(' '),
+      repair: {
+        kind: 'planActionOwnership',
+        toolId,
+        callOrdinal: callIndex + 1,
+        currentSequence,
+        siblingSequence,
+      },
+    };
+  }
+  return undefined;
 }
 
 function assertCompletedProviderBackendOutputV2(

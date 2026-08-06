@@ -559,11 +559,19 @@ export type SessionProviderTurnOutputV2 = (
   | {
       kind: 'noTool';
       guidance?: string;
-      repair?: {
-        kind: 'toolArguments';
-        toolId: string;
-        callOrdinal: number;
-      };
+      repair?:
+        | {
+            kind: 'toolArguments';
+            toolId: string;
+            callOrdinal: number;
+          }
+        | {
+            kind: 'planActionOwnership';
+            toolId: string;
+            callOrdinal: number;
+            currentSequence: number;
+            siblingSequence: number;
+          };
     }
 ) & {
   items: SessionProviderOrderedItemV2[];
