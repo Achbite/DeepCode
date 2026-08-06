@@ -378,6 +378,10 @@ export function restoreSessionKernelLoopStateV2(
     validatePlanActionSettlement(settlement);
     if (
       settlement.planActionId !== planActionId
+      || settlement.planRevision !== state.plan?.planRevision
+      || settlement.controlEpoch !== state.controlEpoch
+      || settlement.snapshotHighWater
+        > state.lineage.cursor.snapshotHighWater
       || !state.plan?.actions.some(
         (action) =>
           action.manifest.planActionId === planActionId
@@ -1578,27 +1582,49 @@ function validateUserInput(input: SessionUserInputRecordV2): void {
 function validatePlanActionSettlement(
   settlement: SessionPlanActionSettlementV2
 ): void {
+  requiredIdentity(settlement.planRevision, 'planRevision');
   requiredIdentity(settlement.planActionId, 'planActionId');
+  positiveEpoch(settlement.controlEpoch);
   requiredText(settlement.recordedAt, 'settlement.recordedAt');
-  if (settlement.kind !== 'completed') {
+  if (settlement.kind !== 'planActionComplete') {
     throw new SessionKernelStateError(
       'session_kernel_plan_action_settlement_kind_invalid',
-      'PlanAction settlements only record completed provider outcomes.'
+      'PlanAction settlements only record the explicit Session PlanActionComplete control.'
     );
   }
   if (
-    settlement.completionKind !== 'answer'
-    && settlement.completionKind !== 'noTool'
+    settlement.outcome !== 'completed'
+    && settlement.outcome !== 'no_op'
+    && settlement.outcome !== 'blocked'
+    && settlement.outcome !== 'skipped'
+    && settlement.outcome !== 'unexecuted'
   ) {
     throw new SessionKernelStateError(
       'session_kernel_plan_action_completion_invalid',
-      'PlanAction completion kind must be answer or noTool.'
+      'PlanActionComplete has an unsupported explicit outcome.'
     );
   }
   requiredIdentity(
     settlement.providerTurnId,
     'settlement.providerTurnId'
   );
+  requiredIdentity(
+    settlement.controlCallId,
+    'settlement.controlCallId'
+  );
+  requiredDigestV2(
+    settlement.controlArgumentsDigest,
+    'settlement.controlArgumentsDigest'
+  );
+  if (
+    !Number.isSafeInteger(settlement.snapshotHighWater)
+    || settlement.snapshotHighWater < 0
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_action_snapshot_high_water_invalid',
+      'PlanActionComplete snapshotHighWater must be a non-negative safe integer.'
+    );
+  }
 }
 
 function positiveEpoch(value: number): void {

@@ -60,10 +60,12 @@ import {
 } from './toolIntent.js';
 import {
   decodeCompletedProviderTerminalV3,
+  decodeProviderPlanActionCompleteArgumentsV2,
   decodeProviderPlanProposalArgumentsV2,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
+  SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
   SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
@@ -101,10 +103,12 @@ export interface SessionKernelProviderTurnHostV2 {
     plan: SessionNaturalLanguagePlanV2
   ): Promise<void>;
 
-  settlePlanActionCompleted(
+  settlePlanActionComplete(
     planActionId: string,
-    completionKind: 'answer' | 'noTool',
+    outcome: SessionPlanActionSettlementV2['outcome'],
     providerTurnId: string,
+    controlCallId: string,
+    controlArgumentsDigest: string,
     recordedAt: string
   ): SessionPlanActionSettlementV2;
 
@@ -719,6 +723,9 @@ export class SessionKernelProviderTurnsV2 {
           );
         }
       }
+      if (output.kind === 'planActionComplete') {
+        await this.host.reconcileFacts();
+      }
 
       if (queuedToolIntents) {
         const queue = activeSessionProviderToolCallQueueV2(
@@ -853,6 +860,15 @@ export class SessionKernelProviderTurnsV2 {
     acceptingState.providerTurn.response = response;
     await this.host.saveCheckpoint();
 
+    if (
+      request.target.kind === 'planAction'
+      && output.kind === 'answer'
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_plan_action_completion_control_required',
+        'A PlanAction turn must return Kernel tool calls or the explicit PlanActionComplete Session control; ordinary text cannot settle it.'
+      );
+    }
     if (output.kind === 'answer') {
       return {
         result: { kind: 'answer', text: output.text },
@@ -863,6 +879,12 @@ export class SessionKernelProviderTurnsV2 {
       await this.host.recordProviderPlan(output.plan);
       return {
         result: { kind: 'plan', plan: output.plan },
+        queuedToolIntents: false,
+      };
+    }
+    if (output.kind === 'planActionComplete') {
+      return {
+        result: { kind: 'noTool' },
         queuedToolIntents: false,
       };
     }
@@ -889,6 +911,12 @@ export class SessionKernelProviderTurnsV2 {
           },
           queuedToolIntents: false,
         };
+      }
+      if (request.target.kind === 'planAction') {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_action_completion_control_required',
+          'A PlanAction turn cannot end without a Kernel tool call, deterministic repair, or explicit PlanActionComplete control.'
+        );
       }
       return {
         result: {
@@ -967,13 +995,14 @@ export class SessionKernelProviderTurnsV2 {
       | undefined;
     if (
       request.target.kind === 'planAction'
-      && (output.kind === 'answer' || output.kind === 'noTool')
-      && result.kind !== 'rejected'
+      && output.kind === 'planActionComplete'
     ) {
-      planActionSettlement = this.host.settlePlanActionCompleted(
+      planActionSettlement = this.host.settlePlanActionComplete(
         request.target.planActionId,
-        output.kind,
+        output.outcome,
         providerTurnId,
+        output.control.callId,
+        output.control.argumentsDigest,
         recordedAt
       );
     }
@@ -1288,6 +1317,9 @@ export class SessionKernelProviderTurnsV2 {
         'session_kernel_provider_recovery_queue_missing',
         'Recovered tool output did not produce its durable ordered queue.'
       );
+    }
+    if (output.kind === 'planActionComplete') {
+      await this.host.reconcileFacts();
     }
     await this.completeProviderOutput(
       request,
@@ -2263,6 +2295,9 @@ function providerOutcomeSummary(
         .slice(0, 8_192),
     };
   }
+  if (output.kind === 'planActionComplete') {
+    return { summary: `PlanAction outcome: ${output.outcome}` };
+  }
   return {};
 }
 
@@ -2305,7 +2340,7 @@ function bindProviderEvidenceV3(
     || !terminalItemsMatchProviderOutputV3(
       terminal.data.orderedItems,
       output,
-      input.target.kind === 'planning'
+      input.target.kind
     )
   ) {
     throw new SessionKernelProviderTurnError(
@@ -2433,7 +2468,7 @@ function requireProviderDispatchAuthorityV3(
 function terminalItemsMatchProviderOutputV3(
   terminalItems: readonly import('./types.js').SessionProviderTerminalOrderedItemV3[],
   output: SessionProviderTurnOutputV2,
-  planningTarget: boolean
+  targetKind: SessionProviderTurnTargetV2['kind']
 ): boolean {
   const outputItems = output.items;
   const terminalTextItems = terminalItems.filter(
@@ -2443,7 +2478,7 @@ function terminalItemsMatchProviderOutputV3(
     > => item.kind === 'text'
   );
   if (
-    planningTarget
+    targetKind === 'planning'
     && output.kind === 'plan'
   ) {
     try {
@@ -2474,6 +2509,49 @@ function terminalItemsMatchProviderOutputV3(
       }));
       return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
         && providerPlanMatchesDraftV3(output.plan, draft);
+    } catch {
+      return false;
+    }
+  }
+  if (
+    targetKind === 'planAction'
+    && output.kind === 'planActionComplete'
+  ) {
+    try {
+      const controlItems = terminalItems.filter(
+        (item): item is Extract<
+          import('./types.js').SessionProviderTerminalOrderedItemV3,
+          { kind: 'toolCall' }
+        > => item.kind === 'toolCall'
+          && item.name
+            === SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME
+      );
+      if (
+        controlItems.length !== 1
+        || terminalTextItems.length + 1 !== terminalItems.length
+        || terminalItems.at(-1) !== controlItems[0]
+        || terminalTextItems.some(
+          (item) => item.phase === 'final_answer'
+        )
+      ) {
+        return false;
+      }
+      const decodedArguments = JSON.parse(
+        controlItems[0]!.arguments
+      ) as unknown;
+      const outcome = decodeProviderPlanActionCompleteArgumentsV2(
+        decodedArguments
+      );
+      const normalizedTextItems = terminalTextItems.map((item) => ({
+        kind: 'text' as const,
+        phase: 'commentary' as const,
+        text: item.text,
+      }));
+      return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
+        && outcome === output.outcome
+        && controlItems[0]!.callId === output.control.callId
+        && sha256Hash(canonicalJson(decodedArguments))
+          === output.control.argumentsDigest;
     } catch {
       return false;
     }

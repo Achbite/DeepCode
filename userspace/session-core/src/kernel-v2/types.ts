@@ -543,6 +543,16 @@ export type SessionProviderTurnOutputV2 = (
       receipt: SessionProviderToolCallReceiptV2;
     }
   | {
+      kind: 'planActionComplete';
+      outcome: SessionPlanActionCompletionOutcomeV2;
+      control: {
+        schemaVersion: 'deepcode.session.plan-action-complete.v2';
+        callId: string;
+        toolName: 'deepcode_session_plan_action_complete_v2';
+        argumentsDigest: string;
+      };
+    }
+  | {
       kind: 'answer';
       text: string;
     }
@@ -836,12 +846,24 @@ export interface SessionReviewFactCoverageV2 {
 }
 
 export interface SessionPlanActionSettlementV2 {
-  kind: 'completed';
+  kind: 'planActionComplete';
+  planRevision: string;
   planActionId: string;
-  completionKind: 'answer' | 'noTool';
+  controlEpoch: number;
+  outcome: SessionPlanActionCompletionOutcomeV2;
   providerTurnId: string;
+  controlCallId: string;
+  controlArgumentsDigest: string;
+  snapshotHighWater: number;
   recordedAt: string;
 }
+
+export type SessionPlanActionCompletionOutcomeV2 =
+  | 'completed'
+  | 'no_op'
+  | 'blocked'
+  | 'skipped'
+  | 'unexecuted';
 
 export interface SessionKernelProjectionEventV2 {
   /**

@@ -1284,6 +1284,7 @@ function validateExactSessionProviderOutcomeRecordV2(
     record.outputKind !== 'plan'
     && record.outputKind !== 'answer'
     && record.outputKind !== 'noTool'
+    && record.outputKind !== 'planActionComplete'
   ) {
     throw invalidQueue();
   }

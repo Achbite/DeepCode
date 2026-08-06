@@ -1372,10 +1372,13 @@ function publicPresentation(
         visibility: 'both',
         fields: {
           status: 'completed',
+          planRevision: textField(data, 'planRevision'),
           planActionId: textField(data, 'planActionId'),
+          controlEpoch: data?.controlEpoch,
           providerTurnId: textField(data, 'providerTurnId'),
-          completionKind: textField(data, 'completionKind'),
-          summary: 'Plan action completed by the Session provider loop.',
+          outcome: textField(data, 'outcome'),
+          snapshotHighWater: data?.snapshotHighWater,
+          summary: 'Plan action settled by explicit Session control.',
         },
       };
     case 'provider.composing':
@@ -1855,13 +1858,24 @@ function currentProjectionData(
     case 'planAction.completed': {
       const data = exactCurrentProjectionRecord(event, {
         kind: 'string',
+        planRevision: 'identity',
         planActionId: 'identity',
-        completionKind: 'string',
+        controlEpoch: 'positiveInteger',
+        outcome: 'string',
         providerTurnId: 'identity',
+        controlCallId: 'identity',
+        controlArgumentsDigest: 'identity',
+        snapshotHighWater: 'nonNegativeInteger',
         recordedAt: 'identity',
       });
-      projectionEnum(data, 'kind', ['completed']);
-      projectionEnum(data, 'completionKind', ['answer', 'noTool']);
+      projectionEnum(data, 'kind', ['planActionComplete']);
+      projectionEnum(data, 'outcome', [
+        'completed',
+        'no_op',
+        'blocked',
+        'skipped',
+        'unexecuted',
+      ]);
       return data;
     }
     case 'run.cancelled':
@@ -1994,6 +2008,7 @@ function currentProviderCompletedProjectionData(
     'answer',
     'noTool',
     'toolIntent',
+    'planActionComplete',
   ]);
   projectionEnum(data, 'terminalScope', ['turn', 'providerTurn']);
   if (data.status !== undefined) {

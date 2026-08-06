@@ -6212,21 +6212,37 @@ fn validate_private_projection_event_data(
                 data,
                 &[
                     "kind",
+                    "planRevision",
                     "planActionId",
-                    "completionKind",
+                    "controlEpoch",
+                    "outcome",
                     "providerTurnId",
+                    "controlCallId",
+                    "controlArgumentsDigest",
+                    "snapshotHighWater",
                     "recordedAt",
                 ],
                 &[],
-                &["planActionId", "providerTurnId", "recordedAt"],
+                &[
+                    "planRevision",
+                    "planActionId",
+                    "providerTurnId",
+                    "controlCallId",
+                    "controlArgumentsDigest",
+                    "recordedAt",
+                ],
+                &["outcome"],
                 &[],
                 &[],
-                &[],
-                &[],
-                &[],
+                &["controlEpoch"],
+                &["snapshotHighWater"],
             )?;
-            require_private_enum(data, "kind", &["completed"])?;
-            require_private_enum(data, "completionKind", &["answer", "noTool"])?;
+            require_private_enum(data, "kind", &["planActionComplete"])?;
+            require_private_enum(
+                data,
+                "outcome",
+                &["completed", "no_op", "blocked", "skipped", "unexecuted"],
+            )?;
         }
         "run.cancelled" => validate_private_projection_fields(
             data,
@@ -6696,7 +6712,13 @@ fn validate_private_provider_completed(
     require_private_enum(
         data,
         "outputKind",
-        &["plan", "answer", "noTool", "toolIntent"],
+        &[
+            "plan",
+            "answer",
+            "noTool",
+            "toolIntent",
+            "planActionComplete",
+        ],
     )?;
     require_private_enum(data, "terminalScope", &["turn", "providerTurn"])?;
     if data.contains_key("status") {
@@ -7680,16 +7702,22 @@ fn validate_public_agent_event_payload(
         "planAction.completed" => (
             &[
                 "status",
+                "planRevision",
                 "planActionId",
+                "controlEpoch",
                 "providerTurnId",
-                "completionKind",
+                "outcome",
+                "snapshotHighWater",
                 "summary",
             ],
             &[
                 "status",
+                "planRevision",
                 "planActionId",
+                "controlEpoch",
                 "providerTurnId",
-                "completionKind",
+                "outcome",
+                "snapshotHighWater",
                 "summary",
             ],
         ),
@@ -7954,7 +7982,10 @@ fn validate_public_agent_event_payload(
                 && channel == "task"
                 && visibility == "both"
                 && status == Some("completed")
-                && matches!(payload_text("completionKind"), Some("answer" | "noTool"))
+                && matches!(
+                    payload_text("outcome"),
+                    Some("completed" | "no_op" | "blocked" | "skipped" | "unexecuted")
+                )
         }
         "provider.composing" => {
             event_kind == "assistant_msg"
@@ -7968,7 +7999,13 @@ fn validate_public_agent_event_payload(
                 && visibility == "conversation"
                 && matches!(
                     payload_text("outputKind"),
-                    Some("plan" | "toolIntent" | "answer" | "noTool")
+                    Some(
+                        "plan"
+                            | "toolIntent"
+                            | "answer"
+                            | "noTool"
+                            | "planActionComplete"
+                    )
                 )
                 && match payload_text("terminalScope") {
                     Some("turn") => {
@@ -8314,12 +8351,14 @@ fn validate_public_projection_payload_types(
             validate_public_review(payload.get("review").expect("required review"))?;
         }
         "planAction.completed" => {
-            for field in ["planActionId", "providerTurnId"] {
+            for field in ["planRevision", "planActionId", "providerTurnId"] {
                 public_string(payload, field, true)?;
             }
-            for field in ["status", "completionKind", "summary"] {
+            for field in ["status", "outcome", "summary"] {
                 public_string(payload, field, false)?;
             }
+            public_integer(payload, "controlEpoch", true)?;
+            public_integer(payload, "snapshotHighWater", false)?;
         }
         "provider.composing" => {
             public_string(payload, "providerTurnId", true)?;
@@ -9443,27 +9482,41 @@ fn validate_public_review_completions(value: &Value) -> Result<(), HostV2Storage
             completion,
             &[
                 "kind",
+                "planRevision",
                 "planActionId",
-                "completionKind",
+                "controlEpoch",
+                "outcome",
                 "providerTurnId",
+                "controlCallId",
+                "controlArgumentsDigest",
+                "snapshotHighWater",
                 "recordedAt",
             ],
             &[],
             "Review completion",
         )?;
-        if public_string(completion, "kind", false)? != "completed"
+        if public_string(completion, "kind", false)? != "planActionComplete"
             || !matches!(
-                public_string(completion, "completionKind", false)?,
-                "answer" | "noTool"
+                public_string(completion, "outcome", false)?,
+                "completed" | "no_op" | "blocked" | "skipped" | "unexecuted"
             )
         {
             return Err(public_projection_shape_invalid(
                 "Review completion kind is invalid",
             ));
         }
-        for field in ["planActionId", "providerTurnId", "recordedAt"] {
+        for field in [
+            "planRevision",
+            "planActionId",
+            "providerTurnId",
+            "controlCallId",
+            "controlArgumentsDigest",
+            "recordedAt",
+        ] {
             public_string(completion, field, true)?;
         }
+        public_integer(completion, "controlEpoch", true)?;
+        public_integer(completion, "snapshotHighWater", false)?;
     }
     Ok(())
 }

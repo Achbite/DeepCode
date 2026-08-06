@@ -5005,14 +5005,19 @@ function materializeProviderOutcomeV3(input: {
   }
   if (
     target.kind === 'planAction'
-    && (output.kind === 'answer' || output.kind === 'noTool')
+    && output.kind === 'planActionComplete'
   ) {
     requirePlanActionOutcomeSettlementV3(
       source,
       byId,
+      plan!.planRevision,
       target.planActionId,
-      output.kind,
+      source.authority.controlEpoch,
+      output.outcome,
       reservation.providerTurnId,
+      output.control.callId,
+      output.control.argumentsDigest,
+      source.cursor.snapshotHighWater,
       terminal.recordedAt
     );
   }
@@ -5073,9 +5078,14 @@ function planRecordRefV3(
 function requirePlanActionOutcomeSettlementV3(
   source: SessionKernelCompactCheckpointV3,
   byId: ReadonlyMap<string, SessionKernelPersistenceRecordV3>,
+  planRevision: string,
   planActionId: string,
-  completionKind: 'answer' | 'noTool',
+  controlEpoch: number,
+  outcome: SessionPlanActionSettlementV2['outcome'],
   providerTurnId: string,
+  controlCallId: string,
+  controlArgumentsDigest: string,
+  snapshotHighWater: number,
   recordedAt: string
 ): void {
   const ref = source.refs.planActionSettlements[planActionId];
@@ -5090,10 +5100,15 @@ function requirePlanActionOutcomeSettlementV3(
     'planActionSettlement'
   ).data as { settlement: SessionPlanActionSettlementV2 };
   const expected: SessionPlanActionSettlementV2 = {
-    kind: 'completed',
+    kind: 'planActionComplete',
+    planRevision,
     planActionId,
-    completionKind,
+    controlEpoch,
+    outcome,
     providerTurnId,
+    controlCallId,
+    controlArgumentsDigest,
+    snapshotHighWater,
     recordedAt,
   };
   if (canonicalJson(wrapper.settlement) !== canonicalJson(expected)) {
@@ -5238,6 +5253,9 @@ function providerOutputSummaryV3(
 ): string | undefined {
   if (output.kind === 'answer') return output.text.slice(0, 8_192);
   if (output.kind === 'noTool') return output.guidance?.slice(0, 8_192);
+  if (output.kind === 'planActionComplete') {
+    return `PlanAction outcome: ${output.outcome}`;
+  }
   return `${output.plan.title}\n${output.plan.objective}`.slice(0, 8_192);
 }
 

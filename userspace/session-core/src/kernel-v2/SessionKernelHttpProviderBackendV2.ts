@@ -23,10 +23,13 @@ import type {
   SessionProviderPlanDraftV2,
 } from './SessionKernelProviderAdapterV2.js';
 import {
+  SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
+  SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
   SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
+  SessionPlanActionCompletionOutcomeV2,
   SessionProviderResultMetadataV2,
   SessionProviderTurnTerminalRecordV3,
   SessionProviderTurnInputV2,
@@ -245,6 +248,65 @@ export function decodeSessionKernelLlmStreamResultV2(
         responseDigest: response.completion.responseDigest,
       };
     }
+    const planActionCompleteCalls = streamCalls.filter(
+      (item) =>
+        item.name === SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME
+    );
+    if (planActionCompleteCalls.length > 0) {
+      if (
+        input.target.kind !== 'planAction'
+        || planActionCompleteCalls.length !== 1
+        || streamCalls.length !== 1
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_plan_action_complete_conflict',
+          'PlanActionComplete must be the only Session control or Kernel tool in the current PlanAction response.'
+        );
+      }
+      const control = planActionCompleteCalls[0]!;
+      const controlIndex = response.items.indexOf(control);
+      const textItems = response.items.filter(
+        (item): item is Extract<
+          SessionKernelLlmStreamResultV2['items'][number],
+          { kind: 'text' }
+        > => item.kind === 'text'
+      );
+      if (
+        response.items.slice(controlIndex + 1).some(
+          (item) => item.kind === 'text'
+        )
+        || textItems.some((item) => item.phase === 'final_answer')
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_plan_action_complete_phase_conflict',
+          'PlanActionComplete may follow commentary but cannot share or precede final-answer text.'
+        );
+      }
+      const decodedArguments = decodeProviderNativeArguments(
+        control.arguments
+      );
+      const outcome = decodeProviderPlanActionCompleteArgumentsV2(
+        decodedArguments
+      );
+      return {
+        kind: 'planActionComplete',
+        outcome,
+        control: {
+          schemaVersion: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
+          callId: requiredIdentity(control.callId, 'callId'),
+          toolName: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+          argumentsDigest: sha256Hash(canonicalJson(decodedArguments)),
+        },
+        items: textItems.map((item) => ({
+          kind: 'text',
+          phase: 'commentary',
+          text: item.text,
+        })),
+        completion: response.completion,
+        providerResult,
+        responseDigest: response.completion.responseDigest,
+      };
+    }
     let toolOrdinal = 0;
     const decodedItems: SessionKernelProviderOrderedItemV2[] =
       response.items.map((item) => {
@@ -447,6 +509,36 @@ export function decodeProviderPlanProposalArgumentsV2(
     throw invalidPlanningResult();
   }
   return decodeProviderPlanDraft(record.plan);
+}
+
+export function decodeProviderPlanActionCompleteArgumentsV2(
+  value: unknown
+): SessionPlanActionCompletionOutcomeV2 {
+  const decoded = decodeRawToolArgumentsV2(value);
+  const record = objectRecord(decoded);
+  if (!record) throw invalidPlanActionComplete();
+  exactKeys(record, ['schemaVersion', 'outcome']);
+  if (
+    record.schemaVersion
+      !== SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA
+    || (
+      record.outcome !== 'completed'
+      && record.outcome !== 'no_op'
+      && record.outcome !== 'blocked'
+      && record.outcome !== 'skipped'
+      && record.outcome !== 'unexecuted'
+    )
+  ) {
+    throw invalidPlanActionComplete();
+  }
+  return record.outcome;
+}
+
+function invalidPlanActionComplete(): SessionKernelProviderTransportError {
+  return new SessionKernelProviderTransportError(
+    'session_kernel_provider_plan_action_complete_invalid',
+    'PlanActionComplete must use the exact current Session control schema and one declared outcome.'
+  );
 }
 
 function decodeProviderPlanDraft(

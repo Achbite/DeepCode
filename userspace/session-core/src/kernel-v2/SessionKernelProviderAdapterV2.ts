@@ -16,6 +16,7 @@ import type {
 } from './ports.js';
 import type {
   SessionNaturalLanguagePlanV2,
+  SessionPlanActionCompletionOutcomeV2,
   SessionProviderCompletionReceiptV1,
   SessionProviderOrderedItemV2,
   SessionProviderResultMetadataV2,
@@ -31,6 +32,37 @@ export const SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA =
   'deepcode.session.plan-proposal.v2' as const;
 export const SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME =
   'deepcode_session_plan_propose_v2' as const;
+export const SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA =
+  'deepcode.session.plan-action-complete.v2' as const;
+export const SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME =
+  'deepcode_session_plan_action_complete_v2' as const;
+
+export function sessionPlanActionCompleteToolV2(): ProviderWireToolDefinition {
+  return {
+    name: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+    description: [
+      'Session-only control that settles the current approved PlanAction; it never executes a Kernel tool.',
+      'Call it exactly once only after the current PlanAction has reached the declared outcome.',
+      'Do not combine it with a Kernel tool call, another Session control, or final-answer text.',
+      'Use completed only when the approved operation is complete; use no_op, blocked, skipped, or unexecuted for the corresponding non-completion outcome.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['schemaVersion', 'outcome'],
+      properties: {
+        schemaVersion: {
+          type: 'string',
+          const: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
+        },
+        outcome: {
+          type: 'string',
+          enum: ['completed', 'no_op', 'blocked', 'skipped', 'unexecuted'],
+        },
+      },
+    },
+  };
+}
 
 export function sessionPlanProposalToolV2(): ProviderWireToolDefinition {
   return {
@@ -226,6 +258,18 @@ export type SessionKernelProviderBackendOutputV2 = (
       }>;
     }
   | {
+      kind: 'planActionComplete';
+      outcome: SessionPlanActionCompletionOutcomeV2;
+      control: {
+        schemaVersion:
+          typeof SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA;
+        callId: string;
+        toolName:
+          typeof SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME;
+        argumentsDigest: string;
+      };
+    }
+  | {
       kind: 'text';
       text: string;
     }
@@ -386,6 +430,20 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
       }
+      case 'planActionComplete':
+        if (input.target.kind !== 'planAction') {
+          throw new SessionKernelProviderAdapterError(
+            'session_kernel_provider_plan_action_complete_target_invalid',
+            'PlanActionComplete is accepted only for the current Session PlanAction turn.'
+          );
+        }
+        return {
+          kind: 'planActionComplete',
+          ...completionFields,
+          outcome: output.outcome,
+          control: cloneJson(output.control),
+          providerResult: output.providerResult,
+        };
       case 'text':
         if (!output.text.trim()) {
           return {
@@ -450,6 +508,28 @@ function assertCompletedProviderBackendOutputV2(
     requiredDigest(
       output.planProposal.argumentsDigest,
       'planProposal.argumentsDigest'
+    );
+  }
+  if (output.kind === 'planActionComplete') {
+    if (
+      output.control.schemaVersion
+        !== SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA
+      || output.control.toolName
+        !== SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME
+      || ![
+        'completed',
+        'no_op',
+        'blocked',
+        'skipped',
+        'unexecuted',
+      ].includes(output.outcome)
+    ) {
+      throw providerCompletionInvalid();
+    }
+    requiredIdentity(output.control.callId, 'planActionComplete.callId');
+    requiredDigest(
+      output.control.argumentsDigest,
+      'planActionComplete.argumentsDigest'
     );
   }
   requiredDigest(completion.reasoningDigest, 'reasoningDigest');
@@ -583,7 +663,9 @@ function assertCompletedProviderBackendOutputV2(
     && (
       native.terminalSignal !== '[DONE]'
       || (
-        orderedTools.length > 0 || output.kind === 'plan'
+        orderedTools.length > 0
+        || output.kind === 'plan'
+        || output.kind === 'planActionComplete'
           ? native.finishReason !== 'tool_calls'
           : native.finishReason !== 'stop'
       )

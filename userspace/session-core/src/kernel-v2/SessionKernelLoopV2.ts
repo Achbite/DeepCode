@@ -177,15 +177,19 @@ export class SessionKernelLoopV2 {
           this.settleProviderToolCallQueue(),
         recordProviderPlan: (plan) =>
           this.persistPlan(plan),
-        settlePlanActionCompleted: (
+        settlePlanActionComplete: (
           planActionId,
-          completionKind,
+          outcome,
           providerTurnId,
+          controlCallId,
+          controlArgumentsDigest,
           recordedAt
-        ) => this.settlePlanActionCompleted(
+        ) => this.settlePlanActionComplete(
           planActionId,
-          completionKind,
+          outcome,
           providerTurnId,
+          controlCallId,
+          controlArgumentsDigest,
           recordedAt
         ),
         transitionBlocked: () =>
@@ -1620,20 +1624,110 @@ export class SessionKernelLoopV2 {
     await this.ensurePlanProjected();
   }
 
-  private settlePlanActionCompleted(
+  private settlePlanActionComplete(
     planActionId: string,
-    completionKind: 'answer' | 'noTool',
+    outcome: SessionPlanActionSettlementV2['outcome'],
     providerTurnId: string,
+    controlCallId: string,
+    controlArgumentsDigest: string,
     recordedAt: string
   ): SessionPlanActionSettlementV2 {
     this.requireAcceptedPlan();
-    sessionPlanActionV2(this.state, planActionId);
+    this.requireNoPendingRequests();
+    const plan = this.state.plan!;
+    const action = sessionPlanActionV2(this.state, planActionId);
+    const providerTurn = this.state.providerTurn;
+    if (
+      providerTurn?.providerTurnId !== providerTurnId
+      || providerTurn.status !== 'active'
+      || providerTurn.target.kind !== 'planAction'
+      || providerTurn.target.planActionId !== planActionId
+      || providerTurn.controlEpoch !== this.state.controlEpoch
+      || providerTurn.planRevision !== plan.planRevision
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_authority_stale',
+        'PlanActionComplete does not bind the exact current Provider target, Plan revision, and control epoch.'
+      );
+    }
+    if (
+      this.state.kernelWakeHint
+      || !sessionKernelFactsCaughtUpV2(this.state.lineage)
+      || sessionKernelFactBarriersPendingV2(this.state)
+      || this.state.activeWait
+      || this.state.providerToolCallQueue?.status === 'active'
+      || (
+        this.state.providerToolCallQueue
+        && !this.state.providerToolCallQueue.outcomeRecorded
+      )
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_state_unsettled',
+        'PlanActionComplete requires caught-up Kernel facts and no pending request, wait, invocation, or Provider tool queue.'
+      );
+    }
+    if (this.state.reviewFacts.indeterminate.totalCount > 0) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_indeterminate',
+        'PlanActionComplete cannot settle while an indeterminate Kernel outcome remains.'
+      );
+    }
+    const planActionLineage = this.state.lineage.planActions[planActionId];
+    const operationIds = new Set(planActionLineage?.operationIds ?? []);
+    const relatedInvocations = Object.values(
+      this.state.lineage.invocations
+    ).filter(
+      (invocation) =>
+        invocation.operationId !== undefined
+        && operationIds.has(invocation.operationId)
+    );
+    if (relatedInvocations.some(
+      (invocation) => invocation.lastTerminalPhase === undefined
+    )) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_invocation_pending',
+        'PlanActionComplete cannot settle while a related Kernel invocation has no terminal fact.'
+      );
+    }
+    if (outcome === 'completed' && relatedInvocations.length === 0) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_invocation_missing',
+        'A completed PlanAction requires at least one related Kernel invocation with canonical terminal facts.'
+      );
+    }
+    const descriptor = this.state.toolContext.bundle.tools.find(
+      (tool) => tool.toolId === action.manifest.toolId
+    );
+    if (!descriptor) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_tool_missing',
+        'PlanActionComplete cannot resolve the immutable Kernel tool descriptor for the current PlanAction.'
+      );
+    }
+    if (
+      outcome === 'completed'
+      && descriptor.effectClass === 'mutation'
+      && !this.state.reviewFacts.observedEffectPlanActions[
+        plan.planRevision
+      ]?.[planActionId]
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_complete_effect_missing',
+        'A mutation PlanAction cannot be completed without a canonical observed-effect fact.'
+      );
+    }
     const existing = this.state.planActionSettlements[planActionId];
     if (existing) {
       if (
-        existing.kind === 'completed'
-        && existing.completionKind === completionKind
+        existing.kind === 'planActionComplete'
+        && existing.planRevision === plan.planRevision
+        && existing.controlEpoch === this.state.controlEpoch
+        && existing.outcome === outcome
         && existing.providerTurnId === providerTurnId
+        && existing.controlCallId === controlCallId
+        && existing.controlArgumentsDigest === controlArgumentsDigest
+        && existing.snapshotHighWater
+          === this.state.lineage.cursor.snapshotHighWater
       ) {
         return cloneJson(existing);
       }
@@ -1643,10 +1737,16 @@ export class SessionKernelLoopV2 {
       );
     }
     const settlement: SessionPlanActionSettlementV2 = {
-      kind: 'completed',
+      kind: 'planActionComplete',
+      planRevision: plan.planRevision,
       planActionId,
-      completionKind,
+      controlEpoch: this.state.controlEpoch,
+      outcome,
       providerTurnId,
+      controlCallId,
+      controlArgumentsDigest,
+      snapshotHighWater:
+        this.state.lineage.cursor.snapshotHighWater,
       recordedAt,
     };
     this.state.planActionSettlements[planActionId] = settlement;

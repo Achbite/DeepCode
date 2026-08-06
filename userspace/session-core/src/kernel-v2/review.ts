@@ -74,12 +74,6 @@ export function buildSessionKernelReviewV2(
   }
   const planned = plannedActions(state);
   const reviewFacts = state.reviewFacts;
-  const observedCurrentPlanActions =
-    state.plan?.planRevision
-      ? reviewFacts.observedEffectPlanActions[
-          state.plan.planRevision
-        ] ?? {}
-      : {};
   return {
     projectionVersion: SESSION_KERNEL_REVIEW_PROJECTION_V2,
     revision: (state.review?.revision ?? 0) + 1,
@@ -110,7 +104,8 @@ export function buildSessionKernelReviewV2(
     actualEffects: cloneJson(reviewFacts.actualEffects.samples),
     unexecuted: planned.filter(
       (action) =>
-        !observedCurrentPlanActions[action.planActionId]
+        state.planActionSettlements[action.planActionId]?.outcome
+          !== 'completed'
     ),
     denied: cloneJson(reviewFacts.denied.samples),
     rejections: cloneJson(reviewFacts.rejections.samples),
