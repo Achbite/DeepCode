@@ -1122,6 +1122,27 @@ export class SessionKernelProviderTurnsV2 {
       },
       recordedAt
     );
+    if (output.kind === 'plan') {
+      const commentaryItems = publicSessionProviderOrderedItemsV2(
+        output.items
+      ).filter((item) =>
+        item.kind === 'text' && item.phase === 'commentary'
+      );
+      if (commentaryItems.length > 0) {
+        await this.host.project(
+          `plan:${output.plan.planRevision}:commentary-ready`,
+          'plan.commentaryReleased',
+          {
+            planRevision: output.plan.planRevision,
+            providerTurnId,
+            controlEpoch: current.providerTurn.controlEpoch,
+            orderedItems: commentaryItems,
+            recordedAt,
+          },
+          recordedAt
+        );
+      }
+    }
     if (planActionSettlement) {
       await this.host.project(
         `plan-action:${planActionSettlement.planActionId}:completed`,

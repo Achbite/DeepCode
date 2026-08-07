@@ -318,8 +318,8 @@ export interface SessionPlanConfirmationProjectionRefV2 {
 
 /**
  * Durable Session authority proving that the exact current Plan, canonical
- * previews, sealed Provider response, and public confirmation boundary were
- * committed together before a trusted user decision was admitted.
+ * previews, sealed Provider response, released commentary, and public Plan
+ * card were durably bound before a trusted user decision was admitted.
  */
 export interface SessionPlanConfirmationAuthorityV2 {
   planRevision: string;

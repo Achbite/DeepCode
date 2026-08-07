@@ -621,7 +621,7 @@ export class SessionKernelLoopV2 {
       ).filter((item) =>
         item.kind === 'text' && item.phase === 'commentary'
       );
-      const recordedAt = this.ports.clock.now();
+      const commentaryRecordedAt = providerOutcome.recordedAt;
       const commentaryEvent = orderedItems.length === 0
         ? undefined
         : this.event(
@@ -632,10 +632,17 @@ export class SessionKernelLoopV2 {
               providerTurnId: providerTurn.providerTurnId,
               controlEpoch: providerTurn.controlEpoch,
               orderedItems,
-              recordedAt,
+              recordedAt: commentaryRecordedAt,
             },
-            recordedAt
+            commentaryRecordedAt
           );
+      const commentaryProjection = commentaryEvent
+        ? requiredDeliveredProjectionReceiptV2(
+            [await this.ports.projection.project(commentaryEvent)],
+            commentaryEvent.projectionId
+          )
+        : undefined;
+      const recordedAt = this.ports.clock.now();
       const confirmationEvent = this.event(
         `plan:${expectedPlanRevision}:confirmation-ready`,
         'plan.confirmationReady',
@@ -651,18 +658,8 @@ export class SessionKernelLoopV2 {
         },
         recordedAt
       );
-      const projectionReceipts = await this.ports.projection.projectBatch([
-        ...(commentaryEvent ? [commentaryEvent] : []),
-        confirmationEvent,
-      ]);
-      const commentaryProjection = commentaryEvent
-        ? requiredDeliveredProjectionReceiptV2(
-            projectionReceipts,
-            commentaryEvent.projectionId
-          )
-        : undefined;
       const confirmationProjection = requiredDeliveredProjectionReceiptV2(
-        projectionReceipts,
+        [await this.ports.projection.project(confirmationEvent)],
         confirmationEvent.projectionId
       );
       const authority = buildSessionPlanConfirmationAuthorityV2(

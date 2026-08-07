@@ -7996,7 +7996,10 @@ fn validate_public_agent_event_payload(
                 && channel == "progress"
                 && visibility == "conversation"
                 && status == Some("running")
-                && matches!(payload_text("providerPhase"), None | Some("commentary"))
+                && matches!(
+                    payload_text("providerPhase"),
+                    None | Some("commentary" | "final_answer")
+                )
         }
         "provider.completed" => {
             status == Some("completed")

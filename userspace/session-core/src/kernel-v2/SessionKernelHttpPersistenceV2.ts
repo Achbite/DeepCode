@@ -1605,31 +1605,12 @@ implements SessionKernelProjectionPortV2 {
     if (!this.sink) return;
     const pending = await this.persistence
       .loadUndeliveredProjections(runId);
-    const consumed = new Set<string>();
     for (const event of pending) {
-      if (consumed.has(event.projectionId)) continue;
-      const confirmation = event.kind === 'plan.commentaryReleased'
-        ? pending.find((candidate) =>
-            candidate.kind === 'plan.confirmationReady'
-            && objectRecord(candidate.data)?.commentaryProjectionId
-              === event.projectionId
-          )
-        : undefined;
-      if (confirmation) {
-        await this.projectBatch([event, confirmation]);
-        consumed.add(event.projectionId);
-        consumed.add(confirmation.projectionId);
-        continue;
-      }
-      if (event.kind === 'plan.commentaryReleased') {
-        continue;
-      }
       await this.sink.publish(
         cloneJson(event),
         () => this.projectionHistoryThrough(event.projectionId)
       );
       await this.persistence.persistProjectionDelivered(event);
-      consumed.add(event.projectionId);
     }
   }
 
