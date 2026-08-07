@@ -451,6 +451,7 @@ pub struct CapabilityApprovalViewV2 {
     pub summary: String,
     pub canonical_targets: Vec<String>,
     pub scope_delta: Vec<String>,
+    #[serde(default)]
     pub resource_presentation: Vec<CapabilityResourcePresentationV2>,
     pub risk: ToolRiskV2,
     pub effect_class: ToolEffectClassV2,
