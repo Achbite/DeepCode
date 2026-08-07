@@ -1751,11 +1751,16 @@ function currentProjectionData(
           controlEpoch: 'positiveInteger',
           streamSequence: 'positiveInteger',
           textOrdinal: 'positiveInteger',
-          providerPhase: 'string',
           textDelta: 'string',
-        }
+        },
+        { providerPhase: 'string' }
       );
-      projectionEnum(data, 'providerPhase', ['commentary']);
+      if (data.providerPhase !== undefined) {
+        projectionEnum(data, 'providerPhase', [
+          'commentary',
+          'final_answer',
+        ]);
+      }
       return data;
     }
     case 'provider.completed':
@@ -2458,7 +2463,11 @@ function providerComposingPresentation(
     || Number(streamSequence) <= 0
     || !Number.isSafeInteger(textOrdinal)
     || Number(textOrdinal) <= 0
-    || providerPhase !== 'commentary'
+    || (
+      providerPhase !== undefined
+      && providerPhase !== 'commentary'
+      && providerPhase !== 'final_answer'
+    )
     || typeof textDelta !== 'string'
     || textDelta.length === 0
     || new TextEncoder().encode(textDelta).byteLength > 1024 * 1024
@@ -2478,7 +2487,7 @@ function providerComposingPresentation(
       controlEpoch,
       streamSequence,
       textOrdinal,
-      providerPhase,
+      ...(providerPhase ? { providerPhase } : {}),
       content: textDelta,
     },
   };

@@ -251,7 +251,11 @@ export function appendProviderComposingProjectionV2(
     || textOrdinal === undefined
     || textOrdinal === 0
     || textDelta === undefined
-    || providerPhase !== 'commentary'
+    || (
+      providerPhase !== undefined
+      && providerPhase !== 'commentary'
+      && providerPhase !== 'final_answer'
+    )
   ) {
     throw new Error('session_projection_provider_composing_invalid');
   }
@@ -293,10 +297,10 @@ export function appendProviderComposingProjectionV2(
     ? {
         ...existing,
         revision: (existing.revision ?? 0) + 1,
-        deliveryMode: 'replay',
-        durability: 'committed',
+        deliveryMode: 'live',
+        durability: 'live',
         entryRole: 'agentUpdate',
-        providerPhase,
+        ...(providerPhase ? { providerPhase } : {}),
         status: 'running',
         summary: combinedText,
         bodyMarkdown: combinedText,
@@ -312,12 +316,12 @@ export function appendProviderComposingProjectionV2(
         id: blockId,
         sequence: turn.blocks.length,
         revision: 1,
-        deliveryMode: 'replay',
-        durability: 'committed',
+        deliveryMode: 'live',
+        durability: 'live',
         kind: 'assistant',
         narrativeKind: 'assistantText',
         entryRole: 'agentUpdate',
-        providerPhase,
+        ...(providerPhase ? { providerPhase } : {}),
         title: 'Assistant Msg',
         summary: combinedText,
         status: 'running',
@@ -2591,7 +2595,11 @@ function projectProviderComposingIntoTurn(
       && turn.controlEpoch !== controlEpoch
     )
     || textDelta === undefined
-    || providerPhase !== 'commentary'
+    || (
+      providerPhase !== undefined
+      && providerPhase !== 'commentary'
+      && providerPhase !== 'final_answer'
+    )
   ) {
     throw new Error('session_projection_provider_composing_invalid');
   }
@@ -2629,6 +2637,8 @@ function projectProviderComposingIntoTurn(
   }
   block.id = blockId;
   block.revision = (existing?.revision ?? 0) + 1;
+  block.deliveryMode = 'live';
+  block.durability = 'live';
   block.entryRole = 'agentUpdate';
   block.status = 'running';
   block.bodyMarkdown = `${existing?.bodyMarkdown ?? ''}${textDelta}`;

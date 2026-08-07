@@ -6038,7 +6038,11 @@ fn validate_private_projection_event_data(
                 &[],
             )?;
             if data.contains_key("providerPhase") {
-                require_private_enum(data, "providerPhase", &["commentary"])?;
+                require_private_enum(
+                    data,
+                    "providerPhase",
+                    &["commentary", "final_answer"],
+                )?;
             }
         }
         "provider.completed" => validate_private_provider_completed(data)?,
@@ -8338,6 +8342,13 @@ fn validate_public_projection_payload_types(
             public_integer(payload, "streamSequence", true)?;
             public_integer(payload, "textOrdinal", true)?;
             public_optional_string(payload, "providerPhase", false)?;
+            if let Some(provider_phase) = payload.get("providerPhase").and_then(Value::as_str) {
+                if !matches!(provider_phase, "commentary" | "final_answer") {
+                    return Err(public_projection_shape_invalid(
+                        "providerPhase is not a current public Provider phase",
+                    ));
+                }
+            }
             for field in ["status", "content"] {
                 public_string(payload, field, false)?;
             }

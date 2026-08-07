@@ -2178,7 +2178,11 @@ export class SessionKernelProviderTurnsV2 {
         || delta.streamSequence <= 0
         || !Number.isSafeInteger(delta.textOrdinal)
         || delta.textOrdinal <= 0
-        || delta.providerPhase !== 'commentary'
+        || (
+          delta.providerPhase !== undefined
+          && delta.providerPhase !== 'commentary'
+          && delta.providerPhase !== 'final_answer'
+        )
         || typeof delta.textDelta !== 'string'
         || delta.textDelta.length === 0
       ) {
@@ -2217,7 +2221,9 @@ export class SessionKernelProviderTurnsV2 {
             controlEpoch,
             streamSequence: delta.streamSequence,
             textOrdinal: delta.textOrdinal,
-            providerPhase: delta.providerPhase,
+            ...(delta.providerPhase
+              ? { providerPhase: delta.providerPhase }
+              : {}),
             textDelta: delta.textDelta,
           }
         );

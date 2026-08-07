@@ -45,7 +45,7 @@ interface SessionKernelLlmStreamPendingTextItemV2
 
 interface SessionKernelLlmPendingPublicTextBatchV2 {
   textOrdinal: number;
-  providerPhase: 'commentary';
+  providerPhase?: 'commentary' | 'final_answer';
   textDelta: string;
   utf8ByteLength: number;
   startedAtMonotonicMs: number;
@@ -59,7 +59,7 @@ export interface SessionKernelLlmPublicTextDeltaV2 {
   providerTurnId: string;
   streamSequence: number;
   textOrdinal: number;
-  providerPhase: 'commentary';
+  providerPhase?: 'commentary' | 'final_answer';
   textDelta: string;
 }
 
@@ -258,7 +258,9 @@ export async function consumeProviderSseV1(
       providerTurnId: expectedRequestId,
       streamSequence: publicStreamSequence,
       textOrdinal: batch.textOrdinal,
-      providerPhase: batch.providerPhase,
+      ...(batch.providerPhase
+        ? { providerPhase: batch.providerPhase }
+        : {}),
       textDelta: batch.textDelta,
     };
     publicTextPublicationTail = publicTextPublicationTail.then(
@@ -343,7 +345,9 @@ export async function consumeProviderSseV1(
   ): Promise<void> => {
     enqueuePublicTextPublication({
       textOrdinal: item.textOrdinal,
-      providerPhase: 'commentary',
+      ...(item.phase === 'unknown'
+        ? {}
+        : { providerPhase: item.phase }),
       textDelta,
       utf8ByteLength: utf8Bytes(textDelta),
       startedAtMonotonicMs: monotonicNowMs(),
@@ -355,7 +359,9 @@ export async function consumeProviderSseV1(
     item: SessionKernelLlmStreamPendingTextItemV2,
     textDelta: string
   ): Promise<void> => {
-    const providerPhase = 'commentary' as const;
+    const providerPhase = item.phase === 'unknown'
+      ? undefined
+      : item.phase;
     let remaining = textDelta;
     while (remaining) {
       if (
@@ -404,7 +410,6 @@ export async function consumeProviderSseV1(
     if (
       !publicTextObserver
       || !content
-      || item.phase !== 'commentary'
     ) {
       return;
     }

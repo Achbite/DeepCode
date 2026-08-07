@@ -496,6 +496,7 @@ function decodeConversationPayload(
       || (
         record.providerPhase !== undefined
         && record.providerPhase !== 'commentary'
+        && record.providerPhase !== 'final_answer'
       )
       || composingText.length === 0
     ) {
