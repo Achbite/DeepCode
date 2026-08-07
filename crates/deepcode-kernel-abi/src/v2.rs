@@ -7,14 +7,14 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::tool_protocol_v2::{
-    CanonicalArgumentsDigestV2, CapabilityAuthorizationDigestV2, CapabilityLeaseIdV2,
-    CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    CanonicalArgumentsDigestV2, CapabilityAuthorizationBindingV2, CapabilityAuthorizationDigestV2,
+    CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
     CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2, ToolAvailabilityV2,
     ToolContextRefV2, ToolContractDigestV2, ToolIdV2, TrustLeaseDigestV2, TrustPolicyIdV2,
 };
 use crate::KERNEL_ABI_V2_VERSION;
 
-pub const FACT_STORE_SCHEMA_CONTRACT_V2: &str = "deepcode.kernel.fact-store.v2.sqlite.5";
+pub const FACT_STORE_SCHEMA_CONTRACT_V2: &str = "deepcode.kernel.fact-store.v2.sqlite.6";
 pub const MAX_ID_BYTES_V2: usize = 512;
 pub const MAX_TEXT_BYTES_V2: usize = 16 * 1024;
 pub const MAX_CORRELATION_REFS_V2: usize = 256;
@@ -1327,7 +1327,7 @@ pub enum AuthorizationFactV2 {
         identity: AuthorizationIdentityV2,
         preview_id: CapabilityScopePreviewIdV2,
         tool_id: ToolIdV2,
-        canonical_arguments_digest: CanonicalArgumentsDigestV2,
+        authorization_binding: CapabilityAuthorizationBindingV2,
         scope_digest: CapabilityScopeDigestV2,
         tool_contract_digest: ToolContractDigestV2,
         context_ref: ToolContextRefV2,

@@ -31,7 +31,7 @@ use crate::session_kernel_v2_store::{decode_session_work_authority_v3, SessionWo
 use crate::*;
 use deepcode_kernel_abi::v2::{CommandRequestId, InputId, RunId, UserDecisionRefV2};
 use deepcode_kernel_abi::v2_command::{
-    CapabilityScopeDispositionV2, CapabilityScopePreviewReplyV2,
+    CapabilityScopeDispositionV2, CapabilityScopePreviewBatchReplyV2, CapabilityScopePreviewReplyV2,
 };
 use deepcode_kernel_abi::{
     CapabilityLeaseIdV2, CapabilityScopePreviewIdV2, TrustPolicyIdV2, UserDecisionErrorV2,
@@ -3238,34 +3238,42 @@ async fn approve_exact_plan_previews_v2(
         let Ok(response) = success_response_v2(settlement) else {
             continue;
         };
-        if response.get("operationKind").and_then(Value::as_str) != Some("previewPlanAction") {
+        if response.get("operationKind").and_then(Value::as_str) != Some("previewPlan") {
             continue;
         }
         let Some(preview_value) = response.pointer("/outcome/preview") else {
             continue;
         };
-        let preview: CapabilityScopePreviewReplyV2 = serde_json::from_value(preview_value.clone())
-            .map_err(|_| {
+        let batch: CapabilityScopePreviewBatchReplyV2 =
+            serde_json::from_value(preview_value.clone()).map_err(|_| {
                 AgentKernelV2Error::invalid(
                     "session_plan_preview_corrupt",
-                    "A durable Plan preview is not strict Kernel v2.",
+                    "A durable Plan preview batch is not strict Kernel v2.",
                 )
             })?;
-        let CapabilityScopePreviewReplyV2::Previewed { preview } = preview else {
-            return Err(AgentKernelV2Error::invalid(
-                "session_plan_preview_rejected",
-                "The current Plan contains a rejected scope preview.",
-            ));
-        };
-        if preview.plan_revision.as_str() != plan_revision {
+        if batch.plan_revision.as_str() != plan_revision {
             continue;
         }
-        let plan_action_id = preview.plan_action_id.as_str().to_string();
-        if previews.insert(plan_action_id, preview).is_some() {
+        if batch.run_id.as_str() != active.run_id {
             return Err(AgentKernelV2Error::invalid(
-                "session_plan_preview_identity_conflict",
-                "One PlanAction has multiple durable current preview records.",
+                "session_plan_preview_binding_conflict",
+                "The durable Plan preview batch belongs to another Kernel Run.",
             ));
+        }
+        for result in batch.results {
+            let CapabilityScopePreviewReplyV2::Previewed { preview } = result else {
+                return Err(AgentKernelV2Error::invalid(
+                    "session_plan_preview_rejected",
+                    "The current Plan contains a rejected scope preview.",
+                ));
+            };
+            let plan_action_id = preview.plan_action_id.as_str().to_string();
+            if previews.insert(plan_action_id, preview).is_some() {
+                return Err(AgentKernelV2Error::invalid(
+                    "session_plan_preview_identity_conflict",
+                    "One PlanAction has multiple durable current preview records.",
+                ));
+            }
         }
     }
     if previews.len() != actions.len() {
@@ -3314,10 +3322,27 @@ async fn approve_exact_plan_previews_v2(
                         )?;
                     }
                     PlanPreviewAuthorizationModeV2::AutoPlanTrust => {
+                        let trust_identity_material = json!({
+                            "schemaVersion": "deepcode.host.auto-plan-authorization-step.v1",
+                            "step": "trustGrant",
+                            "authorization": &decision_material,
+                        });
                         apply_host_plan_trust_v2(
                             kernel_v2,
                             preview.preview_id.as_str(),
-                            &decision_material,
+                            &trust_identity_material,
+                        )?;
+                        let capability_identity_material = json!({
+                            "schemaVersion": "deepcode.host.auto-plan-authorization-step.v1",
+                            "step": "capabilityAllow",
+                            "authorization": &decision_material,
+                        });
+                        apply_host_scope_decision_v2(
+                            kernel_v2,
+                            preview.preview_id.as_str(),
+                            HostCapabilityDecisionKindV2::Allow,
+                            "",
+                            &capability_identity_material,
                         )?;
                     }
                 }
@@ -3868,9 +3893,7 @@ async fn drive_agent_kernel_until_boundary_v2(
             )
         })?;
         let operation = match continuation_kind {
-            "readyToPreviewPlanAction" => HostKernelBridgeOperationV2::PreviewPlanAction {
-                plan_action_id: required_continuation_field_v2(&settlement, "planActionId")?
-                    .to_string(),
+            "readyToPreviewPlan" => HostKernelBridgeOperationV2::PreviewPlan {
                 expected_plan_revision: required_continuation_field_v2(
                     &settlement,
                     "expectedPlanRevision",

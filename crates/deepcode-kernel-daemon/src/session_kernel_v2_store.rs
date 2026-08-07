@@ -18,7 +18,9 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use deepcode_kernel_abi::v2_command::CapabilityScopePreviewRecordV2;
-use deepcode_kernel_abi::{RunCapabilityV2, ToolContextBundleV2, ToolContextRefV2};
+use deepcode_kernel_abi::{
+    RequestedResourceV2, RunCapabilityV2, ScopeIntentV2, ToolContextBundleV2, ToolContextRefV2,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2598,6 +2600,7 @@ fn read_run_store(
         validate_persistence_record(&record, session_id, run_id).map_err(|error| {
             HostV2StorageError::conflict(
                 if record.record_kind == SessionKernelPersistenceRecordKindV3::ToolContextSnapshot
+                    || record.record_kind == SessionKernelPersistenceRecordKindV3::Plan
                     || error.code == "session_kernel_persistence_schema_unsupported"
                     || is_tool_context_history_error_code(error.code)
                 {
@@ -2773,6 +2776,9 @@ fn validate_persistence_record(
         SessionKernelPersistenceRecordKindV3::Input => {
             persisted_input_record_id(record, run_id)?;
         }
+        SessionKernelPersistenceRecordKindV3::Plan => {
+            validate_persisted_plan_record(record, run_id)?;
+        }
         SessionKernelPersistenceRecordKindV3::PublicRequest => {
             persisted_public_request_identity(record, run_id)?;
         }
@@ -2801,6 +2807,29 @@ fn validate_persistence_record(
             validate_provider_turn_terminal_record(record, run_id)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_persisted_plan_record(
+    record: &SessionKernelPersistenceRecordV3,
+    run_id: &str,
+) -> Result<(), HostV2StorageError> {
+    let plan = record.data.as_object().ok_or_else(|| {
+        private_projection_data_invalid("Session private Plan must be an exact current object")
+    })?;
+    validate_private_plan(plan)?;
+    let plan_revision = plan
+        .get("planRevision")
+        .and_then(Value::as_str)
+        .expect("validated private Plan revision");
+    if plan.get("runId").and_then(Value::as_str) != Some(run_id)
+        || plan.get("recordedAt").and_then(Value::as_str) != Some(record.recorded_at.as_str())
+        || record.record_id != format!("session-kernel-v3:{run_id}:plan:{plan_revision}")
+    {
+        return Err(private_projection_data_invalid(
+            "Session private Plan record identity does not match its durable wrapper",
+        ));
     }
     Ok(())
 }
@@ -2933,7 +2962,12 @@ fn decode_compact_checkpoint_record(
         &authority.provider_profile_revision_digest,
         "providerProfileRevisionDigest",
     )?;
-    if !authority.previews.is_object() || !authority.operation_plan_action_bindings.is_object() {
+    validate_compact_checkpoint_scope_previews(
+        &authority.previews,
+        &authority.run_id,
+        authority.control_epoch,
+    )?;
+    if !authority.operation_plan_action_bindings.is_object() {
         return Err(compact_checkpoint_authority_invalid());
     }
     if let Some(work_authority) = &authority.work_authority {
@@ -3368,6 +3402,34 @@ fn compact_checkpoint_authority_invalid() -> HostV2StorageError {
         "session_kernel_checkpoint_authority_invalid",
         "Session Kernel compact checkpoint authority is invalid",
     )
+}
+
+fn validate_compact_checkpoint_scope_previews(
+    value: &Value,
+    run_id: &str,
+    control_epoch: u64,
+) -> Result<(), HostV2StorageError> {
+    let previews = value
+        .as_object()
+        .ok_or_else(compact_checkpoint_authority_invalid)?;
+    let mut preview_ids = HashSet::new();
+    let mut plan_action_ids = HashSet::new();
+    for (operation_id, value) in previews {
+        let preview: CapabilityScopePreviewRecordV2 = serde_json::from_value(value.clone())
+            .map_err(|_| compact_checkpoint_authority_invalid())?;
+        preview
+            .validate()
+            .map_err(|_| compact_checkpoint_authority_invalid())?;
+        if preview.operation_id.as_str() != operation_id
+            || preview.run_id.as_str() != run_id
+            || preview.control_epoch.get() != control_epoch
+            || !preview_ids.insert(preview.preview_id.as_str().to_string())
+            || !plan_action_ids.insert(preview.plan_action_id.as_str().to_string())
+        {
+            return Err(compact_checkpoint_authority_invalid());
+        }
+    }
+    Ok(())
 }
 
 fn validate_provider_turn_terminal_record(
@@ -6038,11 +6100,7 @@ fn validate_private_projection_event_data(
                 &[],
             )?;
             if data.contains_key("providerPhase") {
-                require_private_enum(
-                    data,
-                    "providerPhase",
-                    &["commentary", "final_answer"],
-                )?;
+                require_private_enum(data, "providerPhase", &["commentary", "final_answer"])?;
             }
         }
         "provider.completed" => validate_private_provider_completed(data)?,
@@ -6405,7 +6463,134 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
             "Session private Plan text must be non-empty",
         ));
     }
+    let plan_revision = data
+        .get("planRevision")
+        .and_then(Value::as_str)
+        .expect("validated private Plan revision");
+    let actions = data
+        .get("actions")
+        .and_then(Value::as_array)
+        .expect("validated private Plan actions");
+    if actions.is_empty() || actions.len() > 128 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan must contain 1..=128 current PlanActions",
+        ));
+    }
+    for action in actions {
+        validate_private_plan_action(action, plan_revision)?;
+    }
     Ok(())
+}
+
+fn validate_private_plan_action(
+    value: &Value,
+    plan_revision: &str,
+) -> Result<(), HostV2StorageError> {
+    let action = value.as_object().ok_or_else(|| {
+        private_projection_data_invalid("Session private PlanAction must be an object")
+    })?;
+    validate_private_projection_fields(
+        action,
+        &["taskId", "manifest", "idempotencyKey", "deadline"],
+        &[],
+        &["taskId", "idempotencyKey"],
+        &[],
+        &[],
+        &["manifest", "deadline"],
+        &[],
+        &[],
+    )?;
+    let manifest = action
+        .get("manifest")
+        .and_then(Value::as_object)
+        .expect("validated private ScopeManifest");
+    validate_private_projection_fields(
+        manifest,
+        &[
+            "planRevision",
+            "planActionId",
+            "operationId",
+            "toolId",
+            "scopeIntent",
+        ],
+        &[],
+        &["planRevision", "planActionId", "operationId", "toolId"],
+        &[],
+        &[],
+        &["scopeIntent"],
+        &[],
+        &[],
+    )?;
+    if manifest.get("planRevision").and_then(Value::as_str) != Some(plan_revision) {
+        return Err(private_projection_data_invalid(
+            "Session private ScopeManifest does not bind its enclosing Plan revision",
+        ));
+    }
+    let scope_intent: ScopeIntentV2 = serde_json::from_value(
+        manifest
+            .get("scopeIntent")
+            .expect("validated private ScopeIntent")
+            .clone(),
+    )
+    .map_err(|_| {
+        private_projection_data_invalid(
+            "Session private ScopeIntent must use the exact current ABI shape",
+        )
+    })?;
+    scope_intent.validate().map_err(|_| {
+        private_projection_data_invalid("Session private ScopeIntent violates current invariants")
+    })?;
+    validate_private_deadline(
+        action
+            .get("deadline")
+            .expect("validated private PlanAction deadline"),
+    )
+}
+
+fn validate_private_deadline(value: &Value) -> Result<(), HostV2StorageError> {
+    let deadline = value.as_object().ok_or_else(|| {
+        private_projection_data_invalid("Session private deadline must be an object")
+    })?;
+    validate_private_projection_fields(
+        deadline,
+        &["kind", "data"],
+        &[],
+        &[],
+        &[],
+        &[],
+        &["data"],
+        &[],
+        &[],
+    )?;
+    let data = deadline
+        .get("data")
+        .and_then(Value::as_object)
+        .expect("validated private deadline data");
+    match deadline.get("kind").and_then(Value::as_str) {
+        Some("contractDefault") if data.is_empty() => Ok(()),
+        Some("exactMilliseconds") => {
+            validate_private_projection_fields(
+                data,
+                &["value"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["value"],
+                &[],
+            )?;
+            if data.get("value").and_then(Value::as_u64) == Some(0) {
+                return Err(private_projection_data_invalid(
+                    "Session private exact deadline must be positive",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(private_projection_data_invalid(
+            "Session private deadline kind or data is not current",
+        )),
+    }
 }
 
 fn decode_private_scope_preview(
@@ -7080,6 +7265,28 @@ fn read_session_kernel_v2_public_agent_events_unlocked(
         events_by_id.insert(event_id, record.agent_event.clone());
         events.push(record.agent_event);
     }
+    let timeline_path = public_timeline_path(sessions_dir, session_id)?;
+    let committed_source_event_version = read_public_timeline_records(&timeline_path, session_id)?
+        .last()
+        .map(|record| record.source_event_version)
+        .unwrap_or(0);
+    let committed_event_count = usize::try_from(committed_source_event_version).map_err(|_| {
+        HostV2StorageError::conflict(
+            "session_kernel_public_event_version_invalid",
+            "Committed Session public event version is not representable",
+        )
+    })?;
+    if events.len() < committed_event_count {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_public_event_prefix_missing",
+            "Committed Session public timeline exceeds its durable AgentEvent prefix",
+        ));
+    }
+    // AgentEvent records are appended before the matching timeline snapshot.
+    // A crash may therefore leave a valid but uncommitted suffix. Public
+    // readers, Run recovery, and count paths must observe only the prefix
+    // committed by the latest canonical timeline.
+    events.truncate(committed_event_count);
     Ok(events)
 }
 
@@ -8614,6 +8821,11 @@ fn validate_public_plan_tasks(value: &Value, scoped: bool) -> Result<(), HostV2S
     let tasks = value
         .as_array()
         .ok_or_else(|| public_projection_shape_invalid("Plan tasks must be an array"))?;
+    if tasks.is_empty() || tasks.len() > 128 {
+        return Err(public_projection_shape_invalid(
+            "Plan tasks must contain 1..=128 current PlanActions",
+        ));
+    }
     for task in tasks {
         let optional = if scoped {
             &["scopePreview", "approvalView"][..]
@@ -8622,13 +8834,7 @@ fn validate_public_plan_tasks(value: &Value, scoped: bool) -> Result<(), HostV2S
         };
         let task = public_exact_object(
             task,
-            &[
-                "taskId",
-                "manifest",
-                "previewArguments",
-                "idempotencyKey",
-                "deadline",
-            ],
+            &["taskId", "manifest", "idempotencyKey", "deadline"],
             optional,
             "Plan task",
         )?;
@@ -8636,7 +8842,6 @@ fn validate_public_plan_tasks(value: &Value, scoped: bool) -> Result<(), HostV2S
             public_string(task, field, true)?;
         }
         validate_public_scope_manifest(task.get("manifest").expect("required manifest"))?;
-        public_object(task, "previewArguments")?;
         validate_public_deadline(task.get("deadline").expect("required deadline"))?;
         if task.contains_key("scopePreview") {
             let preview = task.get("scopePreview").expect("present scope preview");
@@ -8667,7 +8872,7 @@ fn validate_public_scope_manifest(value: &Value) -> Result<(), HostV2StorageErro
             "planActionId",
             "operationId",
             "toolId",
-            "requestedResources",
+            "scopeIntent",
         ],
         &[],
         "Scope manifest",
@@ -8675,47 +8880,50 @@ fn validate_public_scope_manifest(value: &Value) -> Result<(), HostV2StorageErro
     for field in ["planRevision", "planActionId", "operationId", "toolId"] {
         public_string(manifest, field, true)?;
     }
-    let resources = public_array(manifest, "requestedResources")?;
-    for resource in resources {
-        let resource = public_exact_object(resource, &["kind", "data"], &[], "Requested resource")?;
-        let kind = public_string(resource, "kind", false)?;
-        let data = public_object(resource, "data")?;
-        match kind {
-            "workspacePath" => {
-                let data = public_exact_map(data, &["path", "access"], &[], "Workspace resource")?;
-                public_string(data, "path", false)?;
-                if !matches!(public_string(data, "access", false)?, "read" | "write") {
-                    return Err(public_projection_shape_invalid(
-                        "Workspace resource access is invalid",
-                    ));
-                }
-            }
-            "repository" => {
-                let data = public_exact_map(data, &["area"], &[], "Repository resource")?;
-                if !matches!(
-                    public_string(data, "area", false)?,
-                    "state" | "index" | "history"
-                ) {
-                    return Err(public_projection_shape_invalid(
-                        "Repository resource area is invalid",
-                    ));
-                }
-            }
-            "networkUrl" | "networkQuery" | "exactInvocation" => {
-                let field = match kind {
-                    "networkUrl" => "url",
-                    "networkQuery" => "query",
-                    _ => "invocationDigest",
-                };
-                let data = public_exact_map(data, &[field], &[], "Requested resource data")?;
-                public_string(data, field, false)?;
-            }
-            _ => {
+    validate_public_scope_intent(manifest.get("scopeIntent").expect("required scopeIntent"))
+}
+
+fn validate_public_scope_intent(value: &Value) -> Result<(), HostV2StorageError> {
+    let intent = public_exact_object(value, &["kind", "data"], &[], "Scope intent")?;
+    let kind = public_string(intent, "kind", false)?;
+    let data = public_object(intent, "data")?;
+    match kind {
+        "resourceScope" => {
+            let data = public_exact_map(
+                data,
+                &["requestedResources"],
+                &[],
+                "Resource-scope intent data",
+            )?;
+            let resources = public_array(data, "requestedResources")?;
+            if resources.is_empty() || resources.len() > 256 {
                 return Err(public_projection_shape_invalid(
-                    "Requested resource kind is not current",
-                ))
+                    "Resource-scope intent must contain 1..=256 requested resources",
+                ));
             }
+            validate_public_requested_resources(resources)
         }
+        "exactInvocation" => {
+            public_exact_map(data, &[], &[], "Exact-invocation public intent data")?;
+            Ok(())
+        }
+        _ => Err(public_projection_shape_invalid(
+            "Scope intent kind is not current",
+        )),
+    }
+}
+
+fn validate_public_requested_resources(resources: &[Value]) -> Result<(), HostV2StorageError> {
+    for resource in resources {
+        let resource: RequestedResourceV2 =
+            serde_json::from_value(resource.clone()).map_err(|_| {
+                public_projection_shape_invalid(
+                    "Requested resource must use the exact current resource-scope shape",
+                )
+            })?;
+        resource.validate().map_err(|_| {
+            public_projection_shape_invalid("Requested resource violates current ABI invariants")
+        })?;
     }
     Ok(())
 }

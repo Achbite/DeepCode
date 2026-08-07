@@ -1,16 +1,17 @@
 use super::authority::{
-    caused_direct_attempt, command_receipt_draft, corrupt_store, direct_execution_result_drafts,
-    direct_failed_before_effect_drafts, direct_pre_effect_stop_drafts,
-    direct_tool_intent_admission_drafts, direct_tool_intent_continuation_drafts,
-    epoch_advance_drafts, exact_epoch, explicit_cancellation_drafts, fact_draft, invalid_field,
+    canonicalize_requested_resource_scope, caused_direct_attempt, command_receipt_draft,
+    corrupt_store, direct_execution_result_drafts, direct_failed_before_effect_drafts,
+    direct_pre_effect_stop_drafts, direct_tool_intent_admission_drafts,
+    direct_tool_intent_continuation_drafts, epoch_advance_drafts, exact_epoch,
+    explicit_cancellation_drafts, fact_draft, invalid_field, materialize_deadline,
     plan_control_cancellation, plan_epoch_advance, prepare_direct_effect,
     prepare_direct_tool_intent, prepare_failure_error, recorded_error_to_error,
     require_current_run, resolve_execution, resolve_workspace_binding, storage_fault,
     EffectPreparation, EpochAdvancePlan,
 };
 use super::model::{
-    invocation_phase_is_terminal, AuthorityResult, AuthorityState, ExecutionResolution,
-    InvocationPhase, RawExecution, ResolvedTarget, WorkspaceBinding,
+    invocation_phase_is_terminal, AuthorityResult, AuthorityState, AuthorizationTargetKey,
+    ExecutionResolution, InvocationPhase, RawExecution, ResolvedTarget, WorkspaceBinding,
 };
 use crate::executors::{
     builtin_executors, invoke_document_read_complete, invoke_web_fetch_complete,
@@ -35,8 +36,8 @@ use deepcode_kernel_abi::v2_command::{
     RecordedCommandErrorV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::{
-    CanonicalArgumentsDigestV2, RunCapabilityV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
-    WorkspaceBindingRefV2,
+    CanonicalArgumentsDigestV2, RequestedResourceV2, RunCapabilityV2, ToolContextRefV2,
+    ToolContractDigestV2, ToolEffectScopeV2, ToolIdV2, WorkspaceBindingRefV2,
 };
 use deepcode_kernel_ledger::v2::{
     AppendWithAuthorityMaterialOutcomeV2, AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2,
@@ -559,6 +560,49 @@ impl AuthorityService {
         )
         .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
         Ok((prepared.resource_scope, prepared.effective_deadline_ms))
+    }
+
+    pub(super) fn canonical_scope_for_requested_resources(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        tool_id: &ToolIdV2,
+        effect_scope: ToolEffectScopeV2,
+        requested_resources: &[RequestedResourceV2],
+        deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
+    ) -> AuthorityResult<(
+        deepcode_kernel_abi::v2::ResourceScopeV2,
+        Vec<AuthorizationTargetKey>,
+        u32,
+    )> {
+        {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            require_current_run(&state, run_id, control_epoch)?;
+        }
+        let registry = crate::kernel_tool_registry();
+        let tool_kind = registry
+            .kernel_internal_tool_kind(tool_id)
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))?;
+        let admission = registry
+            .kernel_internal_admission_metadata(tool_id)
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))?;
+        let effective_deadline_ms = materialize_deadline(
+            deadline,
+            admission.default_deadline_ms,
+            admission.maximum_deadline_ms,
+        )
+        .map_err(|failure| prepare_failure_error("deadline", failure))?;
+        let workspace = self.workspace_for_run(run_id)?;
+        let executor_runtime = self.executor_runtime_snapshot()?;
+        let (scope, targets) = canonicalize_requested_resource_scope(
+            tool_kind,
+            effect_scope,
+            requested_resources,
+            &workspace,
+            &executor_runtime.config,
+        )
+        .map_err(|failure| prepare_failure_error("scopeIntent.requestedResources", failure))?;
+        Ok((scope, targets, effective_deadline_ms))
     }
 
     pub(super) fn open_run_with_public_receipt(

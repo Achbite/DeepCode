@@ -449,6 +449,7 @@ function assertToolContractDigest(tool: ToolDescriptorV2): void {
     effectClass: tool.effectClass,
     effectScope: tool.effectScope,
     risk: tool.risk,
+    authorizationShape: tool.authorizationShape,
   });
   if (tool.contractDigest !== expected) {
     throw new KernelToolContextError(
@@ -466,6 +467,7 @@ function renderKernelToolPromptV2(
     prompt += `\n\nToolId: ${tool.toolId}`;
     prompt += `\nDescription: ${tool.description}`;
     prompt += `\nInputSchema: ${canonicalJson(tool.inputSchema)}`;
+    prompt += `\nAuthorizationShape: ${tool.authorizationShape}`;
     prompt += `\nInstruction: ${tool.promptTemplate}`;
   }
   return prompt;

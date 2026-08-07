@@ -1,11 +1,14 @@
 import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 import type {
+  CapabilityScopePreviewRecordV2,
   DeadlineRequestV2,
   ToolContextBundleV2,
   ToolContextRefV2,
 } from '@deepcode/protocol';
 import {
+  decodeKernelCommandResponseEnvelopeV2,
   decodeToolContextBundleV2,
+  KERNEL_ABI_V2_VERSION,
 } from '@deepcode/protocol';
 import type {
   SessionKernelPersistencePortV2,
@@ -17,6 +20,7 @@ import type {
 import {
   createSessionKernelLoopStateV2,
   createSessionReviewFactAccumulatorV2,
+  currentSessionPlanScopePreviewsV2,
   currentSessionUserInputV2,
   prepareSessionKernelFactReplayV3,
   sameSessionWorkAuthorityV3,
@@ -1605,11 +1609,126 @@ implements SessionKernelProjectionPortV2 {
     if (!this.sink) return;
     const pending = await this.persistence
       .loadUndeliveredProjections(runId);
+    const history = await this.persistence.loadProjectionEvents(runId);
+    const historyById = new Map(
+      history.map((event) => [event.projectionId, event] as const)
+    );
+    const historyIndexById = new Map(
+      history.map((event, index) => [event.projectionId, index] as const)
+    );
+    const confirmationByCommentaryId = new Map<
+      string,
+      SessionKernelProjectionEventV2
+    >();
+    for (const event of history) {
+      if (event.kind !== 'plan.confirmationReady') continue;
+      const commentaryProjectionId = objectRecord(
+        event.data
+      )?.commentaryProjectionId;
+      if (typeof commentaryProjectionId !== 'string') continue;
+      const existing = confirmationByCommentaryId.get(
+        commentaryProjectionId
+      );
+      if (existing && existing.projectionId !== event.projectionId) {
+        throw new SessionKernelPersistenceError(
+          'session_kernel_projection_batch_conflict',
+          'One Plan commentary projection is referenced by multiple confirmation boundaries.'
+        );
+      }
+      confirmationByCommentaryId.set(commentaryProjectionId, event);
+    }
+    const recovered = new Set<string>();
     for (const event of pending) {
+      if (recovered.has(event.projectionId)) continue;
+      if (event.kind === 'plan.commentaryReleased') {
+        const confirmation = confirmationByCommentaryId.get(
+          event.projectionId
+        );
+        if (!confirmation) {
+          // A crash may durably append commentary before its confirmation.
+          // Keep it private and pending until the same immutable confirmation
+          // identity is later persisted.
+          break;
+        }
+        await this.publishRecoveredPlanConfirmationBatch(
+          [event, confirmation],
+          historyIndexById
+        );
+        recovered.add(event.projectionId);
+        recovered.add(confirmation.projectionId);
+        continue;
+      }
+      if (event.kind === 'plan.confirmationReady') {
+        const commentaryProjectionId = objectRecord(
+          event.data
+        )?.commentaryProjectionId;
+        if (commentaryProjectionId !== undefined) {
+          if (typeof commentaryProjectionId !== 'string') {
+            throw new SessionKernelPersistenceError(
+              'session_kernel_projection_batch_invalid',
+              'Plan confirmation commentary identity is invalid.'
+            );
+          }
+          const commentary = historyById.get(commentaryProjectionId);
+          if (!commentary) {
+            throw new SessionKernelPersistenceError(
+              'session_kernel_projection_batch_incomplete',
+              'Plan confirmation references a missing durable commentary projection.'
+            );
+          }
+          await this.publishRecoveredPlanConfirmationBatch(
+            [commentary, event],
+            historyIndexById
+          );
+          recovered.add(commentary.projectionId);
+          recovered.add(event.projectionId);
+          continue;
+        }
+        await this.publishRecoveredPlanConfirmationBatch(
+          [event],
+          historyIndexById
+        );
+        recovered.add(event.projectionId);
+        continue;
+      }
       await this.sink.publish(
         cloneJson(event),
         () => this.projectionHistoryThrough(event.projectionId)
       );
+      await this.persistence.persistProjectionDelivered(event);
+      recovered.add(event.projectionId);
+    }
+  }
+
+  private async publishRecoveredPlanConfirmationBatch(
+    events: readonly SessionKernelProjectionEventV2[],
+    historyIndexById: ReadonlyMap<string, number>
+  ): Promise<void> {
+    const batch = exactPlanConfirmationProjectionBatchV2(events);
+    if (batch.length === 2) {
+      const commentaryIndex = historyIndexById.get(
+        batch[0]!.projectionId
+      );
+      const confirmationIndex = historyIndexById.get(
+        batch[1]!.projectionId
+      );
+      if (
+        commentaryIndex === undefined
+        || confirmationIndex !== commentaryIndex + 1
+      ) {
+        throw new SessionKernelPersistenceError(
+          'session_kernel_projection_batch_order_invalid',
+          'Plan commentary and confirmation are not adjacent in durable projection order.'
+        );
+      }
+    }
+    await this.sink!.publishBatch(
+      batch.map(cloneJson),
+      () => this.projectionHistoryThrough(
+        batch[batch.length - 1]!.projectionId
+      )
+    );
+    for (const event of batch) {
       await this.persistence.persistProjectionDelivered(event);
     }
   }
@@ -1837,7 +1956,7 @@ function decodePersistedPublicRequestV2(
     : intent.kind === 'toolIntentSubmit'
       ? 'effect'
       : intent.kind === 'toolContextGet'
-          || intent.kind === 'capabilityPreview'
+          || intent.kind === 'capabilityPreviewBatch'
           || intent.kind === 'factsQuery'
         ? 'query'
         : undefined;
@@ -2760,6 +2879,15 @@ function decodeCompactCheckpointV3(
       'session_kernel_checkpoint_authority_invalid'
     );
   }
+  const controlEpoch = positiveSafeIntegerV3(
+    authority.controlEpoch,
+    'controlEpoch'
+  );
+  const previews = decodeCheckpointScopePreviewsV3(
+    authority.previews,
+    runId,
+    controlEpoch
+  );
   const toolContext = exactObjectOptional(
     authority.toolContext,
     ['currentRef', 'refreshRequired'],
@@ -2885,10 +3013,7 @@ function decodeCompactCheckpointV3(
         authority.workspaceBindingDigest,
         'workspaceBindingDigest'
       ),
-      controlEpoch: positiveSafeIntegerV3(
-        authority.controlEpoch,
-        'controlEpoch'
-      ),
+      controlEpoch,
       currentInputId: requiredIdentity(
         authority.currentInputId,
         'currentInputId'
@@ -2937,8 +3062,7 @@ function decodeCompactCheckpointV3(
               authority.planConfirmation
             ) as import('./types.js').SessionPlanConfirmationAuthorityV2,
           }),
-      previews: cloneJson(authority.previews) as
-        SessionKernelLoopStateV2['previews'],
+      previews,
       operationPlanActionBindings: cloneJson(
         authority.operationPlanActionBindings
       ) as Record<string, SessionOperationPlanActionBindingV2>,
@@ -3013,6 +3137,76 @@ function decodeCompactCheckpointV3(
     },
     ...(finalAnswer === undefined ? {} : { finalAnswer }),
   };
+}
+
+function decodeCheckpointScopePreviewsV3(
+  value: unknown,
+  runId: string,
+  controlEpoch: number
+): Record<string, CapabilityScopePreviewRecordV2> {
+  const records = objectRecord(value);
+  if (!records) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_checkpoint_scope_previews_invalid'
+    );
+  }
+  const previews: Record<string, CapabilityScopePreviewRecordV2> = {};
+  const previewIds = new Set<string>();
+  const planActionIds = new Set<string>();
+  for (const [operationId, rawPreview] of Object.entries(records)) {
+    const rawRecord = objectRecord(rawPreview);
+    const planRevision = rawRecord?.planRevision;
+    let preview: CapabilityScopePreviewRecordV2;
+    try {
+      const envelope = decodeKernelCommandResponseEnvelopeV2({
+        kind: 'correlated',
+        data: {
+          serverAbiVersion: KERNEL_ABI_V2_VERSION,
+          requestId: 'session-kernel-checkpoint-preview',
+          handling: 'replayed',
+          reply: {
+            kind: 'capabilityScopePreviewBatchResult',
+            data: {
+              runId,
+              acceptedControlEpoch: controlEpoch,
+              planRevision,
+              results: [{
+                kind: 'previewed',
+                data: { preview: rawPreview },
+              }],
+            },
+          },
+        },
+      });
+      const reply = envelope.kind === 'correlated'
+        ? envelope.data.reply
+        : undefined;
+      const result = reply?.kind === 'capabilityScopePreviewBatchResult'
+        ? reply.data.results[0]
+        : undefined;
+      if (!result || result.kind !== 'previewed') {
+        throw new Error('scope preview decoder returned another reply kind');
+      }
+      preview = result.data.preview;
+    } catch {
+      throw new UnsupportedHistorySchemaError(
+        'session_kernel_checkpoint_scope_preview_invalid'
+      );
+    }
+    if (
+      operationId !== preview.operationId
+      || preview.runId !== runId
+      || preview.controlEpoch !== controlEpoch
+      || !previewIds.add(preview.previewId)
+      || !planActionIds.add(preview.planActionId)
+    ) {
+      throw new UnsupportedHistorySchemaError(
+        'session_kernel_checkpoint_scope_preview_binding_invalid'
+      );
+    }
+    previews[operationId] = cloneJson(preview);
+  }
+  return previews;
 }
 
 function decodeToolContextRefV3(
@@ -4332,6 +4526,17 @@ function materializeCompactCheckpointV3(input: {
       checkpoint.authority.planRef,
       'plan'
     ).data) as SessionNaturalLanguagePlanV2;
+  }
+  try {
+    currentSessionPlanScopePreviewsV2(
+      state,
+      state.plan,
+      { requireComplete: false }
+    );
+  } catch {
+    throw new UnsupportedHistorySchemaError(
+      'checkpoint-scope-preview-binding-invalid'
+    );
   }
   if (checkpoint.authority.planDecisionRef) {
     state.planDecision = cloneJson(resolveRecordRefV3(

@@ -358,6 +358,22 @@ pub enum ToolRiskV2 {
     Critical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolAuthorizationShapeV2 {
+    ResourceScope,
+    ExactInvocation,
+}
+
+impl ToolAuthorizationShapeV2 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResourceScope => "resourceScope",
+            Self::ExactInvocation => "exactInvocation",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolDescriptorV2 {
@@ -369,6 +385,7 @@ pub struct ToolDescriptorV2 {
     pub effect_class: ToolEffectClassV2,
     pub effect_scope: ToolEffectScopeV2,
     pub risk: ToolRiskV2,
+    pub authorization_shape: ToolAuthorizationShapeV2,
     pub contract_digest: ToolContractDigestV2,
 }
 
@@ -383,6 +400,7 @@ impl ToolDescriptorV2 {
         effect_class: ToolEffectClassV2,
         effect_scope: ToolEffectScopeV2,
         risk: ToolRiskV2,
+        authorization_shape: ToolAuthorizationShapeV2,
     ) -> Result<Self, V2ValidationError> {
         let mut descriptor = Self {
             tool_id,
@@ -393,6 +411,7 @@ impl ToolDescriptorV2 {
             effect_class,
             effect_scope,
             risk,
+            authorization_shape,
             contract_digest: ToolContractDigestV2::parse(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
             )?,
@@ -540,6 +559,8 @@ pub fn render_kernel_tool_prompt_v2(
             std::str::from_utf8(&schema)
                 .map_err(|_| invalid_value("tool.inputSchema", "must encode as UTF-8"))?,
         );
+        prompt.push_str("\nAuthorizationShape: ");
+        prompt.push_str(tool.authorization_shape.as_str());
         prompt.push_str("\nInstruction: ");
         prompt.push_str(&tool.prompt_template);
     }
@@ -579,9 +600,6 @@ pub enum RequestedResourceV2 {
     NetworkQuery {
         query: String,
     },
-    ExactInvocation {
-        invocation_digest: ExactInvocationDigestV2,
-    },
 }
 
 impl RequestedResourceV2 {
@@ -596,7 +614,83 @@ impl RequestedResourceV2 {
             Self::NetworkQuery { query } => {
                 validate_bounded_text("requestedResource.query", query, 16 * 1024)
             }
-            Self::Repository { .. } | Self::ExactInvocation { .. } => Ok(()),
+            Self::Repository { .. } => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ScopeIntentV2 {
+    ResourceScope {
+        requested_resources: Vec<RequestedResourceV2>,
+    },
+    ExactInvocation {
+        raw_arguments: RawToolArgumentsV2,
+    },
+}
+
+impl ScopeIntentV2 {
+    pub const fn authorization_shape(&self) -> ToolAuthorizationShapeV2 {
+        match self {
+            Self::ResourceScope { .. } => ToolAuthorizationShapeV2::ResourceScope,
+            Self::ExactInvocation { .. } => ToolAuthorizationShapeV2::ExactInvocation,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        match self {
+            Self::ResourceScope {
+                requested_resources,
+            } => {
+                if requested_resources.is_empty() {
+                    return Err(invalid_value(
+                        "scopeIntent.requestedResources",
+                        "must contain at least one resource",
+                    ));
+                }
+                if requested_resources.len() > MAX_TOOL_CONTEXT_ITEMS_V2 {
+                    return Err(invalid_value(
+                        "scopeIntent.requestedResources",
+                        "contains too many resources",
+                    ));
+                }
+                for resource in requested_resources {
+                    resource.validate()?;
+                }
+                Ok(())
+            }
+            Self::ExactInvocation { .. } => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CapabilityAuthorizationBindingV2 {
+    ResourceScope {},
+    ExactInvocation {
+        invocation_digest: ExactInvocationDigestV2,
+    },
+}
+
+impl CapabilityAuthorizationBindingV2 {
+    pub const fn authorization_shape(&self) -> ToolAuthorizationShapeV2 {
+        match self {
+            Self::ResourceScope {} => ToolAuthorizationShapeV2::ResourceScope,
+            Self::ExactInvocation { .. } => ToolAuthorizationShapeV2::ExactInvocation,
         }
     }
 }
@@ -645,6 +739,7 @@ pub fn tool_contract_digest_v2(
             "effectClass": descriptor.effect_class,
             "effectScope": descriptor.effect_scope,
             "risk": descriptor.risk,
+            "authorizationShape": descriptor.authorization_shape,
         }),
     )?))
 }

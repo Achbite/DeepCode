@@ -1,4 +1,6 @@
-import type { CapabilityScopePreviewReplyV2 } from '@deepcode/protocol';
+import type {
+  CapabilityScopePreviewBatchReplyV2,
+} from '@deepcode/protocol';
 import {
   SessionKernelLoopV2,
   type SessionKernelLoopV2Options,
@@ -225,14 +227,10 @@ export class SessionKernelHostRunnerV2 {
     return this.requireProviderPlanRecorded(result);
   }
 
-  async previewPlanAction(
-    planActionId: string,
+  async previewPlan(
     expectedPlanRevision: string
-  ): Promise<CapabilityScopePreviewReplyV2> {
-    return this.loop.previewPlanAction(
-      planActionId,
-      expectedPlanRevision
-    );
+  ): Promise<CapabilityScopePreviewBatchReplyV2> {
+    return this.loop.previewPlan(expectedPlanRevision);
   }
 
   publishPlanConfirmationReady(

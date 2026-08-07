@@ -1,8 +1,8 @@
 use super::model::{
     invocation_phase_is_terminal, AuthorityResult, AuthorityRunRetirementFence, AuthorityState,
-    DirectInvocationRecord, ExecutionResolution, InvocationPhase, PreparedDirectToolIntent,
-    RawExecution, ResolvedTarget, ResourceRecord, RunRecord, StopOverlay, VerifiedExecution,
-    WorkspaceBinding,
+    AuthorizationTargetKey, DirectInvocationRecord, ExecutionResolution, InvocationPhase,
+    PreparedDirectToolIntent, RawExecution, ResolvedTarget, ResourceRecord, RunRecord, StopOverlay,
+    VerifiedExecution, WorkspaceBinding,
 };
 use crate::executors::{plan_v2_text_edit, KernelExecutorConfig};
 use crate::network_policy::review_http_target;
@@ -21,12 +21,12 @@ use deepcode_kernel_abi::v2::{
     KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2, NetworkAddressV2,
     NetworkHostV2, NetworkOriginV2, NetworkQueryV2, NetworkRequestTargetV2, NetworkSchemeV2,
     NetworkTargetObservationDigestV2, OperationId, PlatformV2, PostObservedEffectFailureCodeV2,
-    PreEffectFailureCodeV2, PresentFileObservationV2, ResolvedResourceV2, ResourceAccessV2,
-    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, ResourceResolvedIdentityV2,
-    ResourceScopeV2, ResourceStateV2, RunId, TargetRevalidationDigestV2,
-    TargetRevalidationObservationV2, TargetRevalidationSetDigestV2, ToolAttemptIdentityV2,
-    ToolEffectIdentityV2, ToolObservedTerminalIdentityV2, TransitionIdentityV2,
-    WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
+    PreEffectFailureCodeV2, PresentFileObservationV2, RepositoryAreaV2, ResolvedResourceV2,
+    ResourceAccessV2, ResourceAttemptIdentityV2, ResourceFactV2, ResourceId,
+    ResourceResolvedIdentityV2, ResourceScopeV2, ResourceStateV2, RunId,
+    TargetRevalidationDigestV2, TargetRevalidationObservationV2, TargetRevalidationSetDigestV2,
+    ToolAttemptIdentityV2, ToolEffectIdentityV2, ToolObservedTerminalIdentityV2,
+    TransitionIdentityV2, WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
 };
 use deepcode_kernel_abi::v2_command::{
     ControlCancellationReplyV2, ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2,
@@ -34,8 +34,8 @@ use deepcode_kernel_abi::v2_command::{
     InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, MutationCommandKindV2,
     RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
 };
-use deepcode_kernel_abi::ToolIdV2;
 use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, KernelError, ToolContractDigestV2};
+use deepcode_kernel_abi::{RequestedResourceV2, ToolEffectScopeV2, ToolIdV2};
 use deepcode_kernel_tools::kernel_internal::{
     measure_kernel_output_payload, normalize_canonical_platform_path,
     validate_canonical_invocation, KernelCanonicalInvocation, KernelDeleteTarget,
@@ -1550,7 +1550,7 @@ fn serialized_fits(payload: &KernelToolOutputPayload, maximum: usize) -> Option<
     Some(serde_json::to_vec(payload).ok()?.len() <= maximum)
 }
 
-fn materialize_deadline(
+pub(super) fn materialize_deadline(
     request: DeadlineRequestV2,
     default_ms: u32,
     maximum_ms: u32,
@@ -1715,11 +1715,209 @@ fn resolve_invocation_targets(
     }
 }
 
+pub(super) fn canonicalize_requested_resource_scope(
+    tool_kind: KernelToolKind,
+    effect_scope: ToolEffectScopeV2,
+    requested_resources: &[RequestedResourceV2],
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<(ResourceScopeV2, Vec<AuthorizationTargetKey>), PrepareFailure> {
+    let invalid_scope = || {
+        PrepareFailure::Kernel(invalid_field(
+            "scopeIntent.requestedResources",
+            InvalidFieldViolationV2::InvalidRelation,
+        ))
+    };
+    match effect_scope {
+        ToolEffectScopeV2::WorkspaceRead | ToolEffectScopeV2::WorkspaceWrite => {
+            let expected_access = if effect_scope == ToolEffectScopeV2::WorkspaceRead {
+                ResourceAccessV2::Read
+            } else {
+                ResourceAccessV2::Write
+            };
+            let expected_target = match (effect_scope, tool_kind) {
+                (
+                    ToolEffectScopeV2::WorkspaceRead,
+                    KernelToolKind::DocumentRead | KernelToolKind::FsDiff | KernelToolKind::FsRead,
+                ) => ExpectedTarget::MustFile,
+                (
+                    ToolEffectScopeV2::WorkspaceRead,
+                    KernelToolKind::CodeGrep | KernelToolKind::FsGlob | KernelToolKind::FsList,
+                ) => ExpectedTarget::MustDirectory,
+                (ToolEffectScopeV2::WorkspaceWrite, KernelToolKind::FsCreate) => {
+                    ExpectedTarget::MustAbsent(WorkspaceObjectKindV2::File)
+                }
+                (
+                    ToolEffectScopeV2::WorkspaceWrite,
+                    KernelToolKind::FsEdit | KernelToolKind::FsWrite,
+                ) => ExpectedTarget::MustFile,
+                (ToolEffectScopeV2::WorkspaceWrite, KernelToolKind::FsEnsureDirectory) => {
+                    ExpectedTarget::DirectoryOrAbsent
+                }
+                (ToolEffectScopeV2::WorkspaceWrite, KernelToolKind::FsDelete) => {
+                    ExpectedTarget::ExistingFileOrDirectory
+                }
+                _ => return Err(invalid_scope()),
+            };
+            let mut canonical_targets = Vec::with_capacity(requested_resources.len());
+            let mut authorization_targets = Vec::with_capacity(requested_resources.len());
+            for requested in requested_resources {
+                let RequestedResourceV2::WorkspacePath { path, access } = requested else {
+                    return Err(invalid_scope());
+                };
+                if *access != expected_access {
+                    return Err(invalid_scope());
+                }
+                let resolved = resolve_workspace_target(
+                    workspace,
+                    WorkspaceTargetSpec::new(path, expected_target.clone(), *access),
+                )?;
+                let relative_path = resolved
+                    .relative_path
+                    .clone()
+                    .ok_or_else(|| invalid_scope())?;
+                let object_kind = resolved.object_kind.ok_or_else(|| invalid_scope())?;
+                let target_observation_digest = resolved
+                    .state_digest
+                    .clone()
+                    .ok_or_else(|| invalid_scope())?;
+                canonical_targets.push(WorkspaceScopeTargetV2 {
+                    relative_path: relative_path.clone(),
+                    object_kind,
+                    access: *access,
+                    target_observation_digest,
+                });
+                authorization_targets.push(AuthorizationTargetKey::Workspace {
+                    path: relative_path,
+                    access: *access,
+                    object_kind,
+                });
+            }
+            canonical_targets.sort_by(|left, right| {
+                left.relative_path
+                    .as_bytes()
+                    .cmp(right.relative_path.as_bytes())
+            });
+            canonical_targets.dedup_by(|left, right| {
+                left.relative_path == right.relative_path && left.access == right.access
+            });
+            authorization_targets.sort_by(|left, right| {
+                authorization_target_label(left).cmp(&authorization_target_label(right))
+            });
+            authorization_targets.dedup();
+            Ok((
+                ResourceScopeV2::Workspace {
+                    targets: canonical_targets,
+                },
+                authorization_targets,
+            ))
+        }
+        ToolEffectScopeV2::RepositoryRead
+        | ToolEffectScopeV2::RepositoryIndexWrite
+        | ToolEffectScopeV2::RepositoryHistoryWrite => {
+            let expected_area = match (effect_scope, tool_kind) {
+                (
+                    ToolEffectScopeV2::RepositoryRead,
+                    KernelToolKind::GitStatus | KernelToolKind::GitDiff,
+                ) => RepositoryAreaV2::State,
+                (
+                    ToolEffectScopeV2::RepositoryIndexWrite,
+                    KernelToolKind::GitStage | KernelToolKind::GitUnstage,
+                ) => RepositoryAreaV2::Index,
+                (ToolEffectScopeV2::RepositoryHistoryWrite, KernelToolKind::GitCommit) => {
+                    RepositoryAreaV2::History
+                }
+                _ => return Err(invalid_scope()),
+            };
+            let [RequestedResourceV2::Repository { area }] = requested_resources else {
+                return Err(invalid_scope());
+            };
+            if *area != expected_area {
+                return Err(invalid_scope());
+            }
+            Ok((
+                ResourceScopeV2::Repository { area: *area },
+                vec![AuthorizationTargetKey::Repository { area: *area }],
+            ))
+        }
+        ToolEffectScopeV2::NetworkRead => match tool_kind {
+            KernelToolKind::WebFetch => {
+                let [RequestedResourceV2::NetworkUrl { url }] = requested_resources else {
+                    return Err(invalid_scope());
+                };
+                let parsed = crate::network_policy::validate_http_url_shape(url).map_err(|_| {
+                    PrepareFailure::Target(TargetResolutionFailure::NetworkTargetRejected)
+                })?;
+                let canonical_url = parsed.to_string();
+                let resolved = resolve_network_target(&canonical_url)?;
+                Ok((
+                    ResourceScopeV2::NetworkUrl {
+                        origin: resolved.origin,
+                        target_observation_digest: resolved.target_digest.clone(),
+                    },
+                    vec![AuthorizationTargetKey::NetworkUrl { url: canonical_url }],
+                ))
+            }
+            KernelToolKind::WebSearch => {
+                let [RequestedResourceV2::NetworkQuery { query }] = requested_resources else {
+                    return Err(invalid_scope());
+                };
+                let query = query.trim();
+                if query.is_empty() || query.chars().any(char::is_control) {
+                    return Err(invalid_scope());
+                }
+                let url = crate::executors::web::web_search_target_url(executor_config, query, 1)
+                    .map_err(|_| {
+                    PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable)
+                })?;
+                let resolved = resolve_network_target(&url)?;
+                let query_digest = query_digest_v2(&serde_json::json!({
+                    "kind":"webSearch",
+                    "query":query
+                }))
+                .map_err(|_| storage_fault())?;
+                Ok((
+                    ResourceScopeV2::NetworkQuery {
+                        query_digest,
+                        service_origin: resolved.origin.clone(),
+                        target_observation_digest: resolved.target_digest.clone(),
+                    },
+                    vec![AuthorizationTargetKey::NetworkQuery {
+                        query: query.to_owned(),
+                        service_origin: resolved.origin,
+                    }],
+                ))
+            }
+            _ => Err(invalid_scope()),
+        },
+    }
+}
+
+fn authorization_target_label(target: &AuthorizationTargetKey) -> String {
+    match target {
+        AuthorizationTargetKey::Workspace {
+            path,
+            access,
+            object_kind,
+        } => {
+            format!("workspace:{access:?}:{object_kind:?}:{path}")
+        }
+        AuthorizationTargetKey::Repository { area } => format!("repository:{area:?}"),
+        AuthorizationTargetKey::NetworkUrl { url } => format!("network-url:{url}"),
+        AuthorizationTargetKey::NetworkQuery {
+            query,
+            service_origin,
+        } => format!("network-query:{query}:{service_origin:?}"),
+    }
+}
+
+#[derive(Clone)]
 enum ExpectedTarget {
     MustFile,
     MustDirectory,
     MustAbsent(WorkspaceObjectKindV2),
     DirectoryOrAbsent,
+    ExistingFileOrDirectory,
 }
 
 struct WorkspaceTargetSpec(String, ExpectedTarget, ResourceAccessV2);
@@ -1740,6 +1938,12 @@ fn resolve_workspace_target(
     let object_kind = match (&expected, &state) {
         (ExpectedTarget::MustFile, ResourceStateV2::File { .. }) => WorkspaceObjectKindV2::File,
         (ExpectedTarget::MustDirectory, ResourceStateV2::Directory { .. }) => {
+            WorkspaceObjectKindV2::Directory
+        }
+        (ExpectedTarget::ExistingFileOrDirectory, ResourceStateV2::File { .. }) => {
+            WorkspaceObjectKindV2::File
+        }
+        (ExpectedTarget::ExistingFileOrDirectory, ResourceStateV2::Directory { .. }) => {
             WorkspaceObjectKindV2::Directory
         }
         (ExpectedTarget::MustAbsent(kind), ResourceStateV2::Absent {}) => *kind,
@@ -1839,28 +2043,6 @@ fn resolve_private_workspace_path(
         }
     }
     Ok(resolved)
-}
-
-pub(super) fn canonicalize_requested_workspace_path(
-    workspace: &WorkspaceBinding,
-    relative: &str,
-) -> Result<String, PrepareFailure> {
-    let target = resolve_private_workspace_path(&workspace.canonical_root, relative)?;
-    target
-        .strip_prefix(&workspace.canonical_root)
-        .ok()
-        .and_then(Path::to_str)
-        .map(|value| value.replace('\\', "/"))
-        .map(|value| {
-            if value.is_empty() {
-                ".".to_owned()
-            } else {
-                value
-            }
-        })
-        .ok_or(PrepareFailure::Target(
-            TargetResolutionFailure::ResolverUnavailable,
-        ))
 }
 
 fn resource_state_for_path(path: &Path) -> Result<ResourceStateV2, PrepareFailure> {
@@ -3820,17 +4002,16 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
             identity,
             preview_id,
             tool_id,
-            canonical_arguments_digest,
             scope_digest,
             tool_contract_digest,
             context_ref,
+            ..
         }) => matches!(
             predecessor,
             KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed {
                 identity: source,
                 preview_id: source_preview_id,
                 tool_id: source_tool_id,
-                canonical_arguments_digest: source_arguments_digest,
                 scope_digest: source_scope_digest,
                 tool_contract_digest: source_tool_contract_digest,
                 context_ref: source_context_ref,
@@ -3838,7 +4019,6 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
             }) if authorization_matches_awaiting_subject(source, identity)
                 && preview_id == source_preview_id
                 && tool_id == source_tool_id
-                && canonical_arguments_digest == source_arguments_digest
                 && scope_digest == source_scope_digest
                 && tool_contract_digest == source_tool_contract_digest
                 && context_ref == source_context_ref

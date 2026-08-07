@@ -3,6 +3,7 @@ import type {
   LlmChatRequest,
   RawToolArgumentsV2,
   RequestedResourceV2,
+  ScopeIntentV2,
 } from '@deepcode/protocol';
 import { decodeRawToolArgumentsV2 } from '@deepcode/protocol';
 import {
@@ -25,8 +26,8 @@ import type {
 import {
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
   SessionPlanActionCompletionOutcomeV2,
@@ -192,7 +193,7 @@ export function decodeSessionKernelLlmStreamResultV2(
       );
     }
     const planProposalCalls = streamCalls.filter(
-      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME
+      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
     );
     if (planProposalCalls.length > 0) {
       if (
@@ -231,9 +232,9 @@ export function decodeSessionKernelLlmStreamResultV2(
         kind: 'plan',
         plan,
         planProposal: {
-          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
           callId: requiredIdentity(control.callId, 'callId'),
-          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
           argumentsDigest: sha256Hash(canonicalJson(
             decodeProviderNativeArguments(control.arguments)
           )),
@@ -505,7 +506,7 @@ export function decodeProviderPlanProposalArgumentsV2(
   const record = objectRecord(decoded);
   if (!record) throw invalidPlanningResult();
   exactKeys(record, ['schemaVersion', 'plan']);
-  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA) {
+  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA) {
     throw invalidPlanningResult();
   }
   return decodeProviderPlanDraft(record.plan);
@@ -571,26 +572,47 @@ function decodePlanAction(
   if (!record) throw invalidPlanningResult();
   exactKeys(
     record,
-    [
-      'toolId',
-      'requestedResources',
-      'previewArguments',
-    ],
+    ['toolId', 'scopeIntent'],
     ['deadline']
   );
-  if (!Array.isArray(record.requestedResources)) {
-    throw invalidPlanningResult();
-  }
   return {
     toolId: requiredIdentity(record.toolId, 'toolId'),
-    requestedResources:
-      record.requestedResources.map(decodeRequestedResource),
-    previewArguments:
-      decodeRawToolArgumentsV2(record.previewArguments),
+    scopeIntent: decodePlanScopeIntent(record.scopeIntent),
     ...(record.deadline !== undefined
       ? { deadline: decodeDeadline(record.deadline) }
       : {}),
   };
+}
+
+function decodePlanScopeIntent(value: unknown): ScopeIntentV2 {
+  const tagged = objectRecord(value);
+  if (!tagged) throw invalidPlanningResult();
+  exactKeys(tagged, ['kind', 'data']);
+  const data = objectRecord(tagged.data);
+  if (!data) throw invalidPlanningResult();
+  if (tagged.kind === 'resourceScope') {
+    exactKeys(data, ['requestedResources']);
+    if (!Array.isArray(data.requestedResources)) {
+      throw invalidPlanningResult();
+    }
+    return {
+      kind: tagged.kind,
+      data: {
+        requestedResources:
+          data.requestedResources.map(decodeRequestedResource),
+      },
+    };
+  }
+  if (tagged.kind === 'exactInvocation') {
+    exactKeys(data, ['rawArguments']);
+    return {
+      kind: tagged.kind,
+      data: {
+        rawArguments: decodeRawToolArgumentsV2(data.rawArguments),
+      },
+    };
+  }
+  throw invalidPlanningResult();
 }
 
 function decodeRequestedResource(value: unknown): RequestedResourceV2 {
@@ -633,17 +655,6 @@ function decodeRequestedResource(value: unknown): RequestedResourceV2 {
       return {
         kind: tagged.kind,
         data: { query: requiredText(data.query, 'query') },
-      };
-    case 'exactInvocation':
-      exactKeys(data, ['invocationDigest']);
-      return {
-        kind: tagged.kind,
-        data: {
-          invocationDigest: requiredIdentity(
-            data.invocationDigest,
-            'invocationDigest'
-          ),
-        },
       };
     default:
       throw invalidPlanningResult();
@@ -775,6 +786,6 @@ function requiredText(value: unknown, _field: string): string {
 function invalidPlanningResult(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
     'session_kernel_provider_plan_proposal_invalid',
-    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v2 record.'
+    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v3 record.'
   );
 }

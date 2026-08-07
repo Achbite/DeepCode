@@ -4,8 +4,8 @@ use self::schema::provider_schema_for_tool;
 use crate::invocation_adapter::canonicalize_invocation;
 use crate::invocation_types::{KernelCanonicalInvocation, KernelToolKind};
 use deepcode_kernel_abi::{
-    ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
-    ToolInputSchemaV2, ToolRiskV2,
+    ToolAuthorizationShapeV2, ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2,
+    ToolEffectScopeV2, ToolIdV2, ToolInputSchemaV2, ToolRiskV2,
 };
 use serde_json::Value;
 
@@ -304,6 +304,7 @@ fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
         spec.effect_class,
         spec.effect_scope,
         spec.risk,
+        ToolAuthorizationShapeV2::ResourceScope,
     )
     .unwrap_or_else(|error| panic!("invalid built-in tool `{tool_id}`: {error}"));
     KernelToolRegistration {

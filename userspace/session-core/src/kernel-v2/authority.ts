@@ -1,11 +1,10 @@
 import {
   decodeRawToolArgumentsV2,
   type CapabilityLeaseRefV2,
-  type DeadlineRequestV2,
   type RawToolArgumentsV2,
   type RequestedResourceV2,
+  type ScopeIntentV2,
   type ScopeManifestV2,
-  type ToolContextRefV2,
   type ToolIntentAuthorityV2,
 } from '@deepcode/protocol';
 
@@ -14,17 +13,7 @@ export interface SessionPlanActionScopeInputV2 {
   planActionId: string;
   operationId: string;
   toolId: string;
-  requestedResources: RequestedResourceV2[];
-}
-
-export interface SessionCapabilityScopePreviewV2 {
-  runId: string;
-  expectedControlEpoch: number;
-  manifest: ScopeManifestV2;
-  rawArguments: RawToolArgumentsV2;
-  idempotencyKey: string;
-  deadline: DeadlineRequestV2;
-  toolContextRef: ToolContextRefV2;
+  scopeIntent: ScopeIntentV2;
 }
 
 /**
@@ -35,8 +24,11 @@ export function createScopeManifestV2(
   input: SessionPlanActionScopeInputV2
 ): ScopeManifestV2 {
   if (
-    input.requestedResources.length === 0
-    || input.requestedResources.length > 256
+    input.scopeIntent.kind === 'resourceScope'
+    && (
+      input.scopeIntent.data.requestedResources.length === 0
+      || input.scopeIntent.data.requestedResources.length > 256
+    )
   ) {
     throw new SessionKernelAuthorityError(
       'session_kernel_authority_resources_invalid',
@@ -48,36 +40,7 @@ export function createScopeManifestV2(
     planActionId: identity(input.planActionId, 'planActionId'),
     operationId: identity(input.operationId, 'operationId'),
     toolId: namespacedToolId(input.toolId),
-    requestedResources: input.requestedResources.map(cloneRequestedResource),
-  };
-}
-
-export function createCapabilityScopePreviewV2(input: {
-  runId: string;
-  controlEpoch: number;
-  manifest: ScopeManifestV2;
-  rawArguments: unknown;
-  idempotencyKey: string;
-  toolContext: ToolContextRefV2;
-  deadline?: DeadlineRequestV2;
-}): SessionCapabilityScopePreviewV2 {
-  if (!Number.isSafeInteger(input.controlEpoch) || input.controlEpoch <= 0) {
-    throw new SessionKernelAuthorityError(
-      'session_kernel_authority_epoch_invalid',
-      'Capability preview requires a positive control epoch.'
-    );
-  }
-  return {
-    runId: identity(input.runId, 'runId'),
-    expectedControlEpoch: input.controlEpoch,
-    manifest: input.manifest,
-    rawArguments: decodeRawToolArgumentsV2(input.rawArguments),
-    idempotencyKey: requiredText(input.idempotencyKey, 'idempotencyKey'),
-    deadline: input.deadline ?? {
-      kind: 'contractDefault',
-      data: {},
-    },
-    toolContextRef: { ...input.toolContext },
+    scopeIntent: cloneScopeIntent(input.scopeIntent),
   };
 }
 
@@ -172,9 +135,25 @@ function cloneRequestedResource(
       return { kind: resource.kind, data: { ...resource.data } };
     case 'networkQuery':
       return { kind: resource.kind, data: { ...resource.data } };
-    case 'exactInvocation':
-      return { kind: resource.kind, data: { ...resource.data } };
   }
+}
+
+function cloneScopeIntent(intent: ScopeIntentV2): ScopeIntentV2 {
+  return intent.kind === 'resourceScope'
+    ? {
+        kind: intent.kind,
+        data: {
+          requestedResources:
+            intent.data.requestedResources.map(cloneRequestedResource),
+        },
+      }
+    : {
+        kind: intent.kind,
+        data: {
+          rawArguments:
+            decodeRawToolArgumentsV2(intent.data.rawArguments),
+        },
+      };
 }
 
 export class SessionKernelAuthorityError extends Error {

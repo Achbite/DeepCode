@@ -66,7 +66,7 @@ import {
 import {
   adaptSessionKernelProviderBackendOutputV2,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
 import type {
@@ -2565,7 +2565,7 @@ function terminalItemsMatchProviderOutputV3(
           import('./types.js').SessionProviderTerminalOrderedItemV3,
           { kind: 'toolCall' }
         > => item.kind === 'toolCall'
-          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME
+          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
       );
       if (
         controlItems.length !== 1
@@ -2668,10 +2668,8 @@ function providerPlanMatchesDraftV3(
     && draft.actions.every((actionDraft, index) => {
       const action = plan.actions[index];
       return action?.manifest.toolId === actionDraft.toolId
-        && canonicalJson(action.manifest.requestedResources)
-          === canonicalJson(actionDraft.requestedResources)
-        && canonicalJson(action.previewArguments)
-          === canonicalJson(actionDraft.previewArguments)
+        && canonicalJson(action.manifest.scopeIntent)
+          === canonicalJson(actionDraft.scopeIntent)
         && canonicalJson(action.deadline) === canonicalJson(
           actionDraft.deadline ?? {
             kind: 'contractDefault',

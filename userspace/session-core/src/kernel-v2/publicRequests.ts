@@ -1,5 +1,5 @@
 import type {
-  CapabilityScopePreviewReplyV2,
+  CapabilityScopePreviewBatchReplyV2,
   ControlEpochAdvancedReplyV2,
   InvocationCancelReplyV2,
   KernelFactProjectionV2,
@@ -22,7 +22,7 @@ import {
 } from './review.js';
 import {
   SessionKernelPortError,
-  type SessionKernelCapabilityPreviewRequestV2,
+  type SessionKernelCapabilityPreviewBatchRequestV2,
   type SessionKernelEpochAdvanceRequestV2,
   type SessionKernelFactsRequestV2,
   type SessionKernelInvocationCancelRequestV2,
@@ -63,7 +63,10 @@ import {
 
 export type SessionKernelPublicRequestOutcomeV2 =
   | { kind: 'toolContextGet'; reply: ToolContextGetReplyV2 }
-  | { kind: 'capabilityPreview'; reply: CapabilityScopePreviewReplyV2 }
+  | {
+      kind: 'capabilityPreviewBatch';
+      reply: CapabilityScopePreviewBatchReplyV2;
+    }
   | { kind: 'toolIntentSubmit'; reply: ToolIntentSubmitReplyV2 }
   | { kind: 'factsQuery'; reply: KernelFactProjectionPageV2 }
   | { kind: 'controlEpochAdvance'; reply: ControlEpochAdvancedReplyV2 }
@@ -583,7 +586,7 @@ export function sessionKernelPublicRequestLaneV2(
     case 'toolIntentSubmit':
       return 'effect';
     case 'toolContextGet':
-    case 'capabilityPreview':
+    case 'capabilityPreviewBatch':
     case 'factsQuery':
       return 'query';
   }
@@ -632,14 +635,14 @@ async function dispatchPublicRequest(
           ...record.intent.payload,
         }),
       };
-    case 'capabilityPreview':
+    case 'capabilityPreviewBatch':
       return {
         kind: record.intent.kind,
-        reply: await ports.kernel.previewCapability({
+        reply: await ports.kernel.previewCapabilityBatch({
           requestId,
           signal,
           ...record.intent.payload,
-        } satisfies SessionKernelCapabilityPreviewRequestV2),
+        } satisfies SessionKernelCapabilityPreviewBatchRequestV2),
       };
     case 'toolIntentSubmit':
       return {
@@ -712,26 +715,71 @@ function applyPublicRequestOutcome(
       state.toolContext = next;
       break;
     }
-    case 'capabilityPreview':
-      if (record.intent.kind !== 'capabilityPreview') {
+    case 'capabilityPreviewBatch':
+      if (record.intent.kind !== 'capabilityPreviewBatch') {
         throw new SessionKernelPublicRequestError(
           'session_kernel_public_outcome_kind_mismatch',
-          'Capability preview outcome lost its persisted request correlation.'
+          'Capability preview batch outcome lost its persisted request correlation.'
         );
       }
       if (
-        outcome.reply.kind === 'previewed'
-        && record.intent.payload.expectedControlEpoch
-          === state.controlEpoch
+        outcome.reply.runId !== state.runId
+        || outcome.reply.acceptedControlEpoch
+          !== record.intent.payload.expectedControlEpoch
+        || outcome.reply.planRevision
+          !== record.intent.payload.planRevision
+        || outcome.reply.results.length
+          !== record.intent.payload.items.length
       ) {
-        state.previews[outcome.reply.data.preview.operationId] =
-          outcome.reply.data.preview;
-      } else if (
-        outcome.reply.kind === 'rejected'
-        && record.intent.payload.expectedControlEpoch
-          === state.controlEpoch
+        throw new SessionKernelPublicRequestError(
+          'session_kernel_scope_preview_batch_correlation_mismatch',
+          'Capability preview batch settlement does not match its persisted Run and Plan request.'
+        );
+      }
+      if (
+        record.intent.payload.expectedControlEpoch === state.controlEpoch
       ) {
-        appendUniqueGuidance(state.pendingGuidance, outcome.reply.data.guidance);
+        const nextPreviews = { ...state.previews };
+        const nextGuidance = [...state.pendingGuidance];
+        for (const [index, item] of record.intent.payload.items.entries()) {
+          const result = outcome.reply.results[index]!;
+          const correlation = result.kind === 'previewed'
+            ? result.data.preview
+            : result.data;
+          if (
+            correlation.planActionId !== item.planActionId
+            || correlation.operationId !== item.operationId
+            || correlation.toolId !== item.toolId
+            || (
+              result.kind === 'previewed'
+              && (
+                result.data.preview.runId !== state.runId
+                || result.data.preview.controlEpoch
+                  !== record.intent.payload.expectedControlEpoch
+                || result.data.preview.planRevision
+                  !== record.intent.payload.planRevision
+                || canonicalJson(result.data.preview.contextRef)
+                  !== canonicalJson(
+                    record.intent.payload.toolContextRef
+                  )
+              )
+            )
+          ) {
+            throw new SessionKernelPublicRequestError(
+              'session_kernel_scope_preview_batch_correlation_mismatch',
+              'Capability preview batch item lost its persisted PlanAction correlation.'
+            );
+          }
+          if (result.kind === 'previewed') {
+            nextPreviews[result.data.preview.operationId] =
+              result.data.preview;
+          } else {
+            delete nextPreviews[item.operationId];
+            appendUniqueGuidance(nextGuidance, result.data.guidance);
+          }
+        }
+        state.previews = nextPreviews;
+        state.pendingGuidance = nextGuidance;
       }
       break;
     case 'toolIntentSubmit':

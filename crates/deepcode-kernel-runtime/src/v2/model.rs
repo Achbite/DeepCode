@@ -1,16 +1,37 @@
 use deepcode_kernel_abi::v2::{
     AttemptId, CancelRequestId, CanonicalPrivateTargetV2, ControlEpoch, CorrelationSetV2,
     EffectEvidenceV2, EffectId, FactId, IdempotencyKeyHashV2, IndeterminateReasonV2, InputId,
-    InvocationAuthorityV2, InvocationId, KernelFactEnvelopeV2, OperationId, PlatformV2,
-    PostObservedEffectFailureCodeV2, ResolvedResourceV2, ResourceId, ResourceScopeV2,
-    ResourceStateDigestV2, ResourceStateV2, RunId, RunRetirementReasonCodeV2,
-    TargetRevalidationDigestV2, TargetRevalidationObservationV2, WorkspaceBindingDigestV2,
-    WorkspaceObjectKindV2,
+    InvocationAuthorityV2, InvocationId, KernelFactEnvelopeV2, NetworkOriginV2, OperationId,
+    PlatformV2, PostObservedEffectFailureCodeV2, RepositoryAreaV2, ResolvedResourceV2,
+    ResourceAccessV2, ResourceId, ResourceScopeV2, ResourceStateDigestV2, ResourceStateV2, RunId,
+    RunRetirementReasonCodeV2, TargetRevalidationDigestV2, TargetRevalidationObservationV2,
+    WorkspaceBindingDigestV2, WorkspaceObjectKindV2,
 };
 use deepcode_kernel_abi::v2_command::{InvocationPhaseV2, KernelErrorV2};
 use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelToolKind};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(super) enum AuthorizationTargetKey {
+    Workspace {
+        path: String,
+        access: ResourceAccessV2,
+        object_kind: WorkspaceObjectKindV2,
+    },
+    Repository {
+        area: RepositoryAreaV2,
+    },
+    NetworkUrl {
+        url: String,
+    },
+    NetworkQuery {
+        query: String,
+        service_origin: NetworkOriginV2,
+    },
+}
 
 pub(super) type AuthorityResult<T> = Result<T, KernelErrorV2>;
 

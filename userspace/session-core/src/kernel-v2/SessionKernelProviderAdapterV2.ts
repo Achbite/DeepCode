@@ -4,6 +4,7 @@ import {
   type ProviderWireToolDefinition,
   type RawToolArgumentsV2,
   type RequestedResourceV2,
+  type ScopeIntentV2,
 } from '@deepcode/protocol';
 import {
   canonicalJson,
@@ -28,10 +29,10 @@ import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
 } from './types.js';
 
-export const SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA =
-  'deepcode.session.plan-proposal.v2' as const;
-export const SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME =
-  'deepcode_session_plan_propose_v2' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA =
+  'deepcode.session.plan-proposal.v3' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME =
+  'deepcode_session_plan_propose_v3' as const;
 export const SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA =
   'deepcode.session.plan-action-complete.v2' as const;
 export const SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME =
@@ -64,9 +65,9 @@ export function sessionPlanActionCompleteToolV2(): ProviderWireToolDefinition {
   };
 }
 
-export function sessionPlanProposalToolV2(): ProviderWireToolDefinition {
+export function sessionPlanProposalToolV3(): ProviderWireToolDefinition {
   return {
-    name: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+    name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
     description: [
       'Session-only structured Plan control; it never executes a Kernel tool.',
       'Call it exactly once only when the requested work requires a Plan for user review.',
@@ -80,7 +81,7 @@ export function sessionPlanProposalToolV2(): ProviderWireToolDefinition {
       properties: {
         schemaVersion: {
           type: 'string',
-          const: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+          const: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
         },
         plan: {
           type: 'object',
@@ -99,19 +100,11 @@ export function sessionPlanProposalToolV2(): ProviderWireToolDefinition {
                 additionalProperties: false,
                 required: [
                   'toolId',
-                  'requestedResources',
-                  'previewArguments',
+                  'scopeIntent',
                 ],
                 properties: {
                   toolId: { type: 'string', minLength: 1 },
-                  requestedResources: {
-                    type: 'array',
-                    items: sessionPlanRequestedResourceSchemaV2(),
-                  },
-                  previewArguments: {
-                    type: 'object',
-                    additionalProperties: true,
-                  },
+                  scopeIntent: sessionPlanScopeIntentSchemaV3(),
                   deadline: sessionPlanDeadlineSchemaV2(),
                 },
               },
@@ -120,6 +113,53 @@ export function sessionPlanProposalToolV2(): ProviderWireToolDefinition {
         },
       },
     },
+  };
+}
+
+function sessionPlanScopeIntentSchemaV3(): unknown {
+  return {
+    oneOf: [
+      {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'data'],
+        properties: {
+          kind: { type: 'string', const: 'resourceScope' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['requestedResources'],
+            properties: {
+              requestedResources: {
+                type: 'array',
+                minItems: 1,
+                maxItems: 256,
+                items: sessionPlanRequestedResourceSchemaV2(),
+              },
+            },
+          },
+        },
+      },
+      {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'data'],
+        properties: {
+          kind: { type: 'string', const: 'exactInvocation' },
+          data: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['rawArguments'],
+            properties: {
+              rawArguments: {
+                type: 'object',
+                additionalProperties: true,
+              },
+            },
+          },
+        },
+      },
+    ],
   };
 }
 
@@ -172,11 +212,6 @@ function sessionPlanRequestedResourceSchemaV2(): unknown {
         { query: { type: 'string', minLength: 1 } },
         ['query']
       ),
-      tagged(
-        'exactInvocation',
-        { invocationDigest: { type: 'string', minLength: 1 } },
-        ['invocationDigest']
-      ),
     ],
   };
 }
@@ -218,8 +253,7 @@ function sessionPlanDeadlineSchemaV2(): unknown {
 
 export interface SessionProviderPlanActionDraftV2 {
   toolId: string;
-  requestedResources: RequestedResourceV2[];
-  previewArguments: RawToolArgumentsV2;
+  scopeIntent: ScopeIntentV2;
   deadline?: DeadlineRequestV2;
 }
 
@@ -242,9 +276,9 @@ export type SessionKernelProviderBackendOutputV2 = (
       kind: 'plan';
       plan: SessionProviderPlanDraftV2;
       planProposal: {
-        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA;
+        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA;
         callId: string;
-        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME;
+        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME;
         argumentsDigest: string;
       };
     }
@@ -526,16 +560,13 @@ function planActionOwnershipRepairV2(
   for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
     const call = calls[callIndex]!;
     const toolId = requiredToolId(call.toolId);
-    const argumentDigest = canonicalJson(call.arguments);
     const matchesCurrent =
-      current.manifest.toolId === toolId
-      && canonicalJson(current.previewArguments) === argumentDigest;
+      current.manifest.toolId === toolId;
     if (matchesCurrent) continue;
     const siblingIndexes = plan.actions.flatMap(
       (action, index) =>
         index > currentIndex
         && action.manifest.toolId === toolId
-        && canonicalJson(action.previewArguments) === argumentDigest
           ? [index]
           : []
     );
@@ -583,9 +614,9 @@ function assertCompletedProviderBackendOutputV2(
   if (output.kind === 'plan') {
     if (
       output.planProposal.schemaVersion
-        !== SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA
       || output.planProposal.toolName
-        !== SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
     ) {
       throw providerCompletionInvalid();
     }
@@ -880,11 +911,19 @@ export function materializeProviderPlanV2(
         `Provider plan requested a tool outside the current ready ToolContext: ${action.toolId}.`
       );
     }
-    assertToolArgumentsMatchSchemaV2(
-      action.previewArguments,
-      descriptor.inputSchema,
-      action.toolId
-    );
+    if (descriptor.authorizationShape !== action.scopeIntent.kind) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_scope_shape_invalid',
+        `Provider Plan scopeIntent for ${action.toolId} does not match the immutable Kernel authorization shape.`
+      );
+    }
+    if (action.scopeIntent.kind === 'exactInvocation') {
+      assertToolArgumentsMatchSchemaV2(
+        action.scopeIntent.data.rawArguments,
+        descriptor.inputSchema,
+        action.toolId
+      );
+    }
   }
   const digest = sha256Hash(canonicalJson({
     providerTurnId: input.providerTurnId,
@@ -910,9 +949,8 @@ export function materializeProviderPlanV2(
           planActionId,
           operationId,
           toolId: action.toolId,
-          requestedResources: action.requestedResources,
+          scopeIntent: action.scopeIntent,
         }),
-        previewArguments: action.previewArguments,
         idempotencyKey: `intent-${digest}-${ordinal}`,
         deadline: action.deadline ?? {
           kind: 'contractDefault',
@@ -947,8 +985,11 @@ function normalizePlanDraft(
     ),
     actions: draft.actions.map((action) => {
       if (
-        action.requestedResources.length === 0
-        || action.requestedResources.length > 256
+        action.scopeIntent.kind === 'resourceScope'
+        && (
+          action.scopeIntent.data.requestedResources.length === 0
+          || action.scopeIntent.data.requestedResources.length > 256
+        )
       ) {
         throw new SessionKernelProviderAdapterError(
           'session_kernel_provider_plan_resources_invalid',
@@ -957,10 +998,23 @@ function normalizePlanDraft(
       }
       return {
         toolId: requiredToolId(action.toolId),
-        requestedResources:
-          action.requestedResources.map(cloneRequestedResource),
-        previewArguments:
-          decodeRawToolArgumentsV2(action.previewArguments),
+        scopeIntent: action.scopeIntent.kind === 'resourceScope'
+          ? {
+              kind: action.scopeIntent.kind,
+              data: {
+                requestedResources:
+                  action.scopeIntent.data.requestedResources
+                    .map(cloneRequestedResource),
+              },
+            }
+          : {
+              kind: action.scopeIntent.kind,
+              data: {
+                rawArguments: decodeRawToolArgumentsV2(
+                  action.scopeIntent.data.rawArguments
+                ),
+              },
+            },
         ...(action.deadline
           ? { deadline: cloneDeadline(action.deadline) }
           : {}),
@@ -996,12 +1050,12 @@ function assertToolArgumentsMatchSchemaV2(
     argumentsValue,
     schema,
     toolId,
-    'previewArguments'
+    'scopeIntent.rawArguments'
   );
   if (mismatch) {
     throw new SessionKernelProviderAdapterError(
       'session_kernel_provider_plan_arguments_invalid',
-      `Provider Plan previewArguments for ${toolId} do not match the immutable ToolContext JSON Schema: ${mismatch}`
+      `Provider Plan exact-invocation arguments for ${toolId} do not match the immutable ToolContext JSON Schema: ${mismatch}`
     );
   }
 }
@@ -1256,8 +1310,6 @@ function cloneRequestedResource(
     case 'networkUrl':
       return { kind: resource.kind, data: { ...resource.data } };
     case 'networkQuery':
-      return { kind: resource.kind, data: { ...resource.data } };
-    case 'exactInvocation':
       return { kind: resource.kind, data: { ...resource.data } };
   }
 }

@@ -1,8 +1,9 @@
-import type {
-  CapabilityScopePreviewRecordV2,
-  KernelFactProjectionV2,
-  ToolIntentV2,
-  ToolContextBundleV2,
+import {
+  decodeRawToolArgumentsV2,
+  type CapabilityScopePreviewRecordV2,
+  type KernelFactProjectionV2,
+  type ToolIntentV2,
+  type ToolContextBundleV2,
 } from '@deepcode/protocol';
 import {
   canonicalJson,
@@ -60,7 +61,7 @@ const MAX_SESSION_INPUT_HISTORY_COUNT = 32;
 const MAX_SESSION_INPUT_HISTORY_BYTES = 512 * 1024;
 const MAX_SESSION_PROVIDER_OUTCOME_COUNT = 128;
 const MAX_SESSION_PROVIDER_OUTCOME_BYTES = 256 * 1024;
-const MAX_SESSION_PLAN_ACTIONS = 256;
+const MAX_SESSION_PLAN_ACTIONS = 128;
 const MAX_SESSION_PLAN_BYTES = 512 * 1024;
 // One PlanAction drive admits at most 256 Provider calls. The per-Plan ceiling
 // covers 256 actions at the default 32-call budget without allowing the
@@ -244,6 +245,11 @@ export function restoreSessionKernelLoopStateV2(
       );
     }
   }
+  currentSessionPlanScopePreviewsV2(
+    state,
+    state.plan,
+    { requireComplete: false }
+  );
   if (state.planDecision) {
     validatePlanDecision(state.planDecision);
     if (state.planDecision.planRevision !== state.plan?.planRevision) {
@@ -575,7 +581,7 @@ export function buildSessionPlanConfirmationAuthorityV2(
       'Plan confirmation authority requires the current persisted Plan.'
     );
   }
-  const scopePreviews = currentPlanScopePreviewsV2(state, plan);
+  const scopePreviews = currentSessionPlanScopePreviewsV2(state, plan);
   const authorityWithoutDigest = {
     planRevision: plan.planRevision,
     providerTurnId: requiredIdentity(
@@ -618,7 +624,7 @@ export function currentSessionPlanConfirmationAuthorityV2(
     || authority.controlEpoch !== state.controlEpoch
     || authority.planDigest !== sha256Hash(canonicalJson(plan))
     || authority.scopePreviewsDigest !== sha256Hash(canonicalJson(
-      currentPlanScopePreviewsV2(state, plan)
+      currentSessionPlanScopePreviewsV2(state, plan)
     ))
     || canonicalJson(authority.toolContextRef)
       !== canonicalJson(toolContextRefV2(state.toolContext.bundle))
@@ -1383,6 +1389,7 @@ function validatePlan(plan: SessionNaturalLanguagePlanV2): void {
   const operationIds = new Set<string>();
   const idempotencyKeys = new Set<string>();
   for (const action of plan.actions) {
+    validatePlanActionScopeIntentV3(action);
     requiredIdentity(action.taskId, 'taskId');
     requiredIdentity(action.idempotencyKey, 'idempotencyKey');
     if (action.manifest.planRevision !== plan.planRevision) {
@@ -1405,6 +1412,100 @@ function validatePlan(plan: SessionNaturalLanguagePlanV2): void {
     operationIds.add(action.manifest.operationId);
     idempotencyKeys.add(action.idempotencyKey);
   }
+}
+
+function validatePlanActionScopeIntentV3(
+  action: SessionNaturalLanguagePlanV2['actions'][number]
+): void {
+  const actionRecord = stateRecord(action);
+  const manifest = stateRecord(actionRecord?.manifest);
+  const scopeIntent = stateRecord(manifest?.scopeIntent);
+  const data = stateRecord(scopeIntent?.data);
+  if (
+    !actionRecord
+    || !hasExactFields(actionRecord, [
+      'taskId',
+      'manifest',
+      'idempotencyKey',
+      'deadline',
+    ])
+    || !manifest
+    || !hasExactFields(manifest, [
+      'planRevision',
+      'planActionId',
+      'operationId',
+      'toolId',
+      'scopeIntent',
+    ])
+    || !scopeIntent
+    || !hasExactFields(scopeIntent, ['kind', 'data'])
+    || !data
+  ) {
+    throw invalidPlanScopeIntentV3();
+  }
+  if (scopeIntent.kind === 'exactInvocation') {
+    if (!hasExactFields(data, ['rawArguments'])) {
+      throw invalidPlanScopeIntentV3();
+    }
+    try {
+      decodeRawToolArgumentsV2(data.rawArguments);
+    } catch {
+      throw invalidPlanScopeIntentV3();
+    }
+    return;
+  }
+  if (
+    scopeIntent.kind !== 'resourceScope'
+    || !hasExactFields(data, ['requestedResources'])
+    || !Array.isArray(data.requestedResources)
+    || data.requestedResources.length === 0
+    || data.requestedResources.length > 256
+  ) {
+    throw invalidPlanScopeIntentV3();
+  }
+  data.requestedResources.forEach(validatePlanRequestedResourceV3);
+}
+
+function validatePlanRequestedResourceV3(value: unknown): void {
+  const resource = stateRecord(value);
+  const data = stateRecord(resource?.data);
+  if (
+    !resource
+    || !hasExactFields(resource, ['kind', 'data'])
+    || !data
+  ) {
+    throw invalidPlanScopeIntentV3();
+  }
+  const valid =
+    resource.kind === 'workspacePath'
+      ? hasExactFields(data, ['path', 'access'])
+        && validPlanResourceTextV3(data.path)
+        && (data.access === 'read' || data.access === 'write')
+      : resource.kind === 'repository'
+        ? hasExactFields(data, ['area'])
+          && ['state', 'index', 'history'].includes(String(data.area))
+        : resource.kind === 'networkUrl'
+          ? hasExactFields(data, ['url'])
+            && validPlanResourceTextV3(data.url)
+          : resource.kind === 'networkQuery'
+            ? hasExactFields(data, ['query'])
+              && validPlanResourceTextV3(data.query)
+            : false;
+  if (!valid) throw invalidPlanScopeIntentV3();
+}
+
+function validPlanResourceTextV3(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && new TextEncoder().encode(value).byteLength <= 16 * 1024
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function invalidPlanScopeIntentV3(): SessionKernelStateError {
+  return new SessionKernelStateError(
+    'session_kernel_plan_scope_intent_invalid',
+    'Persisted PlanActions must use the exact current ScopeIntent schema.'
+  );
 }
 
 function validatePlanDecision(decision: SessionPlanDecisionV2): void {
@@ -1553,29 +1654,59 @@ function validatePlanConfirmationProjectionRefV2(
   );
 }
 
-function currentPlanScopePreviewsV2(
+export function currentSessionPlanScopePreviewsV2(
   state: SessionKernelLoopStateV2,
-  plan: SessionNaturalLanguagePlanV2
+  plan: SessionNaturalLanguagePlanV2 | undefined = state.plan,
+  options: { requireComplete?: boolean } = {}
 ): CapabilityScopePreviewRecordV2[] {
+  const requireComplete = options.requireComplete ?? true;
+  const persistedPreviewOperations = Object.keys(state.previews);
+  if (!plan) {
+    if (persistedPreviewOperations.length !== 0) {
+      throw new SessionKernelStateError(
+        'session_kernel_plan_confirmation_preview_mismatch',
+        'Canonical scope previews cannot exist without a current Plan.'
+      );
+    }
+    return [];
+  }
   const contextRef = toolContextRefV2(state.toolContext.bundle);
-  return plan.actions.map((action) => {
-    const preview = state.previews[action.manifest.operationId];
+  const actionsByOperationId = new Map(
+    plan.actions.map((action) => [
+      action.manifest.operationId,
+      action,
+    ] as const)
+  );
+  for (const operationId of persistedPreviewOperations) {
+    const action = actionsByOperationId.get(operationId);
+    const preview = state.previews[operationId];
     if (
-      !preview
+      !action
+      || !preview
       || preview.runId !== state.runId
       || preview.controlEpoch !== state.controlEpoch
       || preview.planRevision !== plan.planRevision
       || preview.planActionId !== action.manifest.planActionId
-      || preview.operationId !== action.manifest.operationId
+      || preview.operationId !== operationId
       || preview.toolId !== action.manifest.toolId
       || canonicalJson(preview.contextRef) !== canonicalJson(contextRef)
     ) {
       throw new SessionKernelStateError(
         'session_kernel_plan_confirmation_preview_mismatch',
+        'Canonical scope previews must bind one exact current PlanAction, Run, epoch, tool, and ToolContext.'
+      );
+    }
+  }
+  return plan.actions.flatMap((action) => {
+    const preview = state.previews[action.manifest.operationId];
+    if (!preview) {
+      if (!requireComplete) return [];
+      throw new SessionKernelStateError(
+        'session_kernel_plan_confirmation_preview_mismatch',
         'Plan confirmation authority requires every exact current canonical preview.'
       );
     }
-    return cloneJson(preview);
+    return [cloneJson(preview)];
   });
 }
 
@@ -2247,6 +2378,16 @@ function hasExactFields(
   const expected = [...fields].sort();
   return keys.length === expected.length
     && keys.every((key, index) => key === expected[index]);
+}
+
+function stateRecord(
+  value: unknown
+): Record<string, unknown> | undefined {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function invalidRunCancellationReply(): SessionKernelStateError {

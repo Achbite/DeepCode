@@ -127,8 +127,7 @@ pub(crate) enum HostKernelBridgeOperationV2 {
         expected_plan_revision: Option<String>,
         guidance: Vec<String>,
     },
-    PreviewPlanAction {
-        plan_action_id: String,
+    PreviewPlan {
         expected_plan_revision: String,
     },
     PublishPlanConfirmationReady {
@@ -3766,7 +3765,7 @@ impl HostKernelBridgeOperationV2 {
                 | Self::Replan { .. }
                 | Self::ResumePlanning { .. }
                 | Self::ResumeAfterBackpressure { .. }
-                | Self::PreviewPlanAction { .. }
+                | Self::PreviewPlan { .. }
                 | Self::DecidePlan { .. }
                 | Self::FinalizeReview { .. }
                 | Self::RequestFinalAnswer { .. }

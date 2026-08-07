@@ -37,6 +37,9 @@ export type ToolAvailabilityV2 =
   | 'revoked'
   | 'unavailable';
 export type ToolRiskV2 = 'low' | 'medium' | 'high' | 'critical';
+export type ToolAuthorizationShapeV2 =
+  | 'resourceScope'
+  | 'exactInvocation';
 export type ToolEffectClassV2 = 'read' | 'mutation';
 export type ToolEffectScopeV2 =
   | 'workspaceRead'
@@ -59,6 +62,7 @@ export interface ToolDescriptorV2 {
   effectClass: ToolEffectClassV2;
   effectScope: ToolEffectScopeV2;
   risk: ToolRiskV2;
+  authorizationShape: ToolAuthorizationShapeV2;
   contractDigest: ToolContractDigestV2;
 }
 
@@ -108,7 +112,20 @@ export type RequestedResourceV2 =
   | {
       kind: 'networkQuery';
       data: { query: string };
+    };
+
+export type ScopeIntentV2 =
+  | {
+      kind: 'resourceScope';
+      data: { requestedResources: RequestedResourceV2[] };
     }
+  | {
+      kind: 'exactInvocation';
+      data: { rawArguments: RawToolArgumentsV2 };
+    };
+
+export type CapabilityAuthorizationBindingV2 =
+  | { kind: 'resourceScope'; data: Record<string, never> }
   | {
       kind: 'exactInvocation';
       data: { invocationDigest: string };
@@ -170,28 +187,31 @@ export type ToolContextGetReplyV2 =
     };
 
 /**
- * Session-owned durable plan shape. The HTTP adapter flattens this structure
- * into CapabilityScopePreviewV2 without changing any requested resource.
+ * Session-owned durable plan shape. The HTTP adapter submits all actions in
+ * one CapabilityScopePreviewBatchV2 without rewriting any scope intent.
  */
 export interface ScopeManifestV2 {
   planRevision: PlanRevisionV2;
   planActionId: PlanActionIdV2;
   operationId: OperationIdV2;
   toolId: ToolIdV2;
-  requestedResources: RequestedResourceV2[];
+  scopeIntent: ScopeIntentV2;
 }
 
-export interface CapabilityScopePreviewV2 {
-  runId: RunIdV2;
-  expectedControlEpoch: ControlEpochV2;
-  planRevision: PlanRevisionV2;
+export interface CapabilityScopePreviewItemV2 {
   planActionId: PlanActionIdV2;
   operationId: OperationIdV2;
   idempotencyKey: string;
   toolId: ToolIdV2;
-  rawArguments: RawToolArgumentsV2;
-  requestedResources: RequestedResourceV2[];
+  scopeIntent: ScopeIntentV2;
   deadline: DeadlineRequestV2;
+}
+
+export interface CapabilityScopePreviewBatchV2 {
+  runId: RunIdV2;
+  expectedControlEpoch: ControlEpochV2;
+  planRevision: PlanRevisionV2;
+  items: CapabilityScopePreviewItemV2[];
   toolContextRef: ToolContextRefV2;
 }
 
@@ -238,7 +258,7 @@ export interface CapabilityScopePreviewRecordV2 {
   planActionId: PlanActionIdV2;
   operationId: OperationIdV2;
   toolId: ToolIdV2;
-  canonicalArgumentsDigest: CanonicalArgumentsDigestV2;
+  authorizationBinding: CapabilityAuthorizationBindingV2;
   canonicalScope: JsonObjectV2;
   scopeDigest: CapabilityScopeDigestV2;
   authorizationDigest: CapabilityAuthorizationDigestV2;
@@ -260,11 +280,20 @@ export type CapabilityScopePreviewReplyV2 =
   | {
       kind: 'rejected';
       data: {
+        planActionId: PlanActionIdV2;
+        operationId: OperationIdV2;
         toolId: ToolIdV2;
         reason: CapabilityScopeRejectionReasonV2;
         guidance: string;
       };
     };
+
+export interface CapabilityScopePreviewBatchReplyV2 {
+  runId: RunIdV2;
+  acceptedControlEpoch: ControlEpochV2;
+  planRevision: PlanRevisionV2;
+  results: CapabilityScopePreviewReplyV2[];
+}
 
 /**
  * Provider calls normalize into this Session semantic record. Transport
@@ -467,7 +496,10 @@ export type InvocationCancelReplyV2 =
 export type KernelCommandV2 =
   | { kind: 'runOpen'; data: RunOpenV2 }
   | { kind: 'toolContextGet'; data: ToolContextGetV2 }
-  | { kind: 'capabilityScopePreview'; data: CapabilityScopePreviewV2 }
+  | {
+      kind: 'capabilityScopePreviewBatch';
+      data: CapabilityScopePreviewBatchV2;
+    }
   | { kind: 'toolIntentSubmit'; data: ToolIntentSubmitV2 }
   | { kind: 'kernelFactsQueryScoped'; data: KernelFactsQueryScopedV2 }
   | { kind: 'controlEpochAdvance'; data: ControlEpochAdvanceV2 }
@@ -487,7 +519,10 @@ export interface KernelTaggedErrorV2 {
 export type KernelReplyV2 =
   | { kind: 'runOpened'; data: RunOpenReplyV2 }
   | { kind: 'toolContext'; data: ToolContextGetReplyV2 }
-  | { kind: 'capabilityScopePreviewed'; data: CapabilityScopePreviewReplyV2 }
+  | {
+      kind: 'capabilityScopePreviewBatchResult';
+      data: CapabilityScopePreviewBatchReplyV2;
+    }
   | { kind: 'toolIntentSubmission'; data: ToolIntentSubmitReplyV2 }
   | { kind: 'kernelFactsProjected'; data: KernelFactProjectionPageV2 }
   | { kind: 'controlEpochAdvanced'; data: ControlEpochAdvancedReplyV2 }
@@ -691,10 +726,10 @@ function decodeKernelCommandV2(value: unknown): KernelCommandV2 {
         kind: command.kind,
         data: decodeToolContextGet(command.data),
       };
-    case 'capabilityScopePreview':
+    case 'capabilityScopePreviewBatch':
       return {
         kind: command.kind,
-        data: decodeCapabilityScopePreview(command.data),
+        data: decodeCapabilityScopePreviewBatch(command.data),
       };
     case 'toolIntentSubmit':
       return {
@@ -754,35 +789,48 @@ function decodeToolContextGet(value: unknown): ToolContextGetV2 {
   };
 }
 
-function decodeCapabilityScopePreview(
+function decodeCapabilityScopePreviewBatch(
   value: unknown
-): CapabilityScopePreviewV2 {
+): CapabilityScopePreviewBatchV2 {
   const data = exactRecord(
     value,
     [
       'runId',
       'expectedControlEpoch',
       'planRevision',
-      'planActionId',
-      'operationId',
-      'idempotencyKey',
-      'toolId',
-      'rawArguments',
-      'requestedResources',
-      'deadline',
+      'items',
       'toolContextRef',
     ],
-    'CapabilityScopePreview command'
+    'CapabilityScopePreviewBatch command'
   );
-  const requestedResources = array(
-    data.requestedResources,
-    'requestedResources'
-  ).map(decodeRequestedResource);
-  if (requestedResources.length === 0 || requestedResources.length > 256) {
+  const items = array(data.items, 'items').map((value) => {
+    const item = exactRecord(
+      value,
+      [
+        'planActionId',
+        'operationId',
+        'idempotencyKey',
+        'toolId',
+        'scopeIntent',
+        'deadline',
+      ],
+      'CapabilityScopePreviewBatch item'
+    );
+    return {
+      planActionId: identity(item.planActionId, 'planActionId'),
+      operationId: identity(item.operationId, 'operationId'),
+      idempotencyKey: wireText(item.idempotencyKey, 'idempotencyKey'),
+      toolId: toolId(item.toolId),
+      scopeIntent: decodeScopeIntent(item.scopeIntent),
+      deadline: decodeDeadlineRequest(item.deadline),
+    };
+  });
+  if (items.length === 0 || items.length > 256) {
     throw new KernelV2WireError(
-      'requestedResources must contain 1..=256 entries.'
+      'items must contain 1..=256 entries.'
     );
   }
+  requireUniquePreviewBatchItems(items);
   return {
     runId: identity(data.runId, 'runId'),
     expectedControlEpoch: positiveInteger(
@@ -790,13 +838,7 @@ function decodeCapabilityScopePreview(
       'expectedControlEpoch'
     ),
     planRevision: identity(data.planRevision, 'planRevision'),
-    planActionId: identity(data.planActionId, 'planActionId'),
-    operationId: identity(data.operationId, 'operationId'),
-    idempotencyKey: wireText(data.idempotencyKey, 'idempotencyKey'),
-    toolId: toolId(data.toolId),
-    rawArguments: decodeRawToolArgumentsV2(data.rawArguments),
-    requestedResources,
-    deadline: decodeDeadlineRequest(data.deadline),
+    items,
     toolContextRef: decodeContextRef(data.toolContextRef),
   };
 }
@@ -962,27 +1004,46 @@ function decodeRequestedResource(value: unknown): RequestedResourceV2 {
         },
       };
     }
-    case 'exactInvocation': {
-      const data = exactRecord(
-        resource.data,
-        ['invocationDigest'],
-        'exact-invocation resource'
-      );
-      return {
-        kind: resource.kind,
-        data: {
-          invocationDigest: digest(
-            data.invocationDigest,
-            'exactInvocationDigest'
-          ),
-        },
-      };
-    }
     default:
       throw new KernelV2WireError(
         `Unsupported requested resource kind ${resource.kind}.`
       );
   }
+}
+
+function decodeScopeIntent(value: unknown): ScopeIntentV2 {
+  const intent = tagged(value, 'scope intent');
+  if (intent.kind === 'resourceScope') {
+    const data = exactRecord(
+      intent.data,
+      ['requestedResources'],
+      'resource-scope intent'
+    );
+    const requestedResources = array(
+      data.requestedResources,
+      'scopeIntent.requestedResources'
+    ).map(decodeRequestedResource);
+    if (requestedResources.length === 0 || requestedResources.length > 256) {
+      throw new KernelV2WireError(
+        'scopeIntent.requestedResources must contain 1..=256 entries.'
+      );
+    }
+    return { kind: intent.kind, data: { requestedResources } };
+  }
+  if (intent.kind === 'exactInvocation') {
+    const data = exactRecord(
+      intent.data,
+      ['rawArguments'],
+      'exact-invocation intent'
+    );
+    return {
+      kind: intent.kind,
+      data: { rawArguments: decodeRawToolArgumentsV2(data.rawArguments) },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported scope intent kind ${intent.kind}.`
+  );
 }
 
 function decodeToolIntentAuthority(value: unknown): ToolIntentAuthorityV2 {
@@ -1080,10 +1141,10 @@ function decodeKernelReplyV2(value: unknown): KernelReplyV2 {
       return { kind: reply.kind, data: decodeRunOpenReplyV2(reply.data) };
     case 'toolContext':
       return { kind: reply.kind, data: decodeToolContextReply(reply.data) };
-    case 'capabilityScopePreviewed':
+    case 'capabilityScopePreviewBatchResult':
       return {
         kind: reply.kind,
-        data: decodeCapabilityScopePreviewReply(reply.data),
+        data: decodeCapabilityScopePreviewBatchReply(reply.data),
       };
     case 'toolIntentSubmission':
       return { kind: reply.kind, data: decodeToolIntentReply(reply.data) };
@@ -1149,6 +1210,82 @@ function decodeToolContextReply(value: unknown): ToolContextGetReplyV2 {
   throw new KernelV2WireError(`Unsupported ToolContext reply ${reply.kind}.`);
 }
 
+function decodeCapabilityScopePreviewBatchReply(
+  value: unknown
+): CapabilityScopePreviewBatchReplyV2 {
+  const data = exactRecord(
+    value,
+    ['runId', 'acceptedControlEpoch', 'planRevision', 'results'],
+    'CapabilityScopePreviewBatch reply'
+  );
+  const results = array(data.results, 'results').map(
+    decodeCapabilityScopePreviewReply
+  );
+  if (results.length === 0 || results.length > 256) {
+    throw new KernelV2WireError('results must contain 1..=256 entries.');
+  }
+  requireUniquePreviewBatchResults(results);
+  return {
+    runId: identity(data.runId, 'runId'),
+    acceptedControlEpoch: positiveInteger(
+      data.acceptedControlEpoch,
+      'acceptedControlEpoch'
+    ),
+    planRevision: identity(data.planRevision, 'planRevision'),
+    results,
+  };
+}
+
+function requireUniquePreviewBatchItems(
+  items: readonly CapabilityScopePreviewItemV2[]
+): void {
+  const planActionIds = new Set<string>();
+  const operationIds = new Set<string>();
+  const idempotencyKeys = new Set<string>();
+  for (const item of items) {
+    if (!planActionIds.add(item.planActionId)) {
+      throw new KernelV2WireError(
+        'items.planActionId must be unique within the preview batch.'
+      );
+    }
+    if (!operationIds.add(item.operationId)) {
+      throw new KernelV2WireError(
+        'items.operationId must be unique within the preview batch.'
+      );
+    }
+    if (!idempotencyKeys.add(item.idempotencyKey)) {
+      throw new KernelV2WireError(
+        'items.idempotencyKey must be unique within the preview batch.'
+      );
+    }
+  }
+}
+
+function requireUniquePreviewBatchResults(
+  results: readonly CapabilityScopePreviewReplyV2[]
+): void {
+  const planActionIds = new Set<string>();
+  const operationIds = new Set<string>();
+  for (const result of results) {
+    const planActionId = result.kind === 'previewed'
+      ? result.data.preview.planActionId
+      : result.data.planActionId;
+    const operationId = result.kind === 'previewed'
+      ? result.data.preview.operationId
+      : result.data.operationId;
+    if (!planActionIds.add(planActionId)) {
+      throw new KernelV2WireError(
+        'results.planActionId must be unique within the preview batch.'
+      );
+    }
+    if (!operationIds.add(operationId)) {
+      throw new KernelV2WireError(
+        'results.operationId must be unique within the preview batch.'
+      );
+    }
+  }
+}
+
 function decodeCapabilityScopePreviewReply(
   value: unknown
 ): CapabilityScopePreviewReplyV2 {
@@ -1163,12 +1300,14 @@ function decodeCapabilityScopePreviewReply(
   if (reply.kind === 'rejected') {
     const data = exactRecord(
       reply.data,
-      ['toolId', 'reason', 'guidance'],
+      ['planActionId', 'operationId', 'toolId', 'reason', 'guidance'],
       'rejected scope preview'
     );
     return {
       kind: reply.kind,
       data: {
+        planActionId: identity(data.planActionId, 'planActionId'),
+        operationId: identity(data.operationId, 'operationId'),
         toolId: toolId(data.toolId),
         reason: oneOf(
           data.reason,
@@ -1347,7 +1486,7 @@ function decodeScopePreviewRecord(value: unknown): CapabilityScopePreviewRecordV
       'planActionId',
       'operationId',
       'toolId',
-      'canonicalArgumentsDigest',
+      'authorizationBinding',
       'canonicalScope',
       'scopeDigest',
       'authorizationDigest',
@@ -1370,9 +1509,8 @@ function decodeScopePreviewRecord(value: unknown): CapabilityScopePreviewRecordV
     planActionId: identity(data.planActionId, 'planActionId'),
     operationId: identity(data.operationId, 'operationId'),
     toolId: toolId(data.toolId),
-    canonicalArgumentsDigest: digest(
-      data.canonicalArgumentsDigest,
-      'canonicalArgumentsDigest'
+    authorizationBinding: decodeAuthorizationBinding(
+      data.authorizationBinding
     ),
     canonicalScope: jsonObject(data.canonicalScope, 'canonicalScope'),
     scopeDigest: digest(data.scopeDigest, 'scopeDigest'),
@@ -1412,6 +1550,35 @@ function decodeScopePreviewRecord(value: unknown): CapabilityScopePreviewRecordV
     );
   }
   return preview;
+}
+
+function decodeAuthorizationBinding(
+  value: unknown
+): CapabilityAuthorizationBindingV2 {
+  const binding = tagged(value, 'capability authorization binding');
+  if (binding.kind === 'resourceScope') {
+    exactRecord(binding.data, [], 'resource-scope binding');
+    return { kind: binding.kind, data: {} };
+  }
+  if (binding.kind === 'exactInvocation') {
+    const data = exactRecord(
+      binding.data,
+      ['invocationDigest'],
+      'exact-invocation binding'
+    );
+    return {
+      kind: binding.kind,
+      data: {
+        invocationDigest: digest(
+          data.invocationDigest,
+          'exactInvocationDigest'
+        ),
+      },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported authorization binding ${binding.kind}.`
+  );
 }
 
 function decodeApprovalView(value: unknown): CapabilityApprovalViewV2 {
@@ -1847,6 +2014,7 @@ function decodeToolDescriptor(value: unknown): ToolDescriptorV2 {
       'effectClass',
       'effectScope',
       'risk',
+      'authorizationShape',
       'contractDigest',
     ],
     'ToolDescriptor'
@@ -1868,6 +2036,11 @@ function decodeToolDescriptor(value: unknown): ToolDescriptorV2 {
     ),
     effectScope: decodeEffectScope(data.effectScope),
     risk: decodeRisk(data.risk),
+    authorizationShape: oneOf(
+      data.authorizationShape,
+      ['resourceScope', 'exactInvocation'] as const,
+      'tool authorizationShape'
+    ),
     contractDigest: digest(data.contractDigest, 'tool contractDigest'),
   };
 }

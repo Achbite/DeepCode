@@ -164,7 +164,7 @@ only from validated provider usage metadata.
 Assistant answers and commentary use provider-native text items and may stream
 after archive-before-publication. A Plan is never encoded as assistant JSON.
 It is proposed only through the Session-only
-`deepcode_session_plan_propose_v2` control with exact arguments. That control
+`deepcode_session_plan_propose_v3` control with exact arguments. That control
 is not a Kernel tool, is never registered in `KernelToolRegistry`, and can
 never become a `ToolIntent`.
 
@@ -235,14 +235,45 @@ planRevision
 planActionId
 operationId
 toolId
-requested resource scope or exact invocation scope
+scopeIntent = resourceScope(requestedResources)
+            | exactInvocation(rawArguments)
 ```
 
-Kernel resolves and canonicalizes the scope and returns an authorization
+Session submits one ordered `CapabilityScopePreviewBatch` for the complete Plan.
+Kernel validates every item before committing any accepted preview, then writes
+the batch receipt and every accepted preview fact/material in one authority
+transaction. The receipt records the complete ordered outcome set; Session
+applies that set atomically, and Plan confirmation requires every action to have
+an accepted preview. A crash cannot expose only part of the batch outcome.
+Kernel resolves and canonicalizes each scope and returns an authorization
 summary plus digest. It may narrow or reject the request; it cannot silently
 expand it. Host confirms the exact digest. Kernel then issues an immutable,
-versioned capability lease bound to run, workspace, control epoch, plan
-revision, tool context, and PlanAction.
+versioned capability lease bound to run, workspace, control epoch, Plan
+revision, tool context, authorization shape, and PlanAction.
+
+`resourceScope` authorization is a subset relation over Kernel-resolved stable
+resource identities. Workspace identity binds normalized path, requested
+access, and object kind, but not a content/state digest. Network identity binds
+the canonical URL or query and service origin; transient DNS/observation
+digests remain canonical execution evidence and are revalidated for every
+invocation, but do not silently turn provider options such as a search result
+limit into a different resource. Scope expansion is monotonic: the new target
+set must equal `previous ∪ actual`. Kernel must not reconstruct an expansion
+through a lossy request DTO; a scope union that the ABI cannot represent fails
+closed and requires re-planning.
+
+`exactInvocation` authorization requires both the exact canonical invocation
+digest and `actualTargets ⊆ approvedTargets`. Matching arguments alone never
+authorize a path, symlink, object-kind, or network target that resolved
+differently at execution time. A different invocation digest is not a scope
+expansion: Kernel rejects it before creating a pending invocation or capability
+interaction and requires a newly persisted and previewed PlanAction.
+
+The private Session Plan retains exact-invocation raw arguments for Kernel
+preview and admission. Public projection replaces that private payload with an
+empty `exactInvocation` authorization-shape marker. GUI, CLI, TUI, memory, Copy,
+and Provider continuation therefore never receive private invocation arguments
+from the Plan projection.
 
 A PlanAction lease is reusable inside the same epoch for the same approved
 tools and resources. Every use still receives independent invocation, attempt,
@@ -272,6 +303,19 @@ revalidates schema, targets, settings, context, and lease:
 - denied expansion: persist denial and return structured guidance to Session;
 - after an observable effect: never request an expansion or automatically
   continue; settle as observed failure or indeterminate.
+
+Before creating `AwaitingCapability`, Kernel also checks the other previewed
+PlanActions in the same run, epoch, Plan revision, tool context, and tool. If the
+actual target is outside the submitted PlanAction but belongs to another
+PlanAction, the intent is rejected with re-plan guidance before any pending
+invocation or permission interaction is created. Session never repairs this
+ownership relation by parsing raw arguments.
+
+When the user has explicitly enabled automatic Plan approval, Host first
+persists the exact trust grant and then asks Kernel to issue the capability for
+that same immutable preview. Trust does not rewrite preview disposition, and it
+cannot authorize a different target, epoch, PlanAction, tool, context, expired
+grant, or revoked grant.
 
 For future tools whose resource effects cannot be bounded, the only reusable
 authority form is an exact canonical invocation digest including command,
@@ -676,6 +720,13 @@ commentary is flushed after 250 ms or 16 KiB, whichever occurs first, with
 monotonic elapsed-time checks performed before accepting more frames so a busy
 stream cannot starve the timer. Final-answer text remains sealed until native
 completion and full response validation.
+
+When commentary immediately precedes a Plan confirmation at one Provider
+boundary, Session submits both projection records as one ordered batch. Public
+AgentEvent readers expose only the prefix covered by the latest committed
+timeline `sourceEventVersion`; a crash-written suffix therefore remains hidden
+until recovery commits the complete batch and cannot expose an orphan
+commentary event.
 
 Private trace contents have no Session/model, CLI, TUI, public projection,
 Copy, Memory, GoalProjection, or cache ingress. A GUI Session-menu user action

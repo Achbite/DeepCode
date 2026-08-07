@@ -1628,7 +1628,7 @@ const CURRENT_SCOPE_PREVIEW_FIELDS = {
   planActionId: 'identity',
   operationId: 'identity',
   toolId: 'identity',
-  canonicalArgumentsDigest: 'identity',
+  authorizationBinding: 'object',
   canonicalScope: 'object',
   scopeDigest: 'identity',
   authorizationDigest: 'identity',
@@ -1936,6 +1936,8 @@ function currentScopePreviewProjectionData(
       reply,
       'scope.previewed.data',
       {
+        planActionId: 'identity',
+        operationId: 'identity',
         toolId: 'identity',
         reason: 'identity',
         guidance: 'string',
@@ -2260,6 +2262,52 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
       );
     }
   }
+  projectionArray(plan, 'actions').forEach((value, index) => {
+    const action = exactCurrentProjectionValue(
+      value,
+      `plan.actions[${String(index)}]`,
+      {
+        taskId: 'identity',
+        manifest: 'object',
+        idempotencyKey: 'identity',
+        deadline: 'object',
+      }
+    );
+    const manifest = exactCurrentProjectionValue(
+      action.manifest,
+      `plan.actions[${String(index)}].manifest`,
+      {
+        planRevision: 'identity',
+        planActionId: 'identity',
+        operationId: 'identity',
+        toolId: 'identity',
+        scopeIntent: 'object',
+      }
+    );
+    const scopeIntent = exactCurrentProjectionValue(
+      manifest.scopeIntent,
+      `plan.actions[${String(index)}].manifest.scopeIntent`,
+      { kind: 'string', data: 'object' }
+    );
+    if (
+      projectionEnum(scopeIntent, 'kind', [
+        'resourceScope',
+        'exactInvocation',
+      ]) === 'exactInvocation'
+    ) {
+      exactCurrentProjectionValue(
+        scopeIntent.data,
+        `plan.actions[${String(index)}].manifest.scopeIntent.data`,
+        { rawArguments: 'object' }
+      );
+    } else {
+      exactCurrentProjectionValue(
+        scopeIntent.data,
+        `plan.actions[${String(index)}].manifest.scopeIntent.data`,
+        { requestedResources: 'array' }
+      );
+    }
+  });
 }
 
 function validateCurrentScopePreview(value: unknown, field: string): void {
@@ -2287,6 +2335,29 @@ function validateCurrentScopePreview(value: unknown, field: string): void {
     'autoIssuable',
     'requiresUserDecision',
   ]);
+  const authorizationBinding = exactCurrentProjectionValue(
+    preview.authorizationBinding,
+    `${field}.authorizationBinding`,
+    { kind: 'string', data: 'object' }
+  );
+  if (
+    projectionEnum(authorizationBinding, 'kind', [
+      'resourceScope',
+      'exactInvocation',
+    ]) === 'resourceScope'
+  ) {
+    exactCurrentProjectionValue(
+      authorizationBinding.data,
+      `${field}.authorizationBinding.data`,
+      {}
+    );
+  } else {
+    exactCurrentProjectionValue(
+      authorizationBinding.data,
+      `${field}.authorizationBinding.data`,
+      { invocationDigest: 'identity' }
+    );
+  }
 }
 
 function exactCurrentProjectionRecord(
@@ -2521,7 +2592,10 @@ function planConfirmationReadyPresentation(
   event: SessionKernelProjectionEventV2,
   data: Record<string, unknown> | undefined
 ): ReturnType<typeof publicPresentation> {
-  const plan = objectRecord(data?.plan);
+  const privatePlan = objectRecord(data?.plan);
+  const plan = privatePlan
+    ? publicPlanForPresentationV3(privatePlan)
+    : undefined;
   const previews = scopePreviewRecords(data);
   const planRevision = textField(plan, 'planRevision')
     ?? textField(data, 'planRevision');
@@ -2573,6 +2647,36 @@ function planConfirmationReadyPresentation(
       ),
     },
   };
+}
+
+/**
+ * Exact invocation arguments remain Session-private. Public Plan tasks retain
+ * only the scope-intent discriminator so Shells never receive raw arguments.
+ */
+function publicPlanForPresentationV3(
+  plan: Record<string, unknown>
+): Record<string, unknown> {
+  const publicPlan = cloneJson(plan);
+  if (!Array.isArray(publicPlan.actions)) return publicPlan;
+  publicPlan.actions = publicPlan.actions.map((value) => {
+    const action = objectRecord(value);
+    const manifest = objectRecord(action?.manifest);
+    const scopeIntent = objectRecord(manifest?.scopeIntent);
+    if (!action || !manifest || scopeIntent?.kind !== 'exactInvocation') {
+      return cloneJson(value);
+    }
+    return {
+      ...cloneJson(action),
+      manifest: {
+        ...cloneJson(manifest),
+        scopeIntent: {
+          kind: 'exactInvocation',
+          data: {},
+        },
+      },
+    };
+  });
+  return publicPlan;
 }
 
 function planScopePreviewsComplete(

@@ -3143,7 +3143,7 @@ fn validate_mutation_result_facts(
                     identity,
                     preview_id,
                     tool_id,
-                    canonical_arguments_digest,
+                    canonical_arguments_digest: _,
                     scope_digest,
                     tool_contract_digest,
                     context_ref,
@@ -3161,7 +3161,6 @@ fn validate_mutation_result_facts(
                     || identity.plan_action_id != preview.plan_action_id
                     || preview_id != &preview.preview_id
                     || tool_id != &preview.tool_id
-                    || canonical_arguments_digest != &preview.canonical_arguments_digest
                     || scope_digest != &preview.scope_digest
                     || tool_contract_digest != &preview.tool_contract_digest
                     || context_ref != &preview.context_ref

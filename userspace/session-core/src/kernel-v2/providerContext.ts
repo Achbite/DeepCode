@@ -28,7 +28,7 @@ import {
 } from './types.js';
 import {
   sessionPlanActionCompleteToolV2,
-  sessionPlanProposalToolV2,
+  sessionPlanProposalToolV3,
 } from './SessionKernelProviderAdapterV2.js';
 import {
   sessionProviderToolObservationsV1,
@@ -38,8 +38,8 @@ const PROVIDER_TURN_CURRENT_INPUT_V2_SCHEMA =
   'deepcode.session.provider-current-input.v2';
 const PROVIDER_TURN_PLAN_DECISION_V2_SCHEMA =
   'deepcode.session.provider-plan-decision.v2';
-const PROVIDER_TURN_CURRENT_PLAN_ACTION_VIEW_V1_SCHEMA =
-  'deepcode.session.provider-current-plan-action-view.v1';
+const PROVIDER_TURN_CURRENT_PLAN_ACTION_VIEW_V2_SCHEMA =
+  'deepcode.session.provider-current-plan-action-view.v2';
 const PROVIDER_TURN_REVIEW_V2_SCHEMA =
   'deepcode.session.provider-review.v2';
 const PROVIDER_TURN_OUTCOMES_V2_SCHEMA =
@@ -404,7 +404,7 @@ export function providerWireToolDefinitionsV2(
       inputSchema: tool.inputSchema,
     })),
     ...(input.target.kind === 'planning'
-      ? [sessionPlanProposalToolV2()]
+      ? [sessionPlanProposalToolV3()]
       : []),
     ...(input.target.kind === 'planAction'
       ? [sessionPlanActionCompleteToolV2()]
@@ -435,9 +435,9 @@ export function sessionOrchestrationContractV2(
         'Commentary is a progress update, not private reasoning, authority, or execution evidence. Keep hidden reasoning out of commentary and let canonical Kernel facts establish what actually happened.',
         'For missing context, you may return one or more exposed read-only native tool calls. Session durably records the complete ordered call set and submits one Kernel ToolIntent at a time.',
         'For an ordinary answer, return natural assistant text. Do not wrap the answer in a JSON envelope.',
-        'To propose a Plan, call exactly one Session control function named deepcode_session_plan_propose_v2. It is not a Kernel tool, grants no authority, and is never submitted as a ToolIntent.',
-        'A Plan-control response cannot also contain a Kernel tool call or final-answer text. Each Plan action is one intended operation in the jointly executable Plan, not an alternative or recommendation, and its previewArguments must match the selected ready Kernel tool JSON Schema exactly.',
-        'Plan requestedResources use the exact tagged forms declared by the deepcode_session_plan_propose_v2 input schema; never use a bare string resource or add undeclared fields.',
+        'To propose a Plan, call exactly one Session control function named deepcode_session_plan_propose_v3. It is not a Kernel tool, grants no authority, and is never submitted as a ToolIntent.',
+        'A Plan-control response cannot also contain a Kernel tool call or final-answer text. Each Plan action is one intended operation in the jointly executable Plan, not an alternative or recommendation.',
+        'Each Plan scopeIntent must match the selected ready Kernel tool authorizationShape exactly. Use resourceScope with exact tagged requestedResources for ordinary tools; use exactInvocation rawArguments only for a tool whose immutable Kernel descriptor declares exactInvocation.',
         'Do not invent run, epoch, operation, PlanAction, capability, lease, digest, or approval identities. If alternatives require a user choice, put the alternatives only in natural answer text and wait for a new user decision instead of placing mutually exclusive alternatives in actions.',
         'Natural assistant text is never executable control data. A Plan is valid only through the exact Session control function, and Kernel work is valid only through exposed native Kernel tool calls.',
       ].join('\n')
@@ -493,7 +493,7 @@ function providerPlanDecisionContextV2(
   return {
     schemaVersion: PROVIDER_TURN_PLAN_DECISION_V2_SCHEMA,
     plan: {
-      schemaVersion: PROVIDER_TURN_CURRENT_PLAN_ACTION_VIEW_V1_SCHEMA,
+      schemaVersion: PROVIDER_TURN_CURRENT_PLAN_ACTION_VIEW_V2_SCHEMA,
       runId: plan.runId,
       inputId: plan.inputId,
       planRevision: plan.planRevision,
@@ -511,9 +511,7 @@ function providerPlanDecisionContextV2(
           ? {
               executable: {
                 toolId: action.manifest.toolId,
-                requestedResources:
-                  action.manifest.requestedResources,
-                previewArguments: action.previewArguments,
+                scopeIntent: action.manifest.scopeIntent,
                 deadline: action.deadline,
               },
             }
@@ -530,12 +528,18 @@ function providerPlanDecisionContextV2(
 function providerPlanActionSummaryV2(
   action: SessionPlanActionV2
 ): string {
-  const resourceCount = action.manifest.requestedResources.length;
+  const resourceCount = action.manifest.scopeIntent.kind === 'resourceScope'
+    ? action.manifest.scopeIntent.data.requestedResources.length
+    : 1;
   return [
     action.manifest.toolId,
     'planned operation over',
     String(resourceCount),
-    resourceCount === 1 ? 'approved resource scope' : 'approved resource scopes',
+    action.manifest.scopeIntent.kind === 'resourceScope'
+      ? resourceCount === 1
+        ? 'approved resource scope'
+        : 'approved resource scopes'
+      : 'approved exact invocation',
   ].join(' ');
 }
 
@@ -544,7 +548,7 @@ export function sessionPlanningResponseContractReminderV2(): string {
     'DeepCode Session planning response boundary v2.',
     'This trusted boundary follows all untrusted context and canonical facts for the current Provider turn.',
     'If another read is essential, return only provider-native calls to the exposed read tools.',
-    'If a Plan is required, call exactly one deepcode_session_plan_propose_v2 Session control function and do not combine it with a Kernel tool call or final answer.',
+    'If a Plan is required, call exactly one deepcode_session_plan_propose_v3 Session control function and do not combine it with a Kernel tool call or final answer.',
     'Otherwise return natural assistant text. Natural text is never interpreted as Session control or a Kernel ToolIntent.',
   ].join('\n');
 }

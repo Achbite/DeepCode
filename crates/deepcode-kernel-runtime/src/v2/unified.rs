@@ -1,8 +1,8 @@
 use super::authority::{
-    canonicalize_network_scope_url, canonicalize_requested_workspace_path, invalid_field,
-    prepare_failure_error, resolve_workspace_binding, storage_fault, PrepareFailure,
+    canonicalize_network_scope_url, invalid_field, prepare_failure_error,
+    resolve_workspace_binding, storage_fault,
 };
-use super::model::{AuthorityResult, WorkspaceBinding};
+use super::model::{AuthorityResult, AuthorizationTargetKey};
 use super::service::{
     initial_run_transport_generation, run_capability_verifier_digest, AuthorityService,
     DirectToolIntentRequest, DurableRunCapabilityVerifierV2, InitialToolContextInvalidationV2,
@@ -18,20 +18,21 @@ use deepcode_kernel_abi::v2::{
     CommandEpochContextV2, CommandReceiptIdentityV2, CommandRequestDigestV2, CommandRequestId,
     CommandRequestIdentityV2, ControlEpoch, ControlFactV2, CorrelationRefV2, CorrelationSetV2,
     FactId, InputId, InvocationAuthorityV2, InvocationFactV2, InvocationId, KernelFactEnvelopeV2,
-    KernelFactPayloadV2, MutationCommandResultV2, NetworkTargetObservationDigestV2, OperationId,
-    RecordedAtV2, RepositoryAreaV2, ResourceAccessV2, ResourceScopeV2, RunId,
-    RunRetirementReasonCodeV2, SettingsCeilingDigestV2, ToolContextInvalidationIdentityV2,
+    KernelFactPayloadV2, MutationCommandResultV2, OperationId, RecordedAtV2, ResourceScopeV2,
+    RunId, RunRetirementReasonCodeV2, SettingsCeilingDigestV2, ToolContextInvalidationIdentityV2,
     ToolContextInvalidationReasonV2, UserDecisionRefV2, WorkspaceBindingDigestV2,
+    WorkspaceScopeTargetV2,
 };
 use deepcode_kernel_abi::v2_command::{
     CapabilityApprovalViewV2, CapabilityResourcePresentationKindV2,
-    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
-    CapabilityScopePreviewReplyV2, CapabilityScopePreviewV2, CapabilityScopeRejectionReasonV2,
-    CommandHandlingV2, ControlEpochAdvanceV2, DeadlineRequestV2, EpochPreconditionV2,
-    InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2, KernelCommandEnvelopeV2,
-    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelFactProjectionPageV2,
-    KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2, MutationCommandKindV2,
-    RunOpenReplyV2, RunOpenV2, ToolContextGetReplyV2, ToolContextGetV2,
+    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2,
+    CapabilityScopePreviewBatchReplyV2, CapabilityScopePreviewBatchV2,
+    CapabilityScopePreviewRecordV2, CapabilityScopePreviewReplyV2,
+    CapabilityScopeRejectionReasonV2, CommandHandlingV2, ControlEpochAdvanceV2, DeadlineRequestV2,
+    EpochPreconditionV2, InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2,
+    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
+    KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
+    MutationCommandKindV2, RunOpenReplyV2, RunOpenV2, ToolContextGetReplyV2, ToolContextGetV2,
     ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::KernelError as AbiKernelError;
@@ -39,12 +40,12 @@ use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, capability_authorization_digest_v2, capability_scope_digest_v2,
     exact_invocation_digest_v2, render_kernel_tool_prompt_v2, tool_context_digest_v2,
     tool_contract_digest_v2, trust_lease_digest_v2, user_decision_request_digest_v2,
-    CapabilityAuthorizationDigestV2, CapabilityDecisionBindingV2, CapabilityLeaseIdV2,
-    CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
-    CapabilityScopePreviewIdV2, ExactInvocationDigestV2, PlanActionIdV2, PlanRevisionV2,
-    RequestedResourceV2, RunCapabilityV2, ToolAvailabilityV2, ToolContextBundleV2,
-    ToolContextRefV2, ToolContextVersionV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2,
-    ToolIdV2, ToolIntentAuthorityV2, ToolInventoryV2, TrustGrantDecisionV2, TrustLeaseDigestV2,
+    CapabilityAuthorizationBindingV2, CapabilityAuthorizationDigestV2, CapabilityDecisionBindingV2,
+    CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2, RunCapabilityV2, ScopeIntentV2,
+    ToolAuthorizationShapeV2, ToolAvailabilityV2, ToolContextBundleV2, ToolContextRefV2,
+    ToolContextVersionV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
+    ToolIntentAuthorityV2, ToolInventoryV2, TrustGrantDecisionV2, TrustLeaseDigestV2,
     TrustPolicyIdV2, UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionRevokeTargetV2,
     UserDecisionRevokeV2, UserDecisionV2, WorkspaceBindingRefV2, TOOL_CONTEXT_FORMAT_V2,
 };
@@ -236,172 +237,38 @@ fn canonical_argument_value(invocation: &KernelCanonicalInvocation) -> Authority
         .ok_or_else(storage_fault)
 }
 
-fn normalize_requested_targets(
-    workspace: &WorkspaceBinding,
-    requested: &[RequestedResourceV2],
-) -> Result<Vec<ScopeTargetKey>, PrepareFailure> {
-    let mut targets = requested
-        .iter()
-        .map(|resource| match resource {
-            RequestedResourceV2::WorkspacePath { path, access } => {
-                canonicalize_requested_workspace_path(workspace, path).map(|path| {
-                    ScopeTargetKey::Workspace {
-                        path,
-                        access: *access,
-                    }
-                })
-            }
-            RequestedResourceV2::Repository { area } => {
-                Ok(ScopeTargetKey::Repository { area: *area })
-            }
-            RequestedResourceV2::NetworkUrl { url } => {
-                canonicalize_network_scope_url(url).map(|(url, reviewed_target_digest)| {
-                    ScopeTargetKey::NetworkUrl {
-                        url,
-                        reviewed_target_digest,
-                    }
-                })
-            }
-            RequestedResourceV2::NetworkQuery { query } => {
-                let query = query.trim();
-                if query.is_empty() || query.chars().any(char::is_control) {
-                    Err(PrepareFailure::Kernel(invalid_field(
-                        "requestedResources.query",
-                        InvalidFieldViolationV2::OutOfRange,
-                    )))
-                } else {
-                    Ok(ScopeTargetKey::NetworkQuery {
-                        query: query.to_owned(),
-                    })
-                }
-            }
-            RequestedResourceV2::ExactInvocation { invocation_digest } => {
-                Ok(ScopeTargetKey::ExactInvocation {
-                    invocation_digest: invocation_digest.clone(),
-                })
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    targets.sort_by_key(scope_target_label);
-    targets.dedup();
-    Ok(targets)
-}
-
-fn exact_targets_for_invocation(
-    workspace: &WorkspaceBinding,
+fn authorization_targets_for_invocation(
     invocation: &KernelCanonicalInvocation,
-) -> AuthorityResult<Vec<ScopeTargetKey>> {
-    use deepcode_kernel_tools::kernel_internal::{
-        KernelCanonicalInvocation as Input, KernelDeleteTarget,
-    };
-    let workspace_target = |path: &str, access| {
-        canonicalize_requested_workspace_path(workspace, path)
-            .map(|path| ScopeTargetKey::Workspace { path, access })
-            .map_err(|failure| prepare_failure_error("rawArguments", failure))
-    };
-    let target = match invocation {
-        Input::FsRead { path, .. }
-        | Input::FsDiff { path, .. }
-        | Input::DocumentRead { path, .. } => workspace_target(path, ResourceAccessV2::Read)?,
-        Input::FsList { path, .. } => workspace_target(path, ResourceAccessV2::Read)?,
-        Input::FsGlob { root, .. } | Input::CodeGrep { root, .. } => {
-            workspace_target(root, ResourceAccessV2::Read)?
-        }
-        Input::FsCreate { path, .. }
-        | Input::FsWrite { path, .. }
-        | Input::FsEdit { path, .. }
-        | Input::FsEnsureDirectory { path } => workspace_target(path, ResourceAccessV2::Write)?,
-        Input::FsDelete(KernelDeleteTarget::File { path })
-        | Input::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => {
-            workspace_target(path, ResourceAccessV2::Write)?
-        }
-        Input::WebSearch { query, .. } => ScopeTargetKey::NetworkQuery {
-            query: query.clone(),
-        },
-        Input::WebFetch { url, .. } => {
-            let (url, reviewed_target_digest) = canonicalize_network_scope_url(url)
-                .map_err(|failure| prepare_failure_error("rawArguments.url", failure))?;
-            ScopeTargetKey::NetworkUrl {
-                url,
-                reviewed_target_digest,
-            }
-        }
-        Input::GitStatus {} | Input::GitDiff { .. } => ScopeTargetKey::Repository {
-            area: RepositoryAreaV2::State,
-        },
-        Input::GitStage { .. } | Input::GitUnstage { .. } => ScopeTargetKey::Repository {
-            area: RepositoryAreaV2::Index,
-        },
-        Input::GitCommit { .. } => ScopeTargetKey::Repository {
-            area: RepositoryAreaV2::History,
-        },
-        Input::FsRename { .. } => {
-            return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))
-        }
-    };
-    Ok(vec![target])
-}
-
-fn targets_cover_invocation(
-    approved: &[ScopeTargetKey],
     canonical_scope: &ResourceScopeV2,
-    invocation: &KernelCanonicalInvocation,
-) -> AuthorityResult<bool> {
-    let invocation_digest = exact_invocation_digest_v2(invocation).map_err(|_| storage_fault())?;
-    if approved.iter().any(|target| {
-        matches!(
-            target,
-            ScopeTargetKey::ExactInvocation {
-                invocation_digest: expected
-            } if expected == &invocation_digest
-        )
-    }) {
-        return Ok(true);
-    }
-    let covered = match canonical_scope {
-        ResourceScopeV2::Workspace { targets } => targets.iter().all(|target| {
-            approved.iter().any(|approved| {
-                matches!(
-                    approved,
-                    ScopeTargetKey::Workspace { path, access }
-                        if path == &target.relative_path && access == &target.access
-                )
+) -> AuthorityResult<Vec<ScopeTargetKey>> {
+    match canonical_scope {
+        ResourceScopeV2::Workspace { targets } => Ok(targets
+            .iter()
+            .map(|target| ScopeTargetKey::Workspace {
+                path: target.relative_path.clone(),
+                access: target.access,
+                object_kind: target.object_kind,
             })
-        }),
-        ResourceScopeV2::Repository { area } => approved.iter().any(|target| {
-            matches!(target, ScopeTargetKey::Repository { area: expected } if expected == area)
-        }),
-        ResourceScopeV2::NetworkQuery { .. } => match invocation {
-            KernelCanonicalInvocation::WebSearch { query, .. } => approved.iter().any(
-                |target| {
-                    matches!(
-                        target,
-                        ScopeTargetKey::NetworkQuery { query: expected } if expected == query
-                    )
-                },
-            ),
-            _ => false,
+            .collect()),
+        ResourceScopeV2::Repository { area } => {
+            Ok(vec![ScopeTargetKey::Repository { area: *area }])
+        }
+        ResourceScopeV2::NetworkQuery { service_origin, .. } => match invocation {
+            KernelCanonicalInvocation::WebSearch { query, .. } => {
+                Ok(vec![ScopeTargetKey::NetworkQuery {
+                    query: query.clone(),
+                    service_origin: service_origin.clone(),
+                }])
+            }
+            _ => Err(storage_fault()),
         },
-        ResourceScopeV2::NetworkUrl {
-            target_observation_digest,
-            ..
-        } => match invocation {
-            KernelCanonicalInvocation::WebFetch { url, .. } => approved.iter().any(
-                |target| {
-                    matches!(
-                        target,
-                        ScopeTargetKey::NetworkUrl {
-                            url: expected,
-                            reviewed_target_digest,
-                        } if expected == url
-                            && reviewed_target_digest == target_observation_digest
-                    )
-                },
-            ),
-            _ => false,
+        ResourceScopeV2::NetworkUrl { .. } => match invocation {
+            KernelCanonicalInvocation::WebFetch { url, .. } => {
+                Ok(vec![ScopeTargetKey::NetworkUrl { url: url.clone() }])
+            }
+            _ => Err(storage_fault()),
         },
-    };
-    Ok(covered)
+    }
 }
 
 fn target_set_contains(approved: &[ScopeTargetKey], requested: &[ScopeTargetKey]) -> bool {
@@ -416,23 +283,194 @@ fn union_targets(current: &[ScopeTargetKey], requested: &[ScopeTargetKey]) -> Ve
     union
 }
 
+fn authorization_binding_allows(
+    binding: &CapabilityAuthorizationBindingV2,
+    approved_targets: &[ScopeTargetKey],
+    invocation: &KernelCanonicalInvocation,
+    actual_targets: &[ScopeTargetKey],
+) -> AuthorityResult<bool> {
+    match binding {
+        CapabilityAuthorizationBindingV2::ResourceScope {} => {
+            Ok(target_set_contains(approved_targets, actual_targets))
+        }
+        CapabilityAuthorizationBindingV2::ExactInvocation { invocation_digest } => Ok(
+            exact_invocation_digest_v2(invocation).map_err(|_| storage_fault())?
+                == *invocation_digest
+                && target_set_contains(approved_targets, actual_targets),
+        ),
+    }
+}
+
+fn exact_invocation_digest_changed(
+    binding: &CapabilityAuthorizationBindingV2,
+    invocation: &KernelCanonicalInvocation,
+) -> AuthorityResult<bool> {
+    match binding {
+        CapabilityAuthorizationBindingV2::ResourceScope {} => Ok(false),
+        CapabilityAuthorizationBindingV2::ExactInvocation { invocation_digest } => Ok(
+            exact_invocation_digest_v2(invocation).map_err(|_| storage_fault())?
+                != *invocation_digest,
+        ),
+    }
+}
+
+fn authorization_binding_can_expand(
+    previous: &CapabilityAuthorizationBindingV2,
+    expanded: &CapabilityAuthorizationBindingV2,
+) -> bool {
+    match (previous, expanded) {
+        (
+            CapabilityAuthorizationBindingV2::ResourceScope {},
+            CapabilityAuthorizationBindingV2::ResourceScope {},
+        ) => true,
+        (
+            CapabilityAuthorizationBindingV2::ExactInvocation {
+                invocation_digest: previous,
+            },
+            CapabilityAuthorizationBindingV2::ExactInvocation {
+                invocation_digest: expanded,
+            },
+        ) => previous == expanded,
+        _ => false,
+    }
+}
+
+fn expanded_authorization_scope(
+    binding: &CapabilityAuthorizationBindingV2,
+    previous_scope: &ResourceScopeV2,
+    previous_targets: &[ScopeTargetKey],
+    actual_scope: &ResourceScopeV2,
+    actual_targets: &[ScopeTargetKey],
+) -> AuthorityResult<(ResourceScopeV2, Vec<ScopeTargetKey>, Vec<ScopeTargetKey>)> {
+    let expanded_targets = union_targets(previous_targets, actual_targets);
+    let scope_delta = match binding {
+        CapabilityAuthorizationBindingV2::ResourceScope {} => actual_targets
+            .iter()
+            .filter(|target| !previous_targets.contains(target))
+            .cloned()
+            .collect::<Vec<_>>(),
+        CapabilityAuthorizationBindingV2::ExactInvocation { .. } => actual_targets.to_vec(),
+    };
+    let canonical_scope = match (previous_scope, actual_scope) {
+        (
+            ResourceScopeV2::Workspace { targets: previous },
+            ResourceScopeV2::Workspace { targets: actual },
+        ) => {
+            let mut targets: Vec<WorkspaceScopeTargetV2> =
+                Vec::with_capacity(previous.len().saturating_add(actual.len()));
+            for actual_target in previous.iter().chain(actual) {
+                if let Some(existing) = targets.iter_mut().find(|existing| {
+                    existing.relative_path == actual_target.relative_path
+                        && existing.access == actual_target.access
+                        && existing.object_kind == actual_target.object_kind
+                }) {
+                    *existing = actual_target.clone();
+                } else {
+                    targets.push(actual_target.clone());
+                }
+            }
+            targets.sort_by_key(|target| {
+                scope_target_label(&ScopeTargetKey::Workspace {
+                    path: target.relative_path.clone(),
+                    access: target.access,
+                    object_kind: target.object_kind,
+                })
+            });
+            let canonical_targets = targets
+                .iter()
+                .map(|target| ScopeTargetKey::Workspace {
+                    path: target.relative_path.clone(),
+                    access: target.access,
+                    object_kind: target.object_kind,
+                })
+                .collect::<Vec<_>>();
+            if !target_set_contains(&canonical_targets, &expanded_targets)
+                || !target_set_contains(&expanded_targets, &canonical_targets)
+            {
+                return Err(invalid_field(
+                    "authorizationBinding",
+                    InvalidFieldViolationV2::InvalidRelation,
+                ));
+            }
+            ResourceScopeV2::Workspace { targets }
+        }
+        (
+            ResourceScopeV2::Repository { area: previous },
+            ResourceScopeV2::Repository { area: actual },
+        ) if previous == actual
+            && matches!(
+                expanded_targets.as_slice(),
+                [ScopeTargetKey::Repository { area }] if area == actual
+            ) =>
+        {
+            ResourceScopeV2::Repository { area: *actual }
+        }
+        (
+            ResourceScopeV2::NetworkQuery {
+                query_digest: previous_query,
+                service_origin: previous_origin,
+                ..
+            },
+            ResourceScopeV2::NetworkQuery {
+                query_digest: actual_query,
+                service_origin: actual_origin,
+                ..
+            },
+        ) if previous_query == actual_query
+            && previous_origin == actual_origin
+            && matches!(
+                expanded_targets.as_slice(),
+                [ScopeTargetKey::NetworkQuery { service_origin, .. }]
+                    if service_origin == actual_origin
+            ) =>
+        {
+            actual_scope.clone()
+        }
+        (
+            ResourceScopeV2::NetworkUrl {
+                origin: previous_origin,
+                ..
+            },
+            ResourceScopeV2::NetworkUrl {
+                origin: actual_origin,
+                ..
+            },
+        ) if previous_origin == actual_origin
+            && matches!(
+                expanded_targets.as_slice(),
+                [ScopeTargetKey::NetworkUrl { .. }]
+            ) =>
+        {
+            actual_scope.clone()
+        }
+        _ => {
+            return Err(invalid_field(
+                "authorizationBinding",
+                InvalidFieldViolationV2::InvalidRelation,
+            ))
+        }
+    };
+    Ok((canonical_scope, expanded_targets, scope_delta))
+}
+
 fn scope_target_label(target: &ScopeTargetKey) -> String {
     match target {
-        ScopeTargetKey::Workspace { path, access } => {
-            format!("workspace:{access:?}:{path}")
+        ScopeTargetKey::Workspace {
+            path,
+            access,
+            object_kind,
+        } => {
+            format!("workspace:{access:?}:{object_kind:?}:{path}")
         }
         ScopeTargetKey::Repository { area } => {
             format!("repository:{area:?}")
         }
-        ScopeTargetKey::NetworkUrl {
-            url,
-            reviewed_target_digest,
-        } => format!("network-url:{url}:{reviewed_target_digest:?}"),
-        ScopeTargetKey::NetworkQuery { query } => {
-            format!("network-query:{query}")
-        }
-        ScopeTargetKey::ExactInvocation { invocation_digest } => {
-            format!("exact-invocation:{invocation_digest:?}")
+        ScopeTargetKey::NetworkUrl { url } => format!("network-url:{url}"),
+        ScopeTargetKey::NetworkQuery {
+            query,
+            service_origin,
+        } => {
+            format!("network-query:{query}:{service_origin:?}")
         }
     }
 }
@@ -458,15 +496,9 @@ fn scope_target_presentation(target: &ScopeTargetKey) -> CapabilityResourcePrese
             workspace_relative_path: None,
             canonical_resource_ref,
         },
-        ScopeTargetKey::NetworkQuery { query } => CapabilityResourcePresentationV2 {
+        ScopeTargetKey::NetworkQuery { query, .. } => CapabilityResourcePresentationV2 {
             kind: CapabilityResourcePresentationKindV2::ResourceLabel,
             label: query.clone(),
-            workspace_relative_path: None,
-            canonical_resource_ref,
-        },
-        ScopeTargetKey::ExactInvocation { .. } => CapabilityResourcePresentationV2 {
-            kind: CapabilityResourcePresentationKindV2::ResourceLabel,
-            label: "exact invocation".to_owned(),
             workspace_relative_path: None,
             canonical_resource_ref,
         },
@@ -844,7 +876,7 @@ fn recover_authority_material(
                     identity,
                     preview_id,
                     tool_id,
-                    canonical_arguments_digest,
+                    authorization_binding,
                     scope_digest,
                     tool_contract_digest,
                     context_ref,
@@ -860,7 +892,7 @@ fn recover_authority_material(
                     || identity.operation_id != durable.record.operation_id
                     || preview_id != &durable.record.preview_id
                     || tool_id != &durable.record.tool_id
-                    || canonical_arguments_digest != &durable.record.canonical_arguments_digest
+                    || authorization_binding != &durable.record.authorization_binding
                     || scope_digest != &durable.record.scope_digest
                     || tool_contract_digest != &durable.record.tool_contract_digest
                     || context_ref != &durable.record.context_ref
@@ -956,6 +988,7 @@ fn recover_authority_material(
                     identity,
                     preview_id,
                     tool_id,
+                    canonical_arguments_digest,
                     ..
                 }) = &source.payload
                 else {
@@ -967,6 +1000,15 @@ fn recover_authority_material(
                     || identity.invocation_id != durable.invocation_id
                     || preview_id != &durable.preview_id
                     || tool_id != &durable.tool_id
+                {
+                    return Err(storage_fault());
+                }
+                let invocation = canonical_invocation(&durable.tool_id, &durable.raw_arguments)
+                    .map_err(|_| storage_fault())?;
+                let canonical_arguments = canonical_argument_value(&invocation)?;
+                if canonical_arguments_digest_v2(&durable.tool_id, &canonical_arguments)
+                    .map_err(|_| storage_fault())?
+                    != *canonical_arguments_digest
                 {
                     return Err(storage_fault());
                 }
@@ -1155,6 +1197,44 @@ fn recover_authority_material(
             _ => return Err(storage_fault()),
         }
     }
+    for preview in previews.values() {
+        let descriptor = crate::kernel_tool_registry()
+            .descriptor_v2(&preview.record.tool_id)
+            .ok_or_else(storage_fault)?;
+        if descriptor.authorization_shape
+            != preview.record.authorization_binding.authorization_shape()
+            || descriptor.contract_digest != preview.record.tool_contract_digest
+        {
+            return Err(storage_fault());
+        }
+    }
+    for lease in leases.values() {
+        let preview = previews.get(&lease.preview_id).ok_or_else(storage_fault)?;
+        if lease.authorization_binding != preview.record.authorization_binding
+            || lease.approved_targets != preview.approved_targets
+            || lease.reference.scope_digest != preview.record.scope_digest
+            || lease.tool_id != preview.record.tool_id
+            || lease.context_ref != preview.record.context_ref
+        {
+            return Err(storage_fault());
+        }
+    }
+    for trust in trusts.values() {
+        let matching_preview = previews.values().any(|preview| {
+            preview.record.run_id == trust.run_id
+                && preview.record.control_epoch == trust.control_epoch
+                && preview.record.plan_revision == trust.plan_revision
+                && preview.record.plan_action_id == trust.plan_action_id
+                && preview.record.operation_id == trust.issuance_operation_id
+                && preview.record.tool_id == trust.tool_id
+                && preview.record.scope_digest == trust.scope_digest
+                && preview.record.authorization_binding == trust.authorization_binding
+                && preview.approved_targets == trust.approved_targets
+        });
+        if !matching_preview {
+            return Err(storage_fault());
+        }
+    }
     Ok(RecoveredAuthorityMaterialV2 {
         previews,
         leases,
@@ -1290,7 +1370,7 @@ fn receipt_outcome(
 fn public_command_run_id(command: &KernelCommandV2) -> Option<RunId> {
     match command {
         KernelCommandV2::ToolContextGet(command) => Some(command.run_id.clone()),
-        KernelCommandV2::CapabilityScopePreview(command) => Some(command.run_id.clone()),
+        KernelCommandV2::CapabilityScopePreviewBatch(command) => Some(command.run_id.clone()),
         KernelCommandV2::ToolIntentSubmit(command) => Some(command.run_id.clone()),
         KernelCommandV2::KernelFactsQueryScoped(command) => Some(command.run_id.clone()),
         KernelCommandV2::ControlEpochAdvance(command) => Some(command.run_id.clone()),
@@ -1376,13 +1456,13 @@ fn classify_scope_preview_rejection(
             reason: InvalidRequestReasonV2::InvalidField { field_path, .. },
         } if field_path.starts_with("rawArguments") => (
             CapabilityScopeRejectionReasonV2::InvalidArguments,
-            "Use previewArguments accepted by the immutable Kernel ToolContext schema.",
+            "Use exact-invocation rawArguments accepted by the immutable Kernel ToolContext schema.",
         ),
         KernelErrorV2::InvalidRequest {
             reason: InvalidRequestReasonV2::InvalidField { field_path, .. },
-        } if field_path == "requestedResources" => (
+        } if field_path.starts_with("scopeIntent.requestedResources") => (
             CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
-            "Use requested resources that exactly cover the canonical tool invocation.",
+            "Use resources whose kind, access, and repository area match this tool contract.",
         ),
         KernelErrorV2::InvalidRequest {
             reason: InvalidRequestReasonV2::InvalidRelation { .. },
@@ -1656,27 +1736,7 @@ fn retirement_pending(run_id: RunId, fence: &RunRetirementFenceRecord) -> Kernel
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-enum ScopeTargetKey {
-    Workspace {
-        path: String,
-        access: ResourceAccessV2,
-    },
-    Repository {
-        area: RepositoryAreaV2,
-    },
-    NetworkUrl {
-        url: String,
-        reviewed_target_digest: NetworkTargetObservationDigestV2,
-    },
-    NetworkQuery {
-        query: String,
-    },
-    ExactInvocation {
-        invocation_digest: ExactInvocationDigestV2,
-    },
-}
+type ScopeTargetKey = AuthorizationTargetKey;
 
 #[derive(Clone)]
 struct PreparedScopePreview {
@@ -1686,6 +1746,29 @@ struct PreparedScopePreview {
     preview_fact_id: FactId,
     automatic_decision_ref: Option<UserDecisionRefV2>,
     decision_class: PreparedScopePreviewDecisionClassV2,
+}
+
+struct UnpersistedScopePreview {
+    record: CapabilityScopePreviewRecordV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    authorization_digest: CapabilityAuthorizationDigestV2,
+    automatic_decision_ref: Option<UserDecisionRefV2>,
+    decision_class: PreparedScopePreviewDecisionClassV2,
+    payload: AuthorizationFactV2,
+    durable: DurablePreparedScopePreviewV2,
+}
+
+impl UnpersistedScopePreview {
+    fn into_prepared(self, preview_fact_id: FactId) -> PreparedScopePreview {
+        PreparedScopePreview {
+            record: self.record,
+            approved_targets: self.approved_targets,
+            authorization_digest: self.authorization_digest,
+            preview_fact_id,
+            automatic_decision_ref: self.automatic_decision_ref,
+            decision_class: self.decision_class,
+        }
+    }
 }
 
 impl PreparedScopePreview {
@@ -1765,6 +1848,7 @@ struct CapabilityLeaseRecord {
     plan_action_id: PlanActionIdV2,
     tool_id: ToolIdV2,
     context_ref: ToolContextRefV2,
+    authorization_binding: CapabilityAuthorizationBindingV2,
     approved_targets: Vec<ScopeTargetKey>,
     decision_ref: Option<UserDecisionRefV2>,
     issuance_operation_id: OperationId,
@@ -1783,6 +1867,7 @@ impl CapabilityLeaseRecord {
             plan_action_id: self.plan_action_id.clone(),
             tool_id: self.tool_id.clone(),
             context_ref: self.context_ref.clone(),
+            authorization_binding: self.authorization_binding.clone(),
             approved_targets: self.approved_targets.clone(),
             decision_ref: self.decision_ref.clone(),
             issuance_operation_id: self.issuance_operation_id.clone(),
@@ -1801,6 +1886,7 @@ struct DurableCapabilityLeaseV2 {
     plan_action_id: PlanActionIdV2,
     tool_id: ToolIdV2,
     context_ref: ToolContextRefV2,
+    authorization_binding: CapabilityAuthorizationBindingV2,
     approved_targets: Vec<ScopeTargetKey>,
     decision_ref: Option<UserDecisionRefV2>,
     issuance_operation_id: OperationId,
@@ -1821,6 +1907,7 @@ impl DurableCapabilityLeaseV2 {
             plan_action_id: self.plan_action_id,
             tool_id: self.tool_id,
             context_ref: self.context_ref,
+            authorization_binding: self.authorization_binding,
             approved_targets: self.approved_targets,
             decision_ref: self.decision_ref,
             issuance_operation_id: self.issuance_operation_id,
@@ -1859,6 +1946,7 @@ struct TrustLeaseRecord {
     issuance_operation_id: OperationId,
     tool_id: ToolIdV2,
     scope_digest: CapabilityScopeDigestV2,
+    authorization_binding: CapabilityAuthorizationBindingV2,
     approved_targets: Vec<ScopeTargetKey>,
     workspace_binding_digest: WorkspaceBindingDigestV2,
     context_ref: ToolContextRefV2,
@@ -1879,6 +1967,7 @@ impl TrustLeaseRecord {
             issuance_operation_id: self.issuance_operation_id.clone(),
             tool_id: self.tool_id.clone(),
             scope_digest: self.scope_digest.clone(),
+            authorization_binding: self.authorization_binding.clone(),
             approved_targets: self.approved_targets.clone(),
             workspace_binding_digest: self.workspace_binding_digest.clone(),
             context_ref: self.context_ref.clone(),
@@ -1900,6 +1989,7 @@ struct DurableTrustLeaseV2 {
     issuance_operation_id: OperationId,
     tool_id: ToolIdV2,
     scope_digest: CapabilityScopeDigestV2,
+    authorization_binding: CapabilityAuthorizationBindingV2,
     approved_targets: Vec<ScopeTargetKey>,
     workspace_binding_digest: WorkspaceBindingDigestV2,
     context_ref: ToolContextRefV2,
@@ -1919,6 +2009,7 @@ impl DurableTrustLeaseV2 {
             issuance_operation_id: self.issuance_operation_id,
             tool_id: self.tool_id,
             scope_digest: self.scope_digest,
+            authorization_binding: self.authorization_binding,
             approved_targets: self.approved_targets,
             workspace_binding_digest: self.workspace_binding_digest,
             context_ref: self.context_ref,
@@ -3906,8 +3997,8 @@ impl KernelSessionServiceV2 {
             KernelCommandV2::ToolContextGet(command) => {
                 KernelReplyV2::ToolContext(self.tool_context_get(command)?)
             }
-            KernelCommandV2::CapabilityScopePreview(command) => {
-                let (reply, persisted) = self.scope_preview(
+            KernelCommandV2::CapabilityScopePreviewBatch(command) => {
+                let (reply, persisted) = self.scope_preview_batch(
                     command,
                     Some(PublicCommandContext {
                         request_id: envelope.request_id.clone(),
@@ -3916,7 +4007,7 @@ impl KernelSessionServiceV2 {
                     }),
                 )?;
                 receipt_persisted = persisted;
-                KernelReplyV2::CapabilityScopePreviewed(reply)
+                KernelReplyV2::CapabilityScopePreviewBatchResult(reply)
             }
             KernelCommandV2::ToolIntentSubmit(command) => {
                 let reply = self.submit_tool_intent(
@@ -4098,108 +4189,222 @@ impl KernelSessionServiceV2 {
         }
     }
 
-    fn scope_preview(
+    fn scope_preview_batch(
         &self,
-        command: CapabilityScopePreviewV2,
+        command: CapabilityScopePreviewBatchV2,
         public_command: Option<PublicCommandContext>,
-    ) -> AuthorityResult<(CapabilityScopePreviewReplyV2, bool)> {
+    ) -> AuthorityResult<(CapabilityScopePreviewBatchReplyV2, bool)> {
         let run = self.run_record(&command.run_id)?;
-        if run.control_epoch != command.expected_control_epoch {
-            return Ok((CapabilityScopePreviewReplyV2::Rejected {
-                tool_id: command.tool_id,
-                reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::StaleControlEpoch,
-                guidance: "Refresh the run epoch before previewing this PlanAction.".to_owned(),
-            }, false));
-        }
         let context = self.build_tool_context(&command.run_id, run.context_version)?;
-        if command.tool_context_ref != context.context_ref() {
-            return Ok((CapabilityScopePreviewReplyV2::Rejected {
-                tool_id: command.tool_id,
-                reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::StaleToolContext,
-                guidance: "Fetch the current ToolContext before previewing this scope.".to_owned(),
-            }, false));
-        }
-        let descriptor = match self.ready_descriptor(&command.run_id, &command.tool_id) {
-            Ok(value) => value,
-            Err(reason) => {
-                return Ok((
-                    CapabilityScopePreviewReplyV2::Rejected {
-                        tool_id: command.tool_id,
-                        reason,
-                        guidance: "The requested tool is not currently executable.".to_owned(),
-                    },
-                    false,
-                ))
-            }
-        };
-        let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
-        let targets = match normalize_requested_targets(&workspace, &command.requested_resources) {
-            Ok(value) => value,
-            Err(failure) => {
-                let error = prepare_failure_error("requestedResources", failure);
-                if matches!(error, KernelErrorV2::FactStoreUnavailable { .. }) {
-                    return Err(error);
-                }
-                return Ok((CapabilityScopePreviewReplyV2::Rejected {
-                    tool_id: command.tool_id,
-                    reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
-                    guidance: "Use canonical workspace-relative resources within this run.".to_owned(),
-                }, false));
-            }
-        };
-        let rejected_tool_id = command.tool_id.clone();
-        let prepared = match self.prepare_preview(
-            &command.run_id,
-            command.expected_control_epoch,
-            command.plan_revision,
-            command.plan_action_id,
-            command.operation_id,
-            command.idempotency_key,
-            command.tool_id,
-            command.raw_arguments,
-            targets,
-            Vec::new(),
-            PreparedScopePreviewDecisionClassV2::Capability,
-            command.deadline,
-            command.tool_context_ref,
-            descriptor,
-            public_command.as_ref(),
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let Some((reason, guidance)) = classify_scope_preview_rejection(&error) else {
-                    return Err(error);
-                };
-                return Ok((
-                    CapabilityScopePreviewReplyV2::Rejected {
-                        tool_id: rejected_tool_id,
-                        reason,
-                        guidance,
-                    },
-                    false,
+        let mut results = Vec::with_capacity(command.items.len());
+        let mut drafts = Vec::new();
+        for item in command.items {
+            let reject = |reason, guidance: &str| CapabilityScopePreviewReplyV2::Rejected {
+                plan_action_id: item.plan_action_id.clone(),
+                operation_id: item.operation_id.clone(),
+                tool_id: item.tool_id.clone(),
+                reason,
+                guidance: guidance.to_owned(),
+            };
+            if run.control_epoch != command.expected_control_epoch {
+                results.push(reject(
+                    CapabilityScopeRejectionReasonV2::StaleControlEpoch,
+                    "Refresh the run epoch before previewing this PlanAction.",
                 ));
+                continue;
             }
+            if command.tool_context_ref != context.context_ref() {
+                results.push(reject(
+                    CapabilityScopeRejectionReasonV2::StaleToolContext,
+                    "Fetch the current ToolContext before previewing this scope.",
+                ));
+                continue;
+            }
+            let descriptor = match self.ready_descriptor(&command.run_id, &item.tool_id) {
+                Ok(value) => value,
+                Err(reason) => {
+                    results.push(reject(
+                        reason,
+                        "The requested tool is not currently executable.",
+                    ));
+                    continue;
+                }
+            };
+            if descriptor.authorization_shape != item.scope_intent.authorization_shape() {
+                results.push(reject(
+                    CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
+                    "Use the authorization shape declared by the current Kernel ToolContext.",
+                ));
+                continue;
+            }
+            let prepared_authorization = match &item.scope_intent {
+                ScopeIntentV2::ResourceScope {
+                    requested_resources,
+                } => self
+                    .inner
+                    .authority
+                    .canonical_scope_for_requested_resources(
+                        &command.run_id,
+                        command.expected_control_epoch,
+                        &item.tool_id,
+                        descriptor.effect_scope,
+                        requested_resources,
+                        item.deadline,
+                    )
+                    .map(|(scope, targets, deadline)| {
+                        (
+                            CapabilityAuthorizationBindingV2::ResourceScope {},
+                            scope,
+                            targets,
+                            deadline,
+                        )
+                    }),
+                ScopeIntentV2::ExactInvocation { raw_arguments } => {
+                    let invocation = canonical_invocation(&item.tool_id, raw_arguments);
+                    invocation.and_then(|invocation| {
+                        let (scope, deadline) = self.inner.authority.canonical_scope_for_tool(
+                            &command.run_id,
+                            &item.operation_id,
+                            command.expected_control_epoch,
+                            &item.idempotency_key,
+                            &invocation,
+                            item.deadline,
+                            vec![CorrelationRefV2::PlanAction {
+                                value: item.plan_action_id.to_string(),
+                            }],
+                        )?;
+                        let targets = authorization_targets_for_invocation(&invocation, &scope)?;
+                        let invocation_digest =
+                            exact_invocation_digest_v2(&invocation).map_err(|_| storage_fault())?;
+                        Ok((
+                            CapabilityAuthorizationBindingV2::ExactInvocation { invocation_digest },
+                            scope,
+                            targets,
+                            deadline,
+                        ))
+                    })
+                }
+            };
+            let (authorization_binding, canonical_scope, targets, effective_deadline_ms) =
+                match prepared_authorization {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let Some((reason, guidance)) = classify_scope_preview_rejection(&error)
+                        else {
+                            return Err(error);
+                        };
+                        results.push(reject(reason, &guidance));
+                        continue;
+                    }
+                };
+            let draft = match self.prepare_preview_draft(
+                &command.run_id,
+                command.expected_control_epoch,
+                command.plan_revision.clone(),
+                item.plan_action_id.clone(),
+                item.operation_id.clone(),
+                item.tool_id.clone(),
+                authorization_binding,
+                canonical_scope,
+                targets,
+                Vec::new(),
+                PreparedScopePreviewDecisionClassV2::Capability,
+                effective_deadline_ms,
+                command.tool_context_ref.clone(),
+                descriptor,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    let Some((reason, guidance)) = classify_scope_preview_rejection(&error) else {
+                        return Err(error);
+                    };
+                    results.push(reject(reason, &guidance));
+                    continue;
+                }
+            };
+            results.push(CapabilityScopePreviewReplyV2::Previewed {
+                preview: draft.record.clone(),
+            });
+            drafts.push(draft);
+        }
+        let reply = CapabilityScopePreviewBatchReplyV2 {
+            run_id: command.run_id.clone(),
+            accepted_control_epoch: run.control_epoch,
+            plan_revision: command.plan_revision,
+            results,
         };
-        let reply = CapabilityScopePreviewReplyV2::Previewed {
-            preview: prepared.record.clone(),
-        };
-        KernelReplyV2::CapabilityScopePreviewed(reply.clone())
+        KernelReplyV2::CapabilityScopePreviewBatchResult(reply.clone())
             .validate()
             .map_err(|_| storage_fault())?;
+        if drafts.is_empty() {
+            return Ok((reply, false));
+        }
+        let payloads = drafts
+            .iter()
+            .map(|draft| KernelFactPayloadV2::Authorization(draft.payload.clone()))
+            .collect::<Vec<_>>();
+        let materials = drafts
+            .iter()
+            .enumerate()
+            .map(|(fact_index, draft)| {
+                Ok(AuthorityMaterialMutationV2::Put {
+                    material: scope_preview_material(&draft.durable, AUTHORITY_MATERIAL_ACTIVE)?,
+                    fact_index,
+                })
+            })
+            .collect::<AuthorityResult<Vec<_>>>()?;
+        let persisted = public_command.is_some();
+        let facts = if let Some(public_command) = public_command {
+            let durable_reply = DurablePublicReplyV2::Kernel {
+                reply: KernelReplyV2::CapabilityScopePreviewBatchResult(reply.clone()),
+            };
+            let receipt = public_receipt(
+                public_command.request_id,
+                public_command.request_digest,
+                public_command.command_kind,
+                Some(command.run_id.clone()),
+                &durable_reply,
+                None,
+            )?;
+            self.inner
+                .authority
+                .append_payloads_with_public_receipt_and_authority_material_builder(
+                    payloads,
+                    drafts.len().checked_sub(1),
+                    materials,
+                    move |_, _| Ok(receipt),
+                )?
+                .facts
+        } else {
+            self.inner
+                .authority
+                .append_payloads_with_authority_material(payloads, materials)?
+                .facts
+        };
+        if facts.len() != drafts.len() {
+            return Err(storage_fault());
+        }
+        let prepared = drafts
+            .into_iter()
+            .zip(facts)
+            .map(|(draft, fact)| draft.into_prepared(fact.fact_id))
+            .collect::<Vec<_>>();
         {
             let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-            let preview_id = prepared.record.preview_id.clone();
-            let run_id = prepared.record.run_id.clone();
-            if state
-                .preview_runs
-                .insert(preview_id.clone(), run_id.clone())
-                .is_some_and(|existing| existing != run_id)
-            {
-                return Err(storage_fault());
+            for preview in prepared {
+                let preview_id = preview.record.preview_id.clone();
+                let preview_run_id = preview.record.run_id.clone();
+                if state
+                    .preview_runs
+                    .insert(preview_id.clone(), preview_run_id.clone())
+                    .is_some_and(|existing| existing != preview_run_id)
+                {
+                    return Err(storage_fault());
+                }
+                state.previews.insert(preview_id, preview);
             }
-            state.previews.insert(preview_id, prepared);
         }
-        Ok((reply, public_command.is_some()))
+        Ok((reply, persisted))
     }
 
     fn resolve_decision_preview(
@@ -4355,6 +4560,25 @@ impl KernelSessionServiceV2 {
                 InvalidFieldViolationV2::InvalidRelation,
             ));
         }
+        if previous.as_ref().is_some_and(|lease| {
+            !authorization_binding_can_expand(
+                &lease.authorization_binding,
+                &preview.record.authorization_binding,
+            )
+        }) {
+            return Err(invalid_field(
+                "authorizationBinding",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        if previous.as_ref().is_some_and(|lease| {
+            !target_set_contains(&preview.approved_targets, &lease.approved_targets)
+        }) {
+            return Err(invalid_field(
+                "authorizationBinding",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
         let (submitted_plan_revision, submitted_plan_action_id) = match &pending.authority {
             ToolIntentAuthorityV2::PlanAction {
                 plan_revision,
@@ -4440,6 +4664,7 @@ impl KernelSessionServiceV2 {
             plan_action_id: preview.record.plan_action_id.clone(),
             tool_id: preview.record.tool_id.clone(),
             context_ref: preview.record.context_ref.clone(),
+            authorization_binding: preview.record.authorization_binding.clone(),
             approved_targets: preview.approved_targets.clone(),
             decision_ref: Some(decision_ref),
             issuance_operation_id: preview.record.operation_id.clone(),
@@ -4472,12 +4697,35 @@ impl KernelSessionServiceV2 {
         let descriptor = self
             .ready_descriptor(&pending.run_id, &pending.tool_id)
             .map_err(|_| invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))?;
-        let invocation = canonical_invocation(&pending.tool_id, &pending.raw_arguments)?;
-        let workspace = self.inner.authority.workspace_for_run(&pending.run_id)?;
-        let actual_targets = exact_targets_for_invocation(&workspace, &invocation)?;
-        if !target_set_contains(&preview.approved_targets, &actual_targets) {
+        if descriptor.authorization_shape
+            != preview.record.authorization_binding.authorization_shape()
+        {
             return Err(invalid_field(
-                "requestedResources",
+                "authorizationBinding",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let invocation = canonical_invocation(&pending.tool_id, &pending.raw_arguments)?;
+        let (actual_scope, _) = self.inner.authority.canonical_scope_for_tool(
+            &pending.run_id,
+            &pending.operation_id,
+            pending.expected_control_epoch,
+            &pending.idempotency_key,
+            &invocation,
+            pending.deadline,
+            vec![CorrelationRefV2::PlanAction {
+                value: preview.record.plan_action_id.to_string(),
+            }],
+        )?;
+        let actual_targets = authorization_targets_for_invocation(&invocation, &actual_scope)?;
+        if !authorization_binding_allows(
+            &preview.record.authorization_binding,
+            &preview.approved_targets,
+            &invocation,
+            &actual_targets,
+        )? {
+            return Err(invalid_field(
+                "authorizationBinding",
                 InvalidFieldViolationV2::InvalidRelation,
             ));
         }
@@ -4487,9 +4735,7 @@ impl KernelSessionServiceV2 {
                 .map_err(|_| storage_fault())?;
         let tool_contract_digest =
             tool_contract_digest_v2(&descriptor).map_err(|_| storage_fault())?;
-        if canonical_arguments_digest != preview.record.canonical_arguments_digest
-            || tool_contract_digest != preview.record.tool_contract_digest
-        {
+        if tool_contract_digest != preview.record.tool_contract_digest {
             return Err(invalid_field(
                 "rawArguments",
                 InvalidFieldViolationV2::InvalidRelation,
@@ -4701,6 +4947,7 @@ impl KernelSessionServiceV2 {
             "runId": run_id,
             "controlEpoch": control_epoch,
             "toolId": preview.record.tool_id,
+            "authorizationBinding": preview.record.authorization_binding,
             "approvedTargets": preview.approved_targets,
             "workspaceBindingDigest": run.workspace_binding_digest,
             "toolContext": preview.record.context_ref,
@@ -4717,6 +4964,7 @@ impl KernelSessionServiceV2 {
             issuance_operation_id: preview.record.operation_id.clone(),
             tool_id: preview.record.tool_id.clone(),
             scope_digest: preview.record.scope_digest.clone(),
+            authorization_binding: preview.record.authorization_binding.clone(),
             approved_targets: preview.approved_targets.clone(),
             workspace_binding_digest: run.workspace_binding_digest.clone(),
             context_ref: preview.record.context_ref.clone(),
@@ -5238,48 +5486,23 @@ impl KernelSessionServiceV2 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_preview(
+    fn prepare_preview_draft(
         &self,
         run_id: &RunId,
         control_epoch: ControlEpoch,
         plan_revision: PlanRevisionV2,
         plan_action_id: PlanActionIdV2,
         operation_id: OperationId,
-        idempotency_key: String,
         tool_id: ToolIdV2,
-        raw_arguments: deepcode_kernel_abi::RawToolArgumentsV2,
+        authorization_binding: CapabilityAuthorizationBindingV2,
+        canonical_resource_scope: ResourceScopeV2,
         approved_targets: Vec<ScopeTargetKey>,
         scope_delta: Vec<ScopeTargetKey>,
         decision_class: PreparedScopePreviewDecisionClassV2,
-        deadline: DeadlineRequestV2,
+        effective_deadline_ms: u32,
         context_ref: ToolContextRefV2,
         descriptor: ToolDescriptorV2,
-        public_command: Option<&PublicCommandContext>,
-    ) -> AuthorityResult<PreparedScopePreview> {
-        let invocation = canonical_invocation(&tool_id, &raw_arguments)?;
-        let correlation_refs = vec![CorrelationRefV2::PlanAction {
-            value: plan_action_id.to_string(),
-        }];
-        let (canonical_resource_scope, effective_deadline_ms) =
-            self.inner.authority.canonical_scope_for_tool(
-                run_id,
-                &operation_id,
-                control_epoch,
-                &idempotency_key,
-                &invocation,
-                deadline,
-                correlation_refs,
-            )?;
-        let canonical_arguments = canonical_argument_value(&invocation)?;
-        let canonical_arguments_digest =
-            canonical_arguments_digest_v2(&tool_id, &canonical_arguments)
-                .map_err(|_| storage_fault())?;
-        if !targets_cover_invocation(&approved_targets, &canonical_resource_scope, &invocation)? {
-            return Err(invalid_field(
-                "requestedResources",
-                InvalidFieldViolationV2::InvalidRelation,
-            ));
-        }
+    ) -> AuthorityResult<UnpersistedScopePreview> {
         let run = self
             .inner
             .state
@@ -5298,6 +5521,7 @@ impl KernelSessionServiceV2 {
             "planRevision": plan_revision,
             "planActionId": plan_action_id,
             "toolId": tool_id,
+            "authorizationBinding": authorization_binding,
             "targets": approved_targets,
             "canonicalResourceScope": canonical_resource_scope,
             "toolContractDigest": descriptor.contract_digest,
@@ -5317,7 +5541,7 @@ impl KernelSessionServiceV2 {
             "planActionId": plan_action_id,
             "operationId": operation_id,
             "toolId": tool_id,
-            "canonicalArgumentsDigest": canonical_arguments_digest,
+            "authorizationBinding": authorization_binding,
             "scopeDigest": scope_digest,
             "decisionClass": decision_class,
             "toolContractDigest": descriptor.contract_digest,
@@ -5349,6 +5573,7 @@ impl KernelSessionServiceV2 {
                             && trust.tool_id == tool_id
                             && trust.workspace_binding_digest == run.workspace_binding_digest
                             && trust.context_ref == context_ref
+                            && trust.authorization_binding == authorization_binding
                             && target_set_contains(&trust.approved_targets, &approved_targets)
                             && trust.expires_at.as_ref().is_none_or(recorded_at_is_future)
                     })
@@ -5399,7 +5624,7 @@ impl KernelSessionServiceV2 {
             plan_action_id: plan_action_id.clone(),
             operation_id: operation_id.clone(),
             tool_id: tool_id.clone(),
-            canonical_arguments_digest: canonical_arguments_digest.clone(),
+            authorization_binding: authorization_binding.clone(),
             canonical_scope: canonical_resource_scope,
             scope_digest: scope_digest.clone(),
             authorization_digest: authorization_digest.clone(),
@@ -5429,7 +5654,7 @@ impl KernelSessionServiceV2 {
             },
             preview_id,
             tool_id,
-            canonical_arguments_digest,
+            authorization_binding,
             scope_digest,
             tool_contract_digest: descriptor.contract_digest,
             context_ref,
@@ -5442,64 +5667,139 @@ impl KernelSessionServiceV2 {
             automatic_decision_ref: automatic_decision_ref.clone(),
             decision_class,
         };
-        let material = AuthorityMaterialMutationV2::Put {
-            material: scope_preview_material(&durable_preview, AUTHORITY_MATERIAL_ACTIVE)?,
-            fact_index: 0,
-        };
-        let fact = if let Some(public_command) = public_command {
-            let reply = DurablePublicReplyV2::Kernel {
-                reply: KernelReplyV2::CapabilityScopePreviewed(
-                    CapabilityScopePreviewReplyV2::Previewed {
-                        preview: record.clone(),
-                    },
-                ),
-            };
-            let receipt = public_receipt(
-                public_command.request_id.clone(),
-                public_command.request_digest.clone(),
-                public_command.command_kind,
-                Some(run_id.clone()),
-                &reply,
-                None,
-            )?;
-            let outcome = self
-                .inner
-                .authority
-                .append_payloads_with_public_receipt_and_authority_material_builder(
-                    vec![KernelFactPayloadV2::Authorization(payload)],
-                    Some(0),
-                    vec![material],
-                    move |_, _| Ok(receipt),
-                )?;
-            match outcome.receipt {
-                PutPublicCommandReceiptOutcomeV2::Inserted(_) => {
-                    outcome.facts.into_iter().next().ok_or_else(storage_fault)?
-                }
-                PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
-                | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
-                    return Err(storage_fault())
-                }
-            }
-        } else {
-            self.inner
-                .authority
-                .append_payloads_with_authority_material(
-                    vec![KernelFactPayloadV2::Authorization(payload)],
-                    vec![material],
-                )?
-                .facts
-                .into_iter()
-                .next()
-                .ok_or_else(storage_fault)?
-        };
-        Ok(PreparedScopePreview {
+        Ok(UnpersistedScopePreview {
             record,
             approved_targets,
             authorization_digest,
-            preview_fact_id: fact.fact_id,
             automatic_decision_ref,
             decision_class,
+            payload,
+            durable: durable_preview,
         })
+    }
+
+    fn persist_preview_draft(
+        &self,
+        draft: UnpersistedScopePreview,
+    ) -> AuthorityResult<PreparedScopePreview> {
+        let material = AuthorityMaterialMutationV2::Put {
+            material: scope_preview_material(&draft.durable, AUTHORITY_MATERIAL_ACTIVE)?,
+            fact_index: 0,
+        };
+        let fact = self
+            .inner
+            .authority
+            .append_payloads_with_authority_material(
+                vec![KernelFactPayloadV2::Authorization(draft.payload.clone())],
+                vec![material],
+            )?
+            .facts
+            .into_iter()
+            .next()
+            .ok_or_else(storage_fault)?;
+        Ok(draft.into_prepared(fact.fact_id))
+    }
+
+    fn resolve_actual_authorization(
+        &self,
+        command: &ToolIntentSubmitV2,
+        invocation: &KernelCanonicalInvocation,
+        plan_action_id: &PlanActionIdV2,
+    ) -> AuthorityResult<(ResourceScopeV2, Vec<ScopeTargetKey>, u32)> {
+        let (scope, effective_deadline_ms) = self.inner.authority.canonical_scope_for_tool(
+            &command.run_id,
+            &command.operation_id,
+            command.expected_control_epoch,
+            &command.idempotency_key,
+            invocation,
+            command.deadline,
+            vec![CorrelationRefV2::PlanAction {
+                value: plan_action_id.to_string(),
+            }],
+        )?;
+        let targets = authorization_targets_for_invocation(invocation, &scope)?;
+        Ok((scope, targets, effective_deadline_ms))
+    }
+
+    fn canonical_scope_for_lease(
+        &self,
+        lease: &CapabilityLeaseRecord,
+    ) -> AuthorityResult<ResourceScopeV2> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let preview = state
+            .previews
+            .get(&lease.preview_id)
+            .ok_or_else(storage_fault)?;
+        if preview.record.run_id != lease.run_id
+            || preview.record.control_epoch != lease.control_epoch
+            || preview.record.plan_revision != lease.plan_revision
+            || preview.record.plan_action_id != lease.plan_action_id
+            || preview.record.tool_id != lease.tool_id
+            || preview.record.context_ref != lease.context_ref
+            || preview.record.authorization_binding != lease.authorization_binding
+            || preview.approved_targets != lease.approved_targets
+            || preview.record.scope_digest != lease.reference.scope_digest
+        {
+            return Err(storage_fault());
+        }
+        Ok(preview.record.canonical_scope.clone())
+    }
+
+    fn actual_scope_matches_other_plan_action(
+        &self,
+        command: &ToolIntentSubmitV2,
+        plan_revision: &PlanRevisionV2,
+        plan_action_id: &PlanActionIdV2,
+        invocation: &KernelCanonicalInvocation,
+        actual_targets: &[ScopeTargetKey],
+    ) -> AuthorityResult<bool> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        for preview in state.previews.values().filter(|preview| {
+            preview.record.run_id == command.run_id
+                && preview.record.control_epoch == command.expected_control_epoch
+                && preview.record.plan_revision == *plan_revision
+                && preview.record.plan_action_id != *plan_action_id
+                && preview.record.tool_id == command.tool_id
+                && preview.record.context_ref == command.tool_context_ref
+        }) {
+            if authorization_binding_allows(
+                &preview.record.authorization_binding,
+                &preview.approved_targets,
+                invocation,
+                actual_targets,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn reject_other_plan_action_scope(
+        &self,
+        command: ToolIntentSubmitV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        self.record_tool_intent_rejection(
+            command,
+            public_command,
+            ToolIntentRejectionReasonV2::CapabilityScopeMismatch,
+            "The actual target belongs to another PlanAction scope. Replan and submit the intent under the matching PlanAction before retrying."
+                .to_owned(),
+        )
+    }
+
+    fn reject_changed_exact_invocation(
+        &self,
+        command: ToolIntentSubmitV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        self.record_tool_intent_rejection(
+            command,
+            public_command,
+            ToolIntentRejectionReasonV2::CapabilityScopeMismatch,
+            "ExactInvocation arguments changed. Persist and preview a new PlanAction instead of expanding or replacing the existing capability lease."
+                .to_owned(),
+        )
     }
 
     fn submit_tool_intent(
@@ -5628,10 +5928,26 @@ impl KernelSessionServiceV2 {
                 } else {
                     None
                 };
-                let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
-                let actual_targets = exact_targets_for_invocation(&workspace, &invocation)?;
+                let (actual_scope, actual_targets, effective_deadline_ms) =
+                    self.resolve_actual_authorization(&command, &invocation, &plan_action_id)?;
                 if let Some(existing) = explicit_lease {
-                    if target_set_contains(&existing.approved_targets, &actual_targets) {
+                    if descriptor.authorization_shape
+                        != existing.authorization_binding.authorization_shape()
+                    {
+                        return self.record_tool_intent_rejection(
+                            command,
+                            public_command,
+                            ToolIntentRejectionReasonV2::CapabilityLeaseStale,
+                            "Refresh the capability lease for the current tool authorization shape."
+                                .to_owned(),
+                        );
+                    }
+                    if authorization_binding_allows(
+                        &existing.authorization_binding,
+                        &existing.approved_targets,
+                        &invocation,
+                        &actual_targets,
+                    )? {
                         return self.execute_with_lease(
                             command,
                             self.inner.ids.invocation_id(),
@@ -5640,17 +5956,37 @@ impl KernelSessionServiceV2 {
                             public_command,
                         );
                     }
-                    let expanded = union_targets(&existing.approved_targets, &actual_targets);
-                    let delta = actual_targets
-                        .iter()
-                        .filter(|target| !existing.approved_targets.contains(target))
-                        .cloned()
-                        .collect();
+                    if exact_invocation_digest_changed(
+                        &existing.authorization_binding,
+                        &invocation,
+                    )? {
+                        return self.reject_changed_exact_invocation(command, public_command);
+                    }
+                    if self.actual_scope_matches_other_plan_action(
+                        &command,
+                        &plan_revision,
+                        &plan_action_id,
+                        &invocation,
+                        &actual_targets,
+                    )? {
+                        return self.reject_other_plan_action_scope(command, public_command);
+                    }
+                    let previous_scope = self.canonical_scope_for_lease(&existing)?;
+                    let (expanded_scope, expanded, delta) = expanded_authorization_scope(
+                        &existing.authorization_binding,
+                        &previous_scope,
+                        &existing.approved_targets,
+                        &actual_scope,
+                        &actual_targets,
+                    )?;
                     return self.await_capability(
                         command,
                         plan_revision,
                         plan_action_id,
                         descriptor,
+                        invocation,
+                        expanded_scope,
+                        effective_deadline_ms,
                         expanded,
                         delta,
                         public_command,
@@ -5678,7 +6014,23 @@ impl KernelSessionServiceV2 {
                         .cloned()
                 };
                 if let Some(existing) = existing {
-                    if target_set_contains(&existing.approved_targets, &actual_targets) {
+                    if descriptor.authorization_shape
+                        != existing.authorization_binding.authorization_shape()
+                    {
+                        return self.record_tool_intent_rejection(
+                            command,
+                            public_command,
+                            ToolIntentRejectionReasonV2::CapabilityLeaseStale,
+                            "Refresh the capability lease for the current tool authorization shape."
+                                .to_owned(),
+                        );
+                    }
+                    if authorization_binding_allows(
+                        &existing.authorization_binding,
+                        &existing.approved_targets,
+                        &invocation,
+                        &actual_targets,
+                    )? {
                         return self.execute_with_lease(
                             command,
                             self.inner.ids.invocation_id(),
@@ -5687,39 +6039,131 @@ impl KernelSessionServiceV2 {
                             public_command,
                         );
                     }
-                    let expanded = union_targets(&existing.approved_targets, &actual_targets);
-                    let delta = actual_targets
-                        .iter()
-                        .filter(|target| !existing.approved_targets.contains(target))
-                        .cloned()
-                        .collect();
+                    if exact_invocation_digest_changed(
+                        &existing.authorization_binding,
+                        &invocation,
+                    )? {
+                        return self.reject_changed_exact_invocation(command, public_command);
+                    }
+                    if self.actual_scope_matches_other_plan_action(
+                        &command,
+                        &plan_revision,
+                        &plan_action_id,
+                        &invocation,
+                        &actual_targets,
+                    )? {
+                        return self.reject_other_plan_action_scope(command, public_command);
+                    }
+                    let previous_scope = self.canonical_scope_for_lease(&existing)?;
+                    let (expanded_scope, expanded, delta) = expanded_authorization_scope(
+                        &existing.authorization_binding,
+                        &previous_scope,
+                        &existing.approved_targets,
+                        &actual_scope,
+                        &actual_targets,
+                    )?;
                     return self.await_capability(
                         command,
                         plan_revision,
                         plan_action_id,
                         descriptor,
+                        invocation,
+                        expanded_scope,
+                        effective_deadline_ms,
                         expanded,
                         delta,
                         public_command,
                     );
                 }
-                let prepared = self.prepare_preview(
-                    &command.run_id,
-                    command.expected_control_epoch,
-                    plan_revision,
-                    plan_action_id,
-                    command.operation_id.clone(),
-                    command.idempotency_key.clone(),
-                    command.tool_id.clone(),
-                    command.raw_arguments.clone(),
-                    actual_targets,
-                    Vec::new(),
-                    PreparedScopePreviewDecisionClassV2::Capability,
-                    command.deadline,
-                    command.tool_context_ref.clone(),
-                    descriptor.clone(),
-                    None,
-                )?;
+                let prepared = {
+                    let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+                    let mut matching = state.previews.values().filter(|preview| {
+                        preview.record.run_id == command.run_id
+                            && preview.record.control_epoch == command.expected_control_epoch
+                            && preview.record.plan_revision == plan_revision
+                            && preview.record.plan_action_id == plan_action_id
+                            && preview.record.operation_id == command.operation_id
+                            && preview.record.tool_id == command.tool_id
+                            && preview.record.context_ref == command.tool_context_ref
+                            && preview.decision_class
+                                == PreparedScopePreviewDecisionClassV2::Capability
+                    });
+                    let preview = matching.next().cloned();
+                    if matching.next().is_some() {
+                        return Err(storage_fault());
+                    }
+                    preview
+                };
+                let Some(prepared) = prepared else {
+                    if self.actual_scope_matches_other_plan_action(
+                        &command,
+                        &plan_revision,
+                        &plan_action_id,
+                        &invocation,
+                        &actual_targets,
+                    )? {
+                        return self.reject_other_plan_action_scope(command, public_command);
+                    }
+                    return self.record_tool_intent_rejection(
+                        command,
+                        public_command,
+                        ToolIntentRejectionReasonV2::PlanActionRequired,
+                        "Preview this PlanAction through CapabilityScopePreviewBatch before submitting its tool intent."
+                            .to_owned(),
+                    );
+                };
+                if descriptor.authorization_shape
+                    != prepared.record.authorization_binding.authorization_shape()
+                {
+                    return self.record_tool_intent_rejection(
+                        command,
+                        public_command,
+                        ToolIntentRejectionReasonV2::CapabilityLeaseStale,
+                        "Refresh the plan preview for the current tool authorization shape."
+                            .to_owned(),
+                    );
+                }
+                if !authorization_binding_allows(
+                    &prepared.record.authorization_binding,
+                    &prepared.approved_targets,
+                    &invocation,
+                    &actual_targets,
+                )? {
+                    if exact_invocation_digest_changed(
+                        &prepared.record.authorization_binding,
+                        &invocation,
+                    )? {
+                        return self.reject_changed_exact_invocation(command, public_command);
+                    }
+                    if self.actual_scope_matches_other_plan_action(
+                        &command,
+                        &plan_revision,
+                        &plan_action_id,
+                        &invocation,
+                        &actual_targets,
+                    )? {
+                        return self.reject_other_plan_action_scope(command, public_command);
+                    }
+                    let (expanded_scope, expanded, delta) = expanded_authorization_scope(
+                        &prepared.record.authorization_binding,
+                        &prepared.record.canonical_scope,
+                        &prepared.approved_targets,
+                        &actual_scope,
+                        &actual_targets,
+                    )?;
+                    return self.await_capability(
+                        command,
+                        plan_revision,
+                        plan_action_id,
+                        descriptor,
+                        invocation,
+                        expanded_scope,
+                        effective_deadline_ms,
+                        expanded,
+                        delta,
+                        public_command,
+                    );
+                }
                 if prepared.record.disposition == CapabilityScopeDispositionV2::AutoIssuable {
                     let lease = self.issue_public_lease(
                         &prepared,
@@ -5727,12 +6171,6 @@ impl KernelSessionServiceV2 {
                         prepared.preview_fact_id.clone(),
                         None,
                     )?;
-                    self.inner
-                        .state
-                        .lock()
-                        .map_err(|_| storage_fault())?
-                        .previews
-                        .insert(prepared.record.preview_id.clone(), prepared);
                     self.execute_with_lease(
                         command,
                         self.inner.ids.invocation_id(),
@@ -5742,12 +6180,6 @@ impl KernelSessionServiceV2 {
                     )
                 } else {
                     let preview_id = prepared.record.preview_id.clone();
-                    self.inner
-                        .state
-                        .lock()
-                        .map_err(|_| storage_fault())?
-                        .previews
-                        .insert(preview_id.clone(), prepared);
                     self.await_preview(command, preview_id, public_command)
                 }
             }
@@ -5790,27 +6222,41 @@ impl KernelSessionServiceV2 {
         plan_revision: PlanRevisionV2,
         plan_action_id: PlanActionIdV2,
         descriptor: ToolDescriptorV2,
+        invocation: KernelCanonicalInvocation,
+        canonical_scope: ResourceScopeV2,
+        effective_deadline_ms: u32,
         targets: Vec<ScopeTargetKey>,
         scope_delta: Vec<ScopeTargetKey>,
         public_command: Option<PublicCommandContext>,
     ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
-        let prepared = self.prepare_preview(
+        let authorization_binding = match descriptor.authorization_shape {
+            ToolAuthorizationShapeV2::ResourceScope => {
+                CapabilityAuthorizationBindingV2::ResourceScope {}
+            }
+            ToolAuthorizationShapeV2::ExactInvocation => {
+                CapabilityAuthorizationBindingV2::ExactInvocation {
+                    invocation_digest: exact_invocation_digest_v2(&invocation)
+                        .map_err(|_| storage_fault())?,
+                }
+            }
+        };
+        let draft = self.prepare_preview_draft(
             &command.run_id,
             command.expected_control_epoch,
             plan_revision,
             plan_action_id,
             command.operation_id.clone(),
-            command.idempotency_key.clone(),
             command.tool_id.clone(),
-            command.raw_arguments.clone(),
+            authorization_binding,
+            canonical_scope,
             targets,
             scope_delta,
             PreparedScopePreviewDecisionClassV2::ScopeExpansion,
-            command.deadline,
+            effective_deadline_ms,
             command.tool_context_ref.clone(),
             descriptor,
-            None,
         )?;
+        let prepared = self.persist_preview_draft(draft)?;
         let preview_id = prepared.record.preview_id.clone();
         self.inner
             .state
@@ -5856,6 +6302,11 @@ impl KernelSessionServiceV2 {
         let idempotency_key_hash =
             idempotency_key_hash_v2(&command.run_id, &command.idempotency_key)
                 .map_err(|_| storage_fault())?;
+        let invocation = canonical_invocation(&command.tool_id, &command.raw_arguments)?;
+        let canonical_arguments = canonical_argument_value(&invocation)?;
+        let canonical_arguments_digest =
+            canonical_arguments_digest_v2(&command.tool_id, &canonical_arguments)
+                .map_err(|_| storage_fault())?;
         let payload = AuthorizationFactV2::CapabilityAwaiting {
             identity: CapabilityAwaitingIdentityV2 {
                 run_id: command.run_id.clone(),
@@ -5870,7 +6321,7 @@ impl KernelSessionServiceV2 {
             },
             preview_id: prepared.record.preview_id.clone(),
             tool_id: command.tool_id.clone(),
-            canonical_arguments_digest: prepared.record.canonical_arguments_digest.clone(),
+            canonical_arguments_digest,
             scope_digest: prepared.record.scope_digest.clone(),
             tool_contract_digest: prepared.record.tool_contract_digest.clone(),
             context_ref: prepared.record.context_ref.clone(),
@@ -6097,9 +6548,20 @@ impl KernelSessionServiceV2 {
         public_command: Option<PublicCommandContext>,
     ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
         let invocation = canonical_invocation(&command.tool_id, &command.raw_arguments)?;
-        let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
-        let actual_targets = exact_targets_for_invocation(&workspace, &invocation)?;
-        if !target_set_contains(&lease.approved_targets, &actual_targets) {
+        if descriptor.authorization_shape != lease.authorization_binding.authorization_shape() {
+            return Err(invalid_field(
+                "authority.lease",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let (_, actual_targets, _) =
+            self.resolve_actual_authorization(&command, &invocation, &lease.plan_action_id)?;
+        if !authorization_binding_allows(
+            &lease.authorization_binding,
+            &lease.approved_targets,
+            &invocation,
+            &actual_targets,
+        )? {
             return Err(invalid_field(
                 "authority.lease",
                 InvalidFieldViolationV2::InvalidRelation,
@@ -6178,6 +6640,25 @@ impl KernelSessionServiceV2 {
             version,
             scope_digest: preview.record.scope_digest.clone(),
         };
+        if previous.as_ref().is_some_and(|lease| {
+            !authorization_binding_can_expand(
+                &lease.authorization_binding,
+                &preview.record.authorization_binding,
+            )
+        }) {
+            return Err(invalid_field(
+                "authorizationBinding",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        if previous.as_ref().is_some_and(|lease| {
+            !target_set_contains(&preview.approved_targets, &lease.approved_targets)
+        }) {
+            return Err(invalid_field(
+                "authorizationBinding",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
         let identity = CapabilityLeaseFactIdentityV2 {
             run_id: preview.record.run_id.clone(),
             control_epoch: preview.record.control_epoch,
@@ -6215,6 +6696,7 @@ impl KernelSessionServiceV2 {
             plan_action_id: preview.record.plan_action_id.clone(),
             tool_id: preview.record.tool_id.clone(),
             context_ref: preview.record.context_ref.clone(),
+            authorization_binding: preview.record.authorization_binding.clone(),
             approved_targets: preview.approved_targets.clone(),
             decision_ref: decision_ref.clone(),
             issuance_operation_id: preview.record.operation_id.clone(),

@@ -1,5 +1,5 @@
 import type {
-  CapabilityScopePreviewReplyV2,
+  CapabilityScopePreviewBatchReplyV2,
   InvocationCancelReplyV2,
 } from '@deepcode/protocol';
 import {
@@ -152,10 +152,9 @@ export interface SessionKernelProductionResumeAfterBackpressureV2 {
   };
 }
 
-export interface SessionKernelProductionPreviewPlanActionV2 {
-  kind: 'previewPlanAction';
+export interface SessionKernelProductionPreviewPlanV2 {
+  kind: 'previewPlan';
   data: {
-    planActionId: string;
     expectedPlanRevision: string;
   };
 }
@@ -237,7 +236,7 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionReplanV2
   | SessionKernelProductionResumePlanningV2
   | SessionKernelProductionResumeAfterBackpressureV2
-  | SessionKernelProductionPreviewPlanActionV2
+  | SessionKernelProductionPreviewPlanV2
   | SessionKernelProductionPublishPlanConfirmationReadyV2
   | SessionKernelProductionDecidePlanV2
   | SessionKernelProductionObserveCapabilityDecisionV2
@@ -334,8 +333,8 @@ export type SessionKernelProductionOutcomeV2 =
       step: SessionPlanActionDriveStepV2;
     }
   | {
-      kind: 'planActionPreview';
-      preview: CapabilityScopePreviewReplyV2;
+      kind: 'planPreviewBatch';
+      preview: CapabilityScopePreviewBatchReplyV2;
     }
   | {
       kind: 'planConfirmationReadyPublished';
@@ -468,8 +467,7 @@ export type SessionKernelProductionContinuationV2 =
       expectedPlanRevision: string;
     }
   | {
-      kind: 'readyToPreviewPlanAction';
-      planActionId: string;
+      kind: 'readyToPreviewPlan';
       expectedPlanRevision: string;
     }
   | {
@@ -1575,15 +1573,14 @@ async function executeProductionOperation(
           }
         ),
       };
-    case 'previewPlanAction':
+    case 'previewPlan':
       requireProductionPlanRevision(
         runner.snapshot(),
         operation.data.expectedPlanRevision
       );
       return {
-        kind: 'planActionPreview',
-        preview: await runner.previewPlanAction(
-          operation.data.planActionId,
+        kind: 'planPreviewBatch',
+        preview: await runner.previewPlan(
           operation.data.expectedPlanRevision
         ),
       };
@@ -2035,18 +2032,14 @@ function decodeOperation(
       },
     };
   }
-  if (tagged.kind === 'previewPlanAction') {
+  if (tagged.kind === 'previewPlan') {
     const body = exactObject(
       data,
-      ['planActionId', 'expectedPlanRevision']
+      ['expectedPlanRevision']
     );
     return {
       kind: tagged.kind,
       data: {
-        planActionId: identity(
-          body.planActionId,
-          'planActionId'
-        ),
         expectedPlanRevision: identity(
           body.expectedPlanRevision,
           'expectedPlanRevision'
@@ -2787,9 +2780,8 @@ function productionContinuation(
       || state.planDecision.decision !== 'accept'
     )
   ) {
-    const unpreviewed = firstUnpreviewedPlanAction(state);
-    if (unpreviewed) {
-      return readyToPreviewPlanAction(unpreviewed);
+    if (planNeedsPreview(state)) {
+      return readyToPreviewPlan(state.plan.planRevision);
     }
     return {
       kind: 'awaitingUserPlanConfirmation',
@@ -2841,32 +2833,36 @@ function productionContinuation(
         state,
         planAction
       );
-    case 'planActionPreview':
-      if (outcome.preview.kind === 'rejected') {
+    case 'planPreviewBatch': {
+      const rejectionGuidance = outcome.preview.results.flatMap(
+        (result) => result.kind === 'rejected'
+          ? [result.data.guidance]
+          : []
+      );
+      if (rejectionGuidance.length > 0) {
         return {
           kind: 'replanRequired',
-          guidance: [outcome.preview.data.guidance],
+          guidance: [...new Set(rejectionGuidance)],
           ...planRevisionField(state),
         };
       }
-      {
-        const unpreviewed = firstUnpreviewedPlanAction(state);
-        if (unpreviewed) {
-          return readyToPreviewPlanAction(unpreviewed);
-        }
-        if (
-          state.planDecision?.planRevision
-            !== state.plan?.planRevision
-          || state.planDecision?.decision !== 'accept'
-        ) {
-          return {
-            kind: 'awaitingUserPlanConfirmation',
-            planRevision: requiredCurrentPlanRevision(state),
-            confirmationReady: false,
-          };
-        }
-        return readyForPlanAction(state, planAction);
+      if (planNeedsPreview(state)) {
+        throw new SessionKernelProductionBridgeError(
+          'session_kernel_production_plan_preview_batch_incomplete'
+        );
       }
+      if (
+        state.planDecision?.planRevision !== state.plan?.planRevision
+        || state.planDecision?.decision !== 'accept'
+      ) {
+        return {
+          kind: 'awaitingUserPlanConfirmation',
+          planRevision: requiredCurrentPlanRevision(state),
+          confirmationReady: false,
+        };
+      }
+      return readyForPlanAction(state, planAction);
+    }
     case 'planConfirmationReadyPublished':
       return {
         kind: 'awaitingUserPlanConfirmation',
@@ -3251,7 +3247,6 @@ function planActionContinuationContext(
 ): PlanActionContinuationContextV2 | undefined {
   const operationPlanActionId =
     operation.kind === 'resumePlanAction'
-    || operation.kind === 'previewPlanAction'
       ? operation.data.planActionId
       : operation.kind === 'resumeAfterBackpressure'
         ? operation.data.planActionId
@@ -3353,15 +3348,15 @@ function readyToDrivePlanAction(
   };
 }
 
-function readyToPreviewPlanAction(
-  context: PlanActionContinuationContextV2
+function readyToPreviewPlan(
+  expectedPlanRevision: string
 ): Extract<
   SessionKernelProductionContinuationV2,
-  { kind: 'readyToPreviewPlanAction' }
+  { kind: 'readyToPreviewPlan' }
 > {
   return {
-    kind: 'readyToPreviewPlanAction',
-    ...context,
+    kind: 'readyToPreviewPlan',
+    expectedPlanRevision,
   };
 }
 
@@ -3373,7 +3368,7 @@ function readyForPlanAction(
   {
     kind:
       | 'readyToDrivePlanAction'
-      | 'readyToPreviewPlanAction'
+      | 'readyToPreviewPlan'
       | 'awaitingUserScopeDecision'
       | 'readyToFinalizeReview'
       | 'awaitingKernelFacts';
@@ -3393,7 +3388,7 @@ function readyForPlanAction(
     );
   }
   const preview = state.previews[action.manifest.operationId];
-  if (!preview) return readyToPreviewPlanAction(context);
+  if (!preview) return readyToPreviewPlan(context.expectedPlanRevision);
   if (
     preview.disposition === 'requiresUserDecision'
     && !planActionHasLease(state, context.planActionId)
@@ -3408,20 +3403,13 @@ function readyForPlanAction(
   return readyToDrivePlanAction(context);
 }
 
-function firstUnpreviewedPlanAction(
+function planNeedsPreview(
   state: SessionKernelLoopStateV2
-): PlanActionContinuationContextV2 | undefined {
-  const action = state.plan?.actions.find(
+): boolean {
+  return state.plan?.actions.some(
     (candidate) =>
       !state.previews[candidate.manifest.operationId]
-  );
-  return action
-    ? {
-        planActionId: action.manifest.planActionId,
-        expectedPlanRevision:
-          action.manifest.planRevision,
-      }
-    : undefined;
+  ) ?? false;
 }
 
 function planActionHasLease(
@@ -3456,7 +3444,7 @@ function readyToDriveOrFinalize(
   {
     kind:
       | 'readyToDrivePlanAction'
-      | 'readyToPreviewPlanAction'
+      | 'readyToPreviewPlan'
       | 'awaitingUserScopeDecision'
       | 'readyToFinalizeReview'
       | 'awaitingKernelFacts';

@@ -1,18 +1,16 @@
 import {
   KERNEL_ABI_V2_VERSION,
   decodeKernelCommandResponseEnvelopeV2,
-  type CapabilityScopePreviewReplyV2,
+  type CapabilityScopePreviewBatchReplyV2,
+  type CapabilityScopePreviewItemV2,
   type ControlEpochAdvancedReplyV2,
-  type DeadlineRequestV2,
   type EpochPreconditionV2,
   type InvocationCancelReplyV2,
   type InvocationCancelTargetV2,
   type KernelCommandEnvelopeV2,
   type KernelCommandV2,
   type KernelFactProjectionPageV2,
-  type RawToolArgumentsV2,
   type RunOpenReplyV2,
-  type ScopeManifestV2,
   type ToolContextGetReplyV2,
   type ToolContextRefV2,
   type ToolIntentSubmitReplyV2,
@@ -29,13 +27,11 @@ export interface SessionKernelCommandRequestV2 {
   signal?: AbortSignal;
 }
 
-export interface SessionKernelCapabilityPreviewRequestV2
+export interface SessionKernelCapabilityPreviewBatchRequestV2
   extends SessionKernelCommandRequestV2 {
   expectedControlEpoch: number;
-  manifest: ScopeManifestV2;
-  rawArguments: RawToolArgumentsV2;
-  idempotencyKey: string;
-  deadline: DeadlineRequestV2;
+  planRevision: string;
+  items: CapabilityScopePreviewItemV2[];
   toolContextRef: ToolContextRefV2;
 }
 
@@ -79,9 +75,9 @@ export interface SessionKernelPortV2 {
     }
   ): Promise<ToolContextGetReplyV2>;
 
-  previewCapability(
-    request: SessionKernelCapabilityPreviewRequestV2
-  ): Promise<CapabilityScopePreviewReplyV2>;
+  previewCapabilityBatch(
+    request: SessionKernelCapabilityPreviewBatchRequestV2
+  ): Promise<CapabilityScopePreviewBatchReplyV2>;
 
   submitToolIntent(
     request: SessionKernelToolIntentRequestV2
@@ -118,7 +114,7 @@ export interface SessionKernelTransportPrivateAuthV2 {
 
 interface SessionKernelReplyDataByKindV2 {
   toolContext: ToolContextGetReplyV2;
-  capabilityScopePreviewed: CapabilityScopePreviewReplyV2;
+  capabilityScopePreviewBatchResult: CapabilityScopePreviewBatchReplyV2;
   toolIntentSubmission: ToolIntentSubmitReplyV2;
   kernelFactsProjected: KernelFactProjectionPageV2;
   controlEpochAdvanced: ControlEpochAdvancedReplyV2;
@@ -238,52 +234,63 @@ export class TransportSessionKernelPortV2 implements SessionKernelPortV2 {
     return reply;
   }
 
-  async previewCapability(
-    request: SessionKernelCapabilityPreviewRequestV2
-  ): Promise<CapabilityScopePreviewReplyV2> {
-    const manifest = request.manifest;
+  async previewCapabilityBatch(
+    request: SessionKernelCapabilityPreviewBatchRequestV2
+  ): Promise<CapabilityScopePreviewBatchReplyV2> {
     const reply = await this.exchange(
       request.requestId,
       {
-        kind: 'capabilityScopePreview',
+        kind: 'capabilityScopePreviewBatch',
         data: {
           runId: this.run.runId,
           expectedControlEpoch: request.expectedControlEpoch,
-          planRevision: manifest.planRevision,
-          planActionId: manifest.planActionId,
-          operationId: manifest.operationId,
-          idempotencyKey: request.idempotencyKey,
-          toolId: manifest.toolId,
-          rawArguments: request.rawArguments,
-          requestedResources: manifest.requestedResources,
-          deadline: request.deadline,
+          planRevision: request.planRevision,
+          items: request.items.map((item) => ({ ...item })),
           toolContextRef: request.toolContextRef,
         },
       },
-      'capabilityScopePreviewed',
+      'capabilityScopePreviewBatchResult',
       request.signal
     );
-    if (reply.kind === 'previewed') {
-      const preview = reply.data.preview;
+    if (
+      reply.runId !== this.run.runId
+      || reply.acceptedControlEpoch !== request.expectedControlEpoch
+      || reply.planRevision !== request.planRevision
+      || reply.results.length !== request.items.length
+    ) {
+      throw new SessionKernelPortError(
+        'session_kernel_scope_preview_batch_correlation_mismatch',
+        'Kernel scope preview batch does not match the submitted Plan identity.'
+      );
+    }
+    for (const [index, item] of request.items.entries()) {
+      const result = reply.results[index]!;
+      const correlation = result.kind === 'previewed'
+        ? result.data.preview
+        : result.data;
       if (
-        preview.runId !== this.run.runId
-        || preview.controlEpoch !== request.expectedControlEpoch
-        || preview.planRevision !== manifest.planRevision
-        || preview.planActionId !== manifest.planActionId
-        || preview.operationId !== manifest.operationId
-        || preview.toolId !== manifest.toolId
-        || !sameToolContextRef(preview.contextRef, request.toolContextRef)
+        correlation.planActionId !== item.planActionId
+        || correlation.operationId !== item.operationId
+        || correlation.toolId !== item.toolId
+        || (
+          result.kind === 'previewed'
+          && (
+            result.data.preview.runId !== this.run.runId
+            || result.data.preview.controlEpoch
+              !== request.expectedControlEpoch
+            || result.data.preview.planRevision !== request.planRevision
+            || !sameToolContextRef(
+              result.data.preview.contextRef,
+              request.toolContextRef
+            )
+          )
+        )
       ) {
         throw new SessionKernelPortError(
-          'session_kernel_scope_preview_correlation_mismatch',
-          'Kernel scope preview does not match the submitted PlanAction identity.'
+          'session_kernel_scope_preview_batch_correlation_mismatch',
+          'Kernel scope preview batch item does not match the submitted PlanAction identity.'
         );
       }
-    } else if (reply.data.toolId !== manifest.toolId) {
-      throw new SessionKernelPortError(
-        'session_kernel_scope_preview_correlation_mismatch',
-        'Kernel scope rejection does not match the submitted tool.'
-      );
     }
     return reply;
   }

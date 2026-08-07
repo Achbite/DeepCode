@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::tool_protocol_v2::{
-    CanonicalArgumentsDigestV2, CapabilityLeaseRefV2, CapabilityScopeDigestV2,
+    CapabilityAuthorizationBindingV2, CapabilityLeaseRefV2, CapabilityScopeDigestV2,
     CapabilityScopePreviewIdV2, FactQueryContinuationV2, PlanActionIdV2, PlanRevisionV2,
-    RawToolArgumentsV2, RequestedResourceV2, ToolContextBundleV2, ToolContextRefV2,
-    ToolContractDigestV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2, ToolIntentAuthorityV2,
-    ToolRiskV2, WorkspaceBindingRefV2,
+    RawToolArgumentsV2, ScopeIntentV2, ToolContextBundleV2, ToolContextRefV2, ToolContractDigestV2,
+    ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2, ToolIntentAuthorityV2, ToolRiskV2,
+    WorkspaceBindingRefV2,
 };
 use crate::v2::{
     decode_strict_json, empty_field, field_too_large, invalid_value, too_many_values,
@@ -56,7 +57,7 @@ impl KernelCommandEnvelopeV2 {
 pub enum KernelCommandV2 {
     RunOpen(RunOpenV2),
     ToolContextGet(ToolContextGetV2),
-    CapabilityScopePreview(CapabilityScopePreviewV2),
+    CapabilityScopePreviewBatch(CapabilityScopePreviewBatchV2),
     ToolIntentSubmit(ToolIntentSubmitV2),
     KernelFactsQueryScoped(KernelFactsQueryScopedV2),
     ControlEpochAdvance(ControlEpochAdvanceV2),
@@ -68,7 +69,7 @@ impl KernelCommandV2 {
         match self {
             Self::RunOpen(value) => value.validate(),
             Self::ToolContextGet(value) => value.validate(),
-            Self::CapabilityScopePreview(value) => value.validate(),
+            Self::CapabilityScopePreviewBatch(value) => value.validate(),
             Self::ToolIntentSubmit(value) => value.validate(),
             Self::KernelFactsQueryScoped(value) => value.validate(),
             Self::ControlEpochAdvance(value) => value.validate(),
@@ -80,7 +81,7 @@ impl KernelCommandV2 {
         match self {
             Self::RunOpen(_) => "runOpen",
             Self::ToolContextGet(_) => "toolContextGet",
-            Self::CapabilityScopePreview(_) => "capabilityScopePreview",
+            Self::CapabilityScopePreviewBatch(_) => "capabilityScopePreviewBatch",
             Self::ToolIntentSubmit(_) => "toolIntentSubmit",
             Self::KernelFactsQueryScoped(_) => "kernelFactsQueryScoped",
             Self::ControlEpochAdvance(_) => "controlEpochAdvance",
@@ -137,36 +138,66 @@ impl ToolContextGetV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CapabilityScopePreviewV2 {
-    pub run_id: RunId,
-    pub expected_control_epoch: ControlEpoch,
-    pub plan_revision: PlanRevisionV2,
+pub struct CapabilityScopePreviewItemV2 {
     pub plan_action_id: PlanActionIdV2,
     pub operation_id: OperationId,
     pub idempotency_key: String,
     pub tool_id: ToolIdV2,
-    pub raw_arguments: RawToolArgumentsV2,
-    pub requested_resources: Vec<RequestedResourceV2>,
+    pub scope_intent: ScopeIntentV2,
     pub deadline: DeadlineRequestV2,
+}
+
+impl CapabilityScopePreviewItemV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_text("idempotencyKey", &self.idempotency_key)?;
+        self.scope_intent.validate()?;
+        self.deadline.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityScopePreviewBatchV2 {
+    pub run_id: RunId,
+    pub expected_control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub items: Vec<CapabilityScopePreviewItemV2>,
     pub tool_context_ref: ToolContextRefV2,
 }
 
-impl CapabilityScopePreviewV2 {
+impl CapabilityScopePreviewBatchV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
-        validate_text("idempotencyKey", &self.idempotency_key)?;
-        if self.requested_resources.is_empty() {
-            return Err(empty_field("requestedResources"));
+        if self.items.is_empty() {
+            return Err(empty_field("items"));
         }
-        if self.requested_resources.len() > MAX_CORRELATION_REFS_V2 {
-            return Err(too_many_values(
-                "requestedResources",
-                MAX_CORRELATION_REFS_V2,
-            ));
+        if self.items.len() > MAX_CORRELATION_REFS_V2 {
+            return Err(too_many_values("items", MAX_CORRELATION_REFS_V2));
         }
-        for resource in &self.requested_resources {
-            resource.validate()?;
+        let mut plan_action_ids = BTreeSet::new();
+        let mut operation_ids = BTreeSet::new();
+        let mut idempotency_keys = BTreeSet::new();
+        for item in &self.items {
+            item.validate()?;
+            if !plan_action_ids.insert(item.plan_action_id.as_str()) {
+                return Err(invalid_value(
+                    "items.planActionId",
+                    "must be unique within the preview batch",
+                ));
+            }
+            if !operation_ids.insert(item.operation_id.as_str()) {
+                return Err(invalid_value(
+                    "items.operationId",
+                    "must be unique within the preview batch",
+                ));
+            }
+            if !idempotency_keys.insert(item.idempotency_key.as_str()) {
+                return Err(invalid_value(
+                    "items.idempotencyKey",
+                    "must be unique within the preview batch",
+                ));
+            }
         }
-        self.deadline.validate()
+        Ok(())
     }
 }
 
@@ -298,7 +329,7 @@ pub enum InvocationCancelTargetV2 {
 pub enum KernelReplyV2 {
     RunOpened(RunOpenReplyV2),
     ToolContext(ToolContextGetReplyV2),
-    CapabilityScopePreviewed(CapabilityScopePreviewReplyV2),
+    CapabilityScopePreviewBatchResult(CapabilityScopePreviewBatchReplyV2),
     ToolIntentSubmission(ToolIntentSubmitReplyV2),
     KernelFactsProjected(KernelFactProjectionPageV2),
     ControlEpochAdvanced(ControlEpochAdvancedReplyV2),
@@ -311,7 +342,7 @@ impl KernelReplyV2 {
         match self {
             Self::RunOpened(reply) => reply.validate()?,
             Self::ToolContext(reply) => reply.validate()?,
-            Self::CapabilityScopePreviewed(reply) => reply.validate()?,
+            Self::CapabilityScopePreviewBatchResult(reply) => reply.validate()?,
             Self::ToolIntentSubmission(reply) => reply.validate()?,
             Self::KernelFactsProjected(reply) => reply.validate()?,
             Self::ControlEpochAdvanced(reply) => reply.validate()?,
@@ -495,7 +526,7 @@ pub struct CapabilityScopePreviewRecordV2 {
     pub plan_action_id: PlanActionIdV2,
     pub operation_id: OperationId,
     pub tool_id: ToolIdV2,
-    pub canonical_arguments_digest: CanonicalArgumentsDigestV2,
+    pub authorization_binding: CapabilityAuthorizationBindingV2,
     pub canonical_scope: ResourceScopeV2,
     pub scope_digest: CapabilityScopeDigestV2,
     pub authorization_digest: crate::tool_protocol_v2::CapabilityAuthorizationDigestV2,
@@ -554,10 +585,36 @@ pub enum CapabilityScopePreviewReplyV2 {
         preview: CapabilityScopePreviewRecordV2,
     },
     Rejected {
+        plan_action_id: PlanActionIdV2,
+        operation_id: OperationId,
         tool_id: ToolIdV2,
         reason: CapabilityScopeRejectionReasonV2,
         guidance: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityScopePreviewBatchReplyV2 {
+    pub run_id: RunId,
+    pub accepted_control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub results: Vec<CapabilityScopePreviewReplyV2>,
+}
+
+impl CapabilityScopePreviewBatchReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        if self.results.is_empty() {
+            return Err(empty_field("results"));
+        }
+        if self.results.len() > MAX_CORRELATION_REFS_V2 {
+            return Err(too_many_values("results", MAX_CORRELATION_REFS_V2));
+        }
+        for result in &self.results {
+            result.validate()?;
+        }
+        Ok(())
+    }
 }
 
 impl CapabilityScopePreviewReplyV2 {

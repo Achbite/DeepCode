@@ -17,7 +17,7 @@ import type {
   SessionContextMemoryV2,
 } from './sessionMemory.js';
 import type {
-  SessionKernelCapabilityPreviewRequestV2,
+  SessionKernelCapabilityPreviewBatchRequestV2,
   SessionKernelEpochAdvanceRequestV2,
   SessionKernelFactsRequestV2,
   SessionKernelInvocationCancelRequestV2,
@@ -284,7 +284,6 @@ export interface SessionProviderToolCallReceiptV2 {
 export interface SessionPlanActionV2 {
   taskId: string;
   manifest: ScopeManifestV2;
-  previewArguments: RawToolArgumentsV2;
   idempotencyKey: string;
   deadline: DeadlineRequestV2;
 }
@@ -613,8 +612,8 @@ export type SessionActiveWaitV2 =
 type ContextRequestPayloadV2 = {
   knownContext?: ToolContextRefV2;
 };
-type PreviewRequestPayloadV2 = Omit<
-  SessionKernelCapabilityPreviewRequestV2,
+type PreviewBatchRequestPayloadV2 = Omit<
+  SessionKernelCapabilityPreviewBatchRequestV2,
   'requestId' | 'signal'
 >;
 type IntentRequestPayloadV2 = Omit<
@@ -636,7 +635,10 @@ type CancelRequestPayloadV2 = Omit<
 
 export type SessionKernelPublicRequestIntentV2 =
   | { kind: 'toolContextGet'; payload: ContextRequestPayloadV2 }
-  | { kind: 'capabilityPreview'; payload: PreviewRequestPayloadV2 }
+  | {
+      kind: 'capabilityPreviewBatch';
+      payload: PreviewBatchRequestPayloadV2;
+    }
   | { kind: 'toolIntentSubmit'; payload: IntentRequestPayloadV2 }
   | { kind: 'factsQuery'; payload: FactsRequestPayloadV2 }
   | { kind: 'controlEpochAdvance'; payload: EpochRequestPayloadV2 }

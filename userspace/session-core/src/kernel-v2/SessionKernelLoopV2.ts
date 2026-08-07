@@ -1,5 +1,5 @@
 import type {
-  CapabilityScopePreviewReplyV2,
+  CapabilityScopePreviewBatchReplyV2,
   ControlEpochAdvancedReplyV2,
   InvocationCancelReplyV2,
   KernelFactProjectionV2,
@@ -35,6 +35,7 @@ import {
   buildSessionPlanConfirmationAuthorityV2,
   cloneSessionKernelLoopStateV2,
   createSessionKernelLoopStateV2,
+  currentSessionPlanScopePreviewsV2,
   currentSessionPlanConfirmationAuthorityV2,
   currentSessionWorkAuthorityV3,
   recordSessionPlanConfirmationAuthorityV2,
@@ -466,11 +467,10 @@ export class SessionKernelLoopV2 {
     }
   }
 
-  async previewPlanAction(
-    planActionId: string,
+  async previewPlan(
     expectedPlanRevision: string
-  ): Promise<CapabilityScopePreviewReplyV2> {
-    this.beginMaintenance('previewPlanAction');
+  ): Promise<CapabilityScopePreviewBatchReplyV2> {
+    this.beginMaintenance('previewPlan');
     try {
       this.requireNoPendingRequests();
       this.requirePlanProjected();
@@ -481,57 +481,83 @@ export class SessionKernelLoopV2 {
           'ToolContext invalidation is refreshed only at the next provider-turn boundary.'
         );
       }
-      const action = sessionPlanActionV2(this.state, planActionId);
-      const outcome = await this.requests.execute(
-        this.requests.newRecord({
-          kind: 'capabilityPreview',
-          payload: {
-            expectedControlEpoch: this.state.controlEpoch,
-            manifest: action.manifest,
-            rawArguments: action.previewArguments,
-            idempotencyKey: action.idempotencyKey,
-            deadline: action.deadline,
-            toolContextRef: toolContextRefV2(
-              this.state.toolContext.bundle
-            ),
-          },
-        })
+      const plan = this.state.plan!;
+      const existingPreviews = currentSessionPlanScopePreviewsV2(
+        this.state,
+        plan,
+        { requireComplete: false }
       );
-      const reply = expectSessionKernelPublicRequestOutcomeV2(
-        outcome,
-        'capabilityPreview'
-      ).reply;
-      const scopePreviews = this.state.plan?.actions.flatMap(
-        (planAction) => {
-          const preview =
-            this.state.previews[planAction.manifest.operationId];
-          return preview ? [preview] : [];
-        }
-      ) ?? [];
-      const projectionData = {
-        ...reply,
-        plan: this.state.plan,
-        scopePreviews,
-        planRevision: action.manifest.planRevision,
-        planActionId: action.manifest.planActionId,
-        operationId: action.manifest.operationId,
-      };
-      if (reply.kind === 'previewed') {
-        await this.project(
-          `scope:${reply.data.preview.previewId}`,
-          'scope.previewed',
-          projectionData
+      if (
+        existingPreviews.length > 0
+        && existingPreviews.length !== plan.actions.length
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_scope_preview_batch_incomplete',
+          'The current Plan contains a partial scope preview batch.'
         );
-      } else {
+      }
+      const reply: CapabilityScopePreviewBatchReplyV2 =
+        existingPreviews.length === plan.actions.length
+          ? {
+              runId: this.state.runId,
+              acceptedControlEpoch: this.state.controlEpoch,
+              planRevision: plan.planRevision,
+              results: existingPreviews.map((preview) => ({
+                kind: 'previewed' as const,
+                data: { preview: cloneJson(preview) },
+              })),
+            }
+          : expectSessionKernelPublicRequestOutcomeV2(
+              await this.requests.execute(
+                this.requests.newRecord({
+                  kind: 'capabilityPreviewBatch',
+                  payload: {
+                    expectedControlEpoch: this.state.controlEpoch,
+                    planRevision: plan.planRevision,
+                    items: plan.actions.map((action) => ({
+                      planActionId: action.manifest.planActionId,
+                      operationId: action.manifest.operationId,
+                      idempotencyKey: action.idempotencyKey,
+                      toolId: action.manifest.toolId,
+                      scopeIntent: cloneJson(action.manifest.scopeIntent),
+                      deadline: cloneJson(action.deadline),
+                    })),
+                    toolContextRef: toolContextRefV2(
+                      this.state.toolContext.bundle
+                    ),
+                  },
+                })
+              ),
+              'capabilityPreviewBatch'
+            ).reply;
+      const scopePreviews = currentSessionPlanScopePreviewsV2(
+        this.state,
+        plan,
+        { requireComplete: false }
+      );
+      for (const result of reply.results) {
+        const correlation = result.kind === 'previewed'
+          ? result.data.preview
+          : result.data;
+        const projectionData = {
+          ...result,
+          plan: cloneJson(plan),
+          scopePreviews,
+          planRevision: plan.planRevision,
+          planActionId: correlation.planActionId,
+          operationId: correlation.operationId,
+        };
         await this.project(
-          [
-            'scope',
-            action.manifest.planRevision,
-            action.manifest.planActionId,
-            String(this.state.controlEpoch),
-            this.state.toolContext.bundle.contextDigest,
-            'rejected',
-          ].join(':'),
+          result.kind === 'previewed'
+            ? `scope:${result.data.preview.previewId}`
+            : [
+                'scope',
+                plan.planRevision,
+                result.data.planActionId,
+                String(this.state.controlEpoch),
+                this.state.toolContext.bundle.contextDigest,
+                'rejected',
+              ].join(':'),
           'scope.previewed',
           projectionData
         );
@@ -568,34 +594,10 @@ export class SessionKernelLoopV2 {
           'Plan confirmation cannot publish while ToolContext refresh is required.'
         );
       }
-      const currentContextRef = toolContextRefV2(
-        this.state.toolContext.bundle
+      const scopePreviews = currentSessionPlanScopePreviewsV2(
+        this.state,
+        plan
       );
-      const scopePreviews = plan.actions.map((action) => {
-        const preview =
-          this.state.previews[action.manifest.operationId];
-        if (
-          !preview
-          || preview.runId !== this.state.runId
-          || preview.controlEpoch !== this.state.controlEpoch
-          || preview.planRevision !== expectedPlanRevision
-          || preview.planActionId !== action.manifest.planActionId
-          || preview.operationId !== action.manifest.operationId
-          || preview.toolId !== action.manifest.toolId
-          || preview.contextRef.contextVersion
-            !== currentContextRef.contextVersion
-          || preview.contextRef.catalogDigest
-            !== currentContextRef.catalogDigest
-          || preview.contextRef.contextDigest
-            !== currentContextRef.contextDigest
-        ) {
-          throw new SessionKernelLoopError(
-            'session_kernel_plan_confirmation_preview_incomplete',
-            'Every current PlanAction requires one matching canonical scope preview before confirmation publication.'
-          );
-        }
-        return preview;
-      });
       const providerTurn = this.state.providerTurn;
       const providerOutcome = [...this.state.providerOutcomes]
         .reverse()
@@ -636,12 +638,6 @@ export class SessionKernelLoopV2 {
             },
             commentaryRecordedAt
           );
-      const commentaryProjection = commentaryEvent
-        ? requiredDeliveredProjectionReceiptV2(
-            [await this.ports.projection.project(commentaryEvent)],
-            commentaryEvent.projectionId
-          )
-        : undefined;
       const recordedAt = this.ports.clock.now();
       const confirmationEvent = this.event(
         `plan:${expectedPlanRevision}:confirmation-ready`,
@@ -649,7 +645,7 @@ export class SessionKernelLoopV2 {
         {
           planRevision: expectedPlanRevision,
           providerTurnId: providerTurn.providerTurnId,
-          plan,
+          plan: cloneJson(plan),
           scopePreviews,
           ...(commentaryEvent
             ? { commentaryProjectionId: commentaryEvent.projectionId }
@@ -658,8 +654,19 @@ export class SessionKernelLoopV2 {
         },
         recordedAt
       );
+      const projectionReceipts = await this.ports.projection.projectBatch(
+        commentaryEvent
+          ? [commentaryEvent, confirmationEvent]
+          : [confirmationEvent]
+      );
+      const commentaryProjection = commentaryEvent
+        ? requiredDeliveredProjectionReceiptV2(
+            projectionReceipts,
+            commentaryEvent.projectionId
+          )
+        : undefined;
       const confirmationProjection = requiredDeliveredProjectionReceiptV2(
-        [await this.ports.projection.project(confirmationEvent)],
+        projectionReceipts,
         confirmationEvent.projectionId
       );
       const authority = buildSessionPlanConfirmationAuthorityV2(
@@ -1569,7 +1576,7 @@ export class SessionKernelLoopV2 {
     await this.project(
       `plan:${plan.planRevision}`,
       'plan.persisted',
-      plan,
+      cloneJson(plan),
       plan.recordedAt
     );
     this.state.projectedPlanRevision = plan.planRevision;
