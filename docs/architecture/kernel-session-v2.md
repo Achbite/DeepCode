@@ -505,6 +505,13 @@ or discriminator fail closed with `UnsupportedHistorySchema`. Historical bytes
 remain untouched but cannot be used as current Run input, public timeline, UI
 replay, or recovery state.
 
+The default canonical fact-store path is physically namespaced by the compiled
+fact-store schema contract. An atomic contract cutover therefore creates a new
+current store instead of reopening, migrating, truncating, or overwriting a
+store from another contract. An explicit `DEEPCODE_KERNEL_FACT_STORE_PATH`
+remains an operator-selected exact path and fails closed when its discriminator
+does not match the compiled contract.
+
 Same-Session persistence is supported only when every record already has the
 current exact schema, physical layout, field set, discriminator, and bound
 identity. Reading those records with the same exact decoder is ordinary current

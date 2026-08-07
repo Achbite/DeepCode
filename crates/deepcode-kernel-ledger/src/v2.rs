@@ -31,6 +31,7 @@ use std::time::Duration;
 
 const SCHEMA_VERSION: &str = "6";
 const SCHEMA_CONTRACT: &str = FACT_STORE_SCHEMA_CONTRACT_V2;
+const SCHEMA_CONTRACT_PREFIX: &str = "deepcode.kernel.fact-store.v2.";
 const WRITER_QUEUE_CAPACITY: usize = 256;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,8 +57,35 @@ pub fn configured_fact_store_path(config_root: impl AsRef<Path>) -> KernelResult
         None => Ok(config_root
             .as_ref()
             .join("kernel")
-            .join("kernel-v2.sqlite3")),
+            .join(default_fact_store_file_name()?)),
     }
+}
+
+fn default_fact_store_file_name() -> KernelResult<String> {
+    let Some(contract_suffix) = SCHEMA_CONTRACT.strip_prefix(SCHEMA_CONTRACT_PREFIX) else {
+        return Err(store_error_message(
+            "resolve_database_path",
+            "compiled fact-store schema contract has an invalid namespace",
+        ));
+    };
+    if contract_suffix.is_empty()
+        || !contract_suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(store_error_message(
+            "resolve_database_path",
+            "compiled fact-store schema contract has an invalid path suffix",
+        ));
+    }
+    let path_tag = contract_suffix
+        .chars()
+        .map(|character| match character {
+            '.' | '_' => '-',
+            other => other,
+        })
+        .collect::<String>();
+    Ok(format!("kernel-v2-{path_tag}.sqlite3"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
