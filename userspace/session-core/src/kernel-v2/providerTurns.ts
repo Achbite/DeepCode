@@ -577,21 +577,15 @@ export class SessionKernelProviderTurnsV2 {
       let output: SessionProviderTurnOutputV2;
       let completedTerminalRecordedAt: string | undefined;
       try {
-        const publishPublicTextDeltas =
-          request.target.kind === 'finalAnswer';
         const liveOutput = await this.ports.provider.requestTurn({
           ...providerInput,
           contextAssembly,
-          ...(publishPublicTextDeltas
-            ? {
-                publicTextObserver: this.publicTextObserverForTurn(
-                  reservation,
-                  generation,
-                  providerTurnId,
-                  state.controlEpoch
-                ),
-              }
-            : {}),
+          publicTextObserver: this.publicTextObserverForTurn(
+            reservation,
+            generation,
+            providerTurnId,
+            state.controlEpoch
+          ),
           publicActivityObserver: this.publicActivityObserverForTurn(
             reservation,
             generation,
@@ -1119,6 +1113,12 @@ export class SessionKernelProviderTurnsV2 {
             : 'providerTurn',
         orderedItems: publicSessionProviderOrderedItemsV2(output.items),
         providerOutcome: output.providerResult,
+        ...(request.target.kind === 'finalAnswer'
+          ? {
+              reviewRevision: request.target.reviewRevision,
+              snapshotHighWater: request.target.snapshotHighWater,
+            }
+          : {}),
       },
       recordedAt
     );
@@ -1511,6 +1511,8 @@ export class SessionKernelProviderTurnsV2 {
           providerTurn.response.items
         ),
         providerOutcome: outcome.providerResult,
+        reviewRevision: finalAnswer.binding.reviewRevision,
+        snapshotHighWater: finalAnswer.binding.snapshotHighWater,
       },
       finalAnswer.committedAt
     );
@@ -2176,10 +2178,7 @@ export class SessionKernelProviderTurnsV2 {
         || delta.streamSequence <= 0
         || !Number.isSafeInteger(delta.textOrdinal)
         || delta.textOrdinal <= 0
-        || (
-          delta.providerPhase !== undefined
-          && delta.providerPhase !== 'commentary'
-        )
+        || delta.providerPhase !== 'commentary'
         || typeof delta.textDelta !== 'string'
         || delta.textDelta.length === 0
       ) {
@@ -2218,9 +2217,7 @@ export class SessionKernelProviderTurnsV2 {
             controlEpoch,
             streamSequence: delta.streamSequence,
             textOrdinal: delta.textOrdinal,
-            ...(delta.providerPhase
-              ? { providerPhase: delta.providerPhase }
-              : {}),
+            providerPhase: delta.providerPhase,
             textDelta: delta.textDelta,
           }
         );

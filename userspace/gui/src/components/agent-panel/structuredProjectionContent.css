@@ -1,0 +1,48 @@
+.agent-final-fact-receipt {
+  margin-top: 12px;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, currentColor 3%, transparent);
+  overflow: hidden;
+}
+
+.agent-final-fact-receipt > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.agent-final-fact-receipt > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-final-fact-receipt > summary::before {
+  content: '›';
+  display: inline-block;
+  transition: transform 120ms ease;
+}
+
+.agent-final-fact-receipt[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.agent-final-fact-receipt__summary {
+  min-width: 0;
+  color: color-mix(in srgb, currentColor 68%, transparent);
+  font-weight: 450;
+}
+
+.agent-final-fact-receipt > .agent-structured-projection {
+  padding: 0 10px 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-final-fact-receipt > summary::before {
+    transition: none;
+  }
+}

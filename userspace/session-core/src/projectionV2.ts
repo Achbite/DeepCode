@@ -9,12 +9,14 @@ import type {
   AgentTimelineRunProjection,
   AgentTimelineStatus,
   AgentTimelineStructuredProjection,
+  AgentTimelineTaskOutcome,
+  AgentTimelineTaskProgress,
   AgentTimelineTaskProjection,
   AgentTimelineTaskProjectionItem,
-  AgentTimelineTaskStatus,
   AgentTimelineTokenUsageProjection,
   AgentTimelineTurn,
   AgentTimelineTurnPart,
+  AgentTimelineResourcePresentation,
   AgentTimelineWorkAttention,
   AgentTimelineWorkOperation,
   AgentTimelineWorkOperationRetry,
@@ -23,7 +25,7 @@ import type {
 } from '@deepcode/protocol';
 import {
   AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
   AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2,
   AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2,
 } from '@deepcode/protocol';
@@ -34,7 +36,7 @@ import {
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION =
   AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
 export const NARRATIVE_TIMELINE_SHAPE_VERSION =
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2;
 
 export interface PendingPermissionProjection {
   request: AgentTimelinePermissionRequestView;
@@ -67,6 +69,15 @@ interface MutableTurn {
   workGroupAnchorBlockIdById: Map<string, string>;
   providerOperationIds: Map<string, Set<string>>;
   providerStreamSequences: Map<string, number>;
+  planOperationResourcePresentation: Map<
+    string,
+    AgentTimelineResourcePresentation[]
+  >;
+  latestReviewEvent?: AgentEvent;
+  finalAnswerReviewBinding?: {
+    reviewRevision: number;
+    snapshotHighWater: number;
+  };
   terminalEvent?: AgentEvent;
 }
 
@@ -109,6 +120,12 @@ export function buildNarrativeTimelineProjection(
     const payload = recordValue(event.payload);
     const runId = stringValue(payload?.runId);
     const turn = projectionTurn(context, event, payload, runId);
+    if (
+      event.kind === 'review_summary'
+      && stringValue(payload?.status) === 'completed'
+    ) {
+      turn.latestReviewEvent = event;
+    }
     const providerOutputProjected = projectProviderOutputIntoTurn(
       turn,
       event,
@@ -157,10 +174,12 @@ export function buildNarrativeTimelineProjection(
         status: turn.status,
         startedAt: turn.startedAt,
         completedAt: turn.completedAt,
-        blocks: turn.blocks.map((block, blockIndex) => ({
-          ...block,
-          sequence: blockIndex,
-        })),
+        blocks: finalBlocksWithFactReceipt(turn).map(
+          (block, blockIndex) => ({
+            ...block,
+            sequence: blockIndex,
+          })
+        ),
         workSegments: finalizeTurnWorkSegments(turn).map(
           (segment, segmentIndex) => ({
             ...segment,
@@ -184,7 +203,7 @@ export function buildNarrativeTimelineProjection(
       ?? new Date(0).toISOString(),
     turns,
     eventCount: input.events.length,
-    taskProjection: buildTaskProjection(currentRunEvents),
+    taskProjection: buildTaskProjection(currentRunEvents, turns),
     interactionProjection,
     runProjection: buildRunProjection(
       input.events,
@@ -232,7 +251,7 @@ export function appendProviderComposingProjectionV2(
     || textOrdinal === undefined
     || textOrdinal === 0
     || textDelta === undefined
-    || (providerPhase !== undefined && providerPhase !== 'commentary')
+    || providerPhase !== 'commentary'
   ) {
     throw new Error('session_projection_provider_composing_invalid');
   }
@@ -277,7 +296,7 @@ export function appendProviderComposingProjectionV2(
         deliveryMode: 'replay',
         durability: 'committed',
         entryRole: 'agentUpdate',
-        ...(providerPhase ? { providerPhase } : {}),
+        providerPhase,
         status: 'running',
         summary: combinedText,
         bodyMarkdown: combinedText,
@@ -298,7 +317,7 @@ export function appendProviderComposingProjectionV2(
         kind: 'assistant',
         narrativeKind: 'assistantText',
         entryRole: 'agentUpdate',
-        ...(providerPhase ? { providerPhase } : {}),
+        providerPhase,
         title: 'Assistant Msg',
         summary: combinedText,
         status: 'running',
@@ -698,7 +717,7 @@ function assertSharedConversationProjection(
     const localWorkSegmentIds = new Set<string>();
     for (const [segmentIndex, segment] of turn.workSegments.entries()) {
       if (
-        !isSharedConversationWorkSegmentV1(segment)
+        !isSharedConversationWorkSegmentV2(segment)
         || workSegmentIds.has(segment.id)
         || segment.sequence !== segmentIndex
       ) {
@@ -1002,6 +1021,11 @@ function validNativeBlockDetails(
         block.kind === 'review'
         && recordValue(block.structuredProjection)?.kind === 'review'
       )
+      || (
+        block.kind === 'assistant'
+        && block.entryRole === 'finalAnswer'
+        && recordValue(block.structuredProjection)?.kind === 'review'
+      )
     )
     && (
       block.decisionRequest === undefined
@@ -1164,6 +1188,7 @@ function validStructuredProjection(value: unknown): boolean {
           'messageArgs',
           'status',
           'targetRefs',
+          'resourcePresentation',
           'auditRefs',
           'objective',
           'acceptanceCriteria',
@@ -1191,6 +1216,10 @@ function validStructuredProjection(value: unknown): boolean {
         || (
           item.targetRefs !== undefined
           && !stringArray(item.targetRefs)
+        )
+        || (
+          item.resourcePresentation !== undefined
+          && !validResourcePresentationArray(item.resourcePresentation)
         )
         || (
           item.auditRefs !== undefined
@@ -1420,9 +1449,15 @@ function validTaskProjection(value: unknown): boolean {
       !item
       || !exactOptionalKeys(item, [
         'id',
-        'title',
-        'summary',
-        'status',
+        'titleKey',
+        'titleArgs',
+        'summaryKey',
+        'messageArgs',
+        'targetRefs',
+        'resourcePresentation',
+        'progress',
+        'outcome',
+        'attention',
         'blockId',
         'narrativeKind',
       ], [
@@ -1430,9 +1465,21 @@ function validTaskProjection(value: unknown): boolean {
       ])
       || !nonemptyString(item.id)
       || itemIds.has(item.id)
-      || typeof item.title !== 'string'
-      || typeof item.summary !== 'string'
-      || !timelineTaskStatus(item.status)
+      || !nonemptyString(item.titleKey)
+      || !validStringRecord(item.titleArgs)
+      || !nonemptyString(item.summaryKey)
+      || !validStringRecord(item.messageArgs)
+      || !stringArray(item.targetRefs)
+      || !validResourcePresentationArray(item.resourcePresentation)
+      || !timelineTaskProgress(item.progress)
+      || (
+        item.outcome !== null
+        && !timelineTaskOutcome(item.outcome)
+      )
+      || (
+        item.attention !== null
+        && !validWorkAttention(item.attention)
+      )
       || !nonemptyString(item.blockId)
       || !timelineNarrativeKind(item.narrativeKind)
       || (
@@ -1626,7 +1673,7 @@ function validNativeTurnLifecycle(
   return turn.completedAt === undefined;
 }
 
-function isSharedConversationWorkSegmentV1(
+function isSharedConversationWorkSegmentV2(
   value: unknown
 ): value is AgentTimelineWorkSegment {
   const segment = recordValue(value);
@@ -1640,6 +1687,10 @@ function isSharedConversationWorkSegmentV1(
     || (
       segment.attention !== null
       && !validWorkAttention(segment.attention)
+    )
+    || (
+      segment.activeOperationId !== undefined
+      && !nonemptyString(segment.activeOperationId)
     )
     || !Array.isArray(segment.operations)
     || !provenance
@@ -1676,6 +1727,7 @@ function isSharedConversationWorkSegmentV1(
     'sequence',
     'lifecycle',
     'attention',
+    'activeOperationId',
     'operations',
     'startedAt',
     'completedAt',
@@ -1684,7 +1736,7 @@ function isSharedConversationWorkSegmentV1(
   ]);
   if (Object.keys(segment).some((key) => !keys.has(key))) return false;
   const operationIds = new Set<string>();
-  return segment.operations.every((operation) => {
+  const operationsValid = segment.operations.every((operation) => {
     if (
       !validWorkOperation(operation)
       || operationIds.has(operation.operationId)
@@ -1694,6 +1746,13 @@ function isSharedConversationWorkSegmentV1(
     operationIds.add(operation.operationId);
     return true;
   });
+  if (!operationsValid) return false;
+  if (segment.activeOperationId === undefined) return true;
+  if (segment.lifecycle !== 'active') return false;
+  return segment.operations.some((operation) =>
+    operation.operationId === segment.activeOperationId
+    && !terminalWorkOperationStatus(operation.status)
+  );
 }
 
 function validWorkOperation(value: unknown): value is AgentTimelineWorkOperation {
@@ -1730,10 +1789,7 @@ function validWorkOperation(value: unknown): value is AgentTimelineWorkOperation
     || !stringArray(operation.resourceRefs)
     || !stringArray(operation.factRefs)
     || !stringArray(operation.effectRefs)
-    || (
-      operation.targets !== undefined
-      && !stringArray(operation.targets)
-    )
+    || !validResourcePresentationArray(operation.resourcePresentation)
     || (
       operation.attempts !== undefined
       && !Array.isArray(operation.attempts)
@@ -1758,7 +1814,7 @@ function validWorkOperation(value: unknown): value is AgentTimelineWorkOperation
     'displayName',
     'status',
     'canonicalAction',
-    'targets',
+    'resourcePresentation',
     'effectSummary',
     'resourceRefs',
     'factRefs',
@@ -1905,6 +1961,41 @@ function validWorkAttention(value: unknown): boolean {
         || key === 'factRefs'
     )
   );
+}
+
+function validResourcePresentationArray(
+  value: unknown
+): value is AgentTimelineResourcePresentation[] {
+  return Array.isArray(value)
+    && value.every((entry) => {
+      const resource = recordValue(entry);
+      if (
+        !resource
+        || !exactOptionalKeys(
+          resource,
+          ['kind', 'label'],
+          ['workspaceRelativePath', 'canonicalResourceRef']
+        )
+        || (
+          resource.kind !== 'workspacePath'
+          && resource.kind !== 'resourceLabel'
+        )
+        || !nonemptyString(resource.label)
+        || (
+          resource.workspaceRelativePath !== undefined
+          && !nonemptyString(resource.workspaceRelativePath)
+        )
+        || (
+          resource.canonicalResourceRef !== undefined
+          && !nonemptyString(resource.canonicalResourceRef)
+        )
+      ) {
+        return false;
+      }
+      return resource.kind === 'workspacePath'
+        ? resource.workspaceRelativePath !== undefined
+        : resource.workspaceRelativePath === undefined;
+    });
 }
 
 function validTimelineAttachments(value: unknown): boolean {
@@ -2138,6 +2229,7 @@ function createProjectionTurn(
     workGroupAnchorBlockIdById: new Map(),
     providerOperationIds: new Map(),
     providerStreamSequences: new Map(),
+    planOperationResourcePresentation: new Map(),
   };
   context.turns.push(turn);
   if (runId) context.turnsByRunId.set(runId, turn);
@@ -2212,6 +2304,28 @@ function projectProviderOutputIntoTurn(
 
   const hasTools = items.some((item) => item.kind === 'toolCall');
   const terminalScope = stringValue(payload?.terminalScope);
+  if (
+    projectionKind === 'provider.completed'
+    && terminalScope === 'turn'
+    && stringValue(payload?.outputKind) === 'answer'
+  ) {
+    const reviewRevision = nonnegativeIntegerValue(
+      payload?.reviewRevision
+    );
+    const snapshotHighWater = nonnegativeIntegerValue(
+      payload?.snapshotHighWater
+    );
+    if (
+      reviewRevision !== undefined
+      && reviewRevision > 0
+      && snapshotHighWater !== undefined
+    ) {
+      turn.finalAnswerReviewBinding = {
+        reviewRevision,
+        snapshotHighWater,
+      };
+    }
+  }
   const privatePlanningDraft =
     projectionKind === 'provider.completed'
     && !hasTools
@@ -2477,10 +2591,7 @@ function projectProviderComposingIntoTurn(
       && turn.controlEpoch !== controlEpoch
     )
     || textDelta === undefined
-    || (
-      providerPhase !== undefined
-      && providerPhase !== 'commentary'
-    )
+    || providerPhase !== 'commentary'
   ) {
     throw new Error('session_projection_provider_composing_invalid');
   }
@@ -2765,6 +2876,100 @@ function reorderProviderParts(
   turn.parts = retained;
 }
 
+function cloneResourcePresentation(
+  value: readonly AgentTimelineResourcePresentation[]
+): AgentTimelineResourcePresentation[] {
+  return value.map((resource) => ({ ...resource }));
+}
+
+function decodeResourcePresentation(
+  value: unknown
+): AgentTimelineResourcePresentation[] {
+  if (!validResourcePresentationArray(value)) {
+    throw new Error('session_projection_resource_presentation_invalid');
+  }
+  return cloneResourcePresentation(value);
+}
+
+function resourcePresentationForPlanTask(
+  task: Record<string, unknown>
+): AgentTimelineResourcePresentation[] {
+  const scopePreview = recordValue(task.scopePreview);
+  const approvalView = recordValue(task.approvalView)
+    ?? recordValue(scopePreview?.approvalView);
+  if (
+    !approvalView
+    || !Object.prototype.hasOwnProperty.call(
+      approvalView,
+      'resourcePresentation'
+    )
+  ) {
+    throw new Error('session_projection_plan_resource_presentation_missing');
+  }
+  return decodeResourcePresentation(approvalView.resourcePresentation);
+}
+
+function rememberPlanOperationResourcePresentation(
+  turn: MutableTurn,
+  payload: Record<string, unknown> | undefined
+): void {
+  for (const task of arrayRecords(payload?.tasks)) {
+    const manifest = recordValue(task.manifest);
+    const operationId = stringValue(task.operationId)
+      ?? stringValue(manifest?.operationId);
+    if (!operationId) continue;
+    turn.planOperationResourcePresentation.set(
+      operationId,
+      resourcePresentationForPlanTask(task)
+    );
+  }
+}
+
+function samePresentedResource(
+  left: AgentTimelineResourcePresentation,
+  right: AgentTimelineResourcePresentation
+): boolean {
+  if (
+    left.kind === 'workspacePath'
+    && right.kind === 'workspacePath'
+  ) {
+    return left.workspaceRelativePath === right.workspaceRelativePath;
+  }
+  if (
+    left.canonicalResourceRef
+    && right.canonicalResourceRef
+  ) {
+    return left.canonicalResourceRef === right.canonicalResourceRef;
+  }
+  return left.kind === right.kind && left.label === right.label;
+}
+
+function mergeResourcePresentation(
+  current: readonly AgentTimelineResourcePresentation[],
+  additional: readonly AgentTimelineResourcePresentation[]
+): AgentTimelineResourcePresentation[] {
+  const merged = cloneResourcePresentation(current);
+  for (const resource of additional) {
+    const existingIndex = merged.findIndex((candidate) =>
+      samePresentedResource(candidate, resource)
+    );
+    if (existingIndex < 0) {
+      merged.push({ ...resource });
+      continue;
+    }
+    const existing = merged[existingIndex]!;
+    merged[existingIndex] = {
+      ...existing,
+      ...(existing.canonicalResourceRef
+        ? {}
+        : resource.canonicalResourceRef
+          ? { canonicalResourceRef: resource.canonicalResourceRef }
+          : {}),
+    };
+  }
+  return merged;
+}
+
 function projectWorkEventIntoTurn(
   turn: MutableTurn,
   event: AgentEvent,
@@ -2772,6 +2977,10 @@ function projectWorkEventIntoTurn(
   _committed: boolean
 ): void {
   const projectionKind = stringValue(payload?.projectionKind);
+  if (event.kind === 'plan_card') {
+    rememberPlanOperationResourcePresentation(turn, payload);
+    return;
+  }
   if (event.kind === 'tool_call') {
     const operationId = stringValue(payload?.operationId);
     if (!operationId) return;
@@ -2801,6 +3010,13 @@ function projectWorkEventIntoTurn(
       status
     );
     operation.status = status;
+    const plannedPresentation =
+      turn.planOperationResourcePresentation.get(operationId);
+    if (plannedPresentation) {
+      operation.resourcePresentation = cloneResourcePresentation(
+        plannedPresentation
+      );
+    }
     const invocationId = stringValue(payload?.invocationId);
     if (invocationId) operation.invocationId = invocationId;
     if (terminalWorkOperationStatus(status)) {
@@ -2974,6 +3190,7 @@ function ensureWorkOperation(
     toolId,
     displayName: toolId,
     status,
+    resourcePresentation: [],
     resourceRefs: [],
     factRefs: [],
     effectRefs: [],
@@ -3116,9 +3333,32 @@ function applyCanonicalWorkFact(
     resourceRefs
   );
   const canonicalTargets = stringArrayValue(fact.targets);
-  operation.targets = appendUniqueStrings(
-    operation.targets ?? [],
-    canonicalTargets
+  const factPresentation = canonicalTargets.map((target) => ({
+    kind: 'workspacePath' as const,
+    label: target,
+    workspaceRelativePath: target,
+  }));
+  const plannedPresentation =
+    turn.planOperationResourcePresentation.get(operationId);
+  if (
+    plannedPresentation
+    && factPresentation.some((resource) =>
+      !plannedPresentation.some((planned) =>
+        samePresentedResource(planned, resource)
+      )
+    )
+  ) {
+    segment.attention = workAttention(
+      'failure',
+      'unresolved',
+      'Canonical operation target differs from the confirmed Plan scope.',
+      operationId,
+      [factId]
+    );
+  }
+  operation.resourcePresentation = mergeResourcePresentation(
+    operation.resourcePresentation,
+    factPresentation
   );
   operation.factRefs = appendUniqueStrings(
     operation.factRefs,
@@ -3305,12 +3545,12 @@ function finalizeTurnWorkSegments(
   return turn.workSegments.map((segment) => {
     const operations = segment.operations.map((operation) => ({
       ...operation,
+      resourcePresentation: cloneResourcePresentation(
+        operation.resourcePresentation
+      ),
       resourceRefs: [...operation.resourceRefs],
       factRefs: [...operation.factRefs],
       effectRefs: [...operation.effectRefs],
-      ...(operation.targets
-        ? { targets: [...operation.targets] }
-        : {}),
       ...(operation.attempts
         ? { attempts: operation.attempts.map((attempt) => ({ ...attempt })) }
         : {}),
@@ -3353,13 +3593,35 @@ function finalizeTurnWorkSegments(
           turn.completedAt,
           segment.completedAt,
         ]);
+    const activeOperationId = lifecycle === 'active'
+      ? currentWorkOperationId(operations)
+      : undefined;
     return {
       ...segment,
       lifecycle,
       operations,
+      ...(activeOperationId ? { activeOperationId } : {}),
       ...(completedAt ? { completedAt } : {}),
     };
   });
+}
+
+function currentWorkOperationId(
+  operations: readonly AgentTimelineWorkOperation[]
+): string | undefined {
+  const priorities: AgentTimelineWorkOperationStatus[] = [
+    'running',
+    'awaitingCapability',
+    'queued',
+    'preparing',
+  ];
+  for (const status of priorities) {
+    const operation = operations.find((candidate) =>
+      candidate.status === status
+    );
+    if (operation) return operation.operationId;
+  }
+  return undefined;
 }
 
 function terminalWorkOperationStatus(
@@ -3728,7 +3990,113 @@ function settleTimelineBlock(
   );
 }
 
-function buildTaskProjection(events: AgentEvent[]): AgentTimelineTaskProjection | undefined {
+function finalBlocksWithFactReceipt(
+  turn: MutableTurn
+): AgentTimelineBlock[] {
+  const reviewEvent = turn.latestReviewEvent;
+  const binding = turn.finalAnswerReviewBinding;
+  if (!reviewEvent || !binding || turn.status !== 'completed') {
+    return turn.blocks;
+  }
+  const finalBlockIndex = turn.blocks.findLastIndex((block) =>
+    block.kind === 'assistant'
+    && block.entryRole === 'finalAnswer'
+    && block.status === 'completed'
+  );
+  if (finalBlockIndex < 0) return turn.blocks;
+  const reviewPayload = recordValue(reviewEvent.payload);
+  if (
+    nonnegativeIntegerValue(reviewPayload?.revision)
+      !== binding.reviewRevision
+    || nonnegativeIntegerValue(reviewPayload?.snapshotHighWater)
+      !== binding.snapshotHighWater
+  ) {
+    return turn.blocks;
+  }
+  const receipt = structuredProjectionForEvent(
+    reviewEvent,
+    reviewPayload,
+    workResourcePresentationByOperation(turn)
+  );
+  if (!receipt || receipt.kind !== 'review') return turn.blocks;
+  const review = recordValue(reviewPayload?.review);
+  const factRefs = reviewFactRefs(review);
+  return turn.blocks.map((block, index) => index === finalBlockIndex
+    ? {
+        ...block,
+        structuredProjection: receipt,
+        evidenceRefs: appendUniqueStrings(
+          block.evidenceRefs ?? [],
+          [reviewEvent.id]
+        ),
+        provenance: {
+          ...block.provenance,
+          sourceEventRefs: appendUniqueStrings(
+            block.provenance.sourceEventRefs,
+            [reviewEvent.id]
+          ),
+          factRefs: appendUniqueStrings(
+            block.provenance.factRefs,
+            factRefs
+          ),
+          evidenceRefs: appendUniqueStrings(
+            block.provenance.evidenceRefs,
+            [reviewEvent.id]
+          ),
+        },
+      }
+    : block);
+}
+
+function workResourcePresentationByOperation(
+  turn: MutableTurn
+): ReadonlyMap<string, AgentTimelineResourcePresentation[]> {
+  const result = new Map<string, AgentTimelineResourcePresentation[]>();
+  for (const segment of turn.workSegments) {
+    for (const operation of segment.operations) {
+      result.set(
+        operation.operationId,
+        cloneResourcePresentation(operation.resourcePresentation)
+      );
+    }
+  }
+  return result;
+}
+
+function reviewFactRefs(
+  review: Record<string, unknown> | undefined
+): string[] {
+  if (!review) return [];
+  const categories = [
+    'planned',
+    'scopeExpansions',
+    'actualEffects',
+    'unexecuted',
+    'denied',
+    'rejections',
+    'cleanup',
+    'indeterminate',
+  ];
+  return [
+    ...new Set(categories.flatMap((category) =>
+      arrayRecords(review[category]).flatMap((item) => [
+        stringValue(item.factId),
+        ...stringArrayValue(item.factIds),
+      ].filter((value): value is string => Boolean(value)))
+    )),
+  ];
+}
+
+interface TaskProjectionState {
+  progress: AgentTimelineTaskProgress;
+  outcome: AgentTimelineTaskOutcome | null;
+  attention: AgentTimelineWorkAttention | null;
+}
+
+function buildTaskProjection(
+  events: AgentEvent[],
+  turns: AgentTimelineTurn[]
+): AgentTimelineTaskProjection | undefined {
   let planEvent: AgentEvent | undefined;
   for (const event of events) {
     if (event.kind === 'plan_card') planEvent = event;
@@ -3739,7 +4107,6 @@ function buildTaskProjection(events: AgentEvent[]): AgentTimelineTaskProjection 
   if (tasks.length === 0) return undefined;
   const planId = stringValue(payload?.planId) ?? planEvent.id;
   const runId = stringValue(payload?.runId) ?? 'run';
-  const summaryByTask = taskSummaryIndex(events);
   const awaitingRevision = planAwaitsRevision(events, planId);
   const items = tasks.flatMap<AgentTimelineTaskProjectionItem>((value, index) => {
     const task = recordValue(value);
@@ -3754,23 +4121,61 @@ function buildTaskProjection(events: AgentEvent[]): AgentTimelineTaskProjection 
       ?? 'kernel.tool';
     const planActionId = stringValue(task.planActionId)
       ?? stringValue(manifest?.planActionId);
-    const status = planActionId
-      ? taskStatusForPlanAction(
+    const operationId = stringValue(task.operationId)
+      ?? stringValue(manifest?.operationId);
+    const state = planActionId
+      ? taskProjectionStateForPlanAction(
           events,
           planId,
           planActionId,
           Boolean(recordValue(task.scopePreview))
         )
-      : awaitingRevision ? 'needsRevision' : 'planned';
+      : awaitingRevision
+        ? {
+            progress: 'completed' as const,
+            outcome: 'unexecuted' as const,
+            attention: workAttention(
+              'failure',
+              'unresolved',
+              'The Plan requires revision before this action can execute.',
+              operationId,
+              []
+            ),
+          }
+        : {
+            progress: 'queued' as const,
+            outcome: null,
+            attention: null,
+          };
+    const workAttentionProjection = operationId
+      ? workAttentionForOperation(turns, operationId)
+      : null;
+    const resourcePresentation = resourcePresentationForPlanTask(task);
+    const targetRefs = [
+      ...new Set(
+        resourcePresentation.flatMap((resource) =>
+          resource.canonicalResourceRef
+            ? [resource.canonicalResourceRef]
+            : []
+        )
+      ),
+    ];
     return [{
       id,
-      title: stringValue(task.title) ?? toolId,
-      summary: summaryByTask.get(planActionId ?? id)
-        ?? taskProjectionSummary(task, status, awaitingRevision),
-      status,
+      titleKey: 'session.projection.task.title',
+      titleArgs: { toolId },
+      summaryKey: state.outcome
+        ? `session.projection.task.outcome.${state.outcome}`
+        : `session.projection.task.progress.${state.progress}`,
+      messageArgs: { toolId },
+      targetRefs,
+      resourcePresentation,
+      progress: state.progress,
+      outcome: state.outcome,
+      attention: workAttentionProjection ?? state.attention,
       blockId: `plan:${runId}:${planId}`,
       narrativeKind: 'plan',
-      ...(status === 'completed'
+      ...(state.outcome === 'succeeded'
         ? { settlementKind: 'sessionEvidenceSatisfied' as const }
         : {}),
     }];
@@ -3783,15 +4188,17 @@ function buildTaskProjection(events: AgentEvent[]): AgentTimelineTaskProjection 
     : undefined;
 }
 
-function taskStatusForPlanAction(
+function taskProjectionStateForPlanAction(
   events: AgentEvent[],
   planId: string,
   planActionId: string,
-  previewed: boolean
-): AgentTimelineTaskStatus {
-  let status: AgentTimelineTaskStatus = previewed
-    ? 'awaitingApproval'
-    : 'planned';
+  _previewed: boolean
+): TaskProjectionState {
+  let state: TaskProjectionState = {
+    progress: 'queued',
+    outcome: null,
+    attention: null,
+  };
   for (const event of events) {
     const payload = recordValue(event.payload);
     if (!payload) continue;
@@ -3808,9 +4215,11 @@ function taskStatusForPlanAction(
             === planActionId;
       });
       if (matchingTask) {
-        status = recordValue(matchingTask.scopePreview)
-          ? 'awaitingApproval'
-          : 'planned';
+        state = {
+          progress: 'queued',
+          outcome: null,
+          attention: null,
+        };
       }
       continue;
     }
@@ -3820,8 +4229,12 @@ function taskStatusForPlanAction(
       const isUnexecuted = arrayRecords(review?.unexecuted).some(
         (candidate) => stringValue(candidate.planActionId) === planActionId
       );
-      if (isUnexecuted && status !== 'needsRevision') {
-        status = 'unexecuted';
+      if (isUnexecuted && state.outcome === null) {
+        state = {
+          progress: 'completed',
+          outcome: 'unexecuted',
+          attention: state.attention,
+        };
       }
       continue;
     }
@@ -3835,17 +4248,43 @@ function taskStatusForPlanAction(
         reviewStatus === 'needsRevision'
         || decision === 'revise'
       ) {
-        status = 'needsRevision';
+        state = {
+          progress: 'completed',
+          outcome: 'unexecuted',
+          attention: workAttention(
+            'failure',
+            'unresolved',
+            stringValue(payload.guidance)
+              ?? 'The Plan requires revision before this action can execute.',
+            undefined,
+            []
+          ),
+        };
       } else if (
         reviewStatus === 'accepted'
         || decision === 'accept'
       ) {
-        status = 'authorized';
+        state = {
+          progress: 'queued',
+          outcome: null,
+          attention: null,
+        };
       } else if (
         reviewStatus === 'rejected'
         || decision === 'reject'
       ) {
-        status = 'unexecuted';
+        state = {
+          progress: 'completed',
+          outcome: 'unexecuted',
+          attention: workAttention(
+            'denial',
+            'resolved',
+            stringValue(payload.guidance)
+              ?? 'The Plan action was not approved.',
+            undefined,
+            []
+          ),
+        };
       }
       continue;
     }
@@ -3856,9 +4295,24 @@ function taskStatusForPlanAction(
       }
       const decision = stringValue(payload.decision)
         ?? stringValue(payload.status);
-      status = decision === 'allow' || decision === 'allowed'
-        ? 'authorized'
-        : 'unexecuted';
+      state = decision === 'allow' || decision === 'allowed'
+        ? {
+            progress: 'queued',
+            outcome: null,
+            attention: null,
+          }
+        : {
+            progress: 'completed',
+            outcome: 'denied',
+            attention: workAttention(
+              'denial',
+              'resolved',
+              stringValue(payload.guidance)
+                ?? 'The requested capability was denied.',
+              stringValue(payload.operationId),
+              stringArrayValue(payload.factIds)
+            ),
+          };
       continue;
     }
 
@@ -3869,40 +4323,132 @@ function taskStatusForPlanAction(
     }
     if (event.kind === 'tool_call') {
       const toolStatus = stringValue(payload.status);
-      status = toolStatus === 'awaitingCapability'
-        ? 'awaitingApproval'
-        : toolStatus === 'rejected'
-          ? 'failed'
-          : 'running';
+      if (toolStatus === 'awaitingCapability') {
+        state = {
+          progress: 'queued',
+          outcome: null,
+          attention: workAttention(
+            'capability',
+            'unresolved',
+            'Canonical capability approval is required.',
+            stringValue(payload.operationId),
+            stringArrayValue(payload.factIds)
+          ),
+        };
+      } else if (toolStatus === 'rejected') {
+        const indeterminate =
+          stringValue(payload.replyReason)
+            === 'indeterminateRecoveryRequired';
+        state = {
+          progress: 'completed',
+          outcome: indeterminate ? 'indeterminate' : 'failed',
+          attention: workAttention(
+            indeterminate ? 'indeterminate' : 'failure',
+            'unresolved',
+            stringValue(payload.summary)
+              ?? (indeterminate
+                ? 'The final effect state is indeterminate.'
+                : 'The operation was rejected before execution.'),
+            stringValue(payload.operationId),
+            stringArrayValue(payload.factIds)
+          ),
+        };
+      } else {
+        state = {
+          progress: 'thinking',
+          outcome: null,
+          attention: null,
+        };
+      }
       continue;
     }
     if (event.kind === 'workflow_stage') {
       const stageStatus = stringValue(payload.status);
-      status = stageStatus === 'completed'
-        ? 'completed'
-        : stageStatus === 'failed'
-          ? 'failed'
-          : stageStatus === 'cancelled'
-            || stageStatus === 'skipped'
-            || stageStatus === 'unexecuted'
-              ? 'unexecuted'
-              : 'running';
+      const completionOutcome = stringValue(payload.outcome);
+      if (stageStatus === 'completed') {
+        state = {
+          progress: 'completed',
+          outcome: taskOutcomeForCompletion(completionOutcome),
+          attention: state.attention?.status === 'unresolved'
+            ? state.attention
+            : null,
+        };
+      } else if (stageStatus === 'failed') {
+        state = {
+          progress: 'completed',
+          outcome: 'failed',
+          attention: workAttention(
+            'failure',
+            'resolved',
+            stringValue(payload.summary) ?? 'The action failed.',
+            stringValue(payload.operationId),
+            stringArrayValue(payload.factIds)
+          ),
+        };
+      } else if (stageStatus === 'cancelled') {
+        state = {
+          progress: 'completed',
+          outcome: 'cancelled',
+          attention: null,
+        };
+      } else if (
+        stageStatus === 'skipped'
+        || stageStatus === 'unexecuted'
+      ) {
+        state = {
+          progress: 'completed',
+          outcome: 'unexecuted',
+          attention: state.attention,
+        };
+      } else {
+        state = {
+          progress: 'thinking',
+          outcome: null,
+          attention: state.attention,
+        };
+      }
     }
   }
-  return status;
+  return state;
 }
 
-function taskSummaryIndex(events: AgentEvent[]): Map<string, string> {
-  const result = new Map<string, string>();
-  for (const event of events) {
-    if (event.kind !== 'plan_review') continue;
-    const payload = recordValue(event.payload);
-    const id = stringValue(payload?.planActionId);
-    const summary = stringValue(payload?.summary)
-      ?? stringValue(payload?.guidance);
-    if (id && summary) result.set(id, summary);
+function taskOutcomeForCompletion(
+  value: string | undefined
+): AgentTimelineTaskOutcome {
+  if (value === 'blocked') return 'failed';
+  if (value === 'skipped' || value === 'unexecuted') {
+    return 'unexecuted';
   }
-  return result;
+  return 'succeeded';
+}
+
+function workAttentionForOperation(
+  turns: readonly AgentTimelineTurn[],
+  operationId: string
+): AgentTimelineWorkAttention | null {
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex];
+    if (!turn) continue;
+    for (
+      let segmentIndex = turn.workSegments.length - 1;
+      segmentIndex >= 0;
+      segmentIndex -= 1
+    ) {
+      const segment = turn.workSegments[segmentIndex];
+      if (
+        segment?.attention?.operationId === operationId
+        && segment.operations.some((operation) =>
+          operation.operationId === operationId
+        )
+      ) {
+        return {
+          ...segment.attention,
+          factRefs: [...segment.attention.factRefs],
+        };
+      }
+    }
+  }
+  return null;
 }
 
 function planAwaitsRevision(events: AgentEvent[], planId: string): boolean {
@@ -3916,33 +4462,6 @@ function planAwaitsRevision(events: AgentEvent[], planId: string): boolean {
       || status === 'rejected';
   }
   return awaitsRevision;
-}
-
-function taskProjectionSummary(
-  task: Record<string, unknown>,
-  status: AgentTimelineTaskStatus,
-  awaitingRevision: boolean
-): string {
-  if (status === 'completed') {
-    return 'Completed from canonical Session evidence.';
-  }
-  if (status === 'running') return 'Execution in progress.';
-  if (status === 'failed') return 'Execution failed.';
-  if (status === 'unexecuted') return 'Not executed.';
-  if (status === 'needsRevision') {
-    return 'Scope preview failed or revision was requested; execution did not start.';
-  }
-  if (status === 'awaitingApproval') {
-    return 'Canonical scope preview recorded; awaiting user approval.';
-  }
-  if (status === 'authorized') {
-    return 'Canonical scope authorized; execution has not started.';
-  }
-  if (status === 'previewing') return 'Canonical scope preview is in progress.';
-  if (awaitingRevision) {
-    return 'Awaiting revised plan; not previewed or executed.';
-  }
-  return 'Planned; scope has not been previewed or executed.';
 }
 
 function buildInteractionProjection(
@@ -4726,7 +5245,11 @@ function standardDecisionRequest(): AgentTimelineDecisionRequest {
 
 function structuredProjectionForEvent(
   event: AgentEvent,
-  payload: Record<string, unknown> | undefined
+  payload: Record<string, unknown> | undefined,
+  resourcePresentationByOperation: ReadonlyMap<
+    string,
+    AgentTimelineResourcePresentation[]
+  > = new Map()
 ): AgentTimelineStructuredProjection | null {
   if (event.kind === 'plan_card') {
     const readable = recordValue(payload?.readablePlan);
@@ -4736,7 +5259,11 @@ function structuredProjectionForEvent(
     const review = recordValue(payload?.review);
     return Array.isArray(review?.sections)
       ? structuredProjectionFromRecord('review', review, payload)
-      : reviewStructuredProjectionV2(review, payload);
+      : reviewStructuredProjectionV2(
+          review,
+          payload,
+          resourcePresentationByOperation
+        );
   }
   return null;
 }
@@ -4765,6 +5292,12 @@ function structuredProjectionFromRecord(
                 messageArgs: stringRecord(item.messageArgs),
                 status: stringValue(item.status),
                 targetRefs: stringArrayValue(item.targetRefs),
+                resourcePresentation:
+                  item.resourcePresentation === undefined
+                    ? undefined
+                    : decodeResourcePresentation(
+                        item.resourcePresentation
+                      ),
                 auditRefs: stringArrayValue(item.auditRefs),
                 objective: stringValue(item.objective)
                   ?? stringValue(metadata?.objective),
@@ -4806,13 +5339,22 @@ function structuredProjectionFromRecord(
 
 function reviewStructuredProjectionV2(
   review: Record<string, unknown> | undefined,
-  fallback: Record<string, unknown> | undefined
+  fallback: Record<string, unknown> | undefined,
+  resourcePresentationByOperation: ReadonlyMap<
+    string,
+    AgentTimelineResourcePresentation[]
+  >
 ): AgentTimelineStructuredProjection {
   const categories: Array<{
     key: string;
     titleKey: string;
     values: unknown;
   }> = [
+    {
+      key: 'planned',
+      titleKey: 'session.projection.review.section.planned',
+      values: review?.planned,
+    },
     {
       key: 'scopeExpansions',
       titleKey: 'session.projection.review.section.scopeExpansions',
@@ -4849,34 +5391,88 @@ function reviewStructuredProjectionV2(
       values: review?.indeterminate,
     },
   ];
-  const plannedCount = arrayRecords(review?.planned).length;
-  const effectCount = arrayRecords(review?.actualEffects).length;
-  const unexecutedCount = arrayRecords(review?.unexecuted).length;
-  const rejectionCount = arrayRecords(review?.denied).length
-    + arrayRecords(review?.rejections).length;
-  const cleanupCount = arrayRecords(review?.cleanup).length;
-  const indeterminateCount = arrayRecords(review?.indeterminate).length;
+  const seenFactIds = new Set<string>();
+  const coverage = recordValue(review?.factCoverage);
+  const prepared = categories.map((category) => {
+    let duplicateCount = 0;
+    const values = arrayRecords(category.values).filter((item) => {
+      const factId = stringValue(item.factId);
+      if (!factId) return true;
+      if (seenFactIds.has(factId)) {
+        duplicateCount += 1;
+        return false;
+      }
+      seenFactIds.add(factId);
+      return true;
+    });
+    const categoryCoverage = recordValue(coverage?.[category.key]);
+    const coveredTotal = nonnegativeIntegerValue(
+      categoryCoverage?.totalCount
+    );
+    const coveredOmitted = nonnegativeIntegerValue(
+      categoryCoverage?.omittedCount
+    );
+    const totalCount = Math.max(
+      values.length,
+      (coveredTotal ?? arrayRecords(category.values).length)
+        - duplicateCount
+    );
+    const omittedCount = Math.min(
+      totalCount,
+      coveredOmitted ?? Math.max(0, totalCount - values.length)
+    );
+    const items = values.map((item, index) =>
+      reviewProjectionItem(
+        category.key,
+        item,
+        index,
+        resourcePresentationByOperation
+      )
+    );
+    if (omittedCount > 0) {
+      items.push({
+        itemId: `omitted:${category.key}`,
+        kind: 'omitted',
+        messageKey: 'session.projection.review.item.omitted',
+        messageArgs: { count: String(omittedCount) },
+        status: 'omitted',
+        auditRefs: [],
+      });
+    }
+    return {
+      ...category,
+      totalCount,
+      omittedCount,
+      items,
+    };
+  });
+  const categoryTotal = (key: string): number =>
+    prepared.find((category) => category.key === key)?.totalCount ?? 0;
   return {
     kind: 'review',
     schemaVersion: AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2,
     title: stringValue(fallback?.title) ?? 'Review',
     summaryKey: 'session.projection.review.summary.counts',
     messageArgs: {
-      planned: String(plannedCount),
-      effects: String(effectCount),
-      unexecuted: String(unexecutedCount),
-      rejected: String(rejectionCount),
-      cleanup: String(cleanupCount),
-      indeterminate: String(indeterminateCount),
+      planned: String(categoryTotal('planned')),
+      effects: String(categoryTotal('actualEffects')),
+      unexecuted: String(categoryTotal('unexecuted')),
+      rejected: String(
+        categoryTotal('denied') + categoryTotal('rejections')
+      ),
+      cleanup: String(categoryTotal('cleanup')),
+      indeterminate: String(categoryTotal('indeterminate')),
     },
-    sections: categories.filter((category) =>
-      arrayRecords(category.values).length > 0
+    sections: prepared.filter((category) =>
+      category.totalCount > 0
     ).map((category) => ({
       sectionId: category.key,
       titleKey: category.titleKey,
-      items: arrayRecords(category.values).map((item, index) =>
-        reviewProjectionItem(category.key, item, index)
-      ),
+      titleArgs: {
+        total: String(category.totalCount),
+        omitted: String(category.omittedCount),
+      },
+      items: category.items,
     })),
   };
 }
@@ -4884,7 +5480,11 @@ function reviewStructuredProjectionV2(
 function reviewProjectionItem(
   category: string,
   item: Record<string, unknown>,
-  index: number
+  index: number,
+  resourcePresentationByOperation: ReadonlyMap<
+    string,
+    AgentTimelineResourcePresentation[]
+  >
 ): AgentTimelineStructuredProjection['sections'][number]['items'][number] {
   const factId = stringValue(item.factId);
   const planActionId = stringValue(item.planActionId)
@@ -4908,7 +5508,7 @@ function reviewProjectionItem(
     reason
   );
   return {
-    itemId: identity,
+    itemId: factId ?? `${category}:${identity}`,
     kind: category,
     messageKey: message.key,
     messageArgs: message.args,
@@ -4921,6 +5521,14 @@ function reviewProjectionItem(
       planActionId,
       ...stringArrayValue(item.resourceIds),
     ].filter((value): value is string => Boolean(value)))],
+    ...(operationId
+      && resourcePresentationByOperation.has(operationId)
+      ? {
+          resourcePresentation: cloneResourcePresentation(
+            resourcePresentationByOperation.get(operationId)!
+          ),
+        }
+      : {}),
   };
 }
 
@@ -4935,6 +5543,8 @@ function reviewProjectionMessage(
   const detail = reason ?? fact;
   const key = category === 'scopeExpansions'
     ? 'session.projection.review.item.scopeExpansion'
+    : category === 'planned'
+      ? 'session.projection.review.item.planned'
     : category === 'actualEffects'
       ? 'session.projection.review.item.actualEffect'
       : category === 'unexecuted'
@@ -5187,16 +5797,23 @@ function timelineStatus(value: unknown): value is AgentTimelineStatus {
     || value === 'failed';
 }
 
-function timelineTaskStatus(value: unknown): value is AgentTimelineTaskStatus {
-  return value === 'planned'
-    || value === 'previewing'
-    || value === 'needsRevision'
-    || value === 'awaitingApproval'
-    || value === 'authorized'
-    || value === 'running'
-    || value === 'completed'
+function timelineTaskProgress(
+  value: unknown
+): value is AgentTimelineTaskProgress {
+  return value === 'queued'
+    || value === 'thinking'
+    || value === 'completed';
+}
+
+function timelineTaskOutcome(
+  value: unknown
+): value is AgentTimelineTaskOutcome {
+  return value === 'succeeded'
     || value === 'failed'
-    || value === 'unexecuted';
+    || value === 'denied'
+    || value === 'unexecuted'
+    || value === 'cancelled'
+    || value === 'indeterminate';
 }
 
 function validRunProjection(value: unknown): boolean {

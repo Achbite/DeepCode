@@ -5,13 +5,16 @@ import type {
   AgentTimelineCurrentActivity,
   AgentTimelineResult,
   AgentTimelineTurn,
+  AgentTimelineWorkAttention,
   AgentTimelineWorkOperation,
   AgentTimelineWorkOperationStatus,
   AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
+import ActivityIndicator from '../../components/agent-panel/ActivityIndicator';
 import {
+  FinalFactReceipt,
   hasStructuredProjection,
   StructuredProjectionContent,
   structuredProjectionText,
@@ -52,6 +55,8 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 }) => {
   const view = timeline;
   const currentActivity = view.runProjection?.currentActivity ?? null;
+  const waitingForUser = view.runProjection?.status === 'waitingUser'
+    || view.runProjection?.wait?.kind === 'user';
   const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
     () => new Map()
   );
@@ -366,7 +371,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             onPlanResolve={onPlanResolve}
           />
         ))}
-        {(currentActivity || loading) && (
+        {!waitingForUser && (currentActivity || loading) && (
           <CurrentActivityLine
             activity={currentActivity}
             language={language}
@@ -650,8 +655,13 @@ const CurrentActivityLine: React.FC<{
   language: UiLanguage;
 }> = ({ activity, language }) => (
   <div className="deepcode-gui-current-activity" role="status" aria-live="polite">
-    <span className="deepcode-gui-current-activity__dot" />
-    <span>{currentActivityLabel(activity, language)}</span>
+    <ActivityIndicator
+      activityKey={activity
+        ? `${activity.code}:${activity.workSegmentId ?? ''}:${activity.operationId ?? ''}`
+        : 'transport-pending'}
+      label={currentActivityLabel(activity, language)}
+      variant={activity?.code === 'retry.backoff' ? 'retry' : 'default'}
+    />
   </div>
 );
 
@@ -697,7 +707,7 @@ const WorkSegment: React.FC<{
       <div className="deepcode-gui-work-segment__details">
         {segment.attention && (
           <div className={`deepcode-gui-work-segment__attention-summary deepcode-gui-work-segment__attention-summary--${segment.attention.status}`}>
-            {segment.attention.summary}
+            {workAttentionLabel(segment.attention, language)}
           </div>
         )}
         <ol className="deepcode-gui-work-segment__operations">
@@ -740,14 +750,14 @@ const WorkOperation: React.FC<{
             : `Attempt ${operation.retry.retryOrdinal} · corrects prior operation`}
         </div>
       )}
-      {operation.targets && operation.targets.length > 0 && (
+      {operation.resourcePresentation.length > 0 && (
         <div className="deepcode-gui-work-operation__targets">
-          {operation.targets.join(' · ')}
+          {operation.resourcePresentation.map((target) => target.label).join(' · ')}
         </div>
       )}
       {operation.effectSummary && (
         <div className="deepcode-gui-work-operation__effect">
-          {operation.effectSummary}
+          {t(language, 'agent.work.effectObserved')}
         </div>
       )}
       {operation.attempts && operation.attempts.length > 0 && (
@@ -781,9 +791,16 @@ function currentActivityLabel(
   };
   const known = labels[String(activity.code)];
   if (!known) {
-    return language === 'zh-CN' ? '正在处理' : 'Working';
+    return t(language, 'agent.activity.working');
   }
-  return activity.summary?.trim() || (language === 'zh-CN' ? known[0] : known[1]);
+  return t(language, `agent.activity.${activity.code}`);
+}
+
+function workAttentionLabel(
+  attention: AgentTimelineWorkAttention,
+  language: UiLanguage
+): string {
+  return t(language, `agent.work.attention.${attention.kind}`);
 }
 
 function workSegmentSummary(
@@ -794,15 +811,12 @@ function workSegmentSummary(
   const count = segment.operations.length;
   const currentOperation = currentWorkOperation(segment, currentActivity);
   if (segment.lifecycle === 'active' && currentOperation) {
-    const title = currentOperation.displayName?.trim()
-      || currentOperation.canonicalAction?.trim()
-      || currentOperation.toolId;
-    const targets = currentOperation.targets
-      ?.map((target) => target.trim())
+    const action = activeOperationActionLabel(currentOperation, language);
+    const targets = currentOperation.resourcePresentation
+      .map((target) => target.label.trim())
       .filter(Boolean)
       .join(' · ');
-    const task = targets ? `${title} · ${targets}` : title;
-    return `${task} · ${workOperationStatusLabel(currentOperation.status, language)}`;
+    return targets ? `${action} ${targets}` : action;
   }
   const labels: Record<AgentTimelineWorkSegment['lifecycle'], readonly [string, string]> = {
     active: ['正在处理', 'Working'],
@@ -828,7 +842,55 @@ function currentWorkOperation(
       operation.operationId === currentActivity.operationId
     );
   }
+  if (segment.activeOperationId) {
+    return segment.operations.find((operation) =>
+      operation.operationId === segment.activeOperationId
+    );
+  }
   return undefined;
+}
+
+function activeOperationActionLabel(
+  operation: AgentTimelineWorkOperation,
+  language: UiLanguage
+): string {
+  const labels: Record<string, readonly [string, string, string]> = {
+    'fs.list': ['查看', 'Inspecting', 'inspect'],
+    'fs.glob': ['搜索', 'Searching', 'search'],
+    'fs.read': ['读取', 'Reading', 'read'],
+    'fs.diff': ['比较', 'Comparing', 'compare'],
+    'fs.create': ['创建', 'Creating', 'create'],
+    'fs.write': ['写入', 'Writing', 'write'],
+    'fs.edit': ['修改', 'Editing', 'edit'],
+    'fs.delete': ['删除', 'Deleting', 'delete'],
+    'fs.ensure_directory': ['创建目录', 'Creating a directory', 'create a directory'],
+    'code.grep': ['搜索', 'Searching', 'search'],
+    'document.read': ['读取', 'Reading', 'read'],
+    'web.search': ['搜索网页', 'Searching the web', 'search the web'],
+    'web.fetch': ['读取网页', 'Reading a web page', 'read a web page'],
+  };
+  const label = labels[operation.toolId];
+  const name = operation.displayName?.trim()
+    || operation.canonicalAction?.trim()
+    || operation.toolId;
+  const action = language === 'zh-CN'
+    ? label?.[0] ?? `执行 ${name}`
+    : operation.status === 'running'
+      ? label?.[1] ?? `Running ${name}`
+      : label?.[2] ?? `run ${name}`;
+  if (operation.status === 'running') {
+    return language === 'zh-CN' ? `正在${action}` : action;
+  }
+  if (operation.status === 'preparing') {
+    return t(language, 'agent.work.action.preparing', { action });
+  }
+  if (operation.status === 'queued') {
+    return t(language, 'agent.work.action.queued', { action });
+  }
+  if (operation.status === 'awaitingCapability') {
+    return t(language, 'agent.work.action.awaitingCapability', { action });
+  }
+  return `${workOperationStatusLabel(operation.status, language)} · ${name}`;
 }
 
 function workOperationStatusLabel(
@@ -975,6 +1037,10 @@ const TimelineBlock: React.FC<{
           speed="normal"
           onVisibleContentChange={onLiveContentChange}
           onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
+        />
+        <FinalFactReceipt
+          projection={block.structuredProjection}
+          language={language}
         />
       </article>
     );

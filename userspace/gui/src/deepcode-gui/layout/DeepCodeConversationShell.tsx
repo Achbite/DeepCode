@@ -9,6 +9,7 @@ import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 interface DeepCodeConversationShellProps {
   language: UiLanguage;
   timeline: AgentTimelineResult;
+  agentReady: boolean;
   forceHome: boolean;
   projectTitle: string | null;
   projectWorkspaceBinding?: AgentWorkspaceBinding;
@@ -24,6 +25,7 @@ interface DeepCodeConversationShellProps {
 const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
   language,
   timeline,
+  agentReady,
   forceHome,
   projectTitle,
   projectWorkspaceBinding,
@@ -36,6 +38,7 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
     <DeepCodeAgentPanel
       language={language}
       timeline={timeline}
+      agentReady={agentReady}
       forceHome={forceHome}
       homeProjectTitle={projectTitle}
       projectWorkspaceBinding={projectWorkspaceBinding}

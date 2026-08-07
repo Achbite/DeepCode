@@ -1,12 +1,12 @@
 import React from 'react';
+import type { AgentTimelineTaskProgress } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { statusLabel } from './DeepCodeShellText';
 
 export interface DeepCodeTaskItem {
   id: string;
   title: string;
   summary: string;
-  status: string;
+  progress: AgentTimelineTaskProgress;
 }
 
 interface DeepCodeTaskPanelProps {
@@ -23,13 +23,12 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, items }
       ) : (
         <div className="deepcode-gui-task-list">
           {items.map((item) => (
-            <div key={item.id} className={`deepcode-gui-task-item deepcode-gui-task-item--${item.status}`}>
+            <div key={item.id} className={`deepcode-gui-task-item deepcode-gui-task-item--${item.progress}`}>
               <span className="deepcode-gui-task-item__dot" />
               <div>
                 <div className="deepcode-gui-task-item__title">{item.title}</div>
-                <div className="deepcode-gui-task-item__summary">{item.summary}</div>
               </div>
-              <strong>{statusLabel(language, item.status)}</strong>
+              <strong>{t(language, `deepcodeGui.tasks.progress.${item.progress}`)}</strong>
             </div>
           ))}
         </div>

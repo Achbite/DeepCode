@@ -24,7 +24,8 @@ use deepcode_kernel_abi::v2::{
     ToolContextInvalidationReasonV2, UserDecisionRefV2, WorkspaceBindingDigestV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    CapabilityApprovalViewV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
+    CapabilityApprovalViewV2, CapabilityResourcePresentationKindV2,
+    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
     CapabilityScopePreviewReplyV2, CapabilityScopePreviewV2, CapabilityScopeRejectionReasonV2,
     CommandHandlingV2, ControlEpochAdvanceV2, DeadlineRequestV2, EpochPreconditionV2,
     InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2, KernelCommandEnvelopeV2,
@@ -433,6 +434,42 @@ fn scope_target_label(target: &ScopeTargetKey) -> String {
         ScopeTargetKey::ExactInvocation { invocation_digest } => {
             format!("exact-invocation:{invocation_digest:?}")
         }
+    }
+}
+
+fn scope_target_presentation(target: &ScopeTargetKey) -> CapabilityResourcePresentationV2 {
+    let canonical_resource_ref = Some(scope_target_label(target));
+    match target {
+        ScopeTargetKey::Workspace { path, .. } => CapabilityResourcePresentationV2 {
+            kind: CapabilityResourcePresentationKindV2::WorkspacePath,
+            label: path.clone(),
+            workspace_relative_path: Some(path.clone()),
+            canonical_resource_ref,
+        },
+        ScopeTargetKey::Repository { area } => CapabilityResourcePresentationV2 {
+            kind: CapabilityResourcePresentationKindV2::ResourceLabel,
+            label: format!("repository {area:?}").to_lowercase(),
+            workspace_relative_path: None,
+            canonical_resource_ref,
+        },
+        ScopeTargetKey::NetworkUrl { url, .. } => CapabilityResourcePresentationV2 {
+            kind: CapabilityResourcePresentationKindV2::ResourceLabel,
+            label: url.clone(),
+            workspace_relative_path: None,
+            canonical_resource_ref,
+        },
+        ScopeTargetKey::NetworkQuery { query } => CapabilityResourcePresentationV2 {
+            kind: CapabilityResourcePresentationKindV2::ResourceLabel,
+            label: query.clone(),
+            workspace_relative_path: None,
+            canonical_resource_ref,
+        },
+        ScopeTargetKey::ExactInvocation { .. } => CapabilityResourcePresentationV2 {
+            kind: CapabilityResourcePresentationKindV2::ResourceLabel,
+            label: "exact invocation".to_owned(),
+            workspace_relative_path: None,
+            canonical_resource_ref,
+        },
     }
 }
 
@@ -5330,6 +5367,10 @@ impl KernelSessionServiceV2 {
             .iter()
             .map(scope_target_label)
             .collect::<Vec<_>>();
+        let resource_presentation = approved_targets
+            .iter()
+            .map(scope_target_presentation)
+            .collect::<Vec<_>>();
         let approval_view = CapabilityApprovalViewV2 {
             summary: format!(
                 "{} {} within {} canonical target(s)",
@@ -5343,6 +5384,7 @@ impl KernelSessionServiceV2 {
             ),
             canonical_targets,
             scope_delta: scope_delta.iter().map(scope_target_label).collect(),
+            resource_presentation,
             risk: descriptor.risk,
             effect_class: descriptor.effect_class,
             effect_scope: descriptor.effect_scope,

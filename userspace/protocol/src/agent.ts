@@ -96,8 +96,8 @@ export type ConversationLanguage = 'zh-CN' | 'en-US';
 
 export const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2 =
   'deepcode.shared-conversation-projection.v2' as const;
-export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1 =
-  'deepcode.shared-conversation.work-segments.v1' as const;
+export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2 =
+  'deepcode.shared-conversation.work-segments.v2' as const;
 
 export type AgentTimelineBlockKind =
   | 'user'
@@ -159,6 +159,13 @@ export interface AgentTimelineLocalizedText {
   text?: string;
   messageKey?: string;
   messageArgs?: Record<string, string>;
+}
+
+export interface AgentTimelineResourcePresentation {
+  kind: 'workspacePath' | 'resourceLabel';
+  label: string;
+  workspaceRelativePath?: string;
+  canonicalResourceRef?: string;
 }
 
 export type AgentTimelineRunStatus =
@@ -231,24 +238,32 @@ export interface AgentTimelineDisplayHints {
 
 export interface AgentTimelineTaskProjectionItem {
   id: string;
-  title: string;
-  summary: string;
-  status: AgentTimelineTaskStatus;
+  titleKey: string;
+  titleArgs: Record<string, string>;
+  summaryKey: string;
+  messageArgs: Record<string, string>;
+  targetRefs: string[];
+  resourcePresentation: AgentTimelineResourcePresentation[];
+  progress: AgentTimelineTaskProgress;
+  outcome: AgentTimelineTaskOutcome | null;
+  attention: AgentTimelineWorkAttention | null;
   blockId: string;
   narrativeKind: AgentTimelineNarrativeKind;
   settlementKind?: 'sessionEvidenceSatisfied';
 }
 
-export type AgentTimelineTaskStatus =
-  | 'planned'
-  | 'previewing'
-  | 'needsRevision'
-  | 'awaitingApproval'
-  | 'authorized'
-  | 'running'
-  | 'completed'
+export type AgentTimelineTaskProgress =
+  | 'queued'
+  | 'thinking'
+  | 'completed';
+
+export type AgentTimelineTaskOutcome =
+  | 'succeeded'
   | 'failed'
-  | 'unexecuted';
+  | 'denied'
+  | 'unexecuted'
+  | 'cancelled'
+  | 'indeterminate';
 
 export interface AgentTimelineTaskProjection {
   title: string;
@@ -377,6 +392,7 @@ export interface AgentTimelineStructuredProjectionItem {
   messageArgs?: Record<string, string>;
   status?: string;
   targetRefs?: string[];
+  resourcePresentation?: AgentTimelineResourcePresentation[];
   auditRefs?: string[];
   objective?: string;
   acceptanceCriteria?: string[];
@@ -475,7 +491,7 @@ export interface AgentTimelineWorkOperation {
   displayName?: string;
   status: AgentTimelineWorkOperationStatus;
   canonicalAction?: string;
-  targets?: string[];
+  resourcePresentation: AgentTimelineResourcePresentation[];
   effectSummary?: string;
   resourceRefs: string[];
   factRefs: string[];
@@ -503,6 +519,7 @@ export interface AgentTimelineWorkSegment {
   sequence: number;
   lifecycle: 'active' | 'completed' | 'cancelled' | 'failed';
   attention: AgentTimelineWorkAttention | null;
+  activeOperationId?: string;
   operations: AgentTimelineWorkOperation[];
   startedAt?: string;
   completedAt?: string;
@@ -528,7 +545,7 @@ export interface AgentTimelineTurn {
 
 export interface AgentTimelineResult {
   schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
-  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2;
   sessionId: string;
   revision: number;
   sourceEventVersion: number;
@@ -554,7 +571,7 @@ export interface AgentTimelineRootProjectionReplacements {
 
 export interface AgentTimelineDelta {
   schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
-  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2;
   sessionId: string;
   baseRevision: number;
   revision: number;

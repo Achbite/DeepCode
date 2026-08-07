@@ -345,6 +345,13 @@ terminal final-answer failure, cancellation, or another canonical terminal
 condition may complete the public turn and retire the Host Run. Pure
 question-and-answer turns may complete in one provider turn.
 
+The frozen Review remains Session-owned settlement evidence. It does not
+create a standalone public Review card or a mandatory waiting-for-review state.
+The committed natural-language final answer carries the corresponding
+structured fact receipt on the same assistant block. Shells may collapse that
+receipt, but they must not synthesize it from prose or omit it from committed
+final output.
+
 ## Shared conversation projection
 
 The canonical public read model remains
@@ -352,14 +359,14 @@ The canonical public read model remains
 require:
 
 ```text
-shapeVersion = deepcode.shared-conversation.work-segments.v1
+shapeVersion = deepcode.shared-conversation.work-segments.v2
 ```
 
 Every native turn contains three coordinated collections:
 
 ```text
-blocks       = user text, assistant commentary/final text, interactions,
-               Review, and necessary diagnostics
+blocks       = user text, assistant commentary/final text, Plan/permission
+               interactions, and necessary diagnostics
 workSegments = ordered Kernel/Session work derived from canonical facts
 parts        = the sole public ordering of block and work-segment references
 ```
@@ -383,6 +390,21 @@ admission adds `invocationId`, while attempts remain nested evidence. Tool
 arguments are never streamed publicly. Only catalog-validated tool identity,
 Kernel-canonical targets, resource references, facts, and effect summaries may
 populate a public operation.
+
+Every operation and Plan/task item carries typed `resourcePresentation`
+entries. A workspace target exposes only its canonical workspace-relative
+label; another approved resource exposes a safe resource label. Internal
+resource identities remain audit references and are never rendered as a path.
+GUI, CLI, and TUI consume this field directly and do not parse raw arguments,
+scope strings, or fact narration. Hyperlink behavior is a separate UI decision
+and is not part of this contract.
+
+The shared task projection exposes exactly three presentation progress states:
+`queued | thinking | completed`. Settlement outcome
+`succeeded | failed | denied | unexecuted | cancelled | indeterminate` and
+attention are orthogonal fields. Internal authorization and invocation states
+remain canonical facts or interaction state; shells must not display their raw
+enum or English backend summaries as task progress.
 
 When Session requests a corrected operation after a pre-effect validation or
 admission failure, the new operation must carry an explicit typed predecessor
@@ -414,6 +436,17 @@ data. A delta binds base and next revisions and atomically replaces complete
 affected turns or root projections. Revision gaps require a fresh snapshot,
 and terminal delivery is reconciled with a final snapshot. GUI, CLI, and TUI
 use the same typed reducer.
+
+A verified, selectable, current-schema Session with `eventCount=0` is a valid
+empty conversation. HostViewer timeline reads return the canonical revision-0
+empty snapshot; Run-authorized reads remain strict. Creating, activating, or
+deleting Sessions uses a monotonic selection generation so a late response
+cannot overwrite a newer selected Session.
+
+Host caller ownership is reconciled by exact caller identity and payload
+digest. A pending or indeterminate caller is queried or replayed under that
+identity; it is not surfaced as a durable user error merely because another
+request currently owns the drive.
 
 Durable public `AgentEvent` accepts only the current projection-kind set and an
 exact envelope. Outer kind/channel/visibility, payload keys, and the private to
@@ -637,6 +670,12 @@ Run-capability timeline SSE is pinned at open to
 same Session. After the pinned Run has a canonical terminal projection and is
 retired, an already-authorized stream may deliver one terminal snapshot for
 that Run and then closes.
+
+The first archived commentary delta is published immediately. Subsequent
+commentary is flushed after 250 ms or 16 KiB, whichever occurs first, with
+monotonic elapsed-time checks performed before accepting more frames so a busy
+stream cannot starve the timer. Final-answer text remains sealed until native
+completion and full response validation.
 
 Private trace contents have no Session/model, CLI, TUI, public projection,
 Copy, Memory, GoalProjection, or cache ingress. A GUI Session-menu user action

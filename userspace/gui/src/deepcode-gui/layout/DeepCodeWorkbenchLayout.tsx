@@ -6,6 +6,7 @@ import type {
   BrowsePathResult,
   InitialLocation,
 } from '@deepcode/protocol';
+import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import {
   browsePath,
@@ -364,6 +365,7 @@ function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
 }
 
 function deriveTaskItems(
+  language: UiLanguage,
   projection: AgentTimelineResult,
   fallbackItems: DeepCodeTaskItem[] = []
 ): DeepCodeTaskItem[] {
@@ -373,9 +375,9 @@ function deriveTaskItems(
     return dedupeTaskItems(
       projectedItems.map((item) => ({
         id: item.id,
-        title: item.title,
-        summary: item.summary,
-        status: item.status,
+        title: t(language, item.titleKey, item.titleArgs),
+        summary: t(language, item.summaryKey, item.messageArgs),
+        progress: item.progress,
       }))
     ).slice(-6);
   }
@@ -434,8 +436,13 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const sidebarPendingActionRef = useRef<string | null>(null);
-  const lastPlanTaskItemsRef = useRef<{ sessionId: string | null; items: DeepCodeTaskItem[] }>({
+  const lastPlanTaskItemsRef = useRef<{
+    sessionId: string | null;
+    runId: string | null;
+    items: DeepCodeTaskItem[];
+  }>({
     sessionId: null,
+    runId: null,
     items: [],
   });
   const workspace = useWorkspaceStore((s) => s.current);
@@ -443,6 +450,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const sessions = useAgentSessionStore((s) => s.sessions);
   const activeSession = useAgentSessionStore((s) => s.session);
   const loadingSession = useAgentSessionStore((s) => s.loading);
+  const sessionSelectionReady = useAgentSessionStore((s) => s.selectionReady);
+  const localWorkspaceScopeKey = useAgentSessionStore((s) => s.localWorkspaceScopeKey);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
@@ -517,26 +526,48 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
   const projectDraftActive = Boolean(draftTargetProjectId);
+  const workspaceScopeKey = createWorkspaceScopeKey(workspace);
   const liveTimelineProjection = projectDraftActive
     ? timelineOrEmpty(null, 'project-draft')
     : timelineOrEmpty(timeline, activeSession?.id);
+  const agentReady = apiStatus === 'connected' && (
+    projectDraftActive
+    || (
+      !loadingSession
+      && sessionSelectionReady
+      && Boolean(activeSession?.id)
+      && localWorkspaceScopeKey === workspaceScopeKey
+      && timeline?.sessionId === activeSession?.id
+    )
+  );
   const taskItems = useMemo(() => {
     const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
+    const taskRunId = projectDraftActive
+      ? null
+      : liveTimelineProjection.runProjection?.runId ?? null;
     const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId
+      && lastPlanTaskItemsRef.current.runId === taskRunId
       ? lastPlanTaskItemsRef.current.items
       : [];
     const items = deriveTaskItems(
+      language,
       liveTimelineProjection,
       fallbackItems
     );
     if (items.length > 0) {
-      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items };
+      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, runId: taskRunId, items };
     }
-    if (items.length === 0 && lastPlanTaskItemsRef.current.sessionId !== taskSessionId) {
-      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items: [] };
+    if (
+      items.length === 0
+      && (
+        lastPlanTaskItemsRef.current.sessionId !== taskSessionId
+        || lastPlanTaskItemsRef.current.runId !== taskRunId
+      )
+    ) {
+      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, runId: taskRunId, items: [] };
     }
     return items;
-  }, [activeSession?.id, liveTimelineProjection, projectDraftActive]);
+  }, [activeSession?.id, language, liveTimelineProjection, projectDraftActive]);
   const cacheHitSummary = useMemo(
     () => deriveCacheHitSummary(language, liveTimelineProjection.tokenUsageProjection),
     [language, liveTimelineProjection.tokenUsageProjection]
@@ -905,6 +936,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       <DeepCodeTitlebar
         language={language}
         apiStatus={apiStatus}
+        agentReady={agentReady}
         cacheHitSummary={cacheHitSummary}
         kernelStartBusy={kernelStartBusy}
         kernelStartMessage={kernelStartMessage}
@@ -951,6 +983,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <DeepCodeConversationShell
           language={language}
           timeline={liveTimelineProjection}
+          agentReady={agentReady}
           forceHome={projectDraftActive}
           projectTitle={draftProject?.title ?? activeProject?.title ?? null}
           projectWorkspaceBinding={
@@ -1193,6 +1226,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               </header>
               <div className="deepcode-gui-settings-sheet__runtime">
                 <span>API {statusLabel(language, apiStatus)}</span>
+                <span>Agent {statusLabel(language, agentReady ? 'ready' : 'checking')}</span>
                 <span>WS {statusLabel(language, wsStatus)}</span>
                 <span>{t(language, 'deepcodeGui.progress.heartbeat')} {lastHeartbeatText}</span>
                 {serverVersion && <span>{serverVersion}</span>}

@@ -207,10 +207,18 @@ export type CapabilityScopeRejectionReasonV2 =
   | 'staleToolContext'
   | 'staleControlEpoch';
 
+export interface CapabilityResourcePresentationV2 {
+  kind: 'workspacePath' | 'resourceLabel';
+  label: string;
+  workspaceRelativePath?: string;
+  canonicalResourceRef?: string;
+}
+
 export interface CapabilityApprovalViewV2 {
   summary: string;
   canonicalTargets: string[];
   scopeDelta: string[];
+  resourcePresentation: CapabilityResourcePresentationV2[];
   risk: ToolRiskV2;
   effectClass: ToolEffectClassV2;
   effectScope: ToolEffectScopeV2;
@@ -1413,6 +1421,7 @@ function decodeApprovalView(value: unknown): CapabilityApprovalViewV2 {
       'summary',
       'canonicalTargets',
       'scopeDelta',
+      'resourcePresentation',
       'risk',
       'effectClass',
       'effectScope',
@@ -1425,6 +1434,9 @@ function decodeApprovalView(value: unknown): CapabilityApprovalViewV2 {
     summary: text(data.summary, 'approval summary'),
     canonicalTargets: stringArray(data.canonicalTargets, 'canonicalTargets'),
     scopeDelta: stringArray(data.scopeDelta, 'scopeDelta'),
+    resourcePresentation: array(data.resourcePresentation, 'resourcePresentation').map(
+      (entry) => decodeCapabilityResourcePresentation(entry)
+    ),
     risk: decodeRisk(data.risk),
     effectClass: oneOf(
       data.effectClass,
@@ -1437,6 +1449,46 @@ function decodeApprovalView(value: unknown): CapabilityApprovalViewV2 {
       'approval effectiveDeadlineMs'
     ),
     scopeDigest: digest(data.scopeDigest, 'approval scopeDigest'),
+  };
+}
+
+function decodeCapabilityResourcePresentation(
+  value: unknown
+): CapabilityResourcePresentationV2 {
+  const data = exactRecord(
+    value,
+    ['kind', 'label', 'workspaceRelativePath', 'canonicalResourceRef'],
+    'Capability resource presentation',
+    ['workspaceRelativePath', 'canonicalResourceRef']
+  );
+  const kind = oneOf(
+    data.kind,
+    ['workspacePath', 'resourceLabel'] as const,
+    'resource presentation kind'
+  );
+  const workspaceRelativePath = data.workspaceRelativePath === undefined
+    ? undefined
+    : text(data.workspaceRelativePath, 'workspaceRelativePath');
+  if (
+    (kind === 'workspacePath' && workspaceRelativePath === undefined)
+    || (kind === 'resourceLabel' && workspaceRelativePath !== undefined)
+  ) {
+    throw new KernelV2WireError(
+      'Capability resource presentation has an invalid workspaceRelativePath.'
+    );
+  }
+  return {
+    kind,
+    label: text(data.label, 'resource presentation label'),
+    ...(workspaceRelativePath === undefined ? {} : { workspaceRelativePath }),
+    ...(data.canonicalResourceRef === undefined
+      ? {}
+      : {
+          canonicalResourceRef: text(
+            data.canonicalResourceRef,
+            'canonicalResourceRef'
+          ),
+        }),
   };
 }
 

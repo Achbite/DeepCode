@@ -455,7 +455,7 @@ export interface SessionProviderTurnInputV2 {
     providerTurnId: string;
     streamSequence: number;
     textOrdinal: number;
-    providerPhase?: 'commentary';
+    providerPhase: 'commentary';
     textDelta: string;
   }) => Promise<void>;
   /**

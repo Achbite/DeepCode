@@ -78,6 +78,7 @@ interface AgentSessionState {
   profileId?: string;
   profileSelectionBusy: boolean;
   loading: boolean;
+  selectionReady: boolean;
   runningSessionIds: string[];
   activeRunSessionIds: string[];
   cancellingSessionIds: string[];
@@ -129,6 +130,8 @@ export interface PendingSubmissionRetryView {
   content: string;
   messageAttachments: AgentInputAttachmentV2[];
   callerRequestId: string;
+  disposition: 'pending' | 'indeterminate';
+  message?: string;
 }
 
 interface ActiveAgentRunIdentity {
@@ -143,6 +146,7 @@ const MAX_AGENT_INPUT_ATTACHMENTS_V2 = 32;
 const CANONICAL_PROGRESS_STREAM_RETRY_MS = 250;
 const CANONICAL_PROGRESS_REQUEST_TIMEOUT_MS = 5_000;
 const CANONICAL_PROGRESS_TRAILING_ATTEMPTS = 3;
+const AGENT_SESSION_INITIALIZATION_RETRY_DELAYS_MS = [0, 250, 750] as const;
 
 interface CanonicalProgressWatcher {
   readonly sessionId: string;
@@ -158,11 +162,14 @@ const canonicalTimelineStaleSessions = new Set<string>();
 const canonicalTimelineFailClosedSessions = new Set<string>();
 const canonicalTimelineGenerations = new Map<string, number>();
 const pendingHostMutationOwners = new Map<string, string>();
+type PendingHostSubmissionDisposition = 'pending' | 'indeterminate';
 type PendingHostSubmission =
   | {
       kind: 'ask';
       fingerprint: string;
       callerRequestId: string;
+      disposition: PendingHostSubmissionDisposition;
+      message?: string;
       messageAttachmentInstances: AgentInputAttachmentV2[];
       request: AskAgentRunRequest;
     }
@@ -170,6 +177,8 @@ type PendingHostSubmission =
       kind: 'input';
       fingerprint: string;
       callerRequestId: string;
+      disposition: PendingHostSubmissionDisposition;
+      message?: string;
       messageAttachmentInstances: AgentInputAttachmentV2[];
       runId: string;
       request: {
@@ -243,9 +252,17 @@ function decodePendingHostSubmission(value: unknown): PendingHostSubmission | nu
     value.messageAttachmentInstances
   );
   const request = value.request;
+  const disposition = value.disposition === 'pending'
+    || value.disposition === 'indeterminate'
+    ? value.disposition
+    : 'indeterminate';
+  const message = value.message === undefined
+    ? undefined
+    : boundedStoredString(value.message, 16 * 1024) ?? null;
   if (!callerRequestId || !fingerprint || !messageAttachmentInstances || !isRecord(request)) {
     return null;
   }
+  if (message === null) return null;
   const requestCallerRequestId = boundedStoredString(request.callerRequestId, 512);
   const attachments = request.attachments === undefined
     ? []
@@ -271,6 +288,8 @@ function decodePendingHostSubmission(value: unknown): PendingHostSubmission | nu
       kind: 'ask',
       fingerprint,
       callerRequestId,
+      disposition,
+      ...(message ? { message } : {}),
       messageAttachmentInstances,
       request: {
         op: 'ask',
@@ -303,6 +322,8 @@ function decodePendingHostSubmission(value: unknown): PendingHostSubmission | nu
       kind: 'input',
       fingerprint,
       callerRequestId,
+      disposition,
+      ...(message ? { message } : {}),
       messageAttachmentInstances,
       runId,
       request: {
@@ -382,9 +403,29 @@ function persistPendingHostSubmissions(
 const loadedPendingHostSubmissions = loadPendingHostSubmissions();
 const pendingHostSubmissionIdentities = loadedPendingHostSubmissions.submissions;
 let pendingHostSubmissionStorageInvalid = loadedPendingHostSubmissions.invalid;
-let agentSessionActivationGeneration = 0;
-let settledAgentSessionActivationGeneration = 0;
-let agentSessionActivationQueue: Promise<void> = Promise.resolve();
+let agentSessionSelectionGeneration = 0;
+let settledAgentSessionSelectionGeneration = 0;
+let activeAgentSessionLoadingScopeKey: string | null = null;
+const agentSessionSelectionQueues = new Map<string, Promise<void>>();
+
+function enqueueAgentSessionSelection<T>(
+  operation: () => Promise<T>,
+  scopeKey = currentWorkspaceScopeKey()
+): Promise<T> {
+  const previous = agentSessionSelectionQueues.get(scopeKey) ?? Promise.resolve();
+  const queued = previous.then(operation, operation);
+  const settled = queued.then(
+    () => undefined,
+    () => undefined
+  );
+  agentSessionSelectionQueues.set(scopeKey, settled);
+  void settled.finally(() => {
+    if (agentSessionSelectionQueues.get(scopeKey) === settled) {
+      agentSessionSelectionQueues.delete(scopeKey);
+    }
+  });
+  return queued;
+}
 
 function markCanonicalTimelineStale(sessionId: string): void {
   canonicalTimelineGenerations.set(
@@ -624,6 +665,31 @@ function rememberHostSubmission<T extends PendingHostSubmission>(
       : [...state.pendingSubmissionSessionIds, sessionId],
   }));
   return submission;
+}
+
+function updateHostSubmissionDisposition(
+  sessionId: string,
+  callerRequestId: string,
+  disposition: PendingHostSubmissionDisposition,
+  message?: string
+): boolean {
+  const submission = pendingHostSubmissionIdentities.get(sessionId);
+  if (submission?.callerRequestId !== callerRequestId) return false;
+  const updated: PendingHostSubmission = {
+    ...submission,
+    disposition,
+    ...(message ? { message } : {}),
+  };
+  pendingHostSubmissionIdentities.set(sessionId, updated);
+  if (!persistPendingHostSubmissions(pendingHostSubmissionIdentities)) {
+    pendingHostSubmissionIdentities.set(sessionId, submission);
+    pendingHostSubmissionStorageInvalid = true;
+    return false;
+  }
+  useAgentSessionStore.setState((state) => ({
+    pendingSubmissionSessionIds: [...state.pendingSubmissionSessionIds],
+  }));
+  return true;
 }
 
 function settleHostSubmissionIdentity(sessionId: string, callerRequestId: string): boolean {
@@ -928,6 +994,9 @@ async function refreshCanonicalTimeline(
   const result = await request;
   if (!result.ok || !result.data) {
     canonicalTimelineStaleSessions.add(sessionId);
+    useAgentSessionStore.setState((state) => state.session?.id === sessionId
+      ? { selectionReady: false }
+      : state);
     return false;
   }
   if (useAgentSessionStore.getState().session?.id !== sessionId) return true;
@@ -940,6 +1009,7 @@ async function refreshCanonicalTimeline(
     useAgentSessionStore.setState((state) => state.session?.id === sessionId
       ? {
           errorMessage: error instanceof Error ? error.message : String(error),
+          selectionReady: false,
         }
       : state);
     return false;
@@ -966,6 +1036,9 @@ async function refreshCanonicalTimeline(
     refreshWorkspaceTreeForTimeline(nextTimeline);
     if (!await refreshActiveAgentRunIdentity(nextTimeline)) {
       canonicalTimelineStaleSessions.add(sessionId);
+      useAgentSessionStore.setState((state) => state.session?.id === sessionId
+        ? { selectionReady: false }
+        : state);
       return false;
     }
   } else {
@@ -981,6 +1054,9 @@ async function refreshCanonicalTimeline(
   }
   canonicalTimelineStaleSessions.delete(sessionId);
   canonicalTimelineFailClosedSessions.delete(sessionId);
+  useAgentSessionStore.setState((state) => state.session?.id === sessionId
+    ? { selectionReady: true }
+    : state);
   return true;
 }
 
@@ -1318,7 +1394,15 @@ function newHostCallerRequestId(kind: string): string {
   return `host-ui-${kind}-${globalThis.crypto.randomUUID()}`;
 }
 
-class HostMutationRejectedError extends Error {}
+class HostMutationOutcomeError extends Error {
+  constructor(
+    message: string,
+    readonly disposition: AgentHostCallerMutationErrorV2['disposition']
+  ) {
+    super(message);
+    this.name = 'HostMutationOutcomeError';
+  }
+}
 
 function hostCallerMutationDisposition(
   response: Pick<ApiResponse<unknown>, 'ok' | 'data'>
@@ -1338,10 +1422,55 @@ function hostCallerMutationDisposition(
   return 'indeterminate';
 }
 
-function isAuthoritativeHostMutationRejection(
-  response: Pick<ApiResponse<unknown>, 'ok' | 'data'>
-): boolean {
-  return hostCallerMutationDisposition(response) === 'rejected';
+async function recordHostMutationNonAcceptance(
+  sessionId: string,
+  callerRequestId: string,
+  response: Pick<ApiResponse<unknown>, 'ok' | 'data' | 'message' | 'error'>,
+  fallbackMessage: string
+): Promise<string | null> {
+  const disposition = hostCallerMutationDisposition(response) ?? 'indeterminate';
+  const message = response.message ?? response.error ?? fallbackMessage;
+  if (disposition === 'rejected') {
+    let reconciled = false;
+    try {
+      reconciled = await refreshCanonicalTimeline(sessionId, true, true);
+    } catch {
+      reconciled = false;
+    }
+    if (!settleHostSubmissionIdentity(sessionId, callerRequestId)) {
+      return agentSessionMessage('agent.hostSubmission.storageFailed');
+    }
+    return reconciled
+      ? null
+      : agentSessionMessage('agent.hostSubmission.reconcileFailed');
+  }
+  if (!updateHostSubmissionDisposition(
+    sessionId,
+    callerRequestId,
+    disposition,
+    message
+  )) {
+    return agentSessionMessage('agent.hostSubmission.storageFailed');
+  }
+  return disposition === 'pending'
+    ? null
+    : agentSessionMessage('agent.hostSubmission.indeterminate');
+}
+
+function recordHostMutationException(
+  sessionId: string,
+  callerRequestId: string,
+  error: unknown
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return updateHostSubmissionDisposition(
+    sessionId,
+    callerRequestId,
+    'indeterminate',
+    message
+  )
+    ? agentSessionMessage('agent.hostSubmission.indeterminate')
+    : agentSessionMessage('agent.hostSubmission.storageFailed');
 }
 
 async function startAndWaitAgentRun(
@@ -1353,10 +1482,10 @@ async function startAndWaitAgentRun(
   const started = await startAgentRun(sessionId, request);
   if (!started.ok || !started.data) {
     const message = started.message ?? started.error ?? 'Shared session run start failed';
-    if (isAuthoritativeHostMutationRejection(started)) {
-      throw new HostMutationRejectedError(message);
-    }
-    throw new Error(message);
+    throw new HostMutationOutcomeError(
+      message,
+      hostCallerMutationDisposition(started) ?? 'indeterminate'
+    );
   }
   let result = started.data;
   const runId = result.run.runId;
@@ -1416,6 +1545,213 @@ function waitForAgentSessionLoad(): Promise<void> {
   });
 }
 
+interface AgentSessionSelectionSnapshot {
+  session: AgentSession | null;
+  currentSessionId?: string;
+  localWorkspaceScopeKey?: string;
+  timeline: AgentTimelineResult | null;
+  profileId?: string;
+  selectionReady: boolean;
+  messageAttachments: AgentInputAttachmentV2[];
+  sessionAttachments: AgentInputAttachmentV2[];
+  pendingPermission: PendingPermission | null;
+  resolvingPermission: PermissionResolution | null;
+  resolvingPlan: PlanResolution | null;
+}
+
+type CanonicalHostSelection =
+  | {
+      kind: 'ready';
+      session: AgentSession;
+      timeline: AgentTimelineResult;
+      sessionAttachments: AgentInputAttachmentV2[];
+      attachmentError: string | null;
+    }
+  | { kind: 'empty' }
+  | { kind: 'invalid'; session: AgentSession; message: string }
+  | { kind: 'unavailable'; message: string };
+
+function captureAgentSessionSelection(
+  state: AgentSessionState
+): AgentSessionSelectionSnapshot {
+  return {
+    session: state.session,
+    currentSessionId: state.currentSessionId,
+    localWorkspaceScopeKey: state.localWorkspaceScopeKey,
+    timeline: state.timeline,
+    profileId: state.profileId,
+    selectionReady: state.selectionReady,
+    messageAttachments: state.messageAttachments,
+    sessionAttachments: state.sessionAttachments,
+    pendingPermission: state.pendingPermission,
+    resolvingPermission: state.resolvingPermission,
+    resolvingPlan: state.resolvingPlan,
+  };
+}
+
+function restoredAgentSessionSelection(
+  snapshot: AgentSessionSelectionSnapshot,
+  errorMessage: string
+): Partial<AgentSessionState> {
+  return {
+    ...snapshot,
+    loading: false,
+    errorMessage,
+  };
+}
+
+function finishAgentSessionSelection(
+  selectionGeneration: number,
+  selectionScopeKey: string
+): void {
+  if (selectionGeneration !== agentSessionSelectionGeneration) return;
+  if (activeAgentSessionLoadingScopeKey === selectionScopeKey) {
+    activeAgentSessionLoadingScopeKey = null;
+  }
+  useAgentSessionStore.setState({ loading: false });
+}
+
+async function readCanonicalHostSelection(
+  scope: ListAgentSessionsRequest
+): Promise<CanonicalHostSelection> {
+  let current;
+  try {
+    current = await getCurrentAgentSession(scope);
+  } catch (error) {
+    return {
+      kind: 'unavailable',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!current.ok) {
+    return {
+      kind: 'unavailable',
+      message: current.message ?? current.error ?? 'Agent session lookup failed',
+    };
+  }
+  if (!current.data) return { kind: 'empty' };
+
+  const session = current.data.session;
+  let timelineResult;
+  try {
+    timelineResult = await boundedAgentTimelineRequest(session.id);
+  } catch (error) {
+    return {
+      kind: 'invalid',
+      session,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!timelineResult.ok || !timelineResult.data) {
+    return {
+      kind: 'invalid',
+      session,
+      message: timelineResult.message
+        ?? timelineResult.error
+        ?? 'Canonical Session timeline is unavailable.',
+    };
+  }
+  try {
+    const timeline = timelineAsReplay(
+      requireExactNativeTimeline(timelineResult.data)
+    );
+    if (!await refreshActiveAgentRunIdentity(timeline)) {
+      return {
+        kind: 'invalid',
+        session,
+        message: 'Canonical Session run identity is unavailable.',
+      };
+    }
+    const restoredAttachments = restoredSessionAttachmentState(
+      timeline,
+      session.id
+    );
+    return {
+      kind: 'ready',
+      session,
+      timeline,
+      sessionAttachments: restoredAttachments.sessionAttachments,
+      attachmentError: restoredAttachments.attachmentError,
+    };
+  } catch (error) {
+    return {
+      kind: 'invalid',
+      session,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function applyCanonicalHostSelection(
+  selection: Exclude<CanonicalHostSelection, { kind: 'unavailable' }>,
+  selectionScopeKey: string,
+  fallbackError?: string
+): void {
+  if (selection.kind === 'ready') {
+    canonicalTimelineStaleSessions.delete(selection.session.id);
+    canonicalTimelineFailClosedSessions.delete(selection.session.id);
+    useAgentSessionStore.setState((state) => ({
+      session: selection.session,
+      localWorkspaceScopeKey: selectionScopeKey,
+      sessions: [
+        selection.session,
+        ...state.sessions.filter((item) => item.id !== selection.session.id),
+      ],
+      currentSessionId: selection.session.id,
+      timeline: selection.timeline,
+      profileId: selection.session.profileId,
+      messageAttachments: [],
+      sessionAttachments: selection.sessionAttachments,
+      pendingPermission: pendingPermissionFromTimeline(selection.timeline),
+      resolvingPermission: null,
+      resolvingPlan: null,
+      errorMessage: selection.attachmentError,
+      loading: false,
+      selectionReady: true,
+    }));
+    return;
+  }
+  if (selection.kind === 'invalid') {
+    canonicalTimelineStaleSessions.add(selection.session.id);
+    canonicalTimelineFailClosedSessions.add(selection.session.id);
+    useAgentSessionStore.setState((state) => ({
+      session: selection.session,
+      localWorkspaceScopeKey: selectionScopeKey,
+      sessions: [
+        selection.session,
+        ...state.sessions.filter((item) => item.id !== selection.session.id),
+      ],
+      currentSessionId: selection.session.id,
+      timeline: null,
+      profileId: selection.session.profileId,
+      messageAttachments: [],
+      sessionAttachments: [],
+      pendingPermission: null,
+      resolvingPermission: null,
+      resolvingPlan: null,
+      errorMessage: selection.message || fallbackError || null,
+      loading: false,
+      selectionReady: false,
+    }));
+    return;
+  }
+  useAgentSessionStore.setState({
+    session: null,
+    localWorkspaceScopeKey: selectionScopeKey,
+    currentSessionId: undefined,
+    timeline: null,
+    profileId: undefined,
+    messageAttachments: [],
+    sessionAttachments: [],
+    pendingPermission: null,
+    resolvingPermission: null,
+    resolvingPlan: null,
+    errorMessage: fallbackError ?? null,
+    loading: false,
+    selectionReady: false,
+  });
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   sessions: [],
@@ -1425,6 +1761,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   profileId: undefined,
   profileSelectionBusy: false,
   loading: false,
+  selectionReady: false,
   runningSessionIds: [],
   activeRunSessionIds: [],
   cancellingSessionIds: [],
@@ -1438,174 +1775,434 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
 
   loadOrCreate: async () => {
     const nextScopeKey = currentWorkspaceScopeKey();
-    if (get().session && get().localWorkspaceScopeKey === nextScopeKey) return;
-    if (get().loading) {
+    const currentSelectionReady = () => {
+      const state = get();
+      return Boolean(
+        state.session
+        && state.selectionReady
+        && state.localWorkspaceScopeKey === nextScopeKey
+        && state.timeline?.sessionId === state.session.id
+        && !canonicalTimelineStaleSessions.has(state.session.id)
+        && !canonicalTimelineFailClosedSessions.has(state.session.id)
+      );
+    };
+    if (currentSelectionReady()) return;
+    if (
+      get().loading
+      && activeAgentSessionLoadingScopeKey === nextScopeKey
+    ) {
       await waitForAgentSessionLoad();
-      if (!get().session || get().localWorkspaceScopeKey !== currentWorkspaceScopeKey()) {
-        await get().loadOrCreate();
-      }
+      if (currentWorkspaceScopeKey() !== nextScopeKey) return get().loadOrCreate();
+      if (!currentSelectionReady()) await get().loadOrCreate();
       return;
     }
+    const selectionGeneration = ++agentSessionSelectionGeneration;
+    activeAgentSessionLoadingScopeKey = nextScopeKey;
+    const existingSession = get().session;
+    const existingTimeline = get().timeline;
+    const failClosedSelection = Boolean(
+      existingSession
+      && (
+        get().localWorkspaceScopeKey !== nextScopeKey
+        || existingTimeline?.sessionId !== existingSession.id
+      )
+    );
     set({
       loading: true,
+      selectionReady: false,
       errorMessage: null,
       messageAttachments: [],
       sessionAttachments: [],
+      ...(failClosedSelection ? {
+        session: null,
+        timeline: null,
+        profileId: undefined,
+        localWorkspaceScopeKey: undefined,
+        pendingPermission: null,
+        resolvingPermission: null,
+        resolvingPlan: null,
+      } : {}),
     });
     try {
-      const scope = currentWorkspaceScope();
-      const list = await listAgentSessions(scope);
-      if (list.ok && list.data) {
-        set({
-          sessions: list.data.sessions,
-          currentSessionId: list.data.currentSessionId,
-        });
-      }
-      const current = await getCurrentAgentSession(scope);
-      if (current.ok && current.data) {
-        const timelineResult = await getAgentTimeline(current.data.session.id);
-        if (!timelineResult.ok || !timelineResult.data) {
-          throw new Error(
-            timelineResult.message ?? 'Canonical Session timeline is unavailable.'
-          );
+      await enqueueAgentSessionSelection(async () => {
+      let lastError = 'Agent session initialization failed';
+      let createAttempted = false;
+      for (
+        let attempt = 0;
+        attempt < AGENT_SESSION_INITIALIZATION_RETRY_DELAYS_MS.length;
+        attempt += 1
+      ) {
+        if (selectionGeneration !== agentSessionSelectionGeneration) return;
+        if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+        const retryDelay = AGENT_SESSION_INITIALIZATION_RETRY_DELAYS_MS[attempt] ?? 0;
+        if (retryDelay > 0) await sleep(retryDelay);
+        if (selectionGeneration !== agentSessionSelectionGeneration) return;
+        if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+        try {
+          const scope = currentWorkspaceScope();
+          const list = await listAgentSessions(scope);
+          if (selectionGeneration !== agentSessionSelectionGeneration) return;
+          if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+          if (list.ok && list.data) {
+            set({
+              sessions: list.data.sessions,
+              currentSessionId: list.data.currentSessionId,
+            });
+          }
+          const current = await getCurrentAgentSession(scope);
+          if (selectionGeneration !== agentSessionSelectionGeneration) return;
+          if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+          if (!current.ok) {
+            throw new Error(
+              current.message ?? current.error ?? 'Agent session lookup failed'
+            );
+          }
+          if (current.data) {
+            const timelineResult = await boundedAgentTimelineRequest(
+              current.data.session.id
+            );
+            if (selectionGeneration !== agentSessionSelectionGeneration) return;
+            if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+            if (!timelineResult.ok || !timelineResult.data) {
+              throw new Error(
+                timelineResult.message ?? 'Canonical Session timeline is unavailable.'
+              );
+            }
+            const timeline = timelineAsReplay(
+              requireExactNativeTimeline(timelineResult.data)
+            );
+            const identityReady = await refreshActiveAgentRunIdentity(timeline);
+            if (!identityReady) {
+              markCanonicalTimelineStale(current.data.session.id);
+              throw new Error(
+                'Canonical Session run identity is unavailable.'
+              );
+            }
+            if (selectionGeneration !== agentSessionSelectionGeneration) return;
+            if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+            canonicalTimelineStaleSessions.delete(current.data.session.id);
+            canonicalTimelineFailClosedSessions.delete(current.data.session.id);
+            const restoredAttachments = restoredSessionAttachmentState(
+              timeline,
+              current.data.session.id
+            );
+            set({
+              session: current.data.session,
+              localWorkspaceScopeKey: nextScopeKey,
+              timeline,
+              profileId: current.data.session.profileId,
+              messageAttachments: [],
+              sessionAttachments: restoredAttachments.sessionAttachments,
+              pendingPermission: pendingPermissionFromTimeline(timeline),
+              errorMessage: restoredAttachments.attachmentError,
+              loading: false,
+              selectionReady: true,
+            });
+            settledAgentSessionSelectionGeneration = selectionGeneration;
+            return;
+          }
+          createAttempted = true;
+          const created = await createAgentSession(scope);
+          if (selectionGeneration !== agentSessionSelectionGeneration) return;
+          if (currentWorkspaceScopeKey() !== nextScopeKey) return;
+          if (!created.ok || !created.data) {
+            throw new Error(
+              created.message ?? current.message ?? 'Agent session initialization failed'
+            );
+          }
+          set({
+            session: created.data.session,
+            localWorkspaceScopeKey: nextScopeKey,
+            sessions: [
+              created.data.session,
+              ...get().sessions.filter((item) => item.id !== created.data!.session.id),
+            ],
+            currentSessionId: created.data.session.id,
+            timeline: emptyTimeline(created.data.session.id),
+            profileId: created.data.session.profileId,
+            messageAttachments: [],
+            sessionAttachments: [],
+            pendingPermission: null,
+            errorMessage: null,
+            loading: false,
+            selectionReady: true,
+          });
+          canonicalTimelineStaleSessions.delete(created.data.session.id);
+          canonicalTimelineFailClosedSessions.delete(created.data.session.id);
+          settledAgentSessionSelectionGeneration = selectionGeneration;
+          return;
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error);
+          if (createAttempted) break;
         }
-        const timeline = timelineAsReplay(
-          requireExactNativeTimeline(timelineResult.data)
-        );
-        await refreshActiveAgentRunIdentity(timeline);
-        const restoredAttachments = restoredSessionAttachmentState(
-          timeline,
-          current.data.session.id
-        );
-        set({
-          session: current.data.session,
-          localWorkspaceScopeKey: nextScopeKey,
-          timeline,
-          profileId: current.data.session.profileId,
-          messageAttachments: [],
-          sessionAttachments: restoredAttachments.sessionAttachments,
-          pendingPermission: pendingPermissionFromTimeline(timeline),
-          errorMessage: restoredAttachments.attachmentError,
-          loading: false,
-        });
-        return;
       }
-      const created = await createAgentSession(scope);
-      if (created.ok && created.data) {
-        set({
-          session: created.data.session,
-          localWorkspaceScopeKey: nextScopeKey,
-          sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
-          currentSessionId: created.data.session.id,
-          timeline: emptyTimeline(created.data.session.id),
-          profileId: created.data.session.profileId,
-          messageAttachments: [],
-          sessionAttachments: [],
-          loading: false,
-        });
-      } else {
-        set({
-          errorMessage: created.message ?? current.message ?? 'Agent session initialization failed',
-          loading: false,
-        });
+      if (selectionGeneration !== agentSessionSelectionGeneration) return;
+      const failedSessionId = get().session?.id;
+      if (failedSessionId) {
+        canonicalTimelineFailClosedSessions.add(failedSessionId);
       }
-    } catch (err) {
       set({
-        errorMessage: err instanceof Error ? err.message : String(err),
+        errorMessage: lastError,
         loading: false,
+        selectionReady: false,
       });
+      }, nextScopeKey);
+    } finally {
+      finishAgentSessionSelection(selectionGeneration, nextScopeKey);
     }
   },
 
   refreshSessions: async () => {
-    const result = await listAgentSessions(currentWorkspaceScope());
-    if (result.ok && result.data) {
-      set({
-        sessions: result.data.sessions,
-        currentSessionId: result.data.currentSessionId,
-      });
-    }
+    const selectionGeneration = agentSessionSelectionGeneration;
+    const selectionScopeKey = currentWorkspaceScopeKey();
+    const selectionScope = currentWorkspaceScope();
+    await enqueueAgentSessionSelection(async () => {
+      const result = await listAgentSessions(selectionScope);
+      if (
+        selectionGeneration !== agentSessionSelectionGeneration
+        || selectionScopeKey !== currentWorkspaceScopeKey()
+      ) return;
+      if (result.ok && result.data) {
+        set({
+          sessions: result.data.sessions,
+          currentSessionId: result.data.currentSessionId,
+        });
+      }
+    }, selectionScopeKey);
   },
 
   createNewSession: async (options = {}) => {
-    if (get().loading) await waitForAgentSessionLoad();
-    const currentSession = get().session;
+    const selectionScopeKey = currentWorkspaceScopeKey();
     if (
-      options.reuseEmpty !== false &&
-      isEmptyAgentSession(currentSession) &&
-      get().localWorkspaceScopeKey === currentWorkspaceScopeKey()
+      get().loading
+      && activeAgentSessionLoadingScopeKey === selectionScopeKey
     ) {
-      if (options.projectId && currentSession?.projectId !== options.projectId) {
-        const rebound = await updateAgentSession(currentSession!.id, {
-          projectId: options.projectId,
-        });
-        if (!rebound.ok || !rebound.data) {
-          set({ errorMessage: rebound.message ?? 'Agent session project binding failed' });
+      await waitForAgentSessionLoad();
+      if (selectionScopeKey !== currentWorkspaceScopeKey()) return null;
+    }
+    const selectionGeneration = ++agentSessionSelectionGeneration;
+    const previousSelection = captureAgentSessionSelection(get());
+    const operationScope = options.projectId
+      ? { projectId: options.projectId }
+      : currentWorkspaceScope();
+    activeAgentSessionLoadingScopeKey = selectionScopeKey;
+    set({ loading: true, selectionReady: false, errorMessage: null });
+    try {
+      return await enqueueAgentSessionSelection(async () => {
+        if (
+          selectionGeneration !== agentSessionSelectionGeneration
+          || selectionScopeKey !== currentWorkspaceScopeKey()
+        ) return null;
+
+        const reconcileUnknownResult = async (
+          errorMessage: string
+        ): Promise<AgentSession | null> => {
+          const canonical = await readCanonicalHostSelection(operationScope);
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) return null;
+          if (canonical.kind === 'unavailable') {
+            if (previousSelection.session) {
+              markCanonicalTimelineStale(previousSelection.session.id);
+            }
+            set({
+              ...restoredAgentSessionSelection(previousSelection, errorMessage),
+              selectionReady: false,
+              loading: false,
+            });
+            return null;
+          }
+          applyCanonicalHostSelection(canonical, selectionScopeKey, errorMessage);
+          if (canonical.kind === 'ready') {
+            if (options.preserveAttachments) {
+              set({
+                messageAttachments: previousSelection.messageAttachments,
+                sessionAttachments: previousSelection.sessionAttachments,
+              });
+            }
+            if (canonical.session.id === previousSelection.session?.id) {
+              set({ errorMessage });
+            }
+            settledAgentSessionSelectionGeneration = selectionGeneration;
+            return canonical.session;
+          }
+          return null;
+        };
+
+        const currentSession = get().session;
+        if (
+          options.reuseEmpty !== false
+          && isEmptyAgentSession(currentSession)
+          && get().localWorkspaceScopeKey === selectionScopeKey
+        ) {
+          if (options.projectId && currentSession?.projectId !== options.projectId) {
+            let rebound;
+            try {
+              rebound = await updateAgentSession(currentSession!.id, {
+                projectId: options.projectId,
+              });
+            } catch (error) {
+              return reconcileUnknownResult(
+                error instanceof Error ? error.message : String(error)
+              );
+            }
+            if (
+              selectionGeneration !== agentSessionSelectionGeneration
+              || selectionScopeKey !== currentWorkspaceScopeKey()
+            ) return null;
+            if (!rebound.ok || !rebound.data) {
+              const message = rebound.message ?? 'Agent session project binding failed';
+              if (hostCallerMutationDisposition(rebound) === 'rejected') {
+                set(restoredAgentSessionSelection(previousSelection, message));
+                settledAgentSessionSelectionGeneration = selectionGeneration;
+                return null;
+              }
+              return reconcileUnknownResult(message);
+            }
+            set((state) => ({
+              session: rebound.data!.session,
+              localWorkspaceScopeKey: selectionScopeKey,
+              sessions: [
+                rebound.data!.session,
+                ...state.sessions.filter((item) => item.id !== rebound.data!.session.id),
+              ],
+              currentSessionId: rebound.data!.session.id,
+              timeline: state.timeline?.sessionId === rebound.data!.session.id
+                ? state.timeline
+                : emptyTimeline(rebound.data!.session.id),
+              messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
+              sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
+              errorMessage: null,
+              loading: false,
+              selectionReady: true,
+            }));
+            settledAgentSessionSelectionGeneration = selectionGeneration;
+            return rebound.data.session;
+          }
+          set({ errorMessage: null, loading: false, selectionReady: true });
+          settledAgentSessionSelectionGeneration = selectionGeneration;
+          return currentSession ?? null;
+        }
+
+        let result;
+        try {
+          result = await createAgentSession(operationScope);
+        } catch (error) {
+          return reconcileUnknownResult(
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+        if (
+          selectionGeneration !== agentSessionSelectionGeneration
+          || selectionScopeKey !== currentWorkspaceScopeKey()
+        ) return null;
+        if (result.ok && result.data) {
+          set((state) => ({
+            session: result.data!.session,
+            localWorkspaceScopeKey: selectionScopeKey,
+            sessions: [
+              result.data!.session,
+              ...state.sessions.filter((item) => item.id !== result.data!.session.id),
+            ],
+            currentSessionId: result.data!.session.id,
+            timeline: emptyTimeline(result.data!.session.id),
+            profileId: result.data!.session.profileId,
+            pendingPermission: null,
+            resolvingPermission: null,
+            resolvingPlan: null,
+            messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
+            sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
+            errorMessage: null,
+            loading: false,
+            selectionReady: true,
+          }));
+          canonicalTimelineStaleSessions.delete(result.data.session.id);
+          canonicalTimelineFailClosedSessions.delete(result.data.session.id);
+          settledAgentSessionSelectionGeneration = selectionGeneration;
+          void get().refreshSessions();
+          return result.data.session;
+        }
+
+        const message = result.message ?? 'Agent session create failed';
+        if (hostCallerMutationDisposition(result) === 'rejected') {
+          set(restoredAgentSessionSelection(previousSelection, message));
+          settledAgentSessionSelectionGeneration = selectionGeneration;
           return null;
         }
-        set((state) => ({
-          session: rebound.data!.session,
-          sessions: [
-            rebound.data!.session,
-            ...state.sessions.filter((item) => item.id !== rebound.data!.session.id),
-          ],
-          currentSessionId: rebound.data!.session.id,
-          messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
-          sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
-          errorMessage: null,
-        }));
-        return rebound.data.session;
-      }
-      set({ errorMessage: null });
-      return currentSession ?? null;
+        return reconcileUnknownResult(message);
+      }, selectionScopeKey);
+    } finally {
+      finishAgentSessionSelection(selectionGeneration, selectionScopeKey);
     }
-    const result = await createAgentSession({
-      ...(options.projectId ? { projectId: options.projectId } : currentWorkspaceScope()),
-    });
-    if (result.ok && result.data) {
-      set((state) => ({
-        session: result.data!.session,
-        localWorkspaceScopeKey: currentWorkspaceScopeKey(),
-        sessions: [result.data!.session, ...state.sessions.filter((item) => item.id !== result.data!.session.id)],
-        currentSessionId: result.data!.session.id,
-        timeline: emptyTimeline(result.data!.session.id),
-        profileId: result.data!.session.profileId,
-        pendingPermission: null,
-        resolvingPermission: null,
-        resolvingPlan: null,
-        messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
-        sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
-        errorMessage: null,
-      }));
-      void get().refreshSessions();
-      return result.data.session;
-    }
-    set({ errorMessage: result.message ?? 'Agent session create failed' });
-    return null;
   },
 
   activateSession: async (sessionId) => {
+    const selectionScopeKey = currentWorkspaceScopeKey();
     if (
       get().session?.id === sessionId
-      && settledAgentSessionActivationGeneration
-        === agentSessionActivationGeneration
+      && get().selectionReady
+      && get().localWorkspaceScopeKey === selectionScopeKey
+      && get().timeline?.sessionId === sessionId
+      && settledAgentSessionSelectionGeneration
+        === agentSessionSelectionGeneration
     ) {
       return;
     }
-    const activationGeneration = ++agentSessionActivationGeneration;
-    set({ loading: true, errorMessage: null });
+    const selectionGeneration = ++agentSessionSelectionGeneration;
+    const previousSelection = captureAgentSessionSelection(get());
+    const operationScope = currentWorkspaceScope();
+    activeAgentSessionLoadingScopeKey = selectionScopeKey;
+    set({ loading: true, selectionReady: false, errorMessage: null });
     const activate = async () => {
-      if (activationGeneration !== agentSessionActivationGeneration) return;
+      if (
+        selectionGeneration !== agentSessionSelectionGeneration
+        || selectionScopeKey !== currentWorkspaceScopeKey()
+      ) return;
+
+      const reconcileUnknownResult = async (errorMessage: string) => {
+        const canonical = await readCanonicalHostSelection(operationScope);
+        if (
+          selectionGeneration !== agentSessionSelectionGeneration
+          || selectionScopeKey !== currentWorkspaceScopeKey()
+        ) return;
+        if (canonical.kind === 'unavailable') {
+          if (previousSelection.session) {
+            markCanonicalTimelineStale(previousSelection.session.id);
+          }
+          set({
+            ...restoredAgentSessionSelection(previousSelection, errorMessage),
+            selectionReady: false,
+          });
+          return;
+        }
+        applyCanonicalHostSelection(canonical, selectionScopeKey, errorMessage);
+        if (canonical.kind === 'ready') {
+          if (canonical.session.id !== sessionId) {
+            set({ errorMessage });
+          }
+          settledAgentSessionSelectionGeneration = selectionGeneration;
+        }
+      };
+
+      let activatedSession: AgentSession | null = null;
       try {
         const result = await boundedAgentSessionActivationRequest(sessionId);
-        if (activationGeneration !== agentSessionActivationGeneration) return;
+        if (
+          selectionGeneration !== agentSessionSelectionGeneration
+          || selectionScopeKey !== currentWorkspaceScopeKey()
+        ) return;
         if (result.ok && result.data) {
+          activatedSession = result.data.session;
           const timelineGeneration =
             canonicalTimelineGenerations.get(sessionId) ?? 0;
           const timelineResult = await boundedAgentTimelineRequest(
             result.data.session.id
           );
-          if (activationGeneration !== agentSessionActivationGeneration) return;
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) return;
           if (!timelineResult.ok || !timelineResult.data) {
             throw new Error(
               timelineResult.message ?? 'Canonical Session timeline is unavailable.'
@@ -1615,7 +2212,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             requireExactNativeTimeline(timelineResult.data)
           );
           const identityReady = await refreshActiveAgentRunIdentity(timeline);
-          if (activationGeneration !== agentSessionActivationGeneration) return;
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) return;
           const canonicalReady = identityReady
             && (canonicalTimelineGenerations.get(sessionId) ?? 0)
               === timelineGeneration;
@@ -1630,7 +2230,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           );
           set({
             session: result.data.session,
-            localWorkspaceScopeKey: currentWorkspaceScopeKey(),
+            localWorkspaceScopeKey: selectionScopeKey,
             currentSessionId: result.data.session.id,
             timeline,
             profileId: result.data.session.profileId,
@@ -1643,26 +2243,56 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
               ? restoredAttachments.attachmentError
               : 'Canonical Session timeline is unavailable; refresh before sending guidance.',
             loading: false,
+            selectionReady: canonicalReady,
           });
-          settledAgentSessionActivationGeneration = activationGeneration;
+          if (!canonicalReady) {
+            canonicalTimelineFailClosedSessions.add(sessionId);
+          }
+          settledAgentSessionSelectionGeneration = selectionGeneration;
           void get().refreshSessions();
           return;
         }
-        set({
-          errorMessage: result.message ?? 'Agent session activate failed',
-          loading: false,
-        });
+        const message = result.message ?? 'Agent session activate failed';
+        if (hostCallerMutationDisposition(result) === 'rejected') {
+          set(restoredAgentSessionSelection(previousSelection, message));
+          settledAgentSessionSelectionGeneration = selectionGeneration;
+          return;
+        }
+        await reconcileUnknownResult(message);
       } catch (err) {
-        if (activationGeneration !== agentSessionActivationGeneration) return;
-        set({
-          errorMessage: err instanceof Error ? err.message : String(err),
-          loading: false,
-        });
+        if (
+          selectionGeneration !== agentSessionSelectionGeneration
+          || selectionScopeKey !== currentWorkspaceScopeKey()
+        ) return;
+        const message = err instanceof Error ? err.message : String(err);
+        if (activatedSession) {
+          canonicalTimelineStaleSessions.add(activatedSession.id);
+          canonicalTimelineFailClosedSessions.add(activatedSession.id);
+          set({
+            session: activatedSession,
+            localWorkspaceScopeKey: selectionScopeKey,
+            currentSessionId: activatedSession.id,
+            timeline: null,
+            profileId: activatedSession.profileId,
+            pendingPermission: null,
+            resolvingPermission: null,
+            resolvingPlan: null,
+            messageAttachments: [],
+            sessionAttachments: [],
+            errorMessage: message,
+            loading: false,
+            selectionReady: false,
+          });
+          return;
+        }
+        await reconcileUnknownResult(message);
       }
     };
-    const queued = agentSessionActivationQueue.then(activate, activate);
-    agentSessionActivationQueue = queued.catch(() => {});
-    await queued;
+    try {
+      await enqueueAgentSessionSelection(activate, selectionScopeKey);
+    } finally {
+      finishAgentSessionSelection(selectionGeneration, selectionScopeKey);
+    }
   },
 
   renameSession: async (sessionId, title) => {
@@ -1713,36 +2343,150 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   },
 
   deleteSession: async (sessionId) => {
-    const result = await deleteAgentSession(sessionId);
-    if (result.ok && result.data) {
-      publishActiveAgentRunIdentity(sessionId, null);
-      const data = result.data;
-      const wasActive = get().session?.id === sessionId;
-      set((state) => ({
-        sessions: data.sessions,
-        currentSessionId: data.currentSessionId,
-        runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
-        ...(wasActive ? {
-          session: null,
-          timeline: null,
-          pendingPermission: null,
-          resolvingPermission: null,
-          resolvingPlan: null,
-          messageAttachments: [],
-          sessionAttachments: [],
-          errorMessage: null,
-          loading: false,
-        } : {}),
-      }));
-      if (wasActive) {
-        const nextSessionId = data.currentSessionId;
-        if (nextSessionId && nextSessionId !== sessionId) {
-          await get().activateSession(nextSessionId);
+    const selectionScopeKey = currentWorkspaceScopeKey();
+    const operationScope = currentWorkspaceScope();
+    const selectionGeneration = ++agentSessionSelectionGeneration;
+    const requestSelection = captureAgentSessionSelection(get());
+    activeAgentSessionLoadingScopeKey = selectionScopeKey;
+    set({
+      loading: true,
+      errorMessage: null,
+      ...(requestSelection.session?.id === sessionId
+        ? { selectionReady: false }
+        : {}),
+    });
+
+    let deletion: {
+      deleted: boolean;
+      chooseNext: boolean;
+      nextSessionId?: string;
+    } = { deleted: false, chooseNext: false };
+    try {
+      deletion = await enqueueAgentSessionSelection(async () => {
+        const activeAtCommit = get().session?.id === sessionId;
+        const commitSelection = captureAgentSessionSelection(get());
+        const rollbackSelection = activeAtCommit
+          && requestSelection.session?.id === sessionId
+          ? requestSelection
+          : commitSelection;
+        if (activeAtCommit) {
+          set({ loading: true, selectionReady: false });
         }
-      }
+
+        const reconcileUnknownResult = async (
+          errorMessage: string
+        ): Promise<{
+          deleted: boolean;
+          chooseNext: boolean;
+          nextSessionId?: string;
+        }> => {
+          const canonical = await readCanonicalHostSelection(operationScope);
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) {
+            return { deleted: false, chooseNext: false };
+          }
+          if (canonical.kind === 'unavailable') {
+            if (rollbackSelection.session) {
+              markCanonicalTimelineStale(rollbackSelection.session.id);
+            }
+            set({
+              ...restoredAgentSessionSelection(rollbackSelection, errorMessage),
+              selectionReady: false,
+            });
+            return { deleted: false, chooseNext: false };
+          }
+          applyCanonicalHostSelection(canonical, selectionScopeKey, errorMessage);
+          if (canonical.kind === 'ready') {
+            if (canonical.session.id === sessionId) {
+              set({ errorMessage });
+            }
+            settledAgentSessionSelectionGeneration = selectionGeneration;
+            return { deleted: canonical.session.id !== sessionId, chooseNext: false };
+          }
+          return {
+            deleted: canonical.kind === 'empty',
+            chooseNext: canonical.kind === 'empty',
+          };
+        };
+
+        let result;
+        try {
+          result = await deleteAgentSession(sessionId);
+        } catch (error) {
+          return reconcileUnknownResult(
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+        if (result.ok && result.data) {
+          publishActiveAgentRunIdentity(sessionId, null);
+          const data = result.data;
+          const selectionStillCurrent =
+            selectionGeneration === agentSessionSelectionGeneration
+            && selectionScopeKey === currentWorkspaceScopeKey();
+          let clearedCurrent = false;
+          set((state) => {
+            const currentStillDeleted = state.session?.id === sessionId;
+            clearedCurrent = currentStillDeleted;
+            return {
+              ...(selectionStillCurrent ? {
+                sessions: data.sessions,
+                currentSessionId: data.currentSessionId,
+              } : {}),
+              runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
+              ...(currentStillDeleted ? {
+                session: null,
+                timeline: null,
+                profileId: undefined,
+                localWorkspaceScopeKey: selectionScopeKey,
+                pendingPermission: null,
+                resolvingPermission: null,
+                resolvingPlan: null,
+                messageAttachments: [],
+                sessionAttachments: [],
+                errorMessage: null,
+                loading: false,
+                selectionReady: false,
+              } : {}),
+            };
+          });
+          return {
+            deleted: true,
+            chooseNext: clearedCurrent && selectionStillCurrent,
+            nextSessionId: clearedCurrent && selectionStillCurrent
+              ? data.currentSessionId
+              : undefined,
+          };
+        }
+
+        const message = result.message ?? 'Agent session delete failed';
+        if (hostCallerMutationDisposition(result) === 'rejected') {
+          if (
+            selectionGeneration === agentSessionSelectionGeneration
+            && selectionScopeKey === currentWorkspaceScopeKey()
+          ) {
+            set(restoredAgentSessionSelection(rollbackSelection, message));
+            settledAgentSessionSelectionGeneration = selectionGeneration;
+          }
+          return { deleted: false, chooseNext: false };
+        }
+        return reconcileUnknownResult(message);
+      }, selectionScopeKey);
+    } finally {
+      finishAgentSessionSelection(selectionGeneration, selectionScopeKey);
+    }
+
+    if (
+      !deletion.chooseNext
+      || selectionGeneration !== agentSessionSelectionGeneration
+      || selectionScopeKey !== currentWorkspaceScopeKey()
+    ) return;
+    if (deletion.nextSessionId && deletion.nextSessionId !== sessionId) {
+      await get().activateSession(deletion.nextSessionId);
       return;
     }
-    set({ errorMessage: result.message ?? 'Agent session delete failed' });
+    await get().createNewSession({ reuseEmpty: false });
   },
 
   selectProfile: async (profileId) => {
@@ -1824,46 +2568,82 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   refreshActiveSessionContext: async () => {
     const sessionId = get().session?.id;
     if (!sessionId) return;
-    const [sessionsResult, timelineResult] = await Promise.all([
-      listAgentSessions(currentWorkspaceScope()),
-      getAgentTimeline(sessionId),
-    ]);
-    if (!sessionsResult.ok || !sessionsResult.data) {
-      set({
-        errorMessage: sessionsResult.message
-          ?? agentSessionMessage('memoryV2.refreshFailed'),
-      });
-      return;
-    }
-    const refreshedSession = sessionsResult.data.sessions.find(
-      (item) => item.id === sessionId
-    );
-    if (!refreshedSession || !timelineResult.ok || !timelineResult.data) {
-      set({
-        errorMessage: timelineResult.message
-          ?? agentSessionMessage('memoryV2.refreshFailed'),
-      });
-      return;
-    }
-    if (get().session?.id !== sessionId) return;
-    let timeline: AgentTimelineResult;
+    const selectionGeneration = ++agentSessionSelectionGeneration;
+    const selectionScopeKey = currentWorkspaceScopeKey();
+    const selectionScope = currentWorkspaceScope();
+    activeAgentSessionLoadingScopeKey = selectionScopeKey;
+    set({ loading: true, selectionReady: false, errorMessage: null });
     try {
-      timeline = timelineAsReplay(
-        requireExactNativeTimeline(timelineResult.data)
-      );
-    } catch (error) {
-      set({
-        errorMessage: error instanceof Error ? error.message : String(error),
-      });
-      return;
+      await enqueueAgentSessionSelection(async () => {
+        if (
+          selectionGeneration !== agentSessionSelectionGeneration
+          || selectionScopeKey !== currentWorkspaceScopeKey()
+        ) return;
+        try {
+          const [sessionsResult, timelineResult] = await Promise.all([
+            listAgentSessions(selectionScope),
+            boundedAgentTimelineRequest(sessionId),
+          ]);
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) return;
+          if (!sessionsResult.ok || !sessionsResult.data) {
+            throw new Error(
+              sessionsResult.message ?? agentSessionMessage('memoryV2.refreshFailed')
+            );
+          }
+          const refreshedSession = sessionsResult.data.sessions.find(
+            (item) => item.id === sessionId
+          );
+          if (!refreshedSession || !timelineResult.ok || !timelineResult.data) {
+            throw new Error(
+              timelineResult.message ?? agentSessionMessage('memoryV2.refreshFailed')
+            );
+          }
+          const timeline = timelineAsReplay(
+            requireExactNativeTimeline(timelineResult.data)
+          );
+          if (!await refreshActiveAgentRunIdentity(timeline)) {
+            throw new Error(agentSessionMessage('memoryV2.refreshFailed'));
+          }
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) return;
+          canonicalTimelineStaleSessions.delete(sessionId);
+          canonicalTimelineFailClosedSessions.delete(sessionId);
+          set({
+            session: refreshedSession,
+            localWorkspaceScopeKey: selectionScopeKey,
+            sessions: sessionsResult.data.sessions,
+            currentSessionId: refreshedSession.id,
+            timeline,
+            profileId: refreshedSession.profileId,
+            pendingPermission: pendingPermissionFromTimeline(timeline),
+            errorMessage: null,
+            loading: false,
+            selectionReady: true,
+          });
+          settledAgentSessionSelectionGeneration = selectionGeneration;
+        } catch (error) {
+          if (
+            selectionGeneration !== agentSessionSelectionGeneration
+            || selectionScopeKey !== currentWorkspaceScopeKey()
+          ) return;
+          canonicalTimelineFailClosedSessions.add(sessionId);
+          set({
+            errorMessage: error instanceof Error
+              ? error.message
+              : agentSessionMessage('memoryV2.refreshFailed'),
+            loading: false,
+            selectionReady: false,
+          });
+        }
+      }, selectionScopeKey);
+    } finally {
+      finishAgentSessionSelection(selectionGeneration, selectionScopeKey);
     }
-    set((state) => ({
-      session: refreshedSession,
-      sessions: sessionsResult.data!.sessions,
-      timeline,
-      pendingPermission: pendingPermissionFromTimeline(timeline),
-      errorMessage: null,
-    }));
   },
   addAttachment: (attachment) => {
     const normalized = normalizeInputAttachment(attachment);
@@ -1941,6 +2721,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       content: pendingHostSubmissionContent(pending),
       messageAttachments: [...pending.messageAttachmentInstances],
       callerRequestId: pending.callerRequestId,
+      disposition: pending.disposition,
+      ...(pending.message ? { message: pending.message } : {}),
     };
   },
   retryPendingSubmission: async (clearOriginalMessageAttachments) => {
@@ -1958,14 +2740,33 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!trimmed) return false;
     if (pendingHostSubmissionStorageInvalid) {
       set({
-        errorMessage:
-          'Pending Host submission recovery storage is unavailable or corrupt; reload after repairing local application storage before sending.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.storageUnavailable'),
       });
       return false;
     }
-    if (!get().session) await get().loadOrCreate();
+    const currentSelection = get();
+    const currentSessionId = currentSelection.session?.id;
+    const selectionReady = Boolean(
+      currentSessionId
+      && currentSelection.selectionReady
+      && currentSelection.localWorkspaceScopeKey === currentWorkspaceScopeKey()
+      && currentSelection.timeline?.sessionId === currentSessionId
+      && !canonicalTimelineStaleSessions.has(currentSessionId)
+      && !canonicalTimelineFailClosedSessions.has(currentSessionId)
+    );
+    if (!selectionReady) await get().loadOrCreate();
     const session = get().session;
-    if (!session) return false;
+    if (
+      !session
+      || !get().selectionReady
+      || get().localWorkspaceScopeKey !== currentWorkspaceScopeKey()
+      || get().timeline?.sessionId !== session.id
+      || canonicalTimelineStaleSessions.has(session.id)
+      || canonicalTimelineFailClosedSessions.has(session.id)
+    ) {
+      set({ errorMessage: agentSessionMessage('agent.readiness.pending') });
+      return false;
+    }
     const unresolvedAtStart = unresolvedHostSubmission(session.id);
     const retryCallerRequestId = options?.retryCallerRequestId;
     const replaySubmission = retryCallerRequestId !== undefined
@@ -1974,8 +2775,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       : null;
     if (retryCallerRequestId && !replaySubmission) {
       set({
-        errorMessage:
-          'The previous submission identity is no longer pending; refresh the Session before sending again.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.staleReplay'),
       });
       return false;
     }
@@ -2008,8 +2808,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const unresolvedSubmission = unresolvedHostSubmission(session.id);
     if (unresolvedSubmission && !replaySubmission) {
       set({
-        errorMessage:
-          'A previous submission has an unknown outcome. Retry the exact original draft before sending a different message.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.retryOriginal'),
       });
       return false;
     }
@@ -2038,8 +2837,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       && replayAfterRefresh?.callerRequestId !== retryCallerRequestId
     ) {
       set({
-        errorMessage:
-          'The previous submission was settled while this view refreshed; refresh the Session before sending again.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.settledDuringRefresh'),
       });
       return false;
     }
@@ -2047,8 +2845,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const unresolvedAfterRefresh = unresolvedHostSubmission(session.id);
     if (unresolvedAfterRefresh && !replaySubmissionAfterRefresh) {
       set({
-        errorMessage:
-          'A previous submission has an unknown outcome. Retry the exact original draft before sending a different message.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.retryOriginal'),
       });
       return false;
     }
@@ -2080,8 +2877,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const mutationOwner = claimPendingHostMutation(session.id);
       if (!mutationOwner) {
         set({
-          errorMessage:
-            'Another Host mutation is still awaiting a durable outcome for this Session.',
+          errorMessage: agentSessionMessage('agent.hostSubmission.busy'),
         });
         return false;
       }
@@ -2090,6 +2886,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         kind: 'input',
         fingerprint: submissionFingerprint,
         callerRequestId: callerIdentity,
+        disposition: 'pending',
         messageAttachmentInstances: submittedMessageAttachments,
         runId: interactionRunId,
         request: {
@@ -2102,8 +2899,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (!submission) {
         releasePendingHostMutation(session.id, mutationOwner);
         set({
-          errorMessage:
-            'The exact Host submission identity could not be persisted; no request was sent.',
+          errorMessage: agentSessionMessage('agent.hostSubmission.identityPersistFailed'),
         });
         return false;
       }
@@ -2123,8 +2919,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (result.ok && result.data) {
           if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
             set({
-              errorMessage:
-                'The Host accepted this input, but its local replay identity could not be settled safely.',
+              errorMessage: agentSessionMessage('agent.hostSubmission.identitySettleFailed'),
             });
             return false;
           }
@@ -2167,24 +2962,28 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           void refreshCanonicalTimeline(result.data.session.id, true, true);
           return true;
         } else {
-          const rejected = isAuthoritativeHostMutationRejection(result);
-          const identitySettled = !rejected
-            || settleHostSubmissionIdentity(session.id, callerRequestId);
+          const failureMessage = await recordHostMutationNonAcceptance(
+            session.id,
+            callerRequestId,
+            result,
+            'New user input append failed'
+          );
           set((state) => state.session?.id === session.id
             ? {
-                errorMessage:
-                  identitySettled
-                    ? result.message ?? 'New user input append failed'
-                    : 'The Host rejected this input, but its local replay identity could not be settled safely.',
+                errorMessage: failureMessage,
               }
             : state);
           return false;
         }
       } catch (error) {
+        const failureMessage = recordHostMutationException(
+          session.id,
+          callerRequestId,
+          error
+        );
         set((state) => state.session?.id === session.id
           ? {
-              errorMessage:
-                error instanceof Error ? error.message : String(error),
+              errorMessage: failureMessage,
             }
           : state);
         return false;
@@ -2206,8 +3005,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const mutationOwner = claimPendingHostMutation(session.id);
       if (!mutationOwner) {
         set({
-          errorMessage:
-            'Another Host mutation is still awaiting a durable outcome for this Session.',
+          errorMessage: agentSessionMessage('agent.hostSubmission.busy'),
         });
         return false;
       }
@@ -2216,6 +3014,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         kind: 'input',
         fingerprint: submissionFingerprint,
         callerRequestId: callerIdentity,
+        disposition: 'pending',
         messageAttachmentInstances: submittedMessageAttachments,
         runId: activeRun.hostRunId,
         request: {
@@ -2228,8 +3027,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (!submission) {
         releasePendingHostMutation(session.id, mutationOwner);
         set({
-          errorMessage:
-            'The exact Host submission identity could not be persisted; no request was sent.',
+          errorMessage: agentSessionMessage('agent.hostSubmission.identityPersistFailed'),
         });
         return false;
       }
@@ -2248,8 +3046,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (result.ok && result.data) {
           if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
             set({
-              errorMessage:
-                'The Host accepted this input, but its local replay identity could not be settled safely.',
+              errorMessage: agentSessionMessage('agent.hostSubmission.identitySettleFailed'),
             });
             return false;
           }
@@ -2292,24 +3089,28 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           void refreshCanonicalTimeline(result.data.session.id, true, true);
           return true;
         } else {
-          const rejected = isAuthoritativeHostMutationRejection(result);
-          const identitySettled = !rejected
-            || settleHostSubmissionIdentity(session.id, callerRequestId);
+          const failureMessage = await recordHostMutationNonAcceptance(
+            session.id,
+            callerRequestId,
+            result,
+            'User guidance append failed'
+          );
           set((state) => state.session?.id === session.id
             ? {
-                errorMessage:
-                  identitySettled
-                    ? result.message ?? 'User guidance append failed'
-                    : 'The Host rejected this input, but its local replay identity could not be settled safely.',
+                errorMessage: failureMessage,
               }
             : state);
           return false;
         }
       } catch (error) {
+        const failureMessage = recordHostMutationException(
+          session.id,
+          callerRequestId,
+          error
+        );
         set((state) => state.session?.id === session.id
           ? {
-              errorMessage:
-                error instanceof Error ? error.message : String(error),
+              errorMessage: failureMessage,
             }
           : state);
         return false;
@@ -2322,15 +3123,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }
     }
     if (!durableReplaySubmission && get().runningSessionIds.includes(session.id)) {
-      set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
+      set({ errorMessage: agentSessionMessage('agent.hostSubmission.runIdentityUnavailable') });
       return false;
     }
 
     const mutationOwner = claimPendingHostMutation(session.id);
     if (!mutationOwner) {
       set({
-        errorMessage:
-          'Another Host mutation is still awaiting a durable outcome for this Session.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.busy'),
       });
       return false;
     }
@@ -2342,6 +3142,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         kind: 'ask',
         fingerprint: submissionFingerprint,
         callerRequestId: callerIdentity,
+        disposition: 'pending',
         messageAttachmentInstances: submittedMessageAttachments,
         request: {
           op: 'ask',
@@ -2355,8 +3156,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!askSubmission) {
       releasePendingHostMutation(session.id, mutationOwner);
       set({
-        errorMessage:
-          'The exact Host submission identity could not be persisted; no request was sent.',
+        errorMessage: agentSessionMessage('agent.hostSubmission.identityPersistFailed'),
       });
       return false;
     }
@@ -2383,8 +3183,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             () => {
               if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
                 set({
-                  errorMessage:
-                    'The Host accepted this input, but its local replay identity could not be settled safely.',
+                  errorMessage: agentSessionMessage('agent.hostSubmission.identitySettleFailed'),
                 });
                 settleAdmission(false);
                 return;
@@ -2422,12 +3221,34 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           markCanonicalTimelineStale(data.session.id);
           void refreshCanonicalTimeline(data.session.id, true, true);
         } catch (err) {
-          if (err instanceof HostMutationRejectedError) {
-            settleHostSubmissionIdentity(session.id, callerRequestId);
-          }
           const message = err instanceof Error ? err.message : String(err);
+          const exactSubmissionStillPending =
+            unresolvedHostSubmission(session.id)?.callerRequestId === callerRequestId;
+          const failureMessage = err instanceof HostMutationOutcomeError
+            ? await recordHostMutationNonAcceptance(
+                session.id,
+                callerRequestId,
+                {
+                  ok: false,
+                  data: {
+                    schemaVersion: 'deepcode.host.caller-mutation-error.v2',
+                    disposition: err.disposition,
+                  },
+                  message,
+                },
+                message
+              )
+            : exactSubmissionStillPending
+              ? recordHostMutationException(
+                  session.id,
+                  callerRequestId,
+                  err
+                )
+              : message;
           set((state) => ({
-            errorMessage: state.session?.id === session.id ? message : state.errorMessage,
+            errorMessage: state.session?.id === session.id
+              ? failureMessage
+              : state.errorMessage,
             runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
           }));
           settleAdmission(false);

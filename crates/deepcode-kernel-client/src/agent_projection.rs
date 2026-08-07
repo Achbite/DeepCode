@@ -6,8 +6,8 @@ use std::fmt;
 
 pub const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2: &str =
     "deepcode.shared-conversation-projection.v2";
-pub const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1: &str =
-    "deepcode.shared-conversation.work-segments.v1";
+pub const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2: &str =
+    "deepcode.shared-conversation.work-segments.v2";
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -414,6 +414,8 @@ pub struct AgentTimelineStructuredProjectionItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_refs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_presentation: Option<Vec<AgentTimelineResourcePresentation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_refs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
@@ -528,6 +530,25 @@ pub enum AgentTimelineWorkOperationStatus {
     Unexecuted,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineResourcePresentationKind {
+    #[serde(rename = "workspacePath")]
+    WorkspacePath,
+    #[serde(rename = "resourceLabel")]
+    ResourceLabel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTimelineResourcePresentation {
+    pub kind: AgentTimelineResourcePresentationKind,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_resource_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTimelineWorkOperationAttempt {
@@ -564,8 +585,7 @@ pub struct AgentTimelineWorkOperation {
     pub status: AgentTimelineWorkOperationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_action: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub targets: Option<Vec<String>>,
+    pub resource_presentation: Vec<AgentTimelineResourcePresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_summary: Option<String>,
     pub resource_refs: Vec<String>,
@@ -643,6 +663,8 @@ pub struct AgentTimelineWorkSegment {
     pub sequence: u64,
     pub lifecycle: AgentTimelineWorkSegmentLifecycle,
     pub attention: AgentTimelineNullableWorkAttention,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_operation_id: Option<String>,
     pub operations: Vec<AgentTimelineWorkOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -825,9 +847,15 @@ pub struct AgentTimelineRunProjection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTimelineTaskProjectionItem {
     pub id: String,
-    pub title: String,
-    pub summary: String,
-    pub status: AgentTimelineTaskStatus,
+    pub title_key: String,
+    pub title_args: BTreeMap<String, String>,
+    pub summary_key: String,
+    pub message_args: BTreeMap<String, String>,
+    pub target_refs: Vec<String>,
+    pub resource_presentation: Vec<AgentTimelineResourcePresentation>,
+    pub progress: AgentTimelineTaskProgress,
+    pub outcome: AgentTimelineNullableTaskOutcome,
+    pub attention: AgentTimelineNullableWorkAttention,
     pub block_id: String,
     pub narrative_kind: AgentTimelineNarrativeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -835,25 +863,42 @@ pub struct AgentTimelineTaskProjectionItem {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AgentTimelineTaskStatus {
-    #[serde(rename = "planned")]
-    Planned,
-    #[serde(rename = "previewing")]
-    Previewing,
-    #[serde(rename = "needsRevision")]
-    NeedsRevision,
-    #[serde(rename = "awaitingApproval")]
-    AwaitingApproval,
-    #[serde(rename = "authorized")]
-    Authorized,
-    #[serde(rename = "running")]
-    Running,
+pub enum AgentTimelineTaskProgress {
+    #[serde(rename = "queued")]
+    Queued,
+    #[serde(rename = "thinking")]
+    Thinking,
     #[serde(rename = "completed")]
     Completed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineTaskOutcome {
+    #[serde(rename = "succeeded")]
+    Succeeded,
     #[serde(rename = "failed")]
     Failed,
+    #[serde(rename = "denied")]
+    Denied,
     #[serde(rename = "unexecuted")]
     Unexecuted,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    #[serde(rename = "indeterminate")]
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct AgentTimelineNullableTaskOutcome(pub Option<AgentTimelineTaskOutcome>);
+
+impl<'de> Deserialize<'de> for AgentTimelineNullableTaskOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<AgentTimelineTaskOutcome>::deserialize(deserializer).map(Self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1503,7 +1548,7 @@ fn validate_schema_and_shape(
             "unsupported shared conversation projection schema",
         ));
     }
-    if shape_version != AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1 {
+    if shape_version != AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2 {
         return Err(AgentProjectionValidationError::new(
             "unsupported shared conversation projection shape",
         ));
@@ -1791,6 +1836,39 @@ fn validate_block(block: &AgentTimelineBlock) -> Result<(), AgentProjectionValid
     if let Some(interaction) = &block.interaction {
         validate_interaction_view(interaction)?;
     }
+    if let Some(structured) = &block.structured_projection {
+        let valid_binding = matches!(
+            (block.kind, block.entry_role, structured.kind),
+            (
+                AgentTimelineBlockKind::Plan,
+                AgentTimelineEntryRole::Interaction,
+                AgentTimelineStructuredProjectionKind::Plan
+            ) | (
+                AgentTimelineBlockKind::Review,
+                AgentTimelineEntryRole::Interaction,
+                AgentTimelineStructuredProjectionKind::Review
+            ) | (
+                AgentTimelineBlockKind::Assistant,
+                AgentTimelineEntryRole::FinalAnswer,
+                AgentTimelineStructuredProjectionKind::Review
+            )
+        );
+        if !valid_binding {
+            return Err(AgentProjectionValidationError::new(
+                "structured projection has an invalid block binding",
+            ));
+        }
+        for section in &structured.sections {
+            for item in &section.items {
+                if let Some(presentation) = &item.resource_presentation {
+                    validate_resource_presentations(
+                        presentation,
+                        "structuredProjection.item.resourcePresentation",
+                    )?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1845,6 +1923,28 @@ fn validate_work_segment<'a>(
             }
         }
     }
+    if let Some(active_operation_id) = &segment.active_operation_id {
+        let active_operation = segment
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == *active_operation_id);
+        if !matches!(segment.lifecycle, AgentTimelineWorkSegmentLifecycle::Active)
+            || !active_operation.is_some_and(|operation| {
+                matches!(
+                    operation.status,
+                    AgentTimelineWorkOperationStatus::Preparing
+                        | AgentTimelineWorkOperationStatus::Queued
+                        | AgentTimelineWorkOperationStatus::Running
+                        | AgentTimelineWorkOperationStatus::AwaitingCapability
+                )
+            })
+        {
+            return Err(AgentProjectionValidationError::new(format!(
+                "work segment {} has an invalid active operation",
+                segment.id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1871,9 +1971,10 @@ fn validate_work_operation(
             )));
         }
     }
-    for target in operation.targets.iter().flatten() {
-        validate_identity(target, "operation.targets")?;
-    }
+    validate_resource_presentations(
+        &operation.resource_presentation,
+        "operation.resourcePresentation",
+    )?;
     let mut attempt_ids = HashSet::new();
     for attempt in operation.attempts.iter().flatten() {
         validate_identity(&attempt.attempt_id, "operation.attempts.attemptId")?;
@@ -1907,6 +2008,13 @@ fn validate_optional_root_projections(
         let mut item_ids = HashSet::new();
         for item in &task.items {
             validate_identity(&item.id, "taskProjection.items.id")?;
+            validate_identity(&item.title_key, "taskProjection.items.titleKey")?;
+            validate_identity(&item.summary_key, "taskProjection.items.summaryKey")?;
+            validate_identity_array(&item.target_refs, "taskProjection.items.targetRefs")?;
+            validate_resource_presentations(
+                &item.resource_presentation,
+                "taskProjection.items.resourcePresentation",
+            )?;
             validate_identity(&item.block_id, "taskProjection.items.blockId")?;
             if !item_ids.insert(item.id.as_str()) {
                 return Err(AgentProjectionValidationError::new(format!(
@@ -1919,6 +2027,22 @@ fn validate_optional_root_projections(
                     "task projection references missing block {}",
                     item.block_id
                 )));
+            }
+            if let Some(attention) = &item.attention.0 {
+                validate_identity(&attention.summary, "taskProjection.items.attention.summary")?;
+                validate_identity_array(
+                    &attention.fact_refs,
+                    "taskProjection.items.attention.factRefs",
+                )?;
+                if let Some(operation_id) = &attention.operation_id {
+                    if identities
+                        .is_some_and(|value| !value.operation_ids.contains(operation_id.as_str()))
+                    {
+                        return Err(AgentProjectionValidationError::new(format!(
+                            "task projection attention references missing operation {operation_id}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -1995,6 +2119,33 @@ fn validate_optional_root_projections(
             &workspace.changed_targets,
             "workspaceProjection.changedTargets",
         )?;
+    }
+    Ok(())
+}
+
+fn validate_resource_presentations(
+    presentations: &[AgentTimelineResourcePresentation],
+    field: &str,
+) -> Result<(), AgentProjectionValidationError> {
+    for presentation in presentations {
+        validate_identity(&presentation.label, &format!("{field}.label"))?;
+        validate_optional_identity(
+            presentation.workspace_relative_path.as_deref(),
+            &format!("{field}.workspaceRelativePath"),
+        )?;
+        validate_optional_identity(
+            presentation.canonical_resource_ref.as_deref(),
+            &format!("{field}.canonicalResourceRef"),
+        )?;
+        if matches!(
+            presentation.kind,
+            AgentTimelineResourcePresentationKind::WorkspacePath
+        ) != presentation.workspace_relative_path.is_some()
+        {
+            return Err(AgentProjectionValidationError::new(format!(
+                "{field} has an invalid workspace-relative presentation"
+            )));
+        }
     }
     Ok(())
 }

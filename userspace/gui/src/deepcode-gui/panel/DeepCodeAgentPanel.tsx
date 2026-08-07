@@ -19,6 +19,7 @@ import SessionModelSelector from './SessionModelSelector';
 interface DeepCodeAgentPanelProps {
   language: UiLanguage;
   timeline: AgentTimelineResult;
+  agentReady: boolean;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
   projectWorkspaceBinding?: AgentWorkspaceBinding;
@@ -43,6 +44,7 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
 const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   language,
   timeline,
+  agentReady,
   forceHome = false,
   homeProjectTitle,
   projectWorkspaceBinding,
@@ -95,6 +97,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       || cancellingSessionIds.includes(session.id)
     )
   );
+  const waitingForUser = timeline.runProjection?.status === 'waitingUser'
+    || timeline.runProjection?.wait?.kind === 'user';
 
   useEffect(() => {
     if (forceHome || session?.projectId) return;
@@ -222,8 +226,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           onAvailabilityChange={setModelAvailable}
         />
       )}
-      sendBlocked={!modelAvailable}
-      sendBlockedTitle={!modelAvailable
+      sendBlocked={!agentReady || !modelAvailable}
+      sendBlockedTitle={!agentReady
+        ? t(language, 'agent.readiness.pending')
+        : !modelAvailable
         ? t(
           language,
           session && !session.profileId
@@ -270,7 +276,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       {!showHome && (
         <DeepCodeTimeline
           timeline={timeline}
-          loading={sessionRunning}
+          loading={sessionRunning && !waitingForUser}
           language={language}
           followLatestSignal={followLatestSignal}
           scrollWatchElement={bottomChromeElement}
@@ -315,6 +321,11 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         {!showHome && errorMessage && (
           <div className="deepcode-gui-agent-panel__error">
             <span>{errorMessage}</span>
+            {!agentReady && (
+              <button type="button" onClick={() => void loadOrCreate()}>
+                {t(language, 'deepcodeGui.statusAction.retry')}
+              </button>
+            )}
           </div>
         )}
 

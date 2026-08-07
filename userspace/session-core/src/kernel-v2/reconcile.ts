@@ -472,7 +472,6 @@ function recordReviewFact(
     && CAPABILITY_DENIED_FACTS.has(fact.factKind)
   ) {
     appendReviewSample(state.reviewFacts.denied, fact);
-    appendReviewSample(state.reviewFacts.rejections, fact);
   } else if (isRejectedToolIntentCommandFact(fact)) {
     const sessionPlanActionId = operationId
       ? state.operationPlanActionBindings[operationId]

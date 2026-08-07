@@ -221,12 +221,15 @@ impl WorkOperationModel {
         {
             details.push(action.to_string());
         }
-        if let Some(targets) = operation
-            .targets
-            .as_ref()
-            .filter(|targets| !targets.is_empty())
-        {
-            details.push(targets.join(", "));
+        if !operation.resource_presentation.is_empty() {
+            details.push(
+                operation
+                    .resource_presentation
+                    .iter()
+                    .map(|target| target.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
         if let Some(effect) = operation
             .effect_summary
@@ -262,7 +265,7 @@ impl WorkOperationModel {
 }
 
 fn block_body(block: &AgentTimelineBlock) -> String {
-    block
+    let mut body = block
         .body_markdown
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -275,13 +278,25 @@ fn block_body(block: &AgentTimelineBlock) -> String {
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_string)
         })
-        .or_else(|| {
-            block
-                .structured_projection
-                .as_ref()
-                .and_then(structured_projection_text)
-        })
-        .unwrap_or_else(|| block.summary.clone())
+        .unwrap_or_else(|| block.summary.clone());
+    if block.entry_role == AgentTimelineEntryRole::FinalAnswer {
+        if let Some(receipt) = block
+            .structured_projection
+            .as_ref()
+            .and_then(structured_projection_text)
+        {
+            if !receipt.trim().is_empty() {
+                return format!("{}\n\n{}", body.trim_end(), receipt);
+            }
+        }
+    } else if body.trim().is_empty() {
+        body = block
+            .structured_projection
+            .as_ref()
+            .and_then(structured_projection_text)
+            .unwrap_or_else(|| block.summary.clone());
+    }
+    body
 }
 
 fn structured_projection_text(readable: &AgentTimelineStructuredProjection) -> Option<String> {
@@ -314,6 +329,16 @@ fn render_readable_projection(readable: &AgentTimelineStructuredProjection) -> S
             });
             if let Some(text) = text.filter(|value| !value.is_empty()) {
                 lines.push(format!("- {text}"));
+            }
+            if let Some(resources) = &item.resource_presentation {
+                let labels = resources
+                    .iter()
+                    .map(|resource| resource.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !labels.is_empty() {
+                    lines.push(format!("  - 资源：{labels}"));
+                }
             }
         }
     }

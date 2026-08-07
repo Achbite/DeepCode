@@ -2183,12 +2183,19 @@ impl LiveProjectionCursor {
                                 .display_name
                                 .as_deref()
                                 .unwrap_or(operation.tool_id.as_str());
-                            let target = operation
-                                .targets
-                                .as_ref()
-                                .filter(|targets| !targets.is_empty())
-                                .map(|targets| format!(" — {}", targets.join(", ")))
-                                .unwrap_or_default();
+                            let target = if operation.resource_presentation.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " — {}",
+                                    operation
+                                        .resource_presentation
+                                        .iter()
+                                        .map(|target| target.label.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
                             let effect = operation
                                 .effect_summary
                                 .as_deref()
@@ -2336,10 +2343,11 @@ fn work_operation_key(operation: &deepcode_kernel_client::AgentTimelineWorkOpera
         retry,
         operation.canonical_action.as_deref().unwrap_or_default(),
         operation
-            .targets
-            .as_ref()
-            .map(|targets| targets.join("\u{1f}"))
-            .unwrap_or_default(),
+            .resource_presentation
+            .iter()
+            .map(|target| target.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1f}"),
         operation.effect_summary.as_deref().unwrap_or_default()
     )
 }

@@ -5,6 +5,7 @@ import {
 } from '@deepcode/protocol';
 import type { AgentTimelineStructuredProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
+import './structuredProjectionContent.css';
 
 type StructuredProjectionKind = 'plan' | 'review';
 
@@ -36,6 +37,31 @@ export function StructuredProjectionContent({
         />
       ))}
     </div>
+  );
+}
+
+export function FinalFactReceipt({
+  projection,
+  language,
+}: {
+  projection: AgentTimelineStructuredProjection | undefined;
+  language: UiLanguage;
+}) {
+  if (!hasStructuredProjection(projection, 'review')) return null;
+  const readable = readableProjection(projection);
+  if (!readable) return null;
+  const summary = readableSummary(readable, language);
+  return (
+    <details className="agent-final-fact-receipt">
+      <summary>
+        <span>{t(language, 'agent.final.factReceipt')}</span>
+        {summary && <span className="agent-final-fact-receipt__summary">{summary}</span>}
+      </summary>
+      <StructuredProjectionContent
+        projection={projection}
+        language={language}
+      />
+    </details>
   );
 }
 
@@ -161,16 +187,32 @@ function titleForSection(section: Record<string, unknown>, language: UiLanguage)
 
 function itemText(item: Record<string, unknown>, language: UiLanguage): string {
   const messageKey = stringField(item, 'messageKey');
-  if (messageKey) return t(language, messageKey, recordStringValues(item.messageArgs));
+  if (messageKey) {
+    const args = recordStringValues(item.messageArgs);
+    if (
+      messageKey === 'session.projection.plan.item.scopeApproval'
+      && args.risk
+    ) {
+      args.risk = t(language, `agent.risk.${args.risk}`);
+    }
+    return t(language, messageKey, args);
+  }
   return stringField(item, 'text') ?? stringField(item, 'summary') ?? '';
 }
 
 function itemDetailLines(item: Record<string, unknown>, language: UiLanguage): string[] {
   const details: string[] = [];
-  const targetRefs = stringArrayField(item, 'targetRefs');
-  if (targetRefs.length) {
-    details.push(t(language, 'session.projection.item.targets', { targets: targetRefs.join(', ') }));
+  const resourceLabels = arrayField(item, 'resourcePresentation')
+    .filter(isRecord)
+    .flatMap((resource) => {
+      const label = stringField(resource, 'label');
+      return label ? [label] : [];
+    });
+  if (resourceLabels.length) {
+    details.push(t(language, 'session.projection.item.targets', { targets: resourceLabels.join(', ') }));
   }
+  const itemKind = stringField(item, 'kind');
+  if (itemKind === 'task' || itemKind === 'permission') return details;
   const metadata = isRecord(item.metadata) ? item.metadata : undefined;
   const objective = stringField(metadata, 'objective');
   if (objective) details.push(t(language, 'session.projection.item.objective', { objective }));

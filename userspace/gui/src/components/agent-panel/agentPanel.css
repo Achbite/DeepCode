@@ -356,13 +356,13 @@
   text-transform: uppercase;
 }
 
-.agent-task-item--waiting,
-.agent-task-item--running {
+.agent-task-item--queued,
+.agent-task-item--thinking {
   color: var(--text-main, #ededed);
 }
 
-.agent-task-item--waiting .agent-task-item__dot,
-.agent-task-item--running .agent-task-item__dot {
+.agent-task-item--queued .agent-task-item__dot,
+.agent-task-item--thinking .agent-task-item__dot {
   background: var(--accent, #0a84ff);
   box-shadow: 0 0 8px rgba(10, 132, 255, 0.45);
 }
@@ -370,11 +370,6 @@
 .agent-task-item--completed .agent-task-item__dot {
   background: #4ade80;
   box-shadow: 0 0 8px rgba(74, 222, 128, 0.35);
-}
-
-.agent-task-item--error .agent-task-item__dot {
-  background: #ff6b5f;
-  box-shadow: 0 0 8px rgba(255, 107, 95, 0.35);
 }
 
 .agent-task-item__commands {
@@ -628,15 +623,6 @@
   color: var(--text-muted, #a1a1aa);
   font-size: 11px;
   backdrop-filter: blur(8px);
-}
-
-.agent-projection-current-activity__dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--accent, #0a84ff);
-  box-shadow: 0 0 7px rgba(10, 132, 255, 0.45);
 }
 
 .agent-message,
@@ -2102,9 +2088,17 @@
 }
 
 .agent-panel-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   color: var(--danger, #ff3b30);
   padding: 8px;
   font-size: 12px;
+}
+
+.agent-panel-error button {
+  flex: 0 0 auto;
 }
 
 .agent-composer__pending-submission {
@@ -2133,6 +2127,11 @@
 .agent-composer__pending-submission button:disabled {
   cursor: default;
   opacity: 0.55;
+}
+
+.agent-composer__pending-submission--pending {
+  border-color: rgba(10, 132, 255, 0.38);
+  background: rgba(10, 132, 255, 0.1);
 }
 
 .agent-flow-card__details--diff {

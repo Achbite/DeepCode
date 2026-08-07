@@ -396,12 +396,62 @@ pub enum CapabilityScopeDispositionV2 {
     RequiresUserDecision,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityResourcePresentationKindV2 {
+    WorkspacePath,
+    ResourceLabel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityResourcePresentationV2 {
+    pub kind: CapabilityResourcePresentationKindV2,
+    pub label: String,
+    pub workspace_relative_path: Option<String>,
+    pub canonical_resource_ref: Option<String>,
+}
+
+impl CapabilityResourcePresentationV2 {
+    fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_text("approvalView.resourcePresentation.label", &self.label)?;
+        validate_optional_text(
+            "approvalView.resourcePresentation.workspaceRelativePath",
+            self.workspace_relative_path.as_deref(),
+        )?;
+        validate_optional_text(
+            "approvalView.resourcePresentation.canonicalResourceRef",
+            self.canonical_resource_ref.as_deref(),
+        )?;
+        match self.kind {
+            CapabilityResourcePresentationKindV2::WorkspacePath
+                if self.workspace_relative_path.is_none() =>
+            {
+                Err(invalid_value(
+                    "approvalView.resourcePresentation.workspaceRelativePath",
+                    "is required for workspacePath presentation",
+                ))
+            }
+            CapabilityResourcePresentationKindV2::ResourceLabel
+                if self.workspace_relative_path.is_some() =>
+            {
+                Err(invalid_value(
+                    "approvalView.resourcePresentation.workspaceRelativePath",
+                    "is only valid for workspacePath presentation",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityApprovalViewV2 {
     pub summary: String,
     pub canonical_targets: Vec<String>,
     pub scope_delta: Vec<String>,
+    pub resource_presentation: Vec<CapabilityResourcePresentationV2>,
     pub risk: ToolRiskV2,
     pub effect_class: ToolEffectClassV2,
     pub effect_scope: ToolEffectScopeV2,
@@ -417,6 +467,7 @@ impl CapabilityApprovalViewV2 {
         }
         if self.canonical_targets.len() > MAX_CORRELATION_REFS_V2
             || self.scope_delta.len() > MAX_CORRELATION_REFS_V2
+            || self.resource_presentation.len() > MAX_CORRELATION_REFS_V2
         {
             return Err(too_many_values(
                 "approvalView.targets",
@@ -425,6 +476,9 @@ impl CapabilityApprovalViewV2 {
         }
         for target in self.canonical_targets.iter().chain(self.scope_delta.iter()) {
             validate_text("approvalView.target", target)?;
+        }
+        for presentation in &self.resource_presentation {
+            presentation.validate()?;
         }
         Ok(())
     }

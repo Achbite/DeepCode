@@ -598,9 +598,10 @@ pub(crate) async fn open_agent_kernel_run_v2(
                 opened,
             ));
             let mut drive_completed = false;
+            let mut failure_indeterminate = true;
             let admission_result = loop {
                 tokio::select! {
-                    _ = &mut drive => {
+                    drive_result = &mut drive => {
                         drive_completed = true;
                         match user_input_is_projected_v2(
                             &admission_state,
@@ -612,10 +613,16 @@ pub(crate) async fn open_agent_kernel_run_v2(
                                 &admission_binding,
                                 &admission_host_run_id,
                             ),
-                            Ok(false) => break Err(AgentKernelV2Error::invalid(
-                                "host_initial_input_projection_missing",
-                                "The initial Session drive ended before its exact input.persisted projection became durable.",
-                            )),
+                            Ok(false) => match drive_result {
+                                Err((error, indeterminate)) => {
+                                    failure_indeterminate = indeterminate;
+                                    break Err(error);
+                                }
+                                Ok(()) => break Err(AgentKernelV2Error::invalid(
+                                    "host_initial_input_projection_missing",
+                                    "The initial Session drive ended before its exact input.persisted projection became durable.",
+                                )),
+                            },
                             Err(error) => break Err(error),
                         }
                     }
@@ -641,12 +648,12 @@ pub(crate) async fn open_agent_kernel_run_v2(
                     &admission_state,
                     &admission_binding,
                     error,
-                    true,
+                    failure_indeterminate,
                 );
             }
             let _ = admission_sender.send(admission_result);
             if !drive_completed {
-                drive.await;
+                let _ = drive.await;
             }
         })
         .await
@@ -3591,21 +3598,35 @@ async fn drive_admitted_agent_kernel_run_v2(
     supervisor: crate::host_kernel_wake_v2::HostKernelWakeSupervisorV2,
     owner: HostKernelWakeOwnerV2,
     admitted: HostKernelRunAdmittedV2,
-) {
+) -> Result<(), (AgentKernelV2Error, bool)> {
     let active = admitted.active_run.clone();
     let settlement = match admitted.await_initial_operation().await {
         Ok(settlement) => settlement,
         Err(error) => {
             let error = AgentKernelV2Error::from_storage(error);
-            handle_owned_drive_error_v2(&context, &active, &error).await;
-            return;
+            let disposition = handle_owned_drive_error_v2(&context, &active, &error).await;
+            return Err((
+                error,
+                matches!(
+                    disposition,
+                    OwnedDriveErrorDispositionV2::RecoveryWaiting
+                        | OwnedDriveErrorDispositionV2::IndeterminateManual
+                ),
+            ));
         }
     };
     let boundary = match drive_agent_kernel_until_boundary_v2(&context, &active, settlement).await {
         Ok(boundary) => boundary,
         Err(error) => {
-            handle_owned_drive_error_v2(&context, &active, &error).await;
-            return;
+            let disposition = handle_owned_drive_error_v2(&context, &active, &error).await;
+            return Err((
+                error,
+                matches!(
+                    disposition,
+                    OwnedDriveErrorDispositionV2::RecoveryWaiting
+                        | OwnedDriveErrorDispositionV2::IndeterminateManual
+                ),
+            ));
         }
     };
     match boundary {
@@ -3613,8 +3634,15 @@ async fn drive_admitted_agent_kernel_run_v2(
             let wait_owner = match host_kernel_wake_owner_v2(&wait) {
                 Ok(wait_owner) => wait_owner,
                 Err(error) => {
-                    handle_owned_drive_error_v2(&context, &active, &error).await;
-                    return;
+                    let disposition = handle_owned_drive_error_v2(&context, &active, &error).await;
+                    return Err((
+                        error,
+                        matches!(
+                            disposition,
+                            OwnedDriveErrorDispositionV2::RecoveryWaiting
+                                | OwnedDriveErrorDispositionV2::IndeterminateManual
+                        ),
+                    ));
                 }
             };
             if !matches!(
@@ -3625,17 +3653,37 @@ async fn drive_admitted_agent_kernel_run_v2(
                     "host_kernel_wake_owner_retag_conflict",
                     "Initial Run drive could not transfer exact ownership to its Kernel facts wait.",
                 );
-                handle_owned_drive_error_v2(&context, &active, &error).await;
-                return;
+                let disposition = handle_owned_drive_error_v2(&context, &active, &error).await;
+                return Err((
+                    error,
+                    matches!(
+                        disposition,
+                        OwnedDriveErrorDispositionV2::RecoveryWaiting
+                            | OwnedDriveErrorDispositionV2::IndeterminateManual
+                    ),
+                ));
             }
             if let Err(error) =
                 drive_owned_agent_kernel_wait_v2(&context, &supervisor, wait_owner, wait).await
             {
-                handle_owned_drive_error_v2(&context, &active, &error).await;
+                let disposition = handle_owned_drive_error_v2(&context, &active, &error).await;
+                return Err((
+                    error,
+                    matches!(
+                        disposition,
+                        OwnedDriveErrorDispositionV2::RecoveryWaiting
+                            | OwnedDriveErrorDispositionV2::IndeterminateManual
+                    ),
+                ));
             }
         }
-        AgentKernelDriveBoundaryV2::Complete | AgentKernelDriveBoundaryV2::Failure { .. } => {}
+        AgentKernelDriveBoundaryV2::Complete => {}
+        AgentKernelDriveBoundaryV2::Failure {
+            error,
+            indeterminate,
+        } => return Err((error, indeterminate)),
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

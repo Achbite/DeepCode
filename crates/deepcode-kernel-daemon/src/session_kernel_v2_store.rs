@@ -5636,7 +5636,7 @@ fn validate_projection_timeline_update(
                 ));
             }
             if delta.schema_version != "deepcode.shared-conversation-projection.v2"
-                || delta.shape_version != "deepcode.shared-conversation.work-segments.v1"
+                || delta.shape_version != "deepcode.shared-conversation.work-segments.v2"
                 || delta.session_id != session_id
             {
                 return Err(HostV2StorageError::invalid(
@@ -6701,13 +6701,19 @@ fn validate_private_provider_completed(
             "orderedItems",
             "providerOutcome",
         ],
-        &["status", "result", "toolCallReceipt"],
+        &[
+            "status",
+            "result",
+            "toolCallReceipt",
+            "reviewRevision",
+            "snapshotHighWater",
+        ],
         &["providerTurnId"],
         &[],
         &["orderedItems"],
         &["providerOutcome", "result", "toolCallReceipt"],
-        &["controlEpoch"],
-        &[],
+        &["controlEpoch", "reviewRevision"],
+        &["snapshotHighWater"],
     )?;
     require_private_enum(
         data,
@@ -6727,6 +6733,17 @@ fn validate_private_provider_completed(
     if data.contains_key("status") == data.contains_key("result") {
         return Err(private_projection_data_invalid(
             "Session private Provider completion variant is inconsistent",
+        ));
+    }
+    let has_review_revision = data.contains_key("reviewRevision");
+    let has_snapshot_high_water = data.contains_key("snapshotHighWater");
+    if has_review_revision != has_snapshot_high_water
+        || (has_review_revision
+            && (data.get("outputKind").and_then(Value::as_str) != Some("answer")
+                || data.get("terminalScope").and_then(Value::as_str) != Some("turn")))
+    {
+        return Err(private_projection_data_invalid(
+            "Session private final Review binding does not match a terminal Provider answer",
         ));
     }
     Ok(())
@@ -7167,7 +7184,7 @@ fn read_public_timeline_records(
         if record.timeline.get("schemaVersion").and_then(Value::as_str)
             != Some("deepcode.shared-conversation-projection.v2")
             || record.timeline.get("shapeVersion").and_then(Value::as_str)
-                != Some("deepcode.shared-conversation.work-segments.v1")
+                != Some("deepcode.shared-conversation.work-segments.v2")
         {
             return Err(HostV2StorageError::conflict(
                 "UnsupportedHistorySchema",
@@ -7219,7 +7236,7 @@ fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2Sto
     if timeline.get("schemaVersion").and_then(Value::as_str)
         != Some("deepcode.shared-conversation-projection.v2")
         || timeline.get("shapeVersion").and_then(Value::as_str)
-            != Some("deepcode.shared-conversation.work-segments.v1")
+            != Some("deepcode.shared-conversation.work-segments.v2")
     {
         return Err(HostV2StorageError::conflict(
             "UnsupportedHistorySchema",
@@ -7440,26 +7457,8 @@ fn validate_public_agent_event_payload(
             &["content", "inputId", "attachments", "controlEpoch"],
         ),
         "plan.persisted" => (
-            &[
-                "planId",
-                "planRevision",
-                "title",
-                "summary",
-                "userPlan",
-                "status",
-                "confirmable",
-                "tasks",
-            ],
-            &[
-                "planId",
-                "planRevision",
-                "title",
-                "summary",
-                "userPlan",
-                "status",
-                "confirmable",
-                "tasks",
-            ],
+            &["planRevision", "status", "summary"],
+            &["planRevision", "status", "summary"],
         ),
         "plan.decided" => (
             &[
@@ -7549,30 +7548,20 @@ fn validate_public_agent_event_payload(
         ),
         "scope.previewed" => (
             &[
-                "planId",
                 "planRevision",
-                "title",
-                "summary",
-                "userPlan",
+                "planActionId",
+                "operationId",
+                "toolId",
                 "status",
-                "confirmable",
-                "tasks",
-                "scopePreviews",
-                "scopeApprovalView",
-                "readablePlan",
+                "summary",
             ],
             &[
-                "planId",
                 "planRevision",
-                "title",
-                "summary",
-                "userPlan",
+                "planActionId",
+                "operationId",
+                "toolId",
                 "status",
-                "confirmable",
-                "tasks",
-                "scopePreviews",
-                "scopeApprovalView",
-                "readablePlan",
+                "summary",
             ],
         ),
         "capability.awaiting" => (
@@ -7749,6 +7738,8 @@ fn validate_public_agent_event_payload(
                 "providerTurnId",
                 "controlEpoch",
                 "providerOutcome",
+                "reviewRevision",
+                "snapshotHighWater",
             ],
             &[
                 "status",
@@ -7872,7 +7863,12 @@ fn validate_public_agent_event_payload(
         "input.persisted" => {
             event_kind == "user_msg" && channel == "user" && visibility == "conversation"
         }
-        "plan.persisted" => event_kind == "plan_card" && channel == "task" && visibility == "both",
+        "plan.persisted" => {
+            event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "trace"
+                && status == Some("running")
+        }
         "plan.decided" => {
             event_kind == "plan_review"
                 && visibility == "both"
@@ -7897,12 +7893,16 @@ fn validate_public_agent_event_payload(
                 && decision.is_none()
         }
         "scope.previewed" => {
-            visibility == "both"
-                && channel == "task"
-                && ((event_kind == "plan_card" && status == Some("running") && decision.is_none())
-                    || (event_kind == "plan_review"
-                        && status == Some("needsRevision")
-                        && decision == Some("revise")))
+            (event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "trace"
+                && status == Some("running")
+                && decision.is_none())
+                || (event_kind == "plan_review"
+                    && channel == "task"
+                    && visibility == "both"
+                    && status == Some("needsRevision")
+                    && decision == Some("revise"))
         }
         "capability.awaiting" => {
             event_kind == "permission_request"
@@ -7999,13 +7999,7 @@ fn validate_public_agent_event_payload(
                 && visibility == "conversation"
                 && matches!(
                     payload_text("outputKind"),
-                    Some(
-                        "plan"
-                            | "toolIntent"
-                            | "answer"
-                            | "noTool"
-                            | "planActionComplete"
-                    )
+                    Some("plan" | "toolIntent" | "answer" | "noTool" | "planActionComplete")
                 )
                 && match payload_text("terminalScope") {
                     Some("turn") => {
@@ -8117,12 +8111,9 @@ fn validate_public_projection_payload_types(
             public_integer(payload, "controlEpoch", true)?;
         }
         "plan.persisted" => {
-            public_plan_fields(payload, false)?;
-            if public_boolean(payload, "confirmable")? {
-                return Err(public_projection_shape_invalid(
-                    "Persisted Plan cannot be confirmable before scope preview",
-                ));
-            }
+            public_string(payload, "planRevision", true)?;
+            public_string(payload, "status", false)?;
+            public_string(payload, "summary", false)?;
         }
         "plan.decided" => {
             for field in ["planId", "planRevision"] {
@@ -8209,31 +8200,12 @@ fn validate_public_projection_payload_types(
             }
         }
         "scope.previewed" => {
-            public_plan_fields(payload, true)?;
-            if public_boolean(payload, "confirmable")? {
-                return Err(public_projection_shape_invalid(
-                    "Scope preview cannot become confirmable before Host settlement",
-                ));
+            for field in ["planRevision", "planActionId", "operationId", "toolId"] {
+                public_string(payload, field, true)?;
             }
-            let scope_previews = public_array(payload, "scopePreviews")?;
-            for preview in scope_previews {
-                validate_private_scope_preview(preview, "public.scopePreviews").map_err(|_| {
-                    public_projection_shape_invalid("Public scope preview is invalid")
-                })?;
+            for field in ["status", "summary"] {
+                public_string(payload, field, false)?;
             }
-            validate_public_scope_preview_bindings(payload, scope_previews)?;
-            validate_public_scope_approval_view(
-                payload
-                    .get("scopeApprovalView")
-                    .expect("required scope approval view"),
-                public_string(payload, "planRevision", true)?,
-                scope_previews,
-            )?;
-            validate_public_readable_plan(
-                payload.get("readablePlan").expect("required readable Plan"),
-                payload,
-                scope_previews,
-            )?;
         }
         "capability.awaiting" => {
             for field in [
@@ -8391,6 +8363,21 @@ fn validate_public_projection_payload_types(
                     .get("providerOutcome")
                     .expect("required provider outcome"),
             )?;
+            let has_review_revision = payload.contains_key("reviewRevision");
+            let has_snapshot_high_water = payload.contains_key("snapshotHighWater");
+            if has_review_revision != has_snapshot_high_water
+                || (has_review_revision
+                    && (payload.get("outputKind").and_then(Value::as_str) != Some("answer")
+                        || payload.get("terminalScope").and_then(Value::as_str) != Some("turn")))
+            {
+                return Err(public_projection_shape_invalid(
+                    "Final Review binding does not match a terminal Provider answer",
+                ));
+            }
+            if has_review_revision {
+                public_integer(payload, "reviewRevision", true)?;
+                public_integer(payload, "snapshotHighWater", false)?;
+            }
         }
         "provider.started" => {
             public_string(payload, "providerTurnId", true)?;
@@ -8835,33 +8822,6 @@ fn validate_public_scope_approval_view(
     Ok(())
 }
 
-fn public_readable_plan_resource_refs(manifest: &serde_json::Map<String, Value>) -> Vec<String> {
-    manifest
-        .get("requestedResources")
-        .and_then(Value::as_array)
-        .expect("validated requested resources")
-        .iter()
-        .map(|resource| {
-            let resource = resource.as_object().expect("validated requested resource");
-            let kind = resource
-                .get("kind")
-                .and_then(Value::as_str)
-                .expect("validated requested resource kind");
-            let data = resource
-                .get("data")
-                .and_then(Value::as_object)
-                .expect("validated requested resource data");
-            let target = ["path", "url", "query", "invocationDigest", "area"]
-                .iter()
-                .find_map(|field| data.get(*field).and_then(Value::as_str));
-            match target.filter(|target| !target.is_empty()) {
-                Some(target) => format!("{kind}:{target}"),
-                None => kind.to_string(),
-            }
-        })
-        .collect()
-}
-
 fn validate_public_readable_plan(
     value: &Value,
     payload: &serde_json::Map<String, Value>,
@@ -8892,12 +8852,20 @@ fn validate_public_readable_plan(
             .and_then(Value::as_str)
             .expect("validated toolId");
         let objective = format!("operationId={operation_id}");
-        let targets = public_readable_plan_resource_refs(manifest);
+        let resource_presentation = previews
+            .iter()
+            .find(|preview| {
+                preview.get("operationId").and_then(Value::as_str) == Some(operation_id)
+            })
+            .and_then(|preview| preview.get("approvalView"))
+            .and_then(|approval| approval.get("resourcePresentation"))
+            .and_then(Value::as_array)
+            .expect("validated PlanAction resourcePresentation");
         readable_tasks.push(json!({
             "taskId": task_id,
             "title": tool_id,
             "objective": objective,
-            "targets": targets,
+            "resourcePresentation": resource_presentation,
             "acceptance": [],
             "failure": [],
             "intentKind": tool_id,
@@ -8906,7 +8874,7 @@ fn validate_public_readable_plan(
             "itemId": task_id,
             "kind": "task",
             "text": tool_id,
-            "targetRefs": targets,
+            "resourcePresentation": resource_presentation,
             "metadata": {
                 "objective": objective,
                 "acceptance": [],
@@ -8950,33 +8918,39 @@ fn validate_public_readable_plan(
                 .get("authorizationDigest")
                 .and_then(Value::as_str)
                 .expect("validated authorizationDigest");
-            let plan_action_id = preview
-                .get("planActionId")
-                .and_then(Value::as_str)
-                .expect("validated planActionId");
-            let operation_id = preview
-                .get("operationId")
-                .and_then(Value::as_str)
-                .expect("validated operationId");
             let approval_summary = approval
                 .get("summary")
                 .and_then(Value::as_str)
                 .expect("validated approval summary");
+            let resource_presentation = approval
+                .get("resourcePresentation")
+                .and_then(Value::as_array)
+                .expect("validated resourcePresentation");
+            let target_refs = resource_presentation
+                .iter()
+                .filter_map(|resource| {
+                    resource
+                        .get("canonicalResourceRef")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
             json!({
                 "itemId": preview_id,
                 "kind": "permission",
-                "text": format!(
-                    "{tool_id}: {approval_summary} [risk={risk}; effect={effect_class}/{effect_scope}; scopeDigest={scope_digest}]"
-                ),
+                "messageKey": "session.projection.plan.item.scopeApproval",
+                "messageArgs": {
+                    "toolId": tool_id,
+                    "summary": approval_summary,
+                    "risk": risk,
+                    "effectClass": effect_class,
+                    "effectScope": effect_scope,
+                },
                 "status": preview.get("disposition").expect("validated disposition"),
-                "targetRefs": approval
-                    .get("canonicalTargets")
-                    .expect("validated canonicalTargets"),
+                "targetRefs": target_refs,
+                "resourcePresentation": resource_presentation,
                 "auditRefs": [preview_id, scope_digest, authorization_digest],
                 "metadata": {
-                    "objective": format!(
-                        "planActionId={plan_action_id}; operationId={operation_id}; authorizationDigest={authorization_digest}"
-                    ),
                     "acceptance": approval.get("scopeDelta").expect("validated scopeDelta"),
                     "failure": [],
                 },

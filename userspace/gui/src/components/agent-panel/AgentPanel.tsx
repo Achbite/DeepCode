@@ -3,7 +3,7 @@ import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
-import { normalizeUiLanguage } from '../../i18n';
+import { normalizeUiLanguage, t } from '../../i18n';
 import AgentComposer from './AgentComposer';
 import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
@@ -18,6 +18,8 @@ const AgentPanel: React.FC = () => {
   const session = useAgentSessionStore((s) => s.session);
   const sessions = useAgentSessionStore((s) => s.sessions);
   const loading = useAgentSessionStore((s) => s.loading);
+  const selectionReady = useAgentSessionStore((s) => s.selectionReady);
+  const localWorkspaceScopeKey = useAgentSessionStore((s) => s.localWorkspaceScopeKey);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
@@ -68,6 +70,15 @@ const AgentPanel: React.FC = () => {
   const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
+  const waitingForUser = timelineProjection.runProjection?.status === 'waitingUser'
+    || timelineProjection.runProjection?.wait?.kind === 'user';
+  const agentReady = Boolean(
+    !loading
+    && selectionReady
+    && session?.id
+    && localWorkspaceScopeKey === workspaceScopeKey
+    && timeline?.sessionId === session.id
+  );
   const pendingSubmissionRetry = session?.id
     && pendingSubmissionSessionIds.includes(session.id)
     ? pendingSubmissionRetryView(session.id)
@@ -114,13 +125,13 @@ const AgentPanel: React.FC = () => {
 
       <AgentTaskList
         projection={timelineProjection}
-        loading={agentBusy}
+        loading={agentBusy && !waitingForUser}
         language={language}
       />
 
       <MessageList
         timeline={timelineProjection}
-        loading={agentBusy}
+        loading={agentBusy && !waitingForUser}
         language={language}
       />
 
@@ -142,6 +153,11 @@ const AgentPanel: React.FC = () => {
       {errorMessage && (
         <div className="agent-panel-error">
           <span>{errorMessage}</span>
+          {!agentReady && (
+            <button type="button" onClick={() => void loadOrCreate()}>
+              {t(language, 'deepcodeGui.statusAction.retry')}
+            </button>
+          )}
         </div>
       )}
 
@@ -152,6 +168,8 @@ const AgentPanel: React.FC = () => {
         allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         language={language}
         loading={agentBusy}
+        sendBlocked={!agentReady}
+        sendBlockedTitle={!agentReady ? t(language, 'agent.readiness.pending') : undefined}
         onSend={sendMessage}
         pendingSubmissionRetry={pendingSubmissionRetry}
         onRetryPendingSubmission={retryPendingSubmission}

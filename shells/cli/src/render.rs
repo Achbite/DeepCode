@@ -68,7 +68,7 @@ fn timeline_block_text(
             }
         }
     }
-    Ok(block
+    let body = block
         .body_markdown
         .as_deref()
         .or_else(|| {
@@ -78,7 +78,16 @@ fn timeline_block_text(
                 .and_then(|content| content.text.as_deref())
         })
         .unwrap_or(block.summary.as_str())
-        .to_string())
+        .to_string();
+    if block.entry_role == AgentTimelineEntryRole::FinalAnswer {
+        if let Some(readable) = block.structured_projection.as_ref() {
+            let receipt = render_readable_projection(readable);
+            if !receipt.trim().is_empty() {
+                return Ok(format!("{}\n\n{}", body.trim_end(), receipt));
+            }
+        }
+    }
+    Ok(body)
 }
 
 fn render_timeline_work_segment(segment: &deepcode_kernel_client::AgentTimelineWorkSegment) {
@@ -121,12 +130,16 @@ fn render_timeline_work_segment(segment: &deepcode_kernel_client::AgentTimelineW
         {
             println!("      action: {action}");
         }
-        if let Some(targets) = operation
-            .targets
-            .as_ref()
-            .filter(|targets| !targets.is_empty())
-        {
-            println!("      targets: {}", targets.join(", "));
+        if !operation.resource_presentation.is_empty() {
+            println!(
+                "      targets: {}",
+                operation
+                    .resource_presentation
+                    .iter()
+                    .map(|target| target.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         if let Some(effect) = operation
             .effect_summary
@@ -238,8 +251,12 @@ fn render_readable_projection(
             if let Some(text) = &item_text {
                 push_unique_render_line(&mut lines, &mut seen_section_lines, format!("- {text}"));
             }
-            if let Some(targets) = item.target_refs.as_ref() {
-                let target_text = targets.join(", ");
+            if let Some(resources) = item.resource_presentation.as_ref() {
+                let target_text = resources
+                    .iter()
+                    .map(|resource| resource.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let target_is_already_visible = item_text
                     .as_ref()
                     .map(|text| text.contains(&target_text))
@@ -621,6 +638,13 @@ pub(crate) fn extract_committed_final_text_v2(timeline: &AgentTimelineSnapshot) 
             })
             .unwrap_or(block.summary.as_str());
         text.push_str(fragment);
+        if let Some(readable) = block.structured_projection.as_ref() {
+            let receipt = render_readable_projection(readable);
+            if !receipt.trim().is_empty() {
+                text.push_str("\n\n");
+                text.push_str(receipt.trim());
+            }
+        }
     }
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())

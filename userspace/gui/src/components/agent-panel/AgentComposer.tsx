@@ -72,6 +72,8 @@ export interface AgentComposerPendingSubmissionRetry {
   content: string;
   messageAttachments: AgentInputAttachmentV2[];
   callerRequestId: string;
+  disposition: 'pending' | 'indeterminate';
+  message?: string;
 }
 
 interface AgentModifiedFileView {
@@ -307,7 +309,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   useEffect(() => {
     if (previousSubmissionScopeRef.current === submissionScopeId) return;
+    const previousScopeId = previousSubmissionScopeRef.current;
     previousSubmissionScopeRef.current = submissionScopeId;
+    if (previousScopeId === null && submissionScopeId !== null) {
+      return;
+    }
     draftRevisionRef.current += 1;
     pendingSubmissionRef.current = null;
     setSubmissionPending(false);
@@ -495,7 +501,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     : submissionPending
       ? true
       : loading
-        ? false
+        ? true
         : pendingDecision
           ? decisionResolving
           : submissionPending || sendBlocked || !value.trim();
@@ -568,18 +574,27 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   return (
     <div className={`agent-composer${inputFocused ? ' agent-composer--input-focused' : ''}${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
       {pendingSubmissionRetry && (
-        <div className="agent-composer__pending-submission" role="status">
+        <div
+          className={`agent-composer__pending-submission agent-composer__pending-submission--${pendingSubmissionRetry.disposition}`}
+          role={pendingSubmissionRetry.disposition === 'indeterminate' ? 'alert' : 'status'}
+        >
           <span>
-            {language === 'zh-CN'
-              ? '上次发送的结果尚未确认。请使用原请求身份安全重试。'
-              : 'The previous send has an unknown outcome. Retry with its original request identity.'}
+            {pendingSubmissionRetry.disposition === 'pending'
+              ? language === 'zh-CN'
+                ? '请求仍在确认中。可用原请求身份安全查询，不会重复执行。'
+                : 'The request is still being confirmed. Query safely with the original request identity without duplicate execution.'
+              : language === 'zh-CN'
+                ? '上次发送的结果不确定，需要关注。请仅使用原请求身份重放。'
+                : 'The previous send has an indeterminate outcome and needs attention. Replay only with its original request identity.'}
           </span>
           <button
             type="button"
             disabled={submissionPending}
             onClick={retryPendingSubmission}
           >
-            {language === 'zh-CN' ? '重试上次发送' : 'Retry previous send'}
+            {pendingSubmissionRetry.disposition === 'pending'
+              ? language === 'zh-CN' ? '确认发送结果' : 'Check send outcome'
+              : language === 'zh-CN' ? '安全重放' : 'Replay safely'}
           </button>
         </div>
       )}

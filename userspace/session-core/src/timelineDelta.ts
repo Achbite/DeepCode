@@ -9,7 +9,7 @@ import type {
 } from '@deepcode/protocol';
 import {
   AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
 } from '@deepcode/protocol';
 import {
   assertSharedConversationProjectionV2,
@@ -48,7 +48,7 @@ export function isNativeWorkSegmentsTimelineSnapshot(
     snapshot.schemaVersion
       !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
     || snapshot.shapeVersion
-      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2
     || !Array.isArray(snapshot.turns)
   ) {
     return false;
@@ -169,7 +169,7 @@ export function createAgentTimelineDelta(
 
   return {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
     sessionId: next.sessionId,
     baseRevision: current.revision,
     revision: next.revision,
@@ -397,7 +397,7 @@ export function timelineAsReplay(
 export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   return {
     schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
     sessionId,
     revision: 0,
     sourceEventVersion: 0,
@@ -436,7 +436,7 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     || delta.schemaVersion
       !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
     || delta.shapeVersion
-      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V1
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2
     || typeof delta.sessionId !== 'string'
     || delta.sessionId.length === 0
     || !isNonnegativeSafeInteger(delta.baseRevision)

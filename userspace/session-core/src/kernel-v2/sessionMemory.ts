@@ -454,7 +454,12 @@ function decodeConversationPayload(
       ? ['providerPhase']
       : kind === 'user_msg'
         ? []
-        : ['status', 'providerOutcome']
+        : [
+            'status',
+            'providerOutcome',
+            'reviewRevision',
+            'snapshotHighWater',
+          ]
   );
   if (
     record.schemaVersion !== PUBLIC_PROJECTION_V2_SCHEMA
@@ -500,6 +505,27 @@ function decodeConversationPayload(
       );
     }
     identity(record.providerTurnId, 'providerTurnId');
+  } else {
+    const hasReviewRevision = record.reviewRevision !== undefined;
+    const hasSnapshotHighWater =
+      record.snapshotHighWater !== undefined;
+    if (
+      hasReviewRevision !== hasSnapshotHighWater
+      || (
+        hasReviewRevision
+        && (
+          !Number.isSafeInteger(record.reviewRevision)
+          || Number(record.reviewRevision) <= 0
+          || !Number.isSafeInteger(record.snapshotHighWater)
+          || Number(record.snapshotHighWater) < 0
+        )
+      )
+    ) {
+      throw invalidMemory(
+        'session_prior_event_projection_schema_unsupported',
+        'Prior final answer has an invalid Review fact binding.'
+      );
+    }
   }
   return {
     runId: identity(record.runId, 'payload.runId'),

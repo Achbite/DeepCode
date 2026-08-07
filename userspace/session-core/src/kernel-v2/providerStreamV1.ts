@@ -45,9 +45,10 @@ interface SessionKernelLlmStreamPendingTextItemV2
 
 interface SessionKernelLlmPendingPublicTextBatchV2 {
   textOrdinal: number;
-  providerPhase?: 'commentary';
+  providerPhase: 'commentary';
   textDelta: string;
   utf8ByteLength: number;
+  startedAtMonotonicMs: number;
 }
 
 type SessionKernelLlmStreamPendingItemV2 =
@@ -58,7 +59,7 @@ export interface SessionKernelLlmPublicTextDeltaV2 {
   providerTurnId: string;
   streamSequence: number;
   textOrdinal: number;
-  providerPhase?: 'commentary';
+  providerPhase: 'commentary';
   textDelta: string;
 }
 
@@ -103,6 +104,10 @@ const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 1024 * 1024;
 const MAX_PUBLIC_TEXT_BATCH_BYTES = 16 * 1024;
 const MAX_PUBLIC_TEXT_BATCH_DELAY_MS = 250;
+
+function monotonicNowMs(): number {
+  return globalThis.performance.now();
+}
 
 export class HttpSessionKernelLlmTransportV2
 implements SessionKernelLlmTransportV2 {
@@ -253,9 +258,7 @@ export async function consumeProviderSseV1(
       providerTurnId: expectedRequestId,
       streamSequence: publicStreamSequence,
       textOrdinal: batch.textOrdinal,
-      ...(batch.providerPhase
-        ? { providerPhase: batch.providerPhase }
-        : {}),
+      providerPhase: batch.providerPhase,
       textDelta: batch.textDelta,
     };
     publicTextPublicationTail = publicTextPublicationTail.then(
@@ -288,12 +291,38 @@ export async function consumeProviderSseV1(
     ) {
       return;
     }
+    const elapsed = monotonicNowMs()
+      - pendingPublicTextBatch.startedAtMonotonicMs;
+    const remaining = Math.max(
+      1,
+      Math.ceil(MAX_PUBLIC_TEXT_BATCH_DELAY_MS - elapsed)
+    );
     publicTextFlushTimer = setTimeout(() => {
       publicTextFlushTimer = undefined;
       const batch = pendingPublicTextBatch;
+      if (!batch) return;
+      if (
+        monotonicNowMs() - batch.startedAtMonotonicMs
+          < MAX_PUBLIC_TEXT_BATCH_DELAY_MS
+      ) {
+        schedulePublicTextFlush();
+        return;
+      }
       pendingPublicTextBatch = undefined;
-      if (batch) enqueuePublicTextPublication(batch);
-    }, MAX_PUBLIC_TEXT_BATCH_DELAY_MS);
+      enqueuePublicTextPublication(batch);
+    }, remaining);
+  };
+
+  const flushPublicTextIfDue = async (): Promise<void> => {
+    const batch = pendingPublicTextBatch;
+    if (
+      !batch
+      || monotonicNowMs() - batch.startedAtMonotonicMs
+        < MAX_PUBLIC_TEXT_BATCH_DELAY_MS
+    ) {
+      return;
+    }
+    await flushPendingPublicText();
   };
 
   const awaitPublicTextPublications = async (): Promise<void> => {
@@ -314,11 +343,10 @@ export async function consumeProviderSseV1(
   ): Promise<void> => {
     enqueuePublicTextPublication({
       textOrdinal: item.textOrdinal,
-      ...(item.phase === 'commentary'
-        ? { providerPhase: 'commentary' as const }
-        : {}),
+      providerPhase: 'commentary',
       textDelta,
       utf8ByteLength: utf8Bytes(textDelta),
+      startedAtMonotonicMs: monotonicNowMs(),
     });
     await awaitPublicTextPublications();
   };
@@ -327,9 +355,7 @@ export async function consumeProviderSseV1(
     item: SessionKernelLlmStreamPendingTextItemV2,
     textDelta: string
   ): Promise<void> => {
-    const providerPhase = item.phase === 'commentary'
-      ? 'commentary' as const
-      : undefined;
+    const providerPhase = 'commentary' as const;
     let remaining = textDelta;
     while (remaining) {
       if (
@@ -344,9 +370,10 @@ export async function consumeProviderSseV1(
       if (!pendingPublicTextBatch) {
         pendingPublicTextBatch = {
           textOrdinal: item.textOrdinal,
-          ...(providerPhase ? { providerPhase } : {}),
+          providerPhase,
           textDelta: '',
           utf8ByteLength: 0,
+          startedAtMonotonicMs: monotonicNowMs(),
         };
         schedulePublicTextFlush();
       }
@@ -374,7 +401,13 @@ export async function consumeProviderSseV1(
     item: SessionKernelLlmStreamPendingTextItemV2,
     content: string
   ): Promise<void> => {
-    if (!publicTextObserver || !content) return;
+    if (
+      !publicTextObserver
+      || !content
+      || item.phase !== 'commentary'
+    ) {
+      return;
+    }
     let textDelta = content;
     if (!item.publicationStarted) {
       if (!publicComposingObserved) {
@@ -396,6 +429,7 @@ export async function consumeProviderSseV1(
   };
 
   const accept = async (frame: string): Promise<void> => {
+    await flushPublicTextIfDue();
     const event = decodeSseFrame(frame, expectedRequestId);
     if (completion) {
       throw protocolViolation(

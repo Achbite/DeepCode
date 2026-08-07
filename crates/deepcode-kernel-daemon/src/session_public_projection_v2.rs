@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 const PROJECTION_SCHEMA_V2: &str = "deepcode.shared-conversation-projection.v2";
-const WORK_SEGMENTS_SHAPE_V1: &str = "deepcode.shared-conversation.work-segments.v1";
+const WORK_SEGMENTS_SHAPE_V2: &str = "deepcode.shared-conversation.work-segments.v2";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROVIDER_USAGE_TOKENS: u64 = 1_000_000_000_000;
 
@@ -39,7 +39,7 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<(), String> {
     if object.get("schemaVersion").and_then(Value::as_str) != Some(PROJECTION_SCHEMA_V2) {
         return Err("Session v2 public projection has an unsupported schema".to_string());
     }
-    if object.get("shapeVersion").and_then(Value::as_str) != Some(WORK_SEGMENTS_SHAPE_V1) {
+    if object.get("shapeVersion").and_then(Value::as_str) != Some(WORK_SEGMENTS_SHAPE_V2) {
         return Err("Session v2 public projection requires the work-segments shape".to_string());
     }
     reject_private_projection_fields(timeline)?;
@@ -55,7 +55,7 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<(), String> {
         validate_native_turn(turn, session_id, index as u64, &mut identities)?;
     }
     if let Some(task_projection) = object.get("taskProjection") {
-        validate_task_projection(task_projection, &identities.block_ids)?;
+        validate_task_projection(task_projection, &identities)?;
     }
     if let Some(interaction_projection) = object.get("interactionProjection") {
         validate_interaction_projection(interaction_projection, &identities.block_ids)?;
@@ -542,11 +542,23 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
                 .to_string(),
         );
     }
-    if object.contains_key("structuredProjection") && !matches!(kind, "plan" | "review") {
-        return Err(
-            "Session v2 public projection structured data is only valid on plan or review blocks"
-                .to_string(),
-        );
+    if let Some(structured) = object
+        .get("structuredProjection")
+        .and_then(Value::as_object)
+    {
+        let structured_kind = structured
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let valid_binding = (kind == "plan" && structured_kind == "plan")
+            || (kind == "review" && structured_kind == "review")
+            || (kind == "assistant" && entry_role == "finalAnswer" && structured_kind == "review");
+        if !valid_binding {
+            return Err(
+                "Session v2 public projection structured data has an invalid block binding"
+                    .to_string(),
+            );
+        }
     }
     if object.contains_key("taskProjectionRef") && kind != "plan" {
         return Err(
@@ -685,6 +697,7 @@ fn validate_structured_item<'a>(
         "messageArgs",
         "status",
         "targetRefs",
+        "resourcePresentation",
         "auditRefs",
         "objective",
         "acceptanceCriteria",
@@ -719,6 +732,12 @@ fn validate_structured_item<'a>(
         if let Some(values) = object.get(field) {
             validate_string_array(Some(values), &format!("structured item.{field}"))?;
         }
+    }
+    if let Some(presentation) = object.get("resourcePresentation") {
+        validate_resource_presentations(
+            Some(presentation),
+            "structured item.resourcePresentation",
+        )?;
     }
     Ok(())
 }
@@ -925,6 +944,7 @@ fn validate_work_segment<'a>(
         "sequence",
         "lifecycle",
         "attention",
+        "activeOperationId",
         "operations",
         "startedAt",
         "completedAt",
@@ -951,8 +971,9 @@ fn validate_work_segment<'a>(
             "Session v2 public projection work segment requires operations".to_string()
         })?;
     let mut local_operation_ids = HashSet::new();
+    let mut local_operation_statuses = HashMap::new();
     for operation in operations {
-        let operation_id = validate_work_operation(operation)?;
+        let (operation_id, operation_status) = validate_work_operation(operation)?;
         if !identities.operation_ids.insert(operation_id)
             || !local_operation_ids.insert(operation_id)
         {
@@ -963,6 +984,7 @@ fn validate_work_segment<'a>(
         identities
             .operation_segment_ids
             .insert(operation_id, segment_id);
+        local_operation_statuses.insert(operation_id, operation_status);
     }
     match object.get("attention") {
         Some(Value::Null) => {}
@@ -971,10 +993,27 @@ fn validate_work_segment<'a>(
             return Err("Session v2 public projection work segment requires attention".to_string())
         }
     }
+    if let Some(active_operation_id) = object.get("activeOperationId") {
+        let active_operation_id =
+            required_identity(Some(active_operation_id), "workSegment.activeOperationId")?;
+        if object.get("lifecycle").and_then(Value::as_str) != Some("active")
+            || !local_operation_ids.contains(active_operation_id)
+            || !local_operation_statuses
+                .get(active_operation_id)
+                .is_some_and(|status| {
+                    ["preparing", "queued", "running", "awaitingCapability"].contains(status)
+                })
+        {
+            return Err(
+                "Session v2 public projection activeOperationId is not an active local operation"
+                    .to_string(),
+            );
+        }
+    }
     Ok(segment_id)
 }
 
-fn validate_work_operation(operation: &Value) -> Result<&str, String> {
+fn validate_work_operation(operation: &Value) -> Result<(&str, &str), String> {
     let object = operation
         .as_object()
         .ok_or_else(|| "Session v2 public projection operation must be an object".to_string())?;
@@ -987,7 +1026,7 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
         "displayName",
         "status",
         "canonicalAction",
-        "targets",
+        "resourcePresentation",
         "effectSummary",
         "resourceRefs",
         "factRefs",
@@ -999,9 +1038,17 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
     let operation_id = required_identity(object.get("operationId"), "operation.operationId")?;
     required_identity(object.get("toolId"), "operation.toolId")?;
     validate_work_operation_status(object.get("status"), "operation.status")?;
+    let operation_status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .expect("validated work operation status must be a string");
     validate_string_array(object.get("resourceRefs"), "operation.resourceRefs")?;
     validate_string_array(object.get("factRefs"), "operation.factRefs")?;
     validate_string_array(object.get("effectRefs"), "operation.effectRefs")?;
+    validate_resource_presentations(
+        object.get("resourcePresentation"),
+        "operation.resourcePresentation",
+    )?;
     if let Some(retry) = object.get("retry") {
         validate_work_retry(retry, operation_id)?;
     }
@@ -1017,9 +1064,6 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
         ],
         "operation",
     )?;
-    if let Some(targets) = object.get("targets") {
-        validate_string_array(Some(targets), "operation.targets")?;
-    }
     if let Some(attempts) = object.get("attempts") {
         let attempts = attempts.as_array().ok_or_else(|| {
             "Session v2 public projection operation attempts must be an array".to_string()
@@ -1029,7 +1073,7 @@ fn validate_work_operation(operation: &Value) -> Result<&str, String> {
             validate_work_attempt(attempt, &mut attempt_ids)?;
         }
     }
-    Ok(operation_id)
+    Ok((operation_id, operation_status))
 }
 
 fn validate_work_retry(retry: &Value, operation_id: &str) -> Result<(), String> {
@@ -1169,7 +1213,10 @@ fn validate_turn_parts(
     Ok(())
 }
 
-fn validate_task_projection(value: &Value, block_ids: &HashSet<&str>) -> Result<(), String> {
+fn validate_task_projection(
+    value: &Value,
+    identities: &NativeProjectionIdentities<'_>,
+) -> Result<(), String> {
     let object = value
         .as_object()
         .ok_or_else(|| "Session v2 public taskProjection must be an object".to_string())?;
@@ -1191,9 +1238,15 @@ fn validate_task_projection(value: &Value, block_ids: &HashSet<&str>) -> Result<
             .ok_or_else(|| "Session v2 public taskProjection item must be an object".to_string())?;
         let allowed = HashSet::from([
             "id",
-            "title",
-            "summary",
-            "status",
+            "titleKey",
+            "titleArgs",
+            "summaryKey",
+            "messageArgs",
+            "targetRefs",
+            "resourcePresentation",
+            "progress",
+            "outcome",
+            "attention",
             "blockId",
             "narrativeKind",
             "settlementKind",
@@ -1209,15 +1262,58 @@ fn validate_task_projection(value: &Value, block_ids: &HashSet<&str>) -> Result<
                 "Session v2 public projection repeats taskProjection item {item_id}"
             ));
         }
-        required_identity(item.get("title"), "taskProjection item.title")?;
-        if item.get("summary").and_then(Value::as_str).is_none() {
-            return Err(
-                "Session v2 public projection taskProjection item.summary is invalid".to_string(),
-            );
+        required_identity(item.get("titleKey"), "taskProjection item.titleKey")?;
+        validate_string_map(
+            item.get("titleArgs").ok_or_else(|| {
+                "Session v2 public projection taskProjection item requires titleArgs".to_string()
+            })?,
+            "taskProjection item.titleArgs",
+        )?;
+        required_identity(item.get("summaryKey"), "taskProjection item.summaryKey")?;
+        validate_string_map(
+            item.get("messageArgs").ok_or_else(|| {
+                "Session v2 public projection taskProjection item requires messageArgs".to_string()
+            })?,
+            "taskProjection item.messageArgs",
+        )?;
+        validate_string_array(item.get("targetRefs"), "taskProjection item.targetRefs")?;
+        validate_resource_presentations(
+            item.get("resourcePresentation"),
+            "taskProjection item.resourcePresentation",
+        )?;
+        validate_task_projection_progress(item.get("progress"), "taskProjection item.progress")?;
+        match item.get("outcome") {
+            Some(Value::Null) => {}
+            Some(value) => validate_required_enum(
+                Some(value),
+                &[
+                    "succeeded",
+                    "failed",
+                    "denied",
+                    "unexecuted",
+                    "cancelled",
+                    "indeterminate",
+                ],
+                "taskProjection item.outcome",
+            )?,
+            None => {
+                return Err(
+                    "Session v2 public projection taskProjection item requires outcome".to_string(),
+                )
+            }
         }
-        validate_task_projection_status(item.get("status"), "taskProjection item.status")?;
+        match item.get("attention") {
+            Some(Value::Null) => {}
+            Some(attention) => validate_work_attention(attention, &identities.operation_ids)?,
+            None => {
+                return Err(
+                    "Session v2 public projection taskProjection item requires attention"
+                        .to_string(),
+                )
+            }
+        }
         let block_id = required_identity(item.get("blockId"), "taskProjection item.blockId")?;
-        if !block_ids.contains(block_id) {
+        if !identities.block_ids.contains(block_id) {
             return Err(
                 "Session v2 public projection taskProjection references a missing block"
                     .to_string(),
@@ -1240,6 +1336,43 @@ fn validate_task_projection(value: &Value, block_ids: &HashSet<&str>) -> Result<
             &["sessionEvidenceSatisfied"],
             "taskProjection item.settlementKind",
         )?;
+    }
+    Ok(())
+}
+
+fn validate_resource_presentations(value: Option<&Value>, field: &str) -> Result<(), String> {
+    let presentations = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("Session v2 public projection {field} must be an array"))?;
+    for presentation in presentations {
+        let object = presentation.as_object().ok_or_else(|| {
+            format!("Session v2 public projection {field} item must be an object")
+        })?;
+        let allowed = HashSet::from([
+            "kind",
+            "label",
+            "workspaceRelativePath",
+            "canonicalResourceRef",
+        ]);
+        reject_unknown_fields(object.keys().map(String::as_str), &allowed, field)?;
+        let kind = required_identity(object.get("kind"), &format!("{field}.kind"))?;
+        if !["workspacePath", "resourceLabel"].contains(&kind) {
+            return Err(format!(
+                "Session v2 public projection {field}.kind is invalid"
+            ));
+        }
+        required_identity(object.get("label"), &format!("{field}.label"))?;
+        for optional_identity in ["workspaceRelativePath", "canonicalResourceRef"] {
+            if let Some(value) = object.get(optional_identity) {
+                required_identity(Some(value), &format!("{field}.{optional_identity}"))?;
+            }
+        }
+        let workspace_relative_path = object.get("workspaceRelativePath");
+        if (kind == "workspacePath") != workspace_relative_path.is_some() {
+            return Err(format!(
+                "Session v2 public projection {field}.workspaceRelativePath does not match kind"
+            ));
+        }
     }
     Ok(())
 }
@@ -1853,22 +1986,8 @@ fn validate_timeline_status(value: Option<&Value>, field: &str) -> Result<(), St
     )
 }
 
-fn validate_task_projection_status(value: Option<&Value>, field: &str) -> Result<(), String> {
-    validate_required_enum(
-        value,
-        &[
-            "planned",
-            "previewing",
-            "needsRevision",
-            "awaitingApproval",
-            "authorized",
-            "running",
-            "completed",
-            "failed",
-            "unexecuted",
-        ],
-        field,
-    )
+fn validate_task_projection_progress(value: Option<&Value>, field: &str) -> Result<(), String> {
+    validate_required_enum(value, &["queued", "thinking", "completed"], field)
 }
 
 fn validate_work_operation_status(value: Option<&Value>, field: &str) -> Result<(), String> {

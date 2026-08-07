@@ -960,20 +960,17 @@ async function projectionHttpFailure(
   projectionId: string
 ): Promise<{ code: string; message: string }> {
   try {
-    const envelope = exactObject(
-      await response.json(),
-      ['ok', 'error']
-    );
-    const error = exactObject(
-      envelope.error,
-      ['code', 'message']
-    );
-    const code = error.code;
-    const message = error.message;
+    const envelope = objectRecord(await response.json());
+    const nestedError = objectRecord(envelope?.error);
+    const code = nestedError?.code
+      ?? (typeof envelope?.error === 'string'
+        ? envelope.error
+        : undefined);
+    const message = nestedError?.message ?? envelope?.message;
     if (
-      envelope.ok === false
+      envelope?.ok === false
       && typeof code === 'string'
-      && /^[a-z][a-z0-9_]{0,127}$/u.test(code)
+      && /^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(code)
       && typeof message === 'string'
       && message.length > 0
       && new TextEncoder().encode(message).byteLength <= 8_192
@@ -1006,7 +1003,7 @@ async function priorEventsHttpFailure(
     if (
       envelope?.ok === false
       && typeof code === 'string'
-      && /^[a-z][a-z0-9_]{0,127}$/u.test(code)
+      && /^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(code)
       && typeof message === 'string'
       && message.length > 0
       && new TextEncoder().encode(message).byteLength <= 8_192
@@ -1195,22 +1192,13 @@ function publicPresentation(
       };
     case 'plan.persisted':
       return {
-        kind: 'plan_card',
-        channel: 'task',
-        visibility: 'both',
+        kind: 'workflow_stage',
+        channel: 'progress',
+        visibility: 'trace',
         fields: {
-          planId: textField(data, 'planRevision'),
           planRevision: textField(data, 'planRevision'),
-          title: textField(data, 'title') ?? 'Plan',
-          summary: textField(data, 'objective')
-            ?? textField(data, 'narrative')
-            ?? 'Plan is ready for review.',
-          userPlan: textField(data, 'narrative'),
           status: 'running',
-          confirmable: false,
-          tasks: Array.isArray(data?.actions)
-            ? cloneJson(data.actions)
-            : [],
+          summary: 'Plan persisted; canonical scope confirmation is pending.',
         },
       };
     case 'plan.decided': {
@@ -1446,6 +1434,12 @@ function publicPresentation(
           providerTurnId,
           controlEpoch,
           providerOutcome: publicProviderOutcome(data?.providerOutcome),
+          ...(data?.reviewRevision === undefined
+            ? {}
+            : {
+                reviewRevision: data.reviewRevision,
+                snapshotHighWater: data.snapshotHighWater,
+              }),
         },
       };
     }
@@ -1749,18 +1743,21 @@ function currentProjectionData(
       return currentScopePreviewProjectionData(event);
     case 'provider.started':
       return currentProviderStartedProjectionData(event);
-    case 'provider.composing':
-      return exactCurrentProjectionRecord(
+    case 'provider.composing': {
+      const data = exactCurrentProjectionRecord(
         event,
         {
           providerTurnId: 'identity',
           controlEpoch: 'positiveInteger',
           streamSequence: 'positiveInteger',
           textOrdinal: 'positiveInteger',
+          providerPhase: 'string',
           textDelta: 'string',
-        },
-        { providerPhase: 'string' }
+        }
       );
+      projectionEnum(data, 'providerPhase', ['commentary']);
+      return data;
+    }
     case 'provider.completed':
       return currentProviderCompletedProjectionData(event);
     case 'provider.stale':
@@ -2001,6 +1998,8 @@ function currentProviderCompletedProjectionData(
       status: 'string',
       result: 'object',
       toolCallReceipt: 'object',
+      reviewRevision: 'positiveInteger',
+      snapshotHighWater: 'nonNegativeInteger',
     }
   );
   projectionEnum(data, 'outputKind', [
@@ -2020,6 +2019,26 @@ function currentProviderCompletedProjectionData(
     throw invalidCurrentProjectionData(
       event.kind,
       'result does not match the current Provider completion variant'
+    );
+  }
+  const hasReviewRevision = Object.prototype.hasOwnProperty.call(
+    data,
+    'reviewRevision'
+  );
+  const hasSnapshotHighWater = Object.prototype.hasOwnProperty.call(
+    data,
+    'snapshotHighWater'
+  );
+  if (
+    hasReviewRevision !== hasSnapshotHighWater
+    || (hasReviewRevision && (
+      data.outputKind !== 'answer'
+      || data.terminalScope !== 'turn'
+    ))
+  ) {
+    throw invalidCurrentProjectionData(
+      event.kind,
+      'final Review binding does not match a terminal Provider answer'
     );
   }
   return data;
@@ -2439,10 +2458,7 @@ function providerComposingPresentation(
     || Number(streamSequence) <= 0
     || !Number.isSafeInteger(textOrdinal)
     || Number(textOrdinal) <= 0
-    || (
-      providerPhase !== undefined
-      && providerPhase !== 'commentary'
-    )
+    || providerPhase !== 'commentary'
     || typeof textDelta !== 'string'
     || textDelta.length === 0
     || new TextEncoder().encode(textDelta).byteLength > 1024 * 1024
@@ -2462,62 +2478,32 @@ function providerComposingPresentation(
       controlEpoch,
       streamSequence,
       textOrdinal,
-      ...(providerPhase ? { providerPhase } : {}),
+      providerPhase,
       content: textDelta,
     },
   };
 }
 
 function planScopePreviewPresentation(
-  event: SessionKernelProjectionEventV2,
+  _event: SessionKernelProjectionEventV2,
   data: Record<string, unknown> | undefined
 ): ReturnType<typeof publicPresentation> {
-  const plan = objectRecord(data?.plan);
-  const previews = scopePreviewRecords(data);
   const currentPreview = objectRecord(objectRecord(data?.data)?.preview);
-  const planRevision = textField(plan, 'planRevision')
-    ?? textField(currentPreview, 'planRevision')
+  const planRevision = textField(currentPreview, 'planRevision')
     ?? textField(data, 'planRevision');
-  const planId = planRevision ?? event.projectionId;
-  const title = textField(plan, 'title') ?? 'Plan';
-  const objective = textField(plan, 'objective')
-    ?? textField(plan, 'narrative')
-    ?? 'Plan is ready for review.';
   return {
-    kind: 'plan_card',
-    channel: 'task',
-    visibility: 'both',
+    kind: 'workflow_stage',
+    channel: 'progress',
+    visibility: 'trace',
     fields: {
-      planId,
       planRevision,
-      title,
-      summary: objective,
-      userPlan: textField(plan, 'narrative'),
+      planActionId: textField(currentPreview, 'planActionId')
+        ?? textField(data, 'planActionId'),
+      operationId: textField(currentPreview, 'operationId')
+        ?? textField(data, 'operationId'),
+      toolId: textField(currentPreview, 'toolId'),
       status: 'running',
-      confirmable: false,
-      tasks: planTasksWithScopePreviews(plan, previews),
-      scopePreviews: cloneJson(previews),
-      scopeApprovalView: {
-        planRevision,
-        previews: previews.map((preview) => ({
-          previewId: textField(preview, 'previewId'),
-          planActionId: textField(preview, 'planActionId'),
-          operationId: textField(preview, 'operationId'),
-          toolId: textField(preview, 'toolId'),
-          authorizationDigest:
-            textField(preview, 'authorizationDigest'),
-          approvalView: preview.approvalView === undefined
-            ? undefined
-            : cloneJson(preview.approvalView),
-        })),
-      },
-      readablePlan: readablePlanScopeApproval(
-        plan,
-        planId,
-        title,
-        objective,
-        previews
-      ),
+      summary: 'Canonical scope preview recorded.',
     },
   };
 }
@@ -2705,13 +2691,16 @@ function readablePlanScopeApproval(
       ?? `plan-action-${index + 1}`;
     const toolId = textField(manifest, 'toolId') ?? 'kernel.tool';
     const operationId = textField(manifest, 'operationId');
+    const preview = previews.find((candidate) =>
+      textField(candidate, 'operationId') === operationId
+    );
     return {
       taskId,
       title: toolId,
       objective: operationId
         ? `operationId=${operationId}`
         : undefined,
-      targets: requestedResourceRefs(manifest),
+      resourcePresentation: previewResourcePresentation(preview),
       acceptance: [],
       failure: [],
       intentKind: toolId,
@@ -2744,7 +2733,7 @@ function readablePlanScopeApproval(
           itemId: task.taskId,
           kind: 'task',
           text: task.title,
-          targetRefs: task.targets,
+          resourcePresentation: task.resourcePresentation,
           metadata: {
             objective: task.objective,
             acceptance: task.acceptance,
@@ -2762,6 +2751,32 @@ function readablePlanScopeApproval(
       },
     ],
   };
+}
+
+function previewResourcePresentation(
+  preview: Record<string, unknown> | undefined
+): Record<string, unknown>[] {
+  const approvalView = objectRecord(preview?.approvalView);
+  if (!Array.isArray(approvalView?.resourcePresentation)) return [];
+  return approvalView.resourcePresentation.flatMap((value) => {
+    const resource = objectRecord(value);
+    return resource ? [cloneJson(resource)] : [];
+  });
+}
+
+function previewResourcePresentationRefs(
+  preview: Record<string, unknown> | undefined
+): string[] {
+  const approvalView = objectRecord(preview?.approvalView);
+  if (!Array.isArray(approvalView?.resourcePresentation)) return [];
+  return approvalView.resourcePresentation.flatMap((value) => {
+    const resource = objectRecord(value);
+    const canonicalResourceRef = textField(
+      resource,
+      'canonicalResourceRef'
+    );
+    return canonicalResourceRef ? [canonicalResourceRef] : [];
+  });
 }
 
 function scopeApprovalProjectionItem(
@@ -2787,44 +2802,27 @@ function scopeApprovalProjectionItem(
   return {
     itemId: previewId,
     kind: 'permission',
-    text: `${toolId}: ${summary} [risk=${risk}; effect=${effectClass}/${effectScope}; scopeDigest=${scopeDigest}]`,
+    messageKey: 'session.projection.plan.item.scopeApproval',
+    messageArgs: {
+      toolId,
+      summary,
+      risk,
+      effectClass,
+      effectScope,
+    },
     status: textField(preview, 'disposition'),
-    targetRefs: stringArrayField(approval, 'canonicalTargets'),
+    targetRefs: previewResourcePresentationRefs(preview),
+    resourcePresentation: previewResourcePresentation(preview),
     auditRefs: [
       previewId,
       scopeDigest,
       textField(preview, 'authorizationDigest'),
     ].filter((value): value is string => Boolean(value)),
     metadata: {
-      objective: [
-        `planActionId=${textField(preview, 'planActionId') ?? 'unknown'}`,
-        `operationId=${textField(preview, 'operationId') ?? 'unknown'}`,
-        `authorizationDigest=${
-          textField(preview, 'authorizationDigest') ?? 'unknown'
-        }`,
-      ].join('; '),
       acceptance: stringArrayField(approval, 'scopeDelta'),
       failure: [],
     },
   };
-}
-
-function requestedResourceRefs(
-  manifest: Record<string, unknown> | undefined
-): string[] {
-  if (!Array.isArray(manifest?.requestedResources)) return [];
-  return manifest.requestedResources.flatMap((value) => {
-    const resource = objectRecord(value);
-    const kind = textField(resource, 'kind');
-    const details = objectRecord(resource?.data);
-    const target = textField(details, 'path')
-      ?? textField(details, 'url')
-      ?? textField(details, 'query')
-      ?? textField(details, 'invocationDigest')
-      ?? textField(details, 'area');
-    if (kind && target) return [`${kind}:${target}`];
-    return kind ? [kind] : [];
-  });
 }
 
 function permissionRequestPresentation(

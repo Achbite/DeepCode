@@ -136,18 +136,25 @@ pub(crate) async fn agent_session_timeline(
         return response;
     }
     let _io_guard = session_private_io_lock(&session_id).read_owned().await;
-    {
+    let empty_host_timeline = {
         let gui = state.gui.lock().expect("gui state lock");
-        if let Err(response) = verified_selectable_session(&gui, &session_id) {
-            return response;
-        }
-    }
+        let session = match verified_selectable_session(&gui, &session_id) {
+            Ok(session) => session,
+            Err(response) => return response,
+        };
+        matches!(&authority, TimelineTransportAuthorityV2::HostViewer)
+            .then(|| empty_timeline_for_verified_session(session, &session_id))
+            .flatten()
+    };
     match timeline_for_transport_authority(&state, &session_id, &authority) {
         Ok(Some(timeline)) => ApiResponse::ok(timeline),
-        Ok(None) => ApiResponse::error(
-            "agent_timeline_unavailable",
-            "Session v2 public timeline is not available",
-        ),
+        Ok(None) => match empty_host_timeline {
+            Some(timeline) => ApiResponse::ok(timeline),
+            None => ApiResponse::error(
+                "agent_timeline_unavailable",
+                "Session v2 public timeline is not available",
+            ),
+        },
         Err(error) => ApiResponse::error(
             error.code,
             format!(
@@ -156,6 +163,27 @@ pub(crate) async fn agent_session_timeline(
             ),
         ),
     }
+}
+
+fn empty_timeline_for_verified_session(session: &Value, session_id: &str) -> Option<Value> {
+    if session.get("eventCount").and_then(Value::as_u64) != Some(0) {
+        return None;
+    }
+    let timeline = json!({
+        "schemaVersion": "deepcode.shared-conversation-projection.v2",
+        "shapeVersion": "deepcode.shared-conversation.work-segments.v2",
+        "sessionId": session_id,
+        "revision": 0,
+        "sourceEventVersion": 0,
+        "generatedAt": "1970-01-01T00:00:00.000Z",
+        "turns": [],
+        "eventCount": 0
+    });
+    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+        &timeline,
+    )
+    .ok()?;
+    Some(timeline)
 }
 
 fn timeline_for_transport_authority(

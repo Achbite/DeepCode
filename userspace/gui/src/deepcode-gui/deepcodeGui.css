@@ -439,6 +439,10 @@ button {
 }
 
 .deepcode-gui-agent-panel__error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin: 8px 16px;
   padding: 9px 10px;
   border: 1px solid rgba(239, 143, 143, 0.55);
@@ -446,6 +450,10 @@ button {
   color: #ffd2d2;
   background: rgba(127, 29, 29, 0.28);
   font-size: 12px;
+}
+
+.deepcode-gui-agent-panel__error button {
+  flex: 0 0 auto;
 }
 
 .deepcode-gui-timeline {
@@ -3302,15 +3310,6 @@ button {
   font-size: 11px;
 }
 
-.deepcode-gui-current-activity__dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 auto;
-  border-radius: 999px;
-  background: #3b82f6;
-  box-shadow: 0 0 0 3px rgb(59 130 246 / 12%);
-}
-
 .deepcode-gui-review-accepted {
   width: auto;
   max-width: none;
@@ -3464,20 +3463,16 @@ button {
   background: #a2a8b0;
 }
 
-.deepcode-gui-task-item--running .deepcode-gui-task-item__dot {
+.deepcode-gui-task-item--thinking .deepcode-gui-task-item__dot {
   background: #2f80ed;
 }
 
-.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot {
+.deepcode-gui-task-item--queued .deepcode-gui-task-item__dot {
   background: #c87d16;
 }
 
 .deepcode-gui-task-item--completed .deepcode-gui-task-item__dot {
   background: #2f9e6d;
-}
-
-.deepcode-gui-task-item--failed .deepcode-gui-task-item__dot {
-  background: #c2413a;
 }
 
 .deepcode-gui-task-item__title {
@@ -3980,6 +3975,12 @@ button {
 .agent-composer__pending-submission button:disabled {
   cursor: default;
   opacity: 0.55;
+}
+
+.agent-composer__pending-submission--pending {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: #eff6ff;
+  color: #1d4ed8;
 }
 
 .agent-composer__footer-left {

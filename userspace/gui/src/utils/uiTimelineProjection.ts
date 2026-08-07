@@ -1,11 +1,16 @@
-import type { AgentTimelineResult } from '@deepcode/protocol';
+import type {
+  AgentTimelineResult,
+  AgentTimelineTaskProgress,
+} from '@deepcode/protocol';
 import { emptyTimeline } from '@deepcode/session-core';
 
 export interface UiProjectionTaskItem {
   id: string;
-  title: string;
-  summary: string;
-  status: string;
+  titleKey: string;
+  titleArgs: Record<string, string>;
+  summaryKey: string;
+  messageArgs: Record<string, string>;
+  progress: AgentTimelineTaskProgress;
 }
 
 export function timelineOrEmpty(
@@ -25,8 +30,10 @@ export function latestPlanTaskItemsFromProjection(view: AgentTimelineResult): Ui
 
   return projectedItems.map((item) => ({
     id: item.id,
-    title: item.title,
-    summary: item.summary,
-    status: item.status,
+    titleKey: item.titleKey,
+    titleArgs: { ...item.titleArgs },
+    summaryKey: item.summaryKey,
+    messageArgs: { ...item.messageArgs },
+    progress: item.progress,
   }));
 }
