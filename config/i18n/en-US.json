@@ -609,6 +609,7 @@
     "agent.hostSubmission.identityPersistFailed": "The replay identity for this input could not be stored safely, so no request was sent.",
     "agent.hostSubmission.identitySettleFailed": "The input was accepted, but its local replay identity did not settle safely. Retry session initialization.",
     "agent.hostSubmission.runIdentityUnavailable": "The current run identity is not ready. Refresh the session or start a new turn.",
+    "agent.session.selectionChangedBeforeSend": "The selected session changed before this message was admitted. The draft was retained; send it again in the intended conversation.",
     "agent.hostSubmission.storageFailed": "The input admission state could not be stored safely. Repair local storage and retry.",
     "agent.hostSubmission.reconcileFailed": "The input was not accepted, and canonical session facts could not be reconciled yet. Retry session initialization.",
     "agent.hostSubmission.indeterminate": "Whether the input was accepted is still indeterminate. Use the retained original draft for an idempotent retry.",

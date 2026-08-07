@@ -609,6 +609,7 @@
     "agent.hostSubmission.identityPersistFailed": "无法安全保存本次输入的重放身份，因此没有发送请求。",
     "agent.hostSubmission.identitySettleFailed": "输入已被接纳，但本地重放身份尚未安全结算；请重试会话初始化。",
     "agent.hostSubmission.runIdentityUnavailable": "当前运行身份尚未就绪；请刷新会话或开始新的对话轮次。",
+    "agent.session.selectionChangedBeforeSend": "消息接纳前会话已发生切换；草稿已保留，请在目标对话中重新发送。",
     "agent.hostSubmission.storageFailed": "无法安全保存输入接纳状态；请修复本地存储后重试。",
     "agent.hostSubmission.reconcileFailed": "输入未被接纳，且当前会话事实暂时无法完成对账；请重试会话初始化。",
     "agent.hostSubmission.indeterminate": "输入是否已被接纳仍不确定；请使用保留的原始草稿进行幂等重试。",

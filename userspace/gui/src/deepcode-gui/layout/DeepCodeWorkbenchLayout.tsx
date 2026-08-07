@@ -457,6 +457,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
+  const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const deleteSession = useAgentSessionStore((s) => s.deleteSession);
@@ -654,7 +655,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     if (targetProjectId) {
       return;
     }
-    const nextSession = await createNewSession({ reuseEmpty: false });
+    const nextSession = await createNewSession();
     if (nextSession?.id) {
       upsertKnownSession(nextSession);
     }
@@ -685,16 +686,21 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftTargetProjectId) return true;
+    if (!draftTargetProjectId) {
+      return captureSubmissionTarget() ?? false;
+    }
     if (!draftSubmissionScopeId) return false;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
     const nextSession = await createNewSession({
-      reuseEmpty: true,
       projectId: targetProjectId,
       preserveAttachments: true,
     });
     if (!nextSession?.id) {
+      return false;
+    }
+    const submissionTarget = captureSubmissionTarget(nextSession.id);
+    if (!submissionTarget) {
       return false;
     }
     pendingProjectSendRef.current = {
@@ -705,7 +711,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     upsertKnownSession(nextSession);
     setActiveProjectId(targetProjectId);
     setDraftTargetProjectId(null);
-    return true;
+    return submissionTarget;
   };
 
   const commitDraftProjectSession = async (

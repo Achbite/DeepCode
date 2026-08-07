@@ -4,6 +4,7 @@ import type {
   AgentWorkspaceBinding,
 } from '@deepcode/protocol';
 import type { UiLanguage } from '../../i18n';
+import type { AgentSessionSubmissionTarget } from '../../state/agentSessionStore';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 
 interface DeepCodeConversationShellProps {
@@ -15,7 +16,9 @@ interface DeepCodeConversationShellProps {
   projectWorkspaceBinding?: AgentWorkspaceBinding;
   projectContext: boolean;
   submissionScopeId?: string | null;
-  onBeforeSend: () => boolean | Promise<boolean>;
+  onBeforeSend: () => AgentSessionSubmissionTarget
+    | false
+    | Promise<AgentSessionSubmissionTarget | false>;
   onAfterSend: (
     submissionScopeId: string | null,
     submittedDraftCleared: boolean

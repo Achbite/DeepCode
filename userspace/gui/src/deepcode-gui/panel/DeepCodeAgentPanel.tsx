@@ -5,6 +5,7 @@ import type {
 } from '@deepcode/protocol';
 import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
+import type { AgentSessionSubmissionTarget } from '../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
@@ -26,7 +27,10 @@ interface DeepCodeAgentPanelProps {
   projectContext?: boolean;
   submissionScopeId?: string | null;
   suppressPendingDecision?: boolean;
-  onBeforeSend?: () => Promise<boolean | void> | boolean | void;
+  onBeforeSend?: () => Promise<AgentSessionSubmissionTarget | boolean | void>
+    | AgentSessionSubmissionTarget
+    | boolean
+    | void;
   onAfterSend?: (
     submissionScopeId: string | null,
     submittedDraftCleared: boolean
@@ -66,6 +70,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
   const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
   const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
   const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
@@ -193,9 +198,13 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       )}
       onSend={async (content) => {
         requestFollowLatest();
-        const shouldContinue = await onBeforeSend?.();
-        if (shouldContinue === false) return false;
-        return sendMessage(content);
+        const prepared = await onBeforeSend?.();
+        if (prepared === false) return false;
+        const expectedTarget = typeof prepared === 'object' && prepared !== null
+          ? prepared
+          : captureSubmissionTarget();
+        if (!expectedTarget) return false;
+        return sendMessage(content, { expectedTarget });
       }}
       pendingSubmissionRetry={pendingSubmissionRetry}
       onRetryPendingSubmission={async (clearOriginalMessageAttachments) => {

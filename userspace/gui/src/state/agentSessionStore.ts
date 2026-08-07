@@ -64,9 +64,14 @@ type PlanResolution = {
 };
 
 interface CreateAgentSessionOptions {
-  reuseEmpty?: boolean;
   projectId?: string;
   preserveAttachments?: boolean;
+}
+
+export interface AgentSessionSubmissionTarget {
+  sessionId: string;
+  selectionGeneration: number;
+  workspaceScopeKey: string;
 }
 
 interface AgentSessionState {
@@ -95,6 +100,7 @@ interface AgentSessionActions {
   loadOrCreate: () => Promise<void>;
   refreshSessions: () => Promise<void>;
   createNewSession: (options?: CreateAgentSessionOptions) => Promise<AgentSession | null>;
+  captureSubmissionTarget: (expectedSessionId?: string) => AgentSessionSubmissionTarget | null;
   activateSession: (sessionId: string) => Promise<void>;
   renameSession: (sessionId: string, title: string) => Promise<void>;
   archiveSession: (sessionId: string) => Promise<void>;
@@ -124,6 +130,7 @@ type Store = AgentSessionState & AgentSessionActions;
 interface AgentSendMessageOptions {
   retryCallerRequestId?: string;
   clearOriginalMessageAttachments?: boolean;
+  expectedTarget?: AgentSessionSubmissionTarget;
 }
 
 export interface PendingSubmissionRetryView {
@@ -474,6 +481,40 @@ function currentWorkspacePath(): string | undefined {
     activeFolder: workspaceState.getActiveFolder(),
     activeFolderId: workspaceState.activeFolderId ?? undefined,
   })?.openPath;
+}
+
+function captureCurrentSubmissionTarget(
+  expectedSessionId?: string
+): AgentSessionSubmissionTarget | null {
+  const state = useAgentSessionStore.getState();
+  const sessionId = state.session?.id;
+  const workspaceScopeKey = currentWorkspaceScopeKey();
+  if (
+    !sessionId
+    || (expectedSessionId !== undefined && sessionId !== expectedSessionId)
+    || !state.selectionReady
+    || state.localWorkspaceScopeKey !== workspaceScopeKey
+    || state.timeline?.sessionId !== sessionId
+    || canonicalTimelineStaleSessions.has(sessionId)
+    || canonicalTimelineFailClosedSessions.has(sessionId)
+    || settledAgentSessionSelectionGeneration !== agentSessionSelectionGeneration
+  ) {
+    return null;
+  }
+  return {
+    sessionId,
+    selectionGeneration: settledAgentSessionSelectionGeneration,
+    workspaceScopeKey,
+  };
+}
+
+function submissionTargetIsCurrent(target: AgentSessionSubmissionTarget): boolean {
+  const current = captureCurrentSubmissionTarget(target.sessionId);
+  return Boolean(
+    current
+    && current.selectionGeneration === target.selectionGeneration
+    && current.workspaceScopeKey === target.workspaceScopeKey
+  );
 }
 
 function normalizeWorkspaceRelativePath(path: string): string | null {
@@ -843,10 +884,6 @@ function cancellableTimelineRunId(
   }
   const runId = projection.runId.trim();
   return runId || null;
-}
-
-function isEmptyAgentSession(session: AgentSession | null | undefined): boolean {
-  return Boolean(session) && (session?.eventCount ?? 0) === 0;
 }
 
 function addRunningSessionId(ids: string[], sessionId: string): string[] {
@@ -1506,16 +1543,54 @@ async function startAndWaitAgentRun(
     ) {
       await sleep(300);
       if (canonicalTimelineTerminalAfter(sessionId, timelineRevisionFloor)) break;
-      const current = await boundedAgentRunRequest(
-        result.run.sessionId,
-        result.run.runId
-      );
+      let current;
+      try {
+        current = await boundedAgentRunRequest(
+          result.run.sessionId,
+          result.run.runId
+        );
+      } catch {
+        markCanonicalTimelineStale(sessionId);
+        try {
+          await refreshCanonicalTimeline(sessionId, true, true);
+        } catch {
+          // Host admission is already durable. Observation transport failure is
+          // reconciled from canonical projection instead of becoming an input
+          // failure.
+        }
+        if (canonicalTimelineTerminalAfter(sessionId, timelineRevisionFloor)) break;
+        if (
+          canonicalTimelineFailClosedSessions.has(sessionId)
+          || useAgentSessionStore.getState().session?.id !== sessionId
+        ) {
+          return result;
+        }
+        continue;
+      }
       if (!current.ok || !current.data) {
-        throw new Error(current.message ?? current.error ?? 'Shared session run refresh failed');
+        markCanonicalTimelineStale(sessionId);
+        try {
+          await refreshCanonicalTimeline(sessionId, true, true);
+        } catch {
+          // The progress stream and the next bounded poll retain ownership of
+          // post-admission observation recovery.
+        }
+        if (canonicalTimelineTerminalAfter(sessionId, timelineRevisionFloor)) break;
+        if (
+          canonicalTimelineFailClosedSessions.has(sessionId)
+          || useAgentSessionStore.getState().session?.id !== sessionId
+        ) {
+          return result;
+        }
+        continue;
       }
       result = current.data;
     }
-    await refreshCanonicalTimeline(sessionId, true, true);
+    try {
+      await refreshCanonicalTimeline(sessionId, true, true);
+    } catch {
+      markCanonicalTimelineStale(sessionId);
+    }
     return result;
   } finally {
     if (
@@ -1971,6 +2046,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, selectionScopeKey);
   },
 
+  captureSubmissionTarget: (expectedSessionId) => (
+    captureCurrentSubmissionTarget(expectedSessionId)
+  ),
+
   createNewSession: async (options = {}) => {
     const selectionScopeKey = currentWorkspaceScopeKey();
     if (
@@ -2029,61 +2108,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           }
           return null;
         };
-
-        const currentSession = get().session;
-        if (
-          options.reuseEmpty !== false
-          && isEmptyAgentSession(currentSession)
-          && get().localWorkspaceScopeKey === selectionScopeKey
-        ) {
-          if (options.projectId && currentSession?.projectId !== options.projectId) {
-            let rebound;
-            try {
-              rebound = await updateAgentSession(currentSession!.id, {
-                projectId: options.projectId,
-              });
-            } catch (error) {
-              return reconcileUnknownResult(
-                error instanceof Error ? error.message : String(error)
-              );
-            }
-            if (
-              selectionGeneration !== agentSessionSelectionGeneration
-              || selectionScopeKey !== currentWorkspaceScopeKey()
-            ) return null;
-            if (!rebound.ok || !rebound.data) {
-              const message = rebound.message ?? 'Agent session project binding failed';
-              if (hostCallerMutationDisposition(rebound) === 'rejected') {
-                set(restoredAgentSessionSelection(previousSelection, message));
-                settledAgentSessionSelectionGeneration = selectionGeneration;
-                return null;
-              }
-              return reconcileUnknownResult(message);
-            }
-            set((state) => ({
-              session: rebound.data!.session,
-              localWorkspaceScopeKey: selectionScopeKey,
-              sessions: [
-                rebound.data!.session,
-                ...state.sessions.filter((item) => item.id !== rebound.data!.session.id),
-              ],
-              currentSessionId: rebound.data!.session.id,
-              timeline: state.timeline?.sessionId === rebound.data!.session.id
-                ? state.timeline
-                : emptyTimeline(rebound.data!.session.id),
-              messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
-              sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
-              errorMessage: null,
-              loading: false,
-              selectionReady: true,
-            }));
-            settledAgentSessionSelectionGeneration = selectionGeneration;
-            return rebound.data.session;
-          }
-          set({ errorMessage: null, loading: false, selectionReady: true });
-          settledAgentSessionSelectionGeneration = selectionGeneration;
-          return currentSession ?? null;
-        }
 
         let result;
         try {
@@ -2486,7 +2510,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       await get().activateSession(deletion.nextSessionId);
       return;
     }
-    await get().createNewSession({ reuseEmpty: false });
+    await get().createNewSession();
   },
 
   selectProfile: async (profileId) => {
@@ -2744,6 +2768,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       });
       return false;
     }
+    const expectedTarget = options?.expectedTarget;
+    if (expectedTarget && !submissionTargetIsCurrent(expectedTarget)) {
+      set({
+        errorMessage: agentSessionMessage('agent.session.selectionChangedBeforeSend'),
+      });
+      return false;
+    }
     const currentSelection = get();
     const currentSessionId = currentSelection.session?.id;
     const selectionReady = Boolean(
@@ -2765,6 +2796,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       || canonicalTimelineFailClosedSessions.has(session.id)
     ) {
       set({ errorMessage: agentSessionMessage('agent.readiness.pending') });
+      return false;
+    }
+    if (expectedTarget && !submissionTargetIsCurrent(expectedTarget)) {
+      set({
+        errorMessage: agentSessionMessage('agent.session.selectionChangedBeforeSend'),
+      });
       return false;
     }
     const unresolvedAtStart = unresolvedHostSubmission(session.id);
@@ -2828,7 +2865,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         return false;
       }
     }
-    if (get().session?.id !== session.id) return false;
+    if (
+      get().session?.id !== session.id
+      || (expectedTarget && !submissionTargetIsCurrent(expectedTarget))
+    ) {
+      set({
+        errorMessage: agentSessionMessage('agent.session.selectionChangedBeforeSend'),
+      });
+      return false;
+    }
     const replayAfterRefresh = retryCallerRequestId
       ? unresolvedHostSubmission(session.id)
       : null;
