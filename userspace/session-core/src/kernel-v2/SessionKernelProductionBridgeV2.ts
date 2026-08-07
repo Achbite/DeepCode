@@ -22,6 +22,7 @@ import {
   HttpSessionKernelAppendOnlyRecordStoreV3,
   SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
   SessionKernelAppendOnlyPersistenceV3,
+  SessionKernelPublicRequestPersistenceError,
 } from './SessionKernelHttpPersistenceV2.js';
 import {
   HttpSessionKernelHostProjectionSinkV2,
@@ -3811,6 +3812,23 @@ function failureBoundaryFromError(
   error: unknown,
   state: SessionKernelLoopStateV2 | undefined
 ): SessionKernelFailureBoundaryV2 {
+  if (error instanceof SessionKernelPublicRequestPersistenceError) {
+    const pendingRequestLanes = state
+      ? (
+          Object.keys(state.publicRequests) as Array<
+            'control' | 'effect' | 'query'
+          >
+        ).sort()
+      : [];
+    return pendingRequestLanes.length > 0
+      ? failureBoundary(
+          'queryFacts',
+          'unknown',
+          'possible',
+          pendingRequestLanes
+        )
+      : failureBoundary(error.disposition, 'none', 'none');
+  }
   if (
     error instanceof SessionKernelProviderTransportError
     || error instanceof SessionKernelProviderAdapterError

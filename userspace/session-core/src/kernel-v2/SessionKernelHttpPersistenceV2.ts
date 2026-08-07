@@ -754,7 +754,20 @@ implements SessionKernelPersistencePortV2 {
       `request:${request.requestId}:attempt:${request.attemptCount}`,
       request,
       request.startedAt
-    );
+    ).catch((error: unknown) => {
+      if (error instanceof SessionKernelPublicRequestPersistenceError) {
+        throw error;
+      }
+      const disposition = error instanceof SessionKernelPersistenceError
+        ? error.replayDisposition
+        : error instanceof UnsupportedHistorySchemaError
+          ? 'doNotRetry'
+          : 'retrySameRequest';
+      throw new SessionKernelPublicRequestPersistenceError(
+        disposition,
+        error
+      );
+    });
   }
 
   settlePublicRequest(
@@ -1545,11 +1558,6 @@ export interface SessionKernelHostProjectionSinkV2 {
     event: SessionKernelProjectionEventV2,
     projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
   ): Promise<SessionKernelProjectionReceiptV2>;
-
-  publishBatch(
-    events: readonly SessionKernelProjectionEventV2[],
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
-  ): Promise<SessionKernelProjectionReceiptV2[]>;
 }
 
 export class DurableSessionKernelProjectionV2
@@ -1579,156 +1587,15 @@ implements SessionKernelProjectionPortV2 {
     };
   }
 
-  async projectBatch(
-    events: readonly SessionKernelProjectionEventV2[]
-  ): Promise<SessionKernelProjectionReceiptV2[]> {
-    const batch = exactPlanConfirmationProjectionBatchV2(events);
-    for (const event of batch) {
-      await this.persistence.persistProjection(event);
-    }
-    if (!this.sink) {
-      return batch.map((event) => ({
-        projectionId: event.projectionId,
-        projectionDigest: sha256Hash(canonicalJson(event)),
-        delivered: false,
-      }));
-    }
-    const receipts = await this.sink.publishBatch(
-      batch.map(cloneJson),
-      () => this.projectionHistoryThrough(
-        batch[batch.length - 1]!.projectionId
-      )
-    );
-    for (const event of batch) {
-      await this.persistence.persistProjectionDelivered(event);
-    }
-    return receipts;
-  }
-
   async flushPending(runId: string): Promise<void> {
     if (!this.sink) return;
     const pending = await this.persistence
       .loadUndeliveredProjections(runId);
-    const history = await this.persistence.loadProjectionEvents(runId);
-    const historyById = new Map(
-      history.map((event) => [event.projectionId, event] as const)
-    );
-    const historyIndexById = new Map(
-      history.map((event, index) => [event.projectionId, index] as const)
-    );
-    const confirmationByCommentaryId = new Map<
-      string,
-      SessionKernelProjectionEventV2
-    >();
-    for (const event of history) {
-      if (event.kind !== 'plan.confirmationReady') continue;
-      const commentaryProjectionId = objectRecord(
-        event.data
-      )?.commentaryProjectionId;
-      if (typeof commentaryProjectionId !== 'string') continue;
-      const existing = confirmationByCommentaryId.get(
-        commentaryProjectionId
-      );
-      if (existing && existing.projectionId !== event.projectionId) {
-        throw new SessionKernelPersistenceError(
-          'session_kernel_projection_batch_conflict',
-          'One Plan commentary projection is referenced by multiple confirmation boundaries.'
-        );
-      }
-      confirmationByCommentaryId.set(commentaryProjectionId, event);
-    }
-    const recovered = new Set<string>();
     for (const event of pending) {
-      if (recovered.has(event.projectionId)) continue;
-      if (event.kind === 'plan.commentaryReleased') {
-        const confirmation = confirmationByCommentaryId.get(
-          event.projectionId
-        );
-        if (!confirmation) {
-          // A crash may durably append commentary before its confirmation.
-          // Keep it private and pending until the same immutable confirmation
-          // identity is later persisted.
-          break;
-        }
-        await this.publishRecoveredPlanConfirmationBatch(
-          [event, confirmation],
-          historyIndexById
-        );
-        recovered.add(event.projectionId);
-        recovered.add(confirmation.projectionId);
-        continue;
-      }
-      if (event.kind === 'plan.confirmationReady') {
-        const commentaryProjectionId = objectRecord(
-          event.data
-        )?.commentaryProjectionId;
-        if (commentaryProjectionId !== undefined) {
-          if (typeof commentaryProjectionId !== 'string') {
-            throw new SessionKernelPersistenceError(
-              'session_kernel_projection_batch_invalid',
-              'Plan confirmation commentary identity is invalid.'
-            );
-          }
-          const commentary = historyById.get(commentaryProjectionId);
-          if (!commentary) {
-            throw new SessionKernelPersistenceError(
-              'session_kernel_projection_batch_incomplete',
-              'Plan confirmation references a missing durable commentary projection.'
-            );
-          }
-          await this.publishRecoveredPlanConfirmationBatch(
-            [commentary, event],
-            historyIndexById
-          );
-          recovered.add(commentary.projectionId);
-          recovered.add(event.projectionId);
-          continue;
-        }
-        await this.publishRecoveredPlanConfirmationBatch(
-          [event],
-          historyIndexById
-        );
-        recovered.add(event.projectionId);
-        continue;
-      }
       await this.sink.publish(
         cloneJson(event),
         () => this.projectionHistoryThrough(event.projectionId)
       );
-      await this.persistence.persistProjectionDelivered(event);
-      recovered.add(event.projectionId);
-    }
-  }
-
-  private async publishRecoveredPlanConfirmationBatch(
-    events: readonly SessionKernelProjectionEventV2[],
-    historyIndexById: ReadonlyMap<string, number>
-  ): Promise<void> {
-    const batch = exactPlanConfirmationProjectionBatchV2(events);
-    if (batch.length === 2) {
-      const commentaryIndex = historyIndexById.get(
-        batch[0]!.projectionId
-      );
-      const confirmationIndex = historyIndexById.get(
-        batch[1]!.projectionId
-      );
-      if (
-        commentaryIndex === undefined
-        || confirmationIndex !== commentaryIndex + 1
-      ) {
-        throw new SessionKernelPersistenceError(
-          'session_kernel_projection_batch_order_invalid',
-          'Plan commentary and confirmation are not adjacent in durable projection order.'
-        );
-      }
-    }
-    await this.sink!.publishBatch(
-      batch.map(cloneJson),
-      () => this.projectionHistoryThrough(
-        batch[batch.length - 1]!.projectionId
-      )
-    );
-    for (const event of batch) {
       await this.persistence.persistProjectionDelivered(event);
     }
   }
@@ -1750,41 +1617,6 @@ implements SessionKernelProjectionPortV2 {
     }
     return history.slice(0, index + 1);
   }
-
-}
-
-function exactPlanConfirmationProjectionBatchV2(
-  events: readonly SessionKernelProjectionEventV2[]
-): SessionKernelProjectionEventV2[] {
-  if (events.length < 1 || events.length > 2) {
-    throw new SessionKernelPersistenceError(
-      'session_kernel_projection_batch_invalid',
-      'Plan confirmation publication requires one confirmation event and at most one preceding commentary event.'
-    );
-  }
-  const batch = events.map(cloneJson);
-  const confirmation = batch[batch.length - 1]!;
-  const commentary = batch.length === 2 ? batch[0] : undefined;
-  const confirmationData = objectRecord(confirmation.data);
-  if (
-    confirmation.kind !== 'plan.confirmationReady'
-    || (commentary !== undefined
-      && commentary.kind !== 'plan.commentaryReleased')
-    || (commentary === undefined
-      && confirmationData?.commentaryProjectionId !== undefined)
-    || (commentary !== undefined
-      && confirmationData?.commentaryProjectionId
-        !== commentary.projectionId)
-    || new Set(batch.map((event) => event.projectionId)).size
-      !== batch.length
-  ) {
-    throw new SessionKernelPersistenceError(
-      'session_kernel_projection_batch_invalid',
-      'Plan commentary and confirmation events do not form one exact ordered authority boundary.'
-    );
-  }
-  batch.forEach(validateCurrentSessionKernelProjectionEventV2);
-  return batch;
 }
 
 const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
@@ -3729,6 +3561,25 @@ function decodeReviewRecordDataV3(
   };
 }
 
+function lastDurableReviewRevisionV3(
+  records: readonly SessionKernelPersistenceRecordV3[],
+  runId: string
+): number {
+  let revision = 0;
+  for (const record of records) {
+    if (record.recordKind !== 'review') continue;
+    revision = Math.max(
+      revision,
+      Number(decodeReviewRecordDataV3(
+        record.data,
+        runId,
+        record.recordId
+      ).review.revision)
+    );
+  }
+  return revision;
+}
+
 function decodePlanActionSettlementRecordDataV3(
   value: unknown,
   runId: string,
@@ -4089,6 +3940,16 @@ function compactCheckpointFromStateV3(input: {
     );
   }
   const byId = new Map(records.map((record) => [record.recordId, record]));
+  const durableLastReviewRevision = lastDurableReviewRevisionV3(
+    records,
+    state.runId
+  );
+  if (state.lastReviewRevision !== durableLastReviewRevision) {
+    throw new SessionKernelPersistenceError(
+      'session_kernel_review_revision_invalid',
+      'In-memory Review sequence does not match immutable Run history.'
+    );
+  }
   const currentToolContextRef = toolContextRefV2(
     state.toolContext.bundle
   );
@@ -4501,6 +4362,10 @@ function materializeCompactCheckpointV3(input: {
     sessionMemory: recovery.sessionMemory,
     providerProfile: recovery.providerProfile,
   });
+  state.lastReviewRevision = lastDurableReviewRevisionV3(
+    records,
+    checkpoint.authority.runId
+  );
   state.inputs = inputs;
   state.currentInputId = currentInput.inputId;
   state.inputHistoryOmittedCount =
@@ -6048,7 +5913,13 @@ async function persistenceHttpError(
       `Dedicated Session v3 persistence ${operation} failed with HTTP ${response.status}`,
       hostErrorCode ? ` (${hostErrorCode})` : '',
       hostErrorMessage ? `: ${hostErrorMessage}` : '.',
-    ].join('')
+    ].join(''),
+    response.status >= 500
+      || response.status === 408
+      || response.status === 425
+      || response.status === 429
+      ? 'retrySameRequest'
+      : 'doNotRetry'
   );
 }
 
@@ -6070,9 +5941,33 @@ export class UnsupportedHistorySchemaError extends Error {
 export class SessionKernelPersistenceError extends Error {
   constructor(
     readonly code: string,
-    message: string
+    message: string,
+    readonly replayDisposition:
+      | 'doNotRetry'
+      | 'retrySameRequest' = 'doNotRetry'
   ) {
     super(message);
     this.name = 'SessionKernelPersistenceError';
+  }
+}
+
+export class SessionKernelPublicRequestPersistenceError extends Error {
+  readonly code: string;
+
+  constructor(
+    readonly disposition: 'doNotRetry' | 'retrySameRequest',
+    readonly persistenceCause: unknown
+  ) {
+    const code = persistenceCause instanceof SessionKernelPersistenceError
+      ? persistenceCause.code
+      : persistenceCause instanceof UnsupportedHistorySchemaError
+        ? persistenceCause.code
+        : 'session_kernel_public_request_persistence_unavailable';
+    const message = persistenceCause instanceof Error
+      ? persistenceCause.message
+      : 'Session Kernel public request persistence failed before Kernel dispatch.';
+    super(message);
+    this.name = 'SessionKernelPublicRequestPersistenceError';
+    this.code = code;
   }
 }

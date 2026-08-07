@@ -18,6 +18,7 @@ import {
 } from './reconcile.js';
 import {
   buildSessionKernelReviewV2,
+  recordSessionKernelReviewV2,
   staleSessionFinalAnswerForFactsDriftV3,
 } from './review.js';
 import {
@@ -806,7 +807,10 @@ function applyPublicRequestOutcome(
         )
         && result.state.plan !== undefined;
       if (reviewReady) {
-        result.state.review = buildSessionKernelReviewV2(result.state, now);
+        recordSessionKernelReviewV2(
+          result.state,
+          buildSessionKernelReviewV2(result.state, now)
+        );
       }
       events.push(host.event(
         `${record.requestId}:facts`,

@@ -139,12 +139,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projection-batches",
-            post(session_kernel_v2_projection_batch_append).layer(DefaultBodyLimit::max(
-                SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,
-            )),
-        )
-        .route(
             "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/prior-events",
             get(session_kernel_v2_prior_events_page),
         )

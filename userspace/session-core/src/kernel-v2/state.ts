@@ -112,6 +112,8 @@ export interface SessionKernelLoopStateV2 {
       SessionKernelPublicRequestRecordV2
     >
   >;
+  /** Highest immutable Review revision ever allocated in this Run. */
+  lastReviewRevision: number;
   review?: SessionKernelReviewV2;
   finalAnswer?: SessionFinalAnswerStateV3;
   runCancellation?: SessionRunCancellationV2;
@@ -185,6 +187,7 @@ export function createSessionKernelLoopStateV2(
     operationPlanActionBindings: {},
     factBarriers: {},
     publicRequests: {},
+    lastReviewRevision: 0,
     kernelWakeHint: false,
     checkpointRevision: 0,
   };
@@ -272,6 +275,19 @@ export function restoreSessionKernelLoopStateV2(
     );
   }
   validateSessionWorkAuthorityV3(state.workAuthority, state);
+  state.lastReviewRevision = nonnegativeSafeInteger(
+    state.lastReviewRevision,
+    'lastReviewRevision'
+  );
+  if (
+    state.review
+    && state.review.revision > state.lastReviewRevision
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_review_revision_invalid',
+      'Current Review revision exceeds the Run-scoped durable Review sequence.'
+    );
+  }
   validateReviewWorkAuthorityV3(state.review, state);
   state.projectedInputIds = (state.projectedInputIds ?? [])
     .filter((inputId) =>

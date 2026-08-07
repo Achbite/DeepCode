@@ -2324,6 +2324,21 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
                 "The exact cancellation was admitted but has no durable response outcome; automatic retry is unsafe.",
             ));
         }
+        let terminal_host_run_id = state
+            .session_runs
+            .lock()
+            .expect("session run state lock")
+            .values()
+            .find(|run| {
+                run.session_id == session_id
+                    && (run.run_id == route_run_id
+                        || run.kernel_run_id.as_deref() == Some(route_run_id))
+                    && matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+            })
+            .map(|run| run.run_id.clone());
+        if terminal_host_run_id.is_some() {
+            return Ok(terminal_host_run_id);
+        }
         return Ok(None);
     };
     require_route_run_identity_v2(&active, route_run_id)?;
@@ -3726,6 +3741,7 @@ fn classify_owned_drive_error_v2(error: &AgentKernelV2Error) -> OwnedDriveErrorD
         }
         "host_kernel_wake_supervisor_unavailable"
         | "host_kernel_retry_recovery_waiting"
+        | "host_kernel_live_bridge_recovery_waiting"
         | "host_kernel_facts_high_water_unavailable"
         | "host_kernel_run_settings_unavailable"
         | "session_kernel_automatic_step_budget_exhausted"

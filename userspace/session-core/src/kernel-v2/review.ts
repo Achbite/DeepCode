@@ -76,7 +76,7 @@ export function buildSessionKernelReviewV2(
   const reviewFacts = state.reviewFacts;
   return {
     projectionVersion: SESSION_KERNEL_REVIEW_PROJECTION_V2,
-    revision: (state.review?.revision ?? 0) + 1,
+    revision: state.lastReviewRevision + 1,
     status: 'draft',
     ...(workAuthority
       ? { workAuthority: cloneJson(workAuthority) }
@@ -144,6 +144,37 @@ export function buildSessionKernelReviewV2(
     ).length,
     createdAt,
   };
+}
+
+/**
+ * Installs a Review without ever reusing an immutable Run-scoped revision.
+ * Clearing the current Review for a new input, Plan, or facts replay does not
+ * rewind the append-only Review sequence.
+ */
+export function recordSessionKernelReviewV2(
+  state: SessionKernelLoopStateV2,
+  review: SessionKernelReviewV2
+): void {
+  if (!Number.isSafeInteger(review.revision) || review.revision < 1) {
+    throw new SessionKernelReviewError(
+      'session_kernel_review_revision_invalid',
+      'Review requires a positive safe Run-scoped revision.'
+    );
+  }
+  if (review.revision <= state.lastReviewRevision) {
+    if (
+      !state.review
+      || canonicalJson(state.review) !== canonicalJson(review)
+    ) {
+      throw new SessionKernelReviewError(
+        'session_kernel_review_revision_conflict',
+        'Review cannot reuse an immutable Run-scoped revision with different content.'
+      );
+    }
+    return;
+  }
+  state.review = cloneReview(review);
+  state.lastReviewRevision = review.revision;
 }
 
 /**

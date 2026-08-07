@@ -4484,6 +4484,12 @@ function buildInteractionProjection(
     const explicitRunId = stringValue(payload?.runId);
     const runId = explicitRunId ?? 'run';
     if (
+      event.kind === 'user_msg'
+      && pendingInteractionRunId(pending) === runId
+    ) {
+      pending = undefined;
+    }
+    if (
       explicitRunId
       && canonicalTerminalRunEvent(event, payload)
     ) {

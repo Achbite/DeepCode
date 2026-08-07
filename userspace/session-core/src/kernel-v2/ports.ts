@@ -130,14 +130,6 @@ export interface SessionKernelProjectionPortV2 {
     event: SessionKernelProjectionEventV2
   ): Promise<SessionKernelProjectionReceiptV2>;
 
-  /**
-   * Publishes one ordered authority boundary as a single Host transaction.
-   * Either every event is publicly visible in order or none is visible.
-   */
-  projectBatch(
-    events: readonly SessionKernelProjectionEventV2[]
-  ): Promise<SessionKernelProjectionReceiptV2[]>;
-
   flushPending(runId: string): Promise<void>;
 }
 

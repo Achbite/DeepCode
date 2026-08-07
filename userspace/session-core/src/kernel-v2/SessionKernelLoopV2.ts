@@ -29,6 +29,7 @@ import {
 } from './publicRequests.js';
 import {
   finalizeSessionKernelReviewV2,
+  recordSessionKernelReviewV2,
 } from './review.js';
 import {
   checkpointSessionKernelStateV2,
@@ -654,19 +655,14 @@ export class SessionKernelLoopV2 {
         },
         recordedAt
       );
-      const projectionReceipts = await this.ports.projection.projectBatch(
-        commentaryEvent
-          ? [commentaryEvent, confirmationEvent]
-          : [confirmationEvent]
-      );
       const commentaryProjection = commentaryEvent
         ? requiredDeliveredProjectionReceiptV2(
-            projectionReceipts,
+            [await this.ports.projection.project(commentaryEvent)],
             commentaryEvent.projectionId
           )
         : undefined;
       const confirmationProjection = requiredDeliveredProjectionReceiptV2(
-        projectionReceipts,
+        [await this.ports.projection.project(confirmationEvent)],
         confirmationEvent.projectionId
       );
       const authority = buildSessionPlanConfirmationAuthorityV2(
@@ -1285,7 +1281,7 @@ export class SessionKernelLoopV2 {
       ) {
         return cloneJson(review);
       }
-      this.state.review = review;
+      recordSessionKernelReviewV2(this.state, review);
       await this.saveCheckpoint();
       await this.project(
         `review:${review.revision}:${review.snapshotHighWater}:final`,

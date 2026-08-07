@@ -392,6 +392,7 @@ type HostKernelOperationCompletionReceiverV2 =
 
 struct HostKernelLiveBridgeV2 {
     bootstrap_digest: String,
+    run_capability_digest: [u8; 32],
     child: HostBridgeChildLeaseV2,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     pending: Arc<Mutex<HashMap<String, HostKernelPendingResponseV2>>>,
@@ -858,28 +859,7 @@ impl HostKernelRunCoordinatorV2 {
                     .host_services
                     .kernel_operations_v2
                     .get_bootstrap(&input.session_id, &input.host_run_id)?;
-                let run_capability = self
-                    .host_services
-                    .active_runs_v2
-                    .run_transport_capability(
-                        &bootstrap.session_id,
-                        &bootstrap.host_run_id,
-                        &bootstrap.run_id,
-                    )
-                    .map_err(|_| {
-                        HostV2StorageError::conflict(
-                            "host_kernel_run_recovery_required",
-                            "Durable Host Run has no current Host transport capability",
-                        )
-                    })?;
-                self.host_services
-                    .session_kernel_v2
-                    .persist_tool_context_snapshot(
-                        &bootstrap.session_id,
-                        &bootstrap.run_id,
-                        &run_capability,
-                        &bootstrap.run_open_reply.tool_context,
-                    )?;
+                let run_capability = self.ensure_run_transport_capability(&turn, &bootstrap)?;
                 if let Some(initial_operation) =
                     self.host_services.kernel_operations_v2.settlement(
                         &input.session_id,
@@ -1198,28 +1178,6 @@ impl HostKernelRunCoordinatorV2 {
                 return Ok(None);
             }
         }
-        let key = HostKernelLiveRunKeyV2 {
-            session_id: session_id.to_string(),
-            host_run_id: host_run_id.to_string(),
-            run_id: bootstrap.run_id.clone(),
-        };
-        let live = self.live_bridge(&key)?;
-        if live.bootstrap_digest != bootstrap.bootstrap_digest {
-            return Err(HostV2StorageError::conflict(
-                "host_kernel_live_bridge_bootstrap_conflict",
-                "Live Session bridge does not match the durable Run bootstrap",
-            ));
-        }
-        let child_exited = live.child.try_wait()?.is_some();
-        if child_exited {
-            live.failed.store(true, Ordering::Release);
-        }
-        if live.failed.load(Ordering::Acquire) {
-            return Err(HostV2StorageError::conflict(
-                "host_kernel_live_bridge_unavailable",
-                "Session bridge is not live and cannot accept another operation",
-            ));
-        }
         let frame =
             production_request_frame_from_bootstrap(&bootstrap, operation_request_id, &operation)?;
         let prepared_input = || HostKernelOperationPreparedV2 {
@@ -1249,6 +1207,13 @@ impl HostKernelRunCoordinatorV2 {
         )? {
             return Ok(Some(settlement));
         }
+        let run_capability = self.ensure_run_transport_capability(&turn, &bootstrap)?;
+        let live = self.ensure_live_bridge(&turn, &bootstrap, &run_capability)?;
+        let key = HostKernelLiveRunKeyV2 {
+            session_id: bootstrap.session_id.clone(),
+            host_run_id: bootstrap.host_run_id.clone(),
+            run_id: bootstrap.run_id.clone(),
+        };
         if existing.is_none() && operation.requires_facts_preflight() {
             self.reconcile_kernel_facts_before_operation(&bootstrap, &live)
                 .await?;
@@ -1336,22 +1301,8 @@ impl HostKernelRunCoordinatorV2 {
                     host_run_id: host_run_id.to_string(),
                     run_id: run_id.to_string(),
                 };
-                let live = self.live_bridge(&key)?;
-                if live.bootstrap_digest != bootstrap.bootstrap_digest {
-                    return Err(HostV2StorageError::conflict(
-                        "host_kernel_live_bridge_bootstrap_conflict",
-                        "Live Session bridge does not match the durable Run bootstrap",
-                    ));
-                }
-                if live.child.try_wait()?.is_some() {
-                    live.failed.store(true, Ordering::Release);
-                }
-                if live.failed.load(Ordering::Acquire) {
-                    return Err(HostV2StorageError::conflict(
-                        "host_kernel_live_bridge_unavailable",
-                        "Session bridge is not live and cannot accept cancellation",
-                    ));
-                }
+                let run_capability = self.ensure_run_transport_capability(&turn, &bootstrap)?;
+                let live = self.ensure_live_bridge(&turn, &bootstrap, &run_capability)?;
                 if existing.is_none() {
                     self.host_services
                         .kernel_operations_v2
@@ -2007,17 +1958,81 @@ impl HostKernelRunCoordinatorV2 {
             host_run_id: bootstrap.host_run_id.clone(),
             run_id: bootstrap.run_id.clone(),
         };
+        let expected_capability_digest: [u8; 32] =
+            Sha256::digest(run_capability.expose_to_transport().as_bytes()).into();
         match self.live_bridge(&key) {
-            Ok(live) if live.bootstrap_digest == bootstrap.bootstrap_digest => Ok(live),
-            Ok(_) => Err(HostV2StorageError::conflict(
-                "host_kernel_live_bridge_bootstrap_conflict",
-                "Live Session bridge does not match the durable Run bootstrap",
-            )),
+            Ok(live) => {
+                if live.bootstrap_digest != bootstrap.bootstrap_digest {
+                    return Err(HostV2StorageError::conflict(
+                        "host_kernel_live_bridge_bootstrap_conflict",
+                        "Live Session bridge does not match the durable Run bootstrap",
+                    ));
+                }
+                let child_exited = live.child.try_wait()?.is_some();
+                if child_exited {
+                    live.failed.store(true, Ordering::Release);
+                }
+                let capability_changed = live.run_capability_digest != expected_capability_digest;
+                if !live.failed.load(Ordering::Acquire) && !capability_changed {
+                    return Ok(live);
+                }
+                let pending = live.pending.lock().map_err(|_| {
+                    HostV2StorageError::io(
+                        "host_kernel_bridge_pending_registry_unavailable",
+                        "Session bridge response correlation registry is unavailable",
+                    )
+                })?;
+                if !pending.is_empty() {
+                    return Err(HostV2StorageError::io(
+                        "host_kernel_live_bridge_recovery_waiting",
+                        "Session bridge recovery is waiting for in-flight response correlation to settle",
+                    ));
+                }
+                drop(pending);
+                self.remove_live_bridge(&key)?;
+                self.spawn_live_bridge(turn, bootstrap, run_capability)
+            }
             Err(error) if error.code == "host_kernel_live_bridge_not_found" => {
                 self.spawn_live_bridge(turn, bootstrap, run_capability)
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn ensure_run_transport_capability(
+        &self,
+        turn: &crate::host_run_broker_v2::HostSessionTurnGuardV2,
+        bootstrap: &HostKernelBootstrapRecordV2,
+    ) -> Result<RunCapabilityV2, HostV2StorageError> {
+        let capability = match self.host_services.active_runs_v2.run_transport_capability(
+            &bootstrap.session_id,
+            &bootstrap.host_run_id,
+            &bootstrap.run_id,
+        ) {
+            Ok(capability) => capability,
+            Err(error) if error.code == "host_run_transport_capability_invalid" => {
+                let capability = self.resume_run_capability(bootstrap)?;
+                self.host_services
+                    .active_runs_v2
+                    .bind_run_transport_capability(
+                        turn,
+                        &bootstrap.host_run_id,
+                        &bootstrap.run_id,
+                        &capability,
+                    )?;
+                capability
+            }
+            Err(error) => return Err(error),
+        };
+        self.host_services
+            .session_kernel_v2
+            .persist_tool_context_snapshot(
+                &bootstrap.session_id,
+                &bootstrap.run_id,
+                &capability,
+                &bootstrap.run_open_reply.tool_context,
+            )?;
+        Ok(capability)
     }
 
     fn spawn_live_bridge(
@@ -2071,6 +2086,8 @@ impl HostKernelRunCoordinatorV2 {
         };
         let live = Arc::new(HostKernelLiveBridgeV2 {
             bootstrap_digest: bootstrap.bootstrap_digest.clone(),
+            run_capability_digest: Sha256::digest(run_capability.expose_to_transport().as_bytes())
+                .into(),
             child,
             stdin: Arc::new(Mutex::new(Some(stdin))),
             pending: Arc::new(Mutex::new(HashMap::new())),

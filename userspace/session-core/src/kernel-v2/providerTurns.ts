@@ -41,6 +41,7 @@ import {
 } from './providerContext.js';
 import {
   finalizeSessionKernelReviewV2,
+  recordSessionKernelReviewV2,
   sameSessionFinalAnswerAuthorityV3,
   sameSessionFinalAnswerBindingV3,
 } from './review.js';
@@ -1646,7 +1647,7 @@ export class SessionKernelProviderTurnsV2 {
       latest,
       this.ports.clock.now()
     );
-    latest.review = review;
+    recordSessionKernelReviewV2(latest, review);
     await this.host.saveCheckpoint();
     await this.host.project(
       `review:${review.revision}:${review.snapshotHighWater}:final`,
