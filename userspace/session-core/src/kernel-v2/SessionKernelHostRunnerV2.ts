@@ -743,11 +743,28 @@ function planActionProviderCallCount(
       `PlanAction ${planActionId} is not present in the current Plan.`
     );
   }
-  return (
+  const operationIds = new Set(
     state.lineage.planActions[planActionId]?.operationIds ?? []
-  ).filter(
-    (operationId) => operationId !== action.manifest.operationId
-  ).length;
+  );
+  const manifestOperationId = action.manifest.operationId;
+  const manifestOperationWasSubmitted =
+    state.providerToolCallQueue?.calls.some(
+      (call) => call.intent.operationId === manifestOperationId
+    )
+    || state.providerOutcomes.some(
+      (outcome) =>
+        outcome.outputKind === 'toolIntent'
+        && outcome.toolCalls.some(
+          (call) => call.operationId === manifestOperationId
+        )
+    )
+    || (
+      state.lineage.operations[manifestOperationId]?.invocationCount ?? 0
+    ) > 0;
+  if (!manifestOperationWasSubmitted) {
+    operationIds.delete(manifestOperationId);
+  }
+  return operationIds.size;
 }
 
 function cloneJson<T>(value: T): T {

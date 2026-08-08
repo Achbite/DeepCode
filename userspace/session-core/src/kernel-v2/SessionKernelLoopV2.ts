@@ -12,6 +12,9 @@ import {
   registerSessionKernelFactBarrierV2,
   sessionKernelFactBarriersPendingV2,
 } from './factBarriers.js';
+import {
+  SessionKernelProjectionDeliveryErrorV2,
+} from './ports.js';
 import type {
   SessionKernelLoopPortsV2,
   SessionKernelProjectionReceiptV2,
@@ -1508,45 +1511,54 @@ export class SessionKernelLoopV2 {
       toolCalls: settledSessionProviderToolCallsV2(queue),
       providerResult: cloneJson(queue.providerResult),
     } as const;
-    if (queue.status === 'completed') {
-      await this.project(
-        `provider:${queue.providerTurnId}:completed`,
-        'provider.completed',
-        {
-          providerTurnId: queue.providerTurnId,
-          controlEpoch: queue.controlEpoch,
-          outputKind: 'toolIntent',
-          terminalScope: 'providerTurn',
-          result: {
-            kind: 'orderedToolCallsCompleted',
-            callCount: queue.calls.length,
+    let projectionDeliveryError:
+      SessionKernelProjectionDeliveryErrorV2 | undefined;
+    try {
+      if (queue.status === 'completed') {
+        await this.project(
+          `provider:${queue.providerTurnId}:completed`,
+          'provider.completed',
+          {
+            providerTurnId: queue.providerTurnId,
+            controlEpoch: queue.controlEpoch,
+            outputKind: 'toolIntent',
+            terminalScope: 'providerTurn',
+            result: {
+              kind: 'orderedToolCallsCompleted',
+              callCount: queue.calls.length,
+            },
+            orderedItems:
+              publicSessionProviderToolCallQueueItemsV2(queue),
+            toolCallReceipt: queue.receipt,
+            providerOutcome: queue.providerResult,
           },
-          orderedItems:
-            publicSessionProviderToolCallQueueItemsV2(queue),
-          toolCallReceipt: queue.receipt,
-          providerOutcome: queue.providerResult,
-        },
-        queue.settledAt
-      );
-    } else {
-      await this.project(
-        `provider:${queue.providerTurnId}:tool-calls-aborted`,
-        'diagnostic',
-        {
-          providerTurnId: queue.providerTurnId,
-          status: 'blocked',
-          code: 'session_kernel_provider_tool_calls_aborted',
-          stage: 'provider.toolCallQueue',
-          reason: queue.abortReason,
-          orderedItems:
-            publicSessionProviderToolCallQueueItemsV2(queue),
-          unexecutedOrdinals: queue.calls
-            .filter((call) => call.status === 'unexecuted')
-            .map((call) => call.ordinal),
-          toolCallReceipt: queue.receipt,
-        },
-        queue.settledAt
-      );
+          queue.settledAt
+        );
+      } else {
+        await this.project(
+          `provider:${queue.providerTurnId}:tool-calls-aborted`,
+          'diagnostic',
+          {
+            providerTurnId: queue.providerTurnId,
+            status: 'blocked',
+            code: 'session_kernel_provider_tool_calls_aborted',
+            stage: 'provider.toolCallQueue',
+            reason: queue.abortReason,
+            orderedItems:
+              publicSessionProviderToolCallQueueItemsV2(queue),
+            unexecutedOrdinals: queue.calls
+              .filter((call) => call.status === 'unexecuted')
+              .map((call) => call.ordinal),
+            toolCallReceipt: queue.receipt,
+          },
+          queue.settledAt
+        );
+      }
+    } catch (error) {
+      if (!(error instanceof SessionKernelProjectionDeliveryErrorV2)) {
+        throw error;
+      }
+      projectionDeliveryError = error;
     }
     const previousOutcomes = cloneJson(this.state.providerOutcomes);
     const previousOmittedCount =
@@ -1562,6 +1574,7 @@ export class SessionKernelLoopV2 {
       queue.outcomeRecorded = false;
       throw error;
     }
+    if (projectionDeliveryError) throw projectionDeliveryError;
   }
 
   private async ensurePlanProjected(): Promise<void> {

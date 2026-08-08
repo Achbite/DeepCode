@@ -10,6 +10,9 @@ import {
   decodeToolContextBundleV2,
   KERNEL_ABI_V2_VERSION,
 } from '@deepcode/protocol';
+import {
+  SessionKernelProjectionDeliveryErrorV2,
+} from './ports.js';
 import type {
   SessionKernelPersistencePortV2,
   SessionKernelProjectionReceiptV2,
@@ -1573,11 +1576,28 @@ implements SessionKernelProjectionPortV2 {
   ): Promise<SessionKernelProjectionReceiptV2> {
     await this.persistence.persistProjection(event);
     if (this.sink) {
-      const receipt = await this.sink.publish(
-        cloneJson(event),
-        () => this.projectionHistoryThrough(event.projectionId)
-      );
-      await this.persistence.persistProjectionDelivered(event);
+      let receipt: SessionKernelProjectionReceiptV2;
+      try {
+        receipt = await this.sink.publish(
+          cloneJson(event),
+          () => this.projectionHistoryThrough(event.projectionId)
+        );
+      } catch (error) {
+        throw new SessionKernelProjectionDeliveryErrorV2(
+          event.projectionId,
+          'publish',
+          error
+        );
+      }
+      try {
+        await this.persistence.persistProjectionDelivered(event);
+      } catch (error) {
+        throw new SessionKernelProjectionDeliveryErrorV2(
+          event.projectionId,
+          'deliveryReceipt',
+          error
+        );
+      }
       return receipt;
     }
     return {
@@ -1592,11 +1612,27 @@ implements SessionKernelProjectionPortV2 {
     const pending = await this.persistence
       .loadUndeliveredProjections(runId);
     for (const event of pending) {
-      await this.sink.publish(
-        cloneJson(event),
-        () => this.projectionHistoryThrough(event.projectionId)
-      );
-      await this.persistence.persistProjectionDelivered(event);
+      try {
+        await this.sink.publish(
+          cloneJson(event),
+          () => this.projectionHistoryThrough(event.projectionId)
+        );
+      } catch (error) {
+        throw new SessionKernelProjectionDeliveryErrorV2(
+          event.projectionId,
+          'publish',
+          error
+        );
+      }
+      try {
+        await this.persistence.persistProjectionDelivered(event);
+      } catch (error) {
+        throw new SessionKernelProjectionDeliveryErrorV2(
+          event.projectionId,
+          'deliveryReceipt',
+          error
+        );
+      }
     }
   }
 

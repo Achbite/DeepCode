@@ -73,6 +73,7 @@ import type { SessionKernelLoopPortsV2 } from './ports.js';
 import type {
   SessionKernelLoopResultV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanActionV2,
   SessionPlanActionSettlementV2,
   SessionKernelProjectionEventV2,
   SessionKernelPublicRequestRecordV2,
@@ -1781,14 +1782,16 @@ export class SessionKernelProviderTurnsV2 {
           'Provider tool does not match the persisted PlanAction tool.'
         );
       }
-      const identity = providerCallIdentity(
-        state,
-        source,
-        `planAction:${action.manifest.planActionId}`
-      );
       const lease = latestPlanActionLease(
         state,
         action.manifest.planActionId
+      );
+      const identity = planActionProviderCallIdentity(
+        state,
+        action,
+        source,
+        index,
+        lease
       );
       return normalizeProviderKernelToolIntentV2(source, {
         runId: state.runId,
@@ -2733,6 +2736,56 @@ function providerCallIdentity(
     operationId: `operation-${digest}`,
     idempotencyKey: `intent-${digest}`,
   };
+}
+
+function planActionProviderCallIdentity(
+  state: SessionKernelLoopStateV2,
+  action: SessionPlanActionV2,
+  source: ProviderKernelToolSourceV2,
+  callIndex: number,
+  lease: CapabilityLeaseRefV2 | undefined
+): {
+  operationId: string;
+  idempotencyKey: string;
+} {
+  if (
+    !lease
+    && callIndex === 0
+    && !planManifestOperationWasPreviouslySubmitted(
+      state,
+      action.manifest.operationId
+    )
+  ) {
+    return {
+      operationId: action.manifest.operationId,
+      idempotencyKey: action.idempotencyKey,
+    };
+  }
+  return providerCallIdentity(
+    state,
+    source,
+    `planAction:${action.manifest.planActionId}`
+  );
+}
+
+function planManifestOperationWasPreviouslySubmitted(
+  state: SessionKernelLoopStateV2,
+  operationId: string
+): boolean {
+  if (
+    state.providerToolCallQueue?.calls.some(
+      (call) => call.intent.operationId === operationId
+    )
+  ) {
+    return true;
+  }
+  return state.providerOutcomes.some(
+    (outcome) =>
+      outcome.outputKind === 'toolIntent'
+      && outcome.toolCalls.some(
+        (call) => call.operationId === operationId
+      )
+  );
 }
 
 function latestPlanActionLease(

@@ -35,6 +35,19 @@ export interface SessionKernelProjectionReceiptV2 {
   delivered: boolean;
 }
 
+export class SessionKernelProjectionDeliveryErrorV2 extends Error {
+  constructor(
+    readonly projectionId: string,
+    readonly deliveryStage: 'publish' | 'deliveryReceipt',
+    readonly deliveryError: unknown
+  ) {
+    super(
+      `Durably staged Session projection ${projectionId} failed during ${deliveryStage}.`
+    );
+    this.name = 'SessionKernelProjectionDeliveryErrorV2';
+  }
+}
+
 export interface SessionKernelPersistencePortV2 {
   loadCheckpoint(
     runId: string,

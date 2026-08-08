@@ -785,7 +785,11 @@ function assertSharedConversationProjection(
   }
   if (
     value.taskProjection !== undefined
-    && !taskProjectionReferencesExist(value.taskProjection, blockIds)
+    && !taskProjectionReferencesExist(
+      value.taskProjection,
+      blockIds,
+      operationIds
+    )
   ) {
     throw new Error('session_projection_v2_task_reference_invalid');
   }
@@ -1500,9 +1504,16 @@ function validTaskProjection(value: unknown): boolean {
 
 function taskProjectionReferencesExist(
   value: AgentTimelineTaskProjection,
-  blockIds: ReadonlySet<string>
+  blockIds: ReadonlySet<string>,
+  operationIds: ReadonlySet<string>
 ): boolean {
-  return value.items.every((item) => blockIds.has(item.blockId));
+  return value.items.every((item) =>
+    blockIds.has(item.blockId)
+    && (
+      item.attention?.operationId === undefined
+      || operationIds.has(item.attention.operationId)
+    )
+  );
 }
 
 function validInteractionProjection(value: unknown): boolean {
@@ -4148,7 +4159,7 @@ function buildTaskProjection(
               'failure',
               'unresolved',
               'The Plan requires revision before this action can execute.',
-              operationId,
+              undefined,
               []
             ),
           }
@@ -4359,7 +4370,9 @@ function taskProjectionStateForPlanAction(
               ?? (indeterminate
                 ? 'The final effect state is indeterminate.'
                 : 'The operation was rejected before execution.'),
-            stringValue(payload.operationId),
+            indeterminate
+              ? stringValue(payload.operationId)
+              : undefined,
             stringArrayValue(payload.factIds)
           ),
         };
