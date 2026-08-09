@@ -42,6 +42,7 @@ cargo test --quiet -p deepcode-kernel-abi
 pass "Kernel v2 ABI wire contracts"
 
 info "Kernel v2 canonical fact-store contracts"
+cargo test --quiet -p deepcode-kernel-ledger --lib
 cargo test --quiet -p deepcode-kernel-ledger --test v2_ledger_contract
 pass "Kernel v2 canonical fact-store contracts"
 

@@ -62,7 +62,11 @@ pub fn configured_fact_store_path(config_root: impl AsRef<Path>) -> KernelResult
 }
 
 fn default_fact_store_file_name() -> KernelResult<String> {
-    let Some(contract_suffix) = SCHEMA_CONTRACT.strip_prefix(SCHEMA_CONTRACT_PREFIX) else {
+    fact_store_file_name_for_schema_contract(SCHEMA_CONTRACT)
+}
+
+fn fact_store_file_name_for_schema_contract(schema_contract: &str) -> KernelResult<String> {
+    let Some(contract_suffix) = schema_contract.strip_prefix(SCHEMA_CONTRACT_PREFIX) else {
         return Err(store_error_message(
             "resolve_database_path",
             "compiled fact-store schema contract has an invalid namespace",
@@ -4535,5 +4539,38 @@ fn store_error_message(stage: &'static str, message: impl Into<String>) -> Kerne
         stage,
         message: format!("kernel v2 fact store unavailable during {stage}: {message}"),
         details: serde_json::json!({ "reason": message }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_fact_store_file_name, fact_store_file_name_for_schema_contract, SCHEMA_CONTRACT,
+        SCHEMA_CONTRACT_PREFIX,
+    };
+
+    #[test]
+    fn default_fact_store_path_is_derived_from_compiled_schema_contract() {
+        assert_eq!(
+            default_fact_store_file_name().expect("derive the compiled fact-store path"),
+            "kernel-v2-sqlite-6.sqlite3"
+        );
+        assert_eq!(
+            fact_store_file_name_for_schema_contract(SCHEMA_CONTRACT)
+                .expect("derive the current schema-contract path"),
+            "kernel-v2-sqlite-6.sqlite3"
+        );
+
+        for invalid_contract in [
+            SCHEMA_CONTRACT_PREFIX,
+            "deepcode.kernel.fact-store.v3.sqlite.6",
+            "deepcode.kernel.fact-store.v2.sqlite/6",
+            "deepcode.kernel.fact-store.v2.sqlite\\6",
+        ] {
+            assert!(
+                fact_store_file_name_for_schema_contract(invalid_contract).is_err(),
+                "invalid schema contract must fail closed: {invalid_contract}"
+            );
+        }
     }
 }

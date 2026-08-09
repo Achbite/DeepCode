@@ -41,6 +41,11 @@ TARGET_DIR = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
 DAEMON = TARGET_DIR / "debug" / "deepcode-kernel-daemon"
 CLI = TARGET_DIR / "debug" / "deepcode-cli"
 ABI_VERSION = "deepcode.kernel.abi.v2"
+FACT_STORE_SCHEMA_VERSION = "6"
+CURRENT_FACT_STORE_SCHEMA_CONTRACT = "deepcode.kernel.fact-store.v2.sqlite.6"
+PREDECESSOR_FACT_STORE_SCHEMA_CONTRACT = "deepcode.kernel.fact-store.v2.sqlite.5"
+CURRENT_FACT_STORE_FILE_NAME = "kernel-v2-sqlite-6.sqlite3"
+PREDECESSOR_FACT_STORE_FILE_NAME = "kernel-v2.sqlite3"
 HOST_HEADER = "x-deepcode-host-shell-capability"
 PROVIDER_TRACE_CAPABILITY_HEADER = "x-deepcode-provider-trace-capability"
 PROVIDER_TRACE_DIGEST_HEADER = "x-deepcode-provider-trace-digest"
@@ -2836,8 +2841,190 @@ class CanonicalRunSnapshot:
     fact_sequences: tuple[tuple[str, int], ...]
 
 
+@dataclass(frozen=True)
+class PredecessorFactStoreSnapshot:
+    contents: bytes
+    sha256: str
+
+
 def kernel_fact_store(config_root: pathlib.Path) -> pathlib.Path:
-    return config_root / "kernel" / "kernel-v2.sqlite3"
+    return config_root / "kernel" / CURRENT_FACT_STORE_FILE_NAME
+
+
+def predecessor_kernel_fact_store(config_root: pathlib.Path) -> pathlib.Path:
+    return config_root / "kernel" / PREDECESSOR_FACT_STORE_FILE_NAME
+
+
+def fact_store_sidecars(database: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    return tuple(
+        pathlib.Path(f"{database}{suffix}")
+        for suffix in ("-journal", "-shm", "-wal")
+    )
+
+
+def fact_store_schema_meta(database: pathlib.Path) -> dict[str, str]:
+    require(database.is_file(), f"fact store is missing: {database.name}")
+    try:
+        with sqlite3.connect(
+            f"file:{database}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        ) as connection:
+            rows = connection.execute(
+                "SELECT key, value FROM schema_meta ORDER BY key"
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise IntegrationFailure(
+            f"fact-store schema metadata query failed for {database.name}: "
+            f"{safe_diagnostic(error)}"
+        ) from error
+    require(
+        all(
+            isinstance(key, str)
+            and isinstance(value, str)
+            and key
+            for key, value in rows
+        ),
+        f"fact-store schema metadata is invalid for {database.name}",
+    )
+    return dict(rows)
+
+
+def seed_incompatible_predecessor_fact_store(
+    config_root: pathlib.Path,
+) -> PredecessorFactStoreSnapshot:
+    predecessor = predecessor_kernel_fact_store(config_root)
+    current = kernel_fact_store(config_root)
+    predecessor.parent.mkdir(parents=True, exist_ok=True)
+    require(
+        not predecessor.exists() and not current.exists(),
+        "fact-store cutover fixture requires an unused config root",
+    )
+    try:
+        with sqlite3.connect(predecessor, timeout=5.0) as connection:
+            connection.execute(
+                "CREATE TABLE schema_meta ("
+                "key TEXT PRIMARY KEY NOT NULL,"
+                "value TEXT NOT NULL"
+                ") WITHOUT ROWID"
+            )
+            connection.executemany(
+                "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)",
+                (
+                    ("schema_version", FACT_STORE_SCHEMA_VERSION),
+                    ("schema_contract", PREDECESSOR_FACT_STORE_SCHEMA_CONTRACT),
+                    ("abi_version", ABI_VERSION),
+                ),
+            )
+    except sqlite3.Error as error:
+        raise IntegrationFailure(
+            f"incompatible predecessor fact-store fixture could not be created: "
+            f"{safe_diagnostic(error)}"
+        ) from error
+    require(
+        not any(path.exists() for path in fact_store_sidecars(predecessor)),
+        "predecessor fixture retained a SQLite sidecar before daemon startup",
+    )
+    contents = predecessor.read_bytes()
+    require(contents, "predecessor fixture is empty")
+    require(
+        fact_store_schema_meta(predecessor)
+        == {
+            "abi_version": ABI_VERSION,
+            "schema_contract": PREDECESSOR_FACT_STORE_SCHEMA_CONTRACT,
+            "schema_version": FACT_STORE_SCHEMA_VERSION,
+        },
+        "predecessor fixture schema discriminator is invalid",
+    )
+    return PredecessorFactStoreSnapshot(
+        contents=contents,
+        sha256=hashlib.sha256(contents).hexdigest(),
+    )
+
+
+def host_startup_uses_current_contract_store_without_touching_incompatible_predecessor(
+    owned: OwnedDaemon,
+    config_root: pathlib.Path,
+    predecessor_snapshot: PredecessorFactStoreSnapshot,
+) -> None:
+    deadline = time.monotonic() + 30.0
+    last_observation = "health endpoint was not observed"
+    while time.monotonic() < deadline:
+        require(
+            owned.process.poll() is None,
+            f"daemon exited before authenticated readiness: {owned.diagnostics()}",
+        )
+        try:
+            status, body = request_json(
+                owned.base_url,
+                "GET",
+                "/api/health",
+                timeout=0.5,
+            )
+        except IntegrationFailure as error:
+            last_observation = safe_diagnostic(error, owned.host_capability)
+            time.sleep(0.05)
+            continue
+        data = body.get("data") if isinstance(body, dict) else None
+        readiness = (
+            data.get("hostStartupReadinessV2")
+            if isinstance(data, dict)
+            else None
+        )
+        if (
+            status == 200
+            and isinstance(body, dict)
+            and body.get("ok") is True
+            and isinstance(data, dict)
+            and data.get("service") == "deepcode-kernel-daemon"
+            and data.get("ok") is True
+            and data.get("status") == "ok"
+            and data.get("kernel") == "ready"
+            and isinstance(readiness, dict)
+            and readiness.get("ready") is True
+            and readiness.get("phase") == "ready"
+        ):
+            break
+        last_observation = safe_diagnostic(body, owned.host_capability)
+        time.sleep(0.05)
+    else:
+        raise IntegrationFailure(
+            "daemon did not reach authenticated Host readiness after fact-store cutover: "
+            f"{last_observation}; {owned.diagnostics()}"
+        )
+
+    predecessor = predecessor_kernel_fact_store(config_root)
+    current = kernel_fact_store(config_root)
+    current_meta = fact_store_schema_meta(current)
+    require(
+        current_meta
+        == {
+            "abi_version": ABI_VERSION,
+            "schema_contract": CURRENT_FACT_STORE_SCHEMA_CONTRACT,
+            "schema_version": FACT_STORE_SCHEMA_VERSION,
+        },
+        "daemon did not create the exact current fact-store schema discriminator",
+    )
+    predecessor_contents = predecessor.read_bytes()
+    require(
+        predecessor_contents == predecessor_snapshot.contents
+        and hashlib.sha256(predecessor_contents).hexdigest()
+        == predecessor_snapshot.sha256,
+        "daemon changed the incompatible predecessor fact-store bytes",
+    )
+    require(
+        fact_store_schema_meta(predecessor)
+        == {
+            "abi_version": ABI_VERSION,
+            "schema_contract": PREDECESSOR_FACT_STORE_SCHEMA_CONTRACT,
+            "schema_version": FACT_STORE_SCHEMA_VERSION,
+        },
+        "daemon changed the incompatible predecessor schema discriminator",
+    )
+    require(
+        not any(path.exists() for path in fact_store_sidecars(predecessor)),
+        "daemon opened the incompatible predecessor and created a SQLite sidecar",
+    )
 
 
 def require_no_execution_fact_domains(
@@ -3008,7 +3195,10 @@ def canonical_run_snapshot(
 ) -> CanonicalRunSnapshot:
     run_id = read_host_kernel_run_identity(config_root, session_id, host_run_id)
     database = kernel_fact_store(config_root)
-    require(database.is_file(), "exact kernel-v2.sqlite3 fact store is missing")
+    require(
+        database.is_file(),
+        f"exact {CURRENT_FACT_STORE_FILE_NAME} fact store is missing",
+    )
     try:
         with sqlite3.connect(
             f"file:{database}?mode=ro",
@@ -5283,9 +5473,18 @@ def run() -> None:
         workspace.mkdir(parents=True)
         (workspace / "README.md").write_text("Host v2 integration workspace\n", encoding="utf-8")
         write_profile(config_root, provider.port)
+        predecessor_fact_store = seed_incompatible_predecessor_fact_store(config_root)
         port = reserve_port()
 
         owned = start_daemon(config_root, port, owner_registry, generation=1)
+        host_startup_uses_current_contract_store_without_touching_incompatible_predecessor(
+            owned,
+            config_root,
+            predecessor_fact_store,
+        )
+        passed(
+            "Host startup uses current contract store without touching incompatible predecessor"
+        )
         inspect_workspace_public_path(owned, workspace)
         passed("Host workspace resolution")
 
