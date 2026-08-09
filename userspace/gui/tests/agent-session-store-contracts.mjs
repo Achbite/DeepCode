@@ -1414,87 +1414,112 @@ const contractCases = [
       host.register(activationScenario);
       const runStore = await freshStore(`${this.id}-run`);
       const activationStore = await freshStore(`${this.id}-activation`);
-      await activate(runStore, runSession);
-      runScenario.startStatus = 'running';
+      try {
+        await activate(runStore, runSession);
+        runScenario.startStatus = 'running';
 
-      const hangOnce = (scenario, kind, openSse = false) => {
-        let first = true;
-        scenario.handlers.set(kind, (context) => {
-          if (!first) {
-            context.error(503, `${kind} trailing refresh rejected`);
+        const hangOnce = (scenario, kind, openSse = false) => {
+          let first = true;
+          scenario.handlers.set(kind, (context) => {
+            if (!first) {
+              context.error(503, `${kind} trailing refresh rejected`);
+              return true;
+            }
+            first = false;
+            if (openSse) context.sseOpen();
             return true;
+          });
+        };
+        hangOnce(runScenario, 'timeline');
+        hangOnce(runScenario, 'runGet');
+        let firstTimelineStream = true;
+        runScenario.handlers.set('timelineStream', (context) => {
+          context.sseOpen();
+          if (firstTimelineStream) {
+            firstTimelineStream = false;
+            context.response.end();
           }
-          first = false;
-          if (openSse) context.sseOpen();
           return true;
         });
-      };
-      hangOnce(runScenario, 'timeline');
-      hangOnce(runScenario, 'runGet');
-      let firstTimelineStream = true;
-      runScenario.handlers.set('timelineStream', (context) => {
-        context.sseOpen();
-        if (firstTimelineStream) {
-          firstTimelineStream = false;
-          context.response.end();
-        }
-        return true;
-      });
-      hangOnce(activationScenario, 'activate');
+        hangOnce(activationScenario, 'activate');
 
-      const startedAt = Date.now();
-      const send = runStore.getState().sendMessage('bounded progress');
-      const activation =
-        activationStore.getState().activateSession(activationSession);
-      await waitFor(
-        () => runScenario.recordsOf('timeline').length > 0
-          && runScenario.recordsOf('runGet').length > 0
-          && runScenario.recordsOf('timelineStream').length > 0
-          && activationScenario.recordsOf('activate').length > 0,
-        'all bounded Host requests'
-      );
-      await withTimeout(
-        Promise.all([send, activation]),
-        8_000,
-        'bounded GUI operations'
-      );
-      const elapsed = Date.now() - startedAt;
-      assert(
-        elapsed >= 4_500 && elapsed < 8_000,
-        `bounded operations settled outside the 5 second boundary: ${elapsed}ms`
-      );
-      await waitFor(
-        () => [
+        const startedAt = Date.now();
+        const send = runStore.getState().sendMessage('bounded progress');
+        const activation =
+          activationStore.getState().activateSession(activationSession);
+        await waitFor(
+          () => runScenario.recordsOf('timeline').length > 0
+            && runScenario.recordsOf('runGet').length > 0
+            && runScenario.recordsOf('timelineStream').length > 0
+            && activationScenario.recordsOf('activate').length > 0,
+          'all bounded Host requests'
+        );
+        const [admitted] = await withTimeout(
+          Promise.all([send, activation]),
+          8_000,
+          'bounded GUI operations'
+        );
+        assert.equal(
+          admitted,
+          true,
+          'bounded observation timeouts changed a successfully admitted Run into a failed send'
+        );
+        const elapsed = Date.now() - startedAt;
+        assert(
+          elapsed >= 4_500 && elapsed < 8_000,
+          `bounded operations settled outside the 5 second boundary: ${elapsed}ms`
+        );
+        await waitFor(
+          () => [
+            [runScenario, 'timeline'],
+            [runScenario, 'runGet'],
+            [activationScenario, 'activate'],
+          ].every(([scenario, kind]) =>
+            scenario.recordsOf(kind).some((record) => record.aborted)
+          ),
+          'server-side AbortSignal observations',
+          1_500
+        );
+        for (const [scenario, kind] of [
           [runScenario, 'timeline'],
           [runScenario, 'runGet'],
           [activationScenario, 'activate'],
-        ].every(([scenario, kind]) =>
-          scenario.recordsOf(kind).some((record) => record.aborted)
-        ),
-        'server-side AbortSignal observations',
-        1_500
-      );
-      for (const [scenario, kind] of [
-        [runScenario, 'timeline'],
-        [runScenario, 'runGet'],
-        [activationScenario, 'activate'],
-      ]) {
+        ]) {
+          assert(
+            scenario.recordsOf(kind).some((record) => record.aborted),
+            `${kind} request did not observe AbortSignal cancellation`
+          );
+        }
         assert(
-          scenario.recordsOf(kind).some((record) => record.aborted),
-          `${kind} request did not observe AbortSignal cancellation`
+          runStore.getState().runningSessionIds.includes(runSession),
+          'an admitted nonterminal Run was cleared by an observation timeout'
         );
+        assert.equal(
+          activationStore.getState().loading,
+          false,
+          'bounded activation failure left the GUI loading'
+        );
+
+        const admittedRun = [...runScenario.runRoutes.values()].find(
+          (route) => route.sessionId === runSession
+        );
+        assert(admittedRun, 'bounded Run admission identity is missing');
+        runScenario.setRunStatus(admittedRun.hostRunId, 'completed');
+        runScenario.timelines.set(runSession, emptyTimeline(runSession, 2));
+        runScenario.handlers.delete('timeline');
+        runScenario.handlers.delete('runGet');
+        runScenario.handlers.delete('timelineStream');
+        await runStore.getState().refreshActiveSessionContext();
+        await waitFor(
+          () => !runStore.getState().runningSessionIds.includes(runSession),
+          'terminal bounded Run bookkeeping'
+        );
+      } finally {
+        runScenario.handlers.clear();
+        activationScenario.handlers.clear();
+        await cleanupStore(runStore);
+        await cleanupStore(activationStore);
       }
-      assert(
-        !runStore.getState().runningSessionIds.includes(runSession),
-        'bounded Run failure left the GUI running'
-      );
-      assert.equal(
-        activationStore.getState().loading,
-        false,
-        'bounded activation failure left the GUI loading'
-      );
-      await cleanupStore(runStore);
-      await cleanupStore(activationStore);
     },
   },
   {

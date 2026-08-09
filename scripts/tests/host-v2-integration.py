@@ -9,6 +9,7 @@ manual CLI/GUI/TUI experience validation.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import http.server
@@ -65,9 +66,6 @@ CLI_TOOL_FINAL_TEXT = (
 CLI_DELETE_PLAN_PROMPT = (
     "Propose one PlanAction to delete host-delete-preview-owned.txt, but do "
     "not execute it without explicit user confirmation."
-)
-CLI_DELETE_REPLAN_TEXT = (
-    "The rejected deletion Plan will not be replaced or executed."
 )
 CLI_DELETE_FINAL_TEXT = (
     "The deletion Plan was rejected and the test-owned file remains unchanged."
@@ -395,7 +393,6 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
                 )
         elif current_input == CLI_DELETE_PLAN_PROMPT:
             target_kind = provider_current_input_target_kind(request)
-            guidance = provider_current_input_guidance(request)
             if target_kind == "finalAnswer":
                 require(
                     not request.get("tools"),
@@ -403,15 +400,6 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
                 )
                 chunks = provider_final_chunks(
                     CLI_DELETE_FINAL_TEXT,
-                    reasoning=DELETE_PLAN_REASONING,
-                )
-            elif guidance:
-                require(
-                    target_kind == "planning",
-                    "delete Plan rejection did not re-enter a planning turn",
-                )
-                chunks = provider_final_chunks(
-                    CLI_DELETE_REPLAN_TEXT,
                     reasoning=DELETE_PLAN_REASONING,
                 )
             else:
@@ -697,7 +685,7 @@ def provider_current_input_guidance(
     ]
 
 
-def provider_canonical_fact_payloads(
+def provider_plan_decision_payloads(
     request: dict[str, Any],
 ) -> list[dict[str, Any]]:
     messages = request.get("messages")
@@ -717,7 +705,33 @@ def provider_canonical_fact_payloads(
         if (
             isinstance(payload, dict)
             and payload.get("schemaVersion")
-            == "deepcode.session.provider-canonical-facts.v2"
+            == "deepcode.session.provider-plan-decision.v2"
+        ):
+            payloads.append(payload)
+    return payloads
+
+
+def provider_tool_observation_payloads(
+    request: dict[str, Any],
+) -> list[dict[str, Any]]:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    payloads: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schemaVersion")
+            == "deepcode.session.provider-tool-observations.v1"
         ):
             payloads.append(payload)
     return payloads
@@ -854,40 +868,42 @@ def assert_fixed_tool_provider_sequence(
         ("planning continuation", continuation),
         ("bound finalAnswer", final_answer),
     ):
-        fact_payloads = provider_canonical_fact_payloads(request)
+        observation_payloads = provider_tool_observation_payloads(request)
         require(
-            len(fact_payloads) == 1,
-            f"{label} omitted the canonical Kernel fact envelope",
+            len(observation_payloads) == 1,
+            f"{label} omitted the safe Provider tool-observation envelope",
         )
-        facts = fact_payloads[0].get("facts")
+        observations = observation_payloads[0].get("observations")
         require(
-            isinstance(facts, list),
-            f"{label} canonical Kernel fact envelope omitted facts",
+            isinstance(observations, list),
+            f"{label} Provider tool-observation envelope omitted observations",
         )
         completed = [
-            fact
-            for fact in facts
-            if isinstance(fact, dict)
-            and fact.get("factKind") == "toolCompleted"
+            observation
+            for observation in observations
+            if isinstance(observation, dict)
+            and observation.get("kind") == "tool"
+            and observation.get("canonicalAction") == FIXED_TOOL_ID
+            and observation.get("outcome") == "completed"
         ]
         require(
             len(completed) == 1,
-            f"{label} did not receive one canonical toolCompleted fact; "
+            f"{label} did not receive one safe completed fs.read observation; "
             f"safeSummary={json.dumps(fixed_tool_provider_request_summary(request), separators=(',', ':'))}",
         )
 
 
 def fixed_tool_provider_request_summary(request: dict[str, Any]) -> dict[str, Any]:
-    fact_payloads = provider_canonical_fact_payloads(request)
-    fact_kinds = [
-        fact.get("factKind")
-        for payload in fact_payloads
-        for fact in (
-            payload.get("facts")
-            if isinstance(payload.get("facts"), list)
+    observation_payloads = provider_tool_observation_payloads(request)
+    observation_outcomes = [
+        observation.get("outcome") or observation.get("factKind")
+        for payload in observation_payloads
+        for observation in (
+            payload.get("observations")
+            if isinstance(payload.get("observations"), list)
             else []
         )
-        if isinstance(fact, dict) and isinstance(fact.get("factKind"), str)
+        if isinstance(observation, dict)
     ]
     messages = request.get("messages")
     return {
@@ -906,7 +922,7 @@ def fixed_tool_provider_request_summary(request: dict[str, Any]) -> dict[str, An
             request,
             FIXED_TOOL_CALL_ID,
         ),
-        "canonicalFactKinds": fact_kinds,
+        "toolObservationOutcomes": observation_outcomes,
     }
 
 
@@ -1818,11 +1834,18 @@ def _darwin_process_references_owner(pid: int, record: OwnerRecord) -> bool | No
 def owned_member_pids(record: OwnerRecord) -> tuple[int, ...] | None:
     owned: list[int] = []
     darwin = not pathlib.Path("/proc").is_dir() and os.uname().sysname == "Darwin"
+    exact_group_members = (
+        set(process_group_member_pids(record.process_group))
+        if darwin
+        else set()
+    )
     for pid in _all_process_pids():
         if darwin:
             referenced = _darwin_process_references_owner(pid, record)
             if referenced is None:
-                return None
+                if pid in exact_group_members:
+                    return None
+                continue
             if referenced:
                 owned.append(pid)
             continue
@@ -2083,6 +2106,11 @@ def start_daemon(
     )
     owned: OwnedDaemon | None = None
     process: subprocess.Popen[bytes] | None = None
+    trusted_parent_executable = capture_process_identity(os.getpid()).executable
+    require(
+        trusted_parent_executable,
+        "trusted daemon launcher parent executable identity is unavailable",
+    )
 
     try:
         release_read_fd, release_write_fd = os.pipe()
@@ -2117,6 +2145,7 @@ def start_daemon(
         allowed_executables = tuple(
             dict.fromkeys(
                 (
+                    trusted_parent_executable,
                     str(pathlib.Path(sys.executable).resolve(strict=True)),
                     str(DAEMON.resolve(strict=True)),
                 )
@@ -2212,7 +2241,36 @@ def start_daemon(
                     and identity.get("pid") == process.pid,
                     "daemon identity did not match the owned process",
                 )
-                return owned
+                try:
+                    health_status, health_body = request_json(
+                        owned.base_url,
+                        "GET",
+                        "/api/health",
+                        host_capability=owned.host_capability,
+                        timeout=0.5,
+                    )
+                except IntegrationFailure:
+                    time.sleep(0.05)
+                    continue
+                health_data = (
+                    health_body.get("data")
+                    if isinstance(health_body, dict)
+                    else None
+                )
+                readiness = (
+                    health_data.get("hostStartupReadinessV2")
+                    if isinstance(health_data, dict)
+                    else None
+                )
+                if (
+                    health_status == 200
+                    and isinstance(health_body, dict)
+                    and health_body.get("ok") is True
+                    and isinstance(readiness, dict)
+                    and readiness.get("ready") is True
+                    and readiness.get("phase") == "ready"
+                ):
+                    return owned
             time.sleep(0.05)
         raise IntegrationFailure(
             f"daemon generation {generation} did not become ready: {owned.diagnostics()}"
@@ -2273,6 +2331,8 @@ def wait_for_owner_change(
 ) -> OwnerObservation:
     deadline = time.monotonic() + timeout
     while True:
+        if process is not None:
+            process.poll()
         observation = observe_owner(record)
         if observation.state == "absent":
             return observation
@@ -2394,6 +2454,7 @@ def cleanup_owner_record(
     *,
     process: subprocess.Popen[bytes] | None,
     graceful_owner: OwnedDaemon | None,
+    owned_log_handle: Any | None,
 ) -> None:
     failures: list[str] = []
     observation = observe_owner(record)
@@ -2426,7 +2487,6 @@ def cleanup_owner_record(
     if observation.state != "absent":
         raise _unsafe_owner_observation(record, observation, "final owner cleanup")
 
-    require_owner_absence(record)
     if process is not None:
         try:
             process.wait(timeout=1.0)
@@ -2434,7 +2494,11 @@ def cleanup_owner_record(
             raise IntegrationFailure(
                 f"owner {record.owner_id} leader remained unreaped; owner evidence was retained"
             ) from error
+    if owned_log_handle is not None and not owned_log_handle.closed:
+        owned_log_handle.close()
+    require_owner_absence(record)
     require_listener_rebindable(record)
+    require_no_open_path_references(pathlib.Path(record.run_root))
     registry.unregister(record)
     if failures:
         raise IntegrationFailure("; ".join(failures))
@@ -2447,6 +2511,7 @@ def stop_owned_process_group(owned: OwnedDaemon, *, graceful: bool) -> None:
             owned.owner_record,
             process=owned.process,
             graceful_owner=owned if graceful else None,
+            owned_log_handle=owned.log_handle,
         )
     finally:
         if owned.owner_registered and not owned.owner_registry.contains(owned.owner_record):
@@ -2461,6 +2526,7 @@ def run_cli(
     arguments: list[str],
     *,
     expect_success: bool,
+    timeout: float = 30.0,
 ) -> subprocess.CompletedProcess[str]:
     environment = minimal_child_environment()
     environment["DEEPCODE_HOST_SHELL_CAPABILITY_V2"] = host_capability
@@ -2478,7 +2544,7 @@ def run_cli(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=30.0,
+        timeout=timeout,
         check=False,
     )
     if expect_success:
@@ -2493,6 +2559,49 @@ def run_cli(
             f"CLI {' '.join(arguments)} unexpectedly succeeded",
         )
     return completed
+
+
+def require_cli_final_answer_and_safe_review(
+    completed: subprocess.CompletedProcess[str],
+    expected_final_text: str,
+    *,
+    planned: int,
+    effects: int,
+    unexecuted: int = 0,
+    rejected: int = 0,
+    cleanup: int = 0,
+    indeterminate: int = 0,
+    expected_effect: str | None = None,
+) -> None:
+    rendered = completed.stdout.strip()
+    expected_counts = (
+        f"{planned} planned; {effects} effects; {unexecuted} unexecuted; "
+        f"{rejected} rejected; {cleanup} cleanup; {indeterminate} indeterminate."
+    )
+    require(
+        rendered.startswith(f"{expected_final_text}\n\n")
+        and expected_counts in rendered,
+        "CLI output omitted its exact final answer prefix or safe Review counts: "
+        f"stdout={safe_diagnostic(rendered)!r}",
+    )
+    if expected_effect is not None:
+        require(
+            "## Actual effects" in rendered and expected_effect in rendered,
+            "CLI readable Review omitted the expected actual effect",
+        )
+    for private in (
+        "auditRef",
+        "provider.started",
+        "wait.changed",
+        "fact-",
+        "invocation-",
+        "effect-",
+        "operation-",
+    ):
+        require(
+            private not in rendered,
+            f"CLI readable Review leaked raw audit identity marker {private}",
+        )
 
 
 def validate_transport_lanes(daemon: OwnedDaemon) -> None:
@@ -2762,27 +2871,19 @@ def require_delete_plan_waiting_projection(
         and len(scope_items) == 1
         and isinstance(scope_items[0], dict)
         and scope_items[0].get("targetRefs")
-        == [f"workspace:Write:{DELETE_TARGET_RELATIVE_PATH}"],
+        == [f"workspace:Write:File:{DELETE_TARGET_RELATIVE_PATH}"],
         "delete Plan canonical scope was not exactly the test-owned relative file",
     )
-    task_projection = timeline.get("taskProjection")
-    task_items = (
-        task_projection.get("items")
-        if isinstance(task_projection, dict)
-        else None
-    )
     require(
-        isinstance(task_items, list)
-        and len(task_items) == 1
-        and isinstance(task_items[0], dict)
-        and task_items[0].get("status") == "awaitingApproval",
-        "delete Plan task did not remain awaitingApproval before user confirmation",
+        timeline.get("taskProjection") is None,
+        "unaccepted delete Plan leaked a root taskProjection before user confirmation",
     )
     return kernel_run_id, plan_revision
 
 
 def require_delete_plan_rejected_projection(
     timeline: dict[str, Any],
+    plan_revision: str,
 ) -> None:
     run_projection = timeline.get("runProjection")
     require(
@@ -2800,18 +2901,9 @@ def require_delete_plan_rejected_projection(
         ),
         "rejected delete Plan retained a pending interaction",
     )
-    task_projection = timeline.get("taskProjection")
-    task_items = (
-        task_projection.get("items")
-        if isinstance(task_projection, dict)
-        else None
-    )
     require(
-        isinstance(task_items, list)
-        and len(task_items) == 1
-        and isinstance(task_items[0], dict)
-        and task_items[0].get("status") == "unexecuted",
-        "rejected delete Plan was not projected as one unexecuted task",
+        timeline.get("taskProjection") is None,
+        "rejected unaccepted delete Plan leaked a root taskProjection",
     )
     turn = current_timeline_turn(timeline)
     require(
@@ -2819,6 +2911,21 @@ def require_delete_plan_rejected_projection(
         "rejected delete Plan synthesized tool work without an invocation",
     )
     blocks = turn.get("blocks")
+    rejected_plans = [
+        block
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("kind") == "plan"
+        and isinstance(block.get("interaction"), dict)
+        and block["interaction"].get("targetId") == plan_revision
+        and block["interaction"].get("state") == "rejected"
+        and isinstance(block["interaction"].get("selectedDecision"), dict)
+        and block["interaction"]["selectedDecision"].get("decision") == "reject"
+    ] if isinstance(blocks, list) else []
+    require(
+        len(rejected_plans) == 1,
+        "rejected delete Plan lost its exact rejected decision identity",
+    )
     committed_finals = [
         block
         for block in blocks
@@ -2960,6 +3067,7 @@ def host_startup_uses_current_contract_store_without_touching_incompatible_prede
                 owned.base_url,
                 "GET",
                 "/api/health",
+                host_capability=owned.host_capability,
                 timeout=0.5,
             )
         except IntegrationFailure as error:
@@ -3571,39 +3679,44 @@ def validate_fs_delete_plan_preview_rejection_without_effect(
                 separators=(",", ":"),
             )
         ) from error
-    require(
-        CLI_DELETE_FINAL_TEXT in rejected.stdout,
-        "delete Plan rejection did not print its bound committed finalAnswer",
+    require_cli_final_answer_and_safe_review(
+        rejected,
+        CLI_DELETE_FINAL_TEXT,
+        planned=1,
+        effects=0,
+        unexecuted=1,
     )
     provider_count_rejected = provider.request_count()
     require(
-        provider_count_rejected == provider_count_before + 3,
-        "delete Plan rejection did not use proposal, replan, and finalAnswer Provider turns",
+        provider_count_rejected == provider_count_before + 2,
+        "delete Plan rejection did not use one proposal and one bound finalAnswer turn",
     )
     requests = provider.request_snapshot()[
         provider_count_before:provider_count_rejected
     ]
     require(
-        len(requests) == 3,
+        len(requests) == 2,
         "delete Plan Provider request snapshot changed during validation",
     )
-    replan_request = requests[1]
-    final_request = requests[2]
+    final_request = requests[1]
     for request in requests:
         assert_provider_received_current_input(
             request,
             CLI_DELETE_PLAN_PROMPT,
         )
+    plan_decisions = provider_plan_decision_payloads(final_request)
+    bound_decision = (
+        plan_decisions[0].get("planDecision")
+        if len(plan_decisions) == 1
+        else None
+    )
     require(
-        provider_current_input_target_kind(replan_request) == "planning"
-        and bool(provider_current_input_guidance(replan_request))
-        and provider_request_exposes_tool(
-            replan_request,
-            SESSION_PLAN_PROPOSAL_TOOL_NAME,
-        )
-        and provider_current_input_target_kind(final_request) == "finalAnswer"
-        and not final_request.get("tools"),
-        "delete Plan rejection did not preserve the replan and no-tools finalAnswer boundaries",
+        provider_current_input_target_kind(final_request) == "finalAnswer"
+        and not final_request.get("tools")
+        and isinstance(bound_decision, dict)
+        and bound_decision.get("planRevision") == plan_revision
+        and bound_decision.get("decision") == "reject",
+        "delete Plan rejection did not preserve the decision-bound no-tools finalAnswer boundary",
     )
 
     host_run_id = read_cli_ask_host_run_identity(config_root, session_id)
@@ -3622,7 +3735,8 @@ def validate_fs_delete_plan_preview_rejection_without_effect(
         "rejected delete Plan",
     )
     require_delete_plan_rejected_projection(
-        read_agent_timeline(daemon, session_id)
+        read_agent_timeline(daemon, session_id),
+        plan_revision,
     )
     require(
         target.is_file()
@@ -4036,13 +4150,100 @@ def validate_provider_trace_export(
         record.get("recordKind") if isinstance(record, dict) else None
         for record in records
     ]
+    response_chunks = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("recordKind") == "responseChunk"
+    ]
     require(
         len(records) == metadata["recordCount"]
         and record_kinds[0] == "request"
-        and "rawUpstreamEnvelope" in record_kinds
-        and "normalizedEvent" in record_kinds
+        and record_kinds[1] == "responseBoundary"
+        and bool(response_chunks)
+        and all(kind == "responseChunk" for kind in record_kinds[2:-2])
         and record_kinds[-2:] == ["terminal", "seal"],
         "Provider trace export lost its chronological chain boundaries",
+    )
+    expected_previous_digest: str | None = None
+    expected_item_ordinal = 1
+    raw_source_bytes = 0
+    raw_envelope_count = 0
+    item_kinds: list[str] = []
+    for expected_sequence, record in enumerate(records, start=1):
+        require(
+            isinstance(record, dict)
+            and record.get("sequence") == expected_sequence
+            and record.get("previousDigest") == expected_previous_digest,
+            "Provider trace outer record sequence or previousDigest chain changed",
+        )
+        digest = record.get("digest")
+        unsigned = dict(record)
+        unsigned.pop("digest", None)
+        canonical = json.dumps(
+            unsigned,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        require(
+            isinstance(digest, str)
+            and digest == f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+            "Provider trace outer record digest chain changed",
+        )
+        expected_previous_digest = digest
+        if record.get("recordKind") != "responseChunk":
+            continue
+        payload = record.get("payload")
+        require(isinstance(payload, dict), "Provider trace responseChunk payload is invalid")
+        items = payload.get("items")
+        require(
+            isinstance(items, list)
+            and payload.get("firstItemOrdinal") == expected_item_ordinal
+            and payload.get("itemCount") == len(items),
+            "Provider trace responseChunk item ordinals are not contiguous",
+        )
+        chunk_raw_bytes = 0
+        chunk_raw_count = 0
+        for item in items:
+            require(isinstance(item, dict), "Provider trace responseChunk item is invalid")
+            kind = item.get("kind")
+            require(
+                kind in {"rawUpstreamEnvelope", "normalizedEvent"},
+                "Provider trace responseChunk contains an unknown item kind",
+            )
+            item_kinds.append(kind)
+            if kind != "rawUpstreamEnvelope":
+                continue
+            try:
+                source = base64.b64decode(item.get("sourceBase64", ""), validate=True)
+            except (ValueError, TypeError) as error:
+                raise IntegrationFailure(
+                    "Provider trace raw upstream envelope is not canonical base64"
+                ) from error
+            require(
+                item.get("sourceEncoding") == "base64"
+                and item.get("sourceByteLength") == len(source)
+                and item.get("sourceDigest")
+                == f"sha256:{hashlib.sha256(source).hexdigest()}",
+                "Provider trace raw upstream envelope byte or digest identity changed",
+            )
+            chunk_raw_count += 1
+            chunk_raw_bytes += len(source)
+        require(
+            payload.get("rawEnvelopeCount") == chunk_raw_count
+            and payload.get("rawSourceBytes") == chunk_raw_bytes,
+            "Provider trace responseChunk raw byte totals changed",
+        )
+        expected_item_ordinal += len(items)
+        raw_envelope_count += chunk_raw_count
+        raw_source_bytes += chunk_raw_bytes
+    require(
+        "rawUpstreamEnvelope" in item_kinds
+        and "normalizedEvent" in item_kinds
+        and raw_source_bytes == metadata.get("rawSourceBytes")
+        and raw_envelope_count > 0
+        and expected_previous_digest == trace_digest,
+        "Provider trace nested item, byte total, or sealed digest identity changed",
     )
     for secret in (TEST_API_KEY, daemon.host_capability, capability):
         require(
@@ -4490,25 +4691,29 @@ def create_real_provider_trace_for_capacity(
     ordinal: int,
 ) -> dict[str, Any]:
     prompt = f"{CLI_PROMPT} Capacity trace {ordinal}."
-    cli_ask = run_cli(
-        daemon.base_url,
-        daemon.host_capability,
-        [
-            "--print",
-            "--session",
-            session_id,
-            "--workspace",
-            str(workspace),
-            "ask",
-            prompt,
-        ],
-        expect_success=True,
+    host_run = open_host_run(
+        daemon,
+        session_id,
+        config_root,
+        {
+            "op": "ask",
+            "content": prompt,
+            "workspacePath": str(workspace),
+            "noWorkspace": False,
+            "attachments": [],
+            "decisionKind": None,
+            "decision": None,
+            "guidance": None,
+            "runId": None,
+            "targetId": None,
+            "callerRequestId": f"caller-provider-trace-capacity-{ordinal}",
+        },
     )
+    host_run_id = host_run.get("runId") or host_run.get("id")
     require(
-        cli_ask.stdout.strip() == FINAL_TEXT,
-        "Provider trace capacity Session did not complete its real CLI turn",
+        isinstance(host_run_id, str) and host_run_id,
+        "Provider trace capacity RunOpen omitted its exact Host Run identity",
     )
-    host_run_id = read_cli_ask_host_run_identity(config_root, session_id)
     snapshot = canonical_run_snapshot(config_root, session_id, host_run_id)
     replay = load_real_provider_trace_replay(
         daemon,
@@ -5113,7 +5318,14 @@ def require_provider_trace_capability_invalid_after_restart(
         status == 400
         and isinstance(body, dict)
         and body.get("error") == "provider_trace_capability_invalid",
-        "Provider trace export capability survived daemon restart",
+        "restarted Provider trace capability check returned the wrong safe boundary: "
+        + json.dumps(
+            {
+                "status": status,
+                "error": body.get("error") if isinstance(body, dict) else None,
+            },
+            separators=(",", ":"),
+        ),
     )
 
 
@@ -5359,6 +5571,7 @@ def validated_owner_paths(
 
 def remove_exact_run_root(run_root: pathlib.Path, registry: OwnerRegistry) -> None:
     require(not registry._read(), "owner registry is not empty; run root was retained")
+    require_no_open_path_references(run_root)
     try:
         before = run_root.lstat()
     except FileNotFoundError:
@@ -5388,6 +5601,7 @@ def cleanup_registered_owners(
                 record,
                 process=None,
                 graceful_owner=None,
+                owned_log_handle=None,
             )
         except BaseException as error:
             failures.append(safe_diagnostic(error))
@@ -5411,7 +5625,72 @@ def cleanup_owned_resources_mode(run_root_text: str, registry_text: str) -> None
     cleanup_registered_owners(run_root, registry, delete_run_root=True)
 
 
+def require_no_open_path_references(root: pathlib.Path) -> None:
+    proc_root = pathlib.Path("/proc")
+    if proc_root.is_dir():
+        normalized_root = pathlib.Path(os.path.normpath(str(root)))
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            links: list[str] = []
+            try:
+                links.append(os.readlink(entry / "cwd"))
+                fd_root = entry / "fd"
+                if fd_root.is_dir():
+                    for descriptor in fd_root.iterdir():
+                        try:
+                            links.append(os.readlink(descriptor))
+                        except (FileNotFoundError, OSError):
+                            continue
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            require(
+                not any(
+                    (candidate := _normalized_absolute_path_reference(value))
+                    is not None
+                    and (
+                        candidate == normalized_root
+                        or candidate.is_relative_to(normalized_root)
+                    )
+                    for value in links
+                ),
+                f"owner root retained an open file reference from pid {entry.name}",
+            )
+        return
+
+    lsof = pathlib.Path("/usr/sbin/lsof")
+    if not lsof.is_file():
+        resolved = shutil.which("lsof")
+        require(resolved is not None, "lsof is required to verify owner root release")
+        lsof = pathlib.Path(resolved)
+    try:
+        completed = subprocess.run(
+            [str(lsof), "-nP", "-Fpn", "+D", str(root)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise IntegrationFailure(
+            f"owner root open-reference verification failed: {safe_diagnostic(error)}"
+        ) from error
+    require(
+        completed.returncode in (0, 1),
+        "owner root open-reference verification was inconclusive: "
+        + safe_diagnostic(completed.stderr),
+    )
+    require(
+        completed.returncode == 1 and not completed.stdout.strip(),
+        "owner root retained an open file reference: "
+        + safe_diagnostic(completed.stdout),
+    )
+
+
 def assert_no_open_test_resources(test_root: pathlib.Path) -> None:
+    require_no_open_path_references(test_root)
     proc_root = pathlib.Path("/proc")
     if proc_root.is_dir():
         root_text = str(test_root)
@@ -5594,6 +5873,7 @@ def run() -> None:
                     CLI_TOOL_PROMPT,
                 ],
                 expect_success=True,
+                timeout=90.0,
             )
         except subprocess.TimeoutExpired as error:
             fixed_requests = provider.request_snapshot()[
@@ -5609,11 +5889,12 @@ def run() -> None:
                 f"{json.dumps([fixed_tool_provider_request_summary(request) for request in fixed_requests], separators=(',', ':'))}; "
                 f"providerErrors={provider_errors or 'none'}"
             ) from error
-        require(
-            fixed_tool_cli.stdout.strip() == CLI_TOOL_FINAL_TEXT,
-            "fixed tool CLI turn did not print the post-Kernel Provider answer: "
-            f"stdout={safe_diagnostic(fixed_tool_cli.stdout, owned.host_capability)!r}; "
-            f"stderr={safe_diagnostic(fixed_tool_cli.stderr, owned.host_capability)!r}",
+        require_cli_final_answer_and_safe_review(
+            fixed_tool_cli,
+            CLI_TOOL_FINAL_TEXT,
+            planned=0,
+            effects=1,
+            expected_effect="Kernel: toolObserved",
         )
         provider_count_after_fixed_tool = provider.request_count()
         require(
@@ -5771,28 +6052,30 @@ def run() -> None:
 
         resource_session_id = create_session(owned)
         provider_count_before_resource_run = provider.request_count()
-        resource_cli_ask = run_cli(
-            owned.base_url,
-            owned.host_capability,
-            [
-                "--print",
-                "--session",
-                resource_session_id,
-                "--workspace",
-                str(workspace),
-                "ask",
-                CLI_PROMPT,
-            ],
-            expect_success=True,
-        )
-        require(
-            resource_cli_ask.stdout.strip() == FINAL_TEXT
-            and provider.request_count() == provider_count_before_resource_run + 1,
-            "Provider trace resource Session did not complete one real Provider turn",
-        )
-        resource_host_run_id = read_cli_ask_host_run_identity(
-            config_root,
+        resource_run = open_host_run(
+            owned,
             resource_session_id,
+            config_root,
+            {
+                "op": "ask",
+                "content": f"{CLI_PROMPT} Provider trace resource setup.",
+                "workspacePath": str(workspace),
+                "noWorkspace": False,
+                "attachments": [],
+                "decisionKind": None,
+                "decision": None,
+                "guidance": None,
+                "runId": None,
+                "targetId": None,
+                "callerRequestId": "caller-provider-trace-resource-setup",
+            },
+        )
+        resource_host_run_id = resource_run.get("runId") or resource_run.get("id")
+        require(
+            isinstance(resource_host_run_id, str)
+            and resource_host_run_id
+            and provider.request_count() == provider_count_before_resource_run + 1,
+            "Provider trace resource Session did not complete one public Host RunOpen",
         )
         resource_snapshot = canonical_run_snapshot(
             config_root,

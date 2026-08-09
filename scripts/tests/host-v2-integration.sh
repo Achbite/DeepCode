@@ -18,6 +18,32 @@ info() { printf '[INFO] %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
+if ! command -v cargo >/dev/null 2>&1; then
+  cargo_bin_dirs=()
+  if [ -n "${DEEPCODE_CARGO_BIN_DIR:-}" ]; then
+    case "$DEEPCODE_CARGO_BIN_DIR" in
+      /*) cargo_bin_dirs+=("$DEEPCODE_CARGO_BIN_DIR") ;;
+      *) fail "DEEPCODE_CARGO_BIN_DIR must be an absolute path" ;;
+    esac
+  fi
+  if [ -n "${CARGO_HOME:-}" ]; then
+    case "$CARGO_HOME" in
+      /*) cargo_bin_dirs+=("$CARGO_HOME/bin") ;;
+      *) fail "CARGO_HOME must be an absolute path" ;;
+    esac
+  elif [ -n "${HOME:-}" ]; then
+    case "$HOME" in
+      /*) cargo_bin_dirs+=("$HOME/.cargo/bin") ;;
+    esac
+  fi
+  for cargo_bin_dir in "${cargo_bin_dirs[@]}"; do
+    if [ -x "$cargo_bin_dir/cargo" ]; then
+      export PATH="$cargo_bin_dir:$PATH"
+      break
+    fi
+  done
+fi
+
 for tool in cargo node pnpm python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
 done
@@ -105,6 +131,8 @@ run_quiet "Session production build" \
   pnpm --filter @deepcode/session-core build
 run_quiet "Daemon and CLI production build" \
   cargo build --quiet -p deepcode-kernel-daemon -p deepcode-cli
+run_quiet "TUI supporting smoke tests" \
+  cargo test --quiet -p deepcode-tui --bin deepcode-tui
 pass "Host v2 production assets"
 
 info "Host workspace, public transport, restart, replay, and owner cleanup"
