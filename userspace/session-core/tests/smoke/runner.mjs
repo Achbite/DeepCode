@@ -20,6 +20,7 @@ const digest = (value) => `sha256:${value.repeat(64)}`;
 const WORKSPACE_DIGEST = digest('d');
 const REPLY_KINDS = Object.freeze({
   getToolContext: 'toolContext',
+  previewCapabilityBatch: 'capabilityScopePreviewBatchResult',
   submitToolIntent: 'toolIntentSubmission',
   queryFacts: 'kernelFactsProjected',
   advanceControlEpoch: 'controlEpochAdvanced',
@@ -218,8 +219,8 @@ function scriptedKernelPort(state) {
   return {
     run: { runId: RUN_ID, workspaceBindingDigest: WORKSPACE_DIGEST },
     getToolContext: (request) => invoke('getToolContext', request),
-    async previewCapability() {
-      throw new Error('scope preview is outside bounded smoke');
+    async previewCapabilityBatch() {
+      throw new Error('scope preview batch is outside bounded smoke');
     },
     submitToolIntent: (request) => invoke('submitToolIntent', request),
     queryFacts: (request) => invoke('queryFacts', request),

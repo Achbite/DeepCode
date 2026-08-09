@@ -15,8 +15,11 @@ import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
+  buildSessionPlanConfirmationAuthorityV2,
   canonicalJson,
+  checkpointSessionKernelStateV2,
   providerWireToolNameV2,
+  recordSessionPlanConfirmationAuthorityV2,
   sha256Hash,
 } from '../../dist/index.js';
 export { assert };
@@ -79,7 +82,7 @@ const CORPUS_IDENTITY_TOKENS = Object.freeze({
 });
 const REPLY_KINDS = Object.freeze({
   getToolContext: 'toolContext',
-  previewCapability: 'capabilityScopePreviewed',
+  previewCapabilityBatch: 'capabilityScopePreviewBatchResult',
   submitToolIntent: 'toolIntentSubmission',
   queryFacts: 'kernelFactsProjected',
   advanceControlEpoch: 'controlEpochAdvanced',
@@ -152,15 +155,16 @@ export function createPlan(overrides = {}) {
       planActionId: overrides.planActionId ?? 'plan-action-write-output',
       operationId: overrides.operationId ?? 'planned-operation-write-output',
       toolId: overrides.toolId ?? 'fs.write',
-      requestedResources: clone(overrides.requestedResources ?? [{
-        kind: 'workspacePath',
-        data: { path: 'output.txt', access: 'write' },
-      }]),
+      scopeIntent: clone(overrides.scopeIntent ?? {
+        kind: 'resourceScope',
+        data: {
+          requestedResources: [{
+            kind: 'workspacePath',
+            data: { path: 'output.txt', access: 'write' },
+          }],
+        },
+      }),
     },
-    previewArguments: clone(overrides.previewArguments ?? {
-      path: 'output.txt',
-      content: 'contract output',
-    }),
     idempotencyKey: overrides.idempotencyKey
       ?? 'plan-action-idempotency-1',
     deadline: clone(overrides.deadline ?? {
@@ -198,21 +202,40 @@ function exactPreview(preview, binding) {
   assert.deepEqual(previewBinding(preview), binding);
   return clone(preview);
 }
-export function createPreview(request, runId) {
-  const { manifest } = request;
-  const key = [runId, manifest.planRevision, manifest.planActionId,
-    manifest.operationId, request.rawArguments.path].join('|');
+export function createPreview(request, item, runId) {
+  const path = previewItemPath(item);
+  const key = [runId, request.planRevision, item.planActionId,
+    item.operationId, path].join('|');
   const previewKey = PREVIEW_KEY_BY_REQUEST[key];
   if (!previewKey) throw new Error(`No Rust golden capability preview for ${key}.`);
-  assert.deepEqual(request.rawArguments, previewKey === 'sessionSecondAction'
-    ? { path: 'second.txt', content: 'second' }
-    : { path: 'output.txt', content: 'contract output' });
   return exactPreview(KERNEL_CAPABILITY_PREVIEWS[previewKey], {
     runId, controlEpoch: request.expectedControlEpoch,
-    planRevision: manifest.planRevision, planActionId: manifest.planActionId,
-    operationId: manifest.operationId, toolId: manifest.toolId,
-    path: request.rawArguments.path, contextRef: request.toolContextRef,
+    planRevision: request.planRevision, planActionId: item.planActionId,
+    operationId: item.operationId, toolId: item.toolId,
+    path, contextRef: request.toolContextRef,
   });
+}
+export function createPreviewBatch(request, runId) {
+  return {
+    runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => ({
+      kind: 'previewed',
+      data: { preview: createPreview(request, item, runId) },
+    })),
+  };
+}
+function previewItemPath(item) {
+  if (item.scopeIntent.kind === 'exactInvocation') {
+    const path = item.scopeIntent.data.rawArguments.path;
+    assert.equal(typeof path, 'string');
+    return path;
+  }
+  const resources = item.scopeIntent.data.requestedResources;
+  assert.equal(resources.length, 1);
+  assert.equal(resources[0].kind, 'workspacePath');
+  return resources[0].data.path;
 }
 export function createExpandedPreview(request, decision) {
   const previewKey = { allow: 'corpusExpandedAllow',
@@ -662,6 +685,11 @@ export function createSessionHarness(options = {}) {
   const projection = {
     async project(event) {
       trace(`projection.project:${event.kind}:${event.projectionId}`);
+      const receipt = {
+        projectionId: event.projectionId,
+        projectionDigest: sha256Hash(canonicalJson(event)),
+        delivered: true,
+      };
       if (store.projectedIds.has(event.projectionId)) {
         const existing = store.projectionEvents.find(
           (candidate) =>
@@ -670,10 +698,11 @@ export function createSessionHarness(options = {}) {
         if (canonicalJson(existing) !== canonicalJson(event)) {
           throw new Error('projection_identity_conflict');
         }
-        return;
+        return receipt;
       }
       store.projectedIds.add(event.projectionId);
       store.projectionEvents.push(clone(event));
+      return receipt;
     },
     async flushPending() {
       trace('projection.flushPending');
@@ -690,9 +719,11 @@ export function createSessionHarness(options = {}) {
       kind: 'current',
       data: { contextRef: toolContextRef(kernelState.toolContext) },
     })),
-    previewCapability: (request) => invoke('previewCapability', request, () => {
-      throw new Error('previewCapability needs a fixture.');
-    }),
+    previewCapabilityBatch: (request) => invoke(
+      'previewCapabilityBatch', request, () => {
+        throw new Error('previewCapabilityBatch needs a fixture.');
+      }
+    ),
     submitToolIntent: (request) => invoke('submitToolIntent', request, () => {
       throw new Error('submitToolIntent needs a fixture.');
     }),
@@ -839,22 +870,67 @@ export async function persistPreviewAndAcceptPlan(
 ) {
   await harness.loop.recordPlan(plan);
   harness.enqueueKernel(
-    'previewCapability',
-    (request) => ({
-      kind: 'previewed',
-      data: { preview: createPreview(request, harness.initial.runId) },
+    'previewCapabilityBatch',
+    (request) => createPreviewBatch(request, harness.initial.runId)
+  );
+  const preview = await harness.loop.previewPlan(plan.planRevision);
+  assert.equal(preview.results.length, plan.actions.length);
+  assert.equal(preview.results[0].kind, 'previewed');
+  const providerTurnId = 'provider-turn-harness-plan-confirmation';
+  const confirmationEvent = {
+    projectionId: [
+      'run',
+      harness.initial.runId,
+      'plan',
+      plan.planRevision,
+      'confirmation-ready',
+    ].join(':'),
+    runId: harness.initial.runId,
+    recordedAt: NOW,
+    kind: 'plan.confirmationReady',
+    data: {
+      planRevision: plan.planRevision,
+      providerTurnId,
+      plan: clone(plan),
+      scopePreviews: preview.results.map((result) => {
+        assert.equal(result.kind, 'previewed');
+        return clone(result.data.preview);
+      }),
+      recordedAt: NOW,
+    },
+  };
+  const confirmationReceipt = await harness.ports.projection.project(
+    confirmationEvent
+  );
+  let state = harness.loop.snapshot();
+  state = recordSessionPlanConfirmationAuthorityV2(
+    state,
+    buildSessionPlanConfirmationAuthorityV2(state, {
+      providerTurnId,
+      providerResponseDigest: sha256Hash(canonicalJson({
+        kind: 'harness-plan-confirmation',
+        planRevision: plan.planRevision,
+      })),
+      recordedAt: NOW,
+      confirmationProjection: {
+        projectionId: confirmationReceipt.projectionId,
+        projectionDigest: confirmationReceipt.projectionDigest,
+      },
     })
   );
-  const preview = await harness.loop.previewPlanAction(
-    plan.actions[0].manifest.planActionId,
-    plan.planRevision
+  await harness.ports.persistence.persistCheckpoint(
+    checkpointSessionKernelStateV2(state, NOW)
   );
-  assert.equal(preview.kind, 'previewed');
+  harness.loop = await SessionKernelLoopV2.open(
+    harness.initial,
+    harness.ports,
+    { factsPageLimit: 32, maxFactsPagesPerWake: 8 }
+  );
   await harness.loop.decidePlan({
     planRevision: plan.planRevision,
     decision: 'accept',
   });
-  return { plan, preview: preview.data.preview };
+  return { plan, preview: preview.results[0].data.preview };
 }
 export function providerToolIntent(
   toolId,

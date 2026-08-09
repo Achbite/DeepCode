@@ -6,14 +6,15 @@ import {
   createPlan,
   createProviderCompletionReceipt,
   createPreview,
+  createPreviewBatch,
   openSessionHarness,
   providerAnswer,
   providerToolIntent,
   providerToolIntents,
 } from './harness.mjs';
 import {
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
   StrictSessionKernelProviderAdapterV2,
   canonicalJson,
   sha256Hash,
@@ -592,7 +593,6 @@ async function lateProviderOutputIsStaleAfterTheInputFence() {
 }
 
 async function planAcceptanceRequiresEveryCanonicalScopePreview() {
-  const harness = await openSessionHarness();
   const secondAction = {
     taskId: 'task-write-second',
     manifest: {
@@ -600,14 +600,15 @@ async function planAcceptanceRequiresEveryCanonicalScopePreview() {
       planActionId: 'plan-action-write-second',
       operationId: 'planned-operation-write-second',
       toolId: 'fs.write',
-      requestedResources: [{
-        kind: 'workspacePath',
-        data: { path: 'second.txt', access: 'write' },
-      }],
-    },
-    previewArguments: {
-      path: 'second.txt',
-      content: 'second',
+      scopeIntent: {
+        kind: 'resourceScope',
+        data: {
+          requestedResources: [{
+            kind: 'workspacePath',
+            data: { path: 'second.txt', access: 'write' },
+          }],
+        },
+      },
     },
     idempotencyKey: 'plan-action-idempotency-second',
     deadline: { kind: 'contractDefault', data: {} },
@@ -621,59 +622,70 @@ async function planAcceptanceRequiresEveryCanonicalScopePreview() {
     ...first,
     actions: [first.actions[0], secondAction],
   };
-  await harness.loop.recordPlan(plan);
 
-  await assert.rejects(
-    harness.loop.decidePlan({
-      planRevision: plan.planRevision,
-      decision: 'accept',
-    }),
-    (error) =>
-      error?.code === 'session_kernel_plan_scope_preview_required'
-  );
-
-  harness.enqueueKernel(
-    'previewCapability',
-    (request) => ({
-      kind: 'previewed',
-      data: { preview: createPreview(request, harness.initial.runId) },
-    })
-  );
-  await harness.loop.previewPlanAction(
-    'plan-action-write-first',
-    plan.planRevision
-  );
-  await assert.rejects(
-    harness.loop.decidePlan({
-      planRevision: plan.planRevision,
-      decision: 'accept',
-    }),
-    (error) =>
-      error?.code === 'session_kernel_plan_scope_preview_required'
-  );
-
-  harness.enqueueKernel(
-    'previewCapability',
-    (request) => ({
-      kind: 'previewed',
-      data: {
-        preview: createPreview(request, harness.initial.runId),
-      },
-    })
-  );
-  await harness.loop.previewPlanAction(
-    'plan-action-write-second',
-    plan.planRevision
-  );
-  const decision = await harness.loop.decidePlan({
-    planRevision: plan.planRevision,
-    decision: 'accept',
+  const partial = await openSessionHarness();
+  await partial.loop.recordPlan(plan);
+  partial.enqueueKernel('previewCapabilityBatch', (request) => {
+    const reply = createPreviewBatch(request, partial.initial.runId);
+    reply.results.pop();
+    return reply;
   });
-  assert.equal(decision.decision, 'accept');
+  await assert.rejects(
+    partial.loop.previewPlan(plan.planRevision),
+    (error) =>
+      error?.code === 'session_kernel_scope_preview_batch_correlation_mismatch',
+    'a partial batch reply must fail before any PlanAction preview is retained'
+  );
+  assert.deepEqual(partial.loop.snapshot().previews, {});
+
+  const mismatched = await openSessionHarness();
+  await mismatched.loop.recordPlan(plan);
+  mismatched.enqueueKernel('previewCapabilityBatch', (request) => {
+    const reply = createPreviewBatch(request, mismatched.initial.runId);
+    reply.results[1].data.preview.planActionId =
+      'plan-action-from-another-batch';
+    return reply;
+  });
+  await assert.rejects(
+    mismatched.loop.previewPlan(plan.planRevision),
+    (error) =>
+      error?.code === 'session_kernel_scope_preview_batch_correlation_mismatch',
+    'every batch result must retain its exact PlanAction correlation'
+  );
+  assert.deepEqual(mismatched.loop.snapshot().previews, {});
+
+  const harness = await openSessionHarness();
+  await harness.loop.recordPlan(plan);
+  harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPreviewBatch(request, harness.initial.runId)
+  );
+  const preview = await harness.loop.previewPlan(plan.planRevision);
+  assert.equal(harness.calls('previewCapabilityBatch').length, 1);
+  assert.deepEqual(
+    harness.calls('previewCapabilityBatch')[0].items,
+    plan.actions.map((action) => ({
+      planActionId: action.manifest.planActionId,
+      operationId: action.manifest.operationId,
+      idempotencyKey: action.idempotencyKey,
+      toolId: action.manifest.toolId,
+      scopeIntent: action.manifest.scopeIntent,
+      deadline: action.deadline,
+    })),
+    'the complete Plan must cross the Kernel boundary as one exact batch'
+  );
+  assert.deepEqual(
+    preview.results.map((result) => result.data.preview.planActionId),
+    plan.actions.map((action) => action.manifest.planActionId)
+  );
+  assert.deepEqual(
+    Object.keys(harness.loop.snapshot().previews).sort(),
+    plan.actions.map((action) => action.manifest.operationId).sort()
+  );
   assert.equal(
     harness.calls('submitToolIntent').length,
     0,
-    'Plan acceptance records authority intent but executes nothing'
+    'atomic Plan preview executes no ToolIntent'
   );
 }
 
@@ -684,13 +696,15 @@ async function planConfirmationRequiresEveryCurrentCanonicalPreview() {
     twoActionPlanDraft(),
     'I will inspect the exact requested scopes before asking for approval.'
   );
-  assert.equal(
-    incomplete.store.projectionEvents.some(
-      (event) => event.kind === 'plan.commentaryReleased'
+  assert.deepEqual(
+    incomplete.store.projectionEvents
+      .filter((event) =>
+        event.kind === 'plan.commentaryReleased'
         || event.kind === 'plan.confirmationReady'
-    ),
-    false,
-    'planning commentary and confirmation must remain private until settlement'
+      )
+      .map((event) => event.kind),
+    ['plan.commentaryReleased'],
+    'sealed commentary may publish before scope settlement, but confirmation may not'
   );
   await assert.rejects(
     incomplete.loop.publishPlanConfirmationReady(
@@ -698,36 +712,10 @@ async function planConfirmationRequiresEveryCurrentCanonicalPreview() {
     ),
     (error) =>
       error?.code
-        === 'session_kernel_plan_confirmation_preview_incomplete'
+        === 'session_kernel_plan_confirmation_preview_mismatch'
   );
   assert.equal(incomplete.store.planDecisions.size, 0);
   assert.equal(incomplete.calls('submitToolIntent').length, 0);
-
-  incomplete.enqueueKernel(
-    'previewCapability',
-    (request) => ({
-      kind: 'previewed',
-      data: {
-        preview: dynamicPlanPreview(
-          request,
-          incomplete.initial.runId
-        ),
-      },
-    })
-  );
-  await incomplete.loop.previewPlanAction(
-    incompletePlan.actions[0].manifest.planActionId,
-    incompletePlan.planRevision
-  );
-  await assert.rejects(
-    incomplete.loop.publishPlanConfirmationReady(
-      incompletePlan.planRevision
-    ),
-    (error) =>
-      error?.code
-        === 'session_kernel_plan_confirmation_preview_incomplete'
-  );
-  assert.equal(incomplete.store.planDecisions.size, 0);
 
   const mismatches = [
     ['plan revision', (preview) => {
@@ -750,30 +738,22 @@ async function planConfirmationRequiresEveryCurrentCanonicalPreview() {
       oneActionPlanDraft(),
       `I will verify the requested file scope and ${label} binding.`
     );
-    mismatched.enqueueKernel(
-      'previewCapability',
-      (request) => {
-        const preview = dynamicPlanPreview(
-          request,
-          mismatched.initial.runId
-        );
-        mutatePreview(preview);
-        return { kind: 'previewed', data: { preview } };
-      }
-    );
-    await mismatched.loop.previewPlanAction(
-      mismatchedPlan.actions[0].manifest.planActionId,
-      mismatchedPlan.planRevision
-    );
+    mismatched.enqueueKernel('previewCapabilityBatch', (request) => {
+      const reply = dynamicPlanPreviewBatch(
+        request,
+        mismatched.initial.runId
+      );
+      mutatePreview(reply.results[0].data.preview);
+      return reply;
+    });
     await assert.rejects(
-      mismatched.loop.publishPlanConfirmationReady(
-        mismatchedPlan.planRevision
-      ),
+      mismatched.loop.previewPlan(mismatchedPlan.planRevision),
       (error) =>
         error?.code
-          === 'session_kernel_plan_confirmation_preview_incomplete',
-      `${label} mismatch must fail closed before Plan confirmation`
+          === 'session_kernel_scope_preview_batch_correlation_mismatch',
+      `${label} mismatch must fail the whole preview batch closed`
     );
+    assert.deepEqual(mismatched.loop.snapshot().previews, {});
     assert.equal(mismatched.store.planDecisions.size, 0);
     assert.equal(mismatched.calls('submitToolIntent').length, 0);
   }
@@ -784,24 +764,14 @@ async function planConfirmationRequiresEveryCurrentCanonicalPreview() {
     twoActionPlanDraft(),
     'I will verify both requested file scopes before asking for approval.'
   );
-  for (const action of completePlan.actions) {
-    complete.enqueueKernel(
-      'previewCapability',
-      (request) => ({
-        kind: 'previewed',
-        data: {
-          preview: dynamicPlanPreview(
-            request,
-            complete.initial.runId
-          ),
-        },
-      })
-    );
-    await complete.loop.previewPlanAction(
-      action.manifest.planActionId,
-      completePlan.planRevision
-    );
-  }
+  complete.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => dynamicPlanPreviewBatch(
+      request,
+      complete.initial.runId
+    )
+  );
+  await complete.loop.previewPlan(completePlan.planRevision);
   assert.equal(complete.store.planDecisions.size, 0);
   await assert.rejects(
     complete.loop.decidePlan({
@@ -960,24 +930,14 @@ async function planActionTurnRequiresOneAcceptedCurrentPlanRevision() {
 
 async function prepareConfirmablePlan(harness, draft, commentary) {
   const plan = await runSealedPlanningTurn(harness, draft, commentary);
-  for (const action of plan.actions) {
-    harness.enqueueKernel(
-      'previewCapability',
-      (request) => ({
-        kind: 'previewed',
-        data: {
-          preview: dynamicPlanPreview(
-            request,
-            harness.initial.runId
-          ),
-        },
-      })
-    );
-    await harness.loop.previewPlanAction(
-      action.manifest.planActionId,
-      plan.planRevision
-    );
-  }
+  harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => dynamicPlanPreviewBatch(
+      request,
+      harness.initial.runId
+    )
+  );
+  await harness.loop.previewPlan(plan.planRevision);
   const confirmation = await harness.loop.publishPlanConfirmationReady(
     plan.planRevision
   );
@@ -986,7 +946,7 @@ async function prepareConfirmablePlan(harness, draft, commentary) {
 
 async function runSealedPlanningTurn(harness, draft, commentary) {
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
     plan: draft,
   };
   const proposalCallId = 'provider-plan-proposal-contract';
@@ -998,9 +958,9 @@ async function runSealedPlanningTurn(harness, draft, commentary) {
     kind: 'plan',
     plan: draft,
     planProposal: {
-      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
       callId: proposalCallId,
-      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
       argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
     },
     items: [{ kind: 'text', phase: 'commentary', text: commentary }],
@@ -1031,7 +991,7 @@ async function runSealedPlanningTurn(harness, draft, commentary) {
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,
       callId: proposalCallId,
-      name: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
       arguments: canonicalJson(proposalArguments),
     });
     terminal.ref.recordDigest = sha256Hash(canonicalJson(terminal.data));
@@ -1057,13 +1017,14 @@ function oneActionPlanDraft() {
     narrative: 'Use the approved PlanAction and report canonical facts.',
     actions: [{
       toolId: 'fs.write',
-      requestedResources: [{
-        kind: 'workspacePath',
-        data: { path: 'output.txt', access: 'write' },
-      }],
-      previewArguments: {
-        path: 'output.txt',
-        content: 'contract output',
+      scopeIntent: {
+        kind: 'resourceScope',
+        data: {
+          requestedResources: [{
+            kind: 'workspacePath',
+            data: { path: 'output.txt', access: 'write' },
+          }],
+        },
       },
     }],
   };
@@ -1079,40 +1040,62 @@ function twoActionPlanDraft() {
       first.actions[0],
       {
         toolId: 'fs.write',
-        requestedResources: [{
-          kind: 'workspacePath',
-          data: { path: 'second.txt', access: 'write' },
-        }],
-        previewArguments: { path: 'second.txt', content: 'second' },
+        scopeIntent: {
+          kind: 'resourceScope',
+          data: {
+            requestedResources: [{
+              kind: 'workspacePath',
+              data: { path: 'second.txt', access: 'write' },
+            }],
+          },
+        },
       },
     ],
   };
 }
 
-function dynamicPlanPreview(request, runId) {
-  const second = request.rawArguments.path === 'second.txt';
+function dynamicPlanPreview(request, item, runId) {
+  const requestedResources = item.scopeIntent.kind === 'resourceScope'
+    ? item.scopeIntent.data.requestedResources
+    : [];
+  const path = item.scopeIntent.kind === 'exactInvocation'
+    ? item.scopeIntent.data.rawArguments.path
+    : requestedResources[0]?.data.path;
+  const second = path === 'second.txt';
+  const templateItem = {
+    ...item,
+    planActionId: second
+      ? 'plan-action-write-second'
+      : 'plan-action-write-first',
+    operationId: second
+      ? 'planned-operation-write-second'
+      : 'planned-operation-write-first',
+  };
   const templateRequest = {
     ...request,
-    manifest: {
-      planRevision: 'plan-two-actions',
-      planActionId: second
-        ? 'plan-action-write-second'
-        : 'plan-action-write-first',
-      operationId: second
-        ? 'planned-operation-write-second'
-        : 'planned-operation-write-first',
-      toolId: 'fs.write',
-      requestedResources: request.manifest.requestedResources,
-    },
+    planRevision: 'plan-two-actions',
+    items: [templateItem],
   };
-  const preview = createPreview(templateRequest, runId);
+  const preview = createPreview(templateRequest, templateItem, runId);
   return {
     ...preview,
-    previewId: `preview-${request.manifest.operationId}`,
-    planRevision: request.manifest.planRevision,
-    planActionId: request.manifest.planActionId,
-    operationId: request.manifest.operationId,
-    toolId: request.manifest.toolId,
+    previewId: `preview-${item.operationId}`,
+    planRevision: request.planRevision,
+    planActionId: item.planActionId,
+    operationId: item.operationId,
+    toolId: item.toolId,
+  };
+}
+
+function dynamicPlanPreviewBatch(request, runId) {
+  return {
+    runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => ({
+      kind: 'previewed',
+      data: { preview: dynamicPlanPreview(request, item, runId) },
+    })),
   };
 }
 

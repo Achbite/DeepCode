@@ -525,7 +525,7 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
         target: { kind: 'planning' },
       }),
       (error) =>
-        error?.code === 'session_kernel_provider_terminal_evidence_mismatch'
+        error?.code === 'session_kernel_provider_plan_proposal_conflict'
     );
   } finally {
     restoreDuplicateControl();
@@ -581,31 +581,25 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
     restore();
   }
   assert.equal(result.kind, 'plan');
-  assert.equal(
-    harness.store.projectionEvents.some((event) =>
-      event.kind === 'plan.commentaryReleased'
-      || event.kind === 'plan.confirmationReady'
-    ),
-    false,
-    'a sealed Plan remains private until canonical preview settlement'
+  assert.deepEqual(
+    harness.store.projectionEvents
+      .filter((event) =>
+        event.kind === 'plan.commentaryReleased'
+        || event.kind === 'plan.confirmationReady'
+      )
+      .map((event) => event.kind),
+    ['plan.commentaryReleased'],
+    'sealed commentary may publish, but confirmation remains unavailable before canonical preview settlement'
   );
 
   harness.enqueueKernel(
-    'previewCapability',
-    (request) => ({
-      kind: 'previewed',
-      data: {
-        preview: planningPreview(
-          request,
-          harness.initial.runId
-        ),
-      },
-    })
+    'previewCapabilityBatch',
+    (request) => planningPreviewBatch(
+      request,
+      harness.initial.runId
+    )
   );
-  await harness.loop.previewPlanAction(
-    result.plan.actions[0].manifest.planActionId,
-    result.plan.planRevision
-  );
+  await harness.loop.previewPlan(result.plan.planRevision);
   const ready = await harness.loop.publishPlanConfirmationReady(
     result.plan.planRevision
   );
@@ -639,35 +633,43 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
     restoreRejectedPreview();
   }
   rejectedPreview.enqueueKernel(
-    'previewCapability',
+    'previewCapabilityBatch',
     (request) => ({
-      kind: 'rejected',
-      data: {
-        toolId: request.manifest.toolId,
-        reason: 'settingsDenied',
-        guidance: 'Revise the requested scope before asking for approval.',
-      },
+      runId: rejectedPreview.initial.runId,
+      acceptedControlEpoch: request.expectedControlEpoch,
+      planRevision: request.planRevision,
+      results: request.items.map((item) => ({
+        kind: 'rejected',
+        data: {
+          planActionId: item.planActionId,
+          operationId: item.operationId,
+          toolId: item.toolId,
+          reason: 'settingsDenied',
+          guidance: 'Revise the requested scope before asking for approval.',
+        },
+      })),
     })
   );
-  const rejectedReply = await rejectedPreview.loop.previewPlanAction(
-    rejectedPlan.plan.actions[0].manifest.planActionId,
+  const rejectedReply = await rejectedPreview.loop.previewPlan(
     rejectedPlan.plan.planRevision
   );
-  assert.equal(rejectedReply.kind, 'rejected');
+  assert.equal(rejectedReply.results[0].kind, 'rejected');
   await assert.rejects(
     rejectedPreview.loop.publishPlanConfirmationReady(
       rejectedPlan.plan.planRevision
     ),
     (error) =>
-      error?.code === 'session_kernel_plan_confirmation_preview_incomplete'
+      error?.code === 'session_kernel_plan_confirmation_preview_mismatch'
   );
-  assert.equal(
-    rejectedPreview.store.projectionEvents.some((event) =>
-      event.kind === 'plan.commentaryReleased'
-      || event.kind === 'plan.confirmationReady'
-    ),
-    false,
-    'a rejected canonical preview must keep planning commentary private'
+  assert.deepEqual(
+    rejectedPreview.store.projectionEvents
+      .filter((event) =>
+        event.kind === 'plan.commentaryReleased'
+        || event.kind === 'plan.confirmationReady'
+      )
+      .map((event) => event.kind),
+    ['plan.commentaryReleased'],
+    'a rejected canonical preview must not publish confirmation authority'
   );
   assert.equal(rejectedPreview.calls('submitToolIntent').length, 0);
 
@@ -689,19 +691,13 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
     restoreConfirmationFailure();
   }
   confirmationFailure.enqueueKernel(
-    'previewCapability',
-    (request) => ({
-      kind: 'previewed',
-      data: {
-        preview: planningPreview(
-          request,
-          confirmationFailure.initial.runId
-        ),
-      },
-    })
+    'previewCapabilityBatch',
+    (request) => planningPreviewBatch(
+      request,
+      confirmationFailure.initial.runId
+    )
   );
-  await confirmationFailure.loop.previewPlanAction(
-    confirmationPlan.plan.actions[0].manifest.planActionId,
+  await confirmationFailure.loop.previewPlan(
     confirmationPlan.plan.planRevision
   );
   const project = confirmationFailure.ports.projection.project.bind(
@@ -719,13 +715,15 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
     ),
     /controlled_confirmation_projection_failure/u
   );
-  assert.equal(
-    confirmationFailure.store.projectionEvents.some((event) =>
-      event.kind === 'plan.commentaryReleased'
-      || event.kind === 'plan.confirmationReady'
-    ),
-    false,
-    'commentary and confirmation must publish atomically or remain private together'
+  assert.deepEqual(
+    confirmationFailure.store.projectionEvents
+      .filter((event) =>
+        event.kind === 'plan.commentaryReleased'
+        || event.kind === 'plan.confirmationReady'
+      )
+      .map((event) => event.kind),
+    ['plan.commentaryReleased'],
+    'a failed confirmation delivery must not manufacture confirmation authority'
   );
   assert.equal(confirmationFailure.calls('submitToolIntent').length, 0);
 }
@@ -820,24 +818,36 @@ function installPlanningTerminalEvidence(
   };
 }
 
-function planningPreview(request, runId) {
+function planningPreview(request, item, runId) {
+  const templateItem = {
+    ...item,
+    planActionId: 'plan-action-write-first',
+    operationId: 'planned-operation-write-first',
+  };
   const template = createPreview({
     ...request,
-    manifest: {
-      planRevision: 'plan-two-actions',
-      planActionId: 'plan-action-write-first',
-      operationId: 'planned-operation-write-first',
-      toolId: 'fs.write',
-      requestedResources: request.manifest.requestedResources,
-    },
-  }, runId);
+    planRevision: 'plan-two-actions',
+    items: [templateItem],
+  }, templateItem, runId);
   return {
     ...template,
-    previewId: `preview-${request.manifest.operationId}`,
-    planRevision: request.manifest.planRevision,
-    planActionId: request.manifest.planActionId,
-    operationId: request.manifest.operationId,
-    toolId: request.manifest.toolId,
+    previewId: `preview-${item.operationId}`,
+    planRevision: request.planRevision,
+    planActionId: item.planActionId,
+    operationId: item.operationId,
+    toolId: item.toolId,
+  };
+}
+
+function planningPreviewBatch(request, runId) {
+  return {
+    runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => ({
+      kind: 'previewed',
+      data: { preview: planningPreview(request, item, runId) },
+    })),
   };
 }
 

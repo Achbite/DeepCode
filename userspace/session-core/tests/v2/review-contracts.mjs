@@ -1,6 +1,7 @@
 import {
   buildSessionKernelReviewV2,
   buildNarrativeTimelineProjection,
+  buildSessionPlanConfirmationAuthorityV2,
   canonicalJson,
   canFinalizeSessionKernelReviewV2,
   createSessionKernelLoopStateV2,
@@ -8,6 +9,7 @@ import {
   finalizeSessionKernelReviewV2,
   reconcileSessionKernelFactsPageV2,
   recordSessionPlanDecisionV2,
+  recordSessionPlanConfirmationAuthorityV2,
   recordSessionPlanV2,
   sessionKernelAgentEventV2,
   sha256Hash,
@@ -21,11 +23,13 @@ import {
   createFactsPage,
   createInitialState,
   createPlan,
+  createPreview,
   corpusFact,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
   providerAnswer,
   providerToolIntents,
+  toolContextRef,
 } from './harness.mjs';
 
 export const contractCases = [
@@ -435,6 +439,7 @@ async function latestRunDrivesLiveProjectionWithoutTruncatingHistory() {
         taskId: 'task-a',
         toolId: 'fs.read',
         operationId: 'operation-a',
+        approvalView: { resourcePresentation: [] },
       }],
     }, 1),
     agentEvent(
@@ -466,6 +471,7 @@ async function latestRunDrivesLiveProjectionWithoutTruncatingHistory() {
         taskId: 'task-b',
         toolId: 'fs.write',
         operationId: 'operation-b',
+        approvalView: { resourcePresentation: [] },
       }],
     }, 5),
     agentEvent(
@@ -510,9 +516,16 @@ async function latestRunDrivesLiveProjectionWithoutTruncatingHistory() {
     true,
     'full Run A history must remain visible'
   );
-  assert.deepEqual(
-    projection.taskProjection.items.map((item) => item.id),
-    ['task-b']
+  assert.equal(
+    Object.hasOwn(projection, 'taskProjection'),
+    false,
+    'the latest unaccepted Plan must not create root task state'
+  );
+  assert.equal(
+    projection.turns.some((turn) => turn.blocks.some((block) =>
+      Object.hasOwn(block, 'taskProjectionRef'))),
+    false,
+    'unaccepted historical and current Plans must not expose task refs'
   );
   assert.equal(
     projection.interactionProjection.pending.requestId,
@@ -520,7 +533,10 @@ async function latestRunDrivesLiveProjectionWithoutTruncatingHistory() {
   );
   assert.equal(projection.runProjection.runId, 'run-b');
   assert.equal(projection.runProjection.status, 'waitingUser');
-  assert.equal(projection.runProjection.wait.interactionId, 'permission-b');
+  assert.equal(
+    projection.runProjection.wait.interactionId,
+    'permission:permission-b'
+  );
   assert.equal(
     findLatestPendingPermission(events).request.id,
     'permission-b'
@@ -762,14 +778,15 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
       planActionId: 'plan-action-second',
       operationId: 'planned-operation-second',
       toolId: 'fs.write',
-      requestedResources: [{
-        kind: 'workspacePath',
-        data: { path: 'second.txt', access: 'write' },
-      }],
-    },
-    previewArguments: {
-      path: 'second.txt',
-      content: 'second',
+      scopeIntent: {
+        kind: 'resourceScope',
+        data: {
+          requestedResources: [{
+            kind: 'workspacePath',
+            data: { path: 'second.txt', access: 'write' },
+          }],
+        },
+      },
     },
     idempotencyKey: 'idempotency-second-action',
     deadline: { kind: 'contractDefault', data: {} },
@@ -1202,10 +1219,73 @@ function acceptedPlanState(plan = createPlan()) {
     createInitialState()
   );
   state = recordSessionPlanV2(state, plan);
+  state.previews = Object.fromEntries(plan.actions.map((action) => [
+    action.manifest.operationId,
+    reviewPlanPreview(state, plan, action),
+  ]));
+  state = recordSessionPlanConfirmationAuthorityV2(
+    state,
+    buildSessionPlanConfirmationAuthorityV2(state, {
+      providerTurnId: 'provider-turn-review-confirmation',
+      providerResponseDigest: sha256Hash(canonicalJson({
+        kind: 'review-test-plan-confirmation',
+        planRevision: plan.planRevision,
+      })),
+      recordedAt: NOW,
+      confirmationProjection: {
+        projectionId: [
+          'run',
+          state.runId,
+          'plan',
+          plan.planRevision,
+          'confirmation-ready',
+        ].join(':'),
+        projectionDigest: sha256Hash(canonicalJson({
+          kind: 'review-test-confirmation-projection',
+          planRevision: plan.planRevision,
+        })),
+      },
+    })
+  );
   state = recordSessionPlanDecisionV2(state, {
     planRevision: plan.planRevision,
     decision: 'accept',
     recordedAt: NOW,
   });
   return state;
+}
+
+function reviewPlanPreview(state, plan, action) {
+  const scopeIntent = action.manifest.scopeIntent;
+  const path = scopeIntent.kind === 'exactInvocation'
+    ? scopeIntent.data.rawArguments.path
+    : scopeIntent.data.requestedResources[0]?.data.path;
+  const second = path === 'second.txt';
+  const item = {
+    planActionId: second
+      ? 'plan-action-write-second'
+      : 'plan-action-write-output',
+    operationId: second
+      ? 'planned-operation-write-second'
+      : 'planned-operation-write-output',
+    idempotencyKey: action.idempotencyKey,
+    toolId: action.manifest.toolId,
+    scopeIntent,
+    deadline: action.deadline,
+  };
+  const request = {
+    expectedControlEpoch: state.controlEpoch,
+    planRevision: second ? 'plan-two-actions' : 'plan-revision-1',
+    items: [item],
+    toolContextRef: toolContextRef(state.toolContext.bundle),
+  };
+  const preview = createPreview(request, item, state.runId);
+  return {
+    ...preview,
+    previewId: `preview-${action.manifest.operationId}`,
+    planRevision: plan.planRevision,
+    planActionId: action.manifest.planActionId,
+    operationId: action.manifest.operationId,
+    toolId: action.manifest.toolId,
+  };
 }
