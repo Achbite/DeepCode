@@ -343,6 +343,8 @@ export function restoreSessionKernelLoopStateV2(
         !== state.providerToolCallQueue.providerTurnId
       || state.providerTurn.controlEpoch
         !== state.providerToolCallQueue.controlEpoch
+      || canonicalJson(state.providerTurn.target)
+        !== canonicalJson(state.providerToolCallQueue.target)
       || state.providerTurn.status !== 'awaitingTools'
       || JSON.stringify(state.providerTurn.response)
         !== JSON.stringify({
@@ -355,6 +357,54 @@ export function restoreSessionKernelLoopStateV2(
       'session_kernel_provider_tool_call_queue_turn_mismatch',
       'Active Provider tool calls do not match the durable Provider turn.'
     );
+  }
+  if (
+    state.providerToolCallQueue?.status === 'active'
+    && state.providerTurn?.target.kind === 'planning'
+  ) {
+    const currentContextRef = toolContextRefV2(
+      state.toolContext.bundle
+    );
+    const contextReadAuthority = state.workAuthority?.kind
+      === 'contextRead'
+      ? state.workAuthority
+      : undefined;
+    const planningQueueInvalid =
+      state.providerToolCallQueue.target.kind !== 'planning'
+      || (
+        state.plan === undefined
+        && !contextReadAuthority
+      )
+      || (
+        state.plan !== undefined
+        && (
+          state.workAuthority?.kind !== 'plan'
+          || state.workAuthority.planRevision
+            !== state.plan.planRevision
+        )
+      )
+      || state.providerToolCallQueue.calls.some((call) => {
+        const descriptor = state.toolContext.bundle.tools.find(
+          (tool) => tool.toolId === call.intent.toolId
+        );
+        return call.intent.authority.kind !== 'contextRead'
+          || canonicalJson(call.intent.toolContextRef)
+            !== canonicalJson(currentContextRef)
+          || descriptor?.availability !== 'ready'
+          || descriptor.effectClass !== 'read'
+          || (
+            state.plan === undefined
+            && !contextReadAuthority?.operationIds.includes(
+              call.intent.operationId
+            )
+          );
+      });
+    if (planningQueueInvalid) {
+      throw new SessionKernelStateError(
+        'session_kernel_provider_tool_call_queue_turn_mismatch',
+        'Active planning Provider calls require exact ContextRead authority and current read-only ToolContext correlation.'
+      );
+    }
   }
   if (
     state.providerTurn?.status === 'awaitingTools'
@@ -1997,11 +2047,8 @@ function validateProviderTurnResponse(
     : 0;
   const planningInvalid = (
     turn.target.kind === 'planning'
-    && (
-      providerNativeToolCount !== 0
-      || response.items.some((item) =>
-        item.kind !== 'text' || item.phase !== 'commentary'
-      )
+    && response.items.some((item) =>
+      item.kind === 'text' && item.phase !== 'commentary'
     )
   );
   const nativeCompletionInvalid = native.providerKind === 'openaiCompatible'

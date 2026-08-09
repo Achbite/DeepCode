@@ -9,6 +9,7 @@ import {
   createPreviewBatch,
   openSessionHarness,
   providerAnswer,
+  providerPlanActionComplete,
   providerToolIntent,
   providerToolIntents,
 } from './harness.mjs';
@@ -991,7 +992,10 @@ async function planActionTurnRequiresOneAcceptedCurrentPlanRevision() {
   assert.equal(accepted.decision, 'accept');
   assert.equal(pending.calls('submitToolIntent').length, 0);
 
-  pending.enqueueProvider(providerAnswer('accepted action completed'));
+  pending.enqueueProvider(providerPlanActionComplete(
+    'no_op',
+    'plan-action-complete-accepted-action'
+  ));
   const completed = await pending.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
@@ -1000,10 +1004,29 @@ async function planActionTurnRequiresOneAcceptedCurrentPlanRevision() {
     },
     remainingToolCallBudget: 1,
   });
-  assert.deepEqual(completed, {
-    kind: 'answer',
-    text: 'accepted action completed',
-  });
+  assert.deepEqual(completed, { kind: 'noTool' });
+  assert.deepEqual(
+    pending.loop.snapshot().planActionSettlements[
+      pendingPlan.actions[0].manifest.planActionId
+    ],
+    {
+      kind: 'planActionComplete',
+      planRevision: pendingPlan.planRevision,
+      planActionId: pendingPlan.actions[0].manifest.planActionId,
+      controlEpoch: pending.loop.snapshot().controlEpoch,
+      outcome: 'no_op',
+      providerTurnId: pending.loop.snapshot().providerTurn.providerTurnId,
+      controlCallId: 'plan-action-complete-accepted-action',
+      controlArgumentsDigest: sha256Hash(canonicalJson({
+        schemaVersion: 'deepcode.session.plan-action-complete.v2',
+        outcome: 'no_op',
+      })),
+      snapshotHighWater:
+        pending.loop.snapshot().lineage.cursor.snapshotHighWater,
+      recordedAt:
+        pending.loop.snapshot().providerOutcomes.at(-1).recordedAt,
+    }
+  );
 
   for (const decision of ['reject', 'revise']) {
     const denied = await openSessionHarness();

@@ -11,6 +11,7 @@ import {
   recordSessionPlanDecisionV2,
   recordSessionPlanConfirmationAuthorityV2,
   recordSessionPlanV2,
+  recordSessionKernelReviewV2,
   sessionKernelAgentEventV2,
   sha256Hash,
 } from '../../dist/index.js';
@@ -27,7 +28,7 @@ import {
   corpusFact,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
-  providerAnswer,
+  providerPlanActionComplete,
   providerToolIntents,
   toolContextRef,
 } from './harness.mjs';
@@ -358,7 +359,10 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   );
   assert.equal(completedQueueEvents().length, 1);
   assert.equal(completedQueueEvents()[0].data.result.callCount, 2);
-  harness.enqueueProvider(providerAnswer('continued after queue settlement'));
+  harness.enqueueProvider(providerPlanActionComplete(
+    'completed',
+    'plan-action-complete-after-queue-settlement'
+  ));
   const continued = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
@@ -367,10 +371,7 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     },
     remainingToolCallBudget: 1,
   });
-  assert.deepEqual(continued, {
-    kind: 'answer',
-    text: 'continued after queue settlement',
-  });
+  assert.deepEqual(continued, { kind: 'noTool' });
   assert.equal(harness.providerInputs.length, 2);
   settled = harness.loop.snapshot();
   const review = buildSessionKernelReviewV2(
@@ -657,7 +658,7 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
     state,
     '2026-07-29T00:10:00.000Z'
   );
-  state.review = first;
+  recordSessionKernelReviewV2(state, first);
   const replayed = buildSessionKernelReviewV2(
     state,
     '2026-07-29T00:11:00.000Z'
@@ -706,7 +707,10 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
   const harness = await openSessionHarness();
   const loopPlan = createPlan();
   await persistPreviewAndAcceptPlan(harness, loopPlan);
-  harness.enqueueProvider(providerAnswer('PlanAction reviewed.'));
+  harness.enqueueProvider(providerPlanActionComplete(
+    'no_op',
+    'plan-action-complete-review-revision'
+  ));
   await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
@@ -716,7 +720,7 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
     remainingToolCallBudget: 32,
   });
   const loopFirst = await harness.loop.finalizeReview(
-    loopPlan.planRevision
+    harness.loop.snapshot().workAuthority
   );
   assert.equal(loopFirst.status, 'final');
   assert.equal(loopFirst.snapshotHighWater, 0);
@@ -731,7 +735,7 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
     },
   }));
   const loopSecond = await harness.loop.finalizeReview(
-    loopPlan.planRevision
+    harness.loop.snapshot().workAuthority
   );
   assert.equal(loopSecond.status, 'final');
   assert.equal(loopSecond.revision, loopFirst.revision + 2);
@@ -755,17 +759,12 @@ async function reviewRevisionIsPinnedToOneFactsHighWater() {
       })),
     [
       {
-        revision: loopFirst.revision + 1,
-        status: 'draft',
-        snapshotHighWater: loopSecond.snapshotHighWater,
-      },
-      {
         revision: loopFirst.revision + 2,
         status: 'final',
         snapshotHighWater: loopSecond.snapshotHighWater,
       },
     ],
-    'late facts must persist distinct draft and final Review revisions at one high-water'
+    'late facts must publish only the final Review revision at one high-water'
   );
 }
 
@@ -1093,10 +1092,18 @@ async function readableReviewKeepsRawIdentitiesOnlyInAuditRefs() {
   const plan = createPlan();
   let state = acceptedPlanState(plan);
   state.planActionSettlements[plan.actions[0].manifest.planActionId] = {
-    kind: 'completed',
+    kind: 'planActionComplete',
+    planRevision: plan.planRevision,
     planActionId: plan.actions[0].manifest.planActionId,
-    completionKind: 'answer',
+    controlEpoch: state.controlEpoch,
+    outcome: 'completed',
     providerTurnId: 'provider-turn-readable-review',
+    controlCallId: 'plan-action-complete-readable-review',
+    controlArgumentsDigest: sha256Hash(canonicalJson({
+      schemaVersion: 'deepcode.session.plan-action-complete.v2',
+      outcome: 'completed',
+    })),
+    snapshotHighWater: 0,
     recordedAt: '2026-07-29T00:51:00.000Z',
   };
   const rawIds = {
@@ -1166,6 +1173,7 @@ async function readableReviewKeepsRawIdentitiesOnlyInAuditRefs() {
     indeterminate: String(review.indeterminate.length),
   });
   const categoryNames = [
+    'planned',
     'scopeExpansions',
     'actualEffects',
     'unexecuted',

@@ -28,6 +28,7 @@ import {
   persistPreviewAndAcceptPlan,
   providerAnswer,
   providerEvidenceRecordsV3,
+  providerPlanActionComplete,
   providerToolIntent,
   providerToolIntents,
   toolContextRef,
@@ -373,6 +374,7 @@ async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
   };
   state.providerTurn = undefined;
   state.providerToolCallQueue = undefined;
+  state.previews = {};
   await durable.persistence.persistCheckpoint(
     checkpointFromStateV3(state, '2026-07-29T00:00:11.000Z')
   );
@@ -1000,6 +1002,67 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
       ),
       (error) =>
         error?.code === 'session_provider_tool_call_queue_invalid'
+    );
+  }
+  const correlationCorruptions = [
+    {
+      label: 'missing ContextRead work authority',
+      corrupt(value) {
+        value.state.workAuthority = undefined;
+      },
+    },
+    {
+      label: 'ContextRead work authority missing the queued operation',
+      corrupt(value) {
+        const operationIds = ['operation-unrelated-context-read'];
+        value.state.workAuthority = {
+          kind: 'contextRead',
+          operationIds,
+          digest: sha256Hash(canonicalJson({
+            kind: 'contextRead',
+            operationIds,
+          })),
+        };
+      },
+    },
+    {
+      label: 'planning queue forged to a mutation descriptor',
+      corrupt(value) {
+        const call = value.state.providerToolCallQueue.calls[0];
+        const ordered = value.state.providerToolCallQueue.orderedItems.find(
+          (item) => item.kind === 'toolCall' && item.ordinal === call.ordinal
+        );
+        const receipt = value.state.providerToolCallQueue.receipt.calls[0];
+        call.intent.toolId = 'fs.write';
+        ordered.toolId = 'fs.write';
+        ordered.toolName = 'fs.write';
+        receipt.toolId = 'fs.write';
+        receipt.toolName = 'fs.write';
+        value.state.providerTurn.response.items =
+          JSON.parse(JSON.stringify(
+            value.state.providerToolCallQueue.orderedItems
+          ));
+      },
+    },
+  ];
+  for (const scenario of correlationCorruptions) {
+    const invalid = JSON.parse(JSON.stringify(checkpoint));
+    scenario.corrupt(invalid);
+    assert.throws(
+      () => restoreSessionKernelLoopStateV2(
+        invalid,
+        {
+          runId: harness.initial.runId,
+          workspaceBindingDigest:
+            harness.initial.workspaceBindingDigest,
+          sessionMemory: harness.initial.sessionMemory,
+          providerProfile: harness.initial.providerProfile,
+        }
+      ),
+      (error) =>
+        error?.code
+          === 'session_kernel_provider_tool_call_queue_turn_mismatch',
+      scenario.label
     );
   }
 }
@@ -2095,7 +2158,10 @@ async function prepareFinalAnswerHarness() {
     planActionId: plan.actions[0].manifest.planActionId,
     expectedPlanRevision: plan.planRevision,
   });
-  harness.enqueueProvider(providerAnswer('Plan action settled.'));
+  harness.enqueueProvider(providerPlanActionComplete(
+    'completed',
+    'plan-action-complete-final-answer-preparation'
+  ));
   await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
@@ -2104,13 +2170,15 @@ async function prepareFinalAnswerHarness() {
     },
     remainingToolCallBudget: 31,
   });
-  const review = await harness.loop.finalizeReview(plan.planRevision);
+  const review = await harness.loop.finalizeReview(
+    harness.loop.snapshot().workAuthority
+  );
   assert.equal(review.status, 'final');
   assert.equal(harness.loop.snapshot().finalAnswer.status, 'pending');
   assert.deepEqual(harness.loop.snapshot().finalAnswer.binding, {
     inputId: harness.loop.snapshot().currentInputId,
     controlEpoch: harness.loop.snapshot().controlEpoch,
-    planRevision: plan.planRevision,
+    workAuthority: harness.loop.snapshot().workAuthority,
     reviewRevision: review.revision,
     snapshotHighWater: review.snapshotHighWater,
   });

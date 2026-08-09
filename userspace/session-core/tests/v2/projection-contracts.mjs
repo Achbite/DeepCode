@@ -517,6 +517,7 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
       providerTurnId: requestId,
       streamSequence: 3,
       textOrdinal: 3,
+      providerPhase: 'final_answer',
       textDelta: 'Final answer.',
     },
   ], 'all archived assistant text is visible while unsealed phases stay unknown');

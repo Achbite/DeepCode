@@ -3710,7 +3710,7 @@ function projectionBlock(
   sequence: number,
   committed: boolean
 ): AgentTimelineBlock | null {
-  if (!semanticHistoryBlockEvent(event)) return null;
+  if (!semanticHistoryBlockEvent(event, payload)) return null;
   const kind = String(event.kind);
   const runId = stringValue(payload?.runId);
   const blockId = logicalBlockId(event, payload);
@@ -3794,11 +3794,18 @@ function projectionBlock(
   };
 }
 
-function semanticHistoryBlockEvent(event: AgentEvent): boolean {
+function semanticHistoryBlockEvent(
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): boolean {
   return event.kind === 'user_msg'
     || event.kind === 'assistant_msg'
     || event.kind === 'plan_card'
     || event.kind === 'permission_request'
+    || (
+      event.kind === 'review_summary'
+      && stringValue(payload?.status) === 'completed'
+    )
     || event.kind === 'error';
 }
 

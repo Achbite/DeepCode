@@ -8,6 +8,8 @@ import {
   SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
   SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA,
   SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
+  SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
+  SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
   SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
   SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
@@ -18,6 +20,7 @@ import {
   buildSessionPlanConfirmationAuthorityV2,
   canonicalJson,
   checkpointSessionKernelStateV2,
+  prepareSessionKernelFactReplayV3,
   providerWireToolNameV2,
   recordSessionPlanConfirmationAuthorityV2,
   sha256Hash,
@@ -400,13 +403,20 @@ export function awaitingCapabilityReply(harness, request, preview, overrides = {
       }),
     },
   });
+  assert.equal(
+    awaiting.details.canonicalArgumentsDigest,
+    sha256Hash(
+      `deepcode.kernel.tools.v2/canonical-arguments\0${canonicalJson({
+        toolId: intent.toolId,
+        arguments: intent.rawArguments,
+      })}`
+    )
+  );
   assert.deepEqual({
-    canonicalArgumentsDigest: awaiting.details.canonicalArgumentsDigest,
     scopeDigest: awaiting.details.scopeDigest,
     toolContractDigest: awaiting.details.toolContractDigest,
     contextRef: awaiting.details.contextRef,
   }, {
-    canonicalArgumentsDigest: preview.canonicalArgumentsDigest,
     scopeDigest: preview.scopeDigest,
     toolContractDigest: preview.toolContractDigest,
     contextRef: preview.contextRef,
@@ -586,7 +596,17 @@ export function createSessionHarness(options = {}) {
     return clone(reply);
   };
   const persistence = {
-    loadCheckpoint: async () => clone(store.checkpoint),
+    loadCheckpoint: async () => {
+      const checkpoint = clone(store.checkpoint);
+      if (!checkpoint) return undefined;
+      prepareSessionKernelFactReplayV3(checkpoint.state, {
+        coverageAfterLedgerSequence:
+          checkpoint.state.reviewFacts.coverageAfterLedgerSequence,
+        snapshotHighWater:
+          checkpoint.state.lineage.cursor.snapshotHighWater,
+      });
+      return checkpoint;
+    },
     loadProviderTurnEvidence: async (_runId, providerTurnId) =>
       clone(store.providerEvidence.get(providerTurnId) ?? {}),
     loadToolContextSnapshot: async (_runId, contextRef) => {
@@ -1011,6 +1031,41 @@ export function providerAnswer(text = 'Session answer') {
   };
 }
 
+export function providerPlanActionComplete(
+  outcome = 'completed',
+  callId = `plan-action-complete-${outcome}`
+) {
+  const controlArguments = {
+    schemaVersion: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
+    outcome,
+  };
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'planActionComplete',
+    callId,
+    controlArguments,
+  }));
+  return (input) => ({
+    kind: 'planActionComplete',
+    outcome,
+    control: {
+      schemaVersion: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
+      callId,
+      toolName: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+      argumentsDigest: sha256Hash(canonicalJson(controlArguments)),
+    },
+    items: [],
+    completion: createProviderCompletionReceipt(responseDigest, {
+      hasToolCalls: true,
+      reasoningTransport: input.providerProfile.reasoningTransport,
+    }),
+    providerResult: {
+      providerProfileId: 'provider-profile-v2-contract',
+      provider: 'contract-provider',
+      model: 'contract-model',
+    },
+  });
+}
+
 export function providerOrderedToolItems(calls) {
   return calls.map((call, index) => ({
     kind: 'toolCall',
@@ -1095,6 +1150,33 @@ function createProviderEvidence(input, output, options = {}) {
     recordDigest: sha256Hash(canonicalJson(dispatchData)),
   };
   const recordedAt = options.recordedAt ?? NOW;
+  const orderedItems = output.items.map((item, index) =>
+    item.kind === 'text'
+      ? {
+          kind: 'text',
+          phase: item.phase,
+          text: item.text,
+        }
+      : {
+          kind: 'toolCall',
+          index,
+          callId: item.callId,
+          name: providerWireToolNameV2(item.toolId),
+          arguments: canonicalJson(item.arguments),
+        }
+  );
+  if (output.kind === 'planActionComplete') {
+    orderedItems.push({
+      kind: 'toolCall',
+      index: orderedItems.length,
+      callId: output.control.callId,
+      name: output.control.toolName,
+      arguments: canonicalJson({
+        schemaVersion: output.control.schemaVersion,
+        outcome: output.outcome,
+      }),
+    });
+  }
   const terminalData = {
     schemaVersion: SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
     providerTurnId: input.providerTurnId,
@@ -1109,21 +1191,7 @@ function createProviderEvidence(input, output, options = {}) {
       sealDigest: output.completion.trace.sealDigest,
       recordCount: output.completion.trace.recordCount,
     },
-    orderedItems: output.items.map((item, index) =>
-      item.kind === 'text'
-        ? {
-            kind: 'text',
-            phase: item.phase,
-            text: item.text,
-          }
-        : {
-            kind: 'toolCall',
-            index,
-            callId: item.callId,
-            name: providerWireToolNameV2(item.toolId),
-            arguments: canonicalJson(item.arguments),
-          }
-    ),
+    orderedItems,
   };
   const terminalRef = {
     recordId:
