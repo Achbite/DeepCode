@@ -43,6 +43,13 @@ const UI_TIMELINE_PROJECTION_MODULE = path.join(
   'utils',
   'uiTimelineProjection.js'
 );
+const SESSION_TIMELINE_DELTA_MODULE = path.resolve(
+  GUI_ROOT,
+  '..',
+  'session-core',
+  'dist',
+  'timelineDelta.js'
+);
 const NOW = '2026-07-31T00:00:00.000Z';
 
 if (
@@ -233,7 +240,7 @@ function sessionRecord(id, title = id) {
 function emptyTimeline(sessionId, revision = 0) {
   return {
     schemaVersion: 'deepcode.shared-conversation-projection.v2',
-    shapeVersion: 'deepcode.shared-conversation.work-segments.v1',
+    shapeVersion: 'deepcode.shared-conversation.work-segments.v2',
     sessionId,
     revision,
     sourceEventVersion: revision,
@@ -675,13 +682,23 @@ const contractCases = [
       const {
         latestAcceptedPlanTaskItemsFromProjection,
       } = await import(pathToFileURL(UI_TIMELINE_PROJECTION_MODULE).href);
+      const {
+        normalizeAgentTimelineSnapshot,
+      } = await import(pathToFileURL(SESSION_TIMELINE_DELTA_MODULE).href);
       const sessionId = 'task-list-plan-a';
       const runId = 'kernel-task-list-plan-a';
       const oldPlanBlockId = 'plan-old-accepted';
-      const planBlock = (id, state) => ({
+      const planBlock = (id, state, sequence) => ({
         id,
+        sequence,
+        durability: 'committed',
         kind: 'plan',
         narrativeKind: 'plan',
+        entryRole: 'interaction',
+        title: 'Plan',
+        summary: '',
+        status: state === 'open' ? 'waiting' : 'completed',
+        defaultCollapsed: false,
         interaction: {
           kind: 'plan',
           interactionId: `interaction-${id}`,
@@ -689,6 +706,27 @@ const contractCases = [
           targetId: id,
           runId,
           state,
+          ...(state === 'open'
+            ? {}
+            : {
+                selectedDecision: {
+                  decision: state === 'accepted' ? 'accept' : 'reject',
+                  source: 'button',
+                  decidedAt: NOW,
+                },
+              }),
+        },
+        attachments: [],
+        provenance: {
+          origin: 'session',
+          authority: 'session',
+          sourceEventRefs: [`event-${id}`],
+          factRefs: [],
+          evidenceRefs: [],
+        },
+        languageBinding: {
+          language: 'neutral',
+          status: 'unavailable',
         },
       });
       const taskItem = (id, blockId, target, progress, outcome) => ({
@@ -712,13 +750,22 @@ const contractCases = [
       });
       const projectionForLatestState = (state) => {
         const latestPlanBlockId = `plan-latest-${state}`;
-        return {
+        return normalizeAgentTimelineSnapshot({
           ...activeTimeline(sessionId, runId, 12),
           turns: [{
             id: 'turn-task-list-plan-a',
+            sequence: 0,
+            sessionId,
+            status: 'running',
+            startedAt: NOW,
             blocks: [
-              planBlock(oldPlanBlockId, 'accepted'),
-              planBlock(latestPlanBlockId, state),
+              planBlock(oldPlanBlockId, 'accepted', 0),
+              planBlock(latestPlanBlockId, state, 1),
+            ],
+            workSegments: [],
+            parts: [
+              { kind: 'block', blockId: oldPlanBlockId },
+              { kind: 'block', blockId: latestPlanBlockId },
             ],
           }],
           taskProjection: {
@@ -764,7 +811,7 @@ const contractCases = [
               },
             ],
           },
-        };
+        });
       };
 
       assert.deepEqual(
@@ -925,21 +972,33 @@ const contractCases = [
       host.register(scenario);
       const store = await freshStore(this.id);
       await activate(store, sessionId);
+      assert.equal(
+        store.getState().selectionReady,
+        true,
+        `watcher Session activation was not ready: ${String(
+          store.getState().errorMessage
+        )}`
+      );
       scenario.records.length = 0;
       const heldStreams = holdSseRequests(scenario, 'timelineStream');
       const heldGuidance = holdRequests(scenario, 'guidance');
+      const heldCancel = holdRequests(scenario, 'cancel');
 
-      const first = store.getState().sendMessage('first consumer');
-      const second = store.getState().sendMessage('second consumer');
+      const guidance = store.getState().sendMessage('guidance consumer');
       await waitFor(
-        () => heldGuidance.length === 2 && heldStreams.length >= 1,
-        'two concurrent consumers and the shared typed timeline stream'
+        () => heldGuidance.length === 1 && heldStreams.length >= 1,
+        'guidance consumer and the shared typed timeline stream'
+      );
+      const cancellation = store.getState().cancelCurrentRun();
+      await waitFor(
+        () => heldCancel.length === 1,
+        'the concurrent legal cancel consumer'
       );
       await flushAsyncTurns();
       assert.equal(
         heldStreams.length,
         1,
-        'concurrent consumers created duplicate watchers'
+        'legal concurrent consumers created duplicate watchers'
       );
       assert.equal(
         heldStreams[0].record.afterRevision,
@@ -947,19 +1006,26 @@ const contractCases = [
         'typed timeline stream did not resume after the visible snapshot'
       );
 
+      const heldTrailingTimeline = holdRequests(scenario, 'timeline');
       respondGuidance(heldGuidance[0]);
-      await first;
+      await guidance;
       assert.equal(
         heldStreams[0].record.aborted,
         false,
-        'the first consumer release aborted the shared watcher'
+        'guidance release aborted the cancel consumer shared watcher'
       );
       assert.equal(heldStreams.length, 1);
 
-      const heldTrailingTimeline = holdRequests(scenario, 'timeline');
-      respondGuidance(heldGuidance[1]);
-      await second;
+      scenario.setRunStatus(heldCancel[0].route.runId, 'cancelled');
+      scenario.timelines.set(sessionId, emptyTimeline(sessionId, 2));
+      heldCancel[0].data(scenario.runResult(
+        sessionId,
+        heldCancel[0].route.runId,
+        'cancelled'
+      ));
+      await cancellation;
       scenario.handlers.delete('guidance');
+      scenario.handlers.delete('cancel');
       await waitFor(
         () => heldTrailingTimeline.length >= 1
           && heldStreams[0].record.aborted,
@@ -973,11 +1039,7 @@ const contractCases = [
       );
       scenario.handlers.delete('timeline');
       scenario.handlers.delete('timelineStream');
-      heldTrailingTimeline[0].data(activeTimeline(
-        sessionId,
-        'kernel-watcher-a',
-        2
-      ));
+      heldTrailingTimeline[0].data(emptyTimeline(sessionId, 2));
       await waitFor(
         () => windowTimers.countByDelay(
           CANONICAL_PROGRESS_STREAM_RETRY_MS
@@ -990,6 +1052,9 @@ const contractCases = [
   {
     id: 'canonical_timeline_revision_gap_refetches_exact_snapshot',
     async run(host) {
+      const {
+        applyAgentTimelineDelta,
+      } = await import(pathToFileURL(SESSION_TIMELINE_DELTA_MODULE).href);
       const sessionId = 'revision-gap-a';
       const scenario = new Scenario(this.id, [sessionId]);
       scenario.setActiveRun(
@@ -1003,6 +1068,30 @@ const contractCases = [
       scenario.records.length = 0;
       const heldTimeline = holdRequests(scenario, 'timeline');
       const heldGuidance = holdRequests(scenario, 'guidance');
+      const gapDelta = {
+        schemaVersion: 'deepcode.shared-conversation-projection.v2',
+        shapeVersion: 'deepcode.shared-conversation.work-segments.v2',
+        sessionId,
+        baseRevision: 99,
+        revision: 100,
+        sourceEventVersion: 100,
+        generatedAt: NOW,
+        eventCount: 100,
+        turnReplacements: [],
+        removedTurnIds: [],
+        rootReplacements: {},
+      };
+      assert.throws(
+        () => applyAgentTimelineDelta(
+          activeTimeline(sessionId, 'kernel-revision-gap-a', 1),
+          gapDelta
+        ),
+        (error) =>
+          error?.code === 'AgentTimelineRevisionGap'
+          && error.expectedBaseRevision === 1
+          && error.receivedBaseRevision === 99,
+        'the stream fixture must be valid v2 and fail only on its revision gap'
+      );
       let streamSequence = 0;
       scenario.handlers.set('timelineStream', (context) => {
         streamSequence += 1;
@@ -1012,19 +1101,7 @@ const contractCases = [
             type: 'delta',
             sessionId,
             revision: 100,
-            delta: {
-              schemaVersion: 'deepcode.shared-conversation-projection.v2',
-              shapeVersion: 'deepcode.shared-conversation.work-segments.v1',
-              sessionId,
-              baseRevision: 99,
-              revision: 100,
-              sourceEventVersion: 100,
-              generatedAt: NOW,
-              eventCount: 100,
-              turnReplacements: [],
-              removedTurnIds: [],
-              rootReplacements: {},
-            },
+            delta: gapDelta,
           });
           context.response.end();
         }
@@ -1501,17 +1578,13 @@ const contractCases = [
           localStorageEntries.clear();
         },
       };
-      const nativeEmptyTimeline = (sessionId) => ({
-        ...emptyTimeline(sessionId),
-        shapeVersion: 'deepcode.shared-conversation.work-segments.v2',
-      });
       window.localStorage.clear();
       try {
         const successSessionId = 'submission-active-success-a';
         const successScenario = new Scenario(this.id, [successSessionId]);
         successScenario.timelines.set(
           successSessionId,
-          nativeEmptyTimeline(successSessionId)
+          emptyTimeline(successSessionId)
         );
         host.register(successScenario);
         const successStore = await freshStore(`${this.id}-success`);
@@ -1619,7 +1692,7 @@ const contractCases = [
         );
         recoveryScenario.timelines.set(
           recoverySessionId,
-          nativeEmptyTimeline(recoverySessionId)
+          emptyTimeline(recoverySessionId)
         );
         host.register(recoveryScenario);
         let startMode = 'pending';
@@ -1793,6 +1866,7 @@ async function main() {
   }
   const host = new ControlledHost();
   await host.start();
+  const localStorageEntries = new Map();
   globalThis.window = {
     location: {
       protocol: 'deepcode-gui:',
@@ -1806,8 +1880,17 @@ async function main() {
       proxyCapability: HOST_CAPABILITY,
     },
     localStorage: {
-      getItem() {
-        return null;
+      getItem(key) {
+        return localStorageEntries.get(String(key)) ?? null;
+      },
+      setItem(key, value) {
+        localStorageEntries.set(String(key), String(value));
+      },
+      removeItem(key) {
+        localStorageEntries.delete(String(key));
+      },
+      clear() {
+        localStorageEntries.clear();
       },
     },
     setTimeout: (...args) => windowTimers.setTimeout(...args),

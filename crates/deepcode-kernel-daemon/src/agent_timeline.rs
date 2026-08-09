@@ -665,7 +665,7 @@ mod tests {
         };
         json!({
             "schemaVersion": "deepcode.shared-conversation-projection.v2",
-            "shapeVersion": "deepcode.shared-conversation.work-segments.v1",
+            "shapeVersion": "deepcode.shared-conversation.work-segments.v2",
             "sessionId": session_id,
             "revision": revision,
             "sourceEventVersion": revision,

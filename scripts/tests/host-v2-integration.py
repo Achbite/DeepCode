@@ -86,9 +86,9 @@ DELETE_PLAN_REASONING = (
 DELETE_PLAN_CALL_ID = "call-host-v2-delete-plan"
 DELETE_TOOL_ID = "fs.delete"
 DELETE_PROVIDER_TOOL_NAME = "dcv2_66732e64656c657465"
-SESSION_PLAN_PROPOSAL_TOOL_NAME = "deepcode_session_plan_propose_v2"
+SESSION_PLAN_PROPOSAL_TOOL_NAME = "deepcode_session_plan_propose_v3"
 DELETE_PLAN_ARGUMENTS = {
-    "schemaVersion": "deepcode.session.plan-proposal.v2",
+    "schemaVersion": "deepcode.session.plan-proposal.v3",
     "plan": {
         "title": "Delete the test-owned file",
         "objective": "Delete exactly one test-owned workspace file after approval.",
@@ -98,18 +98,19 @@ DELETE_PLAN_ARGUMENTS = {
         "actions": [
             {
                 "toolId": DELETE_TOOL_ID,
-                "requestedResources": [
-                    {
-                        "kind": "workspacePath",
-                        "data": {
-                            "path": DELETE_TARGET_RELATIVE_PATH,
-                            "access": "write",
-                        },
-                    }
-                ],
-                "previewArguments": {
-                    "path": DELETE_TARGET_RELATIVE_PATH,
-                    "targetKind": "file",
+                "scopeIntent": {
+                    "kind": "resourceScope",
+                    "data": {
+                        "requestedResources": [
+                            {
+                                "kind": "workspacePath",
+                                "data": {
+                                    "path": DELETE_TARGET_RELATIVE_PATH,
+                                    "access": "write",
+                                },
+                            }
+                        ],
+                    },
                 },
             }
         ],
@@ -2655,7 +2656,7 @@ def read_agent_timeline(
         and timeline.get("schemaVersion")
         == "deepcode.shared-conversation-projection.v2"
         and timeline.get("shapeVersion")
-        == "deepcode.shared-conversation.work-segments.v1",
+        == "deepcode.shared-conversation.work-segments.v2",
         "Session timeline did not use the exact Shared Projection v2 shape",
     )
     return timeline
@@ -5240,7 +5241,7 @@ def open_host_run(
         and timeline.get("schemaVersion")
         == "deepcode.shared-conversation-projection.v2"
         and timeline.get("shapeVersion")
-        == "deepcode.shared-conversation.work-segments.v1"
+        == "deepcode.shared-conversation.work-segments.v2"
         and isinstance(timeline.get("runProjection"), dict)
         and timeline["runProjection"].get("runId") == kernel_run_id
         and timeline["runProjection"].get("status") == "succeeded",

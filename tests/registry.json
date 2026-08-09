@@ -157,10 +157,12 @@
         "crates/deepcode-kernel-runtime/src/tests/v2_invocation_tests.rs",
         "crates/deepcode-kernel-runtime/src/tests/v2_unified_tests.rs",
         "crates/deepcode-kernel-daemon/src/agent_api_tests.rs",
+        "crates/deepcode-kernel-daemon/src/agent_timeline.rs",
         "crates/deepcode-kernel-daemon/src/llm_stream_parser.rs",
         "crates/deepcode-kernel-daemon/src/llm_transport_tests.rs",
         "crates/deepcode-kernel-daemon/src/session_kernel_v2_store_dispatch_tests.rs",
         "shells/cli/src/main.rs",
+        "shells/cli/src/session.rs",
         "shells/cli/src/cli_tests.rs"
       ]
     },

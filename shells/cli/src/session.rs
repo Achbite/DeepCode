@@ -2709,7 +2709,7 @@ mod tests {
     fn waiting_snapshot(revision: u64, interaction_id: &str) -> AgentTimelineSnapshot {
         serde_json::from_value(json!({
             "schemaVersion": "deepcode.shared-conversation-projection.v2",
-            "shapeVersion": "deepcode.shared-conversation.work-segments.v1",
+            "shapeVersion": "deepcode.shared-conversation.work-segments.v2",
             "sessionId": "session-cli-decision-contract",
             "revision": revision,
             "sourceEventVersion": revision,
