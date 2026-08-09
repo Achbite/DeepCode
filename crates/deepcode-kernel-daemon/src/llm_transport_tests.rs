@@ -35,9 +35,16 @@ fn provider_public_error_event_uses_bounded_message_and_ignores_raw_detail() {
 }
 
 #[test]
-fn openai_request_body_clamps_excessive_max_tokens() {
+fn openai_request_body_preserves_current_profile_max_output_tokens() {
     let mut profile = test_profile();
     profile.max_output_tokens = Some(384_000);
+    let expected_max_output_tokens = effective_openai_compatible_max_tokens(&profile);
+
+    assert_eq!(
+        expected_max_output_tokens,
+        Some(384_000),
+        "the current resolved Provider Profile output budget must pass through without transport-local reduction"
+    );
 
     let body = openai_compatible_request_body(
         &profile,
@@ -49,12 +56,12 @@ fn openai_request_body_clamps_excessive_max_tokens() {
 
     assert_eq!(
         body["max_tokens"].as_u64(),
-        Some(OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP as u64)
+        expected_max_output_tokens.map(u64::from)
     );
 }
 
 #[test]
-fn openai_request_body_keeps_configured_max_tokens_under_cap() {
+fn openai_request_body_keeps_configured_profile_output_budget() {
     let mut profile = test_profile();
     profile.max_output_tokens = Some(2048);
 

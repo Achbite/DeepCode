@@ -2759,8 +2759,15 @@ mod tests {
 
     fn bound_cursor(baseline: &AgentTimelineSnapshot) -> LiveProjectionCursor {
         let mut cursor =
-            LiveProjectionCursor::from_baseline(Some(baseline), &decision_request(), false)
+            LiveProjectionCursor::from_baseline(Some(baseline), &decision_request(), None, false)
                 .expect("decision baseline must bind exact Run, turn, and interaction identities");
+        match &cursor.expectation {
+            LiveProjectionExpectation::ExistingRun { run_id, turn_id } => {
+                assert_eq!(run_id, "kernel-run-cli-decision-contract");
+                assert_eq!(turn_id, "turn-cli-decision-contract");
+            }
+            _ => panic!("resolveDecision must continue the exact baseline Run and turn"),
+        }
         cursor.live_run_id = Some("kernel-run-cli-decision-contract".to_string());
         cursor.live_turn_id = Some("turn-cli-decision-contract".to_string());
         cursor
