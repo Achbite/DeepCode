@@ -1,17 +1,18 @@
 use crate::executors::{EmptySecretProvider, KernelExecutorConfig};
 use crate::v2::{KernelSessionServiceV2, PendingCapabilityDecisionClassV2, SettingsCeilingV2};
 use deepcode_kernel_abi::v2::{
-    CommandRequestId, ControlEpoch, InputId, KernelFactEnvelopeV2, OperationId, RunId,
-    UserDecisionRefV2,
+    CommandRequestId, ControlEpoch, InputId, KernelFactEnvelopeV2, OperationId, ResourceAccessV2,
+    RunId, UserDecisionRefV2,
 };
 use deepcode_kernel_abi::v2_command::{
+    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2, CapabilityScopePreviewReplyV2,
     CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2,
     KernelCommandV2, KernelReplyV2, RunOpenV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::{
     CapabilityLeaseRefV2, CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2,
-    RawToolArgumentsV2, RunCapabilityV2, ToolContextRefV2, ToolIdV2, ToolIntentAuthorityV2,
-    UserDecisionReplyV2, UserDecisionV2, WorkspaceBindingRefV2,
+    RawToolArgumentsV2, RequestedResourceV2, RunCapabilityV2, ScopeIntentV2, ToolContextRefV2,
+    ToolIdV2, ToolIntentAuthorityV2, UserDecisionReplyV2, UserDecisionV2, WorkspaceBindingRefV2,
 };
 use deepcode_kernel_ledger::v2::{CanonicalFactStore, FactQueryV2};
 use std::fs;
@@ -143,6 +144,10 @@ impl V2Harness {
         )
     }
 
+    pub(super) fn preview_plan_action(&self, request_id: &str, operation_id: &str, path: &str) {
+        preview_plan_action(&self.service, &self.opened, request_id, operation_id, path);
+    }
+
     pub(super) fn allow_preview(
         &self,
         preview_id: CapabilityScopePreviewIdV2,
@@ -233,6 +238,56 @@ pub(super) fn plan_intent(
             tool_context_ref: opened.tool_context_ref.clone(),
         }),
     )
+}
+
+pub(super) fn preview_plan_action(
+    service: &KernelSessionServiceV2,
+    opened: &OpenedRun,
+    request_id: &str,
+    operation_id: &str,
+    path: &str,
+) {
+    let plan_revision = PlanRevisionV2::new("plan-revision-1").expect("valid plan revision");
+    let plan_action_id = PlanActionIdV2::new("plan-action-1").expect("valid PlanAction id");
+    let operation_id = OperationId::new(operation_id).expect("valid operation id");
+    let tool_id = ToolIdV2::parse("fs.ensure_directory").expect("registered ToolId");
+    let envelope = KernelCommandEnvelopeV2::new(
+        CommandRequestId::new(request_id).expect("valid preview request id"),
+        KernelCommandV2::CapabilityScopePreviewBatch(CapabilityScopePreviewBatchV2 {
+            run_id: opened.run_id.clone(),
+            expected_control_epoch: opened.control_epoch,
+            plan_revision: plan_revision.clone(),
+            items: vec![CapabilityScopePreviewItemV2 {
+                plan_action_id: plan_action_id.clone(),
+                operation_id: operation_id.clone(),
+                idempotency_key: format!("idempotency-{operation_id}"),
+                tool_id: tool_id.clone(),
+                scope_intent: ScopeIntentV2::ResourceScope {
+                    requested_resources: vec![RequestedResourceV2::WorkspacePath {
+                        path: path.to_owned(),
+                        access: ResourceAccessV2::Write,
+                    }],
+                },
+                deadline: DeadlineRequestV2::ContractDefault {},
+            }],
+            tool_context_ref: opened.tool_context_ref.clone(),
+        }),
+    );
+    match service.handle_session_command(envelope, &opened.run_capability) {
+        KernelCommandResponseEnvelopeV2::Correlated {
+            handling: CommandHandlingV2::Evaluated,
+            reply: KernelReplyV2::CapabilityScopePreviewBatchResult(reply),
+            ..
+        } => match reply.results.as_slice() {
+            [CapabilityScopePreviewReplyV2::Previewed { preview }]
+                if preview.plan_revision == plan_revision
+                    && preview.plan_action_id == plan_action_id
+                    && preview.operation_id == operation_id
+                    && preview.tool_id == tool_id => {}
+            other => panic!("expected exact PlanAction scope preview, got {other:?}"),
+        },
+        other => panic!("expected evaluated CapabilityScopePreviewBatch, got {other:?}"),
+    }
 }
 
 pub(super) fn tool_intent_response(

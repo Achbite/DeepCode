@@ -5,6 +5,7 @@ use deepcode_kernel_abi::{CapabilityLeaseRefV2, UserDecisionReplyV2};
 
 fn issue_initial_lease(harness: &V2Harness, path: &str, label: &str) -> CapabilityLeaseRefV2 {
     let operation_id = format!("operation-await-{label}");
+    harness.preview_plan_action(&format!("request-preview-{label}"), &operation_id, path);
     let (_, awaiting) = harness.submit(harness.plan_intent(
         &format!("request-await-{label}"),
         &operation_id,

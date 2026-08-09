@@ -1,4 +1,4 @@
-use super::{open_run, plan_intent, tool_intent_response, TempWorkspace};
+use super::{open_run, plan_intent, preview_plan_action, tool_intent_response, TempWorkspace};
 use crate::executors::{EmptySecretProvider, KernelExecutorConfig};
 use crate::v2::{HostRunResumeDispositionV2, KernelSessionServiceV2, SettingsCeilingV2};
 use deepcode_kernel_abi::v2::{
@@ -28,6 +28,13 @@ fn sqlite_reopen_rotates_transport_and_replays_pending_intent_without_effect() {
         temp.workspace(),
         binding_ref.clone(),
         "sqlite-recovery",
+    );
+    preview_plan_action(
+        &service,
+        &opened,
+        "request-preview-recover-pending",
+        "operation-recover-pending",
+        "still-pending",
     );
     let envelope = plan_intent(
         &opened,

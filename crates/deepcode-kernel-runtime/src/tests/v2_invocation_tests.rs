@@ -9,6 +9,11 @@ use deepcode_kernel_abi::{UserDecisionReplyV2, UserDecisionV2};
 #[test]
 fn awaiting_capability_is_effect_fenced_and_command_replay_is_fact_stable() {
     let harness = V2Harness::new("effect-fence-replay");
+    harness.preview_plan_action(
+        "request-preview-effect-fence",
+        "operation-effect-fence",
+        "must-not-exist",
+    );
     let envelope = harness.plan_intent(
         "request-effect-fence",
         "operation-effect-fence",
@@ -58,6 +63,7 @@ fn awaiting_capability_is_effect_fenced_and_command_replay_is_fact_stable() {
 #[test]
 fn denied_plan_action_records_guidance_without_attempt_or_effect() {
     let harness = V2Harness::new("deny-before-effect");
+    harness.preview_plan_action("request-preview-deny", "operation-deny", "denied");
     let (_, awaiting) =
         harness.submit(harness.plan_intent("request-deny", "operation-deny", "denied", None));
     let preview_id = match awaiting {

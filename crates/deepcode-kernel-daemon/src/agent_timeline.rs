@@ -636,6 +636,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("create test-owned timeline root");
+            let path = fs::canonicalize(path).expect("canonicalize test-owned timeline root");
             Self { path }
         }
     }

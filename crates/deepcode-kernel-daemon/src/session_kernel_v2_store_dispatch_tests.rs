@@ -52,6 +52,7 @@ impl TestRoot {
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create test-owned dispatch root");
+        let path = fs::canonicalize(path).expect("canonicalize test-owned dispatch root");
         Self {
             path,
             cleaned: false,
@@ -87,6 +88,52 @@ impl Drop for TestRoot {
                 ),
             }
         }
+    }
+}
+
+fn assert_no_structured_secret_fields(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                assert_no_structured_secret_fields(item);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, nested) in fields {
+                let normalized_key = key
+                    .bytes()
+                    .filter(u8::is_ascii_alphanumeric)
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !matches!(
+                        normalized_key.as_slice(),
+                        b"runcapability"
+                            | b"decisioncapability"
+                            | b"authorization"
+                            | b"cookie"
+                            | b"apikey"
+                            | b"accesstoken"
+                            | b"refreshtoken"
+                            | b"bearertoken"
+                            | b"clientsecret"
+                            | b"password"
+                            | b"token"
+                    ),
+                    "Session persistence contains forbidden structured secret field {key}"
+                );
+                assert_no_structured_secret_fields(nested);
+            }
+        }
+        serde_json::Value::String(text) => {
+            assert!(
+                !text
+                    .get(..7)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer ")),
+                "Session persistence contains a bearer credential value"
+            );
+        }
+        _ => {}
     }
 }
 
@@ -1596,8 +1643,11 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
             .expect("resolve terminal history path"),
     )
     .expect("read terminal history");
-    assert!(!raw_history.contains("apiKey"));
-    assert!(!raw_history.contains("Authorization"));
+    for line in raw_history.lines() {
+        let record: serde_json::Value =
+            serde_json::from_str(line).expect("decode terminal history record");
+        assert_no_structured_secret_fields(&record);
+    }
     assert!(!raw_history.contains("test-provider-terminal-capability"));
 
     drop(trace);
