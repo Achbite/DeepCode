@@ -34,6 +34,15 @@ const TOKEN_USAGE_STATS_MODULE = path.join(
   'utils',
   'tokenUsageStats.js'
 );
+const UI_TIMELINE_PROJECTION_MODULE = path.join(
+  GUI_ROOT,
+  'dist',
+  'userspace',
+  'gui',
+  'src',
+  'utils',
+  'uiTimelineProjection.js'
+);
 const NOW = '2026-07-31T00:00:00.000Z';
 
 if (
@@ -661,6 +670,194 @@ function respondGuidance(context, title) {
 
 const contractCases = [
   {
+    id: 'task_list_requires_latest_accepted_plan_and_preserves_exact_targets',
+    async run() {
+      const {
+        latestAcceptedPlanTaskItemsFromProjection,
+      } = await import(pathToFileURL(UI_TIMELINE_PROJECTION_MODULE).href);
+      const sessionId = 'task-list-plan-a';
+      const runId = 'kernel-task-list-plan-a';
+      const oldPlanBlockId = 'plan-old-accepted';
+      const planBlock = (id, state) => ({
+        id,
+        kind: 'plan',
+        narrativeKind: 'plan',
+        interaction: {
+          kind: 'plan',
+          interactionId: `interaction-${id}`,
+          interactionRevision: `event-${id}`,
+          targetId: id,
+          runId,
+          state,
+        },
+      });
+      const taskItem = (id, blockId, target, progress, outcome) => ({
+        id,
+        titleKey: 'agent.task.fsCreate',
+        titleArgs: { tool: 'fs.create' },
+        summaryKey: 'agent.task.target',
+        messageArgs: { target },
+        targetRefs: [`workspace:${target}`],
+        resourcePresentation: [{
+          kind: 'workspacePath',
+          label: target,
+          workspaceRelativePath: target,
+          canonicalResourceRef: `workspace:${target}`,
+        }],
+        progress,
+        outcome,
+        attention: null,
+        blockId,
+        narrativeKind: 'plan',
+      });
+      const projectionForLatestState = (state) => {
+        const latestPlanBlockId = `plan-latest-${state}`;
+        return {
+          ...activeTimeline(sessionId, runId, 12),
+          turns: [{
+            id: 'turn-task-list-plan-a',
+            blocks: [
+              planBlock(oldPlanBlockId, 'accepted'),
+              planBlock(latestPlanBlockId, state),
+            ],
+          }],
+          taskProjection: {
+            title: 'Plan tasks',
+            items: [
+              taskItem(
+                'task-old-plan',
+                oldPlanBlockId,
+                'legacy.cpp',
+                'completed',
+                'succeeded'
+              ),
+              taskItem(
+                'task-build-sh',
+                latestPlanBlockId,
+                'build.sh',
+                'queued',
+                null
+              ),
+              taskItem(
+                'task-run-sh',
+                latestPlanBlockId,
+                'run.sh',
+                'completed',
+                'succeeded'
+              ),
+              taskItem(
+                'task-main-cpp',
+                latestPlanBlockId,
+                'src/main.cpp',
+                'completed',
+                'unexecuted'
+              ),
+              {
+                ...taskItem(
+                  'task-review-only',
+                  latestPlanBlockId,
+                  'review.md',
+                  'queued',
+                  null
+                ),
+                narrativeKind: 'review',
+              },
+            ],
+          },
+        };
+      };
+
+      assert.deepEqual(
+        latestAcceptedPlanTaskItemsFromProjection(
+          projectionForLatestState('open')
+        ),
+        [],
+        'an older accepted Plan leaked through the latest open Plan snapshot'
+      );
+      assert.deepEqual(
+        latestAcceptedPlanTaskItemsFromProjection(
+          projectionForLatestState('rejected')
+        ),
+        [],
+        'an older accepted Plan leaked through the latest rejected Plan snapshot'
+      );
+
+      const acceptedItems = latestAcceptedPlanTaskItemsFromProjection(
+        projectionForLatestState('accepted')
+      );
+      assert.equal(
+        acceptedItems.length,
+        3,
+        'the accepted Plan task count was compacted or widened'
+      );
+      assert.deepEqual(
+        acceptedItems.map((item) => item.id),
+        ['task-build-sh', 'task-run-sh', 'task-main-cpp'],
+        'same-name tasks were folded or reordered'
+      );
+      assert.deepEqual(
+        acceptedItems.map((item) => ({
+          id: item.id,
+          blockId: item.blockId,
+          titleKey: item.titleKey,
+          titleArgs: item.titleArgs,
+          targetRefs: item.targetRefs,
+          resourcePresentation: item.resourcePresentation,
+          progress: item.progress,
+          outcome: item.outcome,
+        })),
+        [
+          {
+            id: 'task-build-sh',
+            blockId: 'plan-latest-accepted',
+            titleKey: 'agent.task.fsCreate',
+            titleArgs: { tool: 'fs.create' },
+            targetRefs: ['workspace:build.sh'],
+            resourcePresentation: [{
+              kind: 'workspacePath',
+              label: 'build.sh',
+              workspaceRelativePath: 'build.sh',
+              canonicalResourceRef: 'workspace:build.sh',
+            }],
+            progress: 'queued',
+            outcome: null,
+          },
+          {
+            id: 'task-run-sh',
+            blockId: 'plan-latest-accepted',
+            titleKey: 'agent.task.fsCreate',
+            titleArgs: { tool: 'fs.create' },
+            targetRefs: ['workspace:run.sh'],
+            resourcePresentation: [{
+              kind: 'workspacePath',
+              label: 'run.sh',
+              workspaceRelativePath: 'run.sh',
+              canonicalResourceRef: 'workspace:run.sh',
+            }],
+            progress: 'completed',
+            outcome: 'succeeded',
+          },
+          {
+            id: 'task-main-cpp',
+            blockId: 'plan-latest-accepted',
+            titleKey: 'agent.task.fsCreate',
+            titleArgs: { tool: 'fs.create' },
+            targetRefs: ['workspace:src/main.cpp'],
+            resourcePresentation: [{
+              kind: 'workspacePath',
+              label: 'src/main.cpp',
+              workspaceRelativePath: 'src/main.cpp',
+              canonicalResourceRef: 'workspace:src/main.cpp',
+            }],
+            progress: 'completed',
+            outcome: 'unexecuted',
+          },
+        ],
+        'structured targets or outcomes were degraded in the task-list view'
+      );
+    },
+  },
+  {
     id: 'cache_hit_rate_is_derived_from_canonical_integer_counters',
     async run() {
       const {
@@ -1282,6 +1479,283 @@ const contractCases = [
       assert.equal(store.getState().loading, false);
       scenario.handlers.delete('activate');
       await cleanupStore(store);
+    },
+  },
+  {
+    id: 'active_submission_warning_requires_ownerless_durable_request',
+    async run(host) {
+      const storageKey = 'deepcode.host.pending-submissions.v2';
+      const previousLocalStorage = window.localStorage;
+      const localStorageEntries = new Map();
+      window.localStorage = {
+        getItem(key) {
+          return localStorageEntries.get(String(key)) ?? null;
+        },
+        setItem(key, value) {
+          localStorageEntries.set(String(key), String(value));
+        },
+        removeItem(key) {
+          localStorageEntries.delete(String(key));
+        },
+        clear() {
+          localStorageEntries.clear();
+        },
+      };
+      const nativeEmptyTimeline = (sessionId) => ({
+        ...emptyTimeline(sessionId),
+        shapeVersion: 'deepcode.shared-conversation.work-segments.v2',
+      });
+      window.localStorage.clear();
+      try {
+        const successSessionId = 'submission-active-success-a';
+        const successScenario = new Scenario(this.id, [successSessionId]);
+        successScenario.timelines.set(
+          successSessionId,
+          nativeEmptyTimeline(successSessionId)
+        );
+        host.register(successScenario);
+        const successStore = await freshStore(`${this.id}-success`);
+        await activate(successStore, successSessionId);
+        assert.equal(
+          successStore.getState().selectionReady,
+          true,
+          `success Session activation was not ready: ${String(
+            successStore.getState().errorMessage
+          )}`
+        );
+        const heldStarts = holdRequests(successScenario, 'start');
+        const visibleSuccessWarnings = [];
+        const unsubscribeSuccess = successStore.subscribe((state) => {
+          const warning = state.pendingSubmissionRetryView(successSessionId);
+          if (warning) visibleSuccessWarnings.push(warning);
+        });
+
+        const sendSuccess = successStore.getState().sendMessage(
+          'restore the clean development environment'
+        );
+        let earlySuccessResult;
+        void sendSuccess.then((result) => {
+          earlySuccessResult = result;
+        });
+        await waitFor(
+          () => heldStarts.length === 1 || earlySuccessResult !== undefined,
+          'the actively owned caller submission'
+        );
+        assert.equal(
+          heldStarts.length,
+          1,
+          `submission settled before Host admission: ${String(
+            successStore.getState().errorMessage
+          )}`
+        );
+        const activeState = successStore.getState();
+        assert.deepEqual(
+          activeState.activeSubmissionSessionIds,
+          [successSessionId],
+          'the in-flight submission owner was not observable exactly once'
+        );
+        assert.deepEqual(
+          activeState.pendingSubmissionSessionIds,
+          [successSessionId],
+          'the durable submission identity was not observable exactly once'
+        );
+        assert.equal(
+          activeState.pendingSubmissionRetryView(successSessionId),
+          null,
+          'an actively owned submission was exposed as a recovery warning'
+        );
+        const storedWhileActive = JSON.parse(
+          window.localStorage.getItem(storageKey)
+        );
+        assert.equal(storedWhileActive.submissions.length, 1);
+        const successCallerRequestId =
+          storedWhileActive.submissions[0].submission.callerRequestId;
+        assert.equal(
+          heldStarts[0].record.body.callerRequestId,
+          successCallerRequestId,
+          'the active request did not use its durable caller identity'
+        );
+
+        const successRunId = 'host-submission-active-success-a';
+        successScenario.runRoutes.set(successRunId, {
+          hostRunId: successRunId,
+          status: 'waiting',
+          sessionId: successSessionId,
+        });
+        successScenario.handlers.delete('start');
+        heldStarts[0].data(successScenario.runResult(
+          successSessionId,
+          successRunId,
+          'waiting'
+        ));
+        assert.equal(await sendSuccess, true);
+        await waitFor(
+          () => !successStore.getState().activeSubmissionSessionIds.includes(
+            successSessionId
+          ),
+          'successful submission owner release'
+        );
+        assert.equal(
+          successStore.getState().pendingSubmissionRetryView(successSessionId),
+          null
+        );
+        assert.deepEqual(
+          visibleSuccessWarnings,
+          [],
+          'successful admission briefly exposed a recovery warning'
+        );
+        assert.equal(
+          JSON.parse(window.localStorage.getItem(storageKey)).submissions.length,
+          0,
+          'successful admission left a durable recovery identity'
+        );
+        unsubscribeSuccess();
+        await cleanupStore(successStore);
+
+        const recoverySessionId = 'submission-ownerless-recovery-a';
+        const recoveryScenario = new Scenario(
+          `${this.id}-recovery`,
+          [recoverySessionId]
+        );
+        recoveryScenario.timelines.set(
+          recoverySessionId,
+          nativeEmptyTimeline(recoverySessionId)
+        );
+        host.register(recoveryScenario);
+        let startMode = 'pending';
+        recoveryScenario.handlers.set('start', (context) => {
+          if (startMode === 'success') return false;
+          if (startMode === 'indeterminate') {
+            context.destroy();
+            return true;
+          }
+          context.response.writeHead(200, {
+            'content-type': 'application/json',
+          });
+          context.response.end(JSON.stringify({
+            ok: false,
+            error: 'caller_submission_pending',
+            message: 'Caller submission is still reconciling.',
+            data: {
+              schemaVersion: 'deepcode.host.caller-mutation-error.v2',
+              disposition: 'pending',
+            },
+          }));
+          return true;
+        });
+        const recoveryStore = await freshStore(`${this.id}-recovery`);
+        await activate(recoveryStore, recoverySessionId);
+        assert.equal(
+          await recoveryStore.getState().sendMessage('recover this request'),
+          false
+        );
+        const pendingView = recoveryStore.getState()
+          .pendingSubmissionRetryView(recoverySessionId);
+        assert.equal(pendingView?.disposition, 'pending');
+        assert(
+          !recoveryStore.getState().activeSubmissionSessionIds.includes(
+            recoverySessionId
+          ),
+          'the failed request retained a live submission owner'
+        );
+        assert.equal(
+          recoveryStore.getState().pendingSubmissionSessionIds.filter(
+            (sessionId) => sessionId === recoverySessionId
+          ).length,
+          1,
+          'the ownerless pending identity was duplicated'
+        );
+        const recoveryCallerRequestId = pendingView?.callerRequestId;
+        assert(recoveryCallerRequestId);
+
+        startMode = 'indeterminate';
+        assert.equal(
+          await recoveryStore.getState().retryPendingSubmission(false),
+          false
+        );
+        const indeterminateView = recoveryStore.getState()
+          .pendingSubmissionRetryView(recoverySessionId);
+        assert.equal(indeterminateView?.disposition, 'indeterminate');
+        assert.equal(
+          indeterminateView?.callerRequestId,
+          recoveryCallerRequestId,
+          'indeterminate reconciliation replaced the durable caller identity'
+        );
+        assert.equal(
+          recoveryScenario.recordsOf('start').length,
+          3,
+          'network uncertainty did not perform exactly one replayable transport retry'
+        );
+        assert.deepEqual(
+          [...new Set(recoveryScenario.recordsOf('start').map(
+            (record) => record.body.callerRequestId
+          ))],
+          [recoveryCallerRequestId],
+          'transport retry created a second logical caller identity'
+        );
+        const storedOwnerless = JSON.parse(
+          window.localStorage.getItem(storageKey)
+        );
+        assert.equal(storedOwnerless.submissions.length, 1);
+        assert.equal(
+          storedOwnerless.submissions[0].submission.callerRequestId,
+          recoveryCallerRequestId
+        );
+        await cleanupStore(recoveryStore);
+
+        const restartedStore = await freshStore(`${this.id}-restart`);
+        assert.deepEqual(
+          restartedStore.getState().pendingSubmissionSessionIds,
+          [recoverySessionId],
+          'restart did not recover the ownerless durable request'
+        );
+        assert.equal(
+          restartedStore.getState().pendingSubmissionRetryView(
+            recoverySessionId
+          )?.callerRequestId,
+          recoveryCallerRequestId,
+          'restart changed the durable caller identity'
+        );
+        await activate(restartedStore, recoverySessionId);
+        const restartedWarnings = [];
+        const unsubscribeRestarted = restartedStore.subscribe((state) => {
+          const warning = state.pendingSubmissionRetryView(recoverySessionId);
+          if (warning) restartedWarnings.push(warning);
+        });
+        startMode = 'success';
+        assert.equal(
+          await restartedStore.getState().retryPendingSubmission(false),
+          true
+        );
+        assert.deepEqual(
+          [...new Set(recoveryScenario.recordsOf('start').map(
+            (record) => record.body.callerRequestId
+          ))],
+          [recoveryCallerRequestId],
+          'restart recovery submitted a duplicate logical identity'
+        );
+        assert.deepEqual(
+          restartedWarnings,
+          [],
+          'successful restart recovery flashed a warning while actively owned'
+        );
+        assert.equal(
+          restartedStore.getState().pendingSubmissionRetryView(
+            recoverySessionId
+          ),
+          null
+        );
+        assert.equal(
+          JSON.parse(window.localStorage.getItem(storageKey)).submissions.length,
+          0,
+          'successful restart recovery did not settle durable identity'
+        );
+        unsubscribeRestarted();
+        await cleanupStore(restartedStore);
+      } finally {
+        window.localStorage.clear();
+        window.localStorage = previousLocalStorage;
+      }
     },
   },
 ];

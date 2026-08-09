@@ -11,7 +11,6 @@ import {
 import {
   admittedReply,
   assert,
-  createPlan,
   createProviderCompletionReceipt,
   openSessionHarness,
   providerToolIntent,
@@ -37,6 +36,10 @@ export const contractCases = [
   {
     id: 'task_projection_tracks_plan_authority_without_queued_fallback',
     run: taskProjectionTracksPlanAuthorityWithoutQueuedFallback,
+  },
+  {
+    id: 'task_projection_uses_only_latest_exact_accepted_plan',
+    run: taskProjectionUsesOnlyLatestExactAcceptedPlan,
   },
 ];
 
@@ -637,6 +640,8 @@ async function previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegme
       {
         kind: 'rejected',
         data: {
+          planActionId: rejectedAction.manifest.planActionId,
+          operationId: rejectedAction.manifest.operationId,
           toolId: rejectedAction.manifest.toolId,
           reason: 'settingsDenied',
           guidance: 'Revise only the first action scope.',
@@ -654,26 +659,15 @@ async function previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegme
     events,
   });
   assertSharedConversationProjectionV2(projection);
-  assert.deepEqual(
-    projection.taskProjection.items.map((item) => ({
-      id: item.id,
-      status: item.status,
-    })),
-    [
-      {
-        id: rejectedAction.taskId,
-        status: 'needsRevision',
-      },
-      { id: plan.actions[1].taskId, status: 'planned' },
-      { id: plan.actions[2].taskId, status: 'planned' },
-    ],
-    'a rejected canonical preview may revise only its exact PlanAction'
-  );
   assert.equal(
-    projection.taskProjection.items.some((item) =>
-      item.status === 'running' || item.status === 'completed'
-    ),
-    false
+    Object.hasOwn(projection, 'taskProjection'),
+    false,
+    'an unaccepted Plan must not create a root task projection'
+  );
+  assert.deepEqual(
+    taskProjectionRefs(projection),
+    [],
+    'an unaccepted Plan must not leave a taskProjectionRef on any block'
   );
   assert.equal(
     projection.turns.flatMap((turn) => turn.workSegments).length,
@@ -713,21 +707,22 @@ async function taskProjectionTracksPlanAuthorityWithoutQueuedFallback() {
         recordedAt: timestamp(3),
       }
     ),
+    planConfirmationReadyEvent(sessionId, runId, 4, plan),
     publicProjectionEvent(
       sessionId,
       runId,
-      4,
+      5,
       'plan.decided',
       {
         planRevision: plan.planRevision,
         decision: 'accept',
-        recordedAt: timestamp(4),
+        recordedAt: timestamp(5),
       }
     ),
     publicProjectionEvent(
       sessionId,
       runId,
-      5,
+      6,
       'authorization.decided',
       {
         factId: 'fact-plan-authority-only',
@@ -746,13 +741,21 @@ async function taskProjectionTracksPlanAuthorityWithoutQueuedFallback() {
   });
   assertSharedConversationProjectionV2(projection);
   assert.deepEqual(
-    projection.taskProjection.items.map((item) => item.status),
-    ['authorized', 'authorized', 'authorized'],
-    'accepted Plan authority remains authorized until invocation or facts establish another status'
+    projection.taskProjection.items.map((item) => ({
+      id: item.id,
+      progress: item.progress,
+      outcome: item.outcome,
+    })),
+    plan.actions.map((action) => ({
+      id: action.taskId,
+      progress: 'queued',
+      outcome: null,
+    })),
+    'accepted Plan authority remains queued until an invocation or settlement establishes more'
   );
   assert.equal(
     projection.taskProjection.items.some((item) =>
-      item.status === 'running' || item.status === 'completed'
+      item.progress === 'thinking' || item.progress === 'completed'
     ),
     false,
     'narration and capability facts cannot imply execution'
@@ -761,6 +764,121 @@ async function taskProjectionTracksPlanAuthorityWithoutQueuedFallback() {
     projection.turns.flatMap((turn) => turn.workSegments).length,
     0,
     'authority without an invocation cannot manufacture a WorkSegment'
+  );
+}
+
+async function taskProjectionUsesOnlyLatestExactAcceptedPlan() {
+  const sessionId = 'session-latest-exact-accepted-plan-contract';
+  const runId = 'run-latest-exact-accepted-plan-contract';
+  const oldPlan = threeActionPlan(runId, 'old');
+  const latestPlan = threeActionPlan(runId, 'latest');
+  const acceptedOldEvents = [
+    planInputEvent(sessionId, runId, 1),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      2,
+      'plan.persisted',
+      oldPlan
+    ),
+    planConfirmationReadyEvent(sessionId, runId, 3, oldPlan),
+    planDecisionEvent(sessionId, runId, 4, oldPlan, 'accept'),
+  ];
+  const latestProposalEvents = [
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      5,
+      'plan.persisted',
+      latestPlan
+    ),
+    planConfirmationReadyEvent(sessionId, runId, 6, latestPlan),
+  ];
+  const staleFallbackCases = [
+    {
+      name: 'pending',
+      decisionEvents: [],
+    },
+    {
+      name: 'rejected',
+      decisionEvents: [
+        planDecisionEvent(sessionId, runId, 7, latestPlan, 'reject'),
+      ],
+    },
+    {
+      name: 'needs revision',
+      decisionEvents: [
+        planDecisionEvent(sessionId, runId, 7, latestPlan, 'revise'),
+      ],
+    },
+    {
+      name: 'expired',
+      decisionEvents: [
+        expiredPlanDecisionEvent(sessionId, runId, 7, latestPlan),
+      ],
+    },
+  ];
+
+  for (const staleCase of staleFallbackCases) {
+    const projection = buildNarrativeTimelineProjection({
+      sessionId,
+      events: [
+        ...acceptedOldEvents,
+        ...latestProposalEvents,
+        ...staleCase.decisionEvents,
+      ],
+    });
+    assertSharedConversationProjectionV2(projection);
+    assert.equal(
+      Object.hasOwn(projection, 'taskProjection'),
+      false,
+      `${staleCase.name} latest Plan must not fall back to older accepted tasks`
+    );
+    assert.deepEqual(
+      taskProjectionRefs(projection),
+      [],
+      `${staleCase.name} latest Plan must remove every stale taskProjectionRef`
+    );
+    assert.equal(
+      projection.turns.flatMap((turn) => turn.workSegments).length,
+      0,
+      `${staleCase.name} latest Plan has no invocation and no WorkSegment`
+    );
+  }
+
+  const acceptedLatest = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [
+      ...acceptedOldEvents,
+      ...latestProposalEvents,
+      planDecisionEvent(sessionId, runId, 7, latestPlan, 'accept'),
+    ],
+  });
+  assertSharedConversationProjectionV2(acceptedLatest);
+  assert.deepEqual(
+    acceptedLatest.taskProjection.items.map((item) => ({
+      id: item.id,
+      blockId: item.blockId,
+      progress: item.progress,
+      outcome: item.outcome,
+    })),
+    latestPlan.actions.map((action) => ({
+      id: action.taskId,
+      blockId: `plan:${runId}:${latestPlan.planRevision}`,
+      progress: 'queued',
+      outcome: null,
+    })),
+    'only the exact latest accepted Plan may restore queued task items'
+  );
+  assert.deepEqual(
+    taskProjectionRefs(acceptedLatest),
+    [`tasks:${latestPlan.planRevision}`],
+    'only the exact latest accepted Plan block may retain taskProjectionRef'
+  );
+  assert.equal(
+    acceptedLatest.turns.flatMap((turn) => turn.workSegments).length,
+    0,
+    'acceptance without invocation cannot manufacture a WorkSegment'
   );
 }
 
@@ -781,41 +899,172 @@ function planInputEvent(sessionId, runId, sequence) {
   );
 }
 
-function threeActionPlan(runId) {
-  const first = createPlan({ runId });
+function threeActionPlan(runId, identity = 'authority') {
+  const planRevision = `plan-${identity}`;
   const action = (ordinal, path) => ({
-    taskId: `task-plan-authority-${ordinal}`,
+    taskId: `task-plan-${identity}-${ordinal}`,
     manifest: {
-      planRevision: first.planRevision,
-      planActionId: `plan-action-authority-${ordinal}`,
-      operationId: `operation-authority-${ordinal}`,
+      planRevision,
+      planActionId: `plan-action-${identity}-${ordinal}`,
+      operationId: `operation-${identity}-${ordinal}`,
       toolId: 'fs.write',
-      requestedResources: [{
-        kind: 'workspacePath',
-        data: { path, access: 'write' },
-      }],
+      scopeIntent: {
+        kind: 'exactInvocation',
+        data: {
+          rawArguments: { path, content: `content-${ordinal}` },
+        },
+      },
     },
-    previewArguments: { path, content: `content-${ordinal}` },
-    idempotencyKey: `idempotency-authority-${ordinal}`,
+    idempotencyKey: `idempotency-${identity}-${ordinal}`,
     deadline: { kind: 'contractDefault', data: {} },
   });
   return {
-    ...first,
+    runId,
+    inputId: `input-${runId}`,
+    planRevision,
+    title: `Reviewed ${identity} plan`,
+    objective: `Exercise exact ${identity} PlanAction projection.`,
+    narrative: `Use only the exact accepted ${identity} Plan.`,
     actions: [
-      {
-        ...first.actions[0],
-        taskId: 'task-plan-authority-1',
-        manifest: {
-          ...first.actions[0].manifest,
-          planActionId: 'plan-action-authority-1',
-          operationId: 'operation-authority-1',
-        },
-        idempotencyKey: 'idempotency-authority-1',
-      },
-      action(2, 'second.txt'),
-      action(3, 'third.txt'),
+      action(1, `${identity}-first.txt`),
+      action(2, `${identity}-second.txt`),
+      action(3, `${identity}-third.txt`),
     ],
+    recordedAt: timestamp(2),
   };
+}
+
+function planConfirmationReadyEvent(
+  sessionId,
+  runId,
+  sequence,
+  plan
+) {
+  return publicProjectionEvent(
+    sessionId,
+    runId,
+    sequence,
+    'plan.confirmationReady',
+    {
+      planRevision: plan.planRevision,
+      providerTurnId: `provider-turn-${plan.planRevision}`,
+      plan,
+      scopePreviews: scopePreviewsForPlan(plan),
+      recordedAt: timestamp(sequence),
+    }
+  );
+}
+
+function planDecisionEvent(
+  sessionId,
+  runId,
+  sequence,
+  plan,
+  decision
+) {
+  return publicProjectionEvent(
+    sessionId,
+    runId,
+    sequence,
+    'plan.decided',
+    {
+      planRevision: plan.planRevision,
+      decision,
+      recordedAt: timestamp(sequence),
+    }
+  );
+}
+
+function expiredPlanDecisionEvent(
+  sessionId,
+  runId,
+  sequence,
+  plan
+) {
+  const rejected = planDecisionEvent(
+    sessionId,
+    runId,
+    sequence,
+    plan,
+    'reject'
+  );
+  return {
+    ...rejected,
+    id: `${rejected.id}:expired`,
+    payload: {
+      ...rejected.payload,
+      status: 'expired',
+      decision: 'expire',
+      summary: 'Plan confirmation expired without acceptance.',
+    },
+  };
+}
+
+function scopePreviewsForPlan(plan) {
+  return plan.actions.map((action, index) => {
+    const ordinal = index + 1;
+    const rawArguments = action.manifest.scopeIntent.data.rawArguments;
+    const path = rawArguments.path;
+    const scopeDigest = digest(String(ordinal));
+    return {
+      previewId: `preview-${action.manifest.operationId}`,
+      runId: plan.runId,
+      controlEpoch: 1,
+      planRevision: plan.planRevision,
+      planActionId: action.manifest.planActionId,
+      operationId: action.manifest.operationId,
+      toolId: action.manifest.toolId,
+      authorizationBinding: {
+        kind: 'exactInvocation',
+        data: { invocationDigest: digest('a') },
+      },
+      canonicalScope: {
+        kind: 'workspacePaths',
+        data: { targets: [{ relativePath: path, access: 'write' }] },
+      },
+      scopeDigest,
+      authorizationDigest: digest(String(ordinal + 3)),
+      toolContractDigest: digest(String(ordinal + 6)),
+      contextRef: {
+        contextVersion: 3,
+        catalogDigest: digest('d'),
+        contextDigest: digest('e'),
+      },
+      effectClass: 'mutation',
+      effectScope: 'workspaceWrite',
+      risk: 'medium',
+      effectiveDeadlineMs: 30_000,
+      disposition: 'requiresUserDecision',
+      approvalView: {
+        scopeDigest,
+        effectClass: 'mutation',
+        effectScope: 'workspaceWrite',
+        risk: 'medium',
+        summary: `Write ${path}`,
+        scopeDelta: [],
+        resourcePresentation: [{
+          kind: 'workspacePath',
+          label: path,
+          workspaceRelativePath: path,
+          canonicalResourceRef: `workspace:Write:File:${path}`,
+        }],
+      },
+    };
+  });
+}
+
+function taskProjectionRefs(projection) {
+  return projection.turns.flatMap((turn) =>
+    turn.blocks.flatMap((block) =>
+      Object.hasOwn(block, 'taskProjectionRef')
+        ? [block.taskProjectionRef]
+        : []
+    )
+  );
+}
+
+function digest(character) {
+  return `sha256:${character.repeat(64)}`;
 }
 
 function publicProjectionEvent(

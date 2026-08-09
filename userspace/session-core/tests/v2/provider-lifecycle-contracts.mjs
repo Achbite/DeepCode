@@ -1,7 +1,9 @@
 import {
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+  HttpSessionKernelProviderBackendV2,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
   StrictSessionKernelProviderAdapterV2,
+  buildSessionProviderContextV2,
   canonicalJson,
   sha256Hash,
 } from '../../dist/index.js';
@@ -37,6 +39,10 @@ export const contractCases = [
   {
     id: 'provider_profile_without_reasoning_transport_is_not_current_schema',
     run: providerProfileWithoutReasoningTransportIsNotCurrentSchema,
+  },
+  {
+    id: 'planning_context_separates_intent_facts_and_execution_authority',
+    run: planningContextSeparatesIntentFactsAndExecutionAuthority,
   },
   {
     id: 'planning_control_stays_private_until_native_terminal_and_confirmation_settlement',
@@ -284,6 +290,161 @@ async function providerProfileWithoutReasoningTransportIsNotCurrentSchema() {
   assert.equal(harness.store.checkpoint, undefined);
 }
 
+async function planningContextSeparatesIntentFactsAndExecutionAuthority() {
+  const toolContext = {
+    formatVersion: 'deepcode.kernel.tool-context.v2',
+    contextVersion: 1,
+    catalogDigest: `sha256:${'a'.repeat(64)}`,
+    contextDigest: `sha256:${'b'.repeat(64)}`,
+    fixedPrompt: 'Kernel-owned planning context with no ready native tools.',
+    tools: [],
+  };
+  const initial = createInitialState({ toolContext });
+  initial.initialInput.text = [
+    'Restore the current workspace to its clean state.',
+    'Preserve the established workflow.',
+    'Any new implementation is deferred until I choose its scope.',
+  ].join(' ');
+  const contextSource = {
+    providerTurnId: 'provider-turn-planning-context-contract',
+    purpose: 'primary',
+    runId: initial.runId,
+    controlEpoch: initial.controlEpoch,
+    currentInput: initial.initialInput,
+    conversationInputs: [initial.initialInput],
+    conversationInputOmittedCount: 0,
+    providerOutcomes: [],
+    providerOutcomeOmittedCount: 0,
+    sessionMemory: initial.sessionMemory,
+    providerProfile: initial.providerProfile,
+    kernelFacts: {
+      snapshotHighWater: 0,
+      omittedCount: 0,
+      facts: [],
+    },
+    target: { kind: 'planning' },
+    guidance: [],
+    toolContext: {
+      bundle: toolContext,
+      contextRef: {
+        contextVersion: toolContext.contextVersion,
+        catalogDigest: toolContext.catalogDigest,
+        contextDigest: toolContext.contextDigest,
+      },
+      fixedPrompt: toolContext.fixedPrompt,
+      tools: toolContext.tools,
+    },
+    planActionSettlementOutcomes: {},
+  };
+  const contextAssembly = buildSessionProviderContextV2(contextSource);
+  const answerText = 'Please clarify the desired immediate scope.';
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'text',
+    text: answerText,
+  }));
+  let wireRequest;
+  const backend = new HttpSessionKernelProviderBackendV2(
+    {
+      async request(request) {
+        wireRequest = clone(request);
+        return {
+          requestId: request.requestId,
+          items: [{
+            kind: 'text',
+            phase: 'final_answer',
+            text: answerText,
+          }],
+          providerProfileId: 'provider-profile-v2-contract',
+          provider: 'contract-provider',
+          model: 'contract-model',
+          completion: createProviderCompletionReceipt(responseDigest),
+        };
+      },
+    },
+    'provider-profile-v2-contract'
+  );
+  const adapter = new StrictSessionKernelProviderAdapterV2(
+    backend,
+    { now: () => '2026-07-29T00:00:20.000Z' }
+  );
+  const result = await adapter.requestTurn({
+    ...contextSource,
+    contextAssembly,
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(result.kind, 'answer');
+  assert.equal(result.text, answerText);
+  assert.ok(
+    wireRequest,
+    'the production HTTP backend must assemble one wire request'
+  );
+  assert.deepEqual(
+    wireRequest.messages,
+    contextAssembly.messages,
+    'the wire request must preserve the exact Session context assembly'
+  );
+
+  const messages = contextAssembly.messages;
+  assert.equal(messages[1].role, 'system');
+  assert.equal(messages.at(-1).role, 'system');
+  assert.equal(
+    messages.slice(2, -1).every((message) => message.role === 'user'),
+    true,
+    'the trusted planning reminder must follow all untrusted context sections'
+  );
+  const currentInput = JSON.parse(messages[2].content);
+  assert.equal(currentInput.currentInput.text, initial.initialInput.text);
+
+  const contract = messages[1].content;
+  assert.match(contract, /does not require a Plan/u);
+  assert.match(
+    contract,
+    /exact current input is the controlling semantic source/u
+  );
+  assert.match(contract, /never grants tool execution authority/u);
+  assert.match(contract, /state and execution truth only/u);
+  assert.match(contract, /never create a user goal/u);
+  assert.match(
+    contract,
+    /Preserve constraints outrank inferred completeness/u
+  );
+  assert.match(
+    contract,
+    /Deferred or conditional work is non-executable until a new current input explicitly activates it/u
+  );
+  assert.match(
+    contract,
+    /ask one concise natural-language clarification question instead/u
+  );
+
+  const reminder = messages.at(-1).content;
+  assert.match(reminder, /planning lane does not require a Plan/u);
+  assert.match(
+    reminder,
+    /clarification question and no tool or Plan control/u
+  );
+  assert.match(
+    reminder,
+    /canonical facts may resolve state but never create goals/u
+  );
+  assert.match(reminder, /honors preserve constraints/u);
+  assert.match(reminder, /excludes deferred or conditional work/u);
+
+  const planControls = wireRequest.tools.filter(
+    (tool) => tool.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+  );
+  assert.equal(planControls.length, 1);
+  const planDescription = planControls[0].description;
+  assert.match(planDescription, /explicit immediate requested outcome/u);
+  assert.match(planDescription, /honors every preserve constraint/u);
+  assert.match(planDescription, /excludes deferred or conditional work/u);
+  assert.match(planDescription, /Workspace facts describe state only/u);
+  assert.match(planDescription, /current input did not request/u);
+  assert.match(planDescription, /needs clarification, do not call it/u);
+  assert.equal(wireRequest.tools.length, 1);
+}
+
 async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSettlement() {
   const draft = planningDraft();
   const commentary = 'I will verify the exact file scope before requesting approval.';
@@ -305,9 +466,10 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
       value.planProposal.toolName = 'fs.write';
     }),
     mutate(valid, (value) => {
-      delete value.plan.actions[0].previewArguments.content;
+      delete value.plan.actions[0]
+        .scopeIntent.data.requestedResources[0].data.access;
       const proposalArguments = {
-        schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+        schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
         plan: value.plan,
       };
       value.planProposal.argumentsDigest = sha256Hash(
@@ -570,7 +732,7 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
 
 function sealedPlanningOutput(draft, commentary) {
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
     plan: draft,
   };
   const responseDigest = sha256Hash(canonicalJson({
@@ -581,9 +743,9 @@ function sealedPlanningOutput(draft, commentary) {
     kind: 'plan',
     plan: clone(draft),
     planProposal: {
-      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
       callId: 'provider-plan-lifecycle-contract',
-      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
       argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
     },
     items: [{ kind: 'text', phase: 'commentary', text: commentary }],
@@ -606,14 +768,16 @@ function planningDraft() {
     narrative: 'Preview the exact scope before requesting approval.',
     actions: [{
       toolId: 'fs.write',
-      requestedResources: [{
-        kind: 'workspacePath',
-        data: { path: 'output.txt', access: 'write' },
-      }],
-      previewArguments: {
-        path: 'output.txt',
-        content: 'contract output',
+      scopeIntent: {
+        kind: 'resourceScope',
+        data: {
+          requestedResources: [{
+            kind: 'workspacePath',
+            data: { path: 'output.txt', access: 'write' },
+          }],
+        },
       },
+      deadline: { kind: 'contractDefault', data: {} },
     }],
   };
 }
@@ -627,7 +791,7 @@ function installPlanningTerminalEvidence(
   const map = harness.store.providerEvidence;
   const originalSet = map.set;
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V2_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
     plan: draft,
   };
   map.set = function setPlanningEvidence(providerTurnId, evidence) {
@@ -636,7 +800,7 @@ function installPlanningTerminalEvidence(
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,
       callId,
-      name: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
       arguments: canonicalJson(proposalArguments),
     });
     if (options.duplicateControl) {
@@ -644,7 +808,7 @@ function installPlanningTerminalEvidence(
         kind: 'toolCall',
         index: terminal.data.orderedItems.length,
         callId: `${callId}-duplicate`,
-        name: SESSION_PROVIDER_PLAN_PROPOSAL_V2_TOOL_NAME,
+        name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
         arguments: canonicalJson(proposalArguments),
       });
     }
