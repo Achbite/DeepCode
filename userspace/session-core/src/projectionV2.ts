@@ -160,6 +160,14 @@ export function buildNarrativeTimelineProjection(
   }
 
   const interactionProjection = buildInteractionProjection(currentRunEvents);
+  const interactionDecisions = interactionDecisionIndex(input.events);
+  const taskPlanEvent = latestExactAcceptedPlanEvent(
+    currentRunEvents,
+    interactionDecisions
+  );
+  const taskPlanId = taskPlanEvent
+    ? planEventId(taskPlanEvent)
+    : undefined;
   const turns = settleInteractionBlocks(
     context.turns
       .filter(
@@ -188,8 +196,9 @@ export function buildNarrativeTimelineProjection(
         ),
         parts: [...turn.parts],
       })),
-    input.events,
-    interactionProjection?.pending
+    interactionProjection?.pending,
+    interactionDecisions,
+    taskPlanId
   );
   const events = [...input.events, ...auxiliaryEvents];
   const projection: AgentTimelineResult = {
@@ -203,7 +212,7 @@ export function buildNarrativeTimelineProjection(
       ?? new Date(0).toISOString(),
     turns,
     eventCount: input.events.length,
-    taskProjection: buildTaskProjection(currentRunEvents, turns),
+    taskProjection: buildTaskProjection(currentRunEvents, turns, taskPlanEvent),
     interactionProjection,
     runProjection: buildRunProjection(
       input.events,
@@ -413,24 +422,31 @@ function incrementProjectionCounter(
 
 function settleInteractionBlocks(
   turns: AgentTimelineTurn[],
-  events: AgentEvent[],
   pending:
     | NonNullable<AgentTimelineInteractionProjection['pending']>
-    | undefined
+    | undefined,
+  decisions: ReturnType<typeof interactionDecisionIndex>,
+  activeTaskPlanId: string | undefined
 ): AgentTimelineTurn[] {
-  const decisions = interactionDecisionIndex(events);
+  const activeTaskProjectionRef = activeTaskPlanId
+    ? `tasks:${activeTaskPlanId}`
+    : undefined;
   return turns.map((turn) => ({
     ...turn,
     blocks: turn.blocks.map((block) => {
-      const interaction = block.interaction;
-      if (!interaction) return block;
+      const taskBoundBlock = block.taskProjectionRef === undefined
+        || block.taskProjectionRef === activeTaskProjectionRef
+        ? block
+        : withoutTaskProjectionRef(block);
+      const interaction = taskBoundBlock.interaction;
+      if (!interaction) return taskBoundBlock;
       if (
         pending
         && pending.interactionId === interaction.interactionId
         && pending.interactionRevision === interaction.interactionRevision
       ) {
         return {
-          ...block,
+          ...taskBoundBlock,
           interaction: {
             ...interaction,
             state: 'open',
@@ -442,9 +458,9 @@ function settleInteractionBlocks(
         `${interaction.kind}:${interaction.targetId}`
       );
       return {
-        ...block,
+        ...taskBoundBlock,
         status: interactionBlockStatus(
-          block.status,
+          taskBoundBlock.status,
           decision?.state
         ),
         interaction: {
@@ -466,6 +482,14 @@ function settleInteractionBlocks(
       };
     }),
   }));
+}
+
+function withoutTaskProjectionRef(
+  block: AgentTimelineBlock
+): AgentTimelineBlock {
+  const next = { ...block };
+  delete next.taskProjectionRef;
+  return next;
 }
 
 function interactionBlockStatus(
@@ -4116,12 +4140,9 @@ interface TaskProjectionState {
 
 function buildTaskProjection(
   events: AgentEvent[],
-  turns: AgentTimelineTurn[]
+  turns: AgentTimelineTurn[],
+  planEvent: AgentEvent | undefined
 ): AgentTimelineTaskProjection | undefined {
-  let planEvent: AgentEvent | undefined;
-  for (const event of events) {
-    if (event.kind === 'plan_card') planEvent = event;
-  }
   if (!planEvent) return undefined;
   const payload = recordValue(planEvent.payload);
   const tasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
@@ -4207,6 +4228,25 @@ function buildTaskProjection(
         items,
       }
     : undefined;
+}
+
+function latestExactAcceptedPlanEvent(
+  events: AgentEvent[],
+  decisions: ReturnType<typeof interactionDecisionIndex>
+): AgentEvent | undefined {
+  let latestPlanEvent: AgentEvent | undefined;
+  for (const event of events) {
+    if (event.kind === 'plan_card') latestPlanEvent = event;
+  }
+  if (!latestPlanEvent) return undefined;
+  return decisions.get(`plan:${planEventId(latestPlanEvent)}`)?.state
+    === 'accepted'
+    ? latestPlanEvent
+    : undefined;
+}
+
+function planEventId(event: AgentEvent): string {
+  return stringValue(recordValue(event.payload)?.planId) ?? event.id;
 }
 
 function taskProjectionStateForPlanAction(

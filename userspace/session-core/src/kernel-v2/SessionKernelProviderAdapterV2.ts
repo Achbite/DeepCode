@@ -70,8 +70,9 @@ export function sessionPlanProposalToolV3(): ProviderWireToolDefinition {
     name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
     description: [
       'Session-only structured Plan control; it never executes a Kernel tool.',
-      'Call it exactly once only when the requested work requires a Plan for user review.',
-      'For an ordinary answer, do not call it and reply with natural assistant text.',
+      'Call it exactly once only when every action is necessary for an explicit immediate requested outcome, honors every preserve constraint, and excludes deferred or conditional work.',
+      'Workspace facts describe state only; never use this control for inferred repair, scaffolding, or improvement work that the current input did not request.',
+      'For an ordinary answer or when user preference, scope, timing, or desired project shape needs clarification, do not call it and reply with natural assistant text.',
       'Commentary may precede this control, but final answer text may not share the response.',
     ].join(' '),
     inputSchema: {
