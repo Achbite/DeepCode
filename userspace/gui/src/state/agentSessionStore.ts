@@ -87,6 +87,7 @@ interface AgentSessionState {
   runningSessionIds: string[];
   activeRunSessionIds: string[];
   cancellingSessionIds: string[];
+  activeSubmissionSessionIds: string[];
   pendingSubmissionSessionIds: string[];
   errorMessage: string | null;
   messageAttachments: AgentInputAttachmentV2[];
@@ -653,12 +654,22 @@ function claimPendingHostMutation(sessionId: string): string | null {
   if (pendingHostMutationOwners.has(sessionId)) return null;
   const ownerToken = globalThis.crypto.randomUUID();
   pendingHostMutationOwners.set(sessionId, ownerToken);
+  useAgentSessionStore.setState((state) => ({
+    activeSubmissionSessionIds: state.activeSubmissionSessionIds.includes(sessionId)
+      ? state.activeSubmissionSessionIds
+      : [...state.activeSubmissionSessionIds, sessionId],
+  }));
   return ownerToken;
 }
 
 function releasePendingHostMutation(sessionId: string, ownerToken: string): void {
   if (pendingHostMutationOwners.get(sessionId) === ownerToken) {
     pendingHostMutationOwners.delete(sessionId);
+    useAgentSessionStore.setState((state) => ({
+      activeSubmissionSessionIds: state.activeSubmissionSessionIds.filter(
+        (candidate) => candidate !== sessionId
+      ),
+    }));
   }
 }
 
@@ -1840,6 +1851,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   runningSessionIds: [],
   activeRunSessionIds: [],
   cancellingSessionIds: [],
+  activeSubmissionSessionIds: [],
   pendingSubmissionSessionIds: [...pendingHostSubmissionIdentities.keys()],
   errorMessage: null,
   messageAttachments: [],
@@ -2739,6 +2751,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   },
   pendingSubmissionRetryView: (sessionId) => {
     if (!sessionId) return null;
+    if (pendingHostMutationOwners.has(sessionId)) return null;
     const pending = unresolvedHostSubmission(sessionId);
     if (!pending) return null;
     return {

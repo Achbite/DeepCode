@@ -1,17 +1,36 @@
 import React from 'react';
-import type { AgentTimelineTaskProgress } from '@deepcode/protocol';
+import type {
+  AgentTimelineResourcePresentation,
+  AgentTimelineTaskOutcome,
+  AgentTimelineTaskProgress,
+} from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
 export interface DeepCodeTaskItem {
   id: string;
+  blockId: string;
   title: string;
   summary: string;
   progress: AgentTimelineTaskProgress;
+  outcome: AgentTimelineTaskOutcome | null;
+  targetRefs: string[];
+  resourcePresentation: AgentTimelineResourcePresentation[];
 }
 
 interface DeepCodeTaskPanelProps {
   language: UiLanguage;
   items: DeepCodeTaskItem[];
+}
+
+function structuredTargetLabel(item: DeepCodeTaskItem): string {
+  const labels = item.resourcePresentation.flatMap((resource) => {
+    const label = resource.kind === 'workspacePath'
+      ? resource.workspaceRelativePath ?? resource.label
+      : resource.label;
+    const normalized = label.trim();
+    return normalized ? [normalized] : [];
+  });
+  return [...new Set(labels)].join(' · ');
 }
 
 const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, items }) => (
@@ -22,15 +41,26 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, items }
         <div className="deepcode-gui-task-list-card__empty">{t(language, 'deepcodeGui.tasks.empty')}</div>
       ) : (
         <div className="deepcode-gui-task-list">
-          {items.map((item) => (
-            <div key={item.id} className={`deepcode-gui-task-item deepcode-gui-task-item--${item.progress}`}>
-              <span className="deepcode-gui-task-item__dot" />
-              <div>
-                <div className="deepcode-gui-task-item__title">{item.title}</div>
+          {items.map((item) => {
+            const targetLabel = structuredTargetLabel(item);
+            const statusSummary = item.summary
+              || t(language, `deepcodeGui.tasks.progress.${item.progress}`);
+            return (
+              <div
+                key={JSON.stringify([item.id, item.targetRefs])}
+                className={`deepcode-gui-task-item deepcode-gui-task-item--${item.progress}`}
+              >
+                <span className="deepcode-gui-task-item__dot" />
+                <div>
+                  <div className="deepcode-gui-task-item__title">{item.title}</div>
+                  {targetLabel && (
+                    <div className="deepcode-gui-task-item__summary">{targetLabel}</div>
+                  )}
+                </div>
+                <strong>{statusSummary}</strong>
               </div>
-              <strong>{t(language, `deepcodeGui.tasks.progress.${item.progress}`)}</strong>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </section>

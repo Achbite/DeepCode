@@ -23,7 +23,10 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
-import { latestPlanTaskItemsFromProjection, timelineOrEmpty } from '../../utils/uiTimelineProjection';
+import {
+  latestAcceptedPlanTaskItemsFromProjection,
+  timelineOrEmpty,
+} from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar, {
@@ -358,7 +361,7 @@ const DeepCodeProjectFolderDialog: React.FC<DeepCodeProjectFolderDialogProps> = 
 function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
   const byKey = new Map<string, DeepCodeTaskItem>();
   for (const item of items) {
-    const key = `${item.title.trim()}::${item.summary.trim() || item.id}`;
+    const key = JSON.stringify([item.id, item.targetRefs]);
     byKey.set(key, item);
   }
   return Array.from(byKey.values());
@@ -366,24 +369,23 @@ function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
 
 function deriveTaskItems(
   language: UiLanguage,
-  projection: AgentTimelineResult,
-  fallbackItems: DeepCodeTaskItem[] = []
+  projection: AgentTimelineResult
 ): DeepCodeTaskItem[] {
-  const projectedItems = latestPlanTaskItemsFromProjection(projection);
+  const projectedItems = latestAcceptedPlanTaskItemsFromProjection(projection);
 
   if (projectedItems.length > 0) {
     return dedupeTaskItems(
       projectedItems.map((item) => ({
         id: item.id,
+        blockId: item.blockId,
         title: t(language, item.titleKey, item.titleArgs),
         summary: t(language, item.summaryKey, item.messageArgs),
         progress: item.progress,
+        outcome: item.outcome,
+        targetRefs: [...item.targetRefs],
+        resourcePresentation: item.resourcePresentation.map((resource) => ({ ...resource })),
       }))
     ).slice(-6);
-  }
-
-  if (fallbackItems.length > 0) {
-    return fallbackItems;
   }
 
   return [];
@@ -436,15 +438,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const sidebarPendingActionRef = useRef<string | null>(null);
-  const lastPlanTaskItemsRef = useRef<{
-    sessionId: string | null;
-    runId: string | null;
-    items: DeepCodeTaskItem[];
-  }>({
-    sessionId: null,
-    runId: null,
-    items: [],
-  });
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const sessions = useAgentSessionStore((s) => s.sessions);
@@ -542,33 +535,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     )
   );
   const taskItems = useMemo(() => {
-    const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
-    const taskRunId = projectDraftActive
-      ? null
-      : liveTimelineProjection.runProjection?.runId ?? null;
-    const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId
-      && lastPlanTaskItemsRef.current.runId === taskRunId
-      ? lastPlanTaskItemsRef.current.items
-      : [];
-    const items = deriveTaskItems(
-      language,
-      liveTimelineProjection,
-      fallbackItems
-    );
-    if (items.length > 0) {
-      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, runId: taskRunId, items };
-    }
-    if (
-      items.length === 0
-      && (
-        lastPlanTaskItemsRef.current.sessionId !== taskSessionId
-        || lastPlanTaskItemsRef.current.runId !== taskRunId
-      )
-    ) {
-      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, runId: taskRunId, items: [] };
-    }
-    return items;
-  }, [activeSession?.id, language, liveTimelineProjection, projectDraftActive]);
+    return deriveTaskItems(language, liveTimelineProjection);
+  }, [language, liveTimelineProjection]);
   const cacheHitSummary = useMemo(
     () => deriveCacheHitSummary(language, liveTimelineProjection.tokenUsageProjection),
     [language, liveTimelineProjection.tokenUsageProjection]

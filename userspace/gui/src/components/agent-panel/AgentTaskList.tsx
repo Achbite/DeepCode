@@ -1,14 +1,12 @@
-import React, { useMemo, useRef } from 'react';
+import React, { useMemo } from 'react';
 import type { AgentTimelineResult } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { latestPlanTaskItemsFromProjection } from '../../utils/uiTimelineProjection';
+import { latestAcceptedPlanTaskItemsFromProjection } from '../../utils/uiTimelineProjection';
 
 interface AgentTaskView {
   id: string;
   title: string;
   progress: 'queued' | 'thinking' | 'completed';
-  hasToolActivity: boolean;
-  hasMeaningfulOutput: boolean;
 }
 
 interface AgentTaskState {
@@ -24,8 +22,6 @@ function defaultTasks(loading: boolean, language: UiLanguage): AgentTaskView[] {
         ? t(language, 'agent.task.preparing')
         : t(language, 'agent.task.waiting'),
       progress: loading ? 'thinking' : 'queued',
-      hasToolActivity: false,
-      hasMeaningfulOutput: false,
     },
   ];
 }
@@ -35,7 +31,7 @@ function compactTasks(tasks: AgentTaskView[]): AgentTaskView[] {
 }
 
 function deriveTasks(projection: AgentTimelineResult, loading: boolean, language: UiLanguage): AgentTaskState {
-  const projectedItems = latestPlanTaskItemsFromProjection(projection);
+  const projectedItems = latestAcceptedPlanTaskItemsFromProjection(projection);
   if (projectedItems.length === 0) {
     const waiting = defaultTasks(loading, language);
     return {
@@ -48,8 +44,6 @@ function deriveTasks(projection: AgentTimelineResult, loading: boolean, language
     id: item.id,
     title: t(language, item.titleKey, item.titleArgs),
     progress: item.progress,
-    hasToolActivity: false,
-    hasMeaningfulOutput: true,
   })));
   const nextFocus =
     compacted.find((task) => task.progress === 'thinking')?.id ??
@@ -60,17 +54,6 @@ function deriveTasks(projection: AgentTimelineResult, loading: boolean, language
     tasks: compacted,
     focusTaskId: nextFocus,
   };
-}
-
-function isDefaultWaitingState(state: AgentTaskState): boolean {
-  return state.tasks.length === 1 && state.tasks[0]?.id === 'task-waiting';
-}
-
-function isUsableTaskState(state: AgentTaskState): boolean {
-  return state.tasks.some((task) =>
-    task.id !== 'task-waiting' &&
-    (task.hasMeaningfulOutput || task.hasToolActivity || task.progress !== 'queued')
-  );
 }
 
 interface AgentTaskListProps {
@@ -84,22 +67,7 @@ const AgentTaskList: React.FC<AgentTaskListProps> = ({ projection, loading, lang
     () => deriveTasks(projection, loading, language),
     [language, loading, projection]
   );
-  const projectionIdentity = `${projection.sessionId ?? ''}:${projection.runProjection?.runId ?? ''}`;
-  const lastUsableTaskStateRef = useRef<{
-    identity: string;
-    state: AgentTaskState;
-  } | null>(null);
-  if (isUsableTaskState(projectedTaskState)) {
-    lastUsableTaskStateRef.current = {
-      identity: projectionIdentity,
-      state: projectedTaskState,
-    };
-  }
-  const taskState = isDefaultWaitingState(projectedTaskState)
-    && lastUsableTaskStateRef.current?.identity === projectionIdentity
-    ? lastUsableTaskStateRef.current.state
-    : projectedTaskState;
-  const tasks = taskState.tasks;
+  const tasks = projectedTaskState.tasks;
 
   return (
     <div className="agent-task-list">

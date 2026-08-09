@@ -23,6 +23,7 @@ const AgentPanel: React.FC = () => {
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
+  const activeSubmissionSessionIds = useAgentSessionStore((s) => s.activeSubmissionSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -81,6 +82,7 @@ const AgentPanel: React.FC = () => {
   );
   const pendingSubmissionRetry = session?.id
     && pendingSubmissionSessionIds.includes(session.id)
+    && !activeSubmissionSessionIds.includes(session.id)
     ? pendingSubmissionRetryView(session.id)
     : null;
   const attachmentWorkspaceBinding = session?.workspaceBinding;

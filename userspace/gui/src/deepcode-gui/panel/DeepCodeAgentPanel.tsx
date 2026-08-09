@@ -62,6 +62,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
+  const activeSubmissionSessionIds = useAgentSessionStore((s) => s.activeSubmissionSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -177,6 +178,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const profileLocked = sessionRunning || Boolean(timeline.interactionProjection?.pending);
   const pendingSubmissionRetry = !forceHome && session?.id
     && pendingSubmissionSessionIds.includes(session.id)
+    && !activeSubmissionSessionIds.includes(session.id)
     ? pendingSubmissionRetryView(session.id)
     : null;
   const homePrompt = homeProjectTitle
