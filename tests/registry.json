@@ -77,6 +77,13 @@
       },
       "resources": [],
       "contractSources": [
+        "test.sh",
+        "build.sh",
+        "scripts/cargo-with-fallback.sh",
+        "scripts/macos-package-service.sh",
+        "scripts/package-macos.sh",
+        "scripts/tests/static-contracts.sh",
+        "scripts/test-controller.py",
         "scripts/tests/controller-contracts.py",
         "scripts/tests/test-change-gate-contracts.py",
         "scripts/test-change-gate.py",
@@ -87,6 +94,9 @@
         "scripts/tests/repository-required.sh",
         "scripts/tests/kernel-v2-contracts.sh",
         "scripts/tests/session-v2-contracts.sh",
+        "scripts/tests/host-v2-integration.sh",
+        "scripts/tests/host-v2-integration.py",
+        "scripts/tests/session-smoke.sh",
         "scripts/tests/legacy-cutover-contracts.py"
       ]
     },
@@ -139,18 +149,34 @@
       },
       "resources": [
         "test-owned-temporary-directories",
-        "test-owned-sqlite-databases"
+        "test-owned-sqlite-databases",
+        "test-owned-pty",
+        "test-owned-child-process",
+        "test-owned-loopback-listener",
+        "test-owned-http-sse-connections"
       ],
       "contractSources": [
         "scripts/tests/kernel-v2-contracts.sh",
         "crates/deepcode-kernel-abi/tests/root_roundtrip.rs",
         "crates/deepcode-kernel-abi/tests/v2_wire_contract.rs",
+        "crates/deepcode-kernel-ledger/src/v2.rs",
         "crates/deepcode-kernel-ledger/tests/v2_ledger_contract.rs",
         "crates/deepcode-kernel-client/src/lib.rs",
         "fixtures/kernel-session-v2/wire-golden.json",
+        "crates/deepcode-kernel-config/src/lib.rs",
         "crates/deepcode-kernel-policy/src/tests.rs",
+        "crates/deepcode-kernel-tools/src/file_content.rs",
         "crates/deepcode-kernel-tools/tests/v2_registry_contract.rs",
+        "crates/deepcode-kernel-skills/src/hash.rs",
+        "crates/deepcode-kernel-skills/src/lib.rs",
+        "crates/deepcode-kernel-skills/src/manifest.rs",
+        "crates/deepcode-kernel-skills/src/mount.rs",
+        "crates/deepcode-kernel-skills/src/plugin.rs",
+        "crates/deepcode-kernel-skills/src/scanner.rs",
+        "crates/deepcode-kernel-skills/src/trust_record.rs",
+        "crates/deepcode-kernel-skills/tests/skill_contracts.rs",
         "crates/deepcode-kernel-runtime/src/executors/tests.rs",
+        "crates/deepcode-kernel-runtime/src/network_policy.rs",
         "crates/deepcode-kernel-runtime/src/v2/authority.rs",
         "crates/deepcode-kernel-runtime/src/tests.rs",
         "crates/deepcode-kernel-runtime/src/tests/v2_grant_tests.rs",
@@ -161,7 +187,9 @@
         "crates/deepcode-kernel-daemon/src/llm_stream_parser.rs",
         "crates/deepcode-kernel-daemon/src/llm_transport_tests.rs",
         "crates/deepcode-kernel-daemon/src/session_kernel_v2_store_dispatch_tests.rs",
+        "crates/deepcode-kernel-daemon/src/terminal_runtime.rs",
         "shells/cli/src/main.rs",
+        "shells/cli/src/render.rs",
         "shells/cli/src/session.rs",
         "shells/cli/src/cli_tests.rs"
       ]
@@ -240,7 +268,9 @@
         "scripts/tests/host-v2-integration.py",
         "crates/deepcode-kernel-client/src/lib.rs",
         "shells/cli/src/main.rs",
-        "shells/cli/src/cli_tests.rs"
+        "shells/cli/src/cli_tests.rs",
+        "shells/tui/src/app.rs",
+        "shells/tui/src/model.rs"
       ]
     },
     {

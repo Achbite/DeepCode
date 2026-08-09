@@ -18,6 +18,28 @@ info() { printf '[INFO] %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
+ensure_cargo_on_path() {
+  local cargo_bin_dir
+  command -v cargo >/dev/null 2>&1 && return 0
+  for cargo_bin_dir in \
+    "${DEEPCODE_CARGO_BIN_DIR:-}" \
+    "${CARGO_HOME:+${CARGO_HOME%/}/bin}" \
+    "${HOME:+${HOME%/}/.cargo/bin}"
+  do
+    [ -n "$cargo_bin_dir" ] || continue
+    case "$cargo_bin_dir" in
+      /*) ;;
+      *) continue ;;
+    esac
+    if [ -x "$cargo_bin_dir/cargo" ]; then
+      export PATH="$cargo_bin_dir:$PATH"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_cargo_on_path || fail "cargo is required"
 for tool in cargo git node pnpm python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
 done

@@ -18,7 +18,28 @@ info() { printf '[INFO] %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
-command -v cargo >/dev/null 2>&1 || fail "cargo is required"
+ensure_cargo_on_path() {
+  local cargo_bin_dir
+  command -v cargo >/dev/null 2>&1 && return 0
+  for cargo_bin_dir in \
+    "${DEEPCODE_CARGO_BIN_DIR:-}" \
+    "${CARGO_HOME:+${CARGO_HOME%/}/bin}" \
+    "${HOME:+${HOME%/}/.cargo/bin}"
+  do
+    [ -n "$cargo_bin_dir" ] || continue
+    case "$cargo_bin_dir" in
+      /*) ;;
+      *) continue ;;
+    esac
+    if [ -x "$cargo_bin_dir/cargo" ]; then
+      export PATH="$cargo_bin_dir:$PATH"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_cargo_on_path || fail "cargo is required"
 
 if [ -z "${CARGO_TARGET_DIR:-}" ] && [ -f /.dockerenv ]; then
   export CARGO_TARGET_DIR="$ROOT_DIR/target"
@@ -47,12 +68,15 @@ cargo test --quiet -p deepcode-kernel-ledger --test v2_ledger_contract
 pass "Kernel v2 canonical fact-store contracts"
 
 info "Kernel v2 registry contracts"
+cargo test --quiet -p deepcode-kernel-tools --lib
 cargo test --quiet -p deepcode-kernel-tools --test v2_registry_contract
 pass "Kernel v2 registry contracts"
 
-info "Kernel v2 Settings and trust-policy contracts"
+info "Kernel v2 Settings, skills, and trust-policy contracts"
+cargo test --quiet -p deepcode-kernel-config --lib
+cargo test --quiet -p deepcode-kernel-skills
 cargo test --quiet -p deepcode-kernel-policy --lib
-pass "Kernel v2 Settings and trust-policy contracts"
+pass "Kernel v2 Settings, skills, and trust-policy contracts"
 
 info "Kernel v2 grant, invocation, replay, and recovery contracts"
 cargo test --quiet -p deepcode-kernel-runtime --lib
