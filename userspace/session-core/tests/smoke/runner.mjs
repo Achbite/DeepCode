@@ -3,8 +3,11 @@ import { fileURLToPath } from 'node:url';
 import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+  SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
+  SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
   SessionKernelHostRunnerV2,
   canonicalJson,
+  providerWireToolNameV2,
   sha256Hash,
 } from '../../dist/index.js';
 import {
@@ -55,7 +58,7 @@ export function userInput(inputId, text) {
 }
 export async function openSmokeSession(options) {
   const toolContext = createCorpusToolContext();
-  const state = smokeState(options.kernelScripts);
+  const state = smokeState(options.kernelScripts, toolContext);
   const kernel = scriptedKernelPort(state);
   const initialInput = userInput(
     options.inputId ?? 'input-session-smoke-v2',
@@ -71,10 +74,15 @@ export async function openSmokeSession(options) {
   const provider = {
     async requestTurn(input) {
       state.timeline.push(`provider:${input.currentInput.inputId}`);
-      return sealProviderOutput(
+      const output = sealProviderOutput(
         input,
         await options.provider(input, state)
       );
+      state.providerEvidence.set(
+        input.providerTurnId,
+        providerTurnEvidence(input, output)
+      );
+      return output;
     },
   };
   const runner = await SessionKernelHostRunnerV2.open({
@@ -233,6 +241,26 @@ function persistencePort(state) {
   const noop = async () => {};
   return {
     loadCheckpoint: async () => clone(state.checkpoint),
+    loadProviderTurnEvidence: async (runId, providerTurnId) => {
+      if (runId !== RUN_ID) throw new Error('smoke provider Run mismatch');
+      const evidence = state.providerEvidence.get(providerTurnId);
+      if (!evidence) {
+        throw new Error(
+          `missing durable smoke Provider evidence ${providerTurnId}`
+        );
+      }
+      return clone(evidence);
+    },
+    loadToolContextSnapshot: async (runId, contextRef) => {
+      if (
+        runId !== RUN_ID
+        || canonicalJson(contextRef)
+          !== canonicalJson(toolContextRef(state.toolContext))
+      ) {
+        throw new Error('smoke ToolContext snapshot mismatch');
+      }
+      return clone(state.toolContext);
+    },
     loadLatestPlan: none,
     loadPlanDecision: none,
     loadLatestInput: async () => clone(state.inputs.get(state.latestInputId)),
@@ -253,19 +281,29 @@ function persistencePort(state) {
     async persistCheckpoint(checkpoint) { state.checkpoint = clone(checkpoint); },
     async persistOperationResult(operationRequestId, result) {
       const resultDigest = sha256Hash(canonicalJson(result));
-      return {
+      const record = {
         recordId: `operation-result-${operationRequestId}`,
         recordDigest: sha256Hash(canonicalJson(
           { operationRequestId, resultDigest })),
         resultDigest,
       };
+      state.operationResults.set(operationRequestId, {
+        resultDigest,
+        result: clone(result),
+      });
+      return record;
     },
+    loadOperationResult: async (operationRequestId) =>
+      clone(state.operationResults.get(operationRequestId)),
   };
 }
-function smokeState(kernelScripts = {}) {
+function smokeState(kernelScripts = {}, toolContext) {
   const initialFactsQuery = (request) => emptyFactsPage(request);
   return {
     inputs: new Map(),
+    operationResults: new Map(),
+    providerEvidence: new Map(),
+    toolContext: clone(toolContext),
     projections: [],
     runOpenRequests: [],
     kernelRequests: Object.fromEntries(
@@ -285,6 +323,96 @@ function smokeState(kernelScripts = {}) {
         ],
       ]
     )),
+  };
+}
+
+function providerTurnEvidence(input, output) {
+  const authorityBinding = providerAuthorityBinding(input);
+  const dispatchData = {
+    schemaVersion: SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
+    providerTurnId: input.providerTurnId,
+    purpose: input.purpose,
+    authorityBinding,
+    requestDigest: sha256Hash(canonicalJson({
+      providerTurnId: input.providerTurnId,
+      purpose: input.purpose,
+      authorityBinding,
+      target: input.target,
+      contextRef: input.toolContext.contextRef,
+    })),
+  };
+  const dispatchRef = {
+    recordId:
+      `session-kernel-v3:${input.runId}:provider-turn:${input.providerTurnId}:dispatch`,
+    recordDigest: sha256Hash(canonicalJson(dispatchData)),
+  };
+  const terminalData = {
+    schemaVersion: SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
+    providerTurnId: input.providerTurnId,
+    dispatchRef,
+    authorityBinding,
+    terminalKind: 'completed',
+    responseDigest: output.completion.responseDigest,
+    completion: clone(output.completion),
+    providerResult: clone(output.providerResult),
+    traceRef: {
+      terminalDigest: output.completion.trace.terminalDigest,
+      sealDigest: output.completion.trace.sealDigest,
+      recordCount: output.completion.trace.recordCount,
+    },
+    orderedItems: output.items.map((item, index) =>
+      item.kind === 'text'
+        ? { kind: 'text', phase: item.phase, text: item.text }
+        : {
+            kind: 'toolCall',
+            index,
+            callId: item.callId,
+            name: providerWireToolNameV2(item.toolId),
+            arguments: canonicalJson(item.arguments),
+          }),
+  };
+  const terminalRef = {
+    recordId:
+      `session-kernel-v3:${input.runId}:provider-turn:${input.providerTurnId}:terminal`,
+    recordDigest: sha256Hash(canonicalJson(terminalData)),
+  };
+  return {
+    dispatch: { ref: dispatchRef, recordedAt: NOW, data: dispatchData },
+    terminal: { ref: terminalRef, recordedAt: NOW, data: terminalData },
+  };
+}
+
+function providerAuthorityBinding(input) {
+  const currentInput = input.contextAssembly.receipt.trimming.sections.filter(
+    (section) => section.section === 'currentInput'
+  );
+  assert(
+    currentInput.length === 1,
+    'smoke Provider evidence must bind one exact current input section'
+  );
+  return {
+    runId: input.runId,
+    inputId: input.currentInput.inputId,
+    controlEpoch: input.controlEpoch,
+    currentInputDigest: currentInput[0].digest,
+    ...(input.plan ? { planRevision: input.plan.planRevision } : {}),
+    ...(input.target.kind === 'finalAnswer'
+      ? {
+          reviewRevision: input.target.reviewRevision,
+          snapshotHighWater: input.target.snapshotHighWater,
+        }
+      : {}),
+    providerProfileId: input.providerProfile.providerProfileId,
+    providerProfileRevisionDigest:
+      input.providerProfile.providerProfileRevisionDigest,
+  };
+}
+
+function toolContextRef(toolContext) {
+  return {
+    contextVersion: toolContext.contextVersion,
+    catalogDigest: toolContext.catalogDigest,
+    contextDigest: toolContext.contextDigest,
   };
 }
 function emptyFactsPage(request) {

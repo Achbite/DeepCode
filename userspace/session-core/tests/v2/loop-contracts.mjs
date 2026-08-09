@@ -72,6 +72,9 @@ async function inputFenceOrdersEpochCancelFactsBeforeNextProvider() {
     harness.loop.snapshot().activeWait?.kind,
     'invocation'
   );
+  const supersededProviderTurnId =
+    harness.loop.snapshot().providerTurn?.providerTurnId;
+  assert.equal(typeof supersededProviderTurnId, 'string');
 
   const traceStart = harness.store.trace.length;
   harness.enqueueKernel('advanceControlEpoch', (request) => {
@@ -150,12 +153,30 @@ async function inputFenceOrdersEpochCancelFactsBeforeNextProvider() {
   );
 
   await harness.loop.applyFencedUserInput(nextInput, generation);
-  const supersededQueue =
-    harness.loop.snapshot().providerToolCallQueue;
-  assert.equal(supersededQueue.status, 'aborted');
-  assert.equal(supersededQueue.abortReason, 'userInput');
-  assert.equal(supersededQueue.calls[0].status, 'aborted');
-  assert.equal(supersededQueue.outcomeRecorded, true);
+  const supersededOutcome = harness.loop.snapshot().providerOutcomes.find(
+    (outcome) => outcome.providerTurnId === supersededProviderTurnId
+  );
+  assert.equal(supersededOutcome?.outputKind, 'toolIntent');
+  assert.equal(supersededOutcome.toolSettlement.status, 'aborted');
+  assert.deepEqual(
+    supersededOutcome.toolCalls.map((call) => ({
+      ordinal: call.ordinal,
+      status: call.status,
+      settlementReason: call.settlementReason,
+    })),
+    [{ ordinal: 1, status: 'aborted', settlementReason: 'userInput' }],
+    'the superseded call must survive queue retirement as a durable outcome'
+  );
+  assert.equal(supersededOutcome.toolCallReceipt.callCount, 1);
+  assert.match(supersededOutcome.summary, /userInput/u);
+  assert.equal(
+    harness.store.projectionEvents.some((event) =>
+      event.kind === 'diagnostic'
+      && event.data?.providerTurnId === supersededProviderTurnId
+      && event.data?.reason === 'userInput'),
+    true,
+    'the aborted provider turn must be projected before the next Provider call'
+  );
   harness.enqueueProvider(providerAnswer('new-input answer'));
   const secondResult = await harness.loop.runProviderTurn({
     reason: 'userInput',
@@ -305,6 +326,14 @@ async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
     ['awaitingInvocation', 'pending', 'pending']
   );
   assert.equal(harness.calls('submitToolIntent').length, 1);
+  const providerTurnId = initialQueue.providerTurnId;
+  const orderedOperationIds = initialQueue.calls.map(
+    (call) => call.intent.operationId
+  );
+  const unexecutedOperationIds = new Set(
+    orderedOperationIds.slice(1)
+  );
+  const traceStart = harness.store.trace.length;
 
   const nextInput = createInput({
     inputId: 'input-aborts-multi-queue',
@@ -316,25 +345,47 @@ async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
     await harness.loop.persistUserInputBeforeFence(nextInput);
   await harness.loop.applyFencedUserInput(nextInput, generation);
 
-  const queue = harness.loop.snapshot().providerToolCallQueue;
-  assert.equal(queue.status, 'aborted');
-  assert.equal(queue.abortReason, 'userInput');
-  assert.equal(queue.outcomeRecorded, true);
-  assert.deepEqual(
-    queue.calls.map((call) => call.status),
-    ['aborted', 'unexecuted', 'unexecuted']
+  const outcomes = harness.loop.snapshot().providerOutcomes.filter(
+    (outcome) => outcome.providerTurnId === providerTurnId
+  );
+  assert.equal(
+    outcomes.length,
+    1,
+    'the retired queue must have one durable Provider outcome'
+  );
+  const [outcome] = outcomes;
+  assert.equal(outcome.outputKind, 'toolIntent');
+  assert.equal(outcome.toolSettlement.status, 'aborted');
+  assert.equal(outcome.toolCallReceipt.callCount, 3);
+  assert.match(outcome.summary, /userInput/u);
+  assert.match(outcome.summary, /unexecuted=2/u);
+  const expectedSettlement = orderedOperationIds.map(
+    (operationId, index) => ({
+      ordinal: index + 1,
+      operationId,
+      status: index === 0 ? 'aborted' : 'unexecuted',
+      settlementReason: 'userInput',
+    })
   );
   assert.deepEqual(
-    queue.calls.slice(1).map((call) => call.settlementReason),
-    ['userInput', 'userInput']
+    outcome.toolCalls.map((call) => ({
+      ordinal: call.ordinal,
+      operationId: call.operationId,
+      status: call.status,
+      settlementReason: call.settlementReason,
+    })),
+    expectedSettlement,
+    'durable settlement must preserve Provider call order'
   );
   assert.equal(
     harness.calls('submitToolIntent').length,
     1,
     'the input fence must not dispatch any queued tail call'
   );
-  const unexecutedOperationIds = new Set(
-    queue.calls.slice(1).map((call) => call.intent.operationId)
+  assert.equal(
+    harness.providerInputs.length,
+    1,
+    'the input fence must not repeat the superseded Provider turn'
   );
   assert.equal(
     harness.kernelState.facts.some((fact) =>
@@ -343,16 +394,44 @@ async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
     false,
     'unexecuted tail calls must have no attempt or effect fact'
   );
-  assert.equal(
-    harness.store.projectionEvents.some(
-      (event) =>
-        event.kind === 'diagnostic'
-        && event.data?.status === 'blocked'
-        && event.data?.reason === 'userInput'
-        && event.data?.unexecutedOrdinals?.join(',') === '2,3'
-    ),
-    true
+  const diagnostics = harness.store.projectionEvents.filter(
+    (event) =>
+      event.kind === 'diagnostic'
+      && event.data?.providerTurnId === providerTurnId
+      && event.data?.reason === 'userInput'
   );
+  assert.equal(diagnostics.length, 1);
+  const [diagnostic] = diagnostics;
+  assert.deepEqual(
+    diagnostic.data.toolCallReceipt,
+    outcome.toolCallReceipt,
+    'the diagnostic must carry the exact recorded Provider receipt'
+  );
+  assert.deepEqual(diagnostic.data.unexecutedOrdinals, [2, 3]);
+  assert.deepEqual(
+    diagnostic.data.orderedItems
+      .filter((item) => item.kind === 'toolCall')
+      .map((item) => ({
+        ordinal: item.ordinal,
+        operationId: item.operationId,
+        status: item.status,
+        settlementReason: item.settlementReason,
+      })),
+    expectedSettlement
+  );
+  assert.equal(
+    diagnostic.data.status,
+    'blocked'
+  );
+  assertOrdered(harness.traceSince(traceStart), [
+    (entry) =>
+      entry === 'persistence.persistInput:input-aborts-multi-queue',
+    (entry) =>
+      entry.startsWith('projection.project:diagnostic:')
+      && entry.includes(providerTurnId),
+    (entry) => entry.startsWith('kernel.advanceControlEpoch:'),
+    (entry) => entry.startsWith('kernel.queryFacts:'),
+  ]);
 
   const cancelHarness = await openSessionHarness();
   cancelHarness.enqueueProvider(providerToolIntents([
@@ -392,6 +471,13 @@ async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
     ['awaitingInvocation', 'pending', 'pending']
   );
   assert.equal(cancelHarness.calls('submitToolIntent').length, 1);
+  const cancelProviderTurnId = cancelQueueBefore.providerTurnId;
+  const cancelOperationIds = cancelQueueBefore.calls.map(
+    (call) => call.intent.operationId
+  );
+  const cancelledTailOperationIds = new Set(
+    cancelOperationIds.slice(1)
+  );
 
   const cancellationFactId =
     'fact-explicit-run-cancellation-requested';
@@ -447,32 +533,54 @@ async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
     callerRequestId,
     cancelOperationId,
   }));
+  const cancelTraceStart = cancelHarness.store.trace.length;
   const cancelled = await cancelHarness.loop.cancelRun({
     callerRequestId,
     callerRequestDigest,
     cancelOperationId,
   });
 
-  const cancelQueue =
-    cancelHarness.loop.snapshot().providerToolCallQueue;
-  assert.equal(cancelQueue.status, 'aborted');
-  assert.equal(cancelQueue.abortReason, 'runCancelled');
-  assert.equal(cancelQueue.outcomeRecorded, true);
-  assert.deepEqual(
-    cancelQueue.calls.map((call) => call.status),
-    ['aborted', 'unexecuted', 'unexecuted']
+  const cancelOutcomes = cancelHarness.loop.snapshot().providerOutcomes.filter(
+    (outcome) => outcome.providerTurnId === cancelProviderTurnId
+  );
+  assert.equal(
+    cancelOutcomes.length,
+    1,
+    'Run cancellation must record the Provider outcome exactly once'
+  );
+  const [cancelOutcome] = cancelOutcomes;
+  assert.equal(cancelOutcome.outputKind, 'toolIntent');
+  assert.equal(cancelOutcome.toolSettlement.status, 'aborted');
+  assert.equal(cancelOutcome.toolCallReceipt.callCount, 3);
+  assert.match(cancelOutcome.summary, /runCancelled/u);
+  assert.match(cancelOutcome.summary, /unexecuted=2/u);
+  const expectedCancelSettlement = cancelOperationIds.map(
+    (operationId, index) => ({
+      ordinal: index + 1,
+      operationId,
+      status: index === 0 ? 'aborted' : 'unexecuted',
+      settlementReason: 'runCancelled',
+    })
   );
   assert.deepEqual(
-    cancelQueue.calls.slice(1).map((call) => call.settlementReason),
-    ['runCancelled', 'runCancelled']
+    cancelOutcome.toolCalls.map((call) => ({
+      ordinal: call.ordinal,
+      operationId: call.operationId,
+      status: call.status,
+      settlementReason: call.settlementReason,
+    })),
+    expectedCancelSettlement,
+    'Run cancellation must preserve Provider call order durably'
   );
   assert.equal(
     cancelHarness.calls('submitToolIntent').length,
     1,
     'Run cancellation must not dispatch any queued tail call'
   );
-  const cancelledTailOperationIds = new Set(
-    cancelQueue.calls.slice(1).map((call) => call.intent.operationId)
+  assert.equal(
+    cancelHarness.providerInputs.length,
+    1,
+    'Run cancellation must not repeat the cancelled Provider turn'
   );
   assert.equal(
     cancelHarness.kernelState.facts.some((fact) =>
@@ -494,27 +602,40 @@ async function inputFenceAbortsActiveQueueAndMarksTailUnexecuted() {
     true,
     'Run cancellation must reconcile its canonical explicit cancellation fact'
   );
-  assert.equal(
-    cancelHarness.store.projectionEvents.some(
-      (event) =>
-        event.kind === 'diagnostic'
-        && event.data?.status === 'blocked'
-        && event.data?.reason === 'runCancelled'
-        && event.data?.unexecutedOrdinals?.join(',') === '2,3'
-    ),
-    true
+  const cancelDiagnostics = cancelHarness.store.projectionEvents.filter(
+    (event) =>
+      event.kind === 'diagnostic'
+      && event.data?.providerTurnId === cancelProviderTurnId
+      && event.data?.reason === 'runCancelled'
   );
-  assert.equal(
-    cancelHarness.loop.snapshot().providerOutcomes.some(
-      (outcome) =>
-        outcome.providerTurnId === cancelQueue.providerTurnId
-        && outcome.outputKind === 'toolIntent'
-        && outcome.toolCallReceipt?.callCount === 3
-        && outcome.summary.includes('runCancelled')
-    ),
-    true,
-    'Run cancellation must durably record the whole Provider queue outcome'
+  assert.equal(cancelDiagnostics.length, 1);
+  const [cancelDiagnostic] = cancelDiagnostics;
+  assert.equal(cancelDiagnostic.data.status, 'blocked');
+  assert.deepEqual(
+    cancelDiagnostic.data.toolCallReceipt,
+    cancelOutcome.toolCallReceipt,
+    'Run cancellation diagnostic must carry the recorded receipt'
   );
+  assert.deepEqual(cancelDiagnostic.data.unexecutedOrdinals, [2, 3]);
+  assert.deepEqual(
+    cancelDiagnostic.data.orderedItems
+      .filter((item) => item.kind === 'toolCall')
+      .map((item) => ({
+        ordinal: item.ordinal,
+        operationId: item.operationId,
+        status: item.status,
+        settlementReason: item.settlementReason,
+      })),
+    expectedCancelSettlement
+  );
+  assertOrdered(cancelHarness.traceSince(cancelTraceStart), [
+    (entry) =>
+      entry.startsWith('projection.project:diagnostic:')
+      && entry.includes(cancelProviderTurnId),
+    (entry) => entry.startsWith('kernel.cancelInvocation:'),
+    (entry) => entry.startsWith('kernel.queryFacts:'),
+    (entry) => entry.startsWith('projection.project:run.cancelled:'),
+  ]);
   assert.deepEqual(cancelled, {
     callerRequestId,
     callerRequestDigest,

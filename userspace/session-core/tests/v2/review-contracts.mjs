@@ -796,10 +796,17 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
     actions: [firstPlan.actions[0], secondAction],
   });
   state.planActionSettlements['plan-action-write-output'] = {
-    kind: 'completed',
+    kind: 'planActionComplete',
+    planRevision: firstPlan.planRevision,
     planActionId: 'plan-action-write-output',
-    completionKind: 'answer',
+    controlEpoch: state.controlEpoch,
+    outcome: 'completed',
     providerTurnId: 'provider-turn-completed',
+    controlCallId: 'control-call-plan-action-completed',
+    controlArgumentsDigest: sha256Hash(canonicalJson({
+      outcome: 'completed',
+    })),
+    snapshotHighWater: 0,
     recordedAt: '2026-07-29T00:03:00.000Z',
   };
   const facts = [
@@ -851,10 +858,20 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
         deniedOperationId: 'planned-operation-second',
       },
     }),
-    corpusFact('cleanupScheduled', {
-      factId: 'fact-cleanup-scheduled',
+    corpusFact('controlCommandRecordedRejectedInvalidPathToolIntent', {
+      factId: 'fact-tool-intent-command-rejected',
       ledgerSequence: 5,
       runSequence: 5,
+      identities: {
+        runId: RUN_ID,
+        invalidPathOperationId: 'planned-operation-second',
+        invalidPathRequestId: 'request-review-tool-intent-rejected',
+      },
+    }),
+    corpusFact('cleanupScheduled', {
+      factId: 'fact-cleanup-scheduled',
+      ledgerSequence: 6,
+      runSequence: 6,
       identities: {
         runId: RUN_ID,
         operationId: 'planned-operation-write-output',
@@ -865,8 +882,8 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
     }),
     corpusFact('cleanupCompleted', {
       factId: 'fact-cleanup-completed',
-      ledgerSequence: 6,
-      runSequence: 6,
+      ledgerSequence: 7,
+      runSequence: 7,
       identities: {
         runId: RUN_ID,
         operationId: 'planned-operation-write-output',
@@ -881,7 +898,7 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
     state,
     createFactsPage(facts, {
       requestedAfterLedgerSequence: 0,
-      snapshotHighWater: 6,
+      snapshotHighWater: 7,
     })
   ).state;
 
@@ -890,7 +907,7 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
     '2026-07-29T00:20:00.000Z'
   );
   assert.equal(review.status, 'final');
-  assert.equal(review.snapshotHighWater, 6);
+  assert.equal(review.snapshotHighWater, 7);
   assert.deepEqual(
     review.scopeExpansions.map((fact) => fact.factId),
     ['fact-expansion-allowed', 'fact-expansion-denied']
@@ -905,7 +922,7 @@ async function reviewSeparatesPlanScopeEffectDenialCleanupAndCompletion() {
   );
   assert.deepEqual(
     review.rejections.map((fact) => fact.factId),
-    ['fact-expansion-denied']
+    ['fact-tool-intent-command-rejected']
   );
   assert.deepEqual(
     review.cleanup.map((fact) => fact.factId),
