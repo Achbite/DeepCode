@@ -218,10 +218,10 @@ assert.equal(
   'output.txt'
 );
 assert.equal(normalCompleted.details.output.path, 'output.txt');
-assert.equal(
+assert.match(
   normalAdmission.details.canonicalArgumentsDigest,
-  golden.kernelCapabilityPreviews.corpusNormal
-    .canonicalArgumentsDigest
+  /^sha256:[0-9a-f]{64}$/,
+  'admitted invocation facts must retain their canonical arguments digest'
 );
 assert.equal(
   normalAdmission.details.toolContractDigest,
@@ -248,7 +248,8 @@ const expandedPreview =
   golden.kernelCapabilityPreviews.corpusExpandedAllow;
 assert.equal(
   expandedAwaiting.details.canonicalArgumentsDigest,
-  expandedPreview.canonicalArgumentsDigest
+  resumedAdmission.details.canonicalArgumentsDigest,
+  'awaiting and resumed invocation facts must retain the same canonical arguments digest'
 );
 assert.equal(
   expandedAwaiting.details.scopeDigest,
@@ -267,10 +268,6 @@ assert.equal(
   'expanded.txt'
 );
 assert.equal(expandedCompleted.details.output.path, 'expanded.txt');
-assert.equal(
-  resumedAdmission.details.canonicalArgumentsDigest,
-  expandedPreview.canonicalArgumentsDigest
-);
 assert.equal(
   expandedEffect.lineage.operationId,
   resumedAdmission.lineage.operationId
@@ -298,10 +295,30 @@ assert.deepEqual(
   ].sort(),
   'the shared preview vectors must be a sorted-key-independent Rust set'
 );
+for (const preview of Object.values(golden.kernelCapabilityPreviews)) {
+  assert.deepEqual(
+    preview.authorizationBinding,
+    { kind: 'resourceScope', data: {} },
+    'resource-scope preview vectors must carry the immutable authorization binding'
+  );
+  assert.equal(
+    Object.hasOwn(preview, 'canonicalArgumentsDigest'),
+    false,
+    'resource-scope preview authority must not retain invocation arguments'
+  );
+  assert.deepEqual(
+    preview.approvalView.resourcePresentation.map(
+      (resource) => resource.canonicalResourceRef
+    ),
+    preview.approvalView.canonicalTargets,
+    'safe resource presentation must preserve canonical target identity'
+  );
+}
 assert.equal(denyAwaiting.details.scopeDigest, denyPreview.scopeDigest);
 assert.equal(
   denyAwaiting.details.canonicalArgumentsDigest,
-  denyPreview.canonicalArgumentsDigest
+  expandedAwaiting.details.canonicalArgumentsDigest,
+  'equivalent denied and allowed invocation facts must retain the same arguments digest'
 );
 assert.equal(
   denied.details.requestedScopeDigest,
@@ -340,8 +357,14 @@ assert.deepEqual(
 );
 assert.equal(mutationToolContext.contextVersion, 3);
 assert.deepEqual(
-  mutationToolContext.tools.map((tool) => tool.toolId),
-  ['fs.read', 'fs.write']
+  mutationToolContext.tools.map((tool) => ({
+    toolId: tool.toolId,
+    authorizationShape: tool.authorizationShape,
+  })),
+  [
+    { toolId: 'fs.read', authorizationShape: 'resourceScope' },
+    { toolId: 'fs.write', authorizationShape: 'resourceScope' },
+  ]
 );
 assert.deepEqual(
   decodedCorpus.authorizationContextInvalidated

@@ -2,22 +2,24 @@ use std::collections::BTreeMap;
 
 use deepcode_kernel_abi::v2::*;
 use deepcode_kernel_abi::v2_command::{
-    decode_kernel_command_v2, CapabilityApprovalViewV2, CapabilityScopeDispositionV2,
-    CapabilityScopePreviewRecordV2, CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2,
-    KernelCommandV2, KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2,
-    KernelReplyV2, KernelWireErrorV2, MutationCommandKindV2, ToolIntentRejectionReasonV2,
-    ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
+    decode_kernel_command_v2, CapabilityApprovalViewV2, CapabilityResourcePresentationKindV2,
+    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
+    CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandV2,
+    KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
+    KernelWireErrorV2, MutationCommandKindV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
+    ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, capability_authorization_digest_v2, capability_scope_digest_v2,
     render_kernel_tool_prompt_v2, tool_catalog_digest_v2, tool_context_digest_v2,
-    CanonicalArgumentsDigestV2, CapabilityLeaseIdV2, CapabilityLeaseRefV2,
-    CapabilityLeaseVersionV2, CapabilityScopeDigestV2, CapabilityScopePreviewIdV2,
-    DecisionCapabilityV2, PlanActionIdV2, PlanRevisionV2, RawToolArgumentsV2, RunCapabilityV2,
-    ToolAvailabilityV2, ToolCatalogDigestV2, ToolContextBundleV2, ToolContextDigestV2,
-    ToolContextRefV2, ToolContextVersionV2, ToolContractDigestV2, ToolDescriptorV2,
-    ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2, ToolInputSchemaV2, ToolIntentAuthorityV2,
-    ToolRiskV2, UserDecisionReplyV2, UserDecisionResponseEnvelopeV2, KERNEL_ABI_V2_VERSION,
+    CanonicalArgumentsDigestV2, CapabilityAuthorizationBindingV2, CapabilityLeaseIdV2,
+    CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    CapabilityScopePreviewIdV2, DecisionCapabilityV2, PlanActionIdV2, PlanRevisionV2,
+    RawToolArgumentsV2, RunCapabilityV2, ToolAuthorizationShapeV2, ToolAvailabilityV2,
+    ToolCatalogDigestV2, ToolContextBundleV2, ToolContextDigestV2, ToolContextRefV2,
+    ToolContextVersionV2, ToolContractDigestV2, ToolDescriptorV2, ToolEffectClassV2,
+    ToolEffectScopeV2, ToolIdV2, ToolInputSchemaV2, ToolIntentAuthorityV2, ToolRiskV2,
+    UserDecisionReplyV2, UserDecisionResponseEnvelopeV2, KERNEL_ABI_V2_VERSION,
     TOOL_CONTEXT_FORMAT_V2,
 };
 
@@ -162,7 +164,6 @@ struct MutationPreviewVector<'a> {
     operation_id: &'a str,
     preview_id: &'a str,
     path: &'a str,
-    content: &'a str,
     approved_paths: &'a [&'a str],
     scope_delta: &'a [&'a str],
     target_observation_fill: char,
@@ -173,14 +174,7 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
     let context_ref = golden_mutation_tool_context().context_ref();
     let descriptor = golden_mutation_tool_context().tools[1].clone();
     let tool_id = descriptor.tool_id.clone();
-    let canonical_arguments_digest = canonical_arguments_digest_v2(
-        &tool_id,
-        &serde_json::json!({
-            "content": vector.content,
-            "path": vector.path,
-        }),
-    )
-    .expect("materialize mutation preview canonical arguments digest");
+    let authorization_binding = CapabilityAuthorizationBindingV2::ResourceScope {};
     let canonical_scope = ResourceScopeV2::Workspace {
         targets: vec![WorkspaceScopeTargetV2 {
             relative_path: vector.path.to_owned(),
@@ -220,6 +214,7 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
         "planRevision": plan_revision,
         "planActionId": plan_action_id,
         "toolId": tool_id,
+        "authorizationBinding": authorization_binding,
         "targets": approved_targets,
         "canonicalResourceScope": canonical_scope,
         "toolContractDigest": descriptor.contract_digest,
@@ -238,7 +233,7 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
         "planActionId": plan_action_id,
         "operationId": operation_id,
         "toolId": tool_id,
-        "canonicalArgumentsDigest": canonical_arguments_digest,
+        "authorizationBinding": authorization_binding,
         "scopeDigest": scope_digest,
         "decisionClass": vector.decision_class,
         "toolContractDigest": descriptor.contract_digest,
@@ -255,6 +250,16 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
         .iter()
         .map(|path| format!("workspace:Write:{path}"))
         .collect::<Vec<_>>();
+    let resource_presentation = vector
+        .approved_paths
+        .iter()
+        .map(|path| CapabilityResourcePresentationV2 {
+            kind: CapabilityResourcePresentationKindV2::WorkspacePath,
+            label: (*path).to_owned(),
+            workspace_relative_path: Some((*path).to_owned()),
+            canonical_resource_ref: Some(format!("workspace:Write:{path}")),
+        })
+        .collect::<Vec<_>>();
     let effective_deadline_ms = 30_000;
     CapabilityScopePreviewRecordV2 {
         preview_id,
@@ -264,7 +269,7 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
         plan_action_id,
         operation_id,
         tool_id,
-        canonical_arguments_digest,
+        authorization_binding,
         canonical_scope,
         scope_digest: scope_digest.clone(),
         authorization_digest,
@@ -282,6 +287,7 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
             ),
             canonical_targets,
             scope_delta,
+            resource_presentation,
             risk: descriptor.risk,
             effect_class: descriptor.effect_class,
             effect_scope: descriptor.effect_scope,
@@ -299,7 +305,6 @@ fn corpus_normal_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "planned-operation-golden-output",
         preview_id: "preview-golden-output-1",
         path: "output.txt",
-        content: "contract output",
         approved_paths: &["output.txt"],
         scope_delta: &[],
         target_observation_fill: '9',
@@ -315,7 +320,6 @@ fn corpus_expanded_allow_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "operation-c4cbe96134b04cf4963b4f50d5672870167c9dd3826e9aca6a3ce3a468367e64",
         preview_id: "preview-golden-expanded-allow-1",
         path: "expanded.txt",
-        content: "expanded",
         approved_paths: &["expanded.txt", "output.txt"],
         scope_delta: &["expanded.txt"],
         target_observation_fill: '7',
@@ -331,7 +335,6 @@ fn corpus_deny_normal_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "planned-operation-golden-deny-output",
         preview_id: "preview-golden-deny-output-1",
         path: "output.txt",
-        content: "contract output",
         approved_paths: &["output.txt"],
         scope_delta: &[],
         target_observation_fill: '9',
@@ -347,7 +350,6 @@ fn corpus_expanded_deny_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "operation-9bf7e05374580c4630967e5c9a584a26f5884d63df3fba7ff17338c2da906bb6",
         preview_id: "preview-golden-expanded-deny-1",
         path: "expanded.txt",
-        content: "expanded",
         approved_paths: &["expanded.txt", "output.txt"],
         scope_delta: &["expanded.txt"],
         target_observation_fill: '7',
@@ -363,7 +365,6 @@ fn session_default_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "planned-operation-write-output",
         preview_id: "preview-plan-action-write-output",
         path: "output.txt",
-        content: "contract output",
         approved_paths: &["output.txt"],
         scope_delta: &[],
         target_observation_fill: '9',
@@ -379,7 +380,6 @@ fn session_second_action_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "planned-operation-write-second",
         preview_id: "preview-plan-action-write-second",
         path: "second.txt",
-        content: "second",
         approved_paths: &["second.txt"],
         scope_delta: &[],
         target_observation_fill: '8',
@@ -395,7 +395,6 @@ fn session_first_action_preview() -> CapabilityScopePreviewRecordV2 {
         operation_id: "planned-operation-write-first",
         preview_id: "preview-plan-action-write-first",
         path: "output.txt",
-        content: "contract output",
         approved_paths: &["output.txt"],
         scope_delta: &[],
         target_observation_fill: '9',
@@ -1485,6 +1484,7 @@ fn golden_read_tool_descriptor() -> ToolDescriptorV2 {
         ToolEffectClassV2::Read,
         ToolEffectScopeV2::WorkspaceRead,
         ToolRiskV2::Low,
+        ToolAuthorizationShapeV2::ResourceScope,
     )
     .expect("materialize the ready read tool")
 }
@@ -1512,6 +1512,7 @@ fn golden_write_tool_descriptor() -> ToolDescriptorV2 {
         ToolEffectClassV2::Mutation,
         ToolEffectScopeV2::WorkspaceWrite,
         ToolRiskV2::Medium,
+        ToolAuthorizationShapeV2::ResourceScope,
     )
     .expect("materialize the ready write tool")
 }

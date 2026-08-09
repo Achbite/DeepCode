@@ -9,15 +9,32 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:expanded.txt",
+            "kind": "workspacePath",
+            "label": "expanded.txt",
+            "workspaceRelativePath": "expanded.txt"
+          },
+          {
+            "canonicalResourceRef": "workspace:Write:output.txt",
+            "kind": "workspacePath",
+            "label": "output.txt",
+            "workspaceRelativePath": "output.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [
           "workspace:Write:expanded.txt"
         ],
-        "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+        "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
         "summary": "Mutate using fs.write within 2 canonical target(s)"
       },
-      "authorizationDigest": "sha256:a3a0c9d95e0b7856375a91cdcdda78d0d16bd1d0c57c283da9a5c12e4958f4d2",
-      "canonicalArgumentsDigest": "sha256:459328e0bd5eadf842039d673f0ce937a792165f501131ce4377271209345418",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:fac284d17c8aae9f5121019e96627cebd22bb667d680fd37402b74c540e43426",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -32,8 +49,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -47,8 +64,8 @@
       "previewId": "preview-golden-expanded-allow-1",
       "risk": "medium",
       "runId": "run-1",
-      "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     },
     "corpusExpandedDeny": {
@@ -60,15 +77,32 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:expanded.txt",
+            "kind": "workspacePath",
+            "label": "expanded.txt",
+            "workspaceRelativePath": "expanded.txt"
+          },
+          {
+            "canonicalResourceRef": "workspace:Write:output.txt",
+            "kind": "workspacePath",
+            "label": "output.txt",
+            "workspaceRelativePath": "output.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [
           "workspace:Write:expanded.txt"
         ],
-        "scopeDigest": "sha256:f96310e585cc7f33c9824bf74edbd628cebf48cb39358c964a7b9b3d50eced7f",
+        "scopeDigest": "sha256:ddcd5ad1253bf9d2be7918255ad511d56888a074f82872f612cd544f9255f32b",
         "summary": "Mutate using fs.write within 2 canonical target(s)"
       },
-      "authorizationDigest": "sha256:99b627f9f261a3b6e818ac8c2340792a17c979bf373fe977cf0da15aa7136184",
-      "canonicalArgumentsDigest": "sha256:459328e0bd5eadf842039d673f0ce937a792165f501131ce4377271209345418",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:23a5c87ece84ac084844389ce93f6b13c7a931101be55fd13b8cf253ca9a6cb5",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -83,8 +117,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -98,8 +132,8 @@
       "previewId": "preview-golden-expanded-deny-1",
       "risk": "medium",
       "runId": "run-1",
-      "scopeDigest": "sha256:f96310e585cc7f33c9824bf74edbd628cebf48cb39358c964a7b9b3d50eced7f",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:ddcd5ad1253bf9d2be7918255ad511d56888a074f82872f612cd544f9255f32b",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     },
     "corpusNormal": {
@@ -110,13 +144,24 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:output.txt",
+            "kind": "workspacePath",
+            "label": "output.txt",
+            "workspaceRelativePath": "output.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [],
-        "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+        "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
         "summary": "Mutate using fs.write within 1 canonical target(s)"
       },
-      "authorizationDigest": "sha256:7014610ff86d409a84bac4e84243c8a91413723ee238eaf160c28a26ee359f53",
-      "canonicalArgumentsDigest": "sha256:527bdd1a603e205fd295b80b85998a7810a1be997d02865f266e3fce1cbaf2f6",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:88d270d391295253894d3e64081539d08a2d696c2c9d80db0aa728a364f5d38e",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -131,8 +176,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -146,8 +191,8 @@
       "previewId": "preview-golden-output-1",
       "risk": "medium",
       "runId": "run-1",
-      "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     },
     "corpusNormalDeny": {
@@ -158,13 +203,24 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:output.txt",
+            "kind": "workspacePath",
+            "label": "output.txt",
+            "workspaceRelativePath": "output.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [],
-        "scopeDigest": "sha256:e19ca5ff4bd306f2472d0d6f8c0ff6782d9759b0fc17f75249ff290230ef334a",
+        "scopeDigest": "sha256:6a3fc7b2d33dea3626813739ff890c6848bb34c8a59906ebeb7c6776471983c5",
         "summary": "Mutate using fs.write within 1 canonical target(s)"
       },
-      "authorizationDigest": "sha256:f5d272ff93c059d417dc62fc2559b59fd21fa230e7a14f07de59d5247453582e",
-      "canonicalArgumentsDigest": "sha256:527bdd1a603e205fd295b80b85998a7810a1be997d02865f266e3fce1cbaf2f6",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:bea86b579438c4852447a6fdd65e4a3520fd617d0bce8e0f26030b6859bf26d8",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -179,8 +235,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -194,8 +250,8 @@
       "previewId": "preview-golden-deny-output-1",
       "risk": "medium",
       "runId": "run-1",
-      "scopeDigest": "sha256:e19ca5ff4bd306f2472d0d6f8c0ff6782d9759b0fc17f75249ff290230ef334a",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:6a3fc7b2d33dea3626813739ff890c6848bb34c8a59906ebeb7c6776471983c5",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     },
     "sessionDefault": {
@@ -206,13 +262,24 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:output.txt",
+            "kind": "workspacePath",
+            "label": "output.txt",
+            "workspaceRelativePath": "output.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [],
-        "scopeDigest": "sha256:a36c0c916b687bf141b557b523f380b99ba40f65e81a2d49d9c9217b2b1ee3c8",
+        "scopeDigest": "sha256:1f21856a600b6827653948471f8af6bb831a715f6d85428baf2e94620d554318",
         "summary": "Mutate using fs.write within 1 canonical target(s)"
       },
-      "authorizationDigest": "sha256:5bb8af51ad585c8c8e52ac8de6554d54b538433a040ba88630d855436f23f167",
-      "canonicalArgumentsDigest": "sha256:527bdd1a603e205fd295b80b85998a7810a1be997d02865f266e3fce1cbaf2f6",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:4857e7a78f1c71afcd655b7c62f72588ae8f173a4097f2886de9516a574c4189",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -227,8 +294,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -242,8 +309,8 @@
       "previewId": "preview-plan-action-write-output",
       "risk": "medium",
       "runId": "run-session-v2-contract",
-      "scopeDigest": "sha256:a36c0c916b687bf141b557b523f380b99ba40f65e81a2d49d9c9217b2b1ee3c8",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:1f21856a600b6827653948471f8af6bb831a715f6d85428baf2e94620d554318",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     },
     "sessionFirstAction": {
@@ -254,13 +321,24 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:output.txt",
+            "kind": "workspacePath",
+            "label": "output.txt",
+            "workspaceRelativePath": "output.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [],
-        "scopeDigest": "sha256:c324acc9ab30810075cd84613dc74cc9d1d2ab5c42cedbd456f122fc908e7bd1",
+        "scopeDigest": "sha256:88753ad04148900d6add894c1e7090933cd6198a5295d63e81715c6bb4386cd5",
         "summary": "Mutate using fs.write within 1 canonical target(s)"
       },
-      "authorizationDigest": "sha256:0293f0fa3be3d4eb693da0589734325cc6e9c13357d91fc231e5d904c34fc570",
-      "canonicalArgumentsDigest": "sha256:527bdd1a603e205fd295b80b85998a7810a1be997d02865f266e3fce1cbaf2f6",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:23634cebcae54a0960ce216bd7bb0b1573106a432f10658f4b64d58450be2699",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -275,8 +353,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -290,8 +368,8 @@
       "previewId": "preview-plan-action-write-first",
       "risk": "medium",
       "runId": "run-session-v2-contract",
-      "scopeDigest": "sha256:c324acc9ab30810075cd84613dc74cc9d1d2ab5c42cedbd456f122fc908e7bd1",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:88753ad04148900d6add894c1e7090933cd6198a5295d63e81715c6bb4386cd5",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     },
     "sessionSecondAction": {
@@ -302,13 +380,24 @@
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
         "effectiveDeadlineMs": 30000,
+        "resourcePresentation": [
+          {
+            "canonicalResourceRef": "workspace:Write:second.txt",
+            "kind": "workspacePath",
+            "label": "second.txt",
+            "workspaceRelativePath": "second.txt"
+          }
+        ],
         "risk": "medium",
         "scopeDelta": [],
-        "scopeDigest": "sha256:3d46149366a1f23385c62c71b1b1c44a988955ff0b2505ce9abebecc307c1008",
+        "scopeDigest": "sha256:53afb15848700f80ea150314c9c704d433a03ef11ee1bda3b7a0f03d08efc16f",
         "summary": "Mutate using fs.write within 1 canonical target(s)"
       },
-      "authorizationDigest": "sha256:3fde32de15613b038a70068dff8338cb89f6c0901177de1de32dfc65987d0ad4",
-      "canonicalArgumentsDigest": "sha256:9bcb706e6c5ece992f6486321e6c8cd61181fcffb25163733847e1ee8ae6127b",
+      "authorizationBinding": {
+        "data": {},
+        "kind": "resourceScope"
+      },
+      "authorizationDigest": "sha256:bcf1022e23fd08d7c0b942f6100b3a0c0e452ff50cc4fa3b70aa238b741a8e35",
       "canonicalScope": {
         "data": {
           "targets": [
@@ -323,8 +412,8 @@
         "kind": "workspace"
       },
       "contextRef": {
-        "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-        "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+        "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+        "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
         "contextVersion": 3
       },
       "controlEpoch": 1,
@@ -338,8 +427,8 @@
       "previewId": "preview-plan-action-write-second",
       "risk": "medium",
       "runId": "run-session-v2-contract",
-      "scopeDigest": "sha256:3d46149366a1f23385c62c71b1b1c44a988955ff0b2505ce9abebecc307c1008",
-      "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+      "scopeDigest": "sha256:53afb15848700f80ea150314c9c704d433a03ef11ee1bda3b7a0f03d08efc16f",
+      "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
       "toolId": "fs.write"
     }
   },
@@ -349,8 +438,8 @@
       "details": {
         "canonicalArgumentsDigest": "sha256:459328e0bd5eadf842039d673f0ce937a792165f501131ce4377271209345418",
         "contextRef": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
           "contextVersion": 3
         },
         "identity": {
@@ -374,8 +463,8 @@
           "runId": "run-1"
         },
         "previewId": "preview-golden-expanded-allow-1",
-        "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
-        "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
+        "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "toolId": "fs.write"
       },
       "domain": "authorization",
@@ -403,8 +492,8 @@
       "details": {
         "canonicalArgumentsDigest": "sha256:459328e0bd5eadf842039d673f0ce937a792165f501131ce4377271209345418",
         "contextRef": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
           "contextVersion": 3
         },
         "identity": {
@@ -428,8 +517,8 @@
           "runId": "run-1"
         },
         "previewId": "preview-golden-expanded-deny-1",
-        "scopeDigest": "sha256:f96310e585cc7f33c9824bf74edbd628cebf48cb39358c964a7b9b3d50eced7f",
-        "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "scopeDigest": "sha256:ddcd5ad1253bf9d2be7918255ad511d56888a074f82872f612cd544f9255f32b",
+        "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "toolId": "fs.write"
       },
       "domain": "authorization",
@@ -455,10 +544,10 @@
     "authorizationCapabilityIssued": {
       "abiVersion": "deepcode.kernel.abi.v2",
       "details": {
-        "authorizationDigest": "sha256:7014610ff86d409a84bac4e84243c8a91413723ee238eaf160c28a26ee359f53",
+        "authorizationDigest": "sha256:88d270d391295253894d3e64081539d08a2d696c2c9d80db0aa728a364f5d38e",
         "contextRef": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
           "contextVersion": 3
         },
         "identity": {
@@ -482,8 +571,8 @@
           "previewId": "preview-golden-output-1",
           "runId": "run-1"
         },
-        "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
-        "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
+        "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "toolId": "fs.write"
       },
       "domain": "authorization",
@@ -494,7 +583,7 @@
         "attemptId": null,
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+          "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
           "version": 1
         },
         "controlEpoch": 1,
@@ -513,10 +602,10 @@
     "authorizationCapabilityIssuedDeny": {
       "abiVersion": "deepcode.kernel.abi.v2",
       "details": {
-        "authorizationDigest": "sha256:f5d272ff93c059d417dc62fc2559b59fd21fa230e7a14f07de59d5247453582e",
+        "authorizationDigest": "sha256:bea86b579438c4852447a6fdd65e4a3520fd617d0bce8e0f26030b6859bf26d8",
         "contextRef": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
           "contextVersion": 3
         },
         "identity": {
@@ -540,8 +629,8 @@
           "previewId": "preview-golden-deny-output-1",
           "runId": "run-1"
         },
-        "scopeDigest": "sha256:e19ca5ff4bd306f2472d0d6f8c0ff6782d9759b0fc17f75249ff290230ef334a",
-        "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "scopeDigest": "sha256:6a3fc7b2d33dea3626813739ff890c6848bb34c8a59906ebeb7c6776471983c5",
+        "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "toolId": "fs.write"
       },
       "domain": "authorization",
@@ -552,7 +641,7 @@
         "attemptId": null,
         "capabilityLease": {
           "leaseId": "lease-golden-deny-1",
-          "scopeDigest": "sha256:e19ca5ff4bd306f2472d0d6f8c0ff6782d9759b0fc17f75249ff290230ef334a",
+          "scopeDigest": "sha256:6a3fc7b2d33dea3626813739ff890c6848bb34c8a59906ebeb7c6776471983c5",
           "version": 1
         },
         "controlEpoch": 1,
@@ -578,14 +667,14 @@
           "runId": "run-1"
         },
         "nextContextRef": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:d9e9d0dedd1be52b55c76a3702ecd04006c2ba3c3f0a19c3c5d0ece8df1c0771",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:e390775a6f7e5c9f4db4bc2b7220bd04f06e72ef524dafd84cbdcabee8528bf1",
           "contextVersion": 4
         },
         "nextContextVersion": 4,
         "previousContext": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
           "contextVersion": 3
         },
         "reason": "toolRevoked",
@@ -613,8 +702,8 @@
     "authorizationExpansionAllowed": {
       "abiVersion": "deepcode.kernel.abi.v2",
       "details": {
-        "authorizationDigest": "sha256:a3a0c9d95e0b7856375a91cdcdda78d0d16bd1d0c57c283da9a5c12e4958f4d2",
-        "expandedScopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+        "authorizationDigest": "sha256:fac284d17c8aae9f5121019e96627cebd22bb667d680fd37402b74c540e43426",
+        "expandedScopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
         "identity": {
           "causationFactId": "fact-user-expanded-golden-1",
           "controlEpoch": 1,
@@ -637,7 +726,7 @@
           "runId": "run-1"
         },
         "previousLeaseId": "lease-golden-1",
-        "previousScopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8"
+        "previousScopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79"
       },
       "domain": "authorization",
       "factId": "fact-expansion-allowed-golden-1",
@@ -647,7 +736,7 @@
         "attemptId": null,
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-        "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+          "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
           "version": 2
         },
         "controlEpoch": 1,
@@ -666,7 +755,7 @@
     "authorizationExpansionDenied": {
       "abiVersion": "deepcode.kernel.abi.v2",
       "details": {
-        "authorizationDigest": "sha256:99b627f9f261a3b6e818ac8c2340792a17c979bf373fe977cf0da15aa7136184",
+        "authorizationDigest": "sha256:23a5c87ece84ac084844389ce93f6b13c7a931101be55fd13b8cf253ca9a6cb5",
         "guidance": "User denied scope expansion; re-plan within the approved workspace scope.",
         "identity": {
           "causationFactId": "fact-user-denied-golden-1",
@@ -687,7 +776,7 @@
           "runId": "run-1"
         },
         "previewId": "preview-golden-expanded-deny-1",
-        "requestedScopeDigest": "sha256:f96310e585cc7f33c9824bf74edbd628cebf48cb39358c964a7b9b3d50eced7f"
+        "requestedScopeDigest": "sha256:ddcd5ad1253bf9d2be7918255ad511d56888a074f82872f612cd544f9255f32b"
       },
       "domain": "authorization",
       "factId": "fact-expansion-denied-golden-1",
@@ -734,7 +823,7 @@
           "runId": "run-1"
         },
         "reason": "userRevoked",
-        "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8"
+        "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79"
       },
       "domain": "authorization",
       "factId": "fact-lease-revoked-golden-1",
@@ -744,7 +833,7 @@
         "attemptId": null,
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+          "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
           "version": 1
         },
         "controlEpoch": 1,
@@ -785,7 +874,7 @@
           "runId": "run-1"
         },
         "reason": "controlEpochAdvanced",
-        "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070"
+        "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c"
       },
       "domain": "authorization",
       "factId": "fact-lease-superseded-golden-1",
@@ -795,7 +884,7 @@
         "attemptId": null,
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+          "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
           "version": 2
         },
         "controlEpoch": 1,
@@ -1069,8 +1158,8 @@
               "policyEvaluationDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
               "settingsDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
               "toolContextRef": {
-                "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-                "contextDigest": "sha256:d9e9d0dedd1be52b55c76a3702ecd04006c2ba3c3f0a19c3c5d0ece8df1c0771",
+                "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+                "contextDigest": "sha256:e390775a6f7e5c9f4db4bc2b7220bd04f06e72ef524dafd84cbdcabee8528bf1",
                 "contextVersion": 4
               }
             },
@@ -1126,7 +1215,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+                "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
                 "version": 2
               },
               "planActionId": "plan-action-golden-1",
@@ -1152,7 +1241,7 @@
         "attemptId": "attempt-golden-expanded-2",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+          "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
           "version": 2
         },
         "controlEpoch": 1,
@@ -1191,8 +1280,8 @@
               "policyEvaluationDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
               "settingsDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
               "toolContextRef": {
-                "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-                "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+                "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+                "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
                 "contextVersion": 3
               }
             },
@@ -1248,7 +1337,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-                "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+                "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
                 "version": 1
               },
               "planActionId": "plan-action-golden-1",
@@ -1274,7 +1363,7 @@
         "attemptId": "attempt-golden-output-1",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+          "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
           "version": 1
         },
         "controlEpoch": 1,
@@ -1304,8 +1393,8 @@
               "policyEvaluationDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
               "settingsDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
               "toolContextRef": {
-                "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-                "contextDigest": "sha256:d9e9d0dedd1be52b55c76a3702ecd04006c2ba3c3f0a19c3c5d0ece8df1c0771",
+                "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+                "contextDigest": "sha256:e390775a6f7e5c9f4db4bc2b7220bd04f06e72ef524dafd84cbdcabee8528bf1",
                 "contextVersion": 4
               }
             },
@@ -1334,7 +1423,7 @@
           },
           "kind": "workspace"
         },
-        "toolContractDigest": "sha256:b81f885245743d9543b7180829d3a693a597fd32d5b23627c49358938de5db16",
+        "toolContractDigest": "sha256:449a21bd4862d5312c2b09868f82c0616d29b2c6e11cc6357b6e76ce204521f1",
         "toolId": "fs.read",
         "workspaceBindingDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
       },
@@ -1366,8 +1455,8 @@
               "policyEvaluationDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
               "settingsDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
               "toolContextRef": {
-                "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-                "contextDigest": "sha256:d9e9d0dedd1be52b55c76a3702ecd04006c2ba3c3f0a19c3c5d0ece8df1c0771",
+                "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+                "contextDigest": "sha256:e390775a6f7e5c9f4db4bc2b7220bd04f06e72ef524dafd84cbdcabee8528bf1",
                 "contextVersion": 4
               }
             },
@@ -1416,7 +1505,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-                "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+                "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
                 "version": 2
               },
               "planActionId": "plan-action-golden-1",
@@ -1456,7 +1545,7 @@
         "attemptId": "attempt-golden-expanded-2",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+          "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
           "version": 2
         },
         "controlEpoch": 1,
@@ -1483,7 +1572,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-                "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+                "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
                 "version": 2
               },
               "planActionId": "plan-action-golden-1",
@@ -1522,7 +1611,7 @@
           },
           "kind": "workspace"
         },
-        "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "toolId": "fs.write",
         "workspaceBindingDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
       },
@@ -1534,7 +1623,7 @@
         "attemptId": "attempt-golden-expanded-2",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:b3fb5d32bc182ae2c48a96d6676b7c0500d62cbbd5a2b8e3db49a54b94d77070",
+          "scopeDigest": "sha256:851613d924b4249038501204ee53c894d13d34a52e28814b86e2d9e3741e5b5c",
           "version": 2
         },
         "controlEpoch": 1,
@@ -1562,8 +1651,8 @@
               "policyEvaluationDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
               "settingsDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
               "toolContextRef": {
-                "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-                "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+                "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+                "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
                 "contextVersion": 3
               }
             },
@@ -1592,7 +1681,7 @@
           },
           "kind": "workspace"
         },
-        "toolContractDigest": "sha256:b81f885245743d9543b7180829d3a693a597fd32d5b23627c49358938de5db16",
+        "toolContractDigest": "sha256:449a21bd4862d5312c2b09868f82c0616d29b2c6e11cc6357b6e76ce204521f1",
         "toolId": "fs.read",
         "workspaceBindingDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
       },
@@ -1624,8 +1713,8 @@
               "policyEvaluationDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
               "settingsDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
               "toolContextRef": {
-                "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-                "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+                "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+                "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
                 "contextVersion": 3
               }
             },
@@ -1674,7 +1763,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-                "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+                "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
                 "version": 1
               },
               "planActionId": "plan-action-golden-1",
@@ -1714,7 +1803,7 @@
         "attemptId": "attempt-golden-output-1",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+          "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
           "version": 1
         },
         "controlEpoch": 1,
@@ -1739,7 +1828,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-                "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+                "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
                 "version": 1
               },
               "planActionId": "plan-action-golden-1",
@@ -1776,7 +1865,7 @@
         "attemptId": "attempt-golden-indeterminate-1",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+          "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
           "version": 1
         },
         "controlEpoch": 1,
@@ -1803,7 +1892,7 @@
             "data": {
               "lease": {
                 "leaseId": "lease-golden-1",
-                "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+                "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
                 "version": 1
               },
               "planActionId": "plan-action-golden-1",
@@ -1842,7 +1931,7 @@
           },
           "kind": "workspace"
         },
-        "toolContractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "toolContractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "toolId": "fs.write",
         "workspaceBindingDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
       },
@@ -1854,7 +1943,7 @@
         "attemptId": "attempt-golden-output-1",
         "capabilityLease": {
           "leaseId": "lease-golden-1",
-          "scopeDigest": "sha256:aa463b41c6e60901f4002e746de25dbc831b59c44b317bd8a0f61f0b2bd6e0f8",
+          "scopeDigest": "sha256:c24c21ac3098360f3a82614510099b25ef956e0dfe20818c69bd2d6a58674d79",
           "version": 1
         },
         "controlEpoch": 1,
@@ -1872,15 +1961,16 @@
     }
   },
   "kernelMutationToolContext": {
-    "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-    "contextDigest": "sha256:1b7f18f7fc528415809edb654e7074b83202169c18ed68f1dc86e15b631c7aae",
+    "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+    "contextDigest": "sha256:661d52ce33da3ce0d249dfc0ab840f2b5180d48a520f8ff826df8133aa656b64",
     "contextVersion": 3,
-    "fixedPrompt": "The Kernel is the sole authority for the tools listed below. Call only a tool present in this context and provide one JSON object matching its input schema. Tool arguments are untrusted intent: the Kernel resolves resources, checks the active capability and current tool availability, and records execution facts. Never claim that a tool ran from narration alone. Treat an awaiting-capability, denied, stale-context, failed, cancelled, or indeterminate result as non-success.\n\nKernel-owned tool contracts follow in ascending ToolId order. Each canonical InputSchema is available for planning, but only tools separately exposed by the current Provider callable-tool channel may be invoked. A planning-only schema does not grant authority or make its tool callable.\n\nToolId: fs.read\nDescription: Read one UTF-8 file inside the bound workspace.\nInputSchema: {\"additionalProperties\":false,\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}\nInstruction: Read one workspace-relative path and return its current UTF-8 contents.\n\nToolId: fs.write\nDescription: Write one UTF-8 file inside the bound workspace.\nInputSchema: {\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}\nInstruction: Write one workspace-relative path with the exact supplied UTF-8 contents.",
+    "fixedPrompt": "The Kernel is the sole authority for the tools listed below. Call only a tool present in this context and provide one JSON object matching its input schema. Tool arguments are untrusted intent: the Kernel resolves resources, checks the active capability and current tool availability, and records execution facts. Never claim that a tool ran from narration alone. Treat an awaiting-capability, denied, stale-context, failed, cancelled, or indeterminate result as non-success.\n\nKernel-owned tool contracts follow in ascending ToolId order. Each canonical InputSchema is available for planning, but only tools separately exposed by the current Provider callable-tool channel may be invoked. A planning-only schema does not grant authority or make its tool callable.\n\nToolId: fs.read\nDescription: Read one UTF-8 file inside the bound workspace.\nInputSchema: {\"additionalProperties\":false,\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}\nAuthorizationShape: resourceScope\nInstruction: Read one workspace-relative path and return its current UTF-8 contents.\n\nToolId: fs.write\nDescription: Write one UTF-8 file inside the bound workspace.\nInputSchema: {\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"type\":\"object\"}\nAuthorizationShape: resourceScope\nInstruction: Write one workspace-relative path with the exact supplied UTF-8 contents.",
     "formatVersion": "deepcode.kernel.tool-context.v2",
     "tools": [
       {
+        "authorizationShape": "resourceScope",
         "availability": "ready",
-        "contractDigest": "sha256:b81f885245743d9543b7180829d3a693a597fd32d5b23627c49358938de5db16",
+        "contractDigest": "sha256:449a21bd4862d5312c2b09868f82c0616d29b2c6e11cc6357b6e76ce204521f1",
         "description": "Read one UTF-8 file inside the bound workspace.",
         "effectClass": "read",
         "effectScope": "workspaceRead",
@@ -1901,8 +1991,9 @@
         "toolId": "fs.read"
       },
       {
+        "authorizationShape": "resourceScope",
         "availability": "ready",
-        "contractDigest": "sha256:91714685626222b33f2a73657466741965c16b5ee52b23b43d9f02658a401acc",
+        "contractDigest": "sha256:62132b176eeea0237001ec733c4bc070130fcff4c3c82cebf9ab04b7c0e4c6fb",
         "description": "Write one UTF-8 file inside the bound workspace.",
         "effectClass": "mutation",
         "effectScope": "workspaceWrite",
@@ -1995,15 +2086,16 @@
     "runSequence": 8
   },
   "kernelToolContext": {
-    "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-    "contextDigest": "sha256:d9e9d0dedd1be52b55c76a3702ecd04006c2ba3c3f0a19c3c5d0ece8df1c0771",
+    "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+    "contextDigest": "sha256:e390775a6f7e5c9f4db4bc2b7220bd04f06e72ef524dafd84cbdcabee8528bf1",
     "contextVersion": 4,
-    "fixedPrompt": "The Kernel is the sole authority for the tools listed below. Call only a tool present in this context and provide one JSON object matching its input schema. Tool arguments are untrusted intent: the Kernel resolves resources, checks the active capability and current tool availability, and records execution facts. Never claim that a tool ran from narration alone. Treat an awaiting-capability, denied, stale-context, failed, cancelled, or indeterminate result as non-success.\n\nKernel-owned tool contracts follow in ascending ToolId order. Each canonical InputSchema is available for planning, but only tools separately exposed by the current Provider callable-tool channel may be invoked. A planning-only schema does not grant authority or make its tool callable.\n\nToolId: fs.read\nDescription: Read one UTF-8 file inside the bound workspace.\nInputSchema: {\"additionalProperties\":false,\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}\nInstruction: Read one workspace-relative path and return its current UTF-8 contents.",
+    "fixedPrompt": "The Kernel is the sole authority for the tools listed below. Call only a tool present in this context and provide one JSON object matching its input schema. Tool arguments are untrusted intent: the Kernel resolves resources, checks the active capability and current tool availability, and records execution facts. Never claim that a tool ran from narration alone. Treat an awaiting-capability, denied, stale-context, failed, cancelled, or indeterminate result as non-success.\n\nKernel-owned tool contracts follow in ascending ToolId order. Each canonical InputSchema is available for planning, but only tools separately exposed by the current Provider callable-tool channel may be invoked. A planning-only schema does not grant authority or make its tool callable.\n\nToolId: fs.read\nDescription: Read one UTF-8 file inside the bound workspace.\nInputSchema: {\"additionalProperties\":false,\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}\nAuthorizationShape: resourceScope\nInstruction: Read one workspace-relative path and return its current UTF-8 contents.",
     "formatVersion": "deepcode.kernel.tool-context.v2",
     "tools": [
       {
+        "authorizationShape": "resourceScope",
         "availability": "ready",
-        "contractDigest": "sha256:b81f885245743d9543b7180829d3a693a597fd32d5b23627c49358938de5db16",
+        "contractDigest": "sha256:449a21bd4862d5312c2b09868f82c0616d29b2c6e11cc6357b6e76ce204521f1",
         "description": "Read one UTF-8 file inside the bound workspace.",
         "effectClass": "read",
         "effectScope": "workspaceRead",
@@ -2056,8 +2148,8 @@
         },
         "runId": "run-1",
         "toolContextRef": {
-          "catalogDigest": "sha256:65d4ec965c3c69cbe99780fb5e4697eb04a3d77e94824e024324e76d9b19a6ea",
-          "contextDigest": "sha256:d9e9d0dedd1be52b55c76a3702ecd04006c2ba3c3f0a19c3c5d0ece8df1c0771",
+          "catalogDigest": "sha256:72b468dd0f2611df4383a6eb5f9e4cc8aa8c4e1be8c2ad77e62752acd44214f5",
+          "contextDigest": "sha256:e390775a6f7e5c9f4db4bc2b7220bd04f06e72ef524dafd84cbdcabee8528bf1",
           "contextVersion": 4
         },
         "toolId": "fs.read"
