@@ -172,10 +172,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
           toolName: 'fs.read',
           toolId: 'fs.read',
           operationId: 'operation-read',
-          status: 'completed',
-          invocationId: 'invocation-read',
-          terminalFactId: 'fact-read-completed',
-          terminalFactKind: 'toolCompleted',
+          status: 'pending',
         },
         { kind: 'text', phase: 'commentary', text: 'I will now update the file.' },
         {
@@ -185,10 +182,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
           toolName: 'fs.write',
           toolId: 'fs.write',
           operationId: 'operation-write',
-          status: 'completed',
-          invocationId: 'invocation-write',
-          terminalFactId: 'fact-write-completed',
-          terminalFactKind: 'toolCompleted',
+          status: 'pending',
         },
       ],
       providerOutcome: providerOutcome(),
@@ -197,6 +191,38 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
       sessionId,
       runId,
       5,
+      'toolIntent.submitted',
+      {
+        requestId: 'request-admit-read',
+        operationId: 'operation-read',
+        toolId: 'fs.read',
+        expectedControlEpoch: 1,
+        authorityKind: 'contextRead',
+        replyKind: 'admitted',
+        invocationId: 'invocation-read',
+      }
+    ),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      6,
+      'toolIntent.submitted',
+      {
+        requestId: 'request-admit-write',
+        operationId: 'operation-write',
+        toolId: 'fs.write',
+        expectedControlEpoch: 1,
+        authorityKind: 'planAction',
+        planRevision: 'plan-work-segment',
+        planActionId: 'plan-action-write',
+        replyKind: 'admitted',
+        invocationId: 'invocation-write',
+      }
+    ),
+    publicProjectionEvent(
+      sessionId,
+      runId,
+      7,
       'kernelFacts.reconciled',
       {
         requestId: 'request-facts-work-segment',
@@ -240,7 +266,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
     () => publicProjectionEvent(
       sessionId,
       runId,
-      6,
+      8,
       'provider.completed',
       {
         providerTurnId: 'provider-turn-raw-arguments-rejected',
@@ -271,7 +297,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
     () => publicProjectionEvent(
       sessionId,
       runId,
-      6,
+      8,
       'toolIntent.submitted',
       {
         requestId: 'request-raw-arguments-rejected',
@@ -291,7 +317,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
   const rawIntentEvent = publicProjectionEvent(
     sessionId,
     runId,
-    6,
+    8,
     'toolIntent.submitted',
     {
       requestId: 'request-raw-arguments-omitted',
@@ -312,6 +338,24 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
   assert.equal(rawOmissionJson.includes('rawArguments'), false);
   assert.equal(rawOmissionJson.includes(rawArgumentsSentinel), false);
 
+  const narrationOnly = buildNarrativeTimelineProjection({
+    sessionId,
+    events: events.slice(0, 4),
+  });
+  assertSharedConversationProjectionV2(narrationOnly);
+  assert.equal(
+    narrationOnly.turns[0].workSegments.length,
+    0,
+    'Provider response narration cannot create canonical work'
+  );
+  assert.equal(
+    narrationOnly.turns[0].parts.some(
+      (part) => part.kind === 'workSegment'
+    ),
+    false,
+    'Provider response narration cannot publish a WorkSegment part'
+  );
+
   const beforeFacts = buildNarrativeTimelineProjection({
     sessionId,
     events: events.slice(0, -1),
@@ -325,10 +369,13 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
   for (const operationId of ['operation-read', 'operation-write']) {
     const operation = beforeFactOperations[operationId];
     assert.ok(operation, `missing pre-facts operation ${operationId}`);
+    assert.equal(operation.status, 'queued');
     assert.equal(Object.hasOwn(operation, 'canonicalAction'), false);
     assert.equal(Object.hasOwn(operation, 'targets'), false);
     assert.equal(Object.hasOwn(operation, 'effectSummary'), false);
+    assert.deepEqual(operation.resourcePresentation, []);
     assert.deepEqual(operation.resourceRefs, []);
+    assert.deepEqual(operation.factRefs, []);
     assert.deepEqual(operation.effectRefs, []);
   }
 
@@ -365,12 +412,20 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
   );
   assert.equal(operations['operation-read'].canonicalAction,
     'Read workspace file README.md');
-  assert.deepEqual(operations['operation-read'].targets, ['README.md']);
+  assert.deepEqual(operations['operation-read'].resourcePresentation, [{
+    kind: 'workspacePath',
+    label: 'README.md',
+    workspaceRelativePath: 'README.md',
+  }]);
+  assert.deepEqual(
+    operations['operation-read'].factRefs,
+    ['fact-read-completed']
+  );
   assert.deepEqual(operations['operation-read'].attempts, [{
     attemptId: 'attempt-read',
     status: 'completed',
-    startedAt: timestamp(5),
-    completedAt: timestamp(5),
+    startedAt: timestamp(7),
+    completedAt: timestamp(7),
   }]);
   assert.equal(operations['operation-write'].effectSummary,
     'Updated one canonical workspace resource.');
@@ -772,6 +827,7 @@ async function taskProjectionUsesOnlyLatestExactAcceptedPlan() {
   const runId = 'run-latest-exact-accepted-plan-contract';
   const oldPlan = threeActionPlan(runId, 'old');
   const latestPlan = threeActionPlan(runId, 'latest');
+  const supersedingPlan = threeActionPlan(runId, 'superseding');
   const acceptedOldEvents = [
     planInputEvent(sessionId, runId, 1),
     publicProjectionEvent(
@@ -797,24 +853,36 @@ async function taskProjectionUsesOnlyLatestExactAcceptedPlan() {
   const staleFallbackCases = [
     {
       name: 'pending',
-      decisionEvents: [],
+      suffixEvents: [],
     },
     {
       name: 'rejected',
-      decisionEvents: [
+      suffixEvents: [
         planDecisionEvent(sessionId, runId, 7, latestPlan, 'reject'),
       ],
     },
     {
       name: 'needs revision',
-      decisionEvents: [
+      suffixEvents: [
         planDecisionEvent(sessionId, runId, 7, latestPlan, 'revise'),
       ],
     },
     {
-      name: 'expired',
-      decisionEvents: [
-        expiredPlanDecisionEvent(sessionId, runId, 7, latestPlan),
+      name: 'superseded by a newer pending Plan',
+      suffixEvents: [
+        publicProjectionEvent(
+          sessionId,
+          runId,
+          7,
+          'plan.persisted',
+          supersedingPlan
+        ),
+        planConfirmationReadyEvent(
+          sessionId,
+          runId,
+          8,
+          supersedingPlan
+        ),
       ],
     },
   ];
@@ -825,7 +893,7 @@ async function taskProjectionUsesOnlyLatestExactAcceptedPlan() {
       events: [
         ...acceptedOldEvents,
         ...latestProposalEvents,
-        ...staleCase.decisionEvents,
+        ...staleCase.suffixEvents,
       ],
     });
     assertSharedConversationProjectionV2(projection);
@@ -909,9 +977,12 @@ function threeActionPlan(runId, identity = 'authority') {
       operationId: `operation-${identity}-${ordinal}`,
       toolId: 'fs.write',
       scopeIntent: {
-        kind: 'exactInvocation',
+        kind: 'resourceScope',
         data: {
-          rawArguments: { path, content: `content-${ordinal}` },
+          requestedResources: [{
+            kind: 'workspacePath',
+            data: { path, access: 'write' },
+          }],
         },
       },
     },
@@ -975,36 +1046,12 @@ function planDecisionEvent(
   );
 }
 
-function expiredPlanDecisionEvent(
-  sessionId,
-  runId,
-  sequence,
-  plan
-) {
-  const rejected = planDecisionEvent(
-    sessionId,
-    runId,
-    sequence,
-    plan,
-    'reject'
-  );
-  return {
-    ...rejected,
-    id: `${rejected.id}:expired`,
-    payload: {
-      ...rejected.payload,
-      status: 'expired',
-      decision: 'expire',
-      summary: 'Plan confirmation expired without acceptance.',
-    },
-  };
-}
-
 function scopePreviewsForPlan(plan) {
   return plan.actions.map((action, index) => {
     const ordinal = index + 1;
-    const rawArguments = action.manifest.scopeIntent.data.rawArguments;
-    const path = rawArguments.path;
+    const requestedResources =
+      action.manifest.scopeIntent.data.requestedResources;
+    const path = requestedResources[0].data.path;
     const scopeDigest = digest(String(ordinal));
     return {
       previewId: `preview-${action.manifest.operationId}`,
@@ -1015,8 +1062,8 @@ function scopePreviewsForPlan(plan) {
       operationId: action.manifest.operationId,
       toolId: action.manifest.toolId,
       authorizationBinding: {
-        kind: 'exactInvocation',
-        data: { invocationDigest: digest('a') },
+        kind: 'resourceScope',
+        data: {},
       },
       canonicalScope: {
         kind: 'workspacePaths',
@@ -1096,7 +1143,7 @@ function canonicalOperationFact(options) {
     effectId: options.effectId,
     canonicalAction: options.canonicalAction,
     effectSummary: options.effectSummary,
-    recordedAt: timestamp(5),
+    recordedAt: timestamp(7),
   };
 }
 
