@@ -1194,11 +1194,22 @@ const contractCases = [
       scenario.records.length = 0;
       const heldTimeline = holdRequests(scenario, 'timeline');
       const heldGuidance = holdRequests(scenario, 'guidance');
+      scenario.handlers.set('timelineStream', (context) => {
+        context.sseOpen();
+        context.response.end();
+        return true;
+      });
 
       const first = store.getState().sendMessage('timeline mutation');
       await waitFor(
         () => heldTimeline.length > 0 && heldGuidance.length > 0,
         'pre-mutation timeline fetch'
+      );
+      const preMutationFetchCount = scenario.recordsOf('timeline').length;
+      assert.equal(
+        preMutationFetchCount,
+        1,
+        'the fixture must hold exactly one pre-mutation timeline generation'
       );
       respondGuidance(heldGuidance[0]);
       await first;
@@ -1208,12 +1219,27 @@ const contractCases = [
         return true;
       });
       const second = store.getState().sendMessage('must fail closed');
+      await flushAsyncTurns();
+      assert.equal(
+        scenario.recordsOf('guidance').length,
+        1,
+        'the next send reached Host before the stale timeline generation was fenced'
+      );
+      assert.equal(
+        scenario.recordsOf('start').length,
+        0,
+        'the next send started a Run before the stale timeline generation was fenced'
+      );
       heldTimeline[0].data(activeTimeline(
         sessionId,
         'kernel-stale-a',
         1
       ));
       await second;
+      assert(
+        scenario.recordsOf('timeline').length > preMutationFetchCount,
+        'the stale pre-mutation generation did not trigger a new force-fresh fetch'
+      );
       assert.equal(
         scenario.recordsOf('guidance').length,
         1,
@@ -1224,12 +1250,23 @@ const contractCases = [
         0,
         'a stale timeline allowed a new Run'
       );
+      assert.equal(
+        store.getState().selectionReady,
+        false,
+        'a failed current-generation refresh left the Session send-ready'
+      );
       assert.match(
         store.getState().errorMessage ?? '',
-        /Canonical Session timeline is unavailable/
+        /Agent 会话仍在准备中/
       );
 
       scenario.handlers.delete('timeline');
+      await store.getState().refreshActiveSessionContext();
+      assert.equal(
+        store.getState().selectionReady,
+        true,
+        'an explicit current-generation refresh did not recover Session readiness'
+      );
       await store.getState().sendMessage('fresh guidance');
       assert.equal(scenario.recordsOf('guidance').length, 2);
       assert.equal(
@@ -1237,6 +1274,7 @@ const contractCases = [
         'host-stale-a',
         'force-fresh did not recover the canonical Host route'
       );
+      scenario.handlers.delete('timelineStream');
       await cleanupStore(store);
     },
   },
