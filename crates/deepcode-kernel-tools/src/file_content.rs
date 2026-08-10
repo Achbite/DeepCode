@@ -1,10 +1,26 @@
-pub use deepcode_kernel_abi::ResourceFileClassification as FileContentClassification;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
 pub const MAX_LLM_TEXT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContentClassification {
+    pub kind: String,
+    pub readable_text: bool,
+    pub binary: bool,
+    pub executable: bool,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafeTextFile {
@@ -375,7 +391,35 @@ mod tests {
 
     static TEMP_INDEX: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_file(name: &str, content: &[u8]) -> std::path::PathBuf {
+    struct TempFileFixture {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl TempFileFixture {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempFileFixture {
+        fn drop(&mut self) {
+            match fs::remove_dir_all(&self.root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if std::thread::panicking() => eprintln!(
+                    "failed to remove test-owned file-content root {} during panic: {error}",
+                    self.root.display()
+                ),
+                Err(error) => panic!(
+                    "remove test-owned file-content root {}: {error}",
+                    self.root.display()
+                ),
+            }
+        }
+    }
+
+    fn temp_file(name: &str, content: &[u8]) -> TempFileFixture {
         let root = std::env::temp_dir().join(format!(
             "deepcode-file-content-policy-{}-{}",
             std::process::id(),
@@ -384,35 +428,35 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         let path = root.join(name);
         fs::write(&path, content).expect("write temp file");
-        path
+        TempFileFixture { root, path }
     }
 
     #[test]
     fn binary_magic_is_skipped() {
-        let path = temp_file("generic.bin", b"\x7FELF\x02\x01\x01\0payload");
-        let skipped = read_text_file_for_llm(&path).expect_err("ELF must be skipped");
+        let file = temp_file("generic.bin", b"\x7FELF\x02\x01\x01\0payload");
+        let skipped = read_text_file_for_llm(file.path()).expect_err("ELF must be skipped");
         assert_eq!(skipped.reason, "binary_extension");
     }
 
     #[test]
     fn binary_magic_without_binary_extension_is_skipped() {
-        let path = temp_file("generic.out", b"\x7FELF\x02\x01\x01\0payload");
-        let skipped = read_text_file_for_llm(&path).expect_err("ELF must be skipped");
+        let file = temp_file("generic.out", b"\x7FELF\x02\x01\x01\0payload");
+        let skipped = read_text_file_for_llm(file.path()).expect_err("ELF must be skipped");
         assert_eq!(skipped.reason, "binary_magic");
         assert_eq!(skipped.classification.magic.as_deref(), Some("elf"));
     }
 
     #[test]
     fn executable_text_script_is_readable() {
-        let path = temp_file("generic-script", b"#!/bin/sh\necho ok\n");
+        let file = temp_file("generic-script", b"#!/bin/sh\necho ok\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+            let mut permissions = fs::metadata(file.path()).expect("metadata").permissions();
             permissions.set_mode(0o755);
-            fs::set_permissions(&path, permissions).expect("chmod");
+            fs::set_permissions(file.path(), permissions).expect("chmod");
         }
-        let read = read_text_file_for_llm(&path).expect("script text is readable");
+        let read = read_text_file_for_llm(file.path()).expect("script text is readable");
         assert!(read.content.contains("echo ok"));
         #[cfg(unix)]
         assert_eq!(read.classification.kind, "textExecutableScript");

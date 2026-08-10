@@ -27,62 +27,6 @@
   line-height: 1.55;
 }
 
-/* R4 requirement options 列表：展示 option.effect 副作用文案 */
-.agent-flow-card__options {
-  margin-top: 10px;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.agent-flow-card__option {
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: var(--radius-sm, 4px);
-  padding: 8px 10px;
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.agent-flow-card__option-head {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.agent-flow-card__option-label {
-  font-size: 13px;
-  font-weight: 650;
-  color: var(--text-main, #ededed);
-}
-
-.agent-flow-card__option-badge {
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--accent, #0a84ff);
-  background: rgba(10, 132, 255, 0.12);
-  padding: 1px 6px;
-  border-radius: 2px;
-}
-
-.agent-flow-card__option-desc {
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--text-muted, #a1a1aa);
-  line-height: 1.5;
-}
-
-.agent-flow-card__option-effect {
-  margin-top: 6px;
-  font-size: 11.5px;
-  color: var(--success, #30d158);
-  line-height: 1.5;
-}
-
-.agent-flow-card__option-effect-label {
-  color: var(--text-muted, #a1a1aa);
-}
-
 .agent-flow-card__section {
   margin-top: 10px;
 }
@@ -412,13 +356,13 @@
   text-transform: uppercase;
 }
 
-.agent-task-item--waiting,
-.agent-task-item--running {
+.agent-task-item--queued,
+.agent-task-item--thinking {
   color: var(--text-main, #ededed);
 }
 
-.agent-task-item--waiting .agent-task-item__dot,
-.agent-task-item--running .agent-task-item__dot {
+.agent-task-item--queued .agent-task-item__dot,
+.agent-task-item--thinking .agent-task-item__dot {
   background: var(--accent, #0a84ff);
   box-shadow: 0 0 8px rgba(10, 132, 255, 0.45);
 }
@@ -426,11 +370,6 @@
 .agent-task-item--completed .agent-task-item__dot {
   background: #4ade80;
   box-shadow: 0 0 8px rgba(74, 222, 128, 0.35);
-}
-
-.agent-task-item--error .agent-task-item__dot {
-  background: #ff6b5f;
-  box-shadow: 0 0 8px rgba(255, 107, 95, 0.35);
 }
 
 .agent-task-item__commands {
@@ -491,8 +430,202 @@
   margin-top: 4px;
 }
 
+.agent-projection-block,
+.agent-projection-work {
+  align-self: stretch;
+  max-width: 100%;
+  margin: 2px 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-lg, 8px);
+  background: var(--bg-surface, #1c1c20);
+  color: var(--text-main, #ededed);
+  font-size: 12px;
+  box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.3));
+}
+
+.agent-projection-block--error,
+.agent-projection-work--failed {
+  border-color: rgba(255, 69, 58, 0.35);
+  background: rgba(255, 69, 58, 0.07);
+}
+
+.agent-projection-block__summary,
+.agent-projection-work__summary {
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 650;
+}
+
+.agent-projection-block__summary::-webkit-details-marker,
+.agent-projection-work__summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-projection-block__content,
+.agent-projection-work__content {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 10px 27px;
+  color: var(--text-muted, #a1a1aa);
+}
+
+.agent-projection-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(161, 161, 170, 0.8);
+}
+
+.agent-projection-status--running,
+.agent-projection-status--waiting,
+.agent-projection-work__status--active,
+.agent-projection-operation__status--preparing,
+.agent-projection-operation__status--queued,
+.agent-projection-operation__status--running,
+.agent-projection-operation__status--awaitingCapability {
+  background: var(--accent, #0a84ff);
+  box-shadow: 0 0 7px rgba(10, 132, 255, 0.4);
+}
+
+.agent-projection-status--completed,
+.agent-projection-work__status--completed,
+.agent-projection-operation__status--completed {
+  background: #4ade80;
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.3);
+}
+
+.agent-projection-status--blocked,
+.agent-projection-operation__status--denied,
+.agent-projection-operation__status--stale,
+.agent-projection-operation__status--unexecuted {
+  background: #f5b942;
+}
+
+.agent-projection-status--failed,
+.agent-projection-work__status--failed,
+.agent-projection-operation__status--failed,
+.agent-projection-operation__status--failedAfterObservedEffect,
+.agent-projection-operation__status--indeterminate {
+  background: #ff6b5f;
+  box-shadow: 0 0 6px rgba(255, 107, 95, 0.3);
+}
+
+.agent-projection-operation__status--cancelled,
+.agent-projection-work__status--cancelled,
+.agent-projection-status--cancelled {
+  background: rgba(161, 161, 170, 0.8);
+}
+
+.agent-projection-work__title,
+.agent-projection-operation__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-projection-work__attention {
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--text-muted, #a1a1aa);
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.agent-projection-work__attention--unresolved {
+  color: #ffd27a;
+  background: rgba(245, 185, 66, 0.12);
+}
+
+.agent-projection-work__attention-summary {
+  border-left: 2px solid rgba(161, 161, 170, 0.45);
+  padding-left: 8px;
+  line-height: 1.5;
+}
+
+.agent-projection-work__attention-summary--unresolved {
+  border-left-color: #f5b942;
+  color: var(--text-main, #ededed);
+}
+
+.agent-projection-work__operations {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-projection-operation {
+  display: grid;
+  gap: 5px;
+  padding: 7px 8px;
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.agent-projection-operation__head {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+}
+
+.agent-projection-operation__state {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
+}
+
+.agent-projection-operation__targets,
+.agent-projection-operation__effect,
+.agent-projection-operation__retry {
+  padding-left: 14px;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+
+.agent-projection-operation__targets {
+  color: var(--text-muted, #a1a1aa);
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+.agent-projection-operation__retry {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
+}
+
+.agent-projection-operation__effect {
+  color: var(--text-main, #ededed);
+}
+
+.agent-projection-current-activity {
+  position: sticky;
+  bottom: 0;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 7px 9px;
+  border: 1px solid rgba(10, 132, 255, 0.22);
+  border-radius: var(--radius-md, 6px);
+  background: color-mix(in srgb, var(--bg-panel, #131316) 92%, transparent);
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  backdrop-filter: blur(8px);
+}
+
 .agent-message,
-.agent-tool-bubble,
 .agent-permission {
   max-width: 92%;
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
@@ -501,16 +634,6 @@
   padding: 9px;
   font-size: 12px;
   box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.3));
-}
-
-/* 让 tool bubble 在 hover 时呈现明显卡片感，避免多个 bubble 并列时呈横线状视觉 */
-.agent-tool-bubble {
-  transition: border-color 0.15s ease, background 0.15s ease;
-}
-
-.agent-tool-bubble:hover {
-  border-color: rgba(10, 132, 255, 0.35);
-  background: rgba(10, 132, 255, 0.04);
 }
 
 .agent-message--user_msg {
@@ -669,7 +792,6 @@
 }
 
 .agent-message__meta,
-.agent-tool-bubble__header,
 .agent-permission__meta {
   display: flex;
   align-items: center;
@@ -1237,253 +1359,6 @@
   }
 }
 
-.agent-tool-bubble__title {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-main, #ededed);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-/* ---- 卡片统一状态图标（cardStatus）---- */
-.agent-tool-bubble__lead {
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.agent-status-icon {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 14px;
-  height: 14px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.agent-status-icon--completed {
-  color: var(--success, #30d158);
-}
-
-.agent-status-icon--failed {
-  color: var(--danger, #ff453a);
-}
-
-.agent-status-icon--waiting {
-  color: var(--warn, #ffcc00);
-}
-
-.agent-status-icon--blocked {
-  color: #ff9f0a;
-}
-
-.agent-status-icon--queued {
-  color: var(--text-muted, #a1a1aa);
-}
-
-.agent-tool-bubble__details {
-  margin: 0;
-}
-
-/* ============================================================
- * 工具批次折叠选项卡（agent-tool-batch）
- * 
- * 设计目标：每个工具批次独立成"选项卡"风格折叠卡片，与思考过程视觉同档但用绿色色条区分。
- * 视觉规格：
- *   - 占满消息列容器宽度（align-self: stretch）
- *   - 60px 高度，明显的卡片矩形
- *   - 4px 实色左色条（绿色，区分思考过程的蓝色）
- *   - 大圆角 8px + box-shadow 让卡片浮起
- *   - 移除 overflow: hidden 避免嵌套 details 内容塌陷
- *   - hover 时 border 与 background 强化反馈
- * ============================================================ */
-.agent-tool-batch {
-  display: block;
-  align-self: stretch;
-  width: 100%;
-  margin: 4px 0;
-  padding: 0;
-  border: 1px solid rgba(48, 209, 88, 0.28);
-  border-left: 4px solid var(--success, #30d158);
-  border-radius: 8px;
-  background: rgba(48, 209, 88, 0.05);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
-}
-
-.agent-tool-batch:hover {
-  border-color: rgba(48, 209, 88, 0.5);
-  background: rgba(48, 209, 88, 0.1);
-  box-shadow: 0 2px 8px rgba(48, 209, 88, 0.2);
-}
-
-.agent-tool-batch > summary {
-  min-height: 60px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  cursor: pointer;
-  list-style: none;
-  padding: 16px 18px;
-  border-radius: 6px;
-}
-
-.agent-tool-batch > summary::-webkit-details-marker {
-  display: none;
-}
-
-.agent-tool-batch__label {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text-main, #ededed);
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: 0.2px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-tool-batch__status {
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
-  padding: 2px 8px;
-  color: var(--text-muted, #a1a1aa);
-  font-size: 10px;
-  font-weight: 650;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.agent-tool-batch__status--running {
-  color: var(--accent, #0a84ff);
-  background: rgba(10, 132, 255, 0.12);
-}
-
-.agent-tool-batch__status--done {
-  color: var(--success, #30d158);
-  background: rgba(48, 209, 88, 0.14);
-}
-
-.agent-tool-batch__status--error {
-  color: var(--danger, #ff453a);
-  background: rgba(255, 69, 58, 0.14);
-}
-
-.agent-tool-batch__body {
-  display: grid;
-  gap: 8px;
-  max-height: min(34vh, 320px);
-  overflow: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-  padding: 12px 14px;
-  border-top: 1px solid rgba(48, 209, 88, 0.18);
-}
-
-.agent-tool-batch--narrative {
-  border-left-width: 0;
-  border-color: var(--border-subtle, rgba(148, 163, 184, 0.25));
-  background: var(--surface-subtle, rgba(148, 163, 184, 0.06));
-  box-shadow: none;
-}
-
-.agent-tool-batch--narrative:hover {
-  border-color: var(--border, rgba(148, 163, 184, 0.42));
-  background: var(--surface-hover, rgba(148, 163, 184, 0.1));
-  box-shadow: none;
-}
-
-.agent-tool-batch--narrative > summary {
-  min-height: 42px;
-  padding: 10px 14px;
-}
-
-.agent-tool-batch--narrative .agent-tool-batch__body {
-  max-height: min(30vh, 280px);
-  border-top-color: var(--border-subtle, rgba(148, 163, 184, 0.18));
-}
-
-.agent-tool-bubble__details > summary {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-  list-style: none;
-  min-height: 48px;
-  padding: 10px 14px;
-}
-
-.agent-tool-bubble__details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.agent-tool-bubble__details > summary::after {
-  content: "Show";
-  color: var(--text-muted, #a1a1aa);
-  font-size: 10px;
-  text-transform: uppercase;
-}
-
-.agent-tool-bubble__details[open] > summary::after {
-  content: "Hide";
-}
-
-.agent-tool-bubble__label {
-  color: var(--text-muted, #a1a1aa);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.35px;
-  text-transform: uppercase;
-}
-
-.agent-tool-bubble__summary {
-  margin-top: 6px;
-  overflow-wrap: anywhere;
-  color: var(--text-main, #ededed);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.agent-tool-bubble__output {
-  margin-top: 7px;
-}
-
-.agent-tool-bubble__output-title {
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-  font-weight: 650;
-  margin-bottom: 5px;
-}
-
-.agent-tool-bubble__status {
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
-  padding: 1px 6px;
-  font-size: 10px;
-  text-transform: uppercase;
-}
-
-.agent-tool-bubble__status--ok,
-.agent-tool-bubble__status--accept {
-  color: var(--success, #30d158);
-}
-
-.agent-tool-bubble__status--error,
-.agent-tool-bubble__status--reject,
-.agent-tool-bubble__status--denied {
-  color: var(--danger, #ff453a);
-}
-
-.agent-tool-bubble pre,
 .agent-permission__diff {
   max-height: 180px;
   overflow: auto;
@@ -1496,90 +1371,6 @@
   line-height: 1.45;
   padding: 8px;
   white-space: pre-wrap;
-}
-
-.agent-evidence-list {
-  display: grid;
-  gap: 7px;
-}
-
-.agent-evidence-item {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 58px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 9px;
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.18));
-  border-radius: var(--radius-md, 6px);
-  background: var(--surface-subtle, rgba(148, 163, 184, 0.06));
-  padding: 8px 10px;
-  color: var(--text-main, #ededed);
-  font-size: 12px;
-}
-
-.agent-evidence-item--failed {
-  border-color: rgba(255, 69, 58, 0.32);
-  background: rgba(255, 69, 58, 0.08);
-}
-
-.agent-evidence-item__verb {
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-}
-
-.agent-evidence-item__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 650;
-}
-
-.agent-evidence-item__detail,
-.agent-evidence-item__meta {
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-}
-
-.agent-evidence-item__meta {
-  grid-column: 2 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.agent-evidence-output {
-  grid-column: 2 / -1;
-}
-
-.agent-evidence-output summary {
-  cursor: pointer;
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-}
-
-.agent-evidence-output pre {
-  max-height: 160px;
-  overflow: auto;
-  margin: 7px 0 0;
-  border-radius: var(--radius-md, 6px);
-  background: rgba(0, 0, 0, 0.22);
-  padding: 8px;
-  white-space: pre-wrap;
-}
-
-.agent-evidence-output__list {
-  margin: 7px 0 0;
-  padding-left: 18px;
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.agent-evidence-list__more {
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-  padding: 4px 2px 0;
 }
 
 .agent-turn-actions {
@@ -1769,40 +1560,6 @@
   box-shadow: none;
 }
 
-.agent-attachment-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-bottom: 6px;
-}
-
-.agent-chip {
-  max-width: 100%;
-  min-height: 22px;
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid rgba(10, 132, 255, 0.42);
-  border-radius: 999px;
-  background: var(--accent-soft, rgba(10, 132, 255, 0.15));
-  color: var(--text-main, #ededed);
-  padding: 0 8px;
-  font-size: 11px;
-  cursor: pointer;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-chip--session {
-  border-color: rgba(255, 204, 0, 0.36);
-  background: rgba(255, 204, 0, 0.12);
-}
-
-.agent-chip span {
-  margin-left: 6px;
-  color: var(--text-muted, #a1a1aa);
-}
-
 .agent-composer__input-wrap {
   position: relative;
 }
@@ -1873,8 +1630,7 @@
   gap: 3px;
 }
 
-.agent-change-file__actions button,
-.agent-add-file-button {
+.agent-change-file__actions button {
   min-width: 26px;
   height: 26px;
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
@@ -1886,8 +1642,7 @@
   cursor: pointer;
 }
 
-.agent-change-file__actions button:hover,
-.agent-add-file-button:hover {
+.agent-change-file__actions button:hover {
   border-color: rgba(10, 132, 255, 0.55);
   background: rgba(255, 255, 255, 0.1);
   color: var(--text-strong, #fff);
@@ -2296,6 +2051,15 @@
   font-size: 11px;
 }
 
+.agent-composer__footer-right {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}
+
 .agent-composer__footer button.agent-composer__reject-button {
   display: inline-flex;
   align-items: center;
@@ -2323,68 +2087,51 @@
   font-weight: 720;
 }
 
-.agent-composer__footer-left {
-  min-width: 0;
+.agent-panel-error {
   display: flex;
   align-items: center;
-  gap: 8px;
-}
-
-.agent-composer__attach-wrap {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-}
-
-.agent-attachment-picker {
-  position: absolute;
-  left: 0;
-  width: 280px;
-  bottom: calc(100% + 5px);
-  max-height: 220px;
-  overflow: auto;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: var(--radius-md, 6px);
-  background: var(--bg-surface, #1c1c20);
-  box-shadow: var(--shadow-md, 0 12px 30px rgba(0, 0, 0, 0.42));
-  z-index: 20;
-}
-
-.agent-composer__input-wrap .agent-attachment-picker {
-  right: 0;
-  width: auto;
-}
-
-.agent-attachment-picker button {
-  width: 100%;
-  display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
-  gap: 8px;
-  border: 0;
-  background: transparent;
-  color: var(--text-main, #ededed);
-  text-align: left;
-  padding: 8px;
-  cursor: pointer;
-  font-size: 12px;
-}
-
-.agent-attachment-picker button:hover {
-  background: var(--accent-soft, rgba(10, 132, 255, 0.15));
-  color: #fff;
-}
-
-.agent-attachment-picker strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-attachment-picker__empty,
-.agent-panel-error {
+  justify-content: space-between;
+  gap: 10px;
   color: var(--danger, #ff3b30);
   padding: 8px;
   font-size: 12px;
+}
+
+.agent-panel-error button {
+  flex: 0 0 auto;
+}
+
+.agent-composer__pending-submission {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(255, 159, 10, 0.42);
+  border-radius: 7px;
+  background: rgba(255, 159, 10, 0.1);
+  color: var(--text-main, #ededed);
+  padding: 7px 8px;
+  font-size: 12px;
+}
+
+.agent-composer__pending-submission button {
+  flex: 0 0 auto;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.agent-composer__pending-submission button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.agent-composer__pending-submission--pending {
+  border-color: rgba(10, 132, 255, 0.38);
+  background: rgba(10, 132, 255, 0.1);
 }
 
 .agent-flow-card__details--diff {
@@ -2403,193 +2150,149 @@
   line-height: 1.45;
 }
 
-/* ============================================================
- * DiffView 内联差异视图（agent-diff-view）
- *
- * 把 unified diff 渲染为 +/- 着色的人类可读视图，替代 raw <pre>。
- * 设计：
- *   - 顶部 bar 显示文件路径 + 聚合 +added/-removed 统计
- *   - 行级着色：added 绿 / removed 红 / hunk 蓝 / meta 灰 / context 默认
- *   - body 用 contentVisibility 跳过视口外渲染，缓解长 diff 卡顿
- * ============================================================ */
-.agent-diff-view {
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: var(--radius-md, 6px);
-  background: var(--bg-elevated, rgba(0, 0, 0, 0.2));
-  overflow: hidden;
-}
-
-.agent-diff-view__bar {
+.agent-attachment-chips {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 6px 9px;
-  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.07));
-  background: rgba(255, 255, 255, 0.03);
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
-.agent-diff-view__path {
+.agent-chip {
   min-width: 0;
+  max-width: 100%;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(10, 132, 255, 0.36);
+  border-radius: 7px;
+  background: rgba(10, 132, 255, 0.1);
+  color: var(--text-main, #ededed);
+  padding: 5px 7px;
+  text-align: left;
+}
+
+.agent-chip--session {
+  border-color: rgba(255, 204, 0, 0.36);
+  background: rgba(255, 204, 0, 0.1);
+}
+
+.agent-chip__icon,
+.agent-chip__remove {
+  display: grid;
+  place-items: center;
+}
+
+.agent-chip__icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.45;
+}
+
+.agent-chip__body {
+  min-width: 0;
+  display: grid;
+}
+
+.agent-chip__path {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-main, #ededed);
-  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
-  font-size: 11px;
 }
 
-.agent-diff-view__stat {
-  flex: 0 0 auto;
-  display: inline-flex;
-  gap: 8px;
-  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
-.agent-diff-view__stat-added {
-  color: var(--success, #30d158);
-}
-
-.agent-diff-view__stat-removed {
-  color: var(--danger, #ff453a);
-}
-
-.agent-diff-view__body {
-  overflow: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-  padding: 6px 0;
-  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
-  font-size: 11.5px;
-  line-height: 1.5;
-}
-
-.agent-diff-line {
-  padding: 0 9px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.agent-diff-line__text {
-  display: block;
-  min-height: 1.5em;
-}
-
-.agent-diff-line--added {
-  background: rgba(48, 209, 88, 0.12);
-  color: #b9f6ca;
-}
-
-.agent-diff-line--removed {
-  background: rgba(255, 69, 58, 0.12);
-  color: #ffcdd2;
-}
-
-.agent-diff-line--hunk {
-  color: var(--accent, #0a84ff);
-  background: rgba(10, 132, 255, 0.06);
-}
-
-.agent-diff-line--meta {
+.agent-chip__kind {
   color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
 }
 
-.agent-diff-line--context {
-  color: var(--text-main, #ededed);
+.agent-composer__attachment-error,
+.agent-attachment-picker__empty {
+  color: var(--danger, #ff3b30);
+  padding: 7px 8px;
+  font-size: 12px;
 }
 
-/* ============================================================
- * DiffCard 多文件聚合差异卡（agent-diff-card）
- * 头部聚合 +/- 统计，逐文件折叠，展开才挂载 DiffView。
- * ============================================================ */
-.agent-diff-card {
-  margin-top: 8px;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: var(--radius-md, 6px);
-  background: rgba(0, 0, 0, 0.14);
-  overflow: hidden;
-}
-
-.agent-diff-card__header {
+.agent-composer__footer-left {
+  min-width: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.07));
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-  font-weight: 650;
 }
 
-.agent-diff-card__stat,
-.agent-diff-card__file-stat {
-  flex: 0 0 auto;
-  display: inline-flex;
-  gap: 8px;
-  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
-  font-variant-numeric: tabular-nums;
+.agent-add-file-button {
+  min-width: 28px;
+  min-height: 28px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+  cursor: pointer;
 }
 
-.agent-diff-card__files {
-  display: grid;
-  gap: 1px;
+.agent-attachment-picker {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  width: min(360px, calc(100vw - 48px));
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  background: var(--panel, #16181d);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
+  z-index: 30;
 }
 
-.agent-diff-card__file-head {
+.agent-attachment-picker button {
   width: 100%;
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
-  align-items: center;
+  grid-template-columns: 54px minmax(0, 1fr);
   gap: 8px;
   border: 0;
   background: transparent;
-  color: var(--text-main, #ededed);
-  padding: 7px 10px;
-  font: inherit;
-  font-size: 11.5px;
+  color: inherit;
+  padding: 8px 10px;
   text-align: left;
   cursor: pointer;
 }
 
-.agent-diff-card__file-head:hover {
-  background: rgba(10, 132, 255, 0.06);
+.agent-attachment-picker button:hover {
+  background: rgba(10, 132, 255, 0.14);
 }
 
-.agent-diff-card__file-chevron {
-  color: var(--text-muted, #a1a1aa);
-  font-size: 9px;
-}
-
-.agent-diff-card__file-path {
-  min-width: 0;
+.agent-attachment-picker strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
 }
 
-.agent-diff-card__file-body {
-  padding: 0 10px 8px;
+.agent-attachment-dialog__controls {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) auto minmax(80px, 1fr) minmax(160px, 1fr);
 }
 
-/* ---- WorkMetaRow turn 级处理摘要 ---- */
-.agent-work-meta {
-  display: inline-flex;
+.agent-attachment-dialog__relative-path {
+  overflow: hidden;
+  padding: 0 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-attachment-dialog__workspace-folder {
+  overflow: hidden;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-attachment-dialog__main {
+  min-height: 320px;
+}
+
+.agent-attachment-dialog__scope {
+  display: flex;
   align-items: center;
-  gap: 5px;
-  color: var(--text-muted, #a1a1aa);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.agent-work-meta__glyph {
-  opacity: 0.7;
-}
-
-.agent-work-meta__dot {
-  opacity: 0.5;
+  gap: 14px;
 }

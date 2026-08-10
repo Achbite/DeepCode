@@ -1,41 +1,40 @@
 use sha2::{Digest, Sha256};
 
-mod admission;
-mod authorization;
 mod catalog;
-mod contracts;
 pub mod file_content;
-mod graph;
-mod input_validation;
-mod operation_builders;
-mod operation_model;
+mod invocation_adapter;
+mod invocation_types;
 mod registrations;
-mod review;
-mod sandbox;
 
-pub use admission::*;
-pub use authorization::*;
-pub use catalog::*;
-pub use contracts::*;
+pub use catalog::{CanonicalToolInvocationV2, KernelToolRegistry, KernelToolRegistryErrorV2};
 pub use deepcode_kernel_abi::{
-    CleanupContract, CleanupFailurePolicy, CleanupLeasePolicy, ContractCleanupPolicy,
-    ContractExpiry, FileTargetRef, FileTargetRefKind, IsolationContract, IsolationFallbackPolicy,
-    IsolationLevel, KernelExecutionContract, KernelExecutionContractStatus,
-    KernelExecutionOperation, KernelGateIntervention, KernelGateInterventionKind,
-    KernelGateInterventionStatus, KernelPermissionBundle, KernelProposalReviewReport,
-    OperationExecutionMode, PathScopePolicy, PermissionResourceKind, PlanTargetMode,
-    PlanTargetSource, SandboxSupportState, TargetExistence, ToolChangeKind, ToolContentMode,
-    ToolFactCategory, ToolFactKind, ToolFamily, ToolOperationKind, ToolOutputTrust,
-    ToolPermissionMode, ToolRiskLevel, ToolTargetKind, ToolValidationKind,
+    ToolAvailabilityV2, ToolContextBundleV2, ToolContextRefV2, ToolContextVersionV2,
+    ToolDescriptorV2, ToolIdV2, ToolInventoryV2,
 };
-pub use graph::*;
-pub use input_validation::ToolInputValidationError;
-pub use operation_model::*;
-pub use registrations::KernelToolRegistration;
-pub use sandbox::{
-    CandidateSandboxSpec, SandboxCapabilitySnapshot, SealedSandboxPlan,
-    SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_SPEC_SCHEMA_VERSION,
-};
+
+/// Kernel-private, cross-crate adapter types.
+///
+/// Agent-facing callers use `ToolIdV2` plus raw JSON arguments through
+/// `KernelToolRegistry`; this module exists only because the Rust runtime and
+/// executor crates need a typed boundary after canonicalization.
+#[doc(hidden)]
+pub mod kernel_internal {
+    pub use crate::invocation_adapter::{
+        canonicalize_invocation, normalize_canonical_platform_path, normalize_workspace_path,
+        validate_canonical_invocation, InvocationNormalizationError,
+    };
+    pub use crate::invocation_types::{
+        kernel_tool_output_digest, measure_kernel_output_payload, KernelCanonicalInvocation,
+        KernelDeleteTarget, KernelDocumentPages, KernelEditMatcher, KernelFileDigestPrecondition,
+        KernelGitDiffScope, KernelLineRange, KernelNetworkPublicTarget, KernelOutputTruncation,
+        KernelPathEntry, KernelPathEntrySize, KernelSearchMatch, KernelSearchStrategy,
+        KernelTextMediaType, KernelToolKind, KernelToolOutput, KernelToolOutputPayload,
+        KernelWebSearchItem, KernelWorkspaceObjectKind, MAX_CANONICAL_INVOCATION_BYTES,
+    };
+    pub use crate::registrations::{
+        KernelAdmissionMetadata, KernelExecutionAdapter, KernelExecutorBinding,
+    };
+}
 
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -48,6 +47,3 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     }
     output
 }
-
-#[cfg(test)]
-mod tests;

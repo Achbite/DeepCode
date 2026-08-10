@@ -1,19 +1,30 @@
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PermissionDecision,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
+    AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot,
+    AgentTimelineStatus, AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
-use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
+const EXIT_ACTION_REQUIRED: i32 = 5;
+const EXIT_INTERRUPTED: i32 = 130;
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_RUN_TIMEOUT_ENV: &str = "DEEPCODE_CLI_RUN_TIMEOUT_MS";
+const CLI_INTERRUPT_CLEANUP_WINDOW: Duration = Duration::from_secs(5);
+static CLI_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum CliCommandOutcome {
+    Completed,
+    ActionRequired(String),
+}
 
 #[tokio::main]
 async fn main() {
@@ -26,17 +37,61 @@ async fn main() {
         }
     };
 
-    if let Err(error) = run(command).await {
-        eprintln!("{error}");
-        std::process::exit(EXIT_DAEMON_UNAVAILABLE);
+    CLI_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    let interrupt_task = tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            CLI_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        }
+    });
+    let mut running = Box::pin(run(command));
+    let outcome = tokio::select! {
+        outcome = &mut running => outcome,
+        _ = wait_for_cli_interrupt() => {
+            match tokio::time::timeout(CLI_INTERRUPT_CLEANUP_WINDOW, &mut running).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(
+                    "CLI interrupt cleanup timed out; the owned Kernel guard was reclaimed, but an externally owned Run may still require cancellation"
+                        .to_string(),
+                ),
+            }
+        }
+    };
+    drop(running);
+    interrupt_task.abort();
+
+    if CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        if let Err(error) = outcome {
+            eprintln!("{error}");
+        } else {
+            eprintln!("CLI was interrupted by the user");
+        }
+        std::process::exit(EXIT_INTERRUPTED);
+    }
+
+    match outcome {
+        Ok(CliCommandOutcome::Completed) => {}
+        Ok(CliCommandOutcome::ActionRequired(message)) => {
+            eprintln!("{message}");
+            std::process::exit(EXIT_ACTION_REQUIRED);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(EXIT_DAEMON_UNAVAILABLE);
+        }
     }
 }
 
-pub(crate) async fn run(command: Command) -> Result<(), String> {
+async fn wait_for_cli_interrupt() {
+    while !CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub(crate) async fn run(command: Command) -> Result<CliCommandOutcome, String> {
     match command {
         Command::Help => {
             print_help();
-            Ok(())
+            Ok(CliCommandOutcome::Completed)
         }
         Command::Interactive {
             api,
@@ -44,14 +99,18 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            run_interactive(bootstrap.client().clone(), host).await
+            run_interactive(bootstrap.client().clone(), host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::DaemonStatus {
             api,
             no_auto_start_kernel,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_daemon_status(bootstrap.client()).await
+            print_daemon_status(bootstrap.client())
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsList {
             api,
@@ -60,7 +119,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_sessions(bootstrap.client(), include_archived, &host).await
+            print_sessions(bootstrap.client(), include_archived, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsNew {
             api,
@@ -69,7 +130,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            create_session(bootstrap.client(), title, &host).await
+            create_session(bootstrap.client(), title, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsResume {
             api,
@@ -77,7 +140,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            activate_and_print_timeline(bootstrap.client(), &session_id).await
+            activate_and_print_timeline(bootstrap.client(), &session_id)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsRename {
             api,
@@ -86,7 +151,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             title,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            rename_session(bootstrap.client(), &session_id, &title).await
+            rename_session(bootstrap.client(), &session_id, &title)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsProfile {
             api,
@@ -97,6 +164,7 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
             print_or_update_session_profile(bootstrap.client(), &session_id, profile_id.as_deref())
                 .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsDelete {
             api,
@@ -104,7 +172,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            delete_or_archive_session(bootstrap.client(), &session_id, false).await
+            delete_or_archive_session(bootstrap.client(), &session_id, false)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsArchive {
             api,
@@ -112,7 +182,9 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            delete_or_archive_session(bootstrap.client(), &session_id, true).await
+            delete_or_archive_session(bootstrap.client(), &session_id, true)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::Timeline {
             api,
@@ -121,16 +193,19 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_timeline(bootstrap.client(), session_id, &host).await
+            print_timeline(bootstrap.client(), session_id, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::Permission {
             api,
             no_auto_start_kernel,
             permission_id,
             decision,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            resolve_permission(bootstrap.client(), &permission_id, decision).await
+            resolve_permission(bootstrap.client(), &permission_id, &decision, host).await
         }
         Command::Decision {
             api,
@@ -163,35 +238,6 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
             ask(bootstrap.client(), prompt, plain, host).await
-        }
-        Command::ToolsRun {
-            api,
-            no_auto_start_kernel,
-            tool_id,
-            workspace,
-            args_file,
-            approve_contract,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            run_kernel_tool_contract(
-                bootstrap.client(),
-                &tool_id,
-                &workspace,
-                &args_file,
-                approve_contract,
-            )
-            .await
-        }
-        Command::ToolsVerify {
-            api,
-            no_auto_start_kernel,
-            workspace,
-            cases,
-            approve_contract,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            verify_kernel_tool_contracts(bootstrap.client(), &workspace, &cases, approve_contract)
-                .await
         }
     }
 }
@@ -256,7 +302,8 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         permission_id: String,
-        decision: PermissionDecision,
+        decision: String,
+        host: SessionHostOptions,
     },
     Decision {
         api: Option<String>,
@@ -275,21 +322,6 @@ enum Command {
         plain: bool,
         host: SessionHostOptions,
     },
-    ToolsRun {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        tool_id: String,
-        workspace: String,
-        args_file: String,
-        approve_contract: bool,
-    },
-    ToolsVerify {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        workspace: String,
-        cases: String,
-        approve_contract: bool,
-    },
 }
 
 impl Command {
@@ -303,9 +335,6 @@ impl Command {
         let mut no_workspace = false;
         let mut no_auto_start_kernel = false;
         let mut session_id = None;
-        let mut args_file = None;
-        let mut cases = None;
-        let mut approve_contract = false;
         let mut rest = Vec::new();
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -333,19 +362,6 @@ impl Command {
                         return Err("--session requires a session id".to_string());
                     }
                 }
-                "--args-file" => {
-                    args_file = iter.next();
-                    if args_file.is_none() {
-                        return Err("--args-file requires a JSON path".to_string());
-                    }
-                }
-                "--cases" => {
-                    cases = iter.next();
-                    if cases.is_none() {
-                        return Err("--cases requires a JSONL path".to_string());
-                    }
-                }
-                "--approve-contract" => approve_contract = true,
                 _ => rest.push(arg),
             }
         }
@@ -459,7 +475,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Allow,
+                    decision: "accept".to_string(),
+                    host,
                 })
             }
             [permission, deny, permission_id] if permission == "permission" && deny == "deny" => {
@@ -467,7 +484,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Deny,
+                    decision: "reject".to_string(),
+                    host,
                 })
             }
             [decision_cmd, kind, decision, tail @ ..] if decision_cmd == "decision" => {
@@ -490,8 +508,10 @@ impl Command {
                 })
             }
             [kind, decision, tail @ ..]
-                if matches!(kind.as_str(), "requirement" | "plan" | "review")
-                    && matches!(decision.as_str(), "accept" | "reject" | "revise") =>
+                if matches!(
+                    (kind.as_str(), decision.as_str()),
+                    ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
+                ) =>
             {
                 let run_id = tail.first().cloned();
                 let target_id = tail.get(1).cloned();
@@ -518,26 +538,6 @@ impl Command {
                 plain,
                 host,
             }),
-            [tools, run, tool_id] if tools == "tools" && run == "run" => Ok(Command::ToolsRun {
-                api,
-                no_auto_start_kernel,
-                tool_id: tool_id.to_string(),
-                workspace: host
-                    .workspace
-                    .ok_or_else(|| "tools run requires --workspace <path>".to_string())?,
-                args_file: args_file
-                    .ok_or_else(|| "tools run requires --args-file <json>".to_string())?,
-                approve_contract,
-            }),
-            [tools, verify] if tools == "tools" && verify == "verify" => Ok(Command::ToolsVerify {
-                api,
-                no_auto_start_kernel,
-                workspace: host
-                    .workspace
-                    .ok_or_else(|| "tools verify requires --workspace <path>".to_string())?,
-                cases: cases.ok_or_else(|| "tools verify requires --cases <jsonl>".to_string())?,
-                approve_contract,
-            }),
             prompt if plain && !prompt.is_empty() => Ok(Command::Ask {
                 api,
                 no_auto_start_kernel,
@@ -560,18 +560,23 @@ pub(crate) struct SessionHostOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSessionDecision {
     pub(crate) run_id: String,
-    pub(crate) target_id: Option<String>,
+    pub(crate) target_id: String,
+}
+
+pub(crate) async fn bootstrap_kernel(
+    api: Option<String>,
+    no_auto_start_kernel: bool,
+) -> Result<KernelBootstrap, String> {
+    KernelBootstrap::connect(KernelBootstrapOptions::new(api).auto_start(!no_auto_start_kernel))
+        .await
+        .map_err(|error| format!("daemon unavailable: {error}"))
 }
 
 mod render;
 mod session;
-mod tools;
-mod tools_verify;
 
 pub(crate) use render::*;
 pub(crate) use session::*;
-pub(crate) use tools::*;
-pub(crate) use tools_verify::*;
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]

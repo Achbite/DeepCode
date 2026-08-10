@@ -330,6 +330,24 @@ body.workbench-resizing * {
   align-items: center;
 }
 
+.status-bar__context-button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0 4px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.status-bar__context-button:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.status-bar__context-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
 .header__title {
   gap: 8px;
   min-width: 0;

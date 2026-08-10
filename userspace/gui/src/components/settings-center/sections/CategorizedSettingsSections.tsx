@@ -38,18 +38,8 @@ const GUI_INTERFACE_SETTING_KEYS = [
   'gui.collapseCompletedThinking',
 ] as const;
 
-const AGENT_SETTING_KEYS = [
-  'agent.defaultMode',
-  'agent.defaultWorkflow',
-  'agent.requirementConfirmationMode',
-  'agent.reviewContinuationMode',
-  'agent.interventionLevel',
-  'agent.memory.projectMode',
-  'agent.git.commitMessageMode',
-] as const;
-
 const EDITABLE_PERMISSION_KEYS = [
-  'agent.permissions.autonomyMode',
+  'agent.permissions.autoApprovePlans',
   'agent.permissions.webRead',
   'agent.permissions.privateWebRead',
 ] as const;
@@ -63,12 +53,7 @@ const PUBLIC_WEB_SETTING_KEYS = [
 const KERNEL_OWNED_PERMISSION_KEYS = [
   'agent.permissions.workspaceRead',
   'agent.permissions.workspaceWrite',
-  'agent.permissions.processExec',
   'agent.permissions.gitWrite',
-  'agent.permissions.browserControl',
-  'agent.permissions.providerEgress',
-  'agent.shell.autoExecuteCommands',
-  'agent.shell.commandBlacklist',
 ] as const;
 
 function allDefinitions(): SettingDefinition[] {
@@ -217,28 +202,6 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
           {errorMessage && <div className="settings-error">{errorMessage}</div>}
         </div>
       )}
-    </div>
-  );
-};
-
-export const AgentSettingsSection: React.FC<QueryProps> = ({ query = '' }) => {
-  const language = normalizeUiLanguage(
-    useSettingsStore((state) => state.effectiveSettings['workbench.language'])
-  );
-  const definitions = useMemo(
-    () => definitionsForKeys(AGENT_SETTING_KEYS, language, query),
-    [language, query]
-  );
-  return (
-    <div>
-      <h2 className="settings-title">{t(language, 'settings.agent.title')}</h2>
-      <SettingsCard
-        title={t(language, 'settings.agent.behavior')}
-        definitions={definitions}
-        language={language}
-        emptyText={t(language, 'settings.noSearchMatch')}
-        hint={t(language, 'settings.agent.scopeHint')}
-      />
     </div>
   );
 };

@@ -12,6 +12,8 @@ import {
   buildFileTabId,
 } from '../../state/editorStore';
 import { useSettingsStore } from '../../state/settingsStore';
+import { useAgentSessionStore } from '../../state/agentSessionStore';
+import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -101,6 +103,11 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
   const settingsTitle = t(language, 'settings.title');
+  const agentSession = useAgentSessionStore((state) => state.session);
+  const agentTimeline = useAgentSessionStore((state) => state.timeline);
+  const refreshActiveSessionContext = useAgentSessionStore(
+    (state) => state.refreshActiveSessionContext
+  );
 
   const activeTab = tabs.find((tab) => {
     const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
@@ -123,6 +130,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   const [editorMode, setEditorMode] = useState<InternalBrowserMode>('code');
   const [hydrationPhase, setHydrationPhase] = useState<HydrationPhase>('shell');
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryRefreshing, setMemoryRefreshing] = useState(false);
 
   const canLoadPrimary = hydrationPhase !== 'shell';
   const canLoadIdle = hydrationPhase === 'idle';
@@ -256,25 +265,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     '--bottom-height': terminalMinimized ? '0px' : `${bottomHeight}px`,
   } as React.CSSProperties;
 
-  const addFileTabToAgentContext = async (tab: Extract<(typeof tabs)[number], { kind: 'file' }>) => {
-    const { useAgentSessionStore } = await import('../../state/agentSessionStore');
-    const { useWorkspaceStore } = await import('../../state/workspaceStore');
-    const folder = useWorkspaceStore
-      .getState()
-      .current
-      ?.folders.find((candidate) => candidate.id === tab.folderId);
-    const root = folder?.absolutePath.replace(/\/+$/g, '');
-    const relative = tab.path.replace(/^\/+/g, '');
-    useAgentSessionStore.getState().addAttachment({
-      kind: 'file',
-      path: tab.path,
-      absolutePath: root ? `${root}/${relative}` : undefined,
-      folderId: tab.folderId,
-      source: 'contextMenu',
-      scope: 'message',
-    });
-  };
-
   return (
     <div
       className={`workbench-layout ${!sidebarVisible ? 'workbench-layout--no-sidebar' : ''} ${
@@ -363,11 +353,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
                     setEditorMode('code');
                     setActiveTab(id);
                   }}
-                  onContextMenu={(event) => {
-                    if (tab.kind !== 'file') return;
-                    event.preventDefault();
-                    void addFileTabToAgentContext(tab);
-                  }}
                   className={`editor-tab ${isActive ? 'editor-tab--active' : ''} ${
                     tab.kind === 'settings' ? 'editor-tab--settings' : ''
                   }`}
@@ -455,6 +440,15 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <span>UTF-8</span>
         </div>
         <div className="status-bar__group">
+          <button
+            className="status-bar__context-button"
+            type="button"
+            disabled={!agentSession}
+            title={t(language, 'memoryV2.open')}
+            onClick={() => setMemoryOpen(true)}
+          >
+            {t(language, 'memoryV2.open')}
+          </button>
           <span>API {apiStatus}</span>
           <span>WS {wsStatus}</span>
         </div>
@@ -499,6 +493,33 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <WorkspaceOpenDialog />
           <CodeWorkspaceChoiceDialog />
         </Suspense>
+      )}
+      {memoryOpen && (
+        <div
+          className="agent-memory-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t(language, 'memoryV2.title')}
+          onMouseDown={() => setMemoryOpen(false)}
+        >
+          <div className="agent-memory-sheet" onMouseDown={(event) => event.stopPropagation()}>
+            <AgentMemoryViewer
+              language={language}
+              timeline={agentTimeline}
+              sessionId={agentSession?.id}
+              refreshing={memoryRefreshing}
+              onRefresh={async () => {
+                setMemoryRefreshing(true);
+                try {
+                  await refreshActiveSessionContext();
+                } finally {
+                  setMemoryRefreshing(false);
+                }
+              }}
+              onClose={() => setMemoryOpen(false)}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

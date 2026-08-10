@@ -1,8 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import type {
-  AgentSessionProfileMigration,
-  LlmProviderProfile,
-} from '@deepcode/protocol';
+import type { LlmProviderProfile } from '@deepcode/protocol';
+import { hasCompatibleReasoningTransport } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
@@ -12,10 +10,6 @@ interface SessionModelSelectorProps {
   language: UiLanguage;
   locked: boolean;
   onAvailabilityChange: (available: boolean) => void;
-}
-
-interface ProfilesUpdatedDetail {
-  profileMigrations?: AgentSessionProfileMigration[];
 }
 
 function profileLabel(profile: LlmProviderProfile): string {
@@ -35,7 +29,6 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
-  const [migrationNotice, setMigrationNotice] = useState<string | null>(null);
 
   const loadProfiles = useCallback(async (): Promise<LlmProviderProfile[]> => {
     let result;
@@ -45,61 +38,62 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
       setProfiles([]);
       setDefaultProfileId(undefined);
       setLoadState('error');
-      onAvailabilityChange(false);
       return [];
     }
     if (!result.ok || !result.data) {
       setProfiles([]);
       setDefaultProfileId(undefined);
       setLoadState('error');
-      onAvailabilityChange(false);
       return [];
     }
-    const enabledProfiles = result.data.profiles.filter((profile) => profile.enabled);
+    const enabledProfiles = result.data.profiles.filter(
+      (profile) => (
+        profile.enabled
+        && profile.thinking === 'enabled'
+        && hasCompatibleReasoningTransport(profile)
+      )
+    );
     setProfiles(enabledProfiles);
     setDefaultProfileId(
       enabledProfiles.some((profile) => profile.id === result.data!.defaultProfileId)
         ? result.data.defaultProfileId
-        : enabledProfiles[0]?.id
+        : undefined
     );
     setLoadState('ready');
-    onAvailabilityChange(enabledProfiles.length > 0);
     return enabledProfiles;
-  }, [onAvailabilityChange]);
+  }, []);
 
   useEffect(() => {
     if (apiStatus !== 'connected') {
       setLoadState(apiStatus === 'checking' ? 'loading' : 'error');
-      onAvailabilityChange(false);
       return;
     }
     setLoadState('loading');
     void loadProfiles();
-  }, [apiStatus, loadProfiles, onAvailabilityChange]);
+  }, [apiStatus, loadProfiles]);
 
   useEffect(() => {
-    const onProfilesUpdated = (event: Event) => {
-      const detail = (event as CustomEvent<ProfilesUpdatedDetail>).detail;
-      const migration = detail?.profileMigrations?.find((item) => item.sessionId === session?.id);
+    const onProfilesUpdated = () => {
       void (async () => {
-        const nextProfiles = await loadProfiles();
-        if (!migration) return;
+        await loadProfiles();
         await refreshSessionProfile();
-        const migratedProfile = nextProfiles.find((profile) => profile.id === migration.toProfileId);
-        setMigrationNotice(t(language, 'agent.profile.migrated', {
-          profile: migratedProfile?.name ?? migration.toProfileId,
-        }));
       })();
     };
     window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [language, loadProfiles, refreshSessionProfile, session?.id]);
+  }, [loadProfiles, refreshSessionProfile]);
 
-  const selectedProfileId = session?.profileId ?? defaultProfileId ?? '';
+  const selectedProfileId = session
+    ? session.profileId ?? ''
+    : defaultProfileId ?? '';
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
   );
+  const sessionProfileAvailable = Boolean(session?.profileId && selectedProfile);
+  useEffect(() => {
+    onAvailabilityChange(loadState === 'ready' && sessionProfileAvailable);
+  }, [loadState, onAvailabilityChange, sessionProfileAvailable]);
   const unavailable = loadState !== 'ready' || profiles.length === 0;
   const disabled = locked || profileSelectionBusy || unavailable || !session;
   const selectorTitle = locked
@@ -112,7 +106,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           ? t(language, 'agent.profile.unavailable')
           : selectedProfile
             ? profileLabel(selectedProfile)
-            : t(language, 'agent.profile.selector');
+            : t(language, 'agent.profile.selectionRequired');
 
   return (
     <div className="deepcode-session-model">
@@ -138,7 +132,9 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
                 ? t(language, 'agent.profile.loading')
                 : loadState === 'error'
                   ? t(language, 'agent.profile.loadFailed')
-                  : t(language, 'agent.profile.unavailable')}
+                  : profiles.length === 0
+                    ? t(language, 'agent.profile.unavailable')
+                    : t(language, 'agent.profile.selectionRequired')}
             </option>
           )}
           {profiles.map((profile) => (
@@ -148,18 +144,6 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           ))}
         </select>
       </label>
-      {migrationNotice && (
-        <span className="deepcode-session-model__notice" role="status">
-          {migrationNotice}
-          <button
-            type="button"
-            aria-label="×"
-            onClick={() => setMigrationNotice(null)}
-          >
-            ×
-          </button>
-        </span>
-      )}
     </div>
   );
 };

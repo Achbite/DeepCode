@@ -28,11 +28,43 @@ pub(crate) fn web_search_target_url(
         .replace("{limit}", &limit.clamp(1, 10).to_string()))
 }
 
+pub(crate) fn web_search_runtime_is_ready(
+    config: &KernelExecutorConfig,
+    secret_provider: &dyn SecretProvider,
+) -> bool {
+    let Ok(target) = web_search_target_url(config, "deepcode-runtime-readiness", 1) else {
+        return false;
+    };
+    if validate_http_url(&target).is_err() {
+        return false;
+    }
+    let secret_ref = config.web_search_auth_secret_ref.as_str();
+    if secret_ref.trim().is_empty() {
+        return true;
+    }
+    let Some(secret) = secret_provider.resolve(secret_ref) else {
+        return false;
+    };
+    if secret.is_empty()
+        || reqwest::header::HeaderName::from_bytes(config.web_search_auth_header_name.as_bytes())
+            .is_err()
+    {
+        return false;
+    }
+    reqwest::header::HeaderValue::from_str(&secret).is_ok()
+}
+
 pub(super) struct WebSearchExecutor {
     pub(super) config: KernelExecutorConfig,
     pub(super) secret_provider: Arc<dyn SecretProvider>,
 }
 pub(super) struct WebFetchExecutor;
+
+pub(crate) struct WebFetchCompleteResult {
+    pub(crate) execution: KernelToolExecutionResult,
+    pub(crate) status_code: u16,
+    pub(crate) content_type: String,
+}
 
 impl KernelToolExecutor for WebSearchExecutor {
     fn invoke(
@@ -97,27 +129,38 @@ impl KernelToolExecutor for WebFetchExecutor {
         invocation: KernelToolInvocation,
         _context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let url = get_string(&invocation.input, "url").unwrap_or_default();
-        validate_http_url(&url)?;
-        let reviewed_target = reviewed_target(&invocation.input)?;
-        let max_bytes = invocation
-            .input
-            .get("maxBytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(96 * 1024)
-            .clamp(1024, 256 * 1024) as usize;
-        let body = http_get_text(&url, max_bytes, None, &reviewed_target)?;
-        Ok(ok(
-            invocation.id,
-            serde_json::json!({
-                "url": url,
-                "content": body,
-                "sizeBytes": body.len(),
-                "contentHash": deepcode_kernel_tools::hash_bytes(body.as_bytes()),
-                "untrustedEvidence": true
-            }),
-        ))
+        Ok(invoke_web_fetch_complete(invocation)?.execution)
     }
+}
+
+pub(crate) fn invoke_web_fetch_complete(
+    invocation: KernelToolInvocation,
+) -> KernelResult<WebFetchCompleteResult> {
+    let url = get_string(&invocation.input, "url").unwrap_or_default();
+    validate_http_url(&url)?;
+    let reviewed_target = reviewed_target(&invocation.input)?;
+    let max_bytes = invocation
+        .input
+        .get("maxBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(96 * 1024)
+        .clamp(1024, 256 * 1024) as usize;
+    let response = http_get_complete(&url, max_bytes, None, &reviewed_target)?;
+    let execution = ok(
+        invocation.id,
+        serde_json::json!({
+            "url": url,
+            "content": response.body,
+            "sizeBytes": response.body.len(),
+            "contentHash": deepcode_kernel_tools::hash_bytes(response.body.as_bytes()),
+            "untrustedEvidence": true
+        }),
+    );
+    Ok(WebFetchCompleteResult {
+        execution,
+        status_code: response.status_code,
+        content_type: response.content_type,
+    })
 }
 
 pub(super) fn validate_http_url(url: &str) -> KernelResult<()> {
@@ -141,13 +184,28 @@ pub(super) fn http_get_text(
     auth_header: Option<(&str, &str)>,
     reviewed_target: &crate::network_policy::ReviewedHttpTarget,
 ) -> KernelResult<String> {
+    Ok(http_get_complete(url, max_bytes, auth_header, reviewed_target)?.body)
+}
+
+struct HttpGetComplete {
+    body: String,
+    status_code: u16,
+    content_type: String,
+}
+
+fn http_get_complete(
+    url: &str,
+    max_bytes: usize,
+    auth_header: Option<(&str, &str)>,
+    reviewed_target: &crate::network_policy::ReviewedHttpTarget,
+) -> KernelResult<HttpGetComplete> {
     let url = url.to_string();
     let auth_header = auth_header.map(|(name, value)| (name.to_string(), value.to_string()));
     let reviewed_target = reviewed_target.clone();
     std::thread::Builder::new()
         .name("deepcode-http".to_string())
         .spawn(move || {
-            http_get_text_blocking(
+            http_get_complete_blocking(
                 &url,
                 max_bytes,
                 auth_header
@@ -161,12 +219,12 @@ pub(super) fn http_get_text(
         .map_err(|_| KernelError::Other("HTTP worker panicked".to_string()))?
 }
 
-pub(super) fn http_get_text_blocking(
+fn http_get_complete_blocking(
     url: &str,
     max_bytes: usize,
     auth_header: Option<(&str, &str)>,
     reviewed_target: &crate::network_policy::ReviewedHttpTarget,
-) -> KernelResult<String> {
+) -> KernelResult<HttpGetComplete> {
     crate::network_policy::verify_http_target(url, reviewed_target)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
@@ -195,13 +253,23 @@ pub(super) fn http_get_text_blocking(
             status.as_u16()
         )));
     }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
     response
         .by_ref()
         .take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| KernelError::Other(format!("read HTTP body: {error}")))?;
-    Ok(clip_bytes_to_string(&bytes, max_bytes))
+    Ok(HttpGetComplete {
+        body: clip_bytes_to_string(&bytes, max_bytes),
+        status_code: status.as_u16(),
+        content_type,
+    })
 }
 
 fn reviewed_target(input: &Value) -> KernelResult<crate::network_policy::ReviewedHttpTarget> {

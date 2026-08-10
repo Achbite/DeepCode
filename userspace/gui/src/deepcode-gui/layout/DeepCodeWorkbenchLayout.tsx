@@ -6,13 +6,12 @@ import type {
   BrowsePathResult,
   InitialLocation,
 } from '@deepcode/protocol';
-import type { SessionMemorySnapshot } from '@deepcode/session-core';
+import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import {
   browsePath,
   createAgentProject,
   deleteAgentProject,
-  getAgentSessionMemorySnapshot,
   getInitialLocations,
   listAgentProjects,
   listAgentSessions,
@@ -24,7 +23,10 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
-import { latestPlanTaskItemsFromProjection, timelineOrEmpty } from '../../utils/uiTimelineProjection';
+import {
+  latestAcceptedPlanTaskItemsFromProjection,
+  timelineOrEmpty,
+} from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar, {
@@ -75,16 +77,6 @@ interface DeepCodeProjectCreateMenu {
   y: number;
 }
 
-interface DeepCodeMemoryPanel {
-  kind: 'project' | 'session';
-  title: string;
-  subtitle?: string;
-  sessionIds: string[];
-  snapshots: SessionMemorySnapshot[];
-  loading: boolean;
-  error?: string | null;
-}
-
 interface DeepCodeTextInputDialog {
   kind: 'project' | 'renameSession' | 'renameProject';
   title: string;
@@ -98,6 +90,7 @@ interface DeepCodeTextInputDialog {
 interface PendingProjectSession {
   projectId: string;
   sessionId: string;
+  submissionScopeId: string;
 }
 
 function basename(path?: string | null): string {
@@ -368,31 +361,31 @@ const DeepCodeProjectFolderDialog: React.FC<DeepCodeProjectFolderDialogProps> = 
 function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
   const byKey = new Map<string, DeepCodeTaskItem>();
   for (const item of items) {
-    const key = `${item.title.trim()}::${item.summary.trim() || item.id}`;
+    const key = JSON.stringify([item.id, item.targetRefs]);
     byKey.set(key, item);
   }
   return Array.from(byKey.values());
 }
 
 function deriveTaskItems(
-  projection: AgentTimelineResult,
-  fallbackItems: DeepCodeTaskItem[] = []
+  language: UiLanguage,
+  projection: AgentTimelineResult
 ): DeepCodeTaskItem[] {
-  const projectedItems = latestPlanTaskItemsFromProjection(projection);
+  const projectedItems = latestAcceptedPlanTaskItemsFromProjection(projection);
 
   if (projectedItems.length > 0) {
     return dedupeTaskItems(
       projectedItems.map((item) => ({
         id: item.id,
-        title: item.title,
-        summary: item.summary,
-        status: item.status,
+        blockId: item.blockId,
+        title: t(language, item.titleKey, item.titleArgs),
+        summary: t(language, item.summaryKey, item.messageArgs),
+        progress: item.progress,
+        outcome: item.outcome,
+        targetRefs: [...item.targetRefs],
+        resourcePresentation: item.resourcePresentation.map((resource) => ({ ...resource })),
       }))
     ).slice(-6);
-  }
-
-  if (fallbackItems.length > 0) {
-    return fallbackItems;
   }
 
   return [];
@@ -402,7 +395,7 @@ function deriveCacheHitSummary(
   language: UiLanguage,
   tokenUsageProjection?: AgentTimelineResult['tokenUsageProjection'] | null
 ): DeepCodeCacheHitSummary | null {
-  const stats = deriveTokenUsageStats([], tokenUsageProjection);
+  const stats = deriveTokenUsageStats(tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
   const label = t(language, 'deepcodeGui.cache.label', { percent });
   if (!stats.hasCacheData) {
@@ -432,6 +425,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [projectRecords, setProjectRecords] = useState<DeepCodeGuiProject[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [draftTargetProjectId, setDraftTargetProjectId] = useState<string | null>(null);
+  const [draftSubmissionScopeId, setDraftSubmissionScopeId] = useState<string | null>(null);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [sessionMenu, setSessionMenu] = useState<DeepCodeSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<DeepCodeProjectContextMenu | null>(null);
@@ -439,31 +433,30 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [projectFolderDialogOpen, setProjectFolderDialogOpen] = useState(false);
   const [rebindProjectId, setRebindProjectId] = useState<string | null>(null);
   const [textDialog, setTextDialog] = useState<DeepCodeTextInputDialog | null>(null);
-  const [memoryPanel, setMemoryPanel] = useState<DeepCodeMemoryPanel | null>(null);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryRefreshing, setMemoryRefreshing] = useState(false);
   const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const sidebarPendingActionRef = useRef<string | null>(null);
-  const lastPlanTaskItemsRef = useRef<{ sessionId: string | null; items: DeepCodeTaskItem[] }>({
-    sessionId: null,
-    items: [],
-  });
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const sessions = useAgentSessionStore((s) => s.sessions);
   const activeSession = useAgentSessionStore((s) => s.session);
   const loadingSession = useAgentSessionStore((s) => s.loading);
+  const sessionSelectionReady = useAgentSessionStore((s) => s.selectionReady);
+  const localWorkspaceScopeKey = useAgentSessionStore((s) => s.localWorkspaceScopeKey);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
-  const events = useAgentSessionStore((s) => s.events);
+  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
+  const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const deleteSession = useAgentSessionStore((s) => s.deleteSession);
+  const refreshActiveSessionContext = useAgentSessionStore((s) => s.refreshActiveSessionContext);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
-  );
-  const projectMemoryMode = useSettingsStore((s) =>
-    s.effectiveSettings['agent.memory.projectMode'] === 'auto' ? 'auto' : 'confirm'
   );
 
   useEffect(() => {
@@ -527,26 +520,23 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
   const projectDraftActive = Boolean(draftTargetProjectId);
+  const workspaceScopeKey = createWorkspaceScopeKey(workspace);
   const liveTimelineProjection = projectDraftActive
     ? timelineOrEmpty(null, 'project-draft')
     : timelineOrEmpty(timeline, activeSession?.id);
+  const agentReady = apiStatus === 'connected' && (
+    projectDraftActive
+    || (
+      !loadingSession
+      && sessionSelectionReady
+      && Boolean(activeSession?.id)
+      && localWorkspaceScopeKey === workspaceScopeKey
+      && timeline?.sessionId === activeSession?.id
+    )
+  );
   const taskItems = useMemo(() => {
-    const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
-    const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId
-      ? lastPlanTaskItemsRef.current.items
-      : [];
-    const items = deriveTaskItems(
-      liveTimelineProjection,
-      fallbackItems
-    );
-    if (items.length > 0) {
-      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items };
-    }
-    if (items.length === 0 && lastPlanTaskItemsRef.current.sessionId !== taskSessionId) {
-      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items: [] };
-    }
-    return items;
-  }, [activeSession?.id, liveTimelineProjection, projectDraftActive]);
+    return deriveTaskItems(language, liveTimelineProjection);
+  }, [language, liveTimelineProjection]);
   const cacheHitSummary = useMemo(
     () => deriveCacheHitSummary(language, liveTimelineProjection.tokenUsageProjection),
     [language, liveTimelineProjection.tokenUsageProjection]
@@ -574,30 +564,30 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       byId.set(activeSession.id, {
         ...byId.get(activeSession.id),
         ...activeSession,
-        eventCount: Math.max(activeSession.eventCount ?? 0, events.length),
+        eventCount: Math.max(activeSession.eventCount ?? 0, timeline?.eventCount ?? 0),
       });
     }
     return Array.from(byId.values());
-  }, [activeSession, events.length, knownSessions, sessions]);
-  const memorySessionLabels = useMemo(() => {
-    const labels: Record<string, string> = {};
-    for (const session of displaySessions) {
-      labels[session.id] = displaySessionTitle(language, session.title);
-    }
-    return labels;
-  }, [displaySessions, language]);
-  const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
+  }, [activeSession, knownSessions, sessions, timeline?.eventCount]);
+  const activeSessionRunning = Boolean(
+    activeSession?.id
+    && (
+      runningSessionIds.includes(activeSession.id)
+      || activeRunSessionIds.includes(activeSession.id)
+      || cancellingSessionIds.includes(activeSession.id)
+    )
+  );
   const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
-    || (events.length === 0 && !loadingSession && !activeSessionRunning);
+    || ((timeline?.turns.length ?? 0) === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
     () => displaySessions.filter((item) => {
       if (item.archivedAt) return false;
       if (assignedProjectSessionIds.has(item.id)) return false;
-      const currentWithEvents = item.id === activeSession?.id && events.length > 0;
+      const currentWithEvents = item.id === activeSession?.id && (timeline?.turns.length ?? 0) > 0;
       return shouldShowSidebarSession(item) || currentWithEvents;
     }),
-    [activeSession?.id, assignedProjectSessionIds, displaySessions, events.length]
+    [activeSession?.id, assignedProjectSessionIds, displaySessions, timeline?.turns.length]
   );
   const projectArchiveGroups = useMemo(
     () => deriveProjectArchiveGroups(displaySessions, projectRecords),
@@ -625,10 +615,15 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     pendingProjectSendRef.current = null;
     setActiveProjectId(null);
     setDraftTargetProjectId(targetProjectId);
+    setDraftSubmissionScopeId(
+      targetProjectId
+        ? `project-draft:${targetProjectId}:${globalThis.crypto.randomUUID()}`
+        : null
+    );
     if (targetProjectId) {
       return;
     }
-    const nextSession = await createNewSession({ reuseEmpty: false });
+    const nextSession = await createNewSession();
     if (nextSession?.id) {
       upsertKnownSession(nextSession);
     }
@@ -659,33 +654,50 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftTargetProjectId) return true;
+    if (!draftTargetProjectId) {
+      return captureSubmissionTarget() ?? false;
+    }
+    if (!draftSubmissionScopeId) return false;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
-    const nextSession = await createNewSession({ reuseEmpty: true, projectId: targetProjectId });
+    const nextSession = await createNewSession({
+      projectId: targetProjectId,
+      preserveAttachments: true,
+    });
     if (!nextSession?.id) {
+      return false;
+    }
+    const submissionTarget = captureSubmissionTarget(nextSession.id);
+    if (!submissionTarget) {
       return false;
     }
     pendingProjectSendRef.current = {
       projectId: targetProjectId,
       sessionId: nextSession.id,
+      submissionScopeId: draftSubmissionScopeId,
     };
     upsertKnownSession(nextSession);
     setActiveProjectId(targetProjectId);
     setDraftTargetProjectId(null);
-    return true;
+    return submissionTarget;
   };
 
-  const commitDraftProjectSession = async () => {
+  const commitDraftProjectSession = async (
+    submissionScopeId: string | null,
+    submittedDraftCleared: boolean
+  ) => {
     const pending = pendingProjectSendRef.current;
-    if (!pending) return;
-    pendingProjectSendRef.current = null;
+    if (!pending || pending.submissionScopeId !== submissionScopeId) return;
     const state = useAgentSessionStore.getState();
     const updatedSession = state.session?.id === pending.sessionId
       ? state.session
       : state.sessions.find((item) => item.id === pending.sessionId);
     if (updatedSession) {
       upsertKnownSession(updatedSession);
+    }
+    if (submittedDraftCleared && pendingProjectSendRef.current === pending) {
+      pendingProjectSendRef.current = null;
+      setDraftSubmissionScopeId(null);
     }
   };
 
@@ -730,6 +742,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     setProjectRecords((current) => [project, ...current.filter((item) => item.id !== project.id)]);
     setActiveProjectId(null);
     setDraftTargetProjectId(project.id);
+    setDraftSubmissionScopeId(
+      `project-draft:${project.id}:${globalThis.crypto.randomUUID()}`
+    );
   };
 
   const commitProjectFolderPath = async (projectFolderPath: string) => {
@@ -855,56 +870,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     await copyText(session.id);
   };
 
-  const loadMemoryPanelSnapshots = async (
-    basePanel: Omit<DeepCodeMemoryPanel, 'snapshots' | 'loading' | 'error'>
-  ) => {
-    setMemoryPanel({
-      ...basePanel,
-      snapshots: [],
-      loading: true,
-      error: null,
-    });
-    const snapshots: SessionMemorySnapshot[] = [];
-    let error: string | null = null;
-    for (const sessionId of basePanel.sessionIds) {
-      const result = await getAgentSessionMemorySnapshot(sessionId, { projectMemoryMode });
-      if (result.ok && result.data) {
-        snapshots.push(result.data);
-      } else {
-        error = result.message ?? result.error ?? t(language, 'memory.loadFailed');
-      }
-    }
-    setMemoryPanel({
-      ...basePanel,
-      snapshots,
-      loading: false,
-      error,
-    });
-  };
-
-  const handleOpenSessionMemory = (session: AgentSession) => {
-    setSessionMenu(null);
-    void loadMemoryPanelSnapshots({
-      kind: 'session',
-      title: t(language, 'memory.sessionMemory'),
-      subtitle: displaySessionTitle(language, session.title),
-      sessionIds: [session.id],
-    });
-  };
-
-  const handleOpenProjectMemory = (project: DeepCodeGuiProject) => {
-    setProjectMenu(null);
-    const sessionIds = displaySessions
-      .filter((session) => session.projectId === project.id)
-      .map((session) => session.id);
-    void loadMemoryPanelSnapshots({
-      kind: 'project',
-      title: t(language, 'memory.projectMemory'),
-      subtitle: project.title,
-      sessionIds,
-    });
-  };
-
   const handleMoveSessionToProject = (session: AgentSession, projectId: string) => {
     setSessionMenu(null);
     void moveSessionToProject(projectId, session.id);
@@ -912,6 +877,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       setActiveProjectId(projectId);
     }
     setDraftTargetProjectId(null);
+    setDraftSubmissionScopeId(null);
   };
 
   const handleDeleteProject = async (project: DeepCodeGuiProject) => {
@@ -926,14 +892,25 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     ));
     setCollapsedProjectIds((current) => current.filter((id) => id !== project.id));
     if (activeProjectId === project.id) setActiveProjectId(null);
-    if (draftTargetProjectId === project.id) setDraftTargetProjectId(null);
+    if (draftTargetProjectId === project.id) {
+      setDraftTargetProjectId(null);
+      setDraftSubmissionScopeId(null);
+    }
   };
+
+  const pendingProjectSend = pendingProjectSendRef.current;
+  const composerSubmissionScopeId = projectDraftActive
+    ? draftSubmissionScopeId
+    : pendingProjectSend && pendingProjectSend.sessionId === activeSession?.id
+      ? pendingProjectSend.submissionScopeId
+      : activeSession?.id ?? null;
 
   return (
     <div className="deepcode-gui-workbench">
       <DeepCodeTitlebar
         language={language}
         apiStatus={apiStatus}
+        agentReady={agentReady}
         cacheHitSummary={cacheHitSummary}
         kernelStartBusy={kernelStartBusy}
         kernelStartMessage={kernelStartMessage}
@@ -965,6 +942,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               pendingProjectSendRef.current = null;
               setActiveProjectId(projectId);
               setDraftTargetProjectId(null);
+              setDraftSubmissionScopeId(null);
               await activateSession(session.id);
             });
           }}
@@ -979,8 +957,14 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <DeepCodeConversationShell
           language={language}
           timeline={liveTimelineProjection}
+          agentReady={agentReady}
           forceHome={projectDraftActive}
           projectTitle={draftProject?.title ?? activeProject?.title ?? null}
+          projectWorkspaceBinding={
+            draftProject?.workspaceBinding ?? activeProject?.workspaceBinding
+          }
+          projectContext={Boolean(draftProject ?? activeProject)}
+          submissionScopeId={composerSubmissionScopeId}
           onBeforeSend={prepareProjectDraftSession}
           onAfterSend={commitDraftProjectSession}
         />
@@ -1018,8 +1002,19 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <div className="deepcode-gui-session-context-menu__title">
             {displaySessionTitle(language, sessionMenu.session.title)}
           </div>
-          <button type="button" role="menuitem" onClick={() => handleOpenSessionMemory(sessionMenu.session)}>
-            {t(language, 'memory.openSessionMemory')}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={activeSession?.id !== sessionMenu.session.id}
+            title={activeSession?.id === sessionMenu.session.id
+              ? t(language, 'memoryV2.open')
+              : t(language, 'memoryV2.currentOnly')}
+            onClick={() => {
+              setSessionMenu(null);
+              setMemoryOpen(true);
+            }}
+          >
+            {t(language, 'memoryV2.open')}
           </button>
           <button type="button" role="menuitem" onClick={() => handleRenameSession(sessionMenu.session)}>
             {t(language, 'agent.session.rename')}
@@ -1070,9 +1065,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <div className="deepcode-gui-session-context-menu__title">
             {projectMenu.project.title}
           </div>
-          <button type="button" role="menuitem" onClick={() => handleOpenProjectMemory(projectMenu.project)}>
-            {t(language, 'memory.openProjectMemory')}
-          </button>
           <button type="button" role="menuitem" onClick={() => handleRenameProject(projectMenu.project)}>
             {t(language, 'deepcodeGui.project.rename')}
           </button>
@@ -1087,6 +1079,34 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           >
             {t(language, 'deepcodeGui.project.delete')}
           </button>
+        </div>
+      )}
+
+      {memoryOpen && (
+        <div
+          className="agent-memory-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t(language, 'memoryV2.title')}
+          onMouseDown={() => setMemoryOpen(false)}
+        >
+          <div className="agent-memory-sheet" onMouseDown={(event) => event.stopPropagation()}>
+            <AgentMemoryViewer
+              language={language}
+              timeline={timeline}
+              sessionId={activeSession?.id}
+              refreshing={memoryRefreshing}
+              onRefresh={async () => {
+                setMemoryRefreshing(true);
+                try {
+                  await refreshActiveSessionContext();
+                } finally {
+                  setMemoryRefreshing(false);
+                }
+              }}
+              onClose={() => setMemoryOpen(false)}
+            />
+          </div>
         </div>
       )}
 
@@ -1152,39 +1172,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         />
       )}
 
-      {memoryPanel && (
-        <div
-          className="deepcode-gui-memory-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={memoryPanel.title}
-          onMouseDown={() => setMemoryPanel(null)}
-        >
-          <section
-            className="deepcode-gui-memory-sheet"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
-            <AgentMemoryViewer
-              language={language}
-              title={memoryPanel.title}
-              subtitle={memoryPanel.subtitle}
-              snapshots={memoryPanel.snapshots}
-              defaultScope={memoryPanel.kind === 'session' ? 'session' : 'project'}
-              loading={memoryPanel.loading}
-              error={memoryPanel.error}
-              sessionLabels={memorySessionLabels}
-              onRefresh={() => void loadMemoryPanelSnapshots({
-                kind: memoryPanel.kind,
-                title: memoryPanel.title,
-                subtitle: memoryPanel.subtitle,
-                sessionIds: memoryPanel.sessionIds,
-              })}
-              onClose={() => setMemoryPanel(null)}
-            />
-          </section>
-        </div>
-      )}
-
       <Suspense fallback={null}>
         {settingsOpen && (
           <div
@@ -1213,6 +1200,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               </header>
               <div className="deepcode-gui-settings-sheet__runtime">
                 <span>API {statusLabel(language, apiStatus)}</span>
+                <span>Agent {statusLabel(language, agentReady ? 'ready' : 'checking')}</span>
                 <span>WS {statusLabel(language, wsStatus)}</span>
                 <span>{t(language, 'deepcodeGui.progress.heartbeat')} {lastHeartbeatText}</span>
                 {serverVersion && <span>{serverVersion}</span>}

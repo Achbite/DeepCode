@@ -195,14 +195,10 @@ fn terminal_cwd(state: &AppState, requested: Option<&str>) -> Result<PathBuf, St
 }
 
 fn active_workspace_root(state: &AppState) -> Result<PathBuf, String> {
-    let current = current_workspace(&state.runtime).map_err(|error| error.message)?;
-    let root = current
-        .current
-        .as_ref()
-        .and_then(|workspace| workspace.folders.first())
-        .map(|folder| folder.absolute_path.as_str())
-        .ok_or_else(|| "current workspace is missing".to_string())?;
-    PathBuf::from(root)
-        .canonicalize()
-        .map_err(|error| format!("canonicalize workspace root {root}: {error}"))
+    state
+        .host_services
+        .workspace
+        .current_root()
+        .map_err(|error| error.message)?
+        .ok_or_else(|| "current workspace is missing".to_string())
 }

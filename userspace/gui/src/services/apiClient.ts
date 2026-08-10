@@ -27,7 +27,6 @@ import type {
   CodeGrepResult,
   GitStatusResult,
   GitDiffResult,
-  AgentMode,
   AgentProjectListResult,
   AgentProjectResult,
   AgentSessionListResult,
@@ -40,17 +39,8 @@ import type {
   UpdateAgentSessionRequest,
   ArchiveAgentSessionRequest,
   AgentSessionResult,
+  AgentTimelineStreamEvent,
   AgentTimelineResult,
-  AppendAgentEventsRequest,
-  ResolveAgentPermissionRequest,
-  ResolveAgentPlanRequest,
-  ResolveAgentReviewRequest,
-  AgentFeedbackRequest,
-  AgentFeedbackResult,
-  GetAgentEventSnapshotResult,
-  GetAgentWorkflowConfigResult,
-  PatchAgentWorkflowConfigRequest,
-  ListToolsResult,
   ShellEnvironmentStatus,
   TerminalCapability,
   TerminalSession,
@@ -67,10 +57,11 @@ import type {
   SetBrowserInspectModeRequest,
   KernelHostInspectionQuery,
   KernelHostInspectionResult,
-  ProjectionDeliveryRecord,
+  AgentRunGuidanceRequest,
+  StartAgentRunRequest,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
-import { getKernelApiBase } from './hostTarget';
+import { getHostAdmissionHeaders, getKernelApiBase } from './hostTarget';
 
 const API_BASE = getKernelApiBase();
 
@@ -78,25 +69,34 @@ interface SendJsonOptions {
   signal?: AbortSignal;
 }
 
-export interface StartAgentRunRequest {
-  op?: 'ask' | 'resolveDecision';
-  content?: string;
-  prompt?: string;
-  attachments?: unknown[];
-  workspacePath?: string;
-  noWorkspace?: boolean;
-  profileId?: string;
-  workflow?: string;
-  requirementConfirmationMode?: 'auto' | 'always' | 'off';
-  reviewContinuationMode?: 'auto' | 'ask' | 'off';
-  interventionLevel?: 'low' | 'medium' | 'high';
-  projectMemoryMode?: 'confirm' | 'auto';
-  title?: string;
-  decisionKind?: 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
-  decision?: 'accept' | 'reject' | 'revise';
-  guidance?: string;
-  runId?: string;
-  targetId?: string;
+export type {
+  AgentInputAttachmentV2,
+  AgentRunGuidanceRequest,
+  AskAgentRunRequest,
+  ResolveAgentRunDecisionRequest,
+  StartAgentRunRequest,
+} from '@deepcode/protocol';
+
+function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRequest {
+  if (request.op === 'ask') {
+    return {
+      op: 'ask',
+      content: request.content,
+      workspacePath: request.workspacePath,
+      noWorkspace: request.noWorkspace,
+      attachments: request.attachments,
+      callerRequestId: request.callerRequestId,
+    };
+  }
+  return {
+    op: 'resolveDecision',
+    decisionKind: request.decisionKind,
+    decision: request.decision,
+    guidance: request.guidance,
+    runId: request.runId,
+    targetId: request.targetId,
+    callerRequestId: request.callerRequestId,
+  };
 }
 
 export interface AgentRunStatus {
@@ -108,13 +108,12 @@ export interface AgentRunStatus {
   updatedAt: string;
   completedAt?: string;
   message?: string;
-  finalText?: string;
 }
 
 export interface AgentRunResult {
   run: AgentRunStatus;
   session: AgentSessionResult['session'];
-  events: AgentSessionResult['events'];
+  inputId?: string;
 }
 
 function endpointLabel(url: string): string {
@@ -211,37 +210,6 @@ export interface SkillMountScanResult {
   warnings: string[];
 }
 
-export interface ConversationArchiveFileEntry {
-  path: string;
-  sizeBytes: number;
-}
-
-export interface ConversationArchiveManifest {
-  schemaVersion: string;
-  sessionId: string;
-  workspaceScopeKey: string;
-  runId: string;
-  archivePath: string;
-  createdAt: string;
-  updatedAt: string;
-  files: ConversationArchiveFileEntry[];
-}
-
-export interface ConversationArchiveResult {
-  sessionId: string;
-  conversationArchiveRoot: string;
-  defaultWorkspaceScopeKey: string;
-  archives: ConversationArchiveManifest[];
-}
-
-export interface ConversationArchiveFileResult {
-  sessionId: string;
-  workspaceScopeKey: string;
-  runId: string;
-  path: string;
-  content: string;
-}
-
 export interface DefaultWorkspacePathResult {
   path: string | null;
 }
@@ -283,9 +251,15 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
 }
 
 /** 通用 GET 包装 */
-async function getJson<T>(url: string): Promise<ApiResponse<T>> {
+async function getJson<T>(
+  url: string,
+  signal?: AbortSignal
+): Promise<ApiResponse<T>> {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: getHostAdmissionHeaders(),
+      signal,
+    });
     if (!response.ok) {
       return {
         ok: false,
@@ -309,7 +283,10 @@ async function sendJson<T>(
   try {
     const response = await fetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...getHostAdmissionHeaders(),
+      },
       body: JSON.stringify(body),
       signal: options.signal,
     });
@@ -326,20 +303,56 @@ async function sendJson<T>(
   }
 }
 
+async function sendReplayableHostMutation<T>(
+  url: string,
+  body: unknown
+): Promise<ApiResponse<T>> {
+  const response = await sendJson<T>(url, 'POST', body);
+  if (response.error !== 'network_error') {
+    return response;
+  }
+  return sendJson<T>(url, 'POST', body);
+}
+
+interface SseStreamEvent {
+  event: string;
+  data: unknown;
+}
+
+export class AgentTimelineStreamProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentTimelineStreamProtocolError';
+  }
+}
+
 async function streamSse(
   url: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
+  eventNames: readonly string[],
+  onEvent: (event: SseStreamEvent) => void,
+  terminalEventNames: readonly string[] = [],
   signal?: AbortSignal
 ): Promise<void> {
-  if (typeof EventSource !== 'undefined') {
-    return streamSseWithEventSource(url, onEvent, signal);
+  if (
+    typeof EventSource !== 'undefined' &&
+    Object.keys(getHostAdmissionHeaders()).length === 0
+  ) {
+    return streamSseWithEventSource(
+      url,
+      eventNames,
+      onEvent,
+      terminalEventNames,
+      signal
+    );
   }
   return streamSseWithFetch(url, onEvent, signal);
 }
 
 function streamSseWithEventSource(
   url: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
+  eventNames: readonly string[],
+  onEvent: (event: SseStreamEvent) => void,
+  terminalEventNames: readonly string[],
   signal?: AbortSignal
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -359,37 +372,34 @@ function streamSseWithEventSource(
       else resolve();
     };
     const onAbort = () => finish();
-    const handleMessage = (eventName: AgentRunStreamEvent['event'], event: Event) => {
+    const handleMessage = (eventName: string, event: Event) => {
       const message = event as MessageEvent<string>;
       if (typeof message.data !== 'string' || !message.data.trim()) {
         if (eventName === 'error') {
-          finish(new Error(`Agent run event stream disconnected (${endpointLabel(url)})`));
+          finish(new Error(`Agent stream disconnected (${endpointLabel(url)})`));
         }
         return;
       }
+      let data: unknown;
       try {
-        onEvent({ event: eventName, data: JSON.parse(message.data) as unknown });
+        data = JSON.parse(message.data) as unknown;
       } catch {
-        onEvent({
-          event: 'error',
-          data: {
-            code: 'invalid_sse_payload',
-            message: 'Agent run stream returned invalid JSON payload.',
-          },
-        });
+        data = {
+          code: 'invalid_sse_payload',
+          message: 'Agent stream returned invalid JSON payload.',
+        };
+        eventName = 'error';
       }
-      if (eventName === 'terminal') finish();
+      try {
+        onEvent({ event: eventName, data });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      if (terminalEventNames.includes(eventName)) finish();
     };
 
-    const eventNames: AgentRunStreamEvent['event'][] = [
-      'run',
-      'delta',
-      'events',
-      'terminal',
-      'heartbeat',
-      'error',
-    ];
-    for (const eventName of eventNames) {
+    for (const eventName of new Set([...eventNames, 'error'])) {
       source.addEventListener(eventName, (event) => handleMessage(eventName, event));
     }
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -398,11 +408,14 @@ function streamSseWithEventSource(
 
 async function streamSseWithFetch(
   url: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
+  onEvent: (event: SseStreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(url, {
-    headers: { Accept: 'text/event-stream' },
+    headers: {
+      Accept: 'text/event-stream',
+      ...getHostAdmissionHeaders(),
+    },
     signal,
   });
   if (!response.ok) {
@@ -427,8 +440,8 @@ async function streamSseWithFetch(
   for (const event of consumed.items) onEvent(event);
 }
 
-function consumeSseEvents(buffer: string): { items: AgentRunStreamEvent[]; remaining: string } {
-  const items: AgentRunStreamEvent[] = [];
+function consumeSseEvents(buffer: string): { items: SseStreamEvent[]; remaining: string } {
+  const items: SseStreamEvent[] = [];
   let remaining = buffer;
   for (;;) {
     const boundary = remaining.search(/\r?\n\r?\n/);
@@ -436,22 +449,22 @@ function consumeSseEvents(buffer: string): { items: AgentRunStreamEvent[]; remai
     const raw = remaining.slice(0, boundary);
     const separator = remaining.slice(boundary).match(/^\r?\n\r?\n/);
     remaining = remaining.slice(boundary + (separator?.[0].length ?? 2));
-    const event = parseAgentRunSseEvent(raw);
+    const event = parseSseEvent(raw);
     if (event) items.push(event);
   }
   return { items, remaining };
 }
 
-function parseAgentRunSseEvent(raw: string): AgentRunStreamEvent | null {
+function parseSseEvent(raw: string): SseStreamEvent | null {
   if (!raw.trim()) return null;
-  let eventName: AgentRunStreamEvent['event'] = 'delta';
+  let eventName = 'message';
   const data: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
     if (!line || line.startsWith(':')) continue;
     const separator = line.indexOf(':');
     const field = separator >= 0 ? line.slice(0, separator) : line;
     const value = separator >= 0 ? line.slice(separator + 1).replace(/^ /, '') : '';
-    if (field === 'event') eventName = value as AgentRunStreamEvent['event'];
+    if (field === 'event') eventName = value;
     if (field === 'data') data.push(value);
   }
   const payload = data.join('\n').trim();
@@ -463,7 +476,7 @@ function parseAgentRunSseEvent(raw: string): AgentRunStreamEvent | null {
       event: 'error',
       data: {
         code: 'invalid_sse_payload',
-        message: 'Agent run stream returned invalid JSON payload.',
+        message: 'Agent timeline stream returned invalid JSON payload.',
       },
     };
   }
@@ -679,12 +692,14 @@ export function getCurrentAgentSession(
 }
 
 export function activateAgentSession(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
   return sendJson<AgentSessionResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/activate`,
     'POST',
-    {}
+    {},
+    { signal }
   );
 }
 
@@ -777,62 +792,55 @@ export async function deleteAgentSession(
   return result;
 }
 
-export function getConversationArchive(
-  sessionId: string
-): Promise<ApiResponse<ConversationArchiveResult>> {
-  return getJson<ConversationArchiveResult>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/archive`
-  );
-}
-
-export function readConversationArchiveFile(
-  sessionId: string,
-  request: { path: string; runId?: string }
-): Promise<ApiResponse<ConversationArchiveFileResult>> {
-  const qs = buildQuery({
-    path: request.path,
-    runId: request.runId,
-  });
-  return getJson<ConversationArchiveFileResult>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/archive/file${qs}`
-  );
-}
-
-export function persistAgentSessionMemoryArchive(
-  sessionId: string,
-  request: { snapshot: unknown }
-): Promise<ApiResponse<unknown>> {
-  return sendJson<unknown>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/memory/archive`,
-    'POST',
-    request
-  );
-}
-
-export function appendAgentEvents(
-  sessionId: string,
-  request: AppendAgentEventsRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`,
-    'POST',
-    request
-  );
-}
-
-export function getAgentSession(
-  sessionId: string
-): Promise<ApiResponse<AgentSessionResult>> {
-  return getJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`
-  );
-}
-
 export function getAgentTimeline(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentTimelineResult>> {
   return getJson<AgentTimelineResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`,
+    signal
+  );
+}
+
+export function streamAgentTimeline(
+  sessionId: string,
+  onEvent: (event: AgentTimelineStreamEvent) => void,
+  cursor?: { afterRevision?: number },
+  signal?: AbortSignal
+): Promise<void> {
+  const qs = buildQuery({
+    afterRevision: cursor?.afterRevision === undefined
+      ? undefined
+      : String(cursor.afterRevision),
+  });
+  return streamSse(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline/stream${qs}`,
+    ['snapshot', 'delta'],
+    (event) => {
+      if (event.event === 'error') {
+        const detail = isRecord(event.data)
+          ? stringField(event.data, 'message') ?? stringField(event.data, 'code')
+          : null;
+        if (isRecord(event.data) && event.data.code === 'invalid_sse_payload') {
+          throw new AgentTimelineStreamProtocolError(
+            detail ?? 'Agent timeline stream returned invalid JSON.'
+          );
+        }
+        throw new Error(detail ?? 'Agent timeline stream disconnected');
+      }
+      if (
+        (event.event !== 'snapshot' && event.event !== 'delta')
+        || !isRecord(event.data)
+        || event.data.type !== event.event
+      ) {
+        throw new AgentTimelineStreamProtocolError(
+          'Agent timeline stream returned an invalid event envelope.'
+        );
+      }
+      onEvent(event.data as unknown as AgentTimelineStreamEvent);
+    },
+    [],
+    signal
   );
 }
 
@@ -840,163 +848,49 @@ export function startAgentRun(
   sessionId: string,
   request: StartAgentRunRequest
 ): Promise<ApiResponse<AgentRunResult>> {
-  return sendJson<AgentRunResult>(
+  return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs`,
-    'POST',
-    request
+    agentRunMutationPayload(request)
   );
 }
 
 export function getAgentRun(
   sessionId: string,
-  runId: string
+  runId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentRunResult>> {
   return getJson<AgentRunResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`
-  );
-}
-
-export interface AgentRunStreamEvent {
-  event: 'run' | 'delta' | 'events' | 'terminal' | 'heartbeat' | 'error';
-  data: unknown;
-}
-
-export function streamAgentRun(
-  sessionId: string,
-  runId: string,
-  onEvent: (event: AgentRunStreamEvent) => void,
-  cursor?: { sinceEventCount?: number; sinceDeltaSeq?: number },
-  signal?: AbortSignal
-): Promise<void> {
-  const qs = buildQuery({
-    sinceEventCount: cursor?.sinceEventCount === undefined ? undefined : String(cursor.sinceEventCount),
-    sinceDeltaSeq: cursor?.sinceDeltaSeq === undefined ? undefined : String(cursor.sinceDeltaSeq),
-  });
-  return streamSse(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream${qs}`,
-    onEvent,
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
     signal
-  );
-}
-
-export function appendProjectionDelivery(
-  sessionId: string,
-  entries: ProjectionDeliveryRecord[],
-  signal?: AbortSignal
-): Promise<ApiResponse<{ sessionId: string; appended: number }>> {
-  return sendJson<{ sessionId: string; appended: number }>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/projection-delivery`,
-    'POST',
-    { entries },
-    { signal }
   );
 }
 
 export function cancelAgentRunById(
   sessionId: string,
-  runId: string
+  runId: string,
+  callerRequestId: string
 ): Promise<ApiResponse<AgentRunResult>> {
-  return sendJson<AgentRunResult>(
+  return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
-    'POST',
-    {}
+    { callerRequestId }
   );
 }
 
 export function submitAgentRunGuidance(
   sessionId: string,
   runId: string,
-  request: { guidance: string; attachments?: unknown[] }
+  request: AgentRunGuidanceRequest
 ): Promise<ApiResponse<AgentRunResult>> {
-  return sendJson<AgentRunResult>(
+  return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/guidance`,
-    'POST',
-    request
+    {
+      guidance: request.guidance,
+      workspacePath: request.workspacePath,
+      noWorkspace: request.noWorkspace,
+      attachments: request.attachments,
+      callerRequestId: request.callerRequestId,
+    }
   );
-}
-
-export function cancelAgentRun(
-  sessionId: string
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/cancel`,
-    'POST',
-    {}
-  );
-}
-
-export function getAgentEventSnapshot(
-  sessionId: string
-): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
-  return getJson<GetAgentEventSnapshotResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/trace`
-  );
-}
-
-export function resolveAgentPermission(
-  permissionId: string,
-  request: ResolveAgentPermissionRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/permissions/${encodeURIComponent(permissionId)}/resolve`,
-    'POST',
-    request
-  );
-}
-
-export function resolveAgentPlan(
-  runId: string,
-  planId: string,
-  request: ResolveAgentPlanRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/plans/${encodeURIComponent(runId)}/${encodeURIComponent(planId)}/resolve`,
-    'POST',
-    request
-  );
-}
-
-export function resolveAgentReview(
-  sessionId: string,
-  runId: string,
-  request: ResolveAgentReviewRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/review`,
-    'POST',
-    request
-  );
-}
-
-export function submitAgentFeedback(
-  request: AgentFeedbackRequest
-): Promise<ApiResponse<AgentFeedbackResult>> {
-  return sendJson<AgentFeedbackResult>(
-    `${API_BASE}/agent/feedback`,
-    'POST',
-    request
-  );
-}
-
-export function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
-  return getJson<GetAgentWorkflowConfigResult>(`${API_BASE}/agent/workflow-config`);
-}
-
-export function patchAgentWorkflowConfig(
-  request: PatchAgentWorkflowConfigRequest
-): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
-  return sendJson<GetAgentWorkflowConfigResult>(
-    `${API_BASE}/agent/workflow-config`,
-    'PATCH',
-    request
-  );
-}
-
-export function listAgentTools(
-  mode?: AgentMode
-): Promise<ApiResponse<ListToolsResult>> {
-  const qs = buildQuery({ mode });
-  return getJson<ListToolsResult>(`${API_BASE}/agent/tools${qs}`);
 }
 
 export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {

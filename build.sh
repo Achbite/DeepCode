@@ -49,6 +49,9 @@ LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
+KERNEL_ABI_VERSION="deepcode.kernel.abi.v2"
+TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
+SESSION_BRIDGE_NAME="hostBridgeV2.js"
 
 fs_type_of() {
   stat -f -c %T "$1" 2>/dev/null || true
@@ -706,14 +709,15 @@ stage_hash() {
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
           crates/deepcode-kernel-config \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
-          crates/deepcode-kernel-client crates/deepcode-kernel-daemon shells/cli shells/tui
+          crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-host-web \
+          shells/cli shells/tui
         ;;
       daemon)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
           crates/deepcode-kernel-config \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
-          crates/deepcode-kernel-daemon
+          crates/deepcode-kernel-daemon crates/deepcode-host-web
         ;;
       cli)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
@@ -865,6 +869,8 @@ build_frontend_shared() {
     return
   fi
   echo "==[build][frontend-shared]== build protocol/session-core and check client types"
+  pnpm --filter @deepcode/protocol clean
+  rm -f "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
   pnpm --filter @deepcode/protocol build
   pnpm --filter @deepcode/session-core build
   pnpm --filter @deepcode/client build:types
@@ -899,14 +905,17 @@ build_deepcode_gui() {
 build_daemon() {
   if stage_should_skip daemon \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe"; then
+    "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe"; then
     return
   fi
   configure_sccache
-  echo "==[build][daemon]== build Rust Kernel daemon for Linux"
-  cargo_with_fallback build --release -p deepcode-kernel-daemon
-  echo "==[build][daemon]== build Rust Kernel daemon for Windows GNU"
-  cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
+  echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Linux"
+  cargo_with_fallback build --release -p deepcode-kernel-daemon -p deepcode-host-web
+  echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Windows GNU"
+  cargo_with_fallback build --release --target "$WINDOWS_TARGET" \
+    -p deepcode-kernel-daemon -p deepcode-host-web
   mark_stage_built daemon
   show_sccache_stats
 }
@@ -1063,9 +1072,11 @@ validate_package_inputs() {
   require_package_dir "$CLIENT_DIR/dist" "run ./build.sh --stage gui first" || missing=1
   require_package_dir "$CLIENT_DIR/dist-deepcode-gui" "run ./build.sh --stage deepcode-gui first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "run ./build.sh --stage tauri first" || missing=1
@@ -1099,6 +1110,191 @@ verify_runtime_executable() {
     return 1
   fi
   echo "==[build][verify-package-runtime]== ok $label: $path"
+}
+
+verify_protocol_v2_runtime() {
+  local dist_dir="$1"
+  local label="$2"
+  local required
+  local failed=0
+  for required in index.js tools.js kernelAbiV2.js; do
+    verify_runtime_file "$dist_dir/$required" "$label $required" || failed=1
+  done
+  if [ -d "$dist_dir" ] && find "$dist_dir" -maxdepth 1 -type f \
+    \( -name 'kernel.*' -o -name 'kernelAbiV1.*' \) -print -quit | grep -q .; then
+    echo "==[build][verify-package-runtime][error]== $label contains a retired Kernel ABI module" >&2
+    failed=1
+  fi
+  return "$failed"
+}
+
+verify_llm_profiles_current() {
+  local profiles_path="$1"
+  local node_bin="$2"
+  local label="$3"
+  if [ ! -f "$profiles_path" ]; then
+    echo "==[build][verify-package-runtime][error]== missing $label: $profiles_path" >&2
+    return 1
+  fi
+  if [ ! -x "$node_bin" ]; then
+    echo "==[build][verify-package-runtime][error]== cannot validate $label without packaged Node: $node_bin" >&2
+    return 1
+  fi
+  if ! "$node_bin" - "$profiles_path" <<'NODE'
+const fs = require('node:fs');
+
+const path = process.argv[2];
+const rootFields = new Set(['profiles', 'defaultProfileId', 'storePath']);
+const profileFields = new Set([
+  'id',
+  'name',
+  'kind',
+  'reasoningTransport',
+  'providerFlavor',
+  'baseUrl',
+  'model',
+  'contextWindowTokens',
+  'maxOutputTokens',
+  'temperature',
+  'reasoningEffort',
+  'thinking',
+  'secretRef',
+  'enabled',
+]);
+const transportByKind = new Map([
+  ['openaiCompatible', 'openaiPlaintext'],
+  ['anthropic', 'anthropicPlaintext'],
+  ['ollama', 'ollamaPlaintext'],
+]);
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isTrimmedNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0 && value.trim() === value;
+}
+
+function isOptionalTrimmedNonEmptyString(record, field) {
+  return !(field in record) || isTrimmedNonEmptyString(record[field]);
+}
+
+function isLocalSecretRef(value) {
+  if (typeof value !== 'string' || value.trim() !== value) return false;
+  const prefix = 'local-secret:';
+  if (!value.startsWith(prefix)) return false;
+  const key = value.slice(prefix.length);
+  return key.length > 0 && key.trim() === key;
+}
+
+function isOptionalPositiveInteger(record, field) {
+  if (!(field in record)) return true;
+  const value = record[field];
+  return Number.isInteger(value) && value > 0 && value <= 1_000_000_000;
+}
+
+function reject(message) {
+  throw new Error(message);
+}
+
+try {
+  const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+  if (!isRecord(config)) reject('root must be an object');
+  const rootKeys = Object.keys(config);
+  if (
+    rootKeys.length !== rootFields.size
+    || rootKeys.some((field) => !rootFields.has(field))
+  ) {
+    reject('root must contain only profiles, defaultProfileId, and storePath');
+  }
+  if (!Array.isArray(config.profiles)) reject('profiles must be an array');
+
+  const profilesById = new Map();
+  for (const [index, profile] of config.profiles.entries()) {
+    if (!isRecord(profile)) reject(`profiles[${index}] must be an object`);
+    if (Object.keys(profile).some((field) => !profileFields.has(field))) {
+      reject(`profiles[${index}] contains an unsupported field`);
+    }
+    for (const field of ['id', 'name', 'model']) {
+      if (!isTrimmedNonEmptyString(profile[field])) {
+        reject(`profiles[${index}].${field} must be a trimmed non-empty string`);
+      }
+    }
+    if (profilesById.has(profile.id)) reject(`duplicate profile id: ${profile.id}`);
+    profilesById.set(profile.id, profile);
+    if (typeof profile.enabled !== 'boolean') {
+      reject(`profiles[${index}].enabled must be a boolean`);
+    }
+    const expectedTransport = transportByKind.get(profile.kind);
+    if (expectedTransport === undefined || profile.reasoningTransport !== expectedTransport) {
+      reject(`profiles[${index}] has an incompatible kind/reasoningTransport pair`);
+    }
+    if (
+      'providerFlavor' in profile
+      && !['openai', 'deepseek', 'zhipu'].includes(profile.providerFlavor)
+    ) {
+      reject(`profiles[${index}].providerFlavor is unsupported`);
+    }
+    if (!isOptionalTrimmedNonEmptyString(profile, 'baseUrl')) {
+      reject(`profiles[${index}].baseUrl must be a trimmed non-empty string when present`);
+    }
+    if ('secretRef' in profile && !isLocalSecretRef(profile.secretRef)) {
+      reject(`profiles[${index}].secretRef must be local-secret:<trimmed non-empty key>`);
+    }
+    for (const field of ['contextWindowTokens', 'maxOutputTokens']) {
+      if (!isOptionalPositiveInteger(profile, field)) {
+        reject(`profiles[${index}].${field} must be a bounded positive integer when present`);
+      }
+    }
+    if (
+      Number.isInteger(profile.contextWindowTokens)
+      && Number.isInteger(profile.maxOutputTokens)
+      && profile.maxOutputTokens >= profile.contextWindowTokens
+    ) {
+      reject(`profiles[${index}].maxOutputTokens must be below contextWindowTokens`);
+    }
+    if (
+      'temperature' in profile
+      && (typeof profile.temperature !== 'number' || !Number.isFinite(profile.temperature))
+    ) {
+      reject(`profiles[${index}].temperature must be finite when present`);
+    }
+    if (
+      'reasoningEffort' in profile
+      && !['low', 'medium', 'high', 'max'].includes(profile.reasoningEffort)
+    ) {
+      reject(`profiles[${index}].reasoningEffort is unsupported`);
+    }
+    if (
+      'thinking' in profile
+      && !['enabled', 'disabled'].includes(profile.thinking)
+    ) {
+      reject(`profiles[${index}].thinking is unsupported`);
+    }
+  }
+
+  if (
+    config.defaultProfileId !== null
+    && (
+      !isTrimmedNonEmptyString(config.defaultProfileId)
+      || profilesById.get(config.defaultProfileId)?.enabled !== true
+    )
+  ) {
+    reject('defaultProfileId must be null or reference an enabled profile by exact id');
+  }
+  if (config.storePath !== null && typeof config.storePath !== 'string') {
+    reject('storePath must be null or a string');
+  }
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
+NODE
+  then
+    echo "==[build][verify-package-runtime][error]== $label is not current: $profiles_path" >&2
+    return 1
+  fi
+  echo "==[build][verify-package-runtime]== ok $label: $profiles_path"
 }
 
 verify_frontend_package_assets() {
@@ -1144,7 +1340,7 @@ verify_macos_app_identity() {
     echo "==[build][verify-package-runtime][error]== macOS shared kernel and $product bundled kernel differ" >&2
     failed=1
   fi
-  for field in buildCommit sourceFingerprint protocolVersion toolCatalogVersion; do
+  for field in buildCommit sourceFingerprint kernelAbiVersion toolRegistryVersion sessionBridge; do
     root_value="$(build_info_string_field "$root_build_info" "$field")"
     app_value="$(build_info_string_field "$app_build_info" "$field")"
     if [ -z "$root_value" ] || [ "$root_value" != "$app_value" ]; then
@@ -1152,6 +1348,21 @@ verify_macos_app_identity() {
       failed=1
     fi
   done
+  root_value="$(build_info_string_field "$root_build_info" kernelAbiVersion)"
+  if [ "$root_value" != "$KERNEL_ABI_VERSION" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS build-info kernelAbiVersion=$root_value" >&2
+    failed=1
+  fi
+  root_value="$(build_info_string_field "$root_build_info" toolRegistryVersion)"
+  if [ "$root_value" != "$TOOL_REGISTRY_VERSION" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS build-info toolRegistryVersion=$root_value" >&2
+    failed=1
+  fi
+  root_value="$(build_info_string_field "$root_build_info" sessionBridge)"
+  if [ "$root_value" != "$SESSION_BRIDGE_NAME" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS build-info sessionBridge=$root_value" >&2
+    failed=1
+  fi
   app_value="$(build_info_string_field "$app_build_info" product)"
   if [ "$app_value" != "$product" ]; then
     echo "==[build][verify-package-runtime][error]== $product build-info product=$app_value" >&2
@@ -1168,6 +1379,7 @@ verify_linux_package_runtime() {
   [ -d "$LINUX_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check linux-x64 package"
   verify_runtime_executable "$LINUX_DIR/deepcode-kernel" "linux kernel" || missing=1
+  verify_runtime_executable "$LINUX_DIR/deepcode-host-web" "linux private Host proxy" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-cli" "linux cli" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-tui" "linux tui" || missing=1
   verify_frontend_package_assets "$LINUX_DIR/web" "linux editor web" || missing=1
@@ -1180,6 +1392,7 @@ verify_windows_package_runtime() {
   [ -d "$WIN_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check win64 package"
   verify_runtime_file "$WIN_DIR/deepcode-kernel.exe" "windows kernel" || missing=1
+  verify_runtime_file "$WIN_DIR/deepcode-host-web.exe" "windows private Host proxy" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-cli.exe" "windows cli" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-tui.exe" "windows tui" || missing=1
   verify_runtime_file "$WIN_DIR/DeepCode.exe" "windows editor shell" || missing=1
@@ -1197,15 +1410,26 @@ verify_macos_package_runtime() {
   [ -d "$macos_dir" ] || return 2
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
+  verify_runtime_executable "$macos_dir/DeepCode-CLI.command" "macOS CLI launcher" || missing=1
+  verify_runtime_executable "$macos_dir/DeepCode-TUI.command" "macOS TUI launcher" || missing=1
+  verify_runtime_executable "$macos_dir/libexec/DeepCode-CLI" "macOS CLI host" || missing=1
+  verify_runtime_executable "$macos_dir/libexec/DeepCode-TUI" "macOS TUI host" || missing=1
   verify_runtime_file "$macos_dir/build-info.json" "macOS shared build-info" || missing=1
-  verify_runtime_file "$macos_dir/session-core/hostBridge.js" "macOS session bridge" || missing=1
-  verify_runtime_file "$macos_dir/node_modules/@deepcode/protocol/dist/index.js" "macOS protocol runtime" || missing=1
+  verify_runtime_file "$macos_dir/session-core/$SESSION_BRIDGE_NAME" "macOS Session v2 bridge" || missing=1
+  verify_protocol_v2_runtime \
+    "$macos_dir/node_modules/@deepcode/protocol/dist" \
+    "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
+  verify_llm_profiles_current \
+    "$macos_dir/config/user/local/settings/llm-profiles.json" \
+    "$macos_dir/node/bin/node" \
+    "macOS LLM Profile store" || missing=1
 
   if [ -d "$macos_dir/DeepCode.app" ]; then
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/DeepCode" "macOS DeepCode app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode bundled kernel" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode private Host proxy" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/MacOS/web" "macOS DeepCode bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode.app" "DeepCode" || missing=1
   fi
@@ -1213,6 +1437,7 @@ verify_macos_package_runtime() {
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/DeepCode-GUI" "macOS DeepCode-GUI app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode-GUI bundled kernel" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode-GUI private Host proxy" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode-GUI.app" "DeepCode-GUI" || missing=1
   fi
@@ -1264,7 +1489,7 @@ verify_package_runtime() {
 write_readme() {
   local dist_dir="$1"
   local platform="$2"
-  local gui_entries="  deepcode-gui          Linux GUI host launcher"
+  local gui_entries=""
   if [ "$platform" = "win64" ]; then
     gui_entries="  DeepCode.exe          Windows Editor shell, starts the same-dir Kernel on a free localhost port
   DeepCode-GUI.exe      Windows DeepCode-GUI shell, shares the same Kernel and config"
@@ -1274,7 +1499,8 @@ DeepCode Unified Distribution ($platform)
 =========================================
 
 This folder is one DeepCode host distribution. GUI, CLI, and TUI entries share
-the same Rust Kernel binary, bundled config directory, and packs directory.
+the same Rust Kernel binary, private desktop Host proxy, bundled config directory,
+and packs directory.
 Editor assets live in web/. DeepCode-GUI assets live in web-deepcode-gui/.
 User session composition lives in the TS session-core package; all sensitive
 workspace, process, skill, and context operations must enter the Kernel through
@@ -1292,6 +1518,7 @@ Direct CLI/daemon runs use the OS config root unless DEEPCODE_CONFIG_DIR is set.
 
 Entries:
   deepcode-kernel       Rust Kernel Daemon + localhost API
+  deepcode-host-web     Private desktop Host proxy
 $gui_entries
   deepcode              CLI Host Shell MVP over KernelClient (Linux)
   deepcode-cli          CLI Host Shell MVP over KernelClient
@@ -1306,20 +1533,15 @@ Windows GUI runtime:
 
 Optional desktop shell:
   Tauri thin shell source lives in shells/tauri and shells/deepcode-gui. Each
-  shell embeds its matching React dist, starts or connects to the same-dir
-  Kernel Daemon in the background, and does not contain Agent runtime. Windows
+  shell embeds its matching React dist and owns the same-dir Kernel Daemon plus
+  private Host proxy process tree. It does not contain Agent runtime. Windows
   distribution includes DeepCode.exe and DeepCode-GUI.exe. The desktop shell
-  chooses an available localhost port by default; set DEEPCODE_PORT to force a
-  fixed port such as 31245.
+  chooses available localhost ports by default; set DEEPCODE_PORT to force the
+  proxy port to a fixed value such as 31245.
 
-Run the Linux GUI launcher or force DEEPCODE_PORT=31245, then open:
-  http://127.0.0.1:31245/
-
-The internal browser, Chrome, or any regular browser can open that URL. The
-browser is only a Host client; the Kernel remains the fact source.
-
-Health check:
-  http://127.0.0.1:31245/api/health
+The Linux portable distribution exposes CLI/TUI and the runtime sidecars.
+Desktop GUI use requires the optional Tauri shell build. Ordinary browser
+contexts intentionally receive no private Host bootstrap or capability.
 README
 }
 
@@ -1344,6 +1566,7 @@ clean_package_generated_outputs() {
     "$dist_dir/deepcode"
     "$dist_dir/deepcode-cli"
     "$dist_dir/deepcode-gui"
+    "$dist_dir/deepcode-host-web"
     "$dist_dir/deepcode-kernel"
     "$dist_dir/deepcode-tui"
     "$dist_dir/DeepCode"
@@ -1351,6 +1574,7 @@ clean_package_generated_outputs() {
     "$dist_dir/deepcode-tui.bat"
     "$dist_dir/deepcode.cmd"
     "$dist_dir/deepcode-cli.exe"
+    "$dist_dir/deepcode-host-web.exe"
     "$dist_dir/deepcode-kernel.exe"
     "$dist_dir/deepcode-tui.exe"
     "$dist_dir/DeepCode.exe"
@@ -1372,7 +1596,9 @@ package_distribution() {
 
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
     "run ./build.sh --stage kernel first"
-  chmod +x "$LINUX_DIR/deepcode-kernel"
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$LINUX_DIR/deepcode-host-web" \
+    "run ./build.sh --stage kernel first"
+  chmod +x "$LINUX_DIR/deepcode-kernel" "$LINUX_DIR/deepcode-host-web"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli" \
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode" \
@@ -1382,6 +1608,8 @@ package_distribution() {
   chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
 
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "$WIN_DIR/deepcode-host-web.exe" \
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "$WIN_DIR/deepcode-cli.exe" \
     "run ./build.sh --stage kernel first"
@@ -1402,17 +1630,6 @@ package_distribution() {
   cp -v "$webview2_loader_dll" "$WIN_DIR/WebView2Loader.dll"
 
   echo "==[build][package]== generate host launchers"
-  cat > "$LINUX_DIR/deepcode-gui" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export DEEPCODE_CLIENT_DIST="${DEEPCODE_CLIENT_DIST:-$SCRIPT_DIR/web}"
-export DEEPCODE_HOST="${DEEPCODE_HOST:-127.0.0.1}"
-export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
-"$SCRIPT_DIR/deepcode-kernel" "$@"
-LAUNCHER
-  chmod +x "$LINUX_DIR/deepcode-gui"
-
   cat > "$WIN_DIR/deepcode-cli.bat" <<'LAUNCHER'
 @echo off
 setlocal

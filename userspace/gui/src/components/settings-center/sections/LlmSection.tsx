@@ -1,11 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  DEFAULT_LLM_PROVIDER_PROFILES,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
   DEPRECATED_DEEPSEEK_LLM_MODELS,
+  hasCompatibleReasoningTransport,
+  reasoningTransportForProviderKind,
 } from '@deepcode/protocol';
-import type { LlmProviderKind, LlmProviderProfile } from '@deepcode/protocol';
+import type {
+  LlmProviderFlavor,
+  LlmProviderKind,
+  LlmProviderProfile,
+  LlmReasoningTransport,
+} from '@deepcode/protocol';
 import {
   getLlmProfiles,
   patchLlmProfiles,
@@ -20,15 +28,41 @@ const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
   { value: 'ollama', label: 'Ollama' },
 ];
 
+const PROVIDER_FLAVORS: Array<{
+  value: LlmProviderFlavor;
+  label: string;
+}> = [
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'zhipu', label: 'Zhipu' },
+];
+
+const REASONING_TRANSPORT_LABELS: Record<LlmReasoningTransport, string> = {
+  openaiPlaintext: 'OpenAI plaintext reasoning',
+  anthropicPlaintext: 'Anthropic plaintext thinking',
+  ollamaPlaintext: 'Ollama plaintext reasoning',
+};
+
+const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
+const DEFAULT_REPLACEMENT_PROFILE_ID = 'deepseek-v4-pro-openai';
+
+type ProfileWithoutId<T> = T extends unknown ? Omit<T, 'id'> : never;
+type NewProfile = ProfileWithoutId<LlmProviderProfile>;
+type ProfileCommonPatch = Partial<
+  Omit<LlmProviderProfile, 'kind' | 'reasoningTransport'>
+>;
+
 const PROFILE_PRESETS: Array<{
   label: string;
-  profile: Omit<LlmProviderProfile, 'id'>;
+  profile: NewProfile;
 }> = [
   {
     label: 'DeepSeek Flash',
     profile: {
       name: 'DeepSeek V4 Flash',
       kind: 'openaiCompatible',
+      reasoningTransport: 'openaiPlaintext',
+      providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-flash',
       contextWindowTokens: 1000000,
@@ -44,6 +78,8 @@ const PROFILE_PRESETS: Array<{
     profile: {
       name: 'DeepSeek V4 Pro',
       kind: 'openaiCompatible',
+      reasoningTransport: 'openaiPlaintext',
+      providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-pro',
       contextWindowTokens: 1000000,
@@ -59,6 +95,8 @@ const PROFILE_PRESETS: Array<{
     profile: {
       name: 'DeepSeek V4 Flash (Anthropic)',
       kind: 'anthropic',
+      reasoningTransport: 'anthropicPlaintext',
+      providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
       model: 'deepseek-v4-flash',
       contextWindowTokens: 1000000,
@@ -72,18 +110,56 @@ const PROFILE_PRESETS: Array<{
 ];
 
 function createProfile(
-  preset?: Partial<Omit<LlmProviderProfile, 'id'>>
+  preset?: NewProfile
 ): LlmProviderProfile {
   const id = `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  if (preset) {
+    return { id, ...preset };
+  }
   return {
     id,
-    name: preset?.name ?? 'OpenAI Compatible',
+    name: 'OpenAI Compatible',
     kind: 'openaiCompatible',
+    reasoningTransport: 'openaiPlaintext',
+    providerFlavor: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
-    enabled: true,
-    ...preset,
+    thinking: 'enabled',
+    enabled: false,
   };
+}
+
+function currentProfileReplacementDrafts(): LlmProviderProfile[] {
+  return DEFAULT_LLM_PROVIDER_PROFILES.map((profile) => ({
+    ...profile,
+    enabled: profile.id === DEFAULT_REPLACEMENT_PROFILE_ID,
+  }));
+}
+
+function profileWithProviderKind(
+  profile: LlmProviderProfile,
+  kind: LlmProviderKind,
+): LlmProviderProfile {
+  switch (kind) {
+    case 'openaiCompatible':
+      return {
+        ...profile,
+        kind,
+        reasoningTransport: reasoningTransportForProviderKind(kind),
+      };
+    case 'anthropic':
+      return {
+        ...profile,
+        kind,
+        reasoningTransport: reasoningTransportForProviderKind(kind),
+      };
+    case 'ollama':
+      return {
+        ...profile,
+        kind,
+        reasoningTransport: reasoningTransportForProviderKind(kind),
+      };
+  }
 }
 
 function optionalNumber(value: string): number | undefined {
@@ -98,9 +174,12 @@ const LlmSection: React.FC = () => {
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [storePath, setStorePath] = useState<string | undefined>();
+  const [storeReplacementRequired, setStoreReplacementRequired] = useState(false);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [messageTone, setMessageTone] = useState<'error' | 'success'>('error');
   const [probeState, setProbeState] = useState<Record<string, string>>({});
+  const reenableProfileIdsRef = useRef<Set<string>>(new Set());
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -115,7 +194,23 @@ const LlmSection: React.FC = () => {
       setProfiles(result.data.profiles);
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
+      setStoreReplacementRequired(false);
+      reenableProfileIdsRef.current.clear();
+    } else if (result.error === INVALID_PROFILE_STORE_SCHEMA) {
+      const replacementDrafts = currentProfileReplacementDrafts();
+      setProfiles(replacementDrafts);
+      setDefaultProfileId(
+        replacementDrafts.find((profile) => (
+          profile.id === DEFAULT_REPLACEMENT_PROFILE_ID && profile.enabled
+        ))?.id ?? replacementDrafts.find((profile) => profile.enabled)?.id
+      );
+      setStorePath(undefined);
+      setSecrets({});
+      setProbeState({});
+      setStoreReplacementRequired(true);
+      setMessageTone('error');
     } else {
+      setMessageTone('error');
       setMessage(result.message ?? t(language, 'settings.llm.loadFailed'));
     }
     setLoading(false);
@@ -127,7 +222,7 @@ const LlmSection: React.FC = () => {
 
   const updateProfile = (
     id: string,
-    patch: Partial<LlmProviderProfile>
+    patch: ProfileCommonPatch
   ) => {
     setProfiles((prev) =>
       prev.map((profile) =>
@@ -136,15 +231,38 @@ const LlmSection: React.FC = () => {
     );
   };
 
+  const updateProfileProviderKind = (
+    id: string,
+    kind: LlmProviderKind,
+  ) => {
+    setProfiles((prev) =>
+      prev.map((profile) =>
+        profile.id === id ? profileWithProviderKind(profile, kind) : profile
+      )
+    );
+  };
+
+  const updateProfileEnabled = (id: string, wasEnabled: boolean, enabled: boolean) => {
+    if (!wasEnabled && enabled) {
+      reenableProfileIdsRef.current.add(id);
+    } else if (wasEnabled && !enabled) {
+      reenableProfileIdsRef.current.delete(id);
+    }
+    updateProfile(id, { enabled });
+  };
+
   const addProfile = (
-    preset?: Partial<Omit<LlmProviderProfile, 'id'>>
+    preset?: NewProfile
   ) => {
     const profile = createProfile(preset);
     setProfiles((prev) => [...prev, profile]);
-    setDefaultProfileId((prev) => prev ?? profile.id);
+    if (profile.enabled) {
+      setDefaultProfileId((prev) => prev ?? profile.id);
+    }
   };
 
   const removeProfile = (id: string) => {
+    reenableProfileIdsRef.current.delete(id);
     setProfiles((prev) => prev.filter((profile) => profile.id !== id));
     setSecrets((prev) => {
       const next = { ...prev };
@@ -159,23 +277,66 @@ const LlmSection: React.FC = () => {
   const save = async () => {
     setLoading(true);
     setMessage(null);
+    const savableProfiles = profiles.filter(hasCompatibleReasoningTransport);
+    if (savableProfiles.length !== profiles.length) {
+      setMessageTone('error');
+      setMessage(
+        language === 'zh-CN'
+          ? '存在未配置或与 Provider 不匹配的 reasoning transport；请先完成配置。'
+          : 'A profile has a missing or mismatched reasoning transport. Configure it before saving.'
+      );
+      setLoading(false);
+      return;
+    }
+    const enabledWithoutThinking = savableProfiles.find(
+      (profile) => profile.enabled && profile.thinking !== 'enabled'
+    );
+    if (enabledWithoutThinking) {
+      setMessageTone('error');
+      setMessage(
+        language === 'zh-CN'
+          ? `已启用的 Profile“${enabledWithoutThinking.name}”必须开启 thinking。`
+          : `Enabled profile "${enabledWithoutThinking.name}" must have thinking enabled.`
+      );
+      setLoading(false);
+      return;
+    }
+    const replacementProfileMissingApiKey = storeReplacementRequired
+      ? savableProfiles.find((profile) => (
+        profile.enabled
+        && profile.kind !== 'ollama'
+        && !profile.secretRef
+        && !secrets[profile.id]?.trim()
+      ))
+      : undefined;
+    if (replacementProfileMissingApiKey) {
+      setMessageTone('error');
+      setMessage(
+        language === 'zh-CN'
+          ? `当前 schema 的恢复不会自动关联旧密钥；请为已启用的 Profile“${replacementProfileMissingApiKey.name}”重新输入 API Key。`
+          : `Current-schema recovery does not automatically reconnect old secrets. Re-enter the API key for enabled profile "${replacementProfileMissingApiKey.name}".`
+      );
+      setLoading(false);
+      return;
+    }
     const result = await patchLlmProfiles({
-      profiles,
+      profiles: savableProfiles,
       defaultProfileId,
       secrets,
+      reenableProfileIds: [...reenableProfileIdsRef.current],
     });
     if (result.ok && result.data) {
       setProfiles(result.data.profiles);
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
       setSecrets({});
+      setStoreReplacementRequired(false);
+      reenableProfileIdsRef.current.clear();
+      setMessageTone('success');
       setMessage(t(language, 'settings.llm.saved'));
-      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated', {
-        detail: {
-          profileMigrations: result.data.profileMigrations ?? [],
-        },
-      }));
+      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
     } else {
+      setMessageTone('error');
       setMessage(result.message ?? t(language, 'settings.llm.saveFailed'));
     }
     setLoading(false);
@@ -200,7 +361,13 @@ const LlmSection: React.FC = () => {
   };
 
   const defaultOptions = useMemo(
-    () => profiles.map((profile) => ({ id: profile.id, name: profile.name })),
+    () => profiles
+      .filter((profile) => (
+        profile.enabled
+        && profile.thinking === 'enabled'
+        && hasCompatibleReasoningTransport(profile)
+      ))
+      .map((profile) => ({ id: profile.id, name: profile.name })),
     [profiles]
   );
 
@@ -213,6 +380,12 @@ const LlmSection: React.FC = () => {
         <p className="settings-card__body">
           {t(language, 'settings.llm.body')}
         </p>
+
+        {storeReplacementRequired && (
+          <div className="settings-recovery-notice" role="alert">
+            {t(language, 'settings.llm.replaceInvalidStore')}
+          </div>
+        )}
 
         <div className="settings-toolbar-row">
           <button
@@ -284,11 +457,10 @@ const LlmSection: React.FC = () => {
                 <select
                   className="settings-field__select"
                   value={profile.kind}
-                  onChange={(e) =>
-                    updateProfile(profile.id, {
-                      kind: e.target.value as LlmProviderKind,
-                    })
-                  }
+                  onChange={(e) => updateProfileProviderKind(
+                    profile.id,
+                    e.target.value as LlmProviderKind,
+                  )}
                 >
                   {PROVIDERS.map((provider) => (
                     <option key={provider.value} value={provider.value}>
@@ -300,15 +472,48 @@ const LlmSection: React.FC = () => {
                   <input
                     type="checkbox"
                     checked={profile.enabled}
-                    onChange={(e) =>
-                      updateProfile(profile.id, { enabled: e.target.checked })
-                    }
+                    disabled={!profile.enabled && profile.thinking !== 'enabled'}
+                    onChange={(e) => updateProfileEnabled(
+                      profile.id,
+                      profile.enabled,
+                      e.target.checked,
+                    )}
                   />
                   {t(language, 'settings.common.enabled')}
                 </label>
               </div>
 
               <div className="llm-profile__grid">
+                <label>
+                  <span>Provider flavor</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.providerFlavor}
+                    onChange={(e) => updateProfile(profile.id, {
+                      providerFlavor: e.target.value as LlmProviderFlavor,
+                    })}
+                  >
+                    {PROVIDER_FLAVORS.map((flavor) => (
+                      <option key={flavor.value} value={flavor.value}>
+                        {flavor.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning transport</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.reasoningTransport}
+                    onChange={() => updateProfileProviderKind(profile.id, profile.kind)}
+                  >
+                    <option value={reasoningTransportForProviderKind(profile.kind)}>
+                      {REASONING_TRANSPORT_LABELS[
+                        reasoningTransportForProviderKind(profile.kind)
+                      ]}
+                    </option>
+                  </select>
+                </label>
                 <label>
                   <span>{t(language, 'settings.llm.baseUrl')}</span>
                   <input
@@ -383,11 +588,10 @@ const LlmSection: React.FC = () => {
                     className="settings-field__input"
                     type="number"
                     min={1}
-                    value={profile.maxOutputTokens ?? profile.maxTokens ?? ''}
+                    value={profile.maxOutputTokens ?? ''}
                     onChange={(e) =>
                       updateProfile(profile.id, {
                         maxOutputTokens: optionalNumber(e.target.value),
-                        maxTokens: undefined,
                       })
                     }
                     placeholder="384000"
@@ -437,12 +641,25 @@ const LlmSection: React.FC = () => {
                   {t(language, 'settings.llm.thinkingHint')}
                 </div>
               )}
+              {profile.thinking !== 'enabled' && (
+                <div className="settings-card__hint" role="status">
+                  {language === 'zh-CN'
+                    ? '此 Profile 未开启 plaintext thinking，当前不可用于会话；请先将 thinking 设为启用。'
+                    : 'This profile has no plaintext thinking enabled and is unavailable for sessions. Enable thinking before enabling the profile.'}
+                </div>
+              )}
 
               <div className="llm-profile__actions">
                 <button
                   className="settings-action-button"
                   onClick={() => void probe(profile.id)}
-                  disabled={loading || !profile.secretRef || !!secrets[profile.id]}
+                  disabled={
+                    loading
+                    || !hasCompatibleReasoningTransport(profile)
+                    || profile.thinking !== 'enabled'
+                    || !profile.secretRef
+                    || !!secrets[profile.id]
+                  }
                   title={secrets[profile.id]
                     ? t(language, 'settings.llm.saveKeyBeforeProbe')
                     : t(language, 'settings.llm.probe')}
@@ -471,7 +688,14 @@ const LlmSection: React.FC = () => {
             {t(language, 'settings.llm.profileStore', { path: storePath })}
           </div>
         )}
-        {message && <div className="settings-error">{message}</div>}
+        {message && (
+          <div
+            className={messageTone === 'success' ? 'settings-save-message' : 'settings-error'}
+            role={messageTone === 'success' ? 'status' : 'alert'}
+          >
+            {message}
+          </div>
+        )}
       </div>
     </div>
   );

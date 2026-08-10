@@ -1,221 +1,9 @@
-import type { AgentMode, AgentWorkspaceBinding } from './agent.js';
-
-export type IsolationLevel = 'none' | 'supervised' | 'osSandbox';
-export type SandboxSupportState = 'unavailable' | 'contractOnly' | 'experimental' | 'enforced';
-export type IsolationFallbackPolicy = 'deny';
-
-export type KernelToolFamily =
-  | 'workspace'
-  | 'document'
-  | 'git'
-  | 'process'
-  | 'network'
-  | 'browser'
-  | 'provider';
-export type KernelToolRiskLevel = 'low' | 'medium' | 'high' | 'critical';
-export type KernelToolPermissionMode = 'allow' | 'ask' | 'deny';
-export type KernelToolExecutionMode = 'execute' | 'previewOnly' | 'blocked';
-export type KernelPathScopePolicy = 'none' | 'workspaceReadScope' | 'workspacePathScopedGrant';
-export type KernelPlanTargetMode = 'perTarget' | 'sourceDestination' | 'aggregate';
-export type KernelPlanTargetSource =
-  | 'none'
-  | 'path'
-  | 'pathOrCurrentDirectory'
-  | 'sourceDestination'
-  | 'gitWorkspace'
-  | 'gitIndex'
-  | 'gitRemote'
-  | 'networkUrl'
-  | 'networkQuery';
-export type KernelTargetExistence = 'any' | 'mustExist' | 'mustNotExist';
-export type KernelToolTargetKind = 'file' | 'directory';
-export type KernelToolContentMode = 'none' | 'contentBlock' | 'replacementBlock';
-export type KernelToolOperationKind =
-  | 'fsRead'
-  | 'fsList'
-  | 'fsGlob'
-  | 'fsDiff'
-  | 'fsCreate'
-  | 'fsWrite'
-  | 'fsEdit'
-  | 'fsRename'
-  | 'fsDelete'
-  | 'fsEnsureDirectory'
-  | 'codeGrep'
-  | 'documentRead'
-  | 'gitStatus'
-  | 'gitDiff'
-  | 'gitStage'
-  | 'gitUnstage'
-  | 'gitCommit'
-  | 'gitPush'
-  | 'processExec'
-  | 'webSearch'
-  | 'webFetch'
-  | 'browserOpen'
-  | 'browserReload'
-  | 'browserSnapshot'
-  | 'browserInspect'
-  | 'browserClick'
-  | 'browserType'
-  | 'browserScroll'
-  | 'providerCall';
-
-export interface IsolationContract {
-  minimumLevel: IsolationLevel;
-  supportState: SandboxSupportState;
-  backendRequirement?: string;
-  profileRef?: string;
-  fallback: IsolationFallbackPolicy;
-  outputTrust: 'toolFact' | 'untrustedEvidence';
-}
-
-export interface SandboxCapabilitySnapshot {
-  schemaVersion: string;
-  backend: string;
-  supportState: SandboxSupportState;
-  executablePathRef?: string;
-  backendVersion?: string;
-  platform: string;
-  features: string[];
-  probeStatus: string;
-  probeDiagnostics: string[];
-  observedAt: string;
-}
-
-export interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: object;
-  riskLevel: 'low' | 'medium' | 'high' | 'critical';
-  needsApproval: boolean;
-  allowedModes: AgentMode[];
-  capability?: string;
-  family?: 'workspace' | 'document' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
-  operationKind?: string;
-  permissionMode?: 'allow' | 'ask' | 'deny' | string;
-  pathScopePolicy?: string;
-  executionMode?: 'execute' | 'previewOnly' | 'blocked' | string;
-  isolation?: IsolationContract;
-  readOnly?: boolean;
-  catalogVersion?: string;
-  catalogHash?: string;
-}
-
-export interface KernelToolCatalogTool {
-  toolId: string;
-  capability: string;
-  family: KernelToolFamily;
-  operationKind: KernelToolOperationKind;
-  providerSchema: object;
-  planningSchema: object;
-  providerVisible?: boolean;
-  forbiddenFields?: string[];
-  risk: KernelToolRiskLevel;
-  permissionMode: KernelToolPermissionMode;
-  permissionSummary?: string;
-  pathScopePolicy: KernelPathScopePolicy;
-  planTargetMode: KernelPlanTargetMode;
-  planTargetSource: KernelPlanTargetSource;
-  executionMode: KernelToolExecutionMode;
-  isolation: IsolationContract;
-  hardDenyRules?: string[];
-  needsWorkspace: boolean;
-  readOnly: boolean;
-  usageConstraints: ToolUsageConstraints;
-}
-
-export interface ToolUsageConstraints {
-  targetExistence: KernelTargetExistence;
-  sourceExistence?: KernelTargetExistence;
-  destinationExistence?: KernelTargetExistence;
-  targetKinds?: KernelToolTargetKind[];
-  contentMode: KernelToolContentMode;
-  directoryRecursiveRequired?: boolean;
-}
-
-export interface KernelToolCatalogSnapshot {
-  catalogVersion: string;
-  catalogHash: string;
-  tools: KernelToolCatalogTool[];
-}
-
-export interface ToolCall {
-  id: string;
-  name: string;
-  arguments: unknown;
-}
-
-export interface ToolResult {
-  callId: string;
-  ok: boolean;
-  output?: unknown;
-  error?: string;
-}
-
-export interface ToolExecutionRequest {
-  mode: AgentMode;
-  toolCall: ToolCall;
-  workspaceBinding?: AgentWorkspaceBinding;
-}
-
-export interface PermissionEvaluationRequest {
-  mode: AgentMode;
-  toolCall: ToolCall;
-  workspaceBinding?: AgentWorkspaceBinding;
-}
-
-export interface ListToolsResult {
-  tools: ToolDefinition[];
-  catalogVersion: string;
-  catalogHash: string;
-  toolCatalog: KernelToolCatalogSnapshot;
-}
-
-export interface FsReadInput {
-  path: string;
-  startLine?: number;
-  endLine?: number;
-}
-
-export interface FsContentInput {
-  path: string;
-  contentBlockId: string;
-}
-
-export interface FsDeleteInput {
-  path: string;
-  targetKind?: 'file' | 'directory';
-  recursive?: boolean;
-}
-
-export interface FsListInput {
-  path: string;
-  depth?: number;
-  includeHidden?: boolean;
-}
-
-export interface FsDiffInput {
-  path: string;
-  contentBlockId: string;
-}
-
-export interface FsGlobInput {
-  pattern: string;
-  path?: string;
-  maxResults?: number;
-}
-
-export interface FsEditInput {
-  path: string;
-  replacementBlockId: string;
-  patchSpec: Record<string, unknown>;
-}
-
-export interface FsRenameInput {
-  path: string;
-  destinationPath: string;
-}
+/**
+ * Host inspection DTOs. Agent-facing tool identity, schema, availability, and
+ * context are defined exclusively by kernelAbiV2 ToolInventory/ToolContext.
+ */
+import type { FileReadResult, FileTreeNode } from './files.js';
+import type { BrowsePathResult } from './workspace.js';
 
 export interface CodeGrepInput {
   query: string;
@@ -227,52 +15,16 @@ export interface CodeGrepInput {
   maxResults?: number;
 }
 
-export interface WebSearchInput {
-  query: string;
-  limit?: number;
-}
-
-export interface WebFetchInput {
-  url: string;
-  maxBytes?: number;
-}
-
 export interface GitDiffInput {
   path?: string;
   staged?: boolean;
 }
 
-export interface GitPathInput {
-  path?: string;
-  paths?: string[];
-}
-
-export interface GitCommitInput {
-  message: string;
-}
-
-export interface BrowserOpenInput {
-  url: string;
-}
-
-export interface BrowserSnapshotInput {
-  selector?: string;
-}
-
-export interface BrowserInspectInput {
-  inspectState?: string;
-}
-
-export interface BrowserSelectorInput {
-  selector: string;
-}
-
-export interface BrowserTypeInput extends BrowserSelectorInput {
-  text: string;
-}
-
-export interface BrowserScrollInput {
-  deltaY?: number;
+/** Raw Provider function-call frame; Session maps name to v2 ToolId. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: unknown;
 }
 
 export interface CodeGrepMatch {
@@ -321,4 +73,83 @@ export interface GitDiffResult {
   staged: boolean;
   diff: string;
   truncated: boolean;
+}
+
+/**
+ * Host-only inspection contract. These queries are never exposed as Kernel
+ * agent tools and cannot create a capability lease or an execution fact.
+ */
+export type KernelHostInspectionQuery =
+  | { kind: 'browse'; path?: string }
+  | { kind: 'list'; folderId?: string; path: string; depth: number }
+  | { kind: 'read'; folderId?: string; path: string }
+  | {
+      kind: 'grep';
+      folderId?: string;
+      query: string;
+      path: string;
+      include: string[];
+      exclude: string[];
+      strategy: 'literal' | 'regex';
+      contextLines: number;
+      maxResults: number;
+    }
+  | { kind: 'gitStatus' }
+  | { kind: 'gitDiff'; path?: string; staged: boolean };
+
+export type KernelHostInspectionOutput =
+  | { kind: 'browse'; data: BrowsePathResult }
+  | { kind: 'list'; data: FileTreeNode[] }
+  | { kind: 'read'; data: FileReadResult }
+  | { kind: 'grep'; data: CodeGrepResult }
+  | { kind: 'gitStatus'; data: GitStatusResult }
+  | { kind: 'gitDiff'; data: GitDiffResult };
+
+export interface KernelHostInspectionResult {
+  source: 'hostProjection';
+  output: KernelHostInspectionOutput;
+}
+
+export type KernelHostSkillRiskLevel = 'low' | 'medium' | 'high' | 'critical';
+
+export type KernelHostSkillEffect =
+  | 'readsWorkspace'
+  | 'writesWorkspace'
+  | 'createsWorkspace'
+  | 'deletesWorkspace'
+  | 'readsGit'
+  | 'runsProcess'
+  | 'usesNetwork'
+  | 'readsSecret'
+  | 'modifiesGit'
+  | 'pushesGit'
+  | 'controlsBrowser'
+  | 'modifiesKernel'
+  | 'modifiesConfig';
+
+export type KernelHostSkillSource =
+  | { kind: 'localPack'; packId: string }
+  | { kind: 'externalProcess'; program: string; argv: string[] }
+  | { kind: 'externalConnector'; connectorId: string };
+
+export interface KernelHostSkillDescriptor {
+  id: string;
+  version: string;
+  titleKey?: string;
+  descriptionKey?: string;
+  inputSchema: unknown;
+  outputSchema: unknown;
+  requiredCapabilities: string[];
+  allowedPhases: string[];
+  riskLevel: KernelHostSkillRiskLevel;
+  effects: KernelHostSkillEffect[];
+  source: KernelHostSkillSource;
+  adapterKind: 'declarative' | 'externalProcess' | 'mcp';
+  activationStatus: 'dormant' | 'registered';
+  requestedModelVisible: boolean;
+}
+
+export interface KernelHostSkillCatalogResult {
+  source: 'hostManagement';
+  skills: KernelHostSkillDescriptor[];
 }

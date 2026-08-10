@@ -1,36 +1,121 @@
 use deepcode_kernel_abi::{
-    KernelCommand, KernelCommandEnvelope, KernelEvent, KernelReply, RequestId,
+    is_valid_host_shell_capability_v2, HOST_SHELL_CAPABILITY_ENV_V2,
+    HOST_SHELL_CAPABILITY_HEADER_V2,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+use std::fmt;
+use std::time::Duration;
 use thiserror::Error;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as UnixCommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as WindowsCommandExt;
-
+mod agent;
+mod agent_projection;
 mod bootstrap;
-mod session_bridge;
+mod v2;
 
-pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
-use session_bridge::run_session_host_bridge;
-pub use session_bridge::{
-    session_host_bridge_hint, session_host_bridge_path, terminal_workspace_scope, AgentRunResult,
+pub use agent::{
+    terminal_workspace_scope, AgentInputAttachmentKindV2, AgentInputAttachmentScopeV2,
+    AgentInputAttachmentV2, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
     AgentRunStatus, AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
-    ListAgentSessionsRequest, SessionHostBridgeRequest, SessionHostBridgeResult,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+};
+pub use agent_projection::{
+    reduce_agent_timeline_stream_event, AgentProjectionValidationError, AgentTimelineAttachment,
+    AgentTimelineAttachmentKind, AgentTimelineAttachmentScope, AgentTimelineBlock,
+    AgentTimelineBlockKind, AgentTimelineCheckpointKind, AgentTimelineCurrentActivity,
+    AgentTimelineCurrentActivityCode, AgentTimelineDecisionRequest, AgentTimelineDecisionSource,
+    AgentTimelineDeliveryMode, AgentTimelineDelta, AgentTimelineDisplayDensity,
+    AgentTimelineDisplayHints, AgentTimelineDurability, AgentTimelineEntryRole,
+    AgentTimelineEvidenceMode, AgentTimelineExecutionPhase, AgentTimelineInteractionKind,
+    AgentTimelineInteractionOption, AgentTimelineInteractionProjection,
+    AgentTimelineInteractionState, AgentTimelineInteractionView, AgentTimelineLanguage,
+    AgentTimelineLanguageBinding, AgentTimelineLanguageBindingStatus, AgentTimelineLocalizedText,
+    AgentTimelineNarrativeKind, AgentTimelineNullableCurrentActivity,
+    AgentTimelineNullableTaskOutcome, AgentTimelineNullableWait,
+    AgentTimelineNullableWorkAttention, AgentTimelinePendingInteraction,
+    AgentTimelinePendingPermission, AgentTimelinePendingPlan, AgentTimelinePermissionRequestKind,
+    AgentTimelinePermissionRequestView, AgentTimelineProjectionReplacement,
+    AgentTimelineProvenance, AgentTimelineProvenanceAuthority, AgentTimelineProvenanceOrigin,
+    AgentTimelineProviderPhase, AgentTimelineResourcePresentation,
+    AgentTimelineResourcePresentationKind, AgentTimelineRiskLevel,
+    AgentTimelineRootProjectionReplacements, AgentTimelineRunPhase, AgentTimelineRunProjection,
+    AgentTimelineRunStatus, AgentTimelineSelectedDecision, AgentTimelineSnapshot,
+    AgentTimelineStatus, AgentTimelineStreamEvent, AgentTimelineStreamReduction,
+    AgentTimelineStructuredProjection, AgentTimelineStructuredProjectionItem,
+    AgentTimelineStructuredProjectionKind, AgentTimelineStructuredProjectionSection,
+    AgentTimelineTaskOutcome, AgentTimelineTaskProgress, AgentTimelineTaskProjection,
+    AgentTimelineTaskProjectionItem, AgentTimelineTaskSettlementKind,
+    AgentTimelineTokenUsageProjection, AgentTimelineTokenUsageRequest,
+    AgentTimelineTokenUsageTotals, AgentTimelineTurn, AgentTimelineTurnPart, AgentTimelineWait,
+    AgentTimelineWaitKind, AgentTimelineWorkAttention, AgentTimelineWorkAttentionKind,
+    AgentTimelineWorkAttentionStatus, AgentTimelineWorkOperation,
+    AgentTimelineWorkOperationAttempt, AgentTimelineWorkOperationStatus, AgentTimelineWorkSegment,
+    AgentTimelineWorkSegmentLifecycle, AgentTimelineWorkspaceProjection,
+    AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
+    AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+};
+
+const AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+pub struct AgentTimelineSseStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    pending: VecDeque<AgentTimelineStreamEvent>,
+    ended: bool,
+}
+
+impl AgentTimelineSseStream {
+    pub async fn next_event(&mut self) -> KernelClientResult<Option<AgentTimelineStreamEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.ended {
+                if self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    return Err(KernelClientError::Api(
+                        "timeline SSE ended with an incomplete event".to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
+            match self.response.chunk().await? {
+                Some(chunk) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    self.consume_complete_events()?;
+                    if self.buffer.len() > AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES {
+                        return Err(KernelClientError::Api(
+                            "timeline SSE event exceeds the client buffer limit".to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    self.ended = true;
+                }
+            }
+        }
+    }
+
+    fn consume_complete_events(&mut self) -> KernelClientResult<()> {
+        while let Some((boundary, separator_len)) = sse_event_boundary(&self.buffer) {
+            if boundary > AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES {
+                return Err(KernelClientError::Api(
+                    "timeline SSE event exceeds the client buffer limit".to_string(),
+                ));
+            }
+            let raw = self.buffer[..boundary].to_vec();
+            self.buffer.drain(..boundary + separator_len);
+            if let Some(event) = decode_timeline_sse_event(&raw)? {
+                self.pending.push_back(event);
+            }
+        }
+        Ok(())
+    }
+}
+pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
+pub use v2::{
+    KernelV2ClientError, KernelV2ClientResult, KernelV2HttpErrorCode, SessionKernelV2Client,
 };
 
 #[derive(Debug, Error)]
@@ -39,21 +124,73 @@ pub enum KernelClientError {
     Http(#[from] reqwest::Error),
     #[error("daemon returned error: {0}")]
     Api(String),
+    #[error("daemon returned error: {code}: {message}")]
+    HostCallerMutation {
+        code: String,
+        message: String,
+        disposition: Option<HostCallerMutationDispositionV2>,
+    },
     #[error("daemon response decode failed: {0}")]
     Decode(#[from] serde_json::Error),
-    #[error("daemon response is missing field: {0}")]
-    MissingField(&'static str),
-    #[error("session host bridge failed: {0}")]
-    Bridge(String),
+    #[error(
+        "Host shell admission capability is required through the v2 environment or KernelBootstrapOptions"
+    )]
+    HostAdmissionCapabilityMissing,
+    #[error("Host shell admission capability does not use the required v2 format")]
+    HostAdmissionCapabilityInvalid,
+    #[error("daemon at {base_url} rejected the Host shell admission capability")]
+    HostAdmissionRejected { base_url: String },
+    #[error("daemon at {base_url} is unavailable: {reason}")]
+    DaemonUnavailable { base_url: String, reason: String },
     #[error("kernel bootstrap failed: {0}")]
     Bootstrap(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCallerMutationDispositionV2 {
+    Rejected,
+    Pending,
+    Indeterminate,
+}
+
 pub type KernelClientResult<T> = Result<T, KernelClientError>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+struct HostShellCapabilityV2(String);
+
+impl fmt::Debug for HostShellCapabilityV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostShellCapabilityV2([REDACTED])")
+    }
+}
+
+impl HostShellCapabilityV2 {
+    fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn expose_to_transport(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone)]
 pub struct KernelClientConfig {
     pub base_url: String,
+    host_shell_capability: Option<HostShellCapabilityV2>,
+}
+
+impl fmt::Debug for KernelClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelClientConfig")
+            .field("base_url", &self.base_url)
+            .field(
+                "host_shell_capability",
+                &self.host_shell_capability.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl KernelClientConfig {
@@ -69,7 +206,32 @@ impl KernelClientConfig {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            host_shell_capability: std::env::var(HOST_SHELL_CAPABILITY_ENV_V2)
+                .ok()
+                .map(HostShellCapabilityV2::new),
         }
+    }
+
+    pub fn with_host_shell_capability(mut self, capability: impl Into<String>) -> Self {
+        self.host_shell_capability = Some(HostShellCapabilityV2::new(capability));
+        self
+    }
+
+    pub(crate) fn has_host_shell_capability(&self) -> bool {
+        self.host_shell_capability.is_some()
+    }
+
+    pub(crate) fn validate_host_shell_capability(&self) -> KernelClientResult<()> {
+        if self
+            .host_shell_capability
+            .as_ref()
+            .is_some_and(|capability| {
+                !is_valid_host_shell_capability_v2(capability.expose_to_transport())
+            })
+        {
+            return Err(KernelClientError::HostAdmissionCapabilityInvalid);
+        }
+        Ok(())
     }
 }
 
@@ -77,50 +239,45 @@ impl KernelClientConfig {
 pub struct HttpKernelClient {
     config: KernelClientConfig,
     http: reqwest::Client,
+    stream_http: reqwest::Client,
 }
 
 impl HttpKernelClient {
-    pub fn new(config: KernelClientConfig) -> Self {
-        Self {
+    pub fn new(mut config: KernelClientConfig) -> KernelClientResult<Self> {
+        config.validate_host_shell_capability()?;
+        let capability = config
+            .host_shell_capability
+            .as_ref()
+            .ok_or(KernelClientError::HostAdmissionCapabilityMissing)?;
+        let mut capability_header = HeaderValue::from_str(capability.expose_to_transport())
+            .map_err(|_| KernelClientError::HostAdmissionCapabilityInvalid)?;
+        capability_header.set_sensitive(true);
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            HeaderName::from_static(HOST_SHELL_CAPABILITY_HEADER_V2),
+            capability_header,
+        );
+        let stream_http = reqwest::Client::builder()
+            .default_headers(default_headers.clone())
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .default_headers(default_headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?;
+        config.host_shell_capability = None;
+        Ok(Self {
             config,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        }
+            http,
+            stream_http,
+        })
     }
 
     pub fn base_url(&self) -> &str {
         &self.config.base_url
-    }
-
-    pub async fn kernel_command(&self, command: KernelCommand) -> KernelClientResult<KernelReply> {
-        self.kernel_command_envelope(KernelCommandEnvelope::new(command))
-            .await
-    }
-
-    pub async fn kernel_command_envelope(
-        &self,
-        envelope: KernelCommandEnvelope,
-    ) -> KernelClientResult<KernelReply> {
-        let reply = self
-            .http
-            .post(self.url("/api/kernel/commands"))
-            .json(&envelope)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<KernelReply>()
-            .await?;
-        if !reply.ok {
-            let message = reply
-                .error
-                .as_ref()
-                .map(|error| error.message.as_str())
-                .unwrap_or("Kernel command failed");
-            return Err(KernelClientError::Api(message.to_owned()));
-        }
-        Ok(reply)
     }
 
     pub async fn health(&self) -> KernelClientResult<DaemonStatus> {
@@ -148,7 +305,21 @@ impl HttpKernelClient {
         self.health().await
     }
 
-    pub async fn agent_timeline(&self, session_id: &str) -> KernelClientResult<Value> {
+    pub async fn agent_timeline_v2(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<AgentTimelineSnapshot> {
+        self.agent_timeline_v2_optional(session_id)
+            .await?
+            .ok_or_else(|| {
+                KernelClientError::Api("Session v2 public timeline is not available".to_string())
+            })
+    }
+
+    pub async fn agent_timeline_v2_optional(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<Option<AgentTimelineSnapshot>> {
         let value = self
             .http
             .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline")))
@@ -157,7 +328,58 @@ impl HttpKernelClient {
             .error_for_status()?
             .json::<Value>()
             .await?;
-        api_data(value)
+        if value.get("ok").and_then(Value::as_bool) == Some(false)
+            && value.get("error").and_then(Value::as_str) == Some("agent_timeline_unavailable")
+        {
+            return Ok(None);
+        }
+        let value = api_data(value)?;
+        agent_projection::reject_private_projection_fields(&value)
+            .map_err(|error| KernelClientError::Api(error.to_string()))?;
+        let timeline = serde_json::from_value::<AgentTimelineSnapshot>(value)?;
+        timeline
+            .validate()
+            .map_err(|error| KernelClientError::Api(error.to_string()))?;
+        Ok(Some(timeline))
+    }
+
+    pub async fn agent_timeline_stream_v2(
+        &self,
+        session_id: &str,
+        after_revision: Option<u64>,
+    ) -> KernelClientResult<AgentTimelineSseStream> {
+        let response = self
+            .stream_http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline/stream")))
+            .query(
+                &after_revision
+                    .map(|revision| [("afterRevision", revision)])
+                    .unwrap_or_default(),
+            )
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(KernelClientError::Api(
+                "timeline stream did not return text/event-stream".to_string(),
+            ));
+        }
+        Ok(AgentTimelineSseStream {
+            response,
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            ended: false,
+        })
     }
 
     pub async fn list_agent_sessions(
@@ -301,24 +523,7 @@ impl HttpKernelClient {
     ) -> KernelClientResult<AgentSessionResult> {
         let value = self
             .http
-            .get(self.url(&format!("/api/agent/sessions/{session_id}/events")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data(value)
-    }
-
-    pub async fn append_agent_events(
-        &self,
-        session_id: &str,
-        events: Vec<Value>,
-    ) -> KernelClientResult<AgentSessionResult> {
-        let value = self
-            .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/events")))
-            .json(&json!({ "events": events }))
+            .get(self.url(&format!("/api/agent/sessions/{session_id}")))
             .send()
             .await?
             .error_for_status()?
@@ -332,6 +537,7 @@ impl HttpKernelClient {
         session_id: &str,
         request: StartAgentRunRequest,
     ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
         let value = self
             .http
             .post(self.url(&format!("/api/agent/sessions/{session_id}/runs")))
@@ -360,17 +566,34 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
+    pub async fn active_agent_run(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<Option<AgentRunResult>> {
+        let value = self
+            .http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/active-run")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
     pub async fn cancel_agent_run_by_id(
         &self,
         session_id: &str,
         run_id: &str,
+        request: AgentRunCallerRequest,
     ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
         let value = self
             .http
             .post(self.url(&format!(
                 "/api/agent/sessions/{session_id}/runs/{run_id}/cancel"
             )))
-            .json(&json!({}))
+            .json(&request)
             .send()
             .await?
             .error_for_status()?
@@ -383,118 +606,25 @@ impl HttpKernelClient {
         &self,
         session_id: &str,
         run_id: &str,
-        guidance: impl Into<String>,
-        attachments: Vec<Value>,
+        request: AgentRunGuidanceRequest,
     ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
         let value = self
             .http
             .post(self.url(&format!(
                 "/api/agent/sessions/{session_id}/runs/{run_id}/guidance"
             )))
-            .json(&json!({
-                "guidance": guidance.into(),
-                "attachments": attachments,
-            }))
+            .json(&request)
             .send()
             .await?
             .error_for_status()?
             .json::<Value>()
             .await?;
-        decode_api_data(value)
-    }
-
-    pub async fn cancel_agent_run(
-        &self,
-        session_id: &str,
-    ) -> KernelClientResult<AgentSessionResult> {
-        let value = self
-            .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/cancel")))
-            .json(&json!({}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data(value)
-    }
-
-    pub async fn resolve_permission(
-        &self,
-        permission_id: &str,
-        decision: PermissionDecision,
-    ) -> KernelClientResult<Value> {
-        let response = self
-            .http
-            .post(self.url(&format!("/api/agent/permissions/{permission_id}/resolve")))
-            .json(&json!({
-                "decision": decision.as_str(),
-                "approved": matches!(decision, PermissionDecision::Allow),
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        api_data(response)
-    }
-
-    pub fn run_session_host_bridge(
-        &self,
-        mut request: SessionHostBridgeRequest,
-    ) -> KernelClientResult<SessionHostBridgeResult> {
-        request.api_base = Some(self.config.base_url.clone());
-        run_session_host_bridge(request, None)
-    }
-
-    pub fn run_session_host_bridge_with_cancel(
-        &self,
-        mut request: SessionHostBridgeRequest,
-        cancel_requested: Arc<AtomicBool>,
-    ) -> KernelClientResult<SessionHostBridgeResult> {
-        request.api_base = Some(self.config.base_url.clone());
-        run_session_host_bridge(request, Some(cancel_requested))
-    }
-
-    pub async fn audit_verify(&self) -> KernelClientResult<AuditVerifyResult> {
-        let request_id = RequestId(format!(
-            "client-audit-verify-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let command = KernelCommand::AuditVerify {
-            request_id,
-            scope: json!({ "kind": "all" }),
-        };
-        decode_audit_verify(self.kernel_command(command).await?)
+        decode_api_data_with_code(value)
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.config.base_url, path)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditVerifyResult {
-    pub status: String,
-    pub degraded: bool,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PermissionDecision {
-    Allow,
-    Deny,
-}
-
-impl PermissionDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PermissionDecision::Allow => "allow",
-            PermissionDecision::Deny => "deny",
-        }
     }
 }
 
@@ -524,37 +654,88 @@ fn decode_api_data_with_code<T: DeserializeOwned>(value: Value) -> KernelClientR
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown daemon error");
-        return Err(KernelClientError::Api(format!("{code}: {message}")));
+        let disposition = match (
+            value.pointer("/data/schemaVersion").and_then(Value::as_str),
+            value.pointer("/data/disposition").and_then(Value::as_str),
+        ) {
+            (Some("deepcode.host.caller-mutation-error.v2"), Some("rejected")) => {
+                Some(HostCallerMutationDispositionV2::Rejected)
+            }
+            (Some("deepcode.host.caller-mutation-error.v2"), Some("pending")) => {
+                Some(HostCallerMutationDispositionV2::Pending)
+            }
+            (Some("deepcode.host.caller-mutation-error.v2"), Some("indeterminate")) => {
+                Some(HostCallerMutationDispositionV2::Indeterminate)
+            }
+            _ => None,
+        };
+        return Err(KernelClientError::HostCallerMutation {
+            code: code.to_string(),
+            message: message.to_string(),
+            disposition,
+        });
     }
     decode_api_data(value)
 }
 
-fn decode_audit_verify(reply: KernelReply) -> KernelClientResult<AuditVerifyResult> {
-    for event in reply.events {
-        let KernelEvent::AuditVerifyCompleted { ok, report, .. } = event else {
-            continue;
-        };
-        let message = report
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or(if ok {
-                "audit chain verified"
-            } else {
-                "audit chain verification failed"
-            })
-            .to_string();
-        return Ok(AuditVerifyResult {
-            status: if ok { "verified" } else { "failed" }.to_string(),
-            degraded: report
-                .get("degraded")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            message,
-        });
+fn sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
     }
-    Err(KernelClientError::MissingField(
-        "events[].audit.verify_completed",
-    ))
+}
+
+fn decode_timeline_sse_event(raw: &[u8]) -> KernelClientResult<Option<AgentTimelineStreamEvent>> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| KernelClientError::Api("timeline SSE event is not valid UTF-8".to_string()))?;
+    let mut event_name = None;
+    let mut data = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line, ""));
+        match field {
+            "event" => event_name = Some(value),
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let event_name = event_name.ok_or_else(|| {
+        KernelClientError::Api("timeline SSE event has no explicit type".to_string())
+    })?;
+    if !matches!(event_name, "snapshot" | "delta") {
+        return Err(KernelClientError::Api(format!(
+            "timeline SSE returned unsupported event type {event_name}"
+        )));
+    }
+    let event = serde_json::from_str::<AgentTimelineStreamEvent>(&data.join("\n"))?;
+    event
+        .validate()
+        .map_err(|error| KernelClientError::Api(error.to_string()))?;
+    match (&event, event_name) {
+        (AgentTimelineStreamEvent::Snapshot { .. }, "snapshot")
+        | (AgentTimelineStreamEvent::Delta { .. }, "delta") => Ok(Some(event)),
+        _ => Err(KernelClientError::Api(
+            "timeline SSE event name does not match its typed envelope".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -568,25 +749,49 @@ mod tests {
     }
 
     #[test]
-    fn decodes_real_audit_verify_event() {
-        let result = decode_audit_verify(KernelReply {
-            ok: true,
-            events: vec![KernelEvent::AuditVerifyCompleted {
-                request_id: Some(RequestId("req-audit".to_string())),
-                ok: true,
-                report: json!({
-                    "degraded": true,
-                    "message": "audit chain verified"
-                }),
-                sequence: None,
-            }],
-            snapshot: None,
-            error: None,
-        })
-        .expect("decode audit verification result");
+    fn host_shell_capability_debug_output_is_redacted() {
+        let capability = format!("dchostv2_{}", "a".repeat(64));
+        let config = KernelClientConfig::new("http://127.0.0.1:31245")
+            .with_host_shell_capability(capability.clone());
+        let debug = format!("{config:?}");
 
-        assert_eq!(result.status, "verified");
-        assert!(result.degraded);
-        assert_eq!(result.message, "audit chain verified");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&capability));
+    }
+
+    #[test]
+    fn host_shell_capability_is_required_and_validated() {
+        let missing = KernelClientConfig {
+            base_url: "http://127.0.0.1:31245".to_owned(),
+            host_shell_capability: None,
+        };
+        assert!(matches!(
+            HttpKernelClient::new(missing),
+            Err(KernelClientError::HostAdmissionCapabilityMissing)
+        ));
+
+        let invalid = KernelClientConfig {
+            base_url: "http://127.0.0.1:31245".to_owned(),
+            host_shell_capability: Some(HostShellCapabilityV2::new("short")),
+        };
+        assert!(matches!(
+            HttpKernelClient::new(invalid),
+            Err(KernelClientError::HostAdmissionCapabilityInvalid)
+        ));
+    }
+
+    #[test]
+    fn session_kernel_v2_client_rejects_non_loopback_origins() {
+        let run_capability =
+            deepcode_kernel_abi::RunCapabilityV2::new("run-capability-secret-0001")
+                .expect("valid run capability");
+
+        assert!(matches!(
+            SessionKernelV2Client::new(
+                KernelClientConfig::new("https://example.com"),
+                run_capability
+            ),
+            Err(KernelV2ClientError::InvalidBaseUrl)
+        ));
     }
 }

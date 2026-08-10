@@ -11,6 +11,7 @@ export interface DeepCodeCacheHitSummary {
 interface DeepCodeTitlebarProps {
   language: UiLanguage;
   apiStatus: string;
+  agentReady: boolean;
   cacheHitSummary: DeepCodeCacheHitSummary | null;
   kernelStartBusy: boolean;
   kernelStartMessage?: string | null;
@@ -20,6 +21,7 @@ interface DeepCodeTitlebarProps {
 const DeepCodeTitlebar: React.FC<DeepCodeTitlebarProps> = ({
   language,
   apiStatus,
+  agentReady,
   cacheHitSummary,
   kernelStartBusy,
   kernelStartMessage,
@@ -54,6 +56,9 @@ const DeepCodeTitlebar: React.FC<DeepCodeTitlebarProps> = ({
       )}
       <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${apiStatus}`}>
         API {statusLabel(language, apiStatus)}
+      </span>
+      <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${agentReady ? 'ready' : 'checking'}`}>
+        Agent {statusLabel(language, agentReady ? 'ready' : 'checking')}
       </span>
     </div>
     <WindowControls language={language} />

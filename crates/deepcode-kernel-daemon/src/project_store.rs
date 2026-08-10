@@ -44,13 +44,18 @@ pub(crate) async fn agent_project_create(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let binding = match root_path {
-        Some(path) => match resolve_project_binding(&state.runtime, path) {
-            Ok(binding) => Some(binding),
+    let binding_change = match root_path {
+        Some(path) => match state
+            .host_services
+            .workspace
+            .begin_project_binding(None, path)
+        {
+            Ok(change) => Some(change),
             Err(error) => return ApiResponse::error(error.code, error.message),
         },
         None => None,
     };
+    let binding = binding_change.as_ref().map(|change| change.value.clone());
     let now = now_text();
     let id = format!("project-{}", now_millis());
     let default_title = root_path
@@ -71,7 +76,12 @@ pub(crate) async fn agent_project_create(
     gui.projects.insert(0, project.clone());
     if let Err(error) = persist_agent_projects(&gui) {
         gui.projects.remove(0);
-        return ApiResponse::error("agent_project_persist_failed", error);
+        let message = rollback_project_binding_after_persist_failure(
+            &state.host_services.workspace,
+            binding_change,
+            error,
+        );
+        return ApiResponse::error("agent_project_persist_failed", message);
     }
     ApiResponse::ok(json!({ "project": project }))
 }
@@ -116,23 +126,43 @@ pub(crate) async fn agent_project_rebind(
     else {
         return ApiResponse::error("project_root_required", "project root path is required");
     };
-    let binding = match resolve_project_binding(&state.runtime, root_path) {
-        Ok(binding) => binding,
+    let existing_binding = {
+        let gui = state.gui.lock().expect("gui state lock");
+        let Some(project) = project_by_id(&gui, &project_id) else {
+            return ApiResponse::error("agent_project_not_found", "agent project not found");
+        };
+        project_workspace_binding(project)
+    };
+    let binding_change = match state
+        .host_services
+        .workspace
+        .begin_project_binding(existing_binding.as_ref(), root_path)
+    {
+        Ok(change) => change,
         Err(error) => return ApiResponse::error(error.code, error.message),
     };
     let mut gui = state.gui.lock().expect("gui state lock");
     let previous_projects = gui.projects.clone();
     let Some(project) = project_mut(&mut gui, &project_id) else {
+        let _ = state
+            .host_services
+            .workspace
+            .rollback_project_binding(binding_change);
         return ApiResponse::error("agent_project_not_found", "agent project not found");
     };
     project["kind"] = json!("folder");
-    project["workspaceBinding"] = binding;
+    project["workspaceBinding"] = binding_change.value.clone();
     project["rootStatus"] = json!("ready");
     project["updatedAt"] = json!(now_text());
     let result = project.clone();
     if let Err(error) = persist_agent_projects(&gui) {
         gui.projects = previous_projects;
-        return ApiResponse::error("agent_project_persist_failed", error);
+        let message = rollback_project_binding_after_persist_failure(
+            &state.host_services.workspace,
+            Some(binding_change),
+            error,
+        );
+        return ApiResponse::error("agent_project_persist_failed", message);
     }
     ApiResponse::ok(json!({ "project": result }))
 }
@@ -162,11 +192,13 @@ pub(crate) async fn agent_project_delete(
             session["updatedAt"] = json!(now_text());
         }
     }
-    if let Err(error) = persist_agent_projects(&gui).and_then(|_| persist_session_index(&gui)) {
+    if let Err(error) = persist_agent_projects(&gui)
+        .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
+    {
         gui.projects = previous_projects;
         gui.sessions = previous_sessions;
         let rollback_error = persist_agent_projects(&gui)
-            .and_then(|_| persist_session_index(&gui))
+            .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
             .err();
         let message = rollback_error
             .map(|rollback| format!("{error}; rollback failed: {rollback}"))
@@ -195,37 +227,23 @@ pub(crate) fn project_workspace_binding(project: &Value) -> Option<Value> {
         .cloned()
 }
 
-pub(crate) fn resolve_project_binding(
-    runtime: &SharedRuntime,
-    root_path: &str,
-) -> Result<Value, KernelErrorEnvelope> {
-    let result = dispatch_workspace_result(
-        runtime,
-        KernelCommand::HostWorkspaceBindingResolve {
-            request_id: rid(&format!("project-binding-{}", now_millis())),
-            path: root_path.to_string(),
-        },
-    )
-    .map_err(|error| KernelErrorEnvelope {
-        code: "project_root_unavailable".to_string(),
-        message: format!("project workspace root is unavailable: {}", error.message),
-        message_key: None,
-        args: None,
-    })?;
-    let HostWorkspaceOutput::BindingResolved(output) = result.output else {
-        return Err(KernelErrorEnvelope {
-            code: "project_root_unavailable".to_string(),
-            message: "Kernel did not return a workspace binding".to_string(),
-            message_key: None,
-            args: None,
-        });
+fn rollback_project_binding_after_persist_failure(
+    workspace: &HostWorkspaceService,
+    change: Option<HostProjectBindingChange>,
+    persist_error: String,
+) -> String {
+    let Some(change) = change else {
+        return persist_error;
     };
-    serde_json::to_value(output.workspace_binding).map_err(|error| KernelErrorEnvelope {
-        code: "project_workspace_binding_encoding_failed".to_string(),
-        message: error.to_string(),
-        message_key: None,
-        args: None,
-    })
+    match workspace.rollback_project_binding(change) {
+        Ok(()) => persist_error,
+        Err(rollback_error) => {
+            format!(
+                "{persist_error}; workspace registry rollback failed: {}",
+                rollback_error.message
+            )
+        }
+    }
 }
 
 pub(crate) fn set_project_root_status(state: &AppState, project_id: &str, status: &str) {
@@ -239,184 +257,4 @@ pub(crate) fn set_project_root_status(state: &AppState, project_id: &str, status
     project["rootStatus"] = json!(status);
     project["updatedAt"] = json!(now_text());
     let _ = persist_agent_projects(&gui);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct TestRoot(PathBuf);
-
-    impl Drop for TestRoot {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[tokio::test]
-    async fn project_store_owns_binding_and_rebind_only_updates_future_sessions() {
-        let root = std::env::temp_dir().join(format!(
-            "deepcode-project-store-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        let first_workspace = root.join("first-workspace");
-        let second_workspace = root.join("second-workspace");
-        fs::create_dir_all(&first_workspace).expect("create first workspace");
-        fs::create_dir_all(&second_workspace).expect("create second workspace");
-        let _test_root = TestRoot(root.clone());
-        let state = test_state(&root);
-
-        let created = agent_project_create(
-            State(state.clone()),
-            Json(json!({
-                "title": "Folder project",
-                "rootPath": first_workspace
-            })),
-        )
-        .await
-        .0;
-        assert!(created.ok);
-        let project = created
-            .data
-            .as_ref()
-            .and_then(|data| data.get("project"))
-            .cloned()
-            .expect("created project");
-        let project_id = project["id"].as_str().expect("project id").to_string();
-        let first_hash = project["workspaceBinding"]["workspaceHash"]
-            .as_str()
-            .expect("first workspace hash")
-            .to_string();
-
-        let first_session = agent_session_create(
-            State(state.clone()),
-            Json(json!({
-                "projectId": project_id,
-                "workspaceId": "client-conflict",
-                "workspaceHash": "client-conflict"
-            })),
-        )
-        .await
-        .0;
-        assert!(first_session.ok);
-        let first_session = first_session
-            .data
-            .as_ref()
-            .and_then(|data| data.get("session"))
-            .cloned()
-            .expect("first session");
-        assert_eq!(
-            first_session["workspaceHash"].as_str(),
-            Some(first_hash.as_str())
-        );
-        assert_ne!(
-            first_session["workspaceId"].as_str(),
-            Some("client-conflict")
-        );
-        assert_ne!(
-            first_session["workspaceScopeKey"].as_str(),
-            Some("unbound-workspace")
-        );
-
-        let rebound = agent_project_rebind(
-            State(state.clone()),
-            Path(project_id.clone()),
-            Json(json!({ "rootPath": second_workspace })),
-        )
-        .await
-        .0;
-        assert!(rebound.ok);
-        let second_hash = rebound
-            .data
-            .as_ref()
-            .and_then(|data| data.get("project"))
-            .and_then(|project| project.get("workspaceBinding"))
-            .and_then(|binding| binding.get("workspaceHash"))
-            .and_then(Value::as_str)
-            .expect("second workspace hash")
-            .to_string();
-        assert_ne!(first_hash, second_hash);
-        assert_eq!(
-            first_session["workspaceHash"].as_str(),
-            Some(first_hash.as_str())
-        );
-
-        let second_session = agent_session_create(
-            State(state.clone()),
-            Json(json!({ "projectId": project_id })),
-        )
-        .await
-        .0;
-        let second_session = second_session
-            .data
-            .as_ref()
-            .and_then(|data| data.get("session"))
-            .expect("second session");
-        assert_eq!(
-            second_session["workspaceHash"].as_str(),
-            Some(second_hash.as_str())
-        );
-
-        let stored = restore_agent_projects(&root.join("projects.json"));
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0]["id"].as_str(), Some(project_id.as_str()));
-
-        let deleted = agent_project_delete(State(state), Path(project_id)).await.0;
-        assert!(deleted.ok);
-        assert!(first_workspace.is_dir());
-        assert!(second_workspace.is_dir());
-    }
-
-    #[test]
-    fn project_binding_rejects_files() {
-        let root = std::env::temp_dir().join(format!(
-            "deepcode-project-binding-file-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&root).expect("create root");
-        let _test_root = TestRoot(root.clone());
-        let file = root.join("not-a-directory.txt");
-        fs::write(&file, "text").expect("write file");
-        let runtime = Arc::new(Mutex::new(DeepCodeKernelRuntime::new()));
-        let error = resolve_project_binding(&runtime, &file.to_string_lossy())
-            .expect_err("file binding must fail");
-        assert_eq!(error.code, "project_root_unavailable");
-    }
-
-    fn test_state(root: &FsPath) -> AppState {
-        let paths = HostPaths {
-            settings_path: root.join("settings.json"),
-            llm_profiles_path: root.join("profiles.json"),
-            llm_secrets_path: root.join("secrets.json"),
-            workflow_config_path: root.join("workflow.json"),
-            projects_path: root.join("projects.json"),
-            sessions_index_path: root.join("agent-sessions.json"),
-            sessions_dir: root.join("sessions"),
-            conversation_archives_dir: root.join("archives"),
-            memory_archives_dir: root.join("memory"),
-        };
-        AppState {
-            runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
-            gui: Arc::new(Mutex::new(GuiState {
-                paths,
-                user_settings: json!({}),
-                llm_profiles: json!({}),
-                workflow_config: json!({}),
-                projects: Vec::new(),
-                sessions: Vec::new(),
-                current_session_id: None,
-                current_session_ids_by_scope: HashMap::new(),
-                session_projection_cache: HashMap::new(),
-                session_timeline_cache: HashMap::new(),
-                trace_events: HashMap::new(),
-            })),
-            terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
-            kernel_events: Arc::new(Mutex::new(Vec::new())),
-            session_runs: Arc::new(Mutex::new(HashMap::new())),
-            session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
-            projection_delivery: Arc::new(Mutex::new(ProjectionDeliveryBufferState::default())),
-        }
-    }
 }

@@ -23,9 +23,19 @@ SMOKE_SUITE_IDS = [
     "session.smoke.communication",
     "session.smoke.tools",
     "session.smoke.paths",
-    "session.smoke.authorization",
+    "session.smoke.loop",
 ]
-ALL_SUITE_IDS = ["repository.static", "repository.required", *SMOKE_SUITE_IDS]
+REQUIRED_SUITE_IDS = [
+    "repository.required",
+    "kernel.v2.contracts",
+    "session.v2.contracts",
+    "host.v2.integration",
+]
+ALL_SUITE_IDS = ["repository.static", *REQUIRED_SUITE_IDS, *SMOKE_SUITE_IDS]
+TEST_NOTICE = (
+    "[NOTICE] test.sh results are supporting evidence only; they are not fully "
+    "trusted and do not constitute final acceptance."
+)
 
 
 def load_controller():
@@ -52,7 +62,7 @@ def assert_registry_and_selection(controller) -> None:
 
     default_args = argparse.Namespace(profile=None, suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, default_args)
-    assert suite_ids == ["repository.required"]
+    assert suite_ids == REQUIRED_SUITE_IDS
     assert selected_by == "profile:required"
 
     static_args = argparse.Namespace(profile="static", suite=None)
@@ -67,7 +77,7 @@ def assert_registry_and_selection(controller) -> None:
 
     full_args = argparse.Namespace(profile="full", suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, full_args)
-    assert suite_ids == ["repository.required", *SMOKE_SUITE_IDS]
+    assert suite_ids == [*REQUIRED_SUITE_IDS, *SMOKE_SUITE_IDS]
     assert selected_by == "profile:full"
 
     weakened = copy.deepcopy(data)
@@ -98,7 +108,7 @@ def assert_registry_and_selection(controller) -> None:
         raise AssertionError("self-declared test review model was accepted")
 
     omitted = copy.deepcopy(data)
-    omitted["profiles"]["required"]["suites"] = ["repository.static"]
+    omitted["profiles"]["required"]["suites"] = ["repository.required"]
     try:
         controller.validate_registry(omitted, ROOT)
     except controller.ControllerError as error:
@@ -115,18 +125,18 @@ def assert_registry_and_selection(controller) -> None:
     else:
         raise AssertionError("optional suite in required profile was accepted")
 
-    authoritative_smoke = copy.deepcopy(data)
-    for suite in authoritative_smoke["suites"]:
+    required_gate_smoke = copy.deepcopy(data)
+    for suite in required_gate_smoke["suites"]:
         if suite["id"] == SMOKE_SUITE_IDS[0]:
             suite["requiredGate"] = True
             break
-    authoritative_smoke["profiles"]["required"]["suites"].append(SMOKE_SUITE_IDS[0])
+    required_gate_smoke["profiles"]["required"]["suites"].append(SMOKE_SUITE_IDS[0])
     try:
-        controller.validate_registry(authoritative_smoke, ROOT)
+        controller.validate_registry(required_gate_smoke, ROOT)
     except controller.ControllerError as error:
         assert "smoke suites cannot be requiredGate" in str(error)
     else:
-        raise AssertionError("authoritative smoke suite was accepted")
+        raise AssertionError("required-gate smoke suite was accepted")
 
     omitted_smoke = copy.deepcopy(data)
     omitted_smoke["profiles"]["smoke"]["suites"] = SMOKE_SUITE_IDS[:-1]
@@ -144,13 +154,13 @@ def assert_registry_and_selection(controller) -> None:
                 "id": "communication.unregistered_growth_1",
                 "incidentRef": "fixture:case-budget",
                 "invariant": "fixture",
-                "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts",
+                "sourcePath": "userspace/session-core/tests/smoke/communication.mjs",
             })
             suite["cases"].append({
                 "id": "communication.unregistered_growth_2",
                 "incidentRef": "fixture:case-budget",
                 "invariant": "fixture",
-                "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts",
+                "sourcePath": "userspace/session-core/tests/smoke/communication.mjs",
             })
             break
     try:
@@ -199,6 +209,9 @@ def assert_machine_list(controller) -> None:
         capture_output=True,
         text=True,
     )
+    assert len(completed.stdout.splitlines()) == 1
+    assert TEST_NOTICE not in completed.stdout
+    assert completed.stderr.splitlines().count(TEST_NOTICE) == 1
     payload = json.loads(completed.stdout)
     assert payload["defaultProfile"] == "required"
     assert [suite["id"] for suite in payload["suites"]] == ALL_SUITE_IDS
@@ -207,7 +220,7 @@ def assert_machine_list(controller) -> None:
         "communication",
         "tools",
         "paths",
-        "authorization",
+        "loop",
     ]
     assert all(suite["cases"] for suite in smoke_payloads)
 
@@ -236,6 +249,21 @@ def assert_internal_runners_are_guarded() -> None:
     for runner, arguments, expected in (
         ("session-smoke.sh", ["communication"], "use bash ./test.sh --profile smoke"),
         ("repository-required.sh", [], "use bash ./test.sh"),
+        (
+            "kernel-v2-contracts.sh",
+            [],
+            "use bash ./test.sh --suite kernel.v2.contracts",
+        ),
+        (
+            "session-v2-contracts.sh",
+            [],
+            "use bash ./test.sh --suite session.v2.contracts",
+        ),
+        (
+            "host-v2-integration.sh",
+            [],
+            "use bash ./test.sh --suite host.v2.integration",
+        ),
     ):
         completed = subprocess.run(
             ["bash", str(ROOT / "scripts" / "tests" / runner), *arguments],
@@ -325,7 +353,11 @@ def assert_isolated_public_entrypoint() -> None:
             "profiles": {
                 "required": {
                     "description": "Required fixture profile.",
-                    "suites": ["repository.required"],
+                    "suites": [
+                        "repository.required",
+                        "kernel.v2.contracts",
+                        "session.v2.contracts",
+                    ],
                 },
                 "static": {
                     "description": "Static fixture profile.",
@@ -339,12 +371,16 @@ def assert_isolated_public_entrypoint() -> None:
                     "description": "Full fixture profile.",
                     "suites": [
                         "repository.required",
+                        "kernel.v2.contracts",
+                        "session.v2.contracts",
                         "session.smoke.fixture",
                     ],
                 },
             },
             "suites": [
                 fixture_suite("repository.required", True),
+                fixture_suite("kernel.v2.contracts", True),
+                fixture_suite("session.v2.contracts", True),
                 fixture_suite("repository.static", False),
                 fixture_suite("session.smoke.fixture", False, kind="smoke"),
             ],
@@ -368,47 +404,88 @@ def assert_isolated_public_entrypoint() -> None:
             capture_output=True,
             text=True,
         )
+        assert len(completed.stdout.splitlines()) == 1
+        assert TEST_NOTICE not in completed.stdout
+        assert completed.stderr.splitlines().count(TEST_NOTICE) == 1
         payload = json.loads(completed.stdout)
         assert payload["defaultProfile"] == "required"
         assert [suite["id"] for suite in payload["suites"]] == [
             "repository.required",
+            "kernel.v2.contracts",
+            "session.v2.contracts",
             "repository.static",
             "session.smoke.fixture",
         ]
 
-        def run_receipt(*arguments: str) -> dict[str, object]:
+        def run_receipt(
+            *arguments: str,
+            expected_exit: int = 0,
+        ) -> dict[str, object]:
             executed = subprocess.run(
                 ["bash", str(repo / "test.sh"), *arguments, "--json"],
                 cwd=repo,
-                check=True,
                 capture_output=True,
                 text=True,
             )
+            assert executed.returncode == expected_exit
+            assert len(executed.stdout.splitlines()) == 1
+            assert TEST_NOTICE not in executed.stdout
+            assert executed.stderr.splitlines().count(TEST_NOTICE) == 1
             return json.loads(executed.stdout)
 
         receipt = run_receipt()
         assert receipt["status"] == "passed"
-        assert receipt["authoritative"] is True
+        assert receipt["authoritative"] is False
+        assert receipt["finalAcceptance"] is False
+        assert receipt["evidenceRole"] == "supporting-evidence-only"
+        assert receipt["requiredGateComplete"] is True
         assert receipt["selectedBy"] == "profile:required"
         assert receipt["registryHeadBound"] is True
         assert receipt["controllerHeadBound"] is True
         assert receipt["selectedAssets"]["headBound"] is True
         assert receipt["worktree"]["indexTrusted"] is True
         assert receipt["results"][0]["id"] == "repository.required"
+        assert receipt["results"][1]["id"] == "kernel.v2.contracts"
+        assert receipt["results"][2]["id"] == "session.v2.contracts"
 
         required_receipt = run_receipt("--profile", "required")
-        assert required_receipt["authoritative"] is True
+        assert required_receipt["authoritative"] is False
+        assert required_receipt["finalAcceptance"] is False
+        assert required_receipt["evidenceRole"] == "supporting-evidence-only"
+        assert required_receipt["requiredGateComplete"] is True
 
         for profile in ("static", "smoke", "full"):
             optional_receipt = run_receipt("--profile", profile)
             assert optional_receipt["status"] == "passed"
             assert optional_receipt["authoritative"] is False
+            assert optional_receipt["finalAcceptance"] is False
+            assert optional_receipt["evidenceRole"] == "supporting-evidence-only"
+            assert optional_receipt["requiredGateComplete"] is False
             assert optional_receipt["selectedBy"] == f"profile:{profile}"
 
         explicit_receipt = run_receipt("--suite", "repository.required")
         assert explicit_receipt["status"] == "passed"
         assert explicit_receipt["authoritative"] is False
+        assert explicit_receipt["finalAcceptance"] is False
+        assert explicit_receipt["evidenceRole"] == "supporting-evidence-only"
+        assert explicit_receipt["requiredGateComplete"] is False
         assert explicit_receipt["selectedBy"] == "explicit-suites"
+
+        (repo / "untracked-evidence.txt").write_text("dirty\n", encoding="utf-8")
+        dirty_receipt = run_receipt()
+        assert dirty_receipt["status"] == "passed"
+        assert dirty_receipt["requiredGateComplete"] is False
+        (repo / "untracked-evidence.txt").unlink()
+
+        (repo / "scripts" / "noop.sh").write_text(
+            "#!/usr/bin/env bash\nexit 7\n", encoding="utf-8"
+        )
+        failed_receipt = run_receipt(expected_exit=7)
+        assert failed_receipt["status"] == "failed"
+        assert failed_receipt["authoritative"] is False
+        assert failed_receipt["finalAcceptance"] is False
+        assert failed_receipt["evidenceRole"] == "supporting-evidence-only"
+        assert failed_receipt["requiredGateComplete"] is False
 
 
 def assert_owned_process_group_cleanup(controller) -> None:

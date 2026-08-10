@@ -1,494 +1,308 @@
-use super::*;
-use deepcode_kernel_abi::{
-    ArtifactDraftBatchMetadata, ArtifactDraftFrameBase, ArtifactDraftLedgerFrame,
-    KernelActionBatch, KernelActionProposal, PermissionDecisionKind, ProposalEnvelopeSource,
-    ReviewGateDecision, ReviewGateDecisionKind, TaskIntentTask, ARTIFACT_DRAFT_SCHEMA_VERSION,
+use crate::executors::{EmptySecretProvider, KernelExecutorConfig};
+use crate::v2::{KernelSessionServiceV2, PendingCapabilityDecisionClassV2, SettingsCeilingV2};
+use deepcode_kernel_abi::v2::{
+    CommandRequestId, ControlEpoch, InputId, KernelFactEnvelopeV2, OperationId, ResourceAccessV2,
+    RunId, UserDecisionRefV2,
 };
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use deepcode_kernel_abi::v2_command::{
+    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2, CapabilityScopePreviewReplyV2,
+    CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2,
+    KernelCommandV2, KernelReplyV2, RunOpenV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
+};
+use deepcode_kernel_abi::{
+    CapabilityLeaseRefV2, CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2,
+    RawToolArgumentsV2, RequestedResourceV2, RunCapabilityV2, ScopeIntentV2, ToolContextRefV2,
+    ToolIdV2, ToolIntentAuthorityV2, UserDecisionReplyV2, UserDecisionV2, WorkspaceBindingRefV2,
+};
+use deepcode_kernel_ledger::v2::{CanonicalFactStore, FactQueryV2};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 static TEMP_INDEX: AtomicU64 = AtomicU64::new(0);
 
-struct PermissionResolutionFailingLedger {
-    inner: InMemoryEventLedger,
-    fail_permission_resolution: Arc<AtomicBool>,
+pub(super) struct TempWorkspace {
+    root: PathBuf,
+    workspace: PathBuf,
+    store_path: PathBuf,
 }
 
-struct EventKindFailingLedger {
-    inner: InMemoryEventLedger,
-    fail_kind: String,
-    enabled: Arc<AtomicBool>,
-}
-
-impl EventLedger for EventKindFailingLedger {
-    fn append(&self, event: LedgerEvent) -> KernelResult<()> {
-        if self.enabled.load(Ordering::SeqCst) && event.kind == self.fail_kind {
-            return Err(KernelError::Other(format!(
-                "injected {} persistence failure",
-                self.fail_kind
-            )));
+impl TempWorkspace {
+    pub(super) fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "deepcode-kernel-v2-{label}-{}-{}",
+            std::process::id(),
+            TEMP_INDEX.fetch_add(1, Ordering::SeqCst)
+        ));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("create isolated v2 workspace");
+        Self {
+            store_path: root.join("kernel-v2.sqlite3"),
+            root,
+            workspace,
         }
-        self.inner.append(event)
     }
 
-    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
-        if self.enabled.load(Ordering::SeqCst)
-            && events.iter().any(|event| event.kind == self.fail_kind)
-        {
-            return Err(KernelError::Other(format!(
-                "injected {} persistence failure",
-                self.fail_kind
-            )));
-        }
-        self.inner.append_batch(events)
+    pub(super) fn workspace(&self) -> &Path {
+        &self.workspace
     }
 
-    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
-        self.inner.list_all()
-    }
-
-    fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>> {
-        self.inner.list_by_run(run_id)
-    }
-
-    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>> {
-        self.inner.list_by_session(session_id)
+    pub(super) fn store_path(&self) -> &Path {
+        &self.store_path
     }
 }
 
-impl EventLedger for PermissionResolutionFailingLedger {
-    fn append(&self, event: LedgerEvent) -> KernelResult<()> {
-        self.inner.append(event)
-    }
-
-    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
-        if self.fail_permission_resolution.load(Ordering::SeqCst)
-            && events
-                .iter()
-                .any(|event| event.kind == "permission.resolved")
-        {
-            return Err(KernelError::Other(
-                "injected permission resolution persistence failure".to_string(),
-            ));
-        }
-        self.inner.append_batch(events)
-    }
-
-    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
-        self.inner.list_all()
-    }
-
-    fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>> {
-        self.inner.list_by_run(run_id)
-    }
-
-    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>> {
-        self.inner.list_by_session(session_id)
-    }
-}
-
-struct TestWorkspace(PathBuf);
-
-impl Deref for TestWorkspace {
-    type Target = Path;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for TestWorkspace {
+impl Drop for TempWorkspace {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
-fn runtime_with_workspace() -> (DeepCodeKernelRuntime, TestWorkspace) {
-    let path = std::env::temp_dir().join(format!(
-        "deepcode-runtime-v4-{}-{}",
-        std::process::id(),
-        TEMP_INDEX.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(path.join("nested")).expect("create test workspace");
-    fs::write(path.join("input.txt"), "alpha\nbeta\ngamma\n").expect("write input");
-    fs::write(path.join("nested/child.txt"), "child\n").expect("write nested input");
-
-    let mut runtime = DeepCodeKernelRuntime::new();
-    runtime
-        .dispatch(KernelCommand::HostWorkspaceOpen {
-            request_id: RequestId("workspace-open".to_string()),
-            path: path.to_string_lossy().to_string(),
-        })
-        .expect("workspace opens");
-    runtime
-        .dispatch(KernelCommand::RunCreate {
-            request_id: RequestId("run-create".to_string()),
-            session_id: Some(SessionId("session-1".to_string())),
-            input: UserInput {
-                text: "Execute a generic tool verification batch.".to_string(),
-                attachments: Vec::new(),
-            },
-            workspace_binding: Some(workspace_binding_from_root(&path)),
-            profile_ref: None,
-            run_overrides: None,
-        })
-        .expect("run creates");
-    (runtime, TestWorkspace(path))
+pub(super) struct OpenedRun {
+    pub(super) run_id: RunId,
+    pub(super) control_epoch: ControlEpoch,
+    pub(super) tool_context_ref: ToolContextRefV2,
+    pub(super) run_capability: RunCapabilityV2,
 }
 
-fn action_bundle(actions: Value, content_blocks: Value) -> Value {
-    serde_json::json!({
-        "userPlanMarkdown": "# Plan\n\n## Summary\nExercise canonical Kernel tools.",
-        "contentBlocks": content_blocks,
-        "actionBundle": {
-            "version": "deepcode.agent.protocol.v4",
-            "id": "bundle-1",
-            "goal": "Exercise canonical Kernel tools.",
-            "actions": actions,
-            "validationExpectations": [{
-                "id": "validation-terminal-facts",
-                "description": "Kernel emits terminal tool facts."
-            }],
-            "reviewExpectations": [{
-                "id": "review-terminal-facts",
-                "description": "Review facts reflect actual terminal results."
-            }]
-        }
-    })
-}
-
-fn submit_proposal_raw(runtime: &mut DeepCodeKernelRuntime, payload: Value) -> Value {
-    let events = runtime
-        .dispatch(KernelCommand::ProposalSubmit {
-            request_id: RequestId("proposal-submit".to_string()),
-            run_id: RunId("run-1".to_string()),
-            session_id: Some(SessionId("session-1".to_string())),
-            proposal: ProposalEnvelope {
-                schema_version: "deepcode.agent.protocol.v4".to_string(),
-                proposal_id: "proposal-1".to_string(),
-                run_id: RunId("run-1".to_string()),
-                session_id: Some(SessionId("session-1".to_string())),
-                source: ProposalEnvelopeSource::Llm,
-                kind: ProposalEnvelopeKind::ActionBundle,
-                payload,
-                referenced_resource_packet_refs: Vec::new(),
-                referenced_evidence_refs: Vec::new(),
-                parser_diagnostics: None,
-            },
-        })
-        .expect("proposal submit succeeds");
-    events
-        .into_iter()
-        .find_map(|event| match event {
-            KernelEvent::ProposalReviewed { report, .. } => {
-                Some(serde_json::to_value(report).expect("serialize typed proposal report"))
-            }
-            _ => None,
-        })
-        .expect("proposal review report")
-}
-
-fn submit_proposal(runtime: &mut DeepCodeKernelRuntime, mut payload: Value) -> Value {
-    if payload
-        .get("authorizationContractId")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return submit_proposal_raw(runtime, payload);
-    }
-    let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
-    let snapshot = KernelToolRegistry::default().snapshot();
-    let actions = payload["actionBundle"]["actions"]
-        .as_array()
-        .expect("test action bundle actions");
-    let task_ids_by_action = actions
-        .iter()
-        .enumerate()
-        .map(|(index, action)| {
-            (
-                action["actionId"]
-                    .as_str()
-                    .expect("test action actionId")
-                    .to_string(),
-                format!("task-{suffix}-{index}"),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let tasks = actions
-        .iter()
-        .enumerate()
-        .map(|(index, action)| {
-            let tool_id = action["toolId"].as_str().expect("test action toolId");
-            let depends_on = action["dependsOn"]
-                .as_array()
-                .expect("test action dependsOn")
-                .iter()
-                .map(|dependency| {
-                    let action_id = dependency.as_str().expect("test action dependency id");
-                    task_ids_by_action
-                        .get(action_id)
-                        .unwrap_or_else(|| panic!("unknown test action dependency {action_id}"))
-                        .clone()
-                })
-                .collect();
-            TaskIntentTask {
-                task_id: format!("task-{suffix}-{index}"),
-                tool_id: tool_id.to_string(),
-                targets: plan_targets_for_action(tool_id, &action["args"]),
-                depends_on,
-                args: serde_json::json!({}),
-            }
-        })
-        .collect::<Vec<_>>();
-    let plan_id = format!("plan-{suffix}");
-    let plan_hash = format!("plan-hash-{suffix}");
-    let reviewed = runtime
-        .dispatch(KernelCommand::PlanAuthorizationSubmit {
-            request_id: RequestId(format!("plan-submit-{suffix}")),
-            run_id: RunId("run-1".to_string()),
-            session_id: Some(SessionId("session-1".to_string())),
-            intent: TaskIntentEnvelope {
-                schema_version: deepcode_kernel_abi::TASK_INTENT_SCHEMA_VERSION.to_string(),
-                plan_id: plan_id.clone(),
-                plan_hash: plan_hash.clone(),
-                run_id: RunId("run-1".to_string()),
-                session_id: Some(SessionId("session-1".to_string())),
-                workspace_binding_hash: None,
-                catalog_version: snapshot.catalog_version.to_string(),
-                catalog_hash: snapshot.catalog_hash,
-                tasks,
-            },
-        })
-        .expect("Kernel compiles test plan authorization");
-    let review = reviewed
-        .iter()
-        .find_map(|event| match event {
-            KernelEvent::PlanAuthorizationReviewed { review, .. } => Some(review.clone()),
-            _ => None,
-        })
-        .expect("plan authorization review");
-    assert_eq!(review.status, PlanAuthorizationStatus::Confirmable);
-    runtime
-        .dispatch(KernelCommand::PlanAuthorizationDecisionSubmit {
-            request_id: RequestId(format!("plan-accept-{suffix}")),
-            run_id: RunId("run-1".to_string()),
-            session_id: Some(SessionId("session-1".to_string())),
-            decision: PlanAuthorizationDecisionSubmit {
-                decision_id: format!("plan-decision-{suffix}"),
-                authorization_contract_id: review.authorization_contract.id.clone(),
-                plan_id,
-                plan_hash,
-                contract_hash: review.authorization_contract.contract_hash,
-                decision: PlanAuthorizationDecisionKind::Accept,
-            },
-        })
-        .expect("Kernel accepts test plan authorization");
-    payload
-        .as_object_mut()
-        .expect("test proposal payload")
-        .insert(
-            "authorizationContractId".to_string(),
-            Value::String(review.authorization_contract.id),
-        );
-    submit_proposal_raw(runtime, payload)
-}
-
-fn plan_targets_for_action(tool_id: &str, args: &Value) -> Vec<String> {
-    let path = args.get("path").and_then(Value::as_str).map(str::to_string);
-    match tool_id {
-        "fs.rename" => [
-            path,
-            args.get("destinationPath")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-        "fs.glob" | "code.grep" => vec![path.unwrap_or_else(|| ".".to_string())],
-        tool if tool.starts_with("fs.") || tool == "document.read" => path.into_iter().collect(),
-        "git.status" | "git.diff" => args
-            .get("paths")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|item| format!("git:{item}"))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| vec!["git:workspace".to_string()]),
-        "git.stage" | "git.unstage" => args
-            .get("paths")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|item| format!("git:{item}"))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| vec!["git:index".to_string()]),
-        "git.commit" | "git.push" => vec!["git:index".to_string()],
-        "web.fetch" => args
-            .get("url")
-            .and_then(Value::as_str)
-            .map(|value| vec![format!("network:{value}")])
-            .unwrap_or_default(),
-        "web.search" => args
-            .get("query")
-            .and_then(Value::as_str)
-            .map(|value| vec![format!("network:{value}")])
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn execute_contract(
-    runtime: &mut DeepCodeKernelRuntime,
-    payload: &Value,
-    report: &Value,
-) -> Vec<KernelEvent> {
-    let batch = KernelActionBatch {
-        plan_id: "bundle-1".to_string(),
-        contract_id: report["executionContract"]["id"]
-            .as_str()
-            .expect("execution contract id")
-            .to_string(),
-        contract_hash: report["executionContract"]["contractHash"]
-            .as_str()
-            .expect("execution contract hash")
-            .to_string(),
-        action_bundle: serde_json::from_value(payload["actionBundle"].clone())
-            .expect("canonical action bundle"),
-        content_blocks: serde_json::from_value(
-            payload
-                .get("contentBlocks")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .expect("canonical content blocks"),
+pub(super) fn open_run(
+    service: &KernelSessionServiceV2,
+    workspace: &Path,
+    workspace_binding_ref: WorkspaceBindingRefV2,
+    label: &str,
+) -> OpenedRun {
+    let envelope = KernelCommandEnvelopeV2::new(
+        CommandRequestId::new(format!("request-open-{label}")).expect("valid request id"),
+        KernelCommandV2::RunOpen(RunOpenV2 {
+            workspace_binding_ref,
+            input_id: InputId::new(format!("input-{label}")).expect("valid input id"),
+            opaque_input_ref: format!("opaque-input-{label}"),
+        }),
+    );
+    let (response, capability) = service
+        .open_run(envelope, workspace, SettingsCeilingV2::default())
+        .into_parts();
+    let opened = match response {
+        KernelCommandResponseEnvelopeV2::Correlated {
+            handling: CommandHandlingV2::Evaluated,
+            reply: KernelReplyV2::RunOpened(opened),
+            ..
+        } => opened,
+        other => panic!("expected evaluated RunOpen, got {other:?}"),
     };
-    runtime
-        .dispatch(KernelCommand::ActionBatchSubmit {
-            request_id: RequestId("batch-submit".to_string()),
-            run_id: RunId("run-1".to_string()),
-            session_id: Some(SessionId("session-1".to_string())),
-            batch,
-        })
-        .expect("action batch returns events")
+    OpenedRun {
+        run_id: opened.run_id,
+        control_epoch: opened.control_epoch,
+        tool_context_ref: opened.tool_context.context_ref(),
+        run_capability: capability.expect("Host RunOpen must return a private run capability"),
+    }
 }
 
-fn terminal_tool(events: &[KernelEvent], tool_id: &str, ok: bool) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            KernelEvent::ToolCompleted { fact, .. }
-                if fact.tool_id == tool_id && fact.ok == ok
+pub(super) struct V2Harness {
+    pub(super) service: KernelSessionServiceV2,
+    pub(super) temp: TempWorkspace,
+    pub(super) opened: OpenedRun,
+}
+
+impl V2Harness {
+    pub(super) fn new(label: &str) -> Self {
+        let temp = TempWorkspace::new(label);
+        let service = KernelSessionServiceV2::from_store(
+            CanonicalFactStore::open_in_memory().expect("open isolated fact store"),
+            KernelExecutorConfig::default(),
+            Arc::new(EmptySecretProvider),
         )
-    })
-}
+        .expect("open v2 Kernel service");
+        let binding_ref = WorkspaceBindingRefV2::new(format!("workspace-{label}"))
+            .expect("valid workspace binding ref");
+        let opened = open_run(&service, temp.workspace(), binding_ref, label);
+        Self {
+            service,
+            temp,
+            opened,
+        }
+    }
 
-fn artifact_draft_chunk(
-    draft_id: &str,
-    frame_id: &str,
-    sequence: u64,
-    lines: &[&str],
-    final_chunk: bool,
-) -> ArtifactDraftLedgerFrame {
-    let content_lines = lines
-        .iter()
-        .map(|line| (*line).to_string())
-        .collect::<Vec<_>>();
-    let serialized = serde_json::to_string(&content_lines).expect("serialize draft chunk");
-    ArtifactDraftLedgerFrame::ArtifactChunk {
-        base: artifact_draft_base(draft_id, frame_id, sequence, test_fnv1a64(&serialized)),
-        slot_id: "slot-draft-1".to_string(),
-        content_lines,
-        final_chunk,
-        edit_match: None,
+    pub(super) fn plan_intent(
+        &self,
+        request_id: &str,
+        operation_id: &str,
+        path: &str,
+        lease: Option<CapabilityLeaseRefV2>,
+    ) -> KernelCommandEnvelopeV2 {
+        plan_intent(&self.opened, request_id, operation_id, path, lease)
+    }
+
+    pub(super) fn submit(
+        &self,
+        envelope: KernelCommandEnvelopeV2,
+    ) -> (CommandHandlingV2, ToolIntentSubmitReplyV2) {
+        tool_intent_response(
+            self.service
+                .handle_session_command(envelope, &self.opened.run_capability),
+        )
+    }
+
+    pub(super) fn preview_plan_action(&self, request_id: &str, operation_id: &str, path: &str) {
+        preview_plan_action(&self.service, &self.opened, request_id, operation_id, path);
+    }
+
+    pub(super) fn allow_preview(
+        &self,
+        preview_id: CapabilityScopePreviewIdV2,
+        label: &str,
+    ) -> UserDecisionReplyV2 {
+        let pending = self
+            .service
+            .resolve_pending_capability_decision_host(
+                preview_id,
+                UserDecisionRefV2::new(format!("decision-ref-{label}"))
+                    .expect("valid decision ref"),
+            )
+            .expect("resolve pending decision")
+            .expect("preview remains current");
+        let decision = match pending.class {
+            PendingCapabilityDecisionClassV2::Capability => {
+                UserDecisionV2::CapabilityAllow(pending.binding)
+            }
+            PendingCapabilityDecisionClassV2::ScopeExpansion => {
+                UserDecisionV2::ScopeExpansionAllow(pending.binding)
+            }
+        };
+        let (reply, handling) = self
+            .service
+            .apply_host_user_decision(
+                CommandRequestId::new(format!("decision-request-{label}"))
+                    .expect("valid decision request id"),
+                pending.run_id,
+                pending.expected_control_epoch,
+                decision,
+            )
+            .expect("apply trusted Host decision");
+        assert_eq!(handling, CommandHandlingV2::Evaluated);
+        reply
+    }
+
+    pub(super) fn facts_for_operation(&self, operation_id: &str) -> Vec<KernelFactEnvelopeV2> {
+        self.service
+            .fact_reader()
+            .query(&FactQueryV2 {
+                run_id: Some(self.opened.run_id.to_string()),
+                operation_id: Some(operation_id.to_owned()),
+                ..FactQueryV2::default()
+            })
+            .expect("query canonical facts")
+    }
+
+    pub(super) fn wait_for_effect(&self, operation_id: &str) -> Vec<KernelFactEnvelopeV2> {
+        for _ in 0..400 {
+            let facts = self.facts_for_operation(operation_id);
+            if facts.iter().any(|fact| {
+                matches!(
+                    &fact.payload,
+                    deepcode_kernel_abi::v2::KernelFactPayloadV2::Effect(_)
+                )
+            }) {
+                return facts;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("operation {operation_id} did not record an Effect fact within 2 seconds");
     }
 }
 
-fn artifact_draft_chunk_owned(
-    draft_id: &str,
-    frame_id: &str,
-    sequence: u64,
-    lines: Vec<String>,
-    final_chunk: bool,
-) -> ArtifactDraftLedgerFrame {
-    let serialized = serde_json::to_string(&lines).expect("serialize draft chunk");
-    ArtifactDraftLedgerFrame::ArtifactChunk {
-        base: artifact_draft_base(draft_id, frame_id, sequence, test_fnv1a64(&serialized)),
-        slot_id: "slot-draft-1".to_string(),
-        content_lines: lines,
-        final_chunk,
-        edit_match: None,
-    }
-}
-
-fn artifact_draft_done(
-    draft_id: &str,
-    frame_id: &str,
-    sequence: u64,
-    summary: &str,
-) -> ArtifactDraftLedgerFrame {
-    ArtifactDraftLedgerFrame::BatchDone {
-        base: artifact_draft_base(draft_id, frame_id, sequence, test_fnv1a64(summary)),
-        metadata: ArtifactDraftBatchMetadata {
-            summary: summary.to_string(),
-        },
-    }
-}
-
-fn artifact_draft_base(
-    draft_id: &str,
-    frame_id: &str,
-    sequence: u64,
-    content_hash: String,
-) -> ArtifactDraftFrameBase {
-    ArtifactDraftFrameBase {
-        schema_version: ARTIFACT_DRAFT_SCHEMA_VERSION.to_string(),
-        draft_id: draft_id.to_string(),
-        frame_id: frame_id.to_string(),
-        run_id: "run-1".to_string(),
-        session_id: "session-1".to_string(),
-        task_id: "task-draft".to_string(),
-        sequence,
-        content_hash,
-        expected_slot_ids: vec!["slot-draft-1".to_string()],
-    }
-}
-
-fn submit_artifact_draft(
-    runtime: &mut DeepCodeKernelRuntime,
+pub(super) fn plan_intent(
+    opened: &OpenedRun,
     request_id: &str,
-    frame: ArtifactDraftLedgerFrame,
-) -> KernelResult<Vec<KernelEvent>> {
-    runtime.dispatch(KernelCommand::DraftLedgerSubmit {
-        request_id: RequestId(request_id.to_string()),
-        run_id: RunId("run-1".to_string()),
-        session_id: Some(SessionId("session-1".to_string())),
-        frame,
-    })
+    operation_id: &str,
+    path: &str,
+    lease: Option<CapabilityLeaseRefV2>,
+) -> KernelCommandEnvelopeV2 {
+    KernelCommandEnvelopeV2::new(
+        CommandRequestId::new(request_id).expect("valid request id"),
+        KernelCommandV2::ToolIntentSubmit(ToolIntentSubmitV2 {
+            run_id: opened.run_id.clone(),
+            expected_control_epoch: opened.control_epoch,
+            operation_id: OperationId::new(operation_id).expect("valid operation id"),
+            idempotency_key: format!("idempotency-{operation_id}"),
+            tool_id: ToolIdV2::parse("fs.ensure_directory").expect("registered ToolId"),
+            raw_arguments: RawToolArgumentsV2::new(serde_json::json!({ "path": path }))
+                .expect("object arguments"),
+            authority: ToolIntentAuthorityV2::PlanAction {
+                plan_revision: PlanRevisionV2::new("plan-revision-1").expect("valid plan revision"),
+                plan_action_id: PlanActionIdV2::new("plan-action-1").expect("valid PlanAction id"),
+                lease,
+            },
+            deadline: DeadlineRequestV2::ContractDefault {},
+            tool_context_ref: opened.tool_context_ref.clone(),
+        }),
+    )
 }
 
-fn test_fnv1a64(value: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+pub(super) fn preview_plan_action(
+    service: &KernelSessionServiceV2,
+    opened: &OpenedRun,
+    request_id: &str,
+    operation_id: &str,
+    path: &str,
+) {
+    let plan_revision = PlanRevisionV2::new("plan-revision-1").expect("valid plan revision");
+    let plan_action_id = PlanActionIdV2::new("plan-action-1").expect("valid PlanAction id");
+    let operation_id = OperationId::new(operation_id).expect("valid operation id");
+    let tool_id = ToolIdV2::parse("fs.ensure_directory").expect("registered ToolId");
+    let envelope = KernelCommandEnvelopeV2::new(
+        CommandRequestId::new(request_id).expect("valid preview request id"),
+        KernelCommandV2::CapabilityScopePreviewBatch(CapabilityScopePreviewBatchV2 {
+            run_id: opened.run_id.clone(),
+            expected_control_epoch: opened.control_epoch,
+            plan_revision: plan_revision.clone(),
+            items: vec![CapabilityScopePreviewItemV2 {
+                plan_action_id: plan_action_id.clone(),
+                operation_id: operation_id.clone(),
+                idempotency_key: format!("idempotency-{operation_id}"),
+                tool_id: tool_id.clone(),
+                scope_intent: ScopeIntentV2::ResourceScope {
+                    requested_resources: vec![RequestedResourceV2::WorkspacePath {
+                        path: path.to_owned(),
+                        access: ResourceAccessV2::Write,
+                    }],
+                },
+                deadline: DeadlineRequestV2::ContractDefault {},
+            }],
+            tool_context_ref: opened.tool_context_ref.clone(),
+        }),
+    );
+    match service.handle_session_command(envelope, &opened.run_capability) {
+        KernelCommandResponseEnvelopeV2::Correlated {
+            handling: CommandHandlingV2::Evaluated,
+            reply: KernelReplyV2::CapabilityScopePreviewBatchResult(reply),
+            ..
+        } => match reply.results.as_slice() {
+            [CapabilityScopePreviewReplyV2::Previewed { preview }]
+                if preview.plan_revision == plan_revision
+                    && preview.plan_action_id == plan_action_id
+                    && preview.operation_id == operation_id
+                    && preview.tool_id == tool_id => {}
+            other => panic!("expected exact PlanAction scope preview, got {other:?}"),
+        },
+        other => panic!("expected evaluated CapabilityScopePreviewBatch, got {other:?}"),
     }
-    format!("fnv1a64:{hash:016x}")
 }
 
-mod authorization_tests;
-mod draft_tests;
-mod execution_tests;
-mod tool_tests;
-mod workspace_tests;
+pub(super) fn tool_intent_response(
+    response: KernelCommandResponseEnvelopeV2,
+) -> (CommandHandlingV2, ToolIntentSubmitReplyV2) {
+    match response {
+        KernelCommandResponseEnvelopeV2::Correlated {
+            handling,
+            reply: KernelReplyV2::ToolIntentSubmission(reply),
+            ..
+        } => (handling, reply),
+        other => panic!("expected ToolIntentSubmission, got {other:?}"),
+    }
+}
+
+mod v2_grant_tests;
+mod v2_invocation_tests;
+mod v2_unified_tests;

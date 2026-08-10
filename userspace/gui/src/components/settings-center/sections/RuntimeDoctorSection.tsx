@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { KERNEL_ABI_V2_VERSION } from '@deepcode/protocol';
 import { useSettingsStore } from '../../../state/settingsStore';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { normalizeUiLanguage, t } from '../../../i18n';
 import {
   getLlmProfiles,
+  getHealth,
   getRuntimeStatus,
-  listAgentTools,
   type RuntimeStatus,
 } from '../../../services/runtimeAdapter';
 
@@ -58,7 +59,7 @@ const RuntimeDoctorSection: React.FC = () => {
 
     const nextRuntime = await getRuntimeStatus();
     const llmProfiles = await getLlmProfiles();
-    const agentTools = await listAgentTools();
+    const health = await getHealth();
 
     const skillMounts = parseArraySetting(effectiveSettings['skills.mounts']);
     const mcpServers = parseArraySetting(effectiveSettings['mcp.servers']);
@@ -160,18 +161,25 @@ const RuntimeDoctorSection: React.FC = () => {
               }),
       },
       {
-        id: 'tools',
-        title: t(language, 'settings.doctor.check.tools'),
+        id: 'kernel-protocol-v2',
+        title: t(language, 'settings.doctor.check.protocolV2'),
         status:
-          agentTools.ok &&
-          agentTools.data &&
-          agentTools.data.tools.some((tool) => tool.name === 'fs.write')
+          health.ok &&
+          health.data?.status === 'ok' &&
+          health.data.kernel === 'ready' &&
+          health.data.kernelAbiVersion === KERNEL_ABI_V2_VERSION &&
+          health.data.protocolVersion === KERNEL_ABI_V2_VERSION
             ? 'ok'
             : 'error',
         detail:
-          agentTools.ok && agentTools.data
-            ? t(language, 'settings.doctor.detail.tools', { count: agentTools.data.tools.length })
-            : agentTools.message ?? t(language, 'settings.doctor.toolsNotReachable'),
+          health.ok && health.data
+            ? t(language, 'settings.doctor.detail.protocolV2', {
+                service: health.data.service,
+                kernel: health.data.kernel ?? 'unknown',
+                abi: health.data.kernelAbiVersion ?? 'unknown',
+                protocol: health.data.protocolVersion ?? 'unknown',
+              })
+            : health.message ?? t(language, 'settings.doctor.protocolV2NotReachable'),
       },
     ];
 

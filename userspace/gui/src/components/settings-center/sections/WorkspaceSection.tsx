@@ -1,13 +1,4 @@
-import React, { useMemo, useState } from 'react';
-import type { AgentSession } from '@deepcode/protocol';
-import { createWorkspaceScope, type SessionMemorySnapshot } from '@deepcode/session-core';
-import AgentMemoryViewer from '../../agent-memory/AgentMemoryViewer';
-import {
-  getAgentSessionMemorySnapshot,
-  getConversationArchive,
-  listAgentSessions,
-} from '../../../services/runtimeAdapter';
-import { useAgentSessionStore } from '../../../state/agentSessionStore';
+import React, { useState } from 'react';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { useUiStore } from '../../../state/uiStore';
 import SettingsField from '../SettingsField';
@@ -29,27 +20,8 @@ const WorkspaceSection: React.FC = () => {
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const sources = useSettingsStore((s) => s.sources);
   const patchWorkspaceSetting = useSettingsStore((s) => s.patchWorkspaceSetting);
-  const currentAgentSessionId = useAgentSessionStore((s) => s.session?.id);
-  const projectMemoryMode = effectiveSettings['agent.memory.projectMode'] === 'auto' ? 'auto' : 'confirm';
 
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
-  const [archiveMessage, setArchiveMessage] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
-  const [memoryOpen, setMemoryOpen] = useState(false);
-  const [memoryLoading, setMemoryLoading] = useState(false);
-  const [memoryError, setMemoryError] = useState<string | null>(null);
-  const [memorySessions, setMemorySessions] = useState<AgentSession[]>([]);
-  const [memorySnapshots, setMemorySnapshots] = useState<SessionMemorySnapshot[]>([]);
-  const [selectedMemorySessionId, setSelectedMemorySessionId] = useState<string | null>(null);
-  const memorySessionLabels = useMemo(() => {
-    const labels: Record<string, string> = {};
-    for (const session of memorySessions) {
-      labels[session.id] = session.title?.trim() || session.id;
-    }
-    return labels;
-  }, [memorySessions]);
-  const displayedMemorySnapshots = selectedMemorySessionId
-    ? memorySnapshots.filter((snapshot) => snapshot.sessionId === selectedMemorySessionId)
-    : memorySnapshots;
 
   const handleWorkspaceSettingChange = (key: string, value: UserSettingValue) => {
     void patchWorkspaceSetting(key, value);
@@ -63,63 +35,6 @@ const WorkspaceSection: React.FC = () => {
       return;
     }
     setSaveMessage(result.message ?? t(language, 'workspace.error.saveFile'));
-  };
-
-  const handleCopyArchivePath = async () => {
-    setArchiveMessage(null);
-    if (!currentAgentSessionId) {
-      setArchiveMessage({ kind: 'error', text: t(language, 'workspace.archiveNoSession') });
-      return;
-    }
-
-    const result = await getConversationArchive(currentAgentSessionId);
-    const archivePath = result.data?.archives[0]?.archivePath ?? result.data?.conversationArchiveRoot;
-    if (!result.ok || !archivePath) {
-      setArchiveMessage({
-        kind: 'error',
-        text: result.message ?? result.error ?? t(language, 'workspace.archiveUnavailable'),
-      });
-      return;
-    }
-
-    await copyText(archivePath);
-    setArchiveMessage({
-      kind: 'info',
-      text: t(language, 'workspace.archiveCopied', { path: archivePath }),
-    });
-  };
-
-  const loadWorkspaceMemory = async (sessionId?: string) => {
-    setMemoryOpen(true);
-    setMemoryLoading(true);
-    setMemoryError(null);
-    setSelectedMemorySessionId(sessionId ?? null);
-    const scope = createWorkspaceScope(workspace);
-    const list = await listAgentSessions({ ...scope, includeArchived: true });
-    if (!list.ok || !list.data) {
-      setMemoryError(list.message ?? list.error ?? t(language, 'memory.loadFailed'));
-      setMemoryLoading(false);
-      return;
-    }
-    const scopedSessions = list.data.sessions;
-    setMemorySessions(scopedSessions);
-    const targetSessions = sessionId
-      ? scopedSessions.filter((session) => session.id === sessionId)
-      : scopedSessions.filter((session) => !session.archivedAt);
-    const fallbackSessionIds = targetSessions.length
-      ? targetSessions.map((session) => session.id)
-      : (sessionId ? [sessionId] : currentAgentSessionId ? [currentAgentSessionId] : []);
-    const snapshots: SessionMemorySnapshot[] = [];
-    for (const targetSessionId of fallbackSessionIds) {
-      const result = await getAgentSessionMemorySnapshot(targetSessionId, { projectMemoryMode });
-      if (result.ok && result.data) {
-        snapshots.push(result.data);
-      } else if (sessionId) {
-        setMemoryError(result.message ?? result.error ?? t(language, 'memory.loadFailed'));
-      }
-    }
-    setMemorySnapshots(snapshots);
-    setMemoryLoading(false);
   };
 
   if (!workspace) {
@@ -144,35 +59,6 @@ const WorkspaceSection: React.FC = () => {
           </div>
         </div>
 
-        <div className="settings-card">
-          <div className="settings-card__header-row">
-            <h3 className="settings-card__title">
-              {t(language, 'workspace.archiveTitle')}
-            </h3>
-            <button
-              className="settings-action-button"
-              disabled={!currentAgentSessionId}
-              onClick={() => void handleCopyArchivePath()}
-              type="button"
-            >
-              {t(language, 'workspace.archiveCopyPath')}
-            </button>
-          </div>
-          <div className="settings-card__body">
-            {t(language, 'workspace.archiveBody')}
-          </div>
-          {archiveMessage && (
-            <div
-              className={
-                archiveMessage.kind === 'error'
-                  ? 'settings-status settings-status--error'
-                  : 'settings-status'
-              }
-            >
-              {archiveMessage.text}
-            </div>
-          )}
-        </div>
       </div>
     );
   }
@@ -238,88 +124,11 @@ const WorkspaceSection: React.FC = () => {
           </tbody>
         </table>
 
-        {(lastError || saveMessage || archiveMessage) && (
+        {(lastError || saveMessage) && (
           <div
-            className={
-              lastError || archiveMessage?.kind === 'error'
-                ? 'settings-status settings-status--error'
-                : 'settings-status'
-            }
+            className={lastError ? 'settings-status settings-status--error' : 'settings-status'}
           >
-            {lastError ?? saveMessage ?? archiveMessage?.text}
-          </div>
-        )}
-      </div>
-
-      <div className="settings-card">
-        <div className="settings-card__header-row">
-          <h3 className="settings-card__title">
-            {t(language, 'workspace.archiveTitle')}
-          </h3>
-          <button
-            className="settings-action-button"
-            disabled={!currentAgentSessionId}
-            onClick={() => void handleCopyArchivePath()}
-            type="button"
-          >
-            {t(language, 'workspace.archiveCopyPath')}
-          </button>
-        </div>
-        <div className="settings-card__body">
-          {t(language, 'workspace.archiveBody')}
-        </div>
-      </div>
-
-      <div className="settings-card">
-        <div className="settings-card__header-row">
-          <h3 className="settings-card__title">
-            {t(language, 'workspace.memoryTitle')}
-          </h3>
-          <button
-            className="settings-action-button"
-            onClick={() => void loadWorkspaceMemory()}
-            type="button"
-            disabled={memoryLoading}
-          >
-            {t(language, 'workspace.memoryOpen')}
-          </button>
-        </div>
-        <div className="settings-card__body">
-          {t(language, 'workspace.memoryBody')}
-        </div>
-        {memoryOpen && (
-          <div className="settings-card__inline-placeholder">
-            <AgentMemoryViewer
-              language={language}
-              title={selectedMemorySessionId ? t(language, 'memory.sessionMemory') : t(language, 'memory.workspaceMemory')}
-              subtitle={selectedMemorySessionId
-                ? t(language, 'memory.sessionSubtitle')
-                : t(language, 'memory.workspaceSubtitle')}
-              snapshots={displayedMemorySnapshots}
-              defaultScope={selectedMemorySessionId ? 'session' : 'project'}
-              loading={memoryLoading}
-              error={memoryError}
-              sessionLabels={memorySessionLabels}
-              onRefresh={() => void loadWorkspaceMemory(selectedMemorySessionId ?? undefined)}
-            />
-            {memorySessions.length > 0 && (
-              <div className="settings-memory-session-list">
-                <div className="settings-memory-session-list__title">
-                  {t(language, 'memory.sessionList')}
-                </div>
-                {memorySessions.filter((session) => !session.archivedAt).slice(0, 12).map((session) => (
-                  <button
-                    key={session.id}
-                    type="button"
-                    className={selectedMemorySessionId === session.id ? 'active' : ''}
-                    onClick={() => void loadWorkspaceMemory(session.id)}
-                  >
-                    <span>{session.title?.trim() || session.id}</span>
-                    <small>{session.eventCount ?? 0}</small>
-                  </button>
-                ))}
-              </div>
-            )}
+            {lastError ?? saveMessage}
           </div>
         )}
       </div>
@@ -412,21 +221,5 @@ const WorkspaceSection: React.FC = () => {
     </div>
   );
 };
-
-async function copyText(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.style.position = 'fixed';
-  textarea.style.opacity = '0';
-  document.body.appendChild(textarea);
-  textarea.select();
-  document.execCommand('copy');
-  document.body.removeChild(textarea);
-}
 
 export default WorkspaceSection;

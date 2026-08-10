@@ -11,34 +11,286 @@ pub(crate) struct AgentSessionScopeQuery {
     pub(crate) include_all_scopes: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentSessionRunRequest {
-    pub(crate) op: Option<String>,
+    pub(crate) op: String,
     pub(crate) content: Option<String>,
-    pub(crate) prompt: Option<String>,
-    pub(crate) attachments: Option<Vec<Value>>,
     pub(crate) workspace_path: Option<String>,
     pub(crate) no_workspace: Option<bool>,
-    pub(crate) workflow: Option<String>,
-    pub(crate) requirement_confirmation_mode: Option<String>,
-    pub(crate) review_continuation_mode: Option<String>,
-    pub(crate) intervention_level: Option<String>,
-    pub(crate) autonomy_mode: Option<String>,
-    pub(crate) project_memory_mode: Option<Value>,
-    pub(crate) title: Option<String>,
+    pub(crate) attachments: Option<Vec<AgentInputAttachmentV2>>,
     pub(crate) decision_kind: Option<String>,
     pub(crate) decision: Option<String>,
     pub(crate) guidance: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) target_id: Option<String>,
+    pub(crate) caller_request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentRunStreamQuery {
-    pub(crate) since_event_count: Option<usize>,
-    pub(crate) since_delta_seq: Option<u64>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentRunCallerMutationRequest {
+    pub(crate) caller_request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentRunGuidanceMutationRequest {
+    pub(crate) guidance: String,
+    pub(crate) workspace_path: Option<String>,
+    pub(crate) no_workspace: Option<bool>,
+    pub(crate) attachments: Option<Vec<AgentInputAttachmentV2>>,
+    pub(crate) caller_request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum AgentAuthorityRevokeTargetRequestV2 {
+    CapabilityLease { lease_id: String },
+    TrustPolicy { trust_policy_id: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentAuthorityRevokeRequestV2 {
+    pub(crate) caller_request_id: String,
+    pub(crate) target: AgentAuthorityRevokeTargetRequestV2,
+    pub(crate) reason: String,
+}
+
+fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiResponse> {
+    run_response_with_input_admission(state, session_id, run_id, None)
+}
+
+const HOST_CALLER_MUTATION_ERROR_SCHEMA_V2: &str = "deepcode.host.caller-mutation-error.v2";
+
+fn caller_mutation_error_data(disposition: &str) -> Value {
+    json!({
+        "schemaVersion": HOST_CALLER_MUTATION_ERROR_SCHEMA_V2,
+        "disposition": disposition,
+    })
+}
+
+fn caller_mutation_rejection(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Json<ApiResponse> {
+    ApiResponse::error_with_data(code, message, caller_mutation_error_data("rejected"))
+}
+
+fn caller_mutation_rejection_response(mut response: Json<ApiResponse>) -> Json<ApiResponse> {
+    if !response.0.ok && response.0.data.is_none() {
+        response.0.data = Some(caller_mutation_error_data("rejected"));
+    }
+    response
+}
+
+fn caller_mutation_error_response(error: AgentKernelV2Error) -> Json<ApiResponse> {
+    let code = error.code;
+    let disposition = if matches!(
+        code.as_str(),
+        "host_caller_request_in_progress" | "host_user_input_admission_pending"
+    ) {
+        "pending"
+    } else if code.contains("indeterminate")
+        || matches!(
+            code.as_str(),
+            "host_user_input_projection_missing"
+                | "host_initial_input_projection_missing"
+                | "host_caller_request_recovery_required"
+                | "host_caller_request_outcome_missing"
+                | "host_caller_request_owner_missing"
+                | "host_caller_request_user_input_admission_missing"
+                | "host_user_input_admission_missing"
+                | "host_run_open_admission_incomplete"
+                | "host_run_open_startup_binding_lost"
+                | "host_kernel_caller_drive_owner_lost_before_admission"
+        )
+    {
+        "indeterminate"
+    } else {
+        "rejected"
+    };
+    ApiResponse::error_with_data(code, error.message, caller_mutation_error_data(disposition))
+}
+
+fn run_response_with_input_admission(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    input_id: Option<&str>,
+) -> Json<ApiResponse> {
+    let run = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(run_id)
+            .filter(|run| run.session_id == session_id)
+            .cloned()
+    };
+    let Some(run) = run else {
+        return ApiResponse::error("agent_run_not_found", "agent run not found");
+    };
+    let Some(session) = session_metadata_payload(state, session_id) else {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    };
+    ApiResponse::ok(json!({
+        "run": run,
+        "session": session,
+        "inputId": input_id,
+    }))
+}
+
+fn run_admission_response(
+    state: &AppState,
+    session_id: &str,
+    admission: AgentKernelRunAdmissionV2,
+) -> Json<ApiResponse> {
+    let identity_matches = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(&admission.host_run_id).is_some_and(|run| {
+            run.session_id == session_id
+                && run.kernel_run_id.as_deref() == Some(admission.kernel_run_id.as_str())
+        })
+    };
+    if !identity_matches {
+        return ApiResponse::error(
+            "agent_run_admission_identity_conflict",
+            "Durable Run admission does not match its exact Host and Kernel Run identity.",
+        );
+    }
+    run_response_with_input_admission(
+        state,
+        session_id,
+        &admission.host_run_id,
+        Some(&admission.input_id),
+    )
+}
+
+fn require_verified_selectable_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), Json<ApiResponse>> {
+    let gui = state.gui.lock().expect("gui state lock");
+    verified_selectable_session(&gui, session_id).map(|_| ())
+}
+
+fn session_metadata_payload(state: &AppState, session_id: &str) -> Option<Value> {
+    let session = {
+        let gui = state.gui.lock().expect("gui state lock");
+        session_by_id(&gui, session_id)?.clone()
+    };
+    Some(session)
+}
+
+fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> bool {
+    state
+        .session_runs
+        .lock()
+        .expect("session run state lock")
+        .get(run_id)
+        .is_some_and(|run| run.session_id == session_id)
+}
+
+fn authoritative_project_run_context(
+    state: &AppState,
+    session: &Value,
+    continuing_run: bool,
+) -> Result<Option<Value>, KernelErrorEnvelope> {
+    let Some(project_id) = session
+        .get("projectId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let project = {
+        let gui = state.gui.lock().expect("gui state lock");
+        project_by_id(&gui, project_id).cloned()
+    }
+    .ok_or_else(|| KernelErrorEnvelope {
+        code: "project_root_unavailable".to_string(),
+        message: "project record is unavailable; rebind the project directory".to_string(),
+        message_key: None,
+        args: None,
+    })?;
+    let kind = project
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("blank");
+    if kind == "blank" {
+        return Ok(Some(json!({
+            "projectId": project_id,
+            "kind": "blank",
+            "rootStatus": "unbound"
+        })));
+    }
+    let stored_binding = if continuing_run {
+        session
+            .get("workspaceBinding")
+            .filter(|binding| binding.is_object())
+            .cloned()
+            .or_else(|| project_workspace_binding(&project))
+    } else {
+        project_workspace_binding(&project)
+    }
+    .ok_or_else(|| {
+        if !continuing_run {
+            set_project_root_status(state, project_id, "unavailable");
+        }
+        KernelErrorEnvelope {
+            code: "project_root_unavailable".to_string(),
+            message: "project workspace binding is unavailable; rebind the project directory"
+                .to_string(),
+            message_key: None,
+            args: None,
+        }
+    })?;
+    let resolved_binding = state
+        .host_services
+        .workspace
+        .validate_project_binding(&stored_binding)
+        .map_err(|error| {
+            if !continuing_run {
+                set_project_root_status(state, project_id, "unavailable");
+            }
+            KernelErrorEnvelope {
+                code: error.code,
+                message: format!("project workspace root is unavailable: {}", error.message),
+                message_key: error.message_key,
+                args: error.args,
+            }
+        })?;
+    if !continuing_run {
+        set_project_root_status(state, project_id, "ready");
+    }
+    Ok(Some(json!({
+        "projectId": project_id,
+        "kind": "folder",
+        "rootStatus": "ready",
+        "workspaceBinding": resolved_binding
+    })))
+}
+
+pub(crate) fn session_run_admission_lock(
+    session_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("Session run admission lock registry");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 pub(crate) async fn agent_session_run_start(
@@ -46,492 +298,375 @@ pub(crate) async fn agent_session_run_start(
     Path(session_id): Path<String>,
     Json(body): Json<AgentSessionRunRequest>,
 ) -> Json<ApiResponse> {
-    let Some((session, events)) = session_payload(&state, &session_id) else {
-        return ApiResponse::error("agent_session_not_found", "agent session not found");
-    };
-    if !session_schema_is_compatible(&session) {
-        return incompatible_session_response();
-    }
-    let continuing_run = body.run_id.is_some() || body.decision_kind.is_some();
-    let project_context = match authoritative_project_run_context(&state, &session, continuing_run)
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
-        Ok(context) => context,
-        Err(error) => return ApiResponse::error(error.code, error.message),
+        return caller_mutation_rejection_response(response);
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return caller_mutation_rejection_response(response);
+    }
+    let Some(session) = session_metadata_payload(&state, &session_id) else {
+        return caller_mutation_rejection("agent_session_not_found", "agent session not found");
     };
-    if !continuing_run {
-        if let Some(context) = project_context.as_ref() {
-            if let Some(binding) = context
-                .get("workspaceBinding")
-                .filter(|value| value.is_object())
-            {
-                let mut gui = state.gui.lock().expect("gui state lock");
-                if let Some(stored_session) = session_mut(&mut gui, &session_id) {
-                    stored_session["workspaceBinding"] = binding.clone();
-                    apply_workspace_binding_to_session(stored_session, binding);
-                    stored_session["updatedAt"] = json!(now_text());
-                }
-                if let Err(error) = persist_session_index(&gui) {
-                    return ApiResponse::error("agent_session_persist_failed", error);
-                }
+    if !session_schema_is_current(&session) {
+        return caller_mutation_rejection_response(unsupported_session_schema_response());
+    }
+    match body.op.as_str() {
+        "resolveDecision" => {
+            let mutation_lock = session_run_admission_lock(&session_id);
+            let _mutation_guard = mutation_lock.lock_owned().await;
+            if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+                return caller_mutation_rejection_response(response);
             }
+            if body.content.is_some()
+                || body.workspace_path.is_some()
+                || body.no_workspace.is_some()
+                || body.attachments.is_some()
+            {
+                return caller_mutation_rejection(
+                    "session_operation_v2_invalid",
+                    "A decision cannot alter Run content, attachments, or workspace identity.",
+                );
+            }
+            return match resolve_agent_kernel_decision_v2(&state, &session_id, &body).await {
+                Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
+                Err(error) => caller_mutation_error_response(error),
+            };
+        }
+        "ask" => {
+            let run_start_lock = session_run_admission_lock(&session_id);
+            let _run_start_guard = run_start_lock.lock_owned().await;
+            if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+                return caller_mutation_rejection_response(response);
+            }
+            let Some(session) = session_metadata_payload(&state, &session_id) else {
+                return caller_mutation_rejection(
+                    "agent_session_not_found",
+                    "agent session not found",
+                );
+            };
+            if !session_schema_is_current(&session) {
+                return caller_mutation_rejection_response(unsupported_session_schema_response());
+            }
+            if body.decision_kind.is_some()
+                || body.decision.is_some()
+                || body.guidance.is_some()
+                || body.run_id.is_some()
+                || body.target_id.is_some()
+            {
+                return caller_mutation_rejection(
+                    "session_operation_v2_invalid",
+                    "A new ask cannot carry decision or active Run identity.",
+                );
+            }
+            return agent_session_run_open_admitted(&state, &session_id, &body, &session).await;
+        }
+        _ => {
+            return caller_mutation_rejection(
+                "session_operation_v2_unsupported",
+                "Only a new ask or an exact Plan/capability decision can enter the v2 Run path.",
+            )
         }
     }
-    let start_event_count = events.len();
-    let run_id = format!("session-run-{}", now_millis());
-    let (run, session, profile_id) = {
+}
+
+async fn agent_session_run_open_admitted(
+    state: &AppState,
+    session_id: &str,
+    body: &AgentSessionRunRequest,
+    session: &Value,
+) -> Json<ApiResponse> {
+    match preadmit_open_agent_kernel_run_v2(state, session_id, body).await {
+        Ok(Some(admission)) => return run_admission_response(state, session_id, admission),
+        Ok(None) => {}
+        Err(error) => return caller_mutation_error_response(error),
+    }
+    let project_context = match authoritative_project_run_context(state, session, false) {
+        Ok(context) => context,
+        Err(error) => return caller_mutation_rejection(error.code, error.message),
+    };
+    if let Some(binding) = project_context
+        .as_ref()
+        .and_then(|context| context.get("workspaceBinding"))
+        .filter(|value| value.is_object())
+    {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        if let Some(stored_session) = session_mut(&mut gui, session_id) {
+            stored_session["workspaceBinding"] = binding.clone();
+            apply_workspace_binding_to_session(stored_session, binding);
+            stored_session["updatedAt"] = json!(now_text());
+        }
+        if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
+            return caller_mutation_rejection("agent_session_persist_failed", error);
+        }
+    }
+    let profile_id = {
         let mut gui = state.gui.lock().expect("gui state lock");
         let llm_profiles = gui.llm_profiles.clone();
-        let Some(stored_session) = session_mut(&mut gui, &session_id) else {
-            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        let Some(stored_session) = session_mut(&mut gui, session_id) else {
+            return caller_mutation_rejection("agent_session_not_found", "agent session not found");
         };
         let stored_profile_id = stored_session
             .get("profileId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let profile_id = stored_profile_id
-            .as_deref()
-            .filter(|profile_id| llm_profile_is_enabled(&llm_profiles, profile_id))
-            .map(str::to_string)
-            .or_else(|| preferred_enabled_llm_profile_id(&llm_profiles));
-        let Some(profile_id) = profile_id else {
-            return ApiResponse::error(
+        let Some(profile_id) = stored_profile_id else {
+            return caller_mutation_rejection(
                 "llm_profile_unavailable",
-                "no enabled LLM Profile is available for this session",
+                "this Session has no selected LLM Profile; select one before starting a Run",
             );
         };
-        if stored_profile_id.as_deref() != Some(profile_id.as_str()) {
-            stored_session["profileId"] = json!(profile_id.clone());
-            stored_session["updatedAt"] = json!(now_text());
-            if let Err(error) = persist_session_index(&gui) {
-                return ApiResponse::error("agent_session_persist_failed", error);
+        let profile_available = match effective_llm_profile_is_enabled(
+            &state,
+            &llm_profiles,
+            &profile_id,
+        ) {
+            Ok(available) => available,
+            Err(error) => {
+                return caller_mutation_rejection(
+                    error.code,
+                    "Provider Profile availability could not be verified before starting the Session Run",
+                )
             }
+        };
+        if !profile_available {
+            return caller_mutation_rejection(
+                "llm_profile_unavailable",
+                "the Session's selected LLM Profile does not exist, is disabled, or its exact revision is unavailable; select or re-enable it explicitly",
+            );
         }
-        let session = session_by_id(&gui, &session_id)
-            .cloned()
-            .unwrap_or_else(|| session.clone());
-        let run = AgentRunState::running(
-            run_id.clone(),
-            session_id.clone(),
-            profile_id.clone(),
-            start_event_count,
-        );
-        let mut runs = state.session_runs.lock().expect("session run state lock");
-        runs.insert(run_id.clone(), run.clone());
-        (run, session, profile_id)
+        profile_id
     };
-
-    let intervention_level = body
-        .intervention_level
-        .clone()
-        .or_else(|| user_setting_string(&state, "agent.interventionLevel"))
-        .or_else(|| Some("medium".to_string()));
-    let project_memory_mode = normalize_project_memory_mode(
-        body.project_memory_mode.clone(),
-        user_setting_string(&state, "agent.memory.projectMode"),
-    );
-    let autonomy_mode = body
-        .autonomy_mode
-        .clone()
-        .or_else(|| user_setting_string(&state, "agent.permissions.autonomyMode"))
-        .unwrap_or_else(|| "strict".to_string());
-    let request = host_bridge_request(
-        &session_id,
-        &run_id,
-        &body,
+    let start_event_count = {
+        let sessions_dir = state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .paths
+            .sessions_dir
+            .clone();
+        match read_session_kernel_v2_public_agent_events(&sessions_dir, session_id) {
+            Ok(events) => events.len(),
+            Err(error) => return caller_mutation_rejection(error.code, error.message),
+        }
+    };
+    match open_agent_kernel_run_v2(
+        state,
+        session_id,
+        body,
         &profile_id,
-        intervention_level,
-        project_memory_mode,
-        autonomy_mode,
         project_context.as_ref(),
-    );
-    let worker_state = state.clone();
-    let worker_session_id = session_id.clone();
-    let worker_run_id = run_id.clone();
-    thread::spawn(move || {
-        run_session_bridge_worker(
-            worker_state,
-            worker_session_id,
-            worker_run_id,
-            request,
-            start_event_count,
-        );
-    });
-
-    ApiResponse::ok(json!({
-        "run": run,
-        "session": session,
-        "events": events
-    }))
+        start_event_count,
+    )
+    .await
+    {
+        Ok(admission) => run_admission_response(state, session_id, admission),
+        Err(error) => caller_mutation_error_response(error),
+    }
 }
 
 pub(crate) async fn agent_session_run_get(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
 ) -> Json<ApiResponse> {
-    run_response(&state, &session_id, &run_id)
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
+    if run_belongs_to_session(&state, &session_id, &run_id) {
+        return run_response(&state, &session_id, &run_id);
+    }
+    match restore_agent_kernel_run_cache_v2(&state, &session_id, &run_id) {
+        Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+pub(crate) async fn agent_session_active_run(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
+    let active = match state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(&session_id)
+    {
+        Ok(active) => active,
+        Err(error) => {
+            return ApiResponse::error(error.code, error.message);
+        }
+    };
+    let Some(active) = active else {
+        return ApiResponse::ok(Value::Null);
+    };
+    if !run_belongs_to_session(&state, &session_id, &active.host_run_id) {
+        if let Err(error) =
+            restore_agent_kernel_run_cache_v2(&state, &session_id, &active.host_run_id)
+        {
+            return ApiResponse::error(error.code, error.message);
+        }
+    }
+    run_response(&state, &session_id, &active.host_run_id)
 }
 
 pub(crate) async fn agent_session_run_cancel(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<AgentRunCallerMutationRequest>,
 ) -> Json<ApiResponse> {
-    request_run_cancellation(&state, &run_id);
-    run_response(&state, &session_id, &run_id)
-}
-
-pub(crate) async fn agent_session_run_delta(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    if !run_belongs_to_session(&state, &session_id, &run_id) {
-        return ApiResponse::error("agent_run_not_found", "agent run not found");
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return caller_mutation_rejection_response(response);
     }
-    record_daemon_projection_delivery(
-        &state,
-        &session_id,
-        &run_id,
-        "daemon.timeline_delta_received",
-        Some(&body),
-        "accepted",
-        false,
-    );
-    let normalized_delta = {
-        let mut deltas = state
-            .session_run_deltas
-            .lock()
-            .expect("session run delta state lock");
-        let queue = deltas.entry(run_id.clone()).or_default();
-        let delta_seq = queue
-            .last()
-            .and_then(|delta| delta.get("deltaSeq").and_then(Value::as_u64))
-            .unwrap_or(0)
-            + 1;
-        let delta = normalize_run_delta(&session_id, &run_id, delta_seq, body);
-        queue.push(delta);
-        const MAX_RUN_DELTAS: usize = 2_000;
-        if queue.len() > MAX_RUN_DELTAS {
-            let overflow = queue.len() - MAX_RUN_DELTAS;
-            queue.drain(0..overflow);
-        }
-        queue.last().cloned().unwrap_or(Value::Null)
-    };
-    record_daemon_projection_delivery(
-        &state,
-        &session_id,
-        &run_id,
-        "daemon.timeline_delta_enqueued",
-        Some(&normalized_delta),
-        "accepted",
-        false,
-    );
-    touch_run(&state, &run_id, None);
-    run_response(&state, &session_id, &run_id)
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return caller_mutation_rejection_response(response);
+    }
+    match cancel_agent_kernel_run_v2(&state, &session_id, &run_id, &body.caller_request_id).await {
+        Ok(Some(host_run_id)) => run_response(&state, &session_id, &host_run_id),
+        Ok(None) => caller_mutation_rejection("agent_run_not_found", "agent run not found"),
+        Err(error) => caller_mutation_error_response(error),
+    }
 }
 
 pub(crate) async fn agent_session_run_guidance(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
-    Json(body): Json<Value>,
+    Json(body): Json<AgentRunGuidanceMutationRequest>,
 ) -> Json<ApiResponse> {
-    let run = {
-        let runs = state.session_runs.lock().expect("session run state lock");
-        runs.get(&run_id)
-            .filter(|run| run.session_id == session_id)
-            .cloned()
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return caller_mutation_rejection_response(response);
+    }
+    let mutation_lock = session_run_admission_lock(&session_id);
+    let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return caller_mutation_rejection_response(response);
+    }
+    let Some(session) = session_metadata_payload(&state, &session_id) else {
+        return caller_mutation_rejection("agent_session_not_found", "agent session not found");
     };
-    let Some(run) = run else {
-        return ApiResponse::error("agent_run_not_found", "agent run not found");
+    let project_context = match authoritative_project_run_context(&state, &session, true) {
+        Ok(context) => context,
+        Err(error) => return caller_mutation_rejection(error.code, error.message),
     };
-    if run_status_terminal(&run.status) {
-        return ApiResponse::error(
-            "agent_run_not_active",
-            "run is not active; start a new run or resolve the pending decision",
-        );
-    }
-    let events = session_projection(&state, &session_id);
-    if pending_permission_message(&events).is_some() {
-        return ApiResponse::error(
-            "permission_pending",
-            "permission confirmation is pending; resolve it before sending guidance",
-        );
-    }
-    let guidance = body
-        .get("guidance")
-        .or_else(|| body.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if guidance.is_empty() {
-        return ApiResponse::error("empty_guidance", "guidance must not be empty");
-    }
-    let attachments = body
-        .get("attachments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let guidance_id = format!("guidance-{}", now_millis());
-    append_session_projection(
+    let (workspace_path, no_workspace) = if let Some(project_context) = project_context.as_ref() {
+        if project_context.get("kind").and_then(Value::as_str) == Some("blank") {
+            if body.workspace_path.is_some() || body.no_workspace == Some(false) {
+                return caller_mutation_rejection(
+                    "agent_guidance_project_workspace_conflict",
+                    "The authoritative project has no workspace, but guidance requested a workspace-bound continuation.",
+                );
+            }
+            (None, true)
+        } else {
+            if body.no_workspace == Some(true) {
+                return caller_mutation_rejection(
+                    "agent_guidance_project_workspace_conflict",
+                    "The authoritative project is workspace-bound and cannot continue in no-workspace mode.",
+                );
+            }
+            let Some(authoritative_path) = project_context
+                .pointer("/workspaceBinding/openPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            else {
+                return caller_mutation_rejection(
+                    "agent_guidance_workspace_required",
+                    "Project-backed guidance has no authoritative workspace path.",
+                );
+            };
+            let requested_path = body
+                .workspace_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            (
+                Some(requested_path.unwrap_or(authoritative_path).to_string()),
+                false,
+            )
+        }
+    } else if body.no_workspace == Some(true) {
+        if body.workspace_path.is_some() {
+            return caller_mutation_rejection(
+                "agent_guidance_workspace_conflict",
+                "Guidance cannot request both a workspace path and no-workspace mode.",
+            );
+        }
+        (None, true)
+    } else {
+        let Some(path) = body
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            return caller_mutation_rejection(
+                "agent_guidance_workspace_required",
+                "Guidance for a workspace-bound Run requires the current workspace path.",
+            );
+        };
+        (Some(path.to_string()), false)
+    };
+    let admission = submit_agent_kernel_user_input_v2(
         &state,
         &session_id,
-        vec![agent_event(
+        &run_id,
+        &body.guidance,
+        workspace_path.as_deref(),
+        no_workspace,
+        body.attachments.as_deref(),
+        &body.caller_request_id,
+    )
+    .await;
+    let result = match admission {
+        Ok(admission) => await_agent_kernel_user_input_admission_v2(admission).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(receipt) => run_response_with_input_admission(
+            &state,
             &session_id,
-            "user_guidance",
-            json!({
-                "guidanceId": guidance_id,
-                "content": guidance.clone(),
-                "guidance": guidance.clone(),
-                "attachments": attachments,
-                "source": "user",
-                "targetRunId": run_id.clone(),
-                "targetInteractionKind": "runningRunGuidance",
-                "effectiveCheckpoint": "nextProviderCall",
-                "checkpointKind": "nextProviderCall",
-                "status": "queued",
-                "summary": "用户补充引导已记录，将在下一次 provider checkpoint 生效。",
-                "channel": "user",
-                "visibility": "conversation",
-                "presentation": "body"
-            }),
-            &now_text(),
-        )],
-    );
-    touch_run(&state, &run_id, Some("guidance queued".to_string()));
-    run_response(&state, &session_id, &run_id)
+            &receipt.host_run_id,
+            Some(&receipt.input_id),
+        ),
+        Err(error) => caller_mutation_error_response(error),
+    }
 }
 
-pub(crate) async fn agent_session_run_stream(
+pub(crate) async fn agent_session_run_authority_revoke(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
-    Query(query): Query<AgentRunStreamQuery>,
-) -> Response {
-    let stream_state = state.clone();
-    let stream = async_stream::stream! {
-        let mut sent_delta_seq = query.since_delta_seq.unwrap_or(0);
-        let mut sent_event_count = query.since_event_count.unwrap_or_else(|| {
-            let runs = stream_state.session_runs.lock().expect("session run state lock");
-            runs.get(&run_id).map(|run| run.start_event_count).unwrap_or(0)
-        });
-        let mut last_run_status = String::new();
-        let mut heartbeat_at = Instant::now();
-        loop {
-            let run = {
-                let runs = stream_state.session_runs.lock().expect("session run state lock");
-                runs.get(&run_id)
-                    .filter(|run| run.session_id == session_id)
-                    .cloned()
-            };
-            let Some(run) = run else {
-                yield sse_bytes("error", json!({
-                    "code": "agent_run_not_found",
-                    "message": "agent run not found",
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone()
-                }));
-                break;
-            };
-
-            if run.status != last_run_status {
-                last_run_status = run.status.clone();
-                yield sse_bytes("run", json!({
-                    "run": run.clone(),
-                    "sessionId": session_id.clone()
-                }));
-            }
-
-            let deltas = {
-                let deltas = stream_state
-                    .session_run_deltas
-                    .lock()
-                    .expect("session run delta state lock");
-                deltas.get(&run_id).cloned().unwrap_or_default()
-            };
-            for delta in deltas.iter() {
-                let Some(seq) = delta.get("deltaSeq").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if seq <= sent_delta_seq {
-                    continue;
-                }
-                record_daemon_projection_delivery(
-                    &stream_state,
-                    &session_id,
-                    &run_id,
-                    "daemon.sse_delta_sent",
-                    Some(delta),
-                    "sent",
-                    false,
-                );
-                yield sse_bytes("delta", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "delta": delta
-                }));
-                sent_delta_seq = seq;
-            }
-
-            let events = session_projection(&stream_state, &session_id);
-            if events.len() != sent_event_count {
-                let new_events = events.iter().skip(sent_event_count).cloned().collect::<Vec<_>>();
-                sent_event_count = events.len();
-                yield sse_bytes("events", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "events": new_events,
-                    "eventCount": sent_event_count
-                }));
-            }
-
-            if run_status_terminal(&run.status) {
-                let (terminal_events, terminal_event_count) =
-                    terminal_stream_event_tail(&events, sent_event_count);
-                sent_event_count = terminal_event_count;
-                record_daemon_projection_delivery(
-                    &stream_state,
-                    &session_id,
-                    &run_id,
-                    "daemon.sse_terminal_sent",
-                    None,
-                    "sent",
-                    true,
-                );
-                flush_daemon_projection_delivery_terminal(&stream_state, &run_id).await;
-                yield sse_bytes("terminal", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "run": run.clone(),
-                    "events": terminal_events,
-                    "eventCount": sent_event_count
-                }));
-                break;
-            }
-
-            if heartbeat_at.elapsed() >= Duration::from_secs(10) {
-                heartbeat_at = Instant::now();
-                yield sse_bytes("heartbeat", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "at": now_text()
-                }));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    };
-    (
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response()
-}
-
-pub(crate) async fn agent_session_cancel(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Json(body): Json<AgentAuthorityRevokeRequestV2>,
 ) -> Json<ApiResponse> {
-    let active_runs = {
-        let runs = state.session_runs.lock().expect("session run state lock");
-        runs.values()
-            .filter(|run| run.session_id == session_id && run_status_active(&run.status))
-            .map(|run| run.run_id.clone())
-            .collect::<Vec<_>>()
-    };
-    for run_id in active_runs {
-        request_run_cancellation(&state, &run_id);
-    }
-    let gui = state.gui.lock().expect("gui state lock");
-    session_result(&gui, &session_id)
-}
-
-pub(crate) async fn agent_session_trace(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    let events = gui
-        .trace_events
-        .get(&session_id)
-        .cloned()
-        .unwrap_or_default();
-    ApiResponse::ok(json!({
-        "sessionId": session_id,
-        "trace": {
-            "sessionId": session_id,
-            "events": events,
-            "eventCount": events.len(),
-            "updatedAt": now_text()
-        }
-    }))
-}
-
-pub(crate) async fn agent_permission_resolve(
-    State(state): State<AppState>,
-    Path(permission_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let decision = body
-        .get("decision")
-        .and_then(Value::as_str)
-        .unwrap_or("reject")
-        .to_string();
-    let kernel_decision = if decision == "accept" {
-        deepcode_kernel_abi::PermissionDecisionKind::Accept
-    } else {
-        deepcode_kernel_abi::PermissionDecisionKind::Reject
-    };
-    let kernel_events = {
-        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
-        runtime
-            .dispatch(KernelCommand::PermissionResolve {
-                request_id: rid("agent-permission-resolve"),
-                permission_id: permission_id.clone(),
-                decision: kernel_decision,
-            })
-            .unwrap_or_else(|error| {
-                vec![KernelEvent::Error {
-                    request_id: Some(rid("agent-permission-resolve")),
-                    run_id: None,
-                    session_id: None,
-                    error: KernelErrorEnvelope::from(&error),
-                    message_key: None,
-                    args: None,
-                }]
-            })
-    };
-    let session_id = kernel_events
-        .iter()
-        .find_map(kernel_event_session_id)
-        .or_else(|| {
-            state
-                .gui
-                .lock()
-                .expect("gui state lock")
-                .current_session_id
-                .clone()
-        })
-        .unwrap_or_else(|| "session-unknown".to_string());
-    record_kernel_events(&state, &kernel_events);
-    let projection = kernel_events_to_agent_events(&session_id, &kernel_events);
-    append_session_projection(&state, &session_id, projection);
-    let gui = state.gui.lock().expect("gui state lock");
-    if gui
-        .sessions
-        .iter()
-        .any(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
-        session_result(&gui, &session_id)
-    } else {
-        ApiResponse::ok(json!({
-            "sessionId": session_id,
-            "events": gui
-                .session_projection_cache
-                .get(&session_id)
-                .cloned()
-                .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, &session_id))
-        }))
+        return response;
+    }
+    let mutation_lock = session_run_admission_lock(&session_id);
+    let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
+    match revoke_agent_kernel_authority_v2(&state, &session_id, &run_id, &body) {
+        Ok(result) => ApiResponse::ok(result),
+        Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
 

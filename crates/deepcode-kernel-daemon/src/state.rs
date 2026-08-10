@@ -3,28 +3,34 @@ use crate::*;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
+    pub(crate) kernel_v2: crate::kernel_v2_transport::KernelV2TransportState,
+    pub(crate) kernel_session_v2: crate::host_kernel_run_v2::HostKernelRunCoordinatorV2,
+    pub(crate) kernel_wake_v2: crate::host_kernel_wake_v2::HostKernelWakeSupervisorV2,
+    pub(crate) startup_readiness_v2: crate::startup_readiness_v2::HostStartupReadinessV2,
+    pub(crate) host_shell_authority: crate::host_admission_v2::HostShellAuthorityV2,
     pub(crate) gui: Arc<Mutex<GuiState>>,
+    pub(crate) host_services: HostServices,
+    pub(crate) provider_trace_v1: ProviderTraceStoreV1,
+    pub(crate) provider_trace_export_limiter_v1:
+        crate::provider_trace_api::ProviderTraceExportLimiterV1,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
-    pub(crate) kernel_events: Arc<Mutex<Vec<KernelEvent>>>,
     pub(crate) session_runs: Arc<Mutex<HashMap<String, AgentRunState>>>,
-    pub(crate) session_run_deltas: Arc<Mutex<HashMap<String, Vec<Value>>>>,
-    pub(crate) projection_delivery: Arc<Mutex<ProjectionDeliveryBufferState>>,
 }
 
-pub(crate) type SharedRuntime = Arc<Mutex<DeepCodeKernelRuntime>>;
+impl axum::extract::FromRef<AppState> for crate::kernel_v2_transport::KernelV2TransportState {
+    fn from_ref(state: &AppState) -> Self {
+        state.kernel_v2.clone()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct HostPaths {
     pub(crate) settings_path: PathBuf,
     pub(crate) llm_profiles_path: PathBuf,
     pub(crate) llm_secrets_path: PathBuf,
-    pub(crate) workflow_config_path: PathBuf,
     pub(crate) projects_path: PathBuf,
     pub(crate) sessions_index_path: PathBuf,
     pub(crate) sessions_dir: PathBuf,
-    pub(crate) conversation_archives_dir: PathBuf,
-    pub(crate) memory_archives_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -32,20 +38,19 @@ pub(crate) struct GuiState {
     pub(crate) paths: HostPaths,
     pub(crate) user_settings: Value,
     pub(crate) llm_profiles: Value,
-    pub(crate) workflow_config: Value,
     pub(crate) projects: Vec<Value>,
     pub(crate) sessions: Vec<Value>,
+    pub(crate) session_metadata_error: Option<String>,
     pub(crate) current_session_id: Option<String>,
     pub(crate) current_session_ids_by_scope: HashMap<String, String>,
-    pub(crate) session_projection_cache: HashMap<String, Vec<Value>>,
-    pub(crate) session_timeline_cache: HashMap<String, Value>,
-    pub(crate) trace_events: HashMap<String, Vec<Value>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentRunState {
     pub(crate) run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kernel_run_id: Option<String>,
     pub(crate) session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile_id: Option<String>,
@@ -57,8 +62,6 @@ pub(crate) struct AgentRunState {
     pub(crate) completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) final_text: Option<String>,
 }
 
 impl AgentRunState {
@@ -71,6 +74,7 @@ impl AgentRunState {
         let now = now_text();
         Self {
             run_id,
+            kernel_run_id: None,
             session_id,
             profile_id: Some(profile_id),
             status: "running".to_string(),
@@ -79,7 +83,6 @@ impl AgentRunState {
             updated_at: now,
             completed_at: None,
             message: None,
-            final_text: None,
         }
     }
 }
@@ -89,30 +92,33 @@ impl GuiState {
         let paths = HostPaths::new();
         let user_settings =
             read_json_file(&paths.settings_path).unwrap_or_else(default_user_settings);
-        let llm_profiles =
-            read_json_file(&paths.llm_profiles_path).unwrap_or_else(default_llm_profiles);
-        let workflow_config =
-            read_json_file(&paths.workflow_config_path).unwrap_or_else(default_workflow_config);
+        let llm_profiles = if paths.llm_profiles_path.exists() {
+            read_json_file(&paths.llm_profiles_path).unwrap_or(Value::Null)
+        } else {
+            default_llm_profiles()
+        };
         let projects = restore_agent_projects(&paths.projects_path);
-        let sessions = restore_session_index(&paths);
+        let (sessions, session_metadata_error) =
+            match crate::session_metadata_v2::restore_session_index(&paths) {
+                Ok(sessions) => (sessions, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
         let current_session_id = sessions
             .iter()
-            .find(|session| !is_archived_session(session))
+            .find(|session| session_is_selectable(session))
             .and_then(|session| session.get("id").and_then(Value::as_str))
             .map(ToOwned::to_owned);
-        let current_session_ids_by_scope = restored_current_session_ids_by_scope(&sessions);
+        let current_session_ids_by_scope =
+            crate::session_metadata_v2::restored_current_session_ids_by_scope(&sessions);
         Self {
             paths,
             user_settings,
             llm_profiles,
-            workflow_config,
             projects,
             sessions,
+            session_metadata_error,
             current_session_id,
             current_session_ids_by_scope,
-            session_projection_cache: HashMap::new(),
-            session_timeline_cache: HashMap::new(),
-            trace_events: HashMap::new(),
         }
     }
 }
@@ -134,12 +140,9 @@ impl HostPaths {
             settings_path: settings_dir.join("user-settings.json"),
             llm_profiles_path: settings_dir.join("llm-profiles.json"),
             llm_secrets_path: secrets_dir.join("llm-secrets.json"),
-            workflow_config_path: settings_dir.join("agent-workflow-config.json"),
             projects_path: root.join("projects.json"),
             sessions_index_path: root.join("agent-sessions.json"),
             sessions_dir: root.join("sessions"),
-            conversation_archives_dir: root.join("conversation-archives"),
-            memory_archives_dir: root.join("memory").join("projects"),
         }
     }
 }

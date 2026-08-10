@@ -6,7 +6,6 @@ pub(super) struct FsDiffExecutor;
 pub(super) struct FsCreateExecutor;
 pub(super) struct FsWriteExecutor;
 pub(super) struct FsEditExecutor;
-pub(super) struct FsRenameExecutor;
 pub(super) struct FsDeleteExecutor;
 pub(super) struct FsEnsureDirectoryExecutor;
 
@@ -229,53 +228,6 @@ impl KernelToolExecutor for FsEditExecutor {
     }
 }
 
-impl KernelToolExecutor for FsRenameExecutor {
-    fn invoke(
-        &self,
-        invocation: KernelToolInvocation,
-        context: KernelToolExecutionContext,
-    ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
-        let path = required_string(&invocation.input, "path")?;
-        let destination = required_string(&invocation.input, "destinationPath")?;
-        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
-        WorkspaceBoundary::assert_mutable_config_asset(&destination)?;
-        let source = resolve_workspace_mutation_path(&root, &path)?;
-        let target = resolve_workspace_mutation_path(&root, &destination)?;
-        if !source.exists() {
-            return Err(KernelError::InvalidCommand(format!(
-                "fs.rename source does not exist: {path}"
-            )));
-        }
-        if target.exists() {
-            return Err(KernelError::InvalidCommand(format!(
-                "fs.rename destination already exists: {destination}"
-            )));
-        }
-        let parent = target.parent().ok_or_else(|| {
-            KernelError::InvalidCommand(format!(
-                "fs.rename destination has no parent: {destination}"
-            ))
-        })?;
-        if !parent.is_dir() {
-            return Err(KernelError::InvalidCommand(format!(
-                "fs.rename destination parent does not exist: {}",
-                parent.display()
-            )));
-        }
-        fs::rename(&source, &target)
-            .map_err(|error| KernelError::Other(format!("rename {path}: {error}")))?;
-        Ok(ok(
-            invocation.id,
-            serde_json::json!({
-                "path": normalize_relative_path(&path),
-                "destinationPath": normalize_relative_path(&destination),
-                "renamed": true
-            }),
-        ))
-    }
-}
-
 impl KernelToolExecutor for FsDeleteExecutor {
     fn invoke(
         &self,
@@ -386,9 +338,7 @@ impl KernelToolExecutor for FsDiffExecutor {
             .content;
         let new_content =
             get_string_allow_empty(&invocation.input, "proposedContent").ok_or_else(|| {
-                KernelError::InvalidCommand(
-                    "fs.diff requires proposedContent from contentBlockId".to_string(),
-                )
+                KernelError::InvalidCommand("fs.diff requires proposedContent".to_string())
             })?;
         let changed_ranges = changed_line_ranges(&old_content, &new_content);
         Ok(ok(

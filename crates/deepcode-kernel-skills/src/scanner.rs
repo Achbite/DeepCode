@@ -89,7 +89,7 @@ pub fn scan_skill_manifest(
         script_hash: revision_hash,
         requires_user_approval: manifest.requires_approval() || !findings.is_empty(),
         static_analysis_boundary:
-            "Static analysis is advisory; Broker, PermissionGate, WorkspaceBoundary and AuditLedger remain the security boundary."
+            "Static analysis is advisory; Kernel admission, WorkspaceBoundary and canonical audit facts remain the security boundary."
                 .to_string(),
         findings,
     }

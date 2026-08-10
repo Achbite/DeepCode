@@ -1,0 +1,2955 @@
+use super::authority::{
+    canonicalize_requested_resource_scope, caused_direct_attempt, command_receipt_draft,
+    corrupt_store, direct_execution_result_drafts, direct_failed_before_effect_drafts,
+    direct_pre_effect_stop_drafts, direct_tool_intent_admission_drafts,
+    direct_tool_intent_continuation_drafts, epoch_advance_drafts, exact_epoch,
+    explicit_cancellation_drafts, fact_draft, invalid_field, materialize_deadline,
+    plan_control_cancellation, plan_epoch_advance, prepare_direct_effect,
+    prepare_direct_tool_intent, prepare_failure_error, recorded_error_to_error,
+    require_current_run, resolve_execution, resolve_workspace_binding, storage_fault,
+    EffectPreparation, EpochAdvancePlan,
+};
+use super::model::{
+    invocation_phase_is_terminal, AuthorityResult, AuthorityState, AuthorizationTargetKey,
+    ExecutionResolution, InvocationPhase, RawExecution, ResolvedTarget, WorkspaceBinding,
+};
+use crate::executors::{
+    builtin_executors, invoke_document_read_complete, invoke_web_fetch_complete,
+    runtime_unavailable_tool_ids, snapshot_executor_secrets, KernelExecutorConfig,
+    KernelExecutorRegistry, KernelToolExecutionContext,
+    KernelToolInvocation as ExecutorToolInvocation, SecretProvider,
+};
+use deepcode_kernel_abi::v2::{
+    command_request_digest_v2, target_revalidation_set_digest_v2,
+    validate_cross_language_safe_u64_v2, AttemptId, AuthorizationFactV2, CancelRequestId,
+    CancellationReasonCodeV2, CommandEpochContextV2, CommandRequestId, ControlEpoch,
+    EffectEvidenceV2, EffectId, FactId, IndeterminateReasonV2, InputId, InvocationAuthorityV2,
+    InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2,
+    LastObservationV2, MutationCommandResultV2, OperationId, PreEffectFailureCodeV2, RecordedAtV2,
+    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, RunId, RunRetirementReasonCodeV2,
+    V2ValidationError,
+};
+use deepcode_kernel_abi::v2_command::{
+    ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2, EpochPreconditionV2,
+    InvalidFieldViolationV2, InvocationCancelReplyV2, InvocationCancelTargetV2, InvocationCancelV2,
+    KernelCommandEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelReplyV2, MutationCommandKindV2,
+    RecordedCommandErrorV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
+};
+use deepcode_kernel_abi::{
+    CanonicalArgumentsDigestV2, RequestedResourceV2, RunCapabilityV2, ToolContextRefV2,
+    ToolContractDigestV2, ToolEffectScopeV2, ToolIdV2, WorkspaceBindingRefV2,
+};
+use deepcode_kernel_ledger::v2::{
+    AppendWithAuthorityMaterialOutcomeV2, AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2,
+    AuthorityFactWriterLease, AuthorityMaterialDraftV2, AuthorityMaterialMutationV2,
+    AuthorityMaterialRecordV2, CanonicalFactReader, CanonicalFactStore,
+    ConsumeFactQueryContinuationOutcomeV2, FactQueryContinuationConsumerV2,
+    FactQueryContinuationDraftV2, FactQueryContinuationExpectationV2, OutboxPublisherLease,
+    PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2, PutPublicCommandReceiptOutcomeV2,
+};
+use deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const DIRECT_INVOCATION_MATERIAL_KIND: &str = "toolInvocation";
+const DIRECT_INVOCATION_ADMITTED: &str = "admitted";
+const DIRECT_INVOCATION_TERMINAL: &str = "terminal";
+pub(super) const RUN_CAPABILITY_VERIFIER_MATERIAL_KIND: &str = "runCapabilityVerifier";
+pub(super) const RUN_CAPABILITY_VERIFIER_BOUND: &str = "bound";
+pub(super) const AUTHORITY_MATERIAL_RETIREMENT_PENDING: &str = "retirementPending";
+const AUTHORITY_MATERIAL_ACTIVE: &str = "active";
+const AUTHORITY_MATERIAL_AWAITING: &str = "awaiting";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableRunCapabilityVerifierV2 {
+    pub run_id: RunId,
+    pub token_verifier_sha256: String,
+    #[serde(default = "initial_run_transport_generation")]
+    pub transport_generation: u64,
+}
+
+pub(super) fn initial_run_transport_generation() -> u64 {
+    1
+}
+
+pub(super) struct RunTransportRebindOutcomeV2 {
+    pub transport_generation: u64,
+    pub fact_id: FactId,
+    pub ledger_sequence: u64,
+}
+
+pub(super) fn run_capability_verifier_digest(
+    run_id: &RunId,
+    capability: &RunCapabilityV2,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"deepcode.run-capability-verifier.v2\0");
+    hasher.update(run_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(capability.expose_to_transport().as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn run_capability_verifier_material(
+    run_id: &RunId,
+    control_epoch: ControlEpoch,
+    capability: &RunCapabilityV2,
+) -> AuthorityMaterialDraftV2 {
+    AuthorityMaterialDraftV2 {
+        material_kind: RUN_CAPABILITY_VERIFIER_MATERIAL_KIND.to_owned(),
+        material_id: run_id.to_string(),
+        run_id: run_id.clone(),
+        control_epoch: control_epoch.get(),
+        lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+        operation_id: None,
+        invocation_id: None,
+        lease: None,
+        payload_json: serde_json::json!({
+            "runId": run_id,
+            "tokenVerifierSha256": run_capability_verifier_digest(run_id, capability),
+            "transportGeneration": initial_run_transport_generation(),
+        }),
+    }
+}
+
+struct IdMint {
+    nonce: String,
+    next: AtomicU64,
+}
+
+impl IdMint {
+    fn new(high_water: u64) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        Self {
+            nonce: format!("{nanos:x}-{:x}-{high_water:x}", std::process::id()),
+            next: AtomicU64::new(1),
+        }
+    }
+
+    fn value(&self, kind: &str) -> String {
+        let next = self.next.fetch_add(1, Ordering::Relaxed);
+        format!("kv2-{kind}-{}-{next:x}", self.nonce)
+    }
+
+    fn typed<T>(
+        &self,
+        kind: &str,
+        constructor: impl FnOnce(String) -> Result<T, V2ValidationError>,
+    ) -> T {
+        constructor(self.value(kind)).expect("Kernel-minted identity is valid")
+    }
+
+    fn fact(&self) -> FactId {
+        self.typed("fact", FactId::new)
+    }
+
+    fn cancellation(&self) -> (CancelRequestId, FactId) {
+        (self.typed("cancel", CancelRequestId::new), self.fact())
+    }
+}
+
+struct ServiceInner {
+    state: Mutex<AuthorityState>,
+    writer: Mutex<AuthorityFactWriterLease>,
+    reader: CanonicalFactReader,
+    _publisher: OutboxPublisherLease,
+    workspaces: Mutex<HashMap<RunId, WorkspaceBinding>>,
+    executor_runtime: RwLock<ExecutorRuntimeSnapshot>,
+    execution_tasks: Mutex<HashMap<InvocationId, std::thread::JoinHandle<AuthorityResult<()>>>>,
+    ids: IdMint,
+}
+
+#[derive(Clone)]
+struct ExecutorRuntimeSnapshot {
+    config: KernelExecutorConfig,
+    executors: Arc<KernelExecutorRegistry>,
+    unavailable_tool_ids: Arc<Vec<ToolIdV2>>,
+}
+
+impl ExecutorRuntimeSnapshot {
+    fn build(config: KernelExecutorConfig, secret_provider: Arc<dyn SecretProvider>) -> Self {
+        let secret_provider = snapshot_executor_secrets(&config, secret_provider.as_ref());
+        let unavailable_tool_ids = Arc::new(runtime_unavailable_tool_ids(
+            crate::kernel_tool_registry(),
+            &config,
+            secret_provider.as_ref(),
+        ));
+        let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
+            crate::kernel_tool_registry(),
+            config.clone(),
+            secret_provider,
+        )));
+        Self {
+            config,
+            executors,
+            unavailable_tool_ids,
+        }
+    }
+}
+
+/// Sole coordinator for the sealed v2 admission and effect chain.
+/// It exposes no caller-constructible effect permit.
+#[derive(Clone)]
+pub(crate) struct AuthorityService {
+    inner: Arc<ServiceInner>,
+}
+
+pub(super) struct DirectToolIntentRequest {
+    pub(super) run_id: RunId,
+    pub(super) operation_id: deepcode_kernel_abi::v2::OperationId,
+    pub(super) control_epoch: ControlEpoch,
+    pub(super) idempotency_key: String,
+    pub(super) tool_id: ToolIdV2,
+    pub(super) canonical_arguments_digest: CanonicalArgumentsDigestV2,
+    pub(super) canonical_invocation: KernelCanonicalInvocation,
+    pub(super) authority: InvocationAuthorityV2,
+    pub(super) tool_contract_digest: ToolContractDigestV2,
+    pub(super) deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
+}
+
+pub(super) struct InitialToolContextInvalidationV2 {
+    pub(super) tool_id: ToolIdV2,
+    pub(super) previous_context: ToolContextRefV2,
+    pub(super) next_context: ToolContextRefV2,
+}
+
+pub(super) struct DirectToolIntentContinuationOutcome {
+    pub(super) reply: ToolIntentSubmitReplyV2,
+    pub(super) authorization_fact_id: FactId,
+    pub(super) authorization_ledger_sequence: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct RunRetirementFenceOutcome {
+    pub(super) control_epoch: ControlEpoch,
+    pub(super) fence_fact_id: FactId,
+    pub(super) fence_ledger_sequence: u64,
+    pub(super) reason_code: RunRetirementReasonCodeV2,
+    pub(super) reason: Option<String>,
+}
+
+struct RunRetirementFenceDraft {
+    fact_id: FactId,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<String>,
+}
+
+#[derive(Clone)]
+struct DirectAuthorityAdmittedInvocation {
+    identity: deepcode_kernel_abi::v2::ToolAttemptIdentityV2,
+    invocation: KernelCanonicalInvocation,
+    targets: Vec<(ResourceId, ResolvedTarget)>,
+    attempt_prepared_fact_id: FactId,
+    admitted_at: Instant,
+    effective_deadline: Duration,
+    authority_material: AuthorityMaterialDraftV2,
+}
+
+struct PersistedEffectPermit;
+
+struct DirectEffectReadyInvocation {
+    admitted: DirectAuthorityAdmittedInvocation,
+    preparation: EffectPreparation,
+    execution_started_fact_id: FactId,
+    _permit: PersistedEffectPermit,
+}
+
+fn direct_invocation_authority_material(
+    request: &DirectToolIntentRequest,
+    identity: &deepcode_kernel_abi::v2::ToolAttemptIdentityV2,
+    prepared: &super::model::PreparedDirectToolIntent,
+    lifecycle: &str,
+) -> AuthorityMaterialDraftV2 {
+    AuthorityMaterialDraftV2 {
+        material_kind: DIRECT_INVOCATION_MATERIAL_KIND.to_owned(),
+        material_id: identity.invocation_id.to_string(),
+        run_id: identity.run_id.clone(),
+        control_epoch: identity.control_epoch.get(),
+        lifecycle: lifecycle.to_owned(),
+        operation_id: Some(identity.operation_id.clone()),
+        invocation_id: Some(identity.invocation_id.clone()),
+        lease: identity.authority.capability_lease().cloned(),
+        payload_json: serde_json::json!({
+            "runId": identity.run_id,
+            "controlEpoch": identity.control_epoch,
+            "operationId": identity.operation_id,
+            "invocationId": identity.invocation_id,
+            "attemptId": identity.attempt_id,
+            "idempotencyKeyHash": identity.idempotency_key_hash,
+            "toolId": request.tool_id,
+            "canonicalArgumentsDigest": request.canonical_arguments_digest,
+            "toolContractDigest": request.tool_contract_digest,
+            "workspaceBindingDigest": prepared.workspace_binding_digest,
+            "authority": identity.authority,
+        }),
+    }
+}
+
+fn terminal_direct_invocation_material(
+    admitted: &DirectAuthorityAdmittedInvocation,
+    fact_index: usize,
+) -> AuthorityMaterialMutationV2 {
+    let mut material = admitted.authority_material.clone();
+    material.lifecycle = DIRECT_INVOCATION_TERMINAL.to_owned();
+    AuthorityMaterialMutationV2::Replace {
+        expected_lifecycle: DIRECT_INVOCATION_ADMITTED.to_owned(),
+        expected_payload_digest: None,
+        material,
+        fact_index,
+    }
+}
+
+fn recovered_terminal_direct_invocation_material(
+    record: &AuthorityMaterialRecordV2,
+    fact_index: usize,
+) -> AuthorityResult<AuthorityMaterialMutationV2> {
+    if record.material_kind != DIRECT_INVOCATION_MATERIAL_KIND
+        || record.lifecycle != DIRECT_INVOCATION_ADMITTED
+        || record.invocation_id.as_ref().map(InvocationId::as_str)
+            != Some(record.material_id.as_str())
+    {
+        return Err(corrupt_store());
+    }
+    Ok(AuthorityMaterialMutationV2::Replace {
+        expected_lifecycle: DIRECT_INVOCATION_ADMITTED.to_owned(),
+        expected_payload_digest: Some(record.payload_digest.clone()),
+        material: AuthorityMaterialDraftV2 {
+            material_kind: record.material_kind.clone(),
+            material_id: record.material_id.clone(),
+            run_id: record.run_id.clone(),
+            control_epoch: record.control_epoch,
+            lifecycle: DIRECT_INVOCATION_TERMINAL.to_owned(),
+            operation_id: record.operation_id.clone(),
+            invocation_id: record.invocation_id.clone(),
+            lease: record.lease.clone(),
+            payload_json: record.payload_json.clone(),
+        },
+        fact_index,
+    })
+}
+
+impl AuthorityService {
+    pub(super) fn open(
+        store: CanonicalFactStore,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+    ) -> AuthorityResult<Self> {
+        let mut recovery = store.claim_recovery_admin().map_err(|_| storage_fault())?;
+        recovery
+            .rebuild_materialized_state()
+            .map_err(|_| storage_fault())?;
+        let reader = store.reader();
+        let snapshot = reader.snapshot().map_err(|_| storage_fault())?;
+        let state = AuthorityState::restore(snapshot.facts)?;
+        let writer = store
+            .claim_authority_writer()
+            .map_err(|_| storage_fault())?;
+        let publisher = store
+            .claim_outbox_publisher()
+            .map_err(|_| storage_fault())?;
+        let executor_runtime = ExecutorRuntimeSnapshot::build(executor_config, secret_provider);
+        let service = Self {
+            inner: Arc::new(ServiceInner {
+                state: Mutex::new(state),
+                writer: Mutex::new(writer),
+                reader,
+                _publisher: publisher,
+                workspaces: Mutex::new(HashMap::new()),
+                executor_runtime: RwLock::new(executor_runtime),
+                execution_tasks: Mutex::new(HashMap::new()),
+                ids: IdMint::new(snapshot.ledger_sequence_high_water),
+            }),
+        };
+        service.reconcile_open_attempts()?;
+        Ok(service)
+    }
+
+    pub(super) fn replace_executor_runtime_host(
+        &self,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+    ) -> AuthorityResult<()> {
+        let replacement = ExecutorRuntimeSnapshot::build(executor_config, secret_provider);
+        if self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .runs
+            .values()
+            .any(|run| run.retirement_fence.is_none() && run.retired.is_none())
+        {
+            return Err(invalid_field(
+                "executorRuntime",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        *self
+            .inner
+            .executor_runtime
+            .write()
+            .map_err(|_| storage_fault())? = replacement;
+        Ok(())
+    }
+
+    pub(super) fn runtime_unavailable_tool_ids(&self) -> AuthorityResult<Vec<ToolIdV2>> {
+        Ok(self
+            .executor_runtime_snapshot()?
+            .unavailable_tool_ids
+            .as_ref()
+            .clone())
+    }
+
+    fn executor_runtime_snapshot(&self) -> AuthorityResult<ExecutorRuntimeSnapshot> {
+        self.inner
+            .executor_runtime
+            .read()
+            .map_err(|_| storage_fault())
+            .map(|runtime| runtime.clone())
+    }
+
+    pub(super) fn bind_run_workspace(
+        &self,
+        run_id: &RunId,
+        workspace_root: &Path,
+    ) -> AuthorityResult<WorkspaceBinding> {
+        let binding = resolve_workspace_binding(workspace_root)?;
+        self.bind_resolved_run_workspace(run_id, binding)
+    }
+
+    pub(super) fn bind_resolved_run_workspace(
+        &self,
+        run_id: &RunId,
+        binding: WorkspaceBinding,
+    ) -> AuthorityResult<WorkspaceBinding> {
+        {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if state
+                .runs
+                .get(run_id)
+                .is_some_and(|run| run.retirement_fence.is_some() || run.retired.is_some())
+            {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            }
+            if state.direct_invocations.values().any(|invocation| {
+                invocation.run_id == *run_id
+                    && invocation.workspace_binding_digest != binding.digest
+            }) {
+                return Err(invalid_field(
+                    "workspaceRoot",
+                    InvalidFieldViolationV2::OutOfRange,
+                ));
+            }
+        }
+        let mut workspaces = self.inner.workspaces.lock().map_err(|_| storage_fault())?;
+        if let Some(existing) = workspaces.get(run_id) {
+            if existing.digest != binding.digest {
+                return Err(invalid_field(
+                    "workspaceRoot",
+                    InvalidFieldViolationV2::OutOfRange,
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        workspaces.insert(run_id.clone(), binding.clone());
+        Ok(binding)
+    }
+
+    pub(super) fn unbind_run_workspace_host(&self, run_id: &RunId) -> AuthorityResult<()> {
+        self.inner
+            .workspaces
+            .lock()
+            .map_err(|_| storage_fault())?
+            .remove(run_id);
+        Ok(())
+    }
+
+    pub(super) fn run_retirement_fence_host(
+        &self,
+        run_id: &RunId,
+    ) -> AuthorityResult<Option<RunRetirementFenceOutcome>> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        Ok(run
+            .retirement_fence
+            .as_ref()
+            .map(|fence| RunRetirementFenceOutcome {
+                control_epoch: run.epoch,
+                fence_fact_id: fence.fact_id.clone(),
+                fence_ledger_sequence: fence.ledger_sequence,
+                reason_code: fence.reason_code,
+                reason: fence.reason.clone(),
+            }))
+    }
+
+    pub(super) fn require_run_accepting_commands(&self, run_id: &RunId) -> AuthorityResult<()> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        if run.retirement_fence.is_some() || run.retired.is_some() {
+            return Err(KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn workspace_for_run(&self, run_id: &RunId) -> AuthorityResult<WorkspaceBinding> {
+        self.inner
+            .workspaces
+            .lock()
+            .map_err(|_| storage_fault())?
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| invalid_field("runId", InvalidFieldViolationV2::InvalidRelation))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn canonical_scope_for_tool(
+        &self,
+        run_id: &RunId,
+        operation_id: &OperationId,
+        control_epoch: ControlEpoch,
+        idempotency_key: &str,
+        canonical_invocation: &deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation,
+        deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
+        correlation_refs: Vec<deepcode_kernel_abi::v2::CorrelationRefV2>,
+    ) -> AuthorityResult<(deepcode_kernel_abi::v2::ResourceScopeV2, u32)> {
+        {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            require_current_run(&state, run_id, control_epoch)?;
+        }
+        let workspace = self.workspace_for_run(run_id)?;
+        let executor_runtime = self.executor_runtime_snapshot()?;
+        let prepared = prepare_direct_tool_intent(
+            run_id,
+            operation_id,
+            control_epoch,
+            idempotency_key,
+            canonical_invocation,
+            deadline,
+            correlation_refs,
+            crate::kernel_tool_registry(),
+            &workspace,
+            &executor_runtime.config,
+        )
+        .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
+        Ok((prepared.resource_scope, prepared.effective_deadline_ms))
+    }
+
+    pub(super) fn canonical_scope_for_requested_resources(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        tool_id: &ToolIdV2,
+        effect_scope: ToolEffectScopeV2,
+        requested_resources: &[RequestedResourceV2],
+        deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
+    ) -> AuthorityResult<(
+        deepcode_kernel_abi::v2::ResourceScopeV2,
+        Vec<AuthorizationTargetKey>,
+        u32,
+    )> {
+        {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            require_current_run(&state, run_id, control_epoch)?;
+        }
+        let registry = crate::kernel_tool_registry();
+        let tool_kind = registry
+            .kernel_internal_tool_kind(tool_id)
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))?;
+        let admission = registry
+            .kernel_internal_admission_metadata(tool_id)
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))?;
+        let effective_deadline_ms = materialize_deadline(
+            deadline,
+            admission.default_deadline_ms,
+            admission.maximum_deadline_ms,
+        )
+        .map_err(|failure| prepare_failure_error("deadline", failure))?;
+        let workspace = self.workspace_for_run(run_id)?;
+        let executor_runtime = self.executor_runtime_snapshot()?;
+        let (scope, targets) = canonicalize_requested_resource_scope(
+            tool_kind,
+            effect_scope,
+            requested_resources,
+            &workspace,
+            &executor_runtime.config,
+        )
+        .map_err(|failure| prepare_failure_error("scopeIntent.requestedResources", failure))?;
+        Ok((scope, targets, effective_deadline_ms))
+    }
+
+    pub(super) fn open_run_with_public_receipt(
+        &self,
+        command: ControlEpochAdvanceV2,
+        public_request_id: CommandRequestId,
+        public_request_digest: deepcode_kernel_abi::v2::CommandRequestDigestV2,
+        workspace_binding_ref: WorkspaceBindingRefV2,
+        settings_ceiling_digest: deepcode_kernel_abi::v2::SettingsCeilingDigestV2,
+        initial_tool_context_ref: ToolContextRefV2,
+        initial_context_invalidations: Vec<InitialToolContextInvalidationV2>,
+        run_capability: &RunCapabilityV2,
+        mut receipt: PublicCommandReceiptV2,
+    ) -> AuthorityResult<(ControlEpochAdvancedReplyV2, FactId)> {
+        let workspace = self.workspace_for_run(&command.run_id)?;
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let existing_run = state.runs.get(&command.run_id).cloned();
+        let (epoch_context, previous_epoch, new_epoch) =
+            match plan_epoch_advance(&command.run_id, existing_run.as_ref(), command.precondition)?
+            {
+                EpochAdvancePlan::Ready {
+                    epoch_context,
+                    previous_epoch,
+                    new_epoch,
+                } => (epoch_context, previous_epoch, new_epoch),
+                EpochAdvancePlan::Recorded { .. } => return Err(corrupt_store()),
+            };
+        if previous_epoch.is_some() {
+            return Err(corrupt_store());
+        }
+
+        let internal_request_id = self.inner.ids.typed("command", CommandRequestId::new);
+        let internal_command = KernelCommandV2::ControlEpochAdvance(command.clone());
+        let internal_digest =
+            command_request_digest_v2(&internal_command).map_err(|_| corrupt_store())?;
+        let command_fact_id = self.inner.ids.fact();
+        let epoch_fact_id = self.inner.ids.fact();
+        let run_opened_fact_id = self.inner.ids.fact();
+        let high_water = self.predicted_high_water(
+            3usize
+                .checked_add(initial_context_invalidations.len())
+                .ok_or_else(storage_fault)?,
+        )?;
+        let reply = ControlEpochAdvancedReplyV2 {
+            run_id: command.run_id.clone(),
+            accepted_control_epoch: new_epoch,
+            epoch_fact_id: epoch_fact_id.clone(),
+            superseded_capability_count: 0,
+            cancellation: deepcode_kernel_abi::v2_command::ControlCancellationReplyV2::None {},
+            command_batch_high_water: high_water,
+        };
+        let mut drafts = epoch_advance_drafts(
+            internal_request_id,
+            internal_digest,
+            command.clone(),
+            epoch_context,
+            previous_epoch,
+            new_epoch,
+            command_fact_id,
+            epoch_fact_id.clone(),
+            None,
+            reply.clone(),
+        );
+        drafts.push(KernelFactDraftV2 {
+            fact_id: run_opened_fact_id.clone(),
+            payload: KernelFactPayloadV2::Control(
+                deepcode_kernel_abi::v2::ControlFactV2::RunOpened {
+                    run_id: command.run_id.clone(),
+                    control_epoch: new_epoch,
+                    public_request_id,
+                    public_request_digest,
+                    causation_fact_id: epoch_fact_id,
+                    workspace_binding_ref,
+                    workspace_binding_digest: workspace.digest,
+                    settings_ceiling_digest: settings_ceiling_digest.clone(),
+                    tool_context_ref: initial_tool_context_ref.clone(),
+                },
+            ),
+        });
+        let mut previous_context = initial_tool_context_ref;
+        let mut causation_fact_id = run_opened_fact_id.clone();
+        for invalidation in initial_context_invalidations {
+            if invalidation.previous_context != previous_context
+                || invalidation.next_context.context_version.get()
+                    != previous_context
+                        .context_version
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(storage_fault)?
+            {
+                return Err(corrupt_store());
+            }
+            let invalidation_fact_id = self.inner.ids.fact();
+            previous_context = invalidation.next_context.clone();
+            drafts.push(KernelFactDraftV2 {
+                fact_id: invalidation_fact_id.clone(),
+                payload: KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::ContextInvalidated {
+                        identity:
+                            deepcode_kernel_abi::v2::ToolContextInvalidationIdentityV2 {
+                                run_id: command.run_id.clone(),
+                                control_epoch: new_epoch,
+                                causation_fact_id,
+                            },
+                        previous_context: invalidation.previous_context,
+                        next_context_version: invalidation.next_context.context_version,
+                        next_context_ref: invalidation.next_context,
+                        settings_ceiling_digest: settings_ceiling_digest.clone(),
+                        tool_id: Some(invalidation.tool_id),
+                        availability: Some(
+                            deepcode_kernel_abi::ToolAvailabilityV2::Unavailable,
+                        ),
+                        reason:
+                            deepcode_kernel_abi::v2::ToolContextInvalidationReasonV2::ToolUnavailable,
+                    },
+                ),
+            });
+            causation_fact_id = invalidation_fact_id;
+        }
+        let context_fact_id = causation_fact_id;
+        receipt.settlement_fact_id = Some(run_opened_fact_id);
+        let verifier_material =
+            run_capability_verifier_material(&command.run_id, new_epoch, run_capability);
+        self.prevalidate_drafts(&state, &drafts)?;
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_public_receipt_and_authority_material(
+                drafts,
+                receipt,
+                vec![AuthorityMaterialMutationV2::Put {
+                    material: verifier_material,
+                    fact_index: 2,
+                }],
+            )
+            .map_err(|_| storage_fault())?;
+        match outcome.receipt {
+            PutPublicCommandReceiptOutcomeV2::Inserted(_) => {
+                state.apply_committed(outcome.facts)?;
+                Ok((reply, context_fact_id))
+            }
+            PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => Err(corrupt_store()),
+        }
+    }
+
+    pub(super) fn rebind_run_capability_host(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        next_capability: &RunCapabilityV2,
+    ) -> AuthorityResult<RunTransportRebindOutcomeV2> {
+        let record = self
+            .authority_material_snapshot()?
+            .into_iter()
+            .find(|record| {
+                record.material_kind == RUN_CAPABILITY_VERIFIER_MATERIAL_KIND
+                    && record.material_id == run_id.as_str()
+            })
+            .ok_or_else(corrupt_store)?;
+        if record.run_id != *run_id
+            || record.lifecycle != RUN_CAPABILITY_VERIFIER_BOUND
+            || record.operation_id.is_some()
+            || record.invocation_id.is_some()
+            || record.lease.is_some()
+        {
+            return Err(corrupt_store());
+        }
+        let durable: DurableRunCapabilityVerifierV2 =
+            serde_json::from_value(record.payload_json.clone()).map_err(|_| corrupt_store())?;
+        if durable.run_id != *run_id
+            || durable.transport_generation == 0
+            || durable.token_verifier_sha256.len() != 64
+            || !durable
+                .token_verifier_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(corrupt_store());
+        }
+        let transport_generation = durable
+            .transport_generation
+            .checked_add(1)
+            .ok_or_else(corrupt_store)?;
+        let payload = KernelFactPayloadV2::Control(
+            deepcode_kernel_abi::v2::ControlFactV2::RunTransportRebound {
+                run_id: run_id.clone(),
+                control_epoch,
+                transport_generation,
+                causation_fact_id: record.last_fact_id.clone(),
+            },
+        );
+        payload.validate().map_err(|_| corrupt_store())?;
+        let replacement = AuthorityMaterialDraftV2 {
+            material_kind: record.material_kind,
+            material_id: record.material_id,
+            run_id: run_id.clone(),
+            control_epoch: record.control_epoch,
+            lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+            operation_id: None,
+            invocation_id: None,
+            lease: None,
+            payload_json: serde_json::json!({
+                "runId": run_id,
+                "tokenVerifierSha256": run_capability_verifier_digest(run_id, next_capability),
+                "transportGeneration": transport_generation,
+            }),
+        };
+        let outcome = self.append_payloads_with_authority_material(
+            vec![payload],
+            vec![AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+                expected_payload_digest: Some(record.payload_digest),
+                material: replacement,
+                fact_index: 0,
+            }],
+        )?;
+        let fact = outcome.facts.into_iter().next().ok_or_else(corrupt_store)?;
+        Ok(RunTransportRebindOutcomeV2 {
+            transport_generation,
+            fact_id: fact.fact_id,
+            ledger_sequence: fact.ledger_sequence,
+        })
+    }
+
+    pub(super) fn query_run_facts(
+        &self,
+        run_id: &RunId,
+        after_ledger_sequence: u64,
+        limit: u32,
+    ) -> AuthorityResult<(
+        u64,
+        Vec<deepcode_kernel_abi::v2::KernelFactEnvelopeV2>,
+        bool,
+    )> {
+        {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if !state.runs.contains_key(run_id) {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            }
+        }
+        let high_water = self.high_water()?;
+        let mut facts = self
+            .inner
+            .reader
+            .query(&deepcode_kernel_ledger::v2::FactQueryV2 {
+                run_id: Some(run_id.to_string()),
+                after_ledger_sequence: Some(after_ledger_sequence),
+                limit: Some(limit.saturating_add(1)),
+                ..Default::default()
+            })
+            .map_err(|_| storage_fault())?;
+        let has_more = facts.len() > limit as usize;
+        facts.truncate(limit as usize);
+        Ok((high_water, facts, has_more))
+    }
+
+    pub(super) fn snapshot_facts(
+        &self,
+    ) -> AuthorityResult<Vec<deepcode_kernel_abi::v2::KernelFactEnvelopeV2>> {
+        self.inner
+            .reader
+            .snapshot()
+            .map(|snapshot| snapshot.facts)
+            .map_err(|_| storage_fault())
+    }
+
+    pub(super) fn public_command_receipt(
+        &self,
+        request_id: &deepcode_kernel_abi::v2::CommandRequestId,
+    ) -> AuthorityResult<Option<PublicCommandReceiptV2>> {
+        self.inner
+            .reader
+            .get_public_command_receipt(request_id)
+            .map_err(|_| storage_fault())
+    }
+
+    pub(super) fn authority_material_snapshot(
+        &self,
+    ) -> AuthorityResult<Vec<AuthorityMaterialRecordV2>> {
+        self.inner
+            .reader
+            .authority_material_snapshot()
+            .map_err(|_| storage_fault())
+    }
+
+    pub(super) fn fact_reader(&self) -> CanonicalFactReader {
+        self.inner.reader.clone()
+    }
+
+    pub(super) fn put_public_command_receipt(
+        &self,
+        receipt: PublicCommandReceiptV2,
+    ) -> AuthorityResult<PutPublicCommandReceiptOutcomeV2> {
+        self.inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .put_public_command_receipt_if_absent(receipt)
+            .map_err(|_| storage_fault())
+    }
+
+    pub(super) fn put_fact_query_continuation(
+        &self,
+        continuation: FactQueryContinuationDraftV2,
+    ) -> AuthorityResult<PutFactQueryContinuationOutcomeV2> {
+        self.inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .put_fact_query_continuation_if_absent(continuation)
+            .map_err(|_| storage_fault())
+    }
+
+    pub(super) fn consume_fact_query_continuation(
+        &self,
+        token: deepcode_kernel_abi::FactQueryContinuationV2,
+        expected: FactQueryContinuationExpectationV2,
+        consumer: FactQueryContinuationConsumerV2,
+    ) -> AuthorityResult<ConsumeFactQueryContinuationOutcomeV2> {
+        self.inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .consume_fact_query_continuation(token, expected, consumer)
+            .map_err(|_| storage_fault())
+    }
+
+    pub(super) fn append_payloads_with_authority_material(
+        &self,
+        payloads: Vec<KernelFactPayloadV2>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> AuthorityResult<AppendWithAuthorityMaterialOutcomeV2> {
+        if payloads.is_empty() {
+            return Err(storage_fault());
+        }
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let drafts = payloads
+            .into_iter()
+            .map(|payload| KernelFactDraftV2 {
+                fact_id: self.inner.ids.fact(),
+                payload,
+            })
+            .collect::<Vec<_>>();
+        self.prevalidate_drafts(&state, &drafts)?;
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_authority_material(drafts, mutations)
+            .map_err(|_| storage_fault())?;
+        if let Err(error) = state.apply_committed(outcome.facts.clone()) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn append_payloads_with_public_receipt_and_authority_material_builder<F>(
+        &self,
+        payloads: Vec<KernelFactPayloadV2>,
+        settlement_index: Option<usize>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+        build_receipt: F,
+    ) -> AuthorityResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2>
+    where
+        F: FnOnce(&[FactId], &[u64]) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        if payloads.is_empty() || settlement_index.is_some_and(|index| index >= payloads.len()) {
+            return Err(storage_fault());
+        }
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let batch_len = payloads.len();
+        let batch_len_u64 = u64::try_from(batch_len).map_err(|_| storage_fault())?;
+        let high_water = self.predicted_high_water(batch_len)?;
+        let first_ledger_sequence = high_water
+            .checked_sub(batch_len_u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(storage_fault)?;
+        let drafts = payloads
+            .into_iter()
+            .map(|payload| KernelFactDraftV2 {
+                fact_id: self.inner.ids.fact(),
+                payload,
+            })
+            .collect::<Vec<_>>();
+        self.prevalidate_drafts(&state, &drafts)?;
+        let fact_ids = drafts
+            .iter()
+            .map(|draft| draft.fact_id.clone())
+            .collect::<Vec<_>>();
+        let ledger_sequences = (0..drafts.len())
+            .map(|offset| {
+                let offset = u64::try_from(offset).map_err(|_| storage_fault())?;
+                first_ledger_sequence
+                    .checked_add(offset)
+                    .ok_or_else(storage_fault)
+            })
+            .collect::<AuthorityResult<Vec<_>>>()?;
+        let mut receipt = build_receipt(&fact_ids, &ledger_sequences)?;
+        receipt.settlement_fact_id = settlement_index.map(|index| fact_ids[index].clone());
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
+            .map_err(|_| storage_fault())?;
+        match outcome.receipt {
+            PutPublicCommandReceiptOutcomeV2::Inserted(_) => {}
+            PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                return Err(corrupt_store())
+            }
+        }
+        if !outcome.facts.is_empty() {
+            if let Err(error) = state.apply_committed(outcome.facts.clone()) {
+                state.storage_faulted = true;
+                return Err(error);
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn append_built_payloads_with_public_receipt_and_authority_material<F>(
+        &self,
+        payload_count: usize,
+        settlement_index: usize,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+        build: F,
+    ) -> AuthorityResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2>
+    where
+        F: FnOnce(
+            &[FactId],
+            &[u64],
+        ) -> AuthorityResult<(Vec<KernelFactPayloadV2>, PublicCommandReceiptV2)>,
+    {
+        if payload_count == 0 || settlement_index >= payload_count {
+            return Err(storage_fault());
+        }
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let payload_count_u64 = u64::try_from(payload_count).map_err(|_| storage_fault())?;
+        let high_water = self.predicted_high_water(payload_count)?;
+        let first_ledger_sequence = high_water
+            .checked_sub(payload_count_u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(storage_fault)?;
+        let fact_ids = (0..payload_count)
+            .map(|_| self.inner.ids.fact())
+            .collect::<Vec<_>>();
+        let ledger_sequences = (0..payload_count)
+            .map(|offset| {
+                let offset = u64::try_from(offset).map_err(|_| storage_fault())?;
+                first_ledger_sequence
+                    .checked_add(offset)
+                    .ok_or_else(storage_fault)
+            })
+            .collect::<AuthorityResult<Vec<_>>>()?;
+        let (payloads, mut receipt) = build(&fact_ids, &ledger_sequences)?;
+        if payloads.len() != payload_count {
+            return Err(storage_fault());
+        }
+        let drafts = fact_ids
+            .iter()
+            .cloned()
+            .zip(payloads)
+            .map(|(fact_id, payload)| KernelFactDraftV2 { fact_id, payload })
+            .collect::<Vec<_>>();
+        receipt.settlement_fact_id = Some(fact_ids[settlement_index].clone());
+        self.prevalidate_drafts(&state, &drafts)?;
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
+            .map_err(|_| storage_fault())?;
+        match outcome.receipt {
+            PutPublicCommandReceiptOutcomeV2::Inserted(_) => {}
+            PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                return Err(corrupt_store())
+            }
+        }
+        if !outcome.facts.is_empty() {
+            if let Err(error) = state.apply_committed(outcome.facts.clone()) {
+                state.storage_faulted = true;
+                return Err(error);
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn advance_epoch_with_public_receipt_and_authority_material<F>(
+        &self,
+        envelope: &KernelCommandEnvelopeV2,
+        command: ControlEpochAdvanceV2,
+        superseded_capability_count: u64,
+        material_mutations: Vec<AuthorityMaterialMutationV2>,
+        build_receipt: F,
+    ) -> AuthorityResult<KernelReplyV2>
+    where
+        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2> + 'static,
+    {
+        self.advance_epoch_inner(
+            envelope,
+            command,
+            superseded_capability_count,
+            Some(Box::new(build_receipt)),
+            material_mutations,
+            true,
+            None,
+        )
+    }
+
+    pub(super) fn fence_run_retirement_host(
+        &self,
+        run_id: &RunId,
+        reason_code: RunRetirementReasonCodeV2,
+        reason: Option<String>,
+    ) -> AuthorityResult<RunRetirementFenceOutcome> {
+        let current_epoch = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            if run.retirement_fence.is_some() || run.retired.is_some() {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            }
+            run.epoch
+        };
+        let command = ControlEpochAdvanceV2 {
+            run_id: run_id.clone(),
+            precondition: EpochPreconditionV2::Exact {
+                control_epoch: current_epoch,
+            },
+            input_id: self.inner.ids.typed("retire-input", InputId::new),
+            opaque_input_ref: "Host requested Run retirement".to_owned(),
+        };
+        let envelope = KernelCommandEnvelopeV2::new(
+            self.inner
+                .ids
+                .typed("retire-command", CommandRequestId::new),
+            KernelCommandV2::ControlEpochAdvance(command.clone()),
+        );
+        let fence_fact_id = self.inner.ids.fact();
+        let fence_draft = RunRetirementFenceDraft {
+            fact_id: fence_fact_id.clone(),
+            reason_code,
+            reason: reason.clone(),
+        };
+        match self.advance_epoch_inner(
+            &envelope,
+            command,
+            0,
+            None,
+            Vec::new(),
+            false,
+            Some(fence_draft),
+        )? {
+            KernelReplyV2::ControlEpochAdvanced(reply) => Ok(RunRetirementFenceOutcome {
+                control_epoch: reply.accepted_control_epoch,
+                fence_fact_id,
+                fence_ledger_sequence: reply.command_batch_high_water,
+                reason_code,
+                reason,
+            }),
+            _ => Err(corrupt_store()),
+        }
+    }
+
+    fn advance_epoch_inner(
+        &self,
+        envelope: &KernelCommandEnvelopeV2,
+        command: ControlEpochAdvanceV2,
+        superseded_capability_count: u64,
+        public_receipt: Option<
+            Box<dyn FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>>,
+        >,
+        mut material_mutations: Vec<AuthorityMaterialMutationV2>,
+        require_workspace: bool,
+        retirement_fence: Option<RunRetirementFenceDraft>,
+    ) -> AuthorityResult<KernelReplyV2> {
+        if require_workspace {
+            self.workspace_for_run(&command.run_id)?;
+        }
+        let command_digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let existing_run = state.runs.get(&command.run_id).cloned();
+        let (epoch_context, previous_epoch, new_epoch) =
+            match plan_epoch_advance(&command.run_id, existing_run.as_ref(), command.precondition)?
+            {
+                EpochAdvancePlan::Ready {
+                    epoch_context,
+                    previous_epoch,
+                    new_epoch,
+                } => (epoch_context, previous_epoch, new_epoch),
+                EpochAdvancePlan::Recorded {
+                    current_epoch,
+                    error,
+                } => {
+                    if let Some(build_receipt) = public_receipt {
+                        return self.record_semantic_error_with_public_receipt(
+                            &mut state,
+                            envelope,
+                            command.run_id.clone(),
+                            exact_epoch(current_epoch),
+                            error,
+                            build_receipt,
+                        );
+                    }
+                    return self.record_semantic_error(
+                        &mut state,
+                        envelope,
+                        command.run_id.clone(),
+                        exact_epoch(current_epoch),
+                        error,
+                    );
+                }
+            };
+
+        let command_fact_id = self.inner.ids.fact();
+        let command_settlement_fact_id = command_fact_id.clone();
+        let epoch_fact_id = self.inner.ids.fact();
+        let active_invocation = state
+            .runs
+            .get(&command.run_id)
+            .and_then(|run| run.active_invocation_id.clone());
+        let (cancellation, cancellation_fact) =
+            plan_control_cancellation(&state, active_invocation, || self.inner.ids.cancellation())?;
+        let fence_causation_fact_id = cancellation_fact
+            .as_ref()
+            .map(|(_, _, fact_id)| fact_id.clone())
+            .unwrap_or_else(|| epoch_fact_id.clone());
+        let batch_len =
+            2 + usize::from(cancellation_fact.is_some()) + usize::from(retirement_fence.is_some());
+        let high_water = self.predicted_high_water(batch_len)?;
+        let reply = ControlEpochAdvancedReplyV2 {
+            run_id: command.run_id.clone(),
+            accepted_control_epoch: new_epoch,
+            epoch_fact_id: epoch_fact_id.clone(),
+            superseded_capability_count,
+            cancellation: cancellation.clone(),
+            command_batch_high_water: high_water,
+        };
+        let command_run_id = command.run_id.clone();
+        let mut drafts = epoch_advance_drafts(
+            envelope.request_id.clone(),
+            command_digest,
+            command,
+            epoch_context,
+            previous_epoch,
+            new_epoch,
+            command_fact_id,
+            epoch_fact_id.clone(),
+            cancellation_fact,
+            reply.clone(),
+        );
+        if let Some(fence) = retirement_fence {
+            drafts.push(KernelFactDraftV2 {
+                fact_id: fence.fact_id,
+                payload: KernelFactPayloadV2::Control(
+                    deepcode_kernel_abi::v2::ControlFactV2::RunRetirementFenced {
+                        run_id: command_run_id.clone(),
+                        control_epoch: new_epoch,
+                        reason_code: fence.reason_code,
+                        reason: fence.reason,
+                        causation_fact_id: fence_causation_fact_id,
+                    },
+                ),
+            });
+            material_mutations.push(AuthorityMaterialMutationV2::TransitionRunEpoch {
+                run_id: command_run_id,
+                through_control_epoch: previous_epoch
+                    .map(ControlEpoch::get)
+                    .ok_or_else(corrupt_store)?,
+                expected_lifecycles: vec![
+                    AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                    AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                    RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+                ],
+                next_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
+                fact_index: drafts.len() - 1,
+            });
+        }
+        let kernel_reply = KernelReplyV2::ControlEpochAdvanced(reply);
+        if let Some(build_receipt) = public_receipt {
+            let receipt = build_receipt(&kernel_reply)?;
+            self.commit_locked_with_public_receipt_and_authority_material(
+                &mut state,
+                drafts,
+                receipt,
+                Some(command_settlement_fact_id),
+                material_mutations,
+            )?;
+        } else if material_mutations.is_empty() {
+            self.commit_locked(&mut state, drafts)?;
+        } else {
+            self.prevalidate_drafts(&state, &drafts)?;
+            let outcome = self
+                .inner
+                .writer
+                .lock()
+                .map_err(|_| storage_fault())?
+                .append_with_authority_material(drafts, material_mutations)
+                .map_err(|_| storage_fault())?;
+            if let Err(error) = state.apply_committed(outcome.facts) {
+                state.storage_faulted = true;
+                return Err(error);
+            }
+        }
+        Ok(kernel_reply)
+    }
+
+    pub(super) fn admit_direct_tool_intent_with_public_receipt<F>(
+        &self,
+        request: DirectToolIntentRequest,
+        preferred_invocation_id: Option<InvocationId>,
+        mut material_mutations: Vec<AuthorityMaterialMutationV2>,
+        build_receipt: F,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2>
+    where
+        F: FnOnce(&ToolIntentSubmitReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        self.reap_finished_execution_tasks()?;
+        if request.canonical_invocation.tool_id().as_str() != request.tool_id.as_str() {
+            return Err(invalid_field(
+                "toolId",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let descriptor = crate::kernel_tool_registry()
+            .descriptor_v2(&request.tool_id)
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum))?;
+        let expected_contract_digest = deepcode_kernel_abi::tool_contract_digest_v2(descriptor)
+            .map_err(|_| corrupt_store())?;
+        if descriptor.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
+            || expected_contract_digest != request.tool_contract_digest
+        {
+            return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange));
+        }
+        let workspace = self.workspace_for_run(&request.run_id)?;
+        let correlation_refs = match &request.authority {
+            InvocationAuthorityV2::ContextRead { .. } => Vec::new(),
+            InvocationAuthorityV2::PlanAction { plan_action_id, .. } => {
+                vec![deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction {
+                    value: plan_action_id.to_string(),
+                }]
+            }
+        };
+        let executor_runtime = self.executor_runtime_snapshot()?;
+        let prepared = prepare_direct_tool_intent(
+            &request.run_id,
+            &request.operation_id,
+            request.control_epoch,
+            &request.idempotency_key,
+            &request.canonical_invocation,
+            request.deadline,
+            correlation_refs,
+            crate::kernel_tool_registry(),
+            &workspace,
+            &executor_runtime.config,
+        )
+        .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run =
+            state
+                .runs
+                .get(&request.run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: request.run_id.clone(),
+                })?;
+        if run.epoch != request.control_epoch {
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                ToolIntentRejectionReasonV2::StaleControlEpoch,
+                "Refresh the current control epoch before re-planning.".to_owned(),
+                build_receipt,
+            );
+        }
+        if let Some(active_invocation_id) = run.active_invocation_id {
+            let _ = active_invocation_id;
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                ToolIntentRejectionReasonV2::RunBusy,
+                "Wait for the current invocation to settle before retrying.".to_owned(),
+                build_receipt,
+            );
+        }
+        if state
+            .runs
+            .values()
+            .filter(|run| run.active_invocation_id.is_some())
+            .count()
+            >= 4
+        {
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                ToolIntentRejectionReasonV2::CapacityExceeded,
+                "Wait for execution capacity before retrying.".to_owned(),
+                build_receipt,
+            );
+        }
+        let duplicate_phase = state
+            .direct_invocations
+            .values()
+            .find(|existing| {
+                existing.run_id == request.run_id
+                    && (existing.operation_id == request.operation_id
+                        || existing.idempotency_key_hash == prepared.idempotency_key_hash)
+            })
+            .map(|existing| existing.phase);
+        if let Some(duplicate_phase) = duplicate_phase {
+            let (reason, guidance) = if duplicate_phase == InvocationPhase::Indeterminate {
+                (
+                    ToolIntentRejectionReasonV2::IndeterminateRecoveryRequired,
+                    "Review the indeterminate invocation facts before taking another action."
+                        .to_owned(),
+                )
+            } else {
+                (
+                    ToolIntentRejectionReasonV2::RunBusy,
+                    "Query the existing operation facts instead of resubmitting it.".to_owned(),
+                )
+            };
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                reason,
+                guidance,
+                build_receipt,
+            );
+        }
+        let command_fact_id = self.inner.ids.fact();
+        let command_settlement_fact_id = command_fact_id.clone();
+        let admitted_fact_id = self.inner.ids.fact();
+        let attempt_fact_id = self.inner.ids.fact();
+        let invocation_id = preferred_invocation_id
+            .unwrap_or_else(|| self.inner.ids.typed("invocation", InvocationId::new));
+        let attempt_id = self.inner.ids.typed("attempt", AttemptId::new);
+        let targets = prepared
+            .resolved_targets
+            .iter()
+            .cloned()
+            .map(|target| (self.inner.ids.typed("resource", ResourceId::new), target))
+            .collect::<Vec<_>>();
+        let resource_fact_ids = targets
+            .iter()
+            .map(|_| self.inner.ids.fact())
+            .collect::<Vec<_>>();
+        let high_water = self.predicted_high_water(3 + targets.len())?;
+        let lease = request.authority.capability_lease().cloned();
+        let reply = ToolIntentSubmitReplyV2::Admitted {
+            run_id: request.run_id.clone(),
+            operation_id: request.operation_id.clone(),
+            accepted_control_epoch: request.control_epoch,
+            lease,
+            invocation_id: invocation_id.clone(),
+            attempt_id: attempt_id.clone(),
+            effective_deadline_ms: prepared.effective_deadline_ms,
+            admission_fact_id: admitted_fact_id.clone(),
+            admission_batch_high_water: high_water,
+        };
+        let identity = deepcode_kernel_abi::v2::ToolAttemptIdentityV2 {
+            run_id: request.run_id.clone(),
+            control_epoch: request.control_epoch,
+            operation_id: request.operation_id.clone(),
+            authority: request.authority.clone(),
+            invocation_id: invocation_id.clone(),
+            attempt_id,
+            idempotency_key_hash: prepared.idempotency_key_hash.clone(),
+            causation_fact_id: admitted_fact_id.clone(),
+            correlation_set: prepared.correlations.clone(),
+        };
+        let authority_material = direct_invocation_authority_material(
+            &request,
+            &identity,
+            &prepared,
+            DIRECT_INVOCATION_ADMITTED,
+        );
+        material_mutations.push(AuthorityMaterialMutationV2::Put {
+            material: authority_material.clone(),
+            fact_index: 1,
+        });
+        let receipt = build_receipt(&reply)?;
+        let request_id = receipt.command_request_id.clone();
+        let request_digest = receipt.command_request_digest.clone();
+        let drafts = direct_tool_intent_admission_drafts(
+            command_fact_id,
+            admitted_fact_id.clone(),
+            attempt_fact_id.clone(),
+            resource_fact_ids,
+            request_id,
+            request_digest,
+            &prepared,
+            request.tool_id,
+            request.canonical_arguments_digest,
+            request.tool_contract_digest,
+            &identity,
+            &targets,
+            reply.clone(),
+        );
+        self.commit_locked_with_public_receipt_and_authority_material(
+            &mut state,
+            drafts,
+            receipt,
+            Some(command_settlement_fact_id),
+            material_mutations,
+        )?;
+        drop(state);
+        self.spawn_direct_execution(DirectAuthorityAdmittedInvocation {
+            identity,
+            invocation: prepared.canonical_invocation,
+            targets,
+            attempt_prepared_fact_id: attempt_fact_id,
+            admitted_at: Instant::now(),
+            effective_deadline: Duration::from_millis(u64::from(prepared.effective_deadline_ms)),
+            authority_material,
+        })?;
+        Ok(reply)
+    }
+
+    pub(super) fn reject_tool_intent_with_public_receipt<F>(
+        &self,
+        run_id: RunId,
+        operation_id: OperationId,
+        submitted_control_epoch: ControlEpoch,
+        reason: ToolIntentRejectionReasonV2,
+        guidance: String,
+        build_receipt: F,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2>
+    where
+        F: FnOnce(&ToolIntentSubmitReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        self.reject_tool_intent_locked(
+            &mut state,
+            run_id,
+            operation_id,
+            submitted_control_epoch,
+            reason,
+            guidance,
+            build_receipt,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reject_tool_intent_locked<F>(
+        &self,
+        state: &mut AuthorityState,
+        run_id: RunId,
+        operation_id: OperationId,
+        submitted_control_epoch: ControlEpoch,
+        reason: ToolIntentRejectionReasonV2,
+        guidance: String,
+        build_receipt: F,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2>
+    where
+        F: FnOnce(&ToolIntentSubmitReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        let current_control_epoch = state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?
+            .epoch;
+        let (reason, guidance) = if current_control_epoch != submitted_control_epoch {
+            (
+                ToolIntentRejectionReasonV2::StaleControlEpoch,
+                "Refresh the current control epoch before re-planning.".to_owned(),
+            )
+        } else {
+            (reason, guidance)
+        };
+        let rejection_fact_id = self.inner.ids.fact();
+        let rejection_batch_high_water = self.predicted_high_water(1)?;
+        let reply = ToolIntentSubmitReplyV2::Rejected {
+            run_id: run_id.clone(),
+            operation_id,
+            current_control_epoch,
+            reason,
+            guidance,
+            rejection_fact_id: rejection_fact_id.clone(),
+            rejection_batch_high_water,
+        };
+        let receipt = build_receipt(&reply)?;
+        let draft = command_receipt_draft(
+            rejection_fact_id.clone(),
+            run_id,
+            exact_epoch(current_control_epoch),
+            receipt.command_request_id.clone(),
+            receipt.command_request_digest.clone(),
+            MutationCommandKindV2::ToolIntentSubmit,
+            MutationCommandResultV2::ToolIntentSubmission {
+                reply: reply.clone(),
+            },
+        );
+        self.commit_locked_with_public_receipt_and_authority_material(
+            state,
+            vec![draft],
+            receipt,
+            Some(rejection_fact_id),
+            Vec::new(),
+        )?;
+        Ok(reply)
+    }
+
+    pub(super) fn continue_direct_tool_intent_with_public_receipt<F>(
+        &self,
+        request: DirectToolIntentRequest,
+        invocation_id: InvocationId,
+        authorization: AuthorizationFactV2,
+        mut material_mutations: Vec<AuthorityMaterialMutationV2>,
+        build_receipt: F,
+    ) -> AuthorityResult<DirectToolIntentContinuationOutcome>
+    where
+        F: FnOnce(
+            &FactId,
+            u64,
+            &ToolIntentSubmitReplyV2,
+        ) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        self.reap_finished_execution_tasks()?;
+        if request.canonical_invocation.tool_id().as_str() != request.tool_id.as_str() {
+            return Err(invalid_field(
+                "toolId",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let descriptor = crate::kernel_tool_registry()
+            .descriptor_v2(&request.tool_id)
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum))?;
+        let expected_contract_digest = deepcode_kernel_abi::tool_contract_digest_v2(descriptor)
+            .map_err(|_| corrupt_store())?;
+        if descriptor.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
+            || expected_contract_digest != request.tool_contract_digest
+        {
+            return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange));
+        }
+        let workspace = self.workspace_for_run(&request.run_id)?;
+        let correlation_refs = match &request.authority {
+            InvocationAuthorityV2::ContextRead { .. } => Vec::new(),
+            InvocationAuthorityV2::PlanAction { plan_action_id, .. } => {
+                vec![deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction {
+                    value: plan_action_id.to_string(),
+                }]
+            }
+        };
+        let executor_runtime = self.executor_runtime_snapshot()?;
+        let prepared = prepare_direct_tool_intent(
+            &request.run_id,
+            &request.operation_id,
+            request.control_epoch,
+            &request.idempotency_key,
+            &request.canonical_invocation,
+            request.deadline,
+            correlation_refs,
+            crate::kernel_tool_registry(),
+            &workspace,
+            &executor_runtime.config,
+        )
+        .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run =
+            state
+                .runs
+                .get(&request.run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: request.run_id.clone(),
+                })?;
+        if run.epoch != request.control_epoch {
+            return Err(KernelErrorV2::StaleControlEpoch {
+                run_id: request.run_id,
+                submitted: request.control_epoch,
+                current: run.epoch,
+            });
+        }
+        if run.active_invocation_id.is_some() {
+            return Err(invalid_field(
+                "runId",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        if state
+            .runs
+            .values()
+            .filter(|run| run.active_invocation_id.is_some())
+            .count()
+            >= 4
+        {
+            return Err(invalid_field("runId", InvalidFieldViolationV2::OutOfRange));
+        }
+        if state.direct_invocations.values().any(|existing| {
+            existing.run_id == request.run_id
+                && (existing.operation_id == request.operation_id
+                    || existing.idempotency_key_hash == prepared.idempotency_key_hash)
+        }) {
+            return Err(invalid_field(
+                "operationId",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let authorization_fact_id = self.inner.ids.fact();
+        let admitted_fact_id = self.inner.ids.fact();
+        let attempt_fact_id = self.inner.ids.fact();
+        let attempt_id = self.inner.ids.typed("attempt", AttemptId::new);
+        let targets = prepared
+            .resolved_targets
+            .iter()
+            .cloned()
+            .map(|target| (self.inner.ids.typed("resource", ResourceId::new), target))
+            .collect::<Vec<_>>();
+        let resource_fact_ids = targets
+            .iter()
+            .map(|_| self.inner.ids.fact())
+            .collect::<Vec<_>>();
+        let batch_len = 3 + targets.len();
+        let high_water = self.predicted_high_water(batch_len)?;
+        let batch_len_u64 = u64::try_from(batch_len).map_err(|_| storage_fault())?;
+        let authorization_ledger_sequence = high_water
+            .checked_sub(batch_len_u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(storage_fault)?;
+        let lease = request.authority.capability_lease().cloned();
+        let reply = ToolIntentSubmitReplyV2::Admitted {
+            run_id: request.run_id.clone(),
+            operation_id: request.operation_id.clone(),
+            accepted_control_epoch: request.control_epoch,
+            lease,
+            invocation_id: invocation_id.clone(),
+            attempt_id: attempt_id.clone(),
+            effective_deadline_ms: prepared.effective_deadline_ms,
+            admission_fact_id: admitted_fact_id.clone(),
+            admission_batch_high_water: high_water,
+        };
+        let identity = deepcode_kernel_abi::v2::ToolAttemptIdentityV2 {
+            run_id: request.run_id.clone(),
+            control_epoch: request.control_epoch,
+            operation_id: request.operation_id.clone(),
+            authority: request.authority.clone(),
+            invocation_id: invocation_id.clone(),
+            attempt_id,
+            idempotency_key_hash: prepared.idempotency_key_hash.clone(),
+            causation_fact_id: admitted_fact_id.clone(),
+            correlation_set: prepared.correlations.clone(),
+        };
+        let authority_material = direct_invocation_authority_material(
+            &request,
+            &identity,
+            &prepared,
+            DIRECT_INVOCATION_ADMITTED,
+        );
+        material_mutations.push(AuthorityMaterialMutationV2::Put {
+            material: authority_material.clone(),
+            fact_index: 1,
+        });
+        let receipt = build_receipt(
+            &authorization_fact_id,
+            authorization_ledger_sequence,
+            &reply,
+        )?;
+        let drafts = direct_tool_intent_continuation_drafts(
+            authorization_fact_id.clone(),
+            authorization,
+            admitted_fact_id.clone(),
+            attempt_fact_id.clone(),
+            resource_fact_ids,
+            &prepared,
+            request.tool_id,
+            request.canonical_arguments_digest,
+            request.tool_contract_digest,
+            &identity,
+            &targets,
+        );
+        self.commit_locked_with_public_receipt_and_authority_material(
+            &mut state,
+            drafts,
+            receipt,
+            Some(authorization_fact_id.clone()),
+            material_mutations,
+        )?;
+        drop(state);
+        self.spawn_direct_execution(DirectAuthorityAdmittedInvocation {
+            identity,
+            invocation: prepared.canonical_invocation,
+            targets,
+            attempt_prepared_fact_id: attempt_fact_id,
+            admitted_at: Instant::now(),
+            effective_deadline: Duration::from_millis(u64::from(prepared.effective_deadline_ms)),
+            authority_material,
+        })?;
+        Ok(DirectToolIntentContinuationOutcome {
+            reply,
+            authorization_fact_id,
+            authorization_ledger_sequence,
+        })
+    }
+
+    fn spawn_direct_execution(
+        &self,
+        admitted: DirectAuthorityAdmittedInvocation,
+    ) -> AuthorityResult<()> {
+        let service = self.clone();
+        let invocation_id = admitted.identity.invocation_id.clone();
+        let thread_name = format!("deepcode-v2-{invocation_id}");
+        let task_admitted = admitted.clone();
+        let mut execution_tasks = self
+            .inner
+            .execution_tasks
+            .lock()
+            .map_err(|_| storage_fault())?;
+        if execution_tasks.contains_key(&invocation_id) {
+            return Err(corrupt_store());
+        }
+        match std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.execute_direct_admitted(&task_admitted)
+                }));
+                match execution {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) | Err(_) => {
+                        service.settle_abandoned_direct_execution(&task_admitted)
+                    }
+                }
+            }) {
+            Ok(handle) => {
+                if execution_tasks.insert(invocation_id, handle).is_some() {
+                    return Err(corrupt_store());
+                }
+            }
+            Err(_) => {
+                drop(execution_tasks);
+                self.fail_direct_before_effect(
+                    admitted,
+                    PreEffectFailureCodeV2::ExecutorUnavailable,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_direct_admitted(
+        &self,
+        admitted: &DirectAuthorityAdmittedInvocation,
+    ) -> AuthorityResult<()> {
+        let workspace = match self.workspace_for_run(&admitted.identity.run_id) {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                return self.fail_direct_before_effect(
+                    admitted.clone(),
+                    PreEffectFailureCodeV2::ExecutorUnavailable,
+                )
+            }
+        };
+        let executor_runtime = match self.executor_runtime_snapshot() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return self.fail_direct_before_effect(
+                    admitted.clone(),
+                    PreEffectFailureCodeV2::ExecutorUnavailable,
+                )
+            }
+        };
+        let preparation = match prepare_direct_effect(
+            &admitted.invocation,
+            &admitted.targets,
+            &admitted.identity,
+            &workspace,
+            &executor_runtime.config,
+        ) {
+            Ok(value) => value,
+            Err(code) => return self.fail_direct_before_effect(admitted.clone(), code),
+        };
+        let ready = match self.persist_direct_effect_boundary(admitted.clone(), preparation)? {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        let invocation = ExecutorToolInvocation {
+            id: ready.admitted.identity.invocation_id.to_string(),
+            tool_id: ready.admitted.invocation.tool_id().as_str().to_owned(),
+            input: ready.preparation.executor_input.clone(),
+        };
+        let context = KernelToolExecutionContext {
+            workspace_root: Some(workspace.canonical_root_utf8.clone()),
+        };
+        let execution_adapter = match crate::kernel_tool_registry()
+            .kernel_internal_execution_adapter(&invocation.tool_id)
+        {
+            Some(execution_adapter) => execution_adapter,
+            None => return Err(corrupt_store()),
+        };
+        let tool_id_v2 = match deepcode_kernel_abi::ToolIdV2::parse(&invocation.tool_id) {
+            Ok(tool_id) => tool_id,
+            Err(_) => return Err(corrupt_store()),
+        };
+        let admission =
+            match crate::kernel_tool_registry().kernel_internal_admission_metadata(&tool_id_v2) {
+                Some(admission) => admission,
+                None => return Err(corrupt_store()),
+            };
+        let raw =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match execution_adapter {
+                deepcode_kernel_tools::kernel_internal::KernelExecutionAdapter::DocumentRead => {
+                    invoke_document_read_complete(invocation, context).map(|value| RawExecution {
+                        output: value.execution.output,
+                        complete_document_text: Some(value.complete_text),
+                        http_status_code: None,
+                        http_content_type: None,
+                    })
+                }
+                deepcode_kernel_tools::kernel_internal::KernelExecutionAdapter::WebFetch => {
+                    invoke_web_fetch_complete(invocation).map(|value| RawExecution {
+                        output: value.execution.output,
+                        complete_document_text: None,
+                        http_status_code: Some(value.status_code),
+                        http_content_type: Some(value.content_type),
+                    })
+                }
+                deepcode_kernel_tools::kernel_internal::KernelExecutionAdapter::Standard => {
+                    let tool_id = invocation.tool_id.clone();
+                    executor_runtime
+                        .executors
+                        .invoke(&tool_id, invocation, context)
+                        .map(|value| RawExecution {
+                            output: value.output,
+                            complete_document_text: None,
+                            http_status_code: None,
+                            http_content_type: None,
+                        })
+                }
+            }))
+            .map_err(|_| ())
+            .and_then(|value| value.map_err(|_| ()));
+        let resolution = resolve_execution(
+            &ready.admitted.invocation,
+            &ready.preparation,
+            raw,
+            &workspace,
+            admission.maximum_output_bytes,
+        );
+        self.finalize_direct_execution(ready, resolution)
+    }
+
+    fn persist_direct_effect_boundary(
+        &self,
+        admitted: DirectAuthorityAdmittedInvocation,
+        preparation: EffectPreparation,
+    ) -> AuthorityResult<Option<DirectEffectReadyInvocation>> {
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let record = state
+            .direct_invocations
+            .get(&admitted.identity.invocation_id)
+            .cloned()
+            .ok_or_else(corrupt_store)?;
+        if let Some((cancel_id, cancel_fact_id, _)) = record.stop_overlay.cancellation() {
+            let drafts = direct_pre_effect_stop_drafts(
+                &admitted.identity,
+                self.inner.ids.fact(),
+                self.inner.ids.fact(),
+                Some((cancel_id, cancel_fact_id)),
+            );
+            let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+            self.commit_locked_with_authority_material(
+                &mut state,
+                drafts,
+                vec![terminal_direct_invocation_material(
+                    &admitted,
+                    terminal_index,
+                )],
+            )?;
+            return Ok(None);
+        }
+        if admitted.admitted_at.elapsed() >= admitted.effective_deadline {
+            let drafts = direct_pre_effect_stop_drafts(
+                &admitted.identity,
+                self.inner.ids.fact(),
+                self.inner.ids.fact(),
+                None,
+            );
+            let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+            self.commit_locked_with_authority_material(
+                &mut state,
+                drafts,
+                vec![terminal_direct_invocation_material(
+                    &admitted,
+                    terminal_index,
+                )],
+            )?;
+            return Ok(None);
+        }
+        let mut facts = Vec::with_capacity(preparation.revalidations.len() + 1);
+        let mut set = Vec::with_capacity(preparation.revalidations.len());
+        for item in &preparation.revalidations {
+            let resolution_fact_id = state
+                .resources
+                .get(&item.resource_id)
+                .filter(|resource| resource.invocation_id == admitted.identity.invocation_id)
+                .map(|resource| resource.resolution_fact_id.clone())
+                .ok_or_else(corrupt_store)?;
+            let fact_id = self.inner.ids.fact();
+            set.push((
+                item.resource_id.clone(),
+                fact_id.clone(),
+                item.digest.clone(),
+            ));
+            facts.push(fact_draft(
+                fact_id,
+                KernelFactPayloadV2::Resource(ResourceFactV2::RevalidatedBeforeEffect {
+                    identity: ResourceAttemptIdentityV2 {
+                        run_id: admitted.identity.run_id.clone(),
+                        control_epoch: admitted.identity.control_epoch,
+                        operation_id: admitted.identity.operation_id.clone(),
+                        invocation_id: admitted.identity.invocation_id.clone(),
+                        attempt_id: admitted.identity.attempt_id.clone(),
+                        resource_id: item.resource_id.clone(),
+                        idempotency_key_hash: admitted.identity.idempotency_key_hash.clone(),
+                        causation_fact_id: resolution_fact_id,
+                        correlation_set: admitted.identity.correlation_set.clone(),
+                    },
+                    observation: item.observation.clone(),
+                    target_revalidation_digest: item.digest.clone(),
+                }),
+            ));
+        }
+        let set_refs = set
+            .iter()
+            .map(|(resource, fact, digest)| (resource, fact, digest))
+            .collect::<Vec<_>>();
+        let set_digest = target_revalidation_set_digest_v2(
+            &admitted.identity.run_id,
+            &admitted.identity.operation_id,
+            &admitted.identity.invocation_id,
+            &admitted.identity.attempt_id,
+            &set_refs,
+        )
+        .map_err(|_| corrupt_store())?;
+        let started_id = self.inner.ids.fact();
+        let causation = set
+            .last()
+            .map(|(_, fact_id, _)| fact_id.clone())
+            .unwrap_or_else(|| admitted.attempt_prepared_fact_id.clone());
+        facts.push(fact_draft(
+            started_id.clone(),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ToolExecutionStarted {
+                identity: caused_direct_attempt(&admitted.identity, causation),
+                target_revalidation_set_digest: set_digest,
+            }),
+        ));
+        self.commit_locked(&mut state, facts)?;
+        Ok(Some(DirectEffectReadyInvocation {
+            admitted,
+            preparation,
+            execution_started_fact_id: started_id,
+            _permit: PersistedEffectPermit,
+        }))
+    }
+
+    fn finalize_direct_execution(
+        &self,
+        ready: DirectEffectReadyInvocation,
+        resolution: ExecutionResolution,
+    ) -> AuthorityResult<()> {
+        let deadline_elapsed =
+            ready.admitted.admitted_at.elapsed() >= ready.admitted.effective_deadline;
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let record = state
+            .direct_invocations
+            .get(&ready.admitted.identity.invocation_id)
+            .cloned()
+            .ok_or_else(corrupt_store)?;
+        if record.phase != InvocationPhase::Executing {
+            return Err(corrupt_store());
+        }
+        let cancellation = record
+            .stop_overlay
+            .cancellation()
+            .map(|(request_id, fact_id, _)| (request_id.clone(), fact_id.clone()));
+        let mut drafts = Vec::with_capacity(4);
+        if let Some((request_id, cancellation_fact_id)) = &cancellation {
+            if record.cancellation_observed_fact_id.is_none() {
+                drafts.push(fact_draft(
+                    self.inner.ids.fact(),
+                    KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancellationObserved {
+                        identity: caused_direct_attempt(
+                            &ready.admitted.identity,
+                            cancellation_fact_id.clone(),
+                        ),
+                        cancel_request_id: request_id.clone(),
+                    }),
+                ));
+            }
+        }
+        let deadline_observed = record.deadline_observed_fact_id.is_some() || deadline_elapsed;
+        if deadline_elapsed && record.deadline_observed_fact_id.is_none() {
+            drafts.push(fact_draft(
+                self.inner.ids.fact(),
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolDeadlineObserved {
+                    identity: caused_direct_attempt(
+                        &ready.admitted.identity,
+                        ready.admitted.identity.causation_fact_id.clone(),
+                    ),
+                }),
+            ));
+        }
+        drafts.extend(direct_execution_result_drafts(
+            &ready.admitted.identity,
+            &ready.execution_started_fact_id,
+            self.inner.ids.typed("effect", EffectId::new),
+            self.inner.ids.fact(),
+            self.inner.ids.fact(),
+            ready
+                .preparation
+                .revalidations
+                .iter()
+                .map(|item| item.resource_id.clone())
+                .collect(),
+            resolution,
+            cancellation.as_ref().map(|(request_id, _)| request_id),
+            deadline_observed,
+        )?);
+        let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+        if let Err(error) = self.commit_locked_with_authority_material(
+            &mut state,
+            drafts,
+            vec![terminal_direct_invocation_material(
+                &ready.admitted,
+                terminal_index,
+            )],
+        ) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn fail_direct_before_effect(
+        &self,
+        admitted: DirectAuthorityAdmittedInvocation,
+        error_code: PreEffectFailureCodeV2,
+    ) -> AuthorityResult<()> {
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let drafts = direct_failed_before_effect_drafts(
+            &admitted.identity,
+            &admitted.attempt_prepared_fact_id,
+            self.inner.ids.fact(),
+            error_code,
+        );
+        let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+        self.commit_locked_with_authority_material(
+            &mut state,
+            drafts,
+            vec![terminal_direct_invocation_material(
+                &admitted,
+                terminal_index,
+            )],
+        )
+    }
+
+    fn settle_abandoned_direct_execution(
+        &self,
+        admitted: &DirectAuthorityAdmittedInvocation,
+    ) -> AuthorityResult<()> {
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let snapshot = match self.inner.reader.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                state.storage_faulted = true;
+                return Err(storage_fault());
+            }
+        };
+        let restored = match AuthorityState::restore(snapshot.facts) {
+            Ok(restored) => restored,
+            Err(error) => {
+                state.storage_faulted = true;
+                return Err(error);
+            }
+        };
+        *state = restored;
+        let invocation = state
+            .direct_invocations
+            .get(&admitted.identity.invocation_id)
+            .cloned()
+            .ok_or_else(corrupt_store)?;
+        let drafts = match invocation.phase {
+            phase if invocation_phase_is_terminal(phase) => return Ok(()),
+            InvocationPhase::AttemptPrepared => {
+                let attempt_prepared_fact_id = invocation
+                    .attempt_prepared_fact_id
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                direct_failed_before_effect_drafts(
+                    &admitted.identity,
+                    attempt_prepared_fact_id,
+                    self.inner.ids.fact(),
+                    PreEffectFailureCodeV2::ExecutorUnavailable,
+                )
+            }
+            InvocationPhase::Executing => {
+                let execution_started_fact_id = invocation
+                    .execution_started_fact_id
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                let possible_resources = state
+                    .resources
+                    .values()
+                    .filter(|resource| {
+                        resource.invocation_id == invocation.invocation_id
+                            && resource.revalidation.is_some()
+                    })
+                    .map(|resource| resource.resource_id.clone())
+                    .collect();
+                direct_execution_result_drafts(
+                    &admitted.identity,
+                    execution_started_fact_id,
+                    self.inner.ids.typed("effect", EffectId::new),
+                    self.inner.ids.fact(),
+                    self.inner.ids.fact(),
+                    possible_resources,
+                    ExecutionResolution::Indeterminate {
+                        evidence: EffectEvidenceV2::IndeterminateReadBack {
+                            last_observation: LastObservationV2::None {},
+                        },
+                        reason_code: IndeterminateReasonV2::StorageFaultAfterPermit,
+                    },
+                    invocation
+                        .stop_overlay
+                        .cancellation()
+                        .map(|(request_id, _, _)| request_id),
+                    invocation.stop_overlay.deadline_observed(),
+                )?
+            }
+            _ => return Err(corrupt_store()),
+        };
+        let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+        if let Err(error) = self.commit_locked_with_authority_material(
+            &mut state,
+            drafts,
+            vec![terminal_direct_invocation_material(
+                admitted,
+                terminal_index,
+            )],
+        ) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reap_finished_execution_tasks(&self) -> AuthorityResult<()> {
+        let finished = {
+            let mut tasks = self
+                .inner
+                .execution_tasks
+                .lock()
+                .map_err(|_| storage_fault())?;
+            let invocation_ids = tasks
+                .iter()
+                .filter_map(|(invocation_id, handle)| {
+                    handle.is_finished().then_some(invocation_id.clone())
+                })
+                .collect::<Vec<_>>();
+            invocation_ids
+                .into_iter()
+                .filter_map(|invocation_id| tasks.remove(&invocation_id))
+                .collect::<Vec<_>>()
+        };
+        let mut failure = None;
+        for handle in finished {
+            let outcome = handle.join().unwrap_or_else(|_| Err(corrupt_store()));
+            if let Err(error) = outcome {
+                if let Ok(mut state) = self.inner.state.lock() {
+                    state.storage_faulted = true;
+                }
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn join_owned_execution_tasks(&self) -> AuthorityResult<()> {
+        let tasks = {
+            let mut tasks = self
+                .inner
+                .execution_tasks
+                .lock()
+                .map_err(|_| storage_fault())?;
+            tasks.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+        };
+        let mut failure = None;
+        for handle in tasks {
+            let outcome = handle.join().unwrap_or_else(|_| Err(corrupt_store()));
+            if let Err(error) = outcome {
+                if let Ok(mut state) = self.inner.state.lock() {
+                    state.storage_faulted = true;
+                }
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn observe_run_execution_convergence_host(
+        &self,
+        run_id: &RunId,
+        budget: Duration,
+    ) -> AuthorityResult<bool> {
+        let started = Instant::now();
+        loop {
+            if self.run_execution_converged_once_host(run_id)? {
+                return Ok(true);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                return Ok(false);
+            }
+            std::thread::sleep(budget.saturating_sub(elapsed).min(Duration::from_millis(2)));
+        }
+    }
+
+    fn run_execution_converged_once_host(&self, run_id: &RunId) -> AuthorityResult<bool> {
+        let (invocation_ids, nonterminal_ids) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            if run.retirement_fence.is_none() && run.retired.is_none() {
+                return Err(corrupt_store());
+            }
+            let invocations = state
+                .direct_invocations
+                .values()
+                .filter(|invocation| &invocation.run_id == run_id)
+                .collect::<Vec<_>>();
+            (
+                invocations
+                    .iter()
+                    .map(|invocation| invocation.invocation_id.clone())
+                    .collect::<Vec<_>>(),
+                invocations
+                    .iter()
+                    .filter(|invocation| !invocation_phase_is_terminal(invocation.phase))
+                    .map(|invocation| invocation.invocation_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (finished, has_unfinished_task) = {
+            let mut tasks = self
+                .inner
+                .execution_tasks
+                .lock()
+                .map_err(|_| storage_fault())?;
+            if nonterminal_ids
+                .iter()
+                .any(|invocation_id| !tasks.contains_key(invocation_id))
+            {
+                return Err(corrupt_store());
+            }
+            let finished_ids = invocation_ids
+                .iter()
+                .filter(|invocation_id| {
+                    tasks
+                        .get(*invocation_id)
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let has_unfinished_task = invocation_ids.iter().any(|invocation_id| {
+                tasks
+                    .get(invocation_id)
+                    .is_some_and(|handle| !handle.is_finished())
+            });
+            let finished = finished_ids
+                .into_iter()
+                .filter_map(|invocation_id| tasks.remove(&invocation_id))
+                .collect::<Vec<_>>();
+            (finished, has_unfinished_task)
+        };
+        let mut failure = None;
+        for handle in finished {
+            let outcome = handle.join().unwrap_or_else(|_| Err(corrupt_store()));
+            if let Err(error) = outcome {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            if let Ok(mut state) = self.inner.state.lock() {
+                state.storage_faulted = true;
+            }
+            return Err(error);
+        }
+        if has_unfinished_task {
+            return Ok(false);
+        }
+
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state.runs.get(run_id).ok_or_else(corrupt_store)?;
+        if run.active_invocation_id.is_some()
+            || state.direct_invocations.values().any(|invocation| {
+                &invocation.run_id == run_id && !invocation_phase_is_terminal(invocation.phase)
+            })
+        {
+            return Err(corrupt_store());
+        }
+        Ok(true)
+    }
+
+    pub(super) fn cancel_invocation_with_public_receipt<F>(
+        &self,
+        envelope: &KernelCommandEnvelopeV2,
+        command: InvocationCancelV2,
+        build_receipt: F,
+    ) -> AuthorityResult<KernelReplyV2>
+    where
+        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        if command.reason_code != CancellationReasonCodeV2::UserRequested {
+            return Err(invalid_field(
+                "command.reasonCode",
+                InvalidFieldViolationV2::InvalidEnum,
+            ));
+        }
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run =
+            state
+                .runs
+                .get(&command.run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: command.run_id.clone(),
+                })?;
+        if run.retirement_fence.is_some() || run.retired.is_some() {
+            return Err(KernelErrorV2::RunNotFound {
+                run_id: command.run_id.clone(),
+            });
+        }
+        if run.epoch != command.expected_control_epoch {
+            return self.record_semantic_error_with_public_receipt(
+                &mut state,
+                envelope,
+                command.run_id.clone(),
+                exact_epoch(run.epoch),
+                RecordedCommandErrorV2::StaleControlEpoch {
+                    run_id: command.run_id,
+                    submitted: command.expected_control_epoch,
+                    current: run.epoch,
+                },
+                build_receipt,
+            );
+        };
+        let target_id = match command.target.clone() {
+            InvocationCancelTargetV2::CurrentForRun {} => run.active_invocation_id.clone(),
+            InvocationCancelTargetV2::Exact { invocation_id } => {
+                let invocation_run_id = state
+                    .direct_invocations
+                    .get(&invocation_id)
+                    .map(|invocation| &invocation.run_id);
+                let Some(invocation_run_id) = invocation_run_id else {
+                    return self.record_semantic_error_with_public_receipt(
+                        &mut state,
+                        envelope,
+                        command.run_id.clone(),
+                        exact_epoch(run.epoch),
+                        RecordedCommandErrorV2::InvocationNotFound {
+                            run_id: command.run_id,
+                            invocation_id,
+                        },
+                        build_receipt,
+                    );
+                };
+                if invocation_run_id != &command.run_id {
+                    return self.record_semantic_error_with_public_receipt(
+                        &mut state,
+                        envelope,
+                        command.run_id.clone(),
+                        exact_epoch(run.epoch),
+                        RecordedCommandErrorV2::InvocationNotOwnedByRun {
+                            run_id: command.run_id,
+                            invocation_id,
+                        },
+                        build_receipt,
+                    );
+                }
+                Some(invocation_id)
+            }
+        };
+        let reply = match target_id {
+            None => InvocationCancelReplyV2::NoActiveInvocation {
+                run_id: command.run_id.clone(),
+                control_epoch: run.epoch,
+            },
+            Some(invocation_id) => {
+                let (phase, last_fact_id, stop_overlay) =
+                    if let Some(invocation) = state.direct_invocations.get(&invocation_id) {
+                        (
+                            invocation.phase,
+                            invocation.last_fact_id.clone(),
+                            invocation.stop_overlay.clone(),
+                        )
+                    } else {
+                        return Err(corrupt_store());
+                    };
+                if invocation_phase_is_terminal(phase) {
+                    InvocationCancelReplyV2::AlreadyTerminal {
+                        invocation_id,
+                        terminal_fact_id: last_fact_id,
+                        terminal_phase: phase,
+                    }
+                } else if run.active_invocation_id.as_ref() != Some(&invocation_id) {
+                    return Err(corrupt_store());
+                } else if let Some((cancel_request_id, fact_id, ledger_sequence)) =
+                    stop_overlay.cancellation()
+                {
+                    InvocationCancelReplyV2::AlreadyRequested {
+                        cancel_request_id: cancel_request_id.clone(),
+                        invocation_id,
+                        fact_id: fact_id.clone(),
+                        ledger_sequence,
+                    }
+                } else {
+                    let command_digest = command_request_digest_v2(&envelope.command)
+                        .map_err(|_| corrupt_store())?;
+                    let command_fact_id = self.inner.ids.fact();
+                    let cancel_request_id = CancelRequestId::new(self.inner.ids.value("cancel"))
+                        .expect("Kernel-minted CancelRequestId is valid");
+                    let cancellation_fact_id = self.inner.ids.fact();
+                    let ledger_sequence = self.predicted_high_water(2)?;
+                    let reply = InvocationCancelReplyV2::Requested {
+                        cancel_request_id: cancel_request_id.clone(),
+                        invocation_id: invocation_id.clone(),
+                        fact_id: cancellation_fact_id.clone(),
+                        ledger_sequence,
+                    };
+                    let drafts = explicit_cancellation_drafts(
+                        envelope.request_id.clone(),
+                        command_digest,
+                        command,
+                        run.epoch,
+                        invocation_id,
+                        cancel_request_id,
+                        command_fact_id.clone(),
+                        cancellation_fact_id,
+                        reply.clone(),
+                    );
+                    let kernel_reply = KernelReplyV2::InvocationCancelResult(reply);
+                    let receipt = build_receipt(&kernel_reply)?;
+                    self.commit_locked_with_public_receipt_and_authority_material(
+                        &mut state,
+                        drafts,
+                        receipt,
+                        Some(command_fact_id),
+                        Vec::new(),
+                    )?;
+                    return Ok(kernel_reply);
+                }
+            }
+        };
+        let command_digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
+        let command_fact_id = self.inner.ids.fact();
+        let draft = command_receipt_draft(
+            command_fact_id.clone(),
+            command.run_id,
+            exact_epoch(run.epoch),
+            envelope.request_id.clone(),
+            command_digest,
+            MutationCommandKindV2::InvocationCancel,
+            MutationCommandResultV2::InvocationCancel {
+                reply: reply.clone(),
+            },
+        );
+        let kernel_reply = KernelReplyV2::InvocationCancelResult(reply);
+        let receipt = build_receipt(&kernel_reply)?;
+        self.commit_locked_with_public_receipt_and_authority_material(
+            &mut state,
+            vec![draft],
+            receipt,
+            Some(command_fact_id),
+            Vec::new(),
+        )?;
+        Ok(kernel_reply)
+    }
+
+    fn commit_receipt_locked(
+        &self,
+        state: &mut AuthorityState,
+        envelope: &KernelCommandEnvelopeV2,
+        run_id: RunId,
+        epoch_context: CommandEpochContextV2,
+        result: MutationCommandResultV2,
+    ) -> AuthorityResult<()> {
+        let command_digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
+        self.commit_locked(
+            state,
+            vec![command_receipt_draft(
+                self.inner.ids.fact(),
+                run_id,
+                epoch_context,
+                envelope.request_id.clone(),
+                command_digest,
+                envelope.command.mutation_kind().ok_or_else(corrupt_store)?,
+                result,
+            )],
+        )
+    }
+
+    fn record_semantic_error(
+        &self,
+        state: &mut AuthorityState,
+        envelope: &KernelCommandEnvelopeV2,
+        run_id: RunId,
+        epoch_context: CommandEpochContextV2,
+        error: RecordedCommandErrorV2,
+    ) -> AuthorityResult<KernelReplyV2> {
+        let reply = KernelReplyV2::Error(recorded_error_to_error(error.clone()));
+        self.commit_receipt_locked(
+            state,
+            envelope,
+            run_id,
+            epoch_context,
+            MutationCommandResultV2::RecordedSemanticError { error },
+        )?;
+        Ok(reply)
+    }
+
+    fn record_semantic_error_with_public_receipt<F>(
+        &self,
+        state: &mut AuthorityState,
+        envelope: &KernelCommandEnvelopeV2,
+        run_id: RunId,
+        epoch_context: CommandEpochContextV2,
+        error: RecordedCommandErrorV2,
+        build_receipt: F,
+    ) -> AuthorityResult<KernelReplyV2>
+    where
+        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        let reply = KernelReplyV2::Error(recorded_error_to_error(error.clone()));
+        let command_digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
+        let command_fact_id = self.inner.ids.fact();
+        let draft = command_receipt_draft(
+            command_fact_id.clone(),
+            run_id,
+            epoch_context,
+            envelope.request_id.clone(),
+            command_digest,
+            envelope.command.mutation_kind().ok_or_else(corrupt_store)?,
+            MutationCommandResultV2::RecordedSemanticError { error },
+        );
+        let receipt = build_receipt(&reply)?;
+        self.commit_locked_with_public_receipt_and_authority_material(
+            state,
+            vec![draft],
+            receipt,
+            Some(command_fact_id),
+            Vec::new(),
+        )?;
+        Ok(reply)
+    }
+
+    fn predicted_high_water(&self, batch_len: usize) -> AuthorityResult<u64> {
+        let batch_len = u64::try_from(batch_len).map_err(|_| storage_fault())?;
+        let high_water = self
+            .high_water()?
+            .checked_add(batch_len)
+            .ok_or_else(storage_fault)?;
+        validate_cross_language_safe_u64_v2("ledgerSequence", high_water)
+            .map_err(|_| storage_fault())?;
+        Ok(high_water)
+    }
+
+    fn high_water(&self) -> AuthorityResult<u64> {
+        self.inner
+            .reader
+            .ledger_sequence_high_water()
+            .map_err(|_| storage_fault())
+    }
+
+    fn prevalidate_drafts(
+        &self,
+        state: &AuthorityState,
+        drafts: &[KernelFactDraftV2],
+    ) -> AuthorityResult<()> {
+        if state.storage_faulted {
+            return Err(storage_fault());
+        }
+        if drafts.is_empty() {
+            return Err(corrupt_store());
+        }
+        let durable_high_water = self.high_water()?;
+        let state_high_water = state
+            .facts_by_id
+            .values()
+            .map(|fact| fact.ledger_sequence)
+            .max()
+            .unwrap_or(0);
+        if durable_high_water != state_high_water {
+            return Err(corrupt_store());
+        }
+        let mut next_ledger_sequence = durable_high_water;
+        let mut run_high_waters = HashMap::<RunId, u64>::new();
+        for fact in state.facts_by_id.values() {
+            run_high_waters
+                .entry(fact.payload.run_id().clone())
+                .and_modify(|high_water| {
+                    *high_water = (*high_water).max(fact.run_sequence);
+                })
+                .or_insert(fact.run_sequence);
+        }
+        let recorded_at =
+            RecordedAtV2::new("1970-01-01T00:00:00.000Z").map_err(|_| corrupt_store())?;
+        let mut envelopes = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            next_ledger_sequence = next_ledger_sequence
+                .checked_add(1)
+                .ok_or_else(corrupt_store)?;
+            let run_id = draft.payload.run_id().clone();
+            let run_sequence = run_high_waters
+                .get(&run_id)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(corrupt_store)?;
+            run_high_waters.insert(run_id, run_sequence);
+            let envelope = KernelFactEnvelopeV2 {
+                abi_version: deepcode_kernel_abi::KERNEL_ABI_V2_VERSION.to_owned(),
+                fact_id: draft.fact_id.clone(),
+                ledger_sequence: next_ledger_sequence,
+                run_sequence,
+                recorded_at: recorded_at.clone(),
+                payload: draft.payload.clone(),
+            };
+            envelope.validate().map_err(|_| corrupt_store())?;
+            envelopes.push(envelope);
+        }
+        let mut projected = state.clone();
+        projected.apply_committed(envelopes)
+    }
+
+    fn commit_locked(
+        &self,
+        state: &mut AuthorityState,
+        drafts: Vec<KernelFactDraftV2>,
+    ) -> AuthorityResult<()> {
+        self.prevalidate_drafts(state, &drafts)?;
+        let writer = self.inner.writer.lock().map_err(|_| storage_fault())?;
+        let committed = writer.append_batch(drafts).map_err(|_| storage_fault())?;
+        if let Err(error) = state.apply_committed(committed) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn commit_locked_with_authority_material(
+        &self,
+        state: &mut AuthorityState,
+        drafts: Vec<KernelFactDraftV2>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> AuthorityResult<()> {
+        self.prevalidate_drafts(state, &drafts)?;
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_authority_material(drafts, mutations)
+            .map_err(|_| storage_fault())?;
+        if let Err(error) = state.apply_committed(outcome.facts) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn commit_locked_with_public_receipt_and_authority_material(
+        &self,
+        state: &mut AuthorityState,
+        drafts: Vec<KernelFactDraftV2>,
+        mut receipt: PublicCommandReceiptV2,
+        settlement_fact_id: Option<FactId>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> AuthorityResult<()> {
+        receipt.settlement_fact_id = settlement_fact_id;
+        self.prevalidate_drafts(state, &drafts)?;
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
+            .map_err(|_| storage_fault())?;
+        match outcome.receipt {
+            PutPublicCommandReceiptOutcomeV2::Inserted(_) => {}
+            PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                return Err(corrupt_store())
+            }
+        }
+        if let Err(error) = state.apply_committed(outcome.facts) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reconcile_open_attempts(&self) -> AuthorityResult<()> {
+        let material = self
+            .inner
+            .reader
+            .authority_material_snapshot()
+            .map_err(|_| storage_fault())?;
+        let material_by_invocation = material
+            .into_iter()
+            .filter(|record| record.material_kind == DIRECT_INVOCATION_MATERIAL_KIND)
+            .map(|record| (record.material_id.clone(), record))
+            .collect::<HashMap<_, _>>();
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let open = state
+            .direct_invocations
+            .values()
+            .filter(|invocation| !invocation_phase_is_terminal(invocation.phase))
+            .cloned()
+            .collect::<Vec<_>>();
+        for invocation in open {
+            let identity = deepcode_kernel_abi::v2::ToolAttemptIdentityV2 {
+                run_id: invocation.run_id.clone(),
+                control_epoch: invocation.control_epoch,
+                operation_id: invocation.operation_id.clone(),
+                authority: invocation.authority.clone(),
+                invocation_id: invocation.invocation_id.clone(),
+                attempt_id: invocation.attempt_id.clone(),
+                idempotency_key_hash: invocation.idempotency_key_hash.clone(),
+                causation_fact_id: invocation.admission_fact_id.clone(),
+                correlation_set: invocation.correlations.clone(),
+            };
+            let drafts = match invocation.phase {
+                InvocationPhase::AttemptPrepared => {
+                    let attempt_fact_id = invocation
+                        .attempt_prepared_fact_id
+                        .as_ref()
+                        .ok_or_else(corrupt_store)?;
+                    if let Some((cancel_request_id, cancellation_fact_id, _)) =
+                        invocation.stop_overlay.cancellation()
+                    {
+                        direct_pre_effect_stop_drafts(
+                            &identity,
+                            self.inner.ids.fact(),
+                            self.inner.ids.fact(),
+                            Some((cancel_request_id, cancellation_fact_id)),
+                        )
+                    } else if invocation.stop_overlay.deadline_observed() {
+                        direct_pre_effect_stop_drafts(
+                            &identity,
+                            self.inner.ids.fact(),
+                            self.inner.ids.fact(),
+                            None,
+                        )
+                    } else {
+                        direct_failed_before_effect_drafts(
+                            &identity,
+                            attempt_fact_id,
+                            self.inner.ids.fact(),
+                            PreEffectFailureCodeV2::TargetRevalidationFailed,
+                        )
+                    }
+                }
+                InvocationPhase::Executing => {
+                    let execution_started_fact_id = invocation
+                        .execution_started_fact_id
+                        .as_ref()
+                        .ok_or_else(corrupt_store)?;
+                    let possible_resources = state
+                        .resources
+                        .values()
+                        .filter(|resource| {
+                            resource.invocation_id == invocation.invocation_id
+                                && resource.revalidation.is_some()
+                        })
+                        .map(|resource| resource.resource_id.clone())
+                        .collect();
+                    direct_execution_result_drafts(
+                        &identity,
+                        execution_started_fact_id,
+                        self.inner.ids.typed("effect", EffectId::new),
+                        self.inner.ids.fact(),
+                        self.inner.ids.fact(),
+                        possible_resources,
+                        ExecutionResolution::Indeterminate {
+                            evidence: EffectEvidenceV2::IndeterminateReadBack {
+                                last_observation: LastObservationV2::None {},
+                            },
+                            reason_code: IndeterminateReasonV2::RecoveryEvidenceInsufficient,
+                        },
+                        invocation
+                            .stop_overlay
+                            .cancellation()
+                            .map(|(request_id, _, _)| request_id),
+                        invocation.stop_overlay.deadline_observed(),
+                    )?
+                }
+                _ => return Err(corrupt_store()),
+            };
+            let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+            let material_record = material_by_invocation
+                .get(invocation.invocation_id.as_str())
+                .ok_or_else(corrupt_store)?;
+            self.commit_locked_with_authority_material(
+                &mut state,
+                drafts,
+                vec![recovered_terminal_direct_invocation_material(
+                    material_record,
+                    terminal_index,
+                )?],
+            )?;
+        }
+        Ok(())
+    }
+}

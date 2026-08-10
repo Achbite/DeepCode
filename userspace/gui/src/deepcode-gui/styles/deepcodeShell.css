@@ -28,10 +28,6 @@
   color: var(--dc-accent-contrast);
 }
 
-:root[data-product='deepcode-gui'] .agent-attachment-picker button:hover {
-  color: var(--dc-foreground);
-}
-
 .deepcode-gui-titlebar {
   grid-template-columns: minmax(200px, 1fr) auto auto;
   min-height: 36px;
@@ -468,8 +464,7 @@
   color: var(--dc-foreground);
 }
 
-:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet,
-:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-memory-sheet {
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet {
   border-color: var(--dc-border-strong);
   background: var(--dc-surface);
   box-shadow: var(--dc-shadow-panel);
@@ -554,45 +549,13 @@
   box-shadow: none;
 }
 
-:root[data-product='deepcode-gui'] .agent-attachment-chips {
-  border-color: var(--dc-border);
-  background: var(--dc-surface-subtle);
-}
-
-:root[data-product='deepcode-gui'] .agent-chip,
-:root[data-product='deepcode-gui'] .agent-chip--session {
+:root[data-product='deepcode-gui'] .agent-composer__footer button {
   border-color: var(--dc-border);
   background: var(--dc-surface-raised);
   color: var(--dc-foreground);
 }
 
-:root[data-product='deepcode-gui'] .agent-chip__icon,
-:root[data-product='deepcode-gui'] .agent-chip__kind {
-  color: var(--dc-muted);
-}
-
-:root[data-product='deepcode-gui'] .agent-chip .agent-chip__path {
-  color: var(--dc-foreground);
-}
-
-:root[data-product='deepcode-gui'] .agent-chip__remove {
-  color: var(--dc-muted);
-}
-
-:root[data-product='deepcode-gui'] .agent-chip:hover .agent-chip__remove {
-  background: var(--dc-surface-hover);
-  color: var(--dc-foreground);
-}
-
-:root[data-product='deepcode-gui'] .agent-composer__footer button,
-:root[data-product='deepcode-gui'] .agent-add-file-button {
-  border-color: var(--dc-border);
-  background: var(--dc-surface-raised);
-  color: var(--dc-foreground);
-}
-
-:root[data-product='deepcode-gui'] .agent-composer__footer button:hover:not(:disabled),
-:root[data-product='deepcode-gui'] .agent-add-file-button:hover:not(:disabled) {
+:root[data-product='deepcode-gui'] .agent-composer__footer button:hover:not(:disabled) {
   background: var(--dc-surface-hover);
 }
 

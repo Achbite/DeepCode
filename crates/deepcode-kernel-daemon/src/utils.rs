@@ -1,22 +1,16 @@
+use crate::api_response::ApiResponse;
 use crate::prelude::*;
-
-pub(crate) fn kernel_ledger_path() -> Option<PathBuf> {
-    if std::env::var("DEEPCODE_LEDGER_BACKEND")
-        .map(|value| value.eq_ignore_ascii_case("memory"))
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    Some(
-        std::env::var_os("DEEPCODE_LEDGER_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| user_config_root().join("kernel").join("ledger.ndjson")),
-    )
-}
+use axum::extract::Request;
+use axum::http::request::Parts;
+use axum::http::HeaderValue;
+use axum::middleware::Next;
+use tower_http::cors::AllowOrigin;
 
 pub(crate) fn localhost_cors_layer() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _request: &Parts| trusted_cors_origin(origin),
+        ))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -25,7 +19,78 @@ pub(crate) fn localhost_cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static(
+                crate::host_admission_v2::HOST_SHELL_CAPABILITY_HEADER_V2,
+            ),
+            header::HeaderName::from_static(
+                crate::provider_trace_api::PROVIDER_TRACE_CAPABILITY_HEADER_V1,
+            ),
+        ])
+        .expose_headers([header::HeaderName::from_static(
+            crate::provider_trace_api::PROVIDER_TRACE_DIGEST_HEADER_V1,
+        )])
+}
+
+pub(crate) async fn trusted_local_origin_gate(request: Request, next: Next) -> Response {
+    if crate::session_metadata_v2::trusted_private_storage_origin(request.headers()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        ApiResponse::error(
+            "host_origin_forbidden",
+            "DeepCode Host APIs accept only non-browser local clients, the same loopback application origin, or deepcode-gui://localhost",
+        ),
+    )
+        .into_response()
+}
+
+pub(crate) async fn trusted_host_admission_gate(
+    axum::extract::State(authority): axum::extract::State<
+        crate::host_admission_v2::HostShellAuthorityV2,
+    >,
+    request: Request,
+    next: Next,
+) -> Response {
+    if crate::host_admission_v2::route_uses_specialized_transport(
+        request.method(),
+        request.uri().path(),
+    ) || authority.authorize(request.headers())
+    {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        ApiResponse::error(
+            "host_admission_required",
+            "This Host API requires the process-private Host shell admission capability",
+        ),
+    )
+        .into_response()
+}
+
+fn trusted_cors_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if origin == "deepcode-gui://localhost" {
+        return true;
+    }
+    origin
+        .strip_prefix("http://")
+        .map(is_loopback_origin_authority)
+        .unwrap_or(false)
+}
+
+fn is_loopback_origin_authority(authority: &str) -> bool {
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
 pub(crate) fn distribution_root() -> PathBuf {
@@ -120,6 +185,19 @@ pub(crate) fn atomic_write_json(path: &PathBuf, value: &Value) -> Result<(), Str
     fs::rename(&tmp, path).map_err(|error| format!("rename {}: {error}", path.display()))
 }
 
+pub(crate) fn safe_path_segment(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn merge_object(target: &mut Value, patch: &Value) {
     let Some(target_object) = target.as_object_mut() else {
         return;
@@ -147,6 +225,30 @@ pub(crate) fn now_text() -> String {
     now_millis().to_string()
 }
 
-pub(crate) fn rid(value: &str) -> RequestId {
-    RequestId(value.to_string())
+pub(crate) fn now_rfc3339_text() -> String {
+    let millis = now_millis();
+    let seconds = (millis / 1_000) as i64;
+    let fractional = (millis % 1_000) as u32;
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fractional:03}Z")
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }

@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import type { AgentContextAttachment, FileTreeNode } from '@deepcode/protocol';
+import type { AgentInputAttachmentV2, FileTreeNode } from '@deepcode/protocol';
 import { getFileTree } from '../../services/runtimeAdapter';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 
 interface PickerItem {
-  kind: 'file' | 'directory';
+  kind: AgentInputAttachmentV2['kind'];
   path: string;
   name: string;
   folderId: string;
@@ -14,22 +14,51 @@ interface PickerItem {
 interface ContextAttachmentPickerProps {
   query: string;
   language: UiLanguage;
-  onPick: (attachment: AgentContextAttachment) => void;
+  onPick: (attachment: AgentInputAttachmentV2) => void;
+  onError?: (message: string) => void;
+}
+
+function normalizeWorkspaceRelativePath(path: string): string | null {
+  if (
+    path.trim() !== path
+    || new TextEncoder().encode(path).byteLength > 4096
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(path)
+  ) {
+    return null;
+  }
+  const normalized = path.replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (
+    !normalized.trim()
+    || normalized.startsWith('/')
+    || /^[a-zA-Z]:\//.test(normalized)
+    || normalized.includes('\0')
+  ) {
+    return null;
+  }
+  const parts: string[] = [];
+  for (const part of normalized.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') return null;
+    parts.push(part);
+  }
+  return parts.length > 0 ? parts.join('/') : null;
 }
 
 function flatten(
   nodes: FileTreeNode[],
   folderId: string,
   acc: PickerItem[] = []
-): PickerItem[] {
+): PickerItem[] | null {
   for (const node of nodes) {
+    const path = normalizeWorkspaceRelativePath(node.path);
+    if (!path) return null;
     acc.push({
       kind: node.type,
-      path: node.path,
+      path,
       name: node.name,
       folderId,
     });
-    if (node.children) flatten(node.children, folderId, acc);
+    if (node.children && !flatten(node.children, folderId, acc)) return null;
   }
   return acc;
 }
@@ -38,66 +67,90 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
   query,
   language,
   onPick,
+  onError,
 }) => {
-  const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
-  const workspace = useWorkspaceStore((s) => s.current);
+  const activeFolderId = useWorkspaceStore((state) => state.activeFolderId);
+  const workspace = useWorkspaceStore((state) => state.current);
   const [items, setItems] = useState<PickerItem[]>([]);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (!activeFolderId) {
+    const folderId = activeFolderId ?? workspace?.folders[0]?.id;
+    if (!folderId || !workspace?.folders.some((folder) => folder.id === folderId)) {
       setItems([]);
       return;
     }
     let disposed = false;
-    getFileTree(activeFolderId).then((result) => {
+    setLoading(true);
+    void getFileTree(folderId).then((result) => {
       if (disposed) return;
-      setItems(result.ok && result.data ? flatten(result.data, activeFolderId) : []);
+      setLoading(false);
+      if (!result.ok || !result.data) {
+        setItems([]);
+        onError?.(result.message ?? t(language, 'agent.attachment.loadFailed'));
+        return;
+      }
+      const flattened = flatten(result.data, folderId);
+      if (!flattened) {
+        setItems([]);
+        onError?.(t(language, 'agent.attachment.invalidWorkspacePath'));
+        return;
+      }
+      setItems(flattened);
     });
     return () => {
       disposed = true;
     };
-  }, [activeFolderId]);
+  }, [activeFolderId, language, onError, workspace]);
 
   const filtered = useMemo(() => {
-    const q = query.toLowerCase();
+    const normalizedQuery = query.trim().toLowerCase();
     return items
-      .filter((item) => item.path.toLowerCase().includes(q))
+      .filter((item) => (
+        !normalizedQuery
+        || item.path.toLowerCase().includes(normalizedQuery)
+        || item.name.toLowerCase().includes(normalizedQuery)
+      ))
       .slice(0, 40);
   }, [items, query]);
-
-  const absolutePathForItem = (item: PickerItem): string | undefined => {
-    const folder = workspace?.folders.find((candidate) => candidate.id === item.folderId);
-    if (!folder) return undefined;
-    const root = folder.absolutePath.replace(/\/+$/g, '');
-    const relative = item.path.replace(/^\/+/g, '');
-    return relative ? `${root}/${relative}` : folder.absolutePath;
-  };
 
   return (
     <div className="agent-attachment-picker">
       {filtered.map((item) => (
         <button
           key={`${item.folderId}:${item.path}`}
+          type="button"
           onMouseDown={(event) => {
             event.preventDefault();
+            const currentActiveFolderId = activeFolderId ?? workspace?.folders[0]?.id;
+            const folderStillBound = workspace?.folders.some((folder) => folder.id === item.folderId);
+            const path = normalizeWorkspaceRelativePath(item.path);
+            if (!folderStillBound || item.folderId !== currentActiveFolderId || !path) {
+              onError?.(t(language, 'agent.attachment.invalidWorkspacePath'));
+              return;
+            }
             onPick({
               kind: item.kind,
-              path: item.path,
-              absolutePath: absolutePathForItem(item),
+              path,
               folderId: item.folderId,
-              source: 'mention',
               scope: 'message',
             });
           }}
         >
-          <span>{item.kind === 'directory'
-            ? t(language, 'agent.attachment.folder')
-            : t(language, 'agent.attachment.file')}
+          <span>
+            {item.kind === 'directory'
+              ? t(language, 'agent.attachment.folder')
+              : t(language, 'agent.attachment.file')}
           </span>
           <strong>{item.path}</strong>
         </button>
       ))}
-      {filtered.length === 0 && (
+      {loading && (
+        <div className="agent-attachment-picker__empty">
+          {t(language, 'agent.attachment.loading')}
+        </div>
+      )}
+      {!loading && filtered.length === 0 && (
         <div className="agent-attachment-picker__empty">
           {t(language, 'agent.attachment.noMatches')}
         </div>

@@ -1,82 +1,97 @@
 import type {
   AgentEvent,
-  AgentTimelineBlock,
-  AgentTimelineDeliveryMode,
   AgentTimelineDelta,
+  AgentTimelineDeliveryMode,
   AgentTimelineResult,
-  AgentTimelineStatus,
-  ProjectionDelta,
+  AgentTimelineRootProjectionReplacements,
+  AgentTimelineSnapshot,
+  AgentTimelineTurn,
 } from '@deepcode/protocol';
 import {
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+} from '@deepcode/protocol';
+import {
+  assertSharedConversationProjectionV2,
   buildNarrativeTimelineProjection,
-  buildTimelineProjectionWithLiveOverlay,
-} from './projection.js';
+} from './projectionV2.js';
 
-const TIMELINE_DELTA_SCHEMA_VERSION = 'deepcode.session.timeline-delta.v1' as const;
+export class UnsupportedTimelineHistorySchemaError extends Error {
+  readonly code = 'UnsupportedHistorySchema';
 
-export interface CanonicalTimelineCommitResult {
-  timeline: AgentTimelineResult;
-  deltas: AgentTimelineDelta[];
+  constructor() {
+    super('UnsupportedHistorySchema');
+    this.name = 'UnsupportedTimelineHistorySchemaError';
+  }
 }
 
-export interface AgentTimelineDeltaApplyResult {
-  timeline: AgentTimelineResult;
-  status: 'applied' | 'duplicate' | 'stale' | 'gap';
+export class AgentTimelineRevisionGapError extends Error {
+  readonly code = 'AgentTimelineRevisionGap';
+
+  constructor(
+    readonly expectedBaseRevision: number,
+    readonly receivedBaseRevision: number
+  ) {
+    super(
+      `Agent timeline delta base revision mismatch: expected `
+      + `${expectedBaseRevision}, received ${receivedBaseRevision}.`
+    );
+    this.name = 'AgentTimelineRevisionGapError';
+  }
+}
+
+export function isNativeWorkSegmentsTimelineSnapshot(
+  snapshot: unknown
+): snapshot is AgentTimelineSnapshot {
+  if (!isRecord(snapshot)) return false;
+  if (
+    snapshot.schemaVersion
+      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
+    || snapshot.shapeVersion
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2
+    || !Array.isArray(snapshot.turns)
+  ) {
+    return false;
+  }
+  return snapshot.turns.every((turn) =>
+    isRecord(turn)
+    && Array.isArray(turn.blocks)
+    && Array.isArray(turn.workSegments)
+    && Array.isArray(turn.parts)
+  );
 }
 
 export class CanonicalTimelineProjector {
-  private committedEvents: AgentEvent[];
-  private activeDeltas: ProjectionDelta[] = [];
+  private auxiliaryEvents: AgentEvent[];
   private currentTimeline: AgentTimelineResult;
 
   constructor(
     private readonly sessionId: string,
     initialEvents: AgentEvent[],
-    initialTimeline?: AgentTimelineResult
+    initialTimeline?: AgentTimelineSnapshot,
+    initialAuxiliaryEvents: AgentEvent[] = []
   ) {
-    this.committedEvents = [...initialEvents];
+    this.auxiliaryEvents = deduplicateAuxiliaryEvents(initialAuxiliaryEvents);
+    const normalizedInitial = initialTimeline?.sessionId === sessionId
+      ? normalizeAgentTimelineSnapshot(initialTimeline)
+      : undefined;
     this.currentTimeline =
-      initialTimeline?.schemaVersion === 'deepcode.session.timeline.v1' &&
-      initialTimeline.sessionId === sessionId
-        ? initialTimeline
-        : stampTimeline(
-            buildNarrativeTimelineProjection({ sessionId, events: initialEvents }),
-            undefined,
-            0
-          );
+      normalizedInitial?.eventCount === initialEvents.length
+      && normalizedInitial.sourceEventVersion === initialEvents.length
+        ? normalizedInitial
+        : buildNarrativeTimelineProjection({
+            sessionId,
+            events: initialEvents,
+            auxiliaryEvents: this.auxiliaryEvents,
+          });
   }
 
-  push(delta: ProjectionDelta): AgentTimelineDelta[] {
-    if (delta.sessionId !== this.sessionId || delta.type === 'committed') return [];
-    this.activeDeltas = mergeProjectionDelta(this.activeDeltas, delta);
-    const nextSemantic = buildTimelineProjectionWithLiveOverlay({
-      sessionId: this.sessionId,
-      committedEvents: this.committedEvents,
-      activeDeltas: this.activeDeltas,
-    });
-    const next = stampTimeline(nextSemantic, this.currentTimeline, (this.currentTimeline.revision ?? 0) + 1);
-    const deltas = diffTimelines(this.currentTimeline, next, delta.runId ?? 'run', 'live');
-    if (deltas.length > 0) this.currentTimeline = next;
-    return deltas;
-  }
-
-  commit(events: AgentEvent[]): CanonicalTimelineCommitResult {
-    const previous = this.currentTimeline;
-    this.committedEvents = [...events];
-    this.activeDeltas = [];
-    const committed = stampTimeline(
-      buildNarrativeTimelineProjection({ sessionId: this.sessionId, events }),
-      previous,
-      (previous.revision ?? 0) + 1
-    );
-    const runId = latestRunId(events) ?? 'run';
-    const deliveryModes = committedDeliveryModes(previous, committed);
-    const deltas = [
-      ...diffTimelines(previous, committed, runId, 'buffered'),
-      timelineSyncedDelta(committed, runId, deliveryModes),
-    ];
-    this.currentTimeline = committed;
-    return { timeline: committed, deltas };
+  rememberAuxiliaryEvents(events: readonly AgentEvent[]): void {
+    if (events.length === 0) return;
+    this.auxiliaryEvents = deduplicateAuxiliaryEvents([
+      ...this.auxiliaryEvents,
+      ...events,
+    ]);
   }
 
   snapshot(): AgentTimelineResult {
@@ -84,145 +99,246 @@ export class CanonicalTimelineProjector {
   }
 }
 
-export function isAgentTimelineDelta(value: unknown): value is AgentTimelineDelta {
-  if (!isRecord(value)) return false;
-  return value.schemaVersion === TIMELINE_DELTA_SCHEMA_VERSION &&
-    typeof value.op === 'string' &&
-    typeof value.sessionId === 'string' &&
-    typeof value.runId === 'string' &&
-    typeof value.turnId === 'string' &&
-    typeof value.turnSeq === 'number' &&
-    typeof value.blockId === 'string' &&
-    typeof value.blockSeq === 'number' &&
-    typeof value.revision === 'number';
+function deduplicateAuxiliaryEvents(events: readonly AgentEvent[]): AgentEvent[] {
+  const byId = new Map<string, AgentEvent>();
+  for (const event of events) {
+    if (event.id.trim()) byId.set(event.id, event);
+  }
+  return [...byId.values()];
+}
+
+export function normalizeAgentTimelineSnapshot(
+  snapshot: AgentTimelineSnapshot | unknown
+): AgentTimelineResult {
+  if (!isNativeWorkSegmentsTimelineSnapshot(snapshot)) {
+    throw new UnsupportedTimelineHistorySchemaError();
+  }
+  assertSharedConversationProjectionV2(snapshot);
+  return snapshot;
+}
+
+export function rebuildSharedConversationProjectionV2(
+  sessionId: string,
+  sourceEvents: AgentEvent[],
+  staleSnapshot: AgentTimelineSnapshot,
+  minimumRevision = (staleSnapshot.revision ?? 0) + 1
+): AgentTimelineResult {
+  assertSharedConversationProjectionV2(staleSnapshot);
+  if (staleSnapshot.sessionId !== sessionId) {
+    throw new Error('session_projection_repair_native_v2_required');
+  }
+  return {
+    ...buildNarrativeTimelineProjection({
+      sessionId,
+      events: sourceEvents,
+    }),
+    revision: Math.max(sourceEvents.length, minimumRevision),
+  };
+}
+
+export function createAgentTimelineDelta(
+  current: AgentTimelineResult,
+  next: AgentTimelineResult
+): AgentTimelineDelta {
+  assertNativeTimeline(current);
+  assertNativeTimeline(next);
+  if (current.sessionId !== next.sessionId) {
+    throw new Error('timeline_delta_session_mismatch');
+  }
+  if (next.revision <= current.revision) {
+    throw new Error('timeline_delta_revision_not_advancing');
+  }
+  if (
+    next.sourceEventVersion <= current.sourceEventVersion
+    || next.eventCount <= current.eventCount
+  ) {
+    throw new Error('timeline_delta_source_version_not_advancing');
+  }
+
+  const currentTurns = new Map(
+    current.turns.map((turn) => [turn.id, turn])
+  );
+  const nextTurnIds = new Set(next.turns.map((turn) => turn.id));
+  const turnReplacements = next.turns.filter((turn) => {
+    const existing = currentTurns.get(turn.id);
+    return !existing || !jsonEqual(existing, turn);
+  });
+  const removedTurnIds = current.turns
+    .filter((turn) => !nextTurnIds.has(turn.id))
+    .map((turn) => turn.id);
+
+  return {
+    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+    sessionId: next.sessionId,
+    baseRevision: current.revision,
+    revision: next.revision,
+    sourceEventVersion: next.sourceEventVersion,
+    generatedAt: next.generatedAt,
+    eventCount: next.eventCount,
+    turnReplacements,
+    removedTurnIds,
+    rootReplacements: changedRootProjections(current, next),
+  };
+}
+
+export function createProviderComposingTimelineDelta(
+  current: AgentTimelineResult,
+  next: AgentTimelineResult
+): AgentTimelineDelta {
+  assertNativeTimeline(current);
+  assertNativeTimeline(next);
+  const turnId = next.runProjection?.turnId;
+  if (
+    current.sessionId !== next.sessionId
+    || !turnId
+    || current.runProjection?.runId !== next.runProjection?.runId
+    || next.revision !== current.revision + 1
+    || next.sourceEventVersion !== current.sourceEventVersion + 1
+    || next.eventCount !== current.eventCount + 1
+    || current.turns.length !== next.turns.length
+    || current.taskProjection !== next.taskProjection
+    || current.interactionProjection !== next.interactionProjection
+    || current.tokenUsageProjection !== next.tokenUsageProjection
+    || current.workspaceProjection !== next.workspaceProjection
+  ) {
+    throw new Error('provider_composing_timeline_delta_invalid');
+  }
+  let replacement: AgentTimelineTurn | undefined;
+  for (let index = 0; index < current.turns.length; index += 1) {
+    const before = current.turns[index]!;
+    const after = next.turns[index]!;
+    if (before.id !== after.id || before.sequence !== after.sequence) {
+      throw new Error('provider_composing_timeline_delta_turn_order_changed');
+    }
+    if (after.id === turnId) {
+      if (before === after) {
+        throw new Error('provider_composing_timeline_delta_turn_unchanged');
+      }
+      replacement = after;
+    } else if (before !== after) {
+      throw new Error('provider_composing_timeline_delta_cross_turn_change');
+    }
+  }
+  if (!replacement || current.runProjection === next.runProjection) {
+    throw new Error('provider_composing_timeline_delta_missing_change');
+  }
+  return {
+    schemaVersion: next.schemaVersion,
+    shapeVersion: next.shapeVersion,
+    sessionId: next.sessionId,
+    baseRevision: current.revision,
+    revision: next.revision,
+    sourceEventVersion: next.sourceEventVersion,
+    generatedAt: next.generatedAt,
+    eventCount: next.eventCount,
+    turnReplacements: [replacement],
+    removedTurnIds: [],
+    rootReplacements: {
+      runProjection: next.runProjection,
+    },
+  };
 }
 
 export function applyAgentTimelineDelta(
-  current: AgentTimelineResult | null | undefined,
+  current: AgentTimelineResult,
   delta: AgentTimelineDelta
-): AgentTimelineDeltaApplyResult {
-  const base = current ?? emptyTimeline(delta.sessionId);
-  if (base.sessionId !== delta.sessionId) {
-    return { timeline: base, status: 'stale' };
+): AgentTimelineResult {
+  assertNativeTimeline(current);
+  assertTimelineDelta(delta);
+  if (current.sessionId !== delta.sessionId) {
+    throw new Error('timeline_delta_session_mismatch');
+  }
+  if (delta.baseRevision !== current.revision) {
+    throw new AgentTimelineRevisionGapError(
+      current.revision,
+      delta.baseRevision
+    );
+  }
+  if (delta.revision <= delta.baseRevision) {
+    throw new Error('timeline_delta_revision_not_advancing');
+  }
+  if (
+    delta.sourceEventVersion <= current.sourceEventVersion
+    || delta.eventCount <= current.eventCount
+  ) {
+    throw new Error('timeline_delta_source_version_not_advancing');
   }
 
-  if (delta.op === 'timeline.synced') {
-    if ((base.revision ?? 0) > (delta.timeline.revision ?? delta.revision)) {
-      return { timeline: base, status: 'stale' };
+  const removed = new Set(delta.removedTurnIds);
+  const replacements = new Map(
+    delta.turnReplacements.map((turn) => [turn.id, turn])
+  );
+  for (const turnId of removed) {
+    if (replacements.has(turnId)) {
+      throw new Error('timeline_delta_turn_conflict');
     }
-    return {
-      timeline: reconcileTimelineSnapshot(base, delta.timeline, delta.deliveryModes, delta.deltaSeq),
-      status: 'applied',
-    };
   }
 
-  if (delta.op === 'block.started') {
-    const existing = findBlock(base, delta.blockId);
-    if (existing && (existing.revision ?? 0) >= delta.revision) {
-      return { timeline: withLastDeltaSeq(base, delta.deltaSeq), status: 'duplicate' };
+  const turns: AgentTimelineTurn[] = [];
+  const knownTurnIds = new Set<string>();
+  for (const turn of current.turns) {
+    if (removed.has(turn.id)) continue;
+    const replacement = replacements.get(turn.id);
+    turns.push(replacement ?? turn);
+    knownTurnIds.add(turn.id);
+  }
+  for (const replacement of delta.turnReplacements) {
+    if (!knownTurnIds.has(replacement.id)) {
+      turns.push(replacement);
     }
-    const block = {
-      ...delta.block,
-      id: delta.blockId,
-      sequence: delta.blockSeq,
-      revision: delta.revision,
-      deliveryMode: delta.deliveryMode,
-    };
-    return {
-      timeline: upsertBlock(base, delta, block),
-      status: 'applied',
-    };
   }
+  turns.sort((left, right) =>
+    (left.sequence ?? Number.MAX_SAFE_INTEGER)
+      - (right.sequence ?? Number.MAX_SAFE_INTEGER)
+  );
 
-  const existing = findBlock(base, delta.blockId);
-  if (!existing) return { timeline: base, status: 'gap' };
-  if ((existing.revision ?? 0) > delta.revision) {
-    return { timeline: withLastDeltaSeq(base, delta.deltaSeq), status: 'stale' };
-  }
-
-  if (delta.op === 'text.append') {
-    const content = existing.bodyMarkdown ?? '';
-    if (delta.offset > content.length) return { timeline: base, status: 'gap' };
-    const alreadyPresent = content.slice(delta.offset, delta.offset + delta.text.length) === delta.text;
-    if (alreadyPresent) {
-      return { timeline: withLastDeltaSeq(base, delta.deltaSeq), status: 'duplicate' };
-    }
-    if (delta.offset !== content.length) return { timeline: base, status: 'gap' };
-    return {
-      timeline: updateBlock(base, delta, {
-        ...existing,
-        bodyMarkdown: `${content}${delta.text}`,
-        revision: delta.revision,
-      }),
-      status: 'applied',
-    };
-  }
-
-  if (delta.op === 'block.updated') {
-    return {
-      timeline: updateBlock(base, delta, preserveDeliveryMode(existing, delta.block, delta.revision)),
-      status: 'applied',
-    };
-  }
-
-  if (delta.op === 'activity.upsert') {
-    return {
-      timeline: updateBlock(base, delta, {
-        ...existing,
-        activity: delta.activity,
-        title: delta.activity.title,
-        summary: delta.activity.summary,
-        status: delta.activity.status,
-        revision: delta.revision,
-      }),
-      status: 'applied',
-    };
-  }
-
-  if (delta.op === 'block.completed') {
-    return {
-      timeline: updateBlock(base, delta, {
-        ...existing,
-        status: delta.status,
-        revision: delta.revision,
-      }),
-      status: 'applied',
-    };
-  }
-
-  if (delta.op === 'block.committed') {
-    if ((existing.revision ?? 0) > delta.finalRevision) {
-      return { timeline: withLastDeltaSeq(base, delta.deltaSeq), status: 'stale' };
-    }
-    return {
-      timeline: updateBlock(
-        base,
-        delta,
-        settleCommittedDeliveryMode(existing, delta.block, delta.finalRevision)
-      ),
-      status: 'applied',
-    };
-  }
-
-  return {
-    timeline: removeBlock(base, delta),
-    status: 'applied',
+  const result: AgentTimelineResult = {
+    ...current,
+    schemaVersion: delta.schemaVersion,
+    shapeVersion: delta.shapeVersion,
+    revision: delta.revision,
+    sourceEventVersion: delta.sourceEventVersion,
+    generatedAt: delta.generatedAt,
+    eventCount: delta.eventCount,
+    turns,
   };
+  applyRootProjectionReplacements(result, delta.rootReplacements);
+  assertNativeTimeline(result);
+  return result;
 }
 
 export function reconcileTimelineSnapshot(
   current: AgentTimelineResult | null | undefined,
   incoming: AgentTimelineResult,
-  deliveryModes: Record<string, AgentTimelineDeliveryMode> = {},
-  lastDeltaSeq?: number
+  deliveryModes: Record<string, AgentTimelineDeliveryMode> = {}
 ): AgentTimelineResult {
+  if (current) {
+    assertNativeTimeline(current);
+    if (current.sessionId !== incoming.sessionId) {
+      throw new Error('timeline_reconcile_session_mismatch');
+    }
+    if (
+      incoming.revision < current.revision
+      || incoming.sourceEventVersion < current.sourceEventVersion
+      || incoming.eventCount < current.eventCount
+    ) {
+      throw new Error('timeline_reconcile_stale_snapshot');
+    }
+  }
+  assertNativeTimeline(incoming);
   const existingById = new Map(
-    (current?.turns ?? []).flatMap((turn) => turn.blocks).map((block) => [block.id, block])
+    (current?.turns ?? [])
+      .flatMap((turn) => turn.blocks)
+      .map((block) => [block.id, block])
   );
-  return {
+  const existingWorkSegmentsById = new Map(
+    (current?.turns ?? [])
+      .flatMap((turn) => turn.workSegments)
+      .map((segment) => [segment.id, segment])
+  );
+  const reconciled: AgentTimelineResult = {
     ...incoming,
-    revision: Math.max(current?.revision ?? 0, incoming.revision ?? 0),
-    lastDeltaSeq: lastDeltaSeq ?? current?.lastDeltaSeq ?? incoming.lastDeltaSeq,
     turns: incoming.turns.map((turn, turnIndex) => ({
       ...turn,
       sequence: turn.sequence ?? turnIndex,
@@ -232,18 +348,32 @@ export function reconcileTimelineSnapshot(
           ...block,
           sequence: block.sequence ?? blockIndex,
           revision: Math.max(existing?.revision ?? 0, block.revision ?? 0),
-          deliveryMode: deliveryModes[block.id] ??
-            (existing?.deliveryMode === 'live' ? 'replay' : existing?.deliveryMode) ??
-            block.deliveryMode ??
-            'replay',
+          deliveryMode: deliveryModes[block.id]
+            ?? (existing?.deliveryMode === 'live' ? 'replay' : existing?.deliveryMode)
+            ?? block.deliveryMode
+            ?? 'replay',
         };
       }),
+      workSegments: turn.workSegments.map((segment, segmentIndex) => ({
+        ...segment,
+        sequence: segment.sequence ?? segmentIndex,
+        revision: Math.max(
+          existingWorkSegmentsById.get(segment.id)?.revision ?? 0,
+          segment.revision
+        ),
+      })),
+      parts: turn.parts.map((part) => ({ ...part })),
     })),
   };
+  assertNativeTimeline(reconciled);
+  return reconciled;
 }
 
-export function timelineAsReplay(timeline: AgentTimelineResult): AgentTimelineResult {
-  return {
+export function timelineAsReplay(
+  timeline: AgentTimelineResult
+): AgentTimelineResult {
+  assertNativeTimeline(timeline);
+  const replay: AgentTimelineResult = {
     ...timeline,
     turns: timeline.turns.map((turn, turnIndex) => ({
       ...turn,
@@ -253,422 +383,221 @@ export function timelineAsReplay(timeline: AgentTimelineResult): AgentTimelineRe
         sequence: block.sequence ?? blockIndex,
         deliveryMode: 'replay',
       })),
+      workSegments: turn.workSegments.map((segment, segmentIndex) => ({
+        ...segment,
+        sequence: segment.sequence ?? segmentIndex,
+      })),
+      parts: turn.parts.map((part) => ({ ...part })),
     })),
   };
+  assertNativeTimeline(replay);
+  return replay;
 }
 
 export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   return {
-    schemaVersion: 'deepcode.session.timeline.v1',
+    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
     sessionId,
     revision: 0,
-    lastDeltaSeq: 0,
+    sourceEventVersion: 0,
     generatedAt: new Date(0).toISOString(),
     turns: [],
     eventCount: 0,
   };
 }
 
-function diffTimelines(
-  previous: AgentTimelineResult,
-  next: AgentTimelineResult,
-  runId: string,
-  newBlockMode: AgentTimelineDeliveryMode
-): AgentTimelineDelta[] {
-  const previousBlocks = timelineBlockIndex(previous);
-  const nextBlocks = timelineBlockIndex(next);
-  const deltas: AgentTimelineDelta[] = [];
+function assertNativeTimeline(
+  timeline: AgentTimelineResult
+): void {
+  if (!isNativeWorkSegmentsTimelineSnapshot(timeline)) {
+    throw new Error('shared_conversation_projection_native_shape_required');
+  }
+  assertSharedConversationProjectionV2(timeline);
+}
 
-  for (const entry of nextBlocks.values()) {
-    const prior = previousBlocks.get(entry.block.id);
-    const base = deltaBase(next, runId, entry);
-    if (!prior) {
-      deltas.push({
-        ...base,
-        op: 'block.started',
-        block: entry.block,
-        deliveryMode: newBlockMode,
-      });
-      continue;
+function assertTimelineDelta(delta: AgentTimelineDelta): void {
+  const deltaKeys = [
+    'schemaVersion',
+    'shapeVersion',
+    'sessionId',
+    'baseRevision',
+    'revision',
+    'sourceEventVersion',
+    'generatedAt',
+    'eventCount',
+    'turnReplacements',
+    'removedTurnIds',
+    'rootReplacements',
+  ];
+  if (
+    !isRecord(delta)
+    || !hasExactKeys(delta, deltaKeys)
+    || delta.schemaVersion
+      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
+    || delta.shapeVersion
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2
+    || typeof delta.sessionId !== 'string'
+    || delta.sessionId.length === 0
+    || !isNonnegativeSafeInteger(delta.baseRevision)
+    || !isNonnegativeSafeInteger(delta.revision)
+    || !isNonnegativeSafeInteger(delta.sourceEventVersion)
+    || typeof delta.generatedAt !== 'string'
+    || delta.generatedAt.length === 0
+    || !isNonnegativeSafeInteger(delta.eventCount)
+    || !Array.isArray(delta.turnReplacements)
+    || !Array.isArray(delta.removedTurnIds)
+    || !isRecord(delta.rootReplacements)
+    || !hasOnlyKeys(delta.rootReplacements, [
+      'taskProjection',
+      'interactionProjection',
+      'runProjection',
+      'tokenUsageProjection',
+      'workspaceProjection',
+    ])
+  ) {
+    throw new Error('invalid_timeline_delta');
+  }
+  const replacementIds = new Set<string>();
+  for (const turn of delta.turnReplacements) {
+    if (
+      !isRecord(turn)
+      || typeof turn.id !== 'string'
+      || turn.id.length === 0
+      || replacementIds.has(turn.id)
+    ) {
+      throw new Error('invalid_timeline_delta_turn_replacement');
     }
-    if (blockSemanticSignature(prior.block) === blockSemanticSignature(entry.block)) continue;
-
-    const priorBody = prior.block.bodyMarkdown ?? '';
-    const nextBody = entry.block.bodyMarkdown ?? '';
-    const commitsLiveBlock = isLiveBlock(prior.block) && !isLiveBlock(entry.block);
-    if (commitsLiveBlock) {
-      deltas.push({
-        ...base,
-        op: 'block.committed',
-        committedEventIds: committedEventIds(entry.block),
-        finalRevision: entry.block.revision ?? base.revision,
-        finalContentHash: hashText(nextBody),
-        block: entry.block,
-      });
-      continue;
+    replacementIds.add(turn.id);
+  }
+  const removedIds = new Set<string>();
+  for (const turnId of delta.removedTurnIds) {
+    if (
+      typeof turnId !== 'string'
+      || turnId.length === 0
+      || removedIds.has(turnId)
+    ) {
+      throw new Error('invalid_timeline_delta_removed_turn');
     }
-    if (nextBody.startsWith(priorBody) && nextBody.length > priorBody.length) {
-      deltas.push({
-        ...base,
-        op: 'text.append',
-        segmentId: `${entry.block.id}:body`,
-        offset: priorBody.length,
-        text: nextBody.slice(priorBody.length),
-        format: 'markdown',
-        fullCharLength: nextBody.length,
-        visibleCharLength: nextBody.length,
-      });
-      if (blockMetadataSignature(prior.block) !== blockMetadataSignature(entry.block)) {
-        deltas.push({ ...base, op: 'block.updated', block: entry.block });
-      }
-    } else if (activitySignature(prior.block) !== activitySignature(entry.block) && entry.block.activity) {
-      deltas.push({
-        ...base,
-        op: 'activity.upsert',
-        activityId: entry.block.activity.activityId,
-        activityRevision: entry.block.revision ?? base.revision,
-        activity: entry.block.activity,
-      });
-      if (blockMetadataSignature(prior.block) !== blockMetadataSignature(entry.block)) {
-        deltas.push({ ...base, op: 'block.updated', block: entry.block });
-      }
-    } else {
-      deltas.push({ ...base, op: 'block.updated', block: entry.block });
+    removedIds.add(turnId);
+  }
+}
+
+function changedRootProjections(
+  current: AgentTimelineResult,
+  next: AgentTimelineResult
+): AgentTimelineRootProjectionReplacements {
+  const replacements: AgentTimelineRootProjectionReplacements = {};
+  if (!jsonEqual(current.taskProjection, next.taskProjection)) {
+    replacements.taskProjection = next.taskProjection ?? null;
+  }
+  if (
+    !jsonEqual(
+      current.interactionProjection,
+      next.interactionProjection
+    )
+  ) {
+    replacements.interactionProjection =
+      next.interactionProjection ?? null;
+  }
+  if (!jsonEqual(current.runProjection, next.runProjection)) {
+    replacements.runProjection = next.runProjection ?? null;
+  }
+  if (
+    !jsonEqual(
+      current.tokenUsageProjection,
+      next.tokenUsageProjection
+    )
+  ) {
+    replacements.tokenUsageProjection =
+      next.tokenUsageProjection ?? null;
+  }
+  if (
+    !jsonEqual(
+      current.workspaceProjection,
+      next.workspaceProjection
+    )
+  ) {
+    replacements.workspaceProjection =
+      next.workspaceProjection ?? null;
+  }
+  return replacements;
+}
+
+function applyRootProjectionReplacements(
+  timeline: AgentTimelineResult,
+  replacements: AgentTimelineRootProjectionReplacements
+): void {
+  if (hasOwn(replacements, 'taskProjection')) {
+    if (replacements.taskProjection === null) {
+      delete timeline.taskProjection;
+    } else if (replacements.taskProjection !== undefined) {
+      timeline.taskProjection = replacements.taskProjection;
     }
-
-    if (prior.block.status !== entry.block.status && isCompletedStatus(entry.block.status)) {
-      deltas.push({
-        ...base,
-        op: 'block.completed',
-        status: entry.block.status,
-        contentHash: hashText(nextBody),
-      });
+  }
+  if (hasOwn(replacements, 'interactionProjection')) {
+    if (replacements.interactionProjection === null) {
+      delete timeline.interactionProjection;
+    } else if (replacements.interactionProjection !== undefined) {
+      timeline.interactionProjection =
+        replacements.interactionProjection;
     }
   }
-
-  for (const entry of previousBlocks.values()) {
-    if (nextBlocks.has(entry.block.id)) continue;
-    deltas.push({
-      ...deltaBase(next, runId, entry),
-      op: 'block.removed',
-      revision: (entry.block.revision ?? 0) + 1,
-    });
+  if (hasOwn(replacements, 'runProjection')) {
+    if (replacements.runProjection === null) {
+      delete timeline.runProjection;
+    } else if (replacements.runProjection !== undefined) {
+      timeline.runProjection = replacements.runProjection;
+    }
   }
-
-  return deltas;
-}
-
-function timelineSyncedDelta(
-  timeline: AgentTimelineResult,
-  runId: string,
-  deliveryModes: Record<string, AgentTimelineDeliveryMode>
-): AgentTimelineDelta {
-  return {
-    schemaVersion: TIMELINE_DELTA_SCHEMA_VERSION,
-    op: 'timeline.synced',
-    sessionId: timeline.sessionId,
-    runId,
-    turnId: 'timeline',
-    turnSeq: 0,
-    blockId: 'timeline',
-    blockSeq: 0,
-    revision: timeline.revision ?? 0,
-    timeline,
-    deliveryModes,
-  };
-}
-
-function stampTimeline(
-  timeline: AgentTimelineResult,
-  previous: AgentTimelineResult | undefined,
-  revision: number
-): AgentTimelineResult {
-  const previousBlocks = new Map(
-    (previous?.turns ?? []).flatMap((turn) => turn.blocks).map((block) => [block.id, block])
-  );
-  return {
-    ...timeline,
-    revision,
-    lastDeltaSeq: previous?.lastDeltaSeq ?? 0,
-    turns: timeline.turns.map((turn, turnIndex) => ({
-      ...turn,
-      sequence: turnIndex,
-      blocks: turn.blocks.map((block, blockIndex) => {
-        const prior = previousBlocks.get(block.id);
-        const changed = !prior || blockSemanticSignature(prior) !== blockSemanticSignature(block);
-        return {
-          ...block,
-          sequence: blockIndex,
-          revision: changed ? (prior?.revision ?? 0) + 1 : prior?.revision ?? 1,
-          deliveryMode: 'replay',
-        };
-      }),
-    })),
-  };
-}
-
-function committedDeliveryModes(
-  previous: AgentTimelineResult,
-  committed: AgentTimelineResult
-): Record<string, AgentTimelineDeliveryMode> {
-  const previousBlocks = new Map(
-    previous.turns.flatMap((turn) => turn.blocks).map((block) => [block.id, block])
-  );
-  const result: Record<string, AgentTimelineDeliveryMode> = {};
-  for (const block of committed.turns.flatMap((turn) => turn.blocks)) {
-    const prior = previousBlocks.get(block.id);
-    if (prior) continue;
-    result[block.id] = shouldLocallyAnimate(block) ? 'buffered' : 'replay';
+  if (hasOwn(replacements, 'tokenUsageProjection')) {
+    if (replacements.tokenUsageProjection === null) {
+      delete timeline.tokenUsageProjection;
+    } else if (replacements.tokenUsageProjection !== undefined) {
+      timeline.tokenUsageProjection =
+        replacements.tokenUsageProjection;
+    }
   }
-  return result;
-}
-
-function shouldLocallyAnimate(block: AgentTimelineBlock): boolean {
-  const kind = block.narrativeKind;
-  return kind === 'thinking' ||
-    kind === 'assistantNarration' ||
-    kind === 'assistantText' ||
-    kind === 'requirement' ||
-    kind === 'plan' ||
-    kind === 'review';
-}
-
-function deltaBase(
-  timeline: AgentTimelineResult,
-  runId: string,
-  entry: TimelineBlockEntry
-): Omit<AgentTimelineDelta, 'op'> {
-  return {
-    schemaVersion: TIMELINE_DELTA_SCHEMA_VERSION,
-    sessionId: timeline.sessionId,
-    runId,
-    turnId: entry.turnId,
-    turnSeq: entry.turnSeq,
-    blockId: entry.block.id,
-    blockSeq: entry.blockSeq,
-    revision: entry.block.revision ?? timeline.revision ?? 0,
-    sourceEventRefs: entry.block.rawEventRefs,
-  } as Omit<AgentTimelineDelta, 'op'>;
-}
-
-interface TimelineBlockEntry {
-  turnId: string;
-  turnSeq: number;
-  blockSeq: number;
-  block: AgentTimelineBlock;
-}
-
-function timelineBlockIndex(timeline: AgentTimelineResult): Map<string, TimelineBlockEntry> {
-  const result = new Map<string, TimelineBlockEntry>();
-  timeline.turns.forEach((turn, turnIndex) => {
-    turn.blocks.forEach((block, blockIndex) => {
-      result.set(block.id, {
-        turnId: turn.id,
-        turnSeq: turn.sequence ?? turnIndex,
-        blockSeq: block.sequence ?? blockIndex,
-        block,
-      });
-    });
-  });
-  return result;
-}
-
-function mergeProjectionDelta(existing: ProjectionDelta[], incoming: ProjectionDelta): ProjectionDelta[] {
-  const key = projectionDeltaKey(incoming);
-  const index = existing.findIndex((delta) => projectionDeltaKey(delta) === key);
-  if (index < 0) return [...existing, incoming].sort(compareProjectionDelta);
-  const current = existing[index];
-  const next = [...existing];
-  next[index] = isTextProjectionDelta(incoming)
-    ? {
-        ...current,
-        ...incoming,
-        seq: current.seq ?? incoming.seq,
-        delta: `${current.delta ?? ''}${incoming.delta ?? ''}`,
-      }
-    : {
-        ...current,
-        ...incoming,
-        seq: current.seq ?? incoming.seq,
-        activity: current.activity && incoming.activity
-          ? { ...current.activity, ...incoming.activity }
-          : incoming.activity ?? current.activity,
-      };
-  return next.sort(compareProjectionDelta);
-}
-
-function projectionDeltaKey(delta: ProjectionDelta): string {
-  const identity = delta.activity?.activityId ?? delta.itemId ?? delta.draftId ?? delta.stage ?? delta.type;
-  return [delta.runId ?? 'run', delta.turnId ?? 'turn', delta.type, delta.channel ?? '', identity].join(':');
-}
-
-function isTextProjectionDelta(delta: ProjectionDelta): boolean {
-  return delta.type === 'assistant_delta' ||
-    delta.type === 'reasoning_delta' ||
-    delta.type === 'draft_delta' ||
-    delta.type === 'part_delta';
-}
-
-function compareProjectionDelta(left: ProjectionDelta, right: ProjectionDelta): number {
-  return (left.seq ?? 0) - (right.seq ?? 0);
-}
-
-function upsertBlock(
-  timeline: AgentTimelineResult,
-  delta: AgentTimelineDelta,
-  block: AgentTimelineBlock
-): AgentTimelineResult {
-  const turns = timeline.turns.map((turn) => ({ ...turn, blocks: [...turn.blocks] }));
-  let turn = turns.find((candidate) => candidate.id === delta.turnId);
-  if (!turn) {
-    turn = {
-      id: delta.turnId,
-      sequence: delta.turnSeq,
-      sessionId: delta.sessionId,
-      status: 'running',
-      blocks: [],
-    };
-    turns.push(turn);
+  if (hasOwn(replacements, 'workspaceProjection')) {
+    if (replacements.workspaceProjection === null) {
+      delete timeline.workspaceProjection;
+    } else if (replacements.workspaceProjection !== undefined) {
+      timeline.workspaceProjection =
+        replacements.workspaceProjection;
+    }
   }
-  const index = turn.blocks.findIndex((candidate) => candidate.id === block.id);
-  if (index >= 0) turn.blocks[index] = block;
-  else turn.blocks.push(block);
-  turn.blocks.sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
-  turns.sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
-  return {
-    ...timeline,
-    revision: Math.max(timeline.revision ?? 0, delta.revision),
-    lastDeltaSeq: delta.deltaSeq ?? timeline.lastDeltaSeq,
-    generatedAt: new Date().toISOString(),
-    turns,
-  };
 }
 
-function updateBlock(
-  timeline: AgentTimelineResult,
-  delta: AgentTimelineDelta,
-  block: AgentTimelineBlock
-): AgentTimelineResult {
-  return upsertBlock(timeline, delta, block);
+function jsonEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function removeBlock(timeline: AgentTimelineResult, delta: AgentTimelineDelta): AgentTimelineResult {
-  return {
-    ...timeline,
-    revision: Math.max(timeline.revision ?? 0, delta.revision),
-    lastDeltaSeq: delta.deltaSeq ?? timeline.lastDeltaSeq,
-    turns: timeline.turns
-      .map((turn) => ({
-        ...turn,
-        blocks: turn.blocks.filter((block) => block.id !== delta.blockId),
-      }))
-      .filter((turn) => turn.blocks.length > 0),
-  };
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function findBlock(timeline: AgentTimelineResult, blockId: string): AgentTimelineBlock | undefined {
-  return timeline.turns.flatMap((turn) => turn.blocks).find((block) => block.id === blockId);
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  return Object.keys(value).length === keys.length
+    && hasOnlyKeys(value, keys);
 }
 
-function preserveDeliveryMode(
-  existing: AgentTimelineBlock,
-  incoming: AgentTimelineBlock,
-  revision: number
-): AgentTimelineBlock {
-  return {
-    ...incoming,
-    revision,
-    deliveryMode: existing.deliveryMode ?? incoming.deliveryMode ?? 'replay',
-  };
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
 }
 
-function settleCommittedDeliveryMode(
-  existing: AgentTimelineBlock,
-  incoming: AgentTimelineBlock,
-  revision: number
-): AgentTimelineBlock {
-  return {
-    ...incoming,
-    revision,
-    deliveryMode: existing.deliveryMode === 'live'
-      ? 'replay'
-      : existing.deliveryMode ?? incoming.deliveryMode ?? 'replay',
-  };
-}
-
-function withLastDeltaSeq(timeline: AgentTimelineResult, deltaSeq?: number): AgentTimelineResult {
-  return deltaSeq === undefined ? timeline : { ...timeline, lastDeltaSeq: deltaSeq };
-}
-
-function blockSemanticSignature(block: AgentTimelineBlock): string {
-  return JSON.stringify({
-    kind: block.kind,
-    narrativeKind: block.narrativeKind,
-    activity: block.activity,
-    title: block.title,
-    summary: block.summary,
-    status: block.status,
-    defaultCollapsed: block.defaultCollapsed,
-    bodyMarkdown: block.bodyMarkdown,
-    structuredProjection: block.structuredProjection,
-    decisionRequest: block.decisionRequest,
-    attachments: block.attachments,
-    evidenceRefs: block.evidenceRefs,
-    rawEventRefs: block.rawEventRefs,
-    taskProjectionRef: block.taskProjectionRef,
-  });
-}
-
-function blockMetadataSignature(block: AgentTimelineBlock): string {
-  return JSON.stringify({
-    title: block.title,
-    summary: block.summary,
-    status: block.status,
-    structuredProjection: block.structuredProjection,
-    decisionRequest: block.decisionRequest,
-    rawEventRefs: block.rawEventRefs,
-  });
-}
-
-function activitySignature(block: AgentTimelineBlock): string {
-  return JSON.stringify(block.activity ?? null);
-}
-
-function isLiveBlock(block: AgentTimelineBlock): boolean {
-  return (block.rawEventRefs ?? []).some((ref) => ref.startsWith('event:live:'));
-}
-
-function committedEventIds(block: AgentTimelineBlock): string[] {
-  return (block.rawEventRefs ?? [])
-    .filter((ref) => ref.startsWith('event:'))
-    .map((ref) => ref.slice('event:'.length))
-    .filter((id) => !id.startsWith('live:'));
-}
-
-function isCompletedStatus(
-  status: AgentTimelineStatus
-): status is Extract<AgentTimelineStatus, 'completed' | 'waiting' | 'failed' | 'blocked'> {
-  return status === 'completed' || status === 'waiting' || status === 'failed' || status === 'blocked';
-}
-
-function latestRunId(events: AgentEvent[]): string | undefined {
-  for (const event of [...events].reverse()) {
-    if (!isRecord(event.payload)) continue;
-    const runId = event.payload.runId;
-    if (typeof runId === 'string' && runId) return runId;
-  }
-  return undefined;
-}
-
-function hashText(value: string): string {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value);
 }

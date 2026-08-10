@@ -13,6 +13,5 @@ path = "src/main.rs"
 [dependencies]
 deepcode-kernel-abi.workspace = true
 deepcode-kernel-client.workspace = true
-deepcode-kernel-tools.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }

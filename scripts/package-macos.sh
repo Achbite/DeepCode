@@ -39,6 +39,9 @@ TUI_COMMAND_NAME=""
 COPY_ROOT_WEB_DIST="0"
 WRITE_TUI_LAUNCHER="0"
 BIN_DIR="$ROOT_DIR/bin/macos-arm64"
+KERNEL_ABI_VERSION="deepcode.kernel.abi.v2"
+TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
+SESSION_BRIDGE_NAME="hostBridgeV2.js"
 
 add_requested_product() {
   local product="$1"
@@ -247,6 +250,7 @@ running_process_ids_for_path() {
 target_app_process_ids() {
   local app_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/$TAURI_BIN_NAME"
   local kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+  local host_web_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-host-web"
   local distribution_kernel_bin="$BIN_DIR/deepcode-kernel"
 
   if [ -e "$app_bin" ]; then
@@ -254,6 +258,9 @@ target_app_process_ids() {
   fi
   if [ -e "$kernel_bin" ]; then
     running_process_ids_for_path "$kernel_bin" || true
+  fi
+  if [ -e "$host_web_bin" ]; then
+    running_process_ids_for_path "$host_web_bin" || true
   fi
   if [ -e "$distribution_kernel_bin" ]; then
     running_process_ids_for_path "$distribution_kernel_bin" || true
@@ -343,6 +350,7 @@ clean_shared_package_cache() {
     "$BIN_DIR/README.txt" \
     "$BIN_DIR/build-info.json" \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
     "$CARGO_TARGET_ROOT/release/deepcode-cli" \
     "$CARGO_TARGET_ROOT/release/deepcode-tui"
 }
@@ -669,6 +677,8 @@ ensure_gui_dists() {
 
 build_gui_dist() {
   log "build TS protocol/session-core/React GUI"
+  pnpm --filter @deepcode/protocol clean
+  rm -f "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
   pnpm --filter @deepcode/protocol build
   pnpm --filter @deepcode/session-core build
   if [ "$PRODUCT" = "DeepCode-GUI" ]; then
@@ -680,8 +690,9 @@ build_gui_dist() {
 }
 
 build_rust_bins() {
-  log "build Darwin Kernel/CLI/TUI release binaries"
-  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+  log "build Darwin Kernel/private Host proxy/CLI/TUI release binaries"
+  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release \
+    -p deepcode-kernel-daemon -p deepcode-host-web -p deepcode-cli -p deepcode-tui
 }
 
 build_tauri_app() {
@@ -707,26 +718,65 @@ copy_required_file() {
   install -m "$mode" "$src" "$dst"
 }
 
+validate_protocol_v2_dist() {
+  local dist_dir="$1"
+  local label="$2"
+  local emitted name source stem
+
+  [ -d "$dist_dir" ] || fail "$label protocol dist is missing at $dist_dir"
+  for emitted in "$dist_dir"/*; do
+    [ -f "$emitted" ] || continue
+    name="$(basename "$emitted")"
+    case "$name" in
+      *.d.ts.map) stem="${name%.d.ts.map}" ;;
+      *.js.map) stem="${name%.js.map}" ;;
+      *.d.ts) stem="${name%.d.ts}" ;;
+      *.js) stem="${name%.js}" ;;
+      *) continue ;;
+    esac
+    [ -f "$ROOT_DIR/userspace/protocol/src/$stem.ts" ] \
+      || fail "$label protocol dist contains retired output without a source module: $name"
+  done
+  for source in "$ROOT_DIR"/userspace/protocol/src/*.ts; do
+    [ -f "$source" ] || continue
+    stem="$(basename "${source%.ts}")"
+    [ -f "$dist_dir/$stem.js" ] \
+      || fail "$label protocol dist is missing $stem.js"
+    [ -f "$dist_dir/$stem.d.ts" ] \
+      || fail "$label protocol dist is missing $stem.d.ts"
+  done
+  for name in index.js tools.js kernelAbiV2.js; do
+    [ -f "$dist_dir/$name" ] \
+      || fail "$label protocol dist is missing $name"
+  done
+  if find "$dist_dir" -maxdepth 1 -type f \
+    \( -name 'kernel.*' -o -name 'kernelAbiV1.*' \) -print -quit | grep -q .; then
+    fail "$label protocol dist contains a retired Kernel ABI module"
+  fi
+}
+
 copy_session_core_runtime() {
   local session_dist="$ROOT_DIR/userspace/session-core/dist"
   local protocol_dist="$ROOT_DIR/userspace/protocol/dist"
   local session_dst="$BIN_DIR/session-core"
   local protocol_dst="$BIN_DIR/node_modules/@deepcode/protocol"
 
-  [ -f "$session_dist/hostBridge.js" ] || fail "session-core bridge missing at $session_dist/hostBridge.js; build session-core before packaging"
+  [ -f "$session_dist/$SESSION_BRIDGE_NAME" ] || fail "session-core bridge missing at $session_dist/$SESSION_BRIDGE_NAME; build session-core before packaging"
   [ -d "$protocol_dist" ] || fail "protocol dist missing at $protocol_dist; build protocol before packaging"
+  validate_protocol_v2_dist "$protocol_dist" "source"
 
   rm -rf "$session_dst" "$protocol_dst"
   mkdir -p "$session_dst/dist" "$protocol_dst/dist"
   cp -R "$session_dist/." "$session_dst/dist/"
   cp -R "$protocol_dist/." "$protocol_dst/dist/"
+  validate_protocol_v2_dist "$protocol_dst/dist" "packaged"
   copy_required_file "$ROOT_DIR/userspace/session-core/package.json" "$session_dst/package.json" 644
   copy_required_file "$ROOT_DIR/userspace/protocol/package.json" "$protocol_dst/package.json" 644
 
-  cat > "$session_dst/hostBridge.js" <<'BRIDGE'
-import "./dist/hostBridge.js";
+  cat > "$session_dst/$SESSION_BRIDGE_NAME" <<BRIDGE
+import "./dist/$SESSION_BRIDGE_NAME";
 BRIDGE
-  chmod 644 "$session_dst/hostBridge.js"
+  chmod 644 "$session_dst/$SESSION_BRIDGE_NAME"
 }
 
 ensure_packaged_node_runtime() {
@@ -834,10 +884,11 @@ prepare_portable_config_root() {
   "agent.interventionLevel": "medium",
   "agent.memory.projectMode": "confirm",
   "agent.permissions.workspaceRead": "allow",
+  "agent.permissions.autoApprovePlans": false,
   "agent.permissions.workspaceWrite": "ask",
   "agent.permissions.gitWrite": "ask",
-  "agent.permissions.webRead": "allow",
-  "agent.permissions.privateWebRead": "ask",
+  "agent.permissions.webRead": "deny",
+  "agent.permissions.privateWebRead": "deny",
   "agent.permissions.processExec": "deny",
   "agent.permissions.browserControl": "deny",
   "agent.permissions.providerEgress": "ask",
@@ -862,6 +913,8 @@ JSON
       "id": "deepseek-v4-flash-openai",
       "name": "DeepSeek V4 Flash",
       "kind": "openaiCompatible",
+      "reasoningTransport": "openaiPlaintext",
+      "providerFlavor": "deepseek",
       "baseUrl": "https://api.deepseek.com",
       "model": "deepseek-v4-flash",
       "contextWindowTokens": 1000000,
@@ -875,6 +928,8 @@ JSON
       "id": "deepseek-v4-pro-openai",
       "name": "DeepSeek V4 Pro",
       "kind": "openaiCompatible",
+      "reasoningTransport": "openaiPlaintext",
+      "providerFlavor": "deepseek",
       "baseUrl": "https://api.deepseek.com",
       "model": "deepseek-v4-pro",
       "contextWindowTokens": 1000000,
@@ -927,10 +982,7 @@ SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 HOST="\${DEEPCODE_HOST:-127.0.0.1}"
 KERNEL_BIN="\$SCRIPT_DIR/deepcode-kernel"
 TUI_BIN="\$SCRIPT_DIR/libexec/$TUI_EXEC_NAME"
-WEB_DIR="\$SCRIPT_DIR/$WEB_DIR_NAME"
 CONFIG_ROOT="\${DEEPCODE_CONFIG_DIR:-\$SCRIPT_DIR}"
-LOG_DIR="\${DEEPCODE_LOG_DIR:-\$CONFIG_ROOT/logs}"
-mkdir -p "\$LOG_DIR"
 
 fail() {
   printf '$PRODUCT TUI launcher error: %s\n' "\$*" >&2
@@ -961,60 +1013,19 @@ choose_port() {
   fail "no free localhost port found in $DEFAULT_PORT-31345"
 }
 
-health_ok() {
-  /usr/bin/curl -fsS "\$1/api/health" >/dev/null 2>&1
-}
-
-wait_for_kernel() {
-  local api_url="\$1"
-  local attempt=1
-  while [ "\$attempt" -le 80 ]; do
-    if health_ok "\$api_url"; then
-      return 0
-    fi
-    sleep 0.1
-    attempt=\$((attempt + 1))
-  done
-  return 1
-}
-
 [ -x "\$KERNEL_BIN" ] || fail "missing executable: \$KERNEL_BIN"
 [ -x "\$TUI_BIN" ] || fail "missing executable: \$TUI_BIN"
-[ -f "\$WEB_DIR/index.html" ] || fail "missing GUI web assets: \$WEB_DIR/index.html"
 
 PORT="\$(choose_port)"
 API_URL="http://\$HOST:\$PORT"
-KERNEL_PID=""
-STARTED_KERNEL=0
-
-cleanup() {
-  if [ "\$STARTED_KERNEL" = "1" ] && [ "\$KERNEL_PID" != "" ]; then
-    kill "\$KERNEL_PID" >/dev/null 2>&1 || true
-    wait "\$KERNEL_PID" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-if ! health_ok "\$API_URL"; then
-  DEEPCODE_HOST="\$HOST" \
-  DEEPCODE_PORT="\$PORT" \
-  DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT" \
-  DEEPCODE_CLIENT_DIST="\$WEB_DIR" \
-    "\$KERNEL_BIN" >>"\$LOG_DIR/deepcode-kernel.log" 2>&1 &
-  KERNEL_PID="\$!"
-  STARTED_KERNEL=1
-
-  if ! wait_for_kernel "\$API_URL"; then
-    fail "kernel did not become ready at \$API_URL; see \$LOG_DIR/deepcode-kernel.log"
-  fi
-fi
 
 export DEEPCODE_HOST="\$HOST"
 export DEEPCODE_PORT="\$PORT"
 export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
 export DEEPCODE_API_URL="\$API_URL"
-if [ -f "\$SCRIPT_DIR/session-core/hostBridge.js" ]; then
-  export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/hostBridge.js"
+export DEEPCODE_KERNEL_BIN="\$KERNEL_BIN"
+if [ -f "\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME" ]; then
+  export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME"
 fi
 if [ -x "\$SCRIPT_DIR/node/bin/node" ]; then
   export DEEPCODE_NODE="\$SCRIPT_DIR/node/bin/node"
@@ -1057,8 +1068,8 @@ export DEEPCODE_HOST="\$HOST"
 export DEEPCODE_PORT="\$PORT"
 export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
 export DEEPCODE_KERNEL_BIN="\$KERNEL_BIN"
-if [ -f "\$SCRIPT_DIR/session-core/hostBridge.js" ]; then
-  export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/hostBridge.js"
+if [ -f "\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME" ]; then
+  export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME"
 fi
 if [ -x "\$SCRIPT_DIR/node/bin/node" ]; then
   export DEEPCODE_NODE="\$SCRIPT_DIR/node/bin/node"
@@ -1110,11 +1121,13 @@ PLIST
 
 sign_app_bundle() {
   local app_dir="$1"
-  command -v codesign >/dev/null 2>&1 || return
+  command -v codesign >/dev/null 2>&1 \
+    || fail "codesign is required to publish $APP_NAME.app"
   log "ad-hoc sign $APP_NAME.app"
-  codesign --force --deep --sign - "$app_dir" >/dev/null 2>&1 || {
-    log "warning: ad-hoc signing failed; leaving local app unsigned"
-  }
+  codesign --force --deep --sign - "$app_dir" >/dev/null 2>&1 \
+    || fail "ad-hoc signing failed for $APP_NAME.app"
+  codesign --verify --deep --strict "$app_dir" >/dev/null 2>&1 \
+    || fail "strict signature verification failed for $APP_NAME.app"
 }
 
 sync_signed_kernel_sidecar_to_root() {
@@ -1150,7 +1163,7 @@ write_readme() {
   DeepCode-GUI. Both GUI variants use the same kernel/session/user settings
   model unless DEEPCODE_CONFIG_DIR is explicitly overridden.
   TUI/CLI ordinary input, decisions, and cancel requests go through the daemon
-  shared Session Runtime run API. The daemon uses session-core/dist/hostBridge.js,
+  shared Session Runtime run API. The daemon uses session-core/dist/$SESSION_BRIDGE_NAME,
   package-local node/bin/node, and node_modules/@deepcode/protocol internally.
   Set DEEPCODE_NODE or DEEPCODE_SESSION_BRIDGE only when overriding that packaged
   daemon runtime. DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls the daemon session
@@ -1166,9 +1179,9 @@ write_readme() {
   gui_section=""
   note_assets=""
   if [ "$PRODUCT" = "DeepCode" ] || [ -d "$BIN_DIR/DeepCode.app" ]; then
-    app_entries="  DeepCode.app              Native macOS Editor shell. Starts its bundled Kernel."
+    app_entries="  DeepCode.app              Native macOS Editor shell. Starts its bundled Kernel and private Host proxy."
     gui_section="  open DeepCode.app"
-    note_assets="  DeepCode.app contains deepcode-kernel and web/ under Contents/MacOS."
+    note_assets="  DeepCode.app contains deepcode-kernel, deepcode-host-web, and web/ under Contents/MacOS."
   fi
   if [ "$PRODUCT" = "DeepCode-GUI" ] || [ -d "$BIN_DIR/DeepCode-GUI.app" ]; then
     if [ "$WEB_DIR_NAME" != "web-deepcode-gui" ]; then
@@ -1178,15 +1191,15 @@ write_readme() {
     fi
     if [ -n "$app_entries" ]; then
       app_entries="$app_entries
-  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel."
+  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel and private Host proxy."
       gui_section="$gui_section
   open DeepCode-GUI.app"
       note_assets="$note_assets
-  DeepCode-GUI.app contains deepcode-kernel and web-deepcode-gui/ under Contents/MacOS."
+  DeepCode-GUI.app contains deepcode-kernel, deepcode-host-web, and web-deepcode-gui/ under Contents/MacOS."
     else
-      app_entries="  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel."
+      app_entries="  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel and private Host proxy."
       gui_section="  open DeepCode-GUI.app"
-      note_assets="  DeepCode-GUI.app contains deepcode-kernel and web-deepcode-gui/ under Contents/MacOS."
+      note_assets="  DeepCode-GUI.app contains deepcode-kernel, deepcode-host-web, and web-deepcode-gui/ under Contents/MacOS."
     fi
   fi
 
@@ -1230,8 +1243,9 @@ write_build_info() {
   "sourceDirty": $SOURCE_DIRTY,
   "sourceStatusHash": "$SOURCE_STATUS_HASH",
   "sourceFingerprint": "$SOURCE_FINGERPRINT",
-  "protocolVersion": "deepcode.agent.protocol.v4",
-  "toolCatalogVersion": "deepcode.kernel.tools.v3",
+  "kernelAbiVersion": "$KERNEL_ABI_VERSION",
+  "toolRegistryVersion": "$TOOL_REGISTRY_VERSION",
+  "sessionBridge": "$SESSION_BRIDGE_NAME",
   "product": "$product"
 }
 JSON
@@ -1268,6 +1282,7 @@ stage_product_app() {
 
   copy_required_file "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME" "$app_macos_dir/$TAURI_BIN_NAME" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$app_macos_dir/deepcode-kernel" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$app_macos_dir/deepcode-host-web" 755
   write_build_info "$app_macos_dir/build-info.json"
 
   copy_web_dist "$app_macos_dir/$WEB_DIR_NAME"
@@ -1309,7 +1324,8 @@ finalize_shared_distribution() {
 verify_packaged_kernel_markers() {
   local kernel_bin="$BIN_DIR/deepcode-kernel"
   local original_product="$PRODUCT"
-  local product app_kernel_bin root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product strings_file
+  local product app_kernel_bin app_host_proxy root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product
+  local build_info_kernel_abi build_info_tool_registry build_info_session_bridge strings_file
   local checked_app=0
   [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
   root_hash="$(shasum -a 256 "$kernel_bin" | awk '{print $1}')"
@@ -1318,8 +1334,14 @@ verify_packaged_kernel_markers() {
   for build_info in "$BIN_DIR/build-info.json"; do
     build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
     build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
+    build_info_kernel_abi="$(awk -F '"' '/"kernelAbiVersion"/ { print $4; exit }' "$build_info")"
+    build_info_tool_registry="$(awk -F '"' '/"toolRegistryVersion"/ { print $4; exit }' "$build_info")"
+    build_info_session_bridge="$(awk -F '"' '/"sessionBridge"/ { print $4; exit }' "$build_info")"
     [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
     [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
+    [ "$build_info_kernel_abi" = "$KERNEL_ABI_VERSION" ] || fail "$build_info kernelAbiVersion=$build_info_kernel_abi does not match $KERNEL_ABI_VERSION"
+    [ "$build_info_tool_registry" = "$TOOL_REGISTRY_VERSION" ] || fail "$build_info toolRegistryVersion=$build_info_tool_registry does not match $TOOL_REGISTRY_VERSION"
+    [ "$build_info_session_bridge" = "$SESSION_BRIDGE_NAME" ] || fail "$build_info sessionBridge=$build_info_session_bridge does not match $SESSION_BRIDGE_NAME"
   done
 
   for product in DeepCode-GUI DeepCode; do
@@ -1327,31 +1349,40 @@ verify_packaged_kernel_markers() {
     [ -d "$BIN_DIR/$APP_NAME.app" ] || continue
     checked_app=1
     app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+    app_host_proxy="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-host-web"
     build_info="$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"
     [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
+    [ -x "$app_host_proxy" ] || fail "missing bundled private Host proxy: $app_host_proxy"
+    codesign --verify --deep --strict "$BIN_DIR/$APP_NAME.app" >/dev/null 2>&1 \
+      || fail "published $APP_NAME.app failed strict signature verification"
     app_hash="$(shasum -a 256 "$app_kernel_bin" | awk '{print $1}')"
     [ "$root_hash" = "$app_hash" ] || fail "root deepcode-kernel and $APP_NAME.app bundled Kernel differ"
     [ -f "$build_info" ] || fail "missing bundled build-info.json: $build_info"
     build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
     build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
     build_info_product="$(awk -F '"' '/"product"/ { print $4; exit }' "$build_info")"
+    build_info_kernel_abi="$(awk -F '"' '/"kernelAbiVersion"/ { print $4; exit }' "$build_info")"
+    build_info_tool_registry="$(awk -F '"' '/"toolRegistryVersion"/ { print $4; exit }' "$build_info")"
+    build_info_session_bridge="$(awk -F '"' '/"sessionBridge"/ { print $4; exit }' "$build_info")"
     [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
     [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
     [ "$build_info_product" = "$product" ] || fail "$build_info product=$build_info_product does not match app product $product"
+    [ "$build_info_kernel_abi" = "$KERNEL_ABI_VERSION" ] || fail "$build_info kernelAbiVersion=$build_info_kernel_abi does not match $KERNEL_ABI_VERSION"
+    [ "$build_info_tool_registry" = "$TOOL_REGISTRY_VERSION" ] || fail "$build_info toolRegistryVersion=$build_info_tool_registry does not match $TOOL_REGISTRY_VERSION"
+    [ "$build_info_session_bridge" = "$SESSION_BRIDGE_NAME" ] || fail "$build_info sessionBridge=$build_info_session_bridge does not match $SESSION_BRIDGE_NAME"
   done
   [ "$checked_app" = "1" ] || fail "no packaged macOS app was published in $BIN_DIR"
   configure_product "$original_product"
 
   strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
   strings "$kernel_bin" >"$strings_file"
-  grep -Fq 'deepcode.agent.protocol.v4' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing deepcode.agent.protocol.v4 marker"; }
-  grep -Fq 'deepcode.kernel.tools.v3' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing deepcode.kernel.tools.v3 marker"; }
+  grep -Fq "$KERNEL_ABI_VERSION" "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing $KERNEL_ABI_VERSION marker"; }
+  grep -Fq "$TOOL_REGISTRY_VERSION" "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing $TOOL_REGISTRY_VERSION marker"; }
   grep -Fq 'web.search' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing web.search"; }
   grep -Fq 'git.status' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing git.status"; }
-  grep -Fq 'browser.snapshot' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing browser.snapshot"; }
   ! grep -Fq 'Kernel terminal placeholder ready' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin still contains old placeholder terminal runtime"; }
   ! grep -Fq 'terminal runtime reserved' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin still contains reserved terminal placeholder output"; }
-  grep -Fq 'Kernel PTY terminal runtime is ready.' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing PTY terminal runtime marker"; }
+  grep -Fq 'Host PTY terminal runtime is ready.' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing Host PTY terminal runtime marker"; }
   rm -f "$strings_file"
 }
 
