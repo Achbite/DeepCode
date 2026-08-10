@@ -25,7 +25,7 @@ const TokenStatsSection: React.FC<TokenStatsSectionProps> = ({ tokenUsageProject
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const stats = deriveTokenUsageStats([], tokenUsageProjection);
+  const stats = deriveTokenUsageStats(tokenUsageProjection);
   const maxValue = Math.max(
     stats.promptCacheHitTokens,
     stats.promptCacheMissTokens,

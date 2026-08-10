@@ -6,51 +6,43 @@
  * 由 daemon shared Session Runtime 承载，GUI 不直接编排 provider / Kernel loop。
  */
 import type {
-  AgentFeedbackRequest,
-  AgentFeedbackResult,
-  AgentMode,
+  AgentProjectListResult,
+  AgentProjectResult,
   AgentSessionListResult,
   AgentSessionResult,
-  AgentTraceEvent,
   ApiResponse,
-  AppendAgentEventsRequest,
   ArchiveAgentSessionRequest,
-  AttachPanelSnapshotResult,
   BrowsePathResult,
   BrowserRuntimeStatusResult,
-  CodeSearchInput,
-  CodeSearchResult,
+  CodeGrepInput,
+  CodeGrepResult,
+  CreateAgentProjectRequest,
   CreateAgentSessionRequest,
   CreateTerminalSessionRequest,
   FileReadResult,
   FileTreeNode,
-  GetAgentEventSnapshotResult,
-  GetAgentWorkflowConfigResult,
   GetUserSettingsResult,
+  GitDiffResult,
+  GitStatusResult,
   HealthStatus,
   InitialLocations,
   ListAgentSessionsRequest,
-  ListToolsResult,
   LlmProbeRequest,
   LlmProbeResult,
   LlmProfilesResult,
   OpenBrowserPreviewRequest,
   OpenWorkspaceResult,
-  PanelSnapshotResult,
-  PatchAgentWorkflowConfigRequest,
   PatchLlmProfilesRequest,
   PatchUserSettingsRequest,
   PatchUserSettingsResult,
   PatchWorkspaceSettingsResult,
   RenameAgentSessionRequest,
-  ResolveAgentPermissionRequest,
-  ResolveAgentPlanRequest,
-  ResolveAgentReviewRequest,
+  RebindAgentProjectRequest,
   SaveWorkspaceFileRequest,
   SaveWorkspaceFileResult,
   SetBrowserInspectModeRequest,
   ShellEnvironmentStatus,
-  SkillReferenceResult,
+  KernelHostSkillCatalogResult,
   TerminalCapability,
   TerminalEventsResult,
   TerminalInputRequest,
@@ -58,10 +50,10 @@ import type {
   TerminalSession,
   TerminalSessionsResult,
   TerminalWarmupStatus,
+  UpdateAgentProjectRequest,
+  UpdateAgentSessionRequest,
   WorkspaceState,
 } from '@deepcode/protocol';
-import { buildSessionMemorySnapshot, type SessionMemorySnapshot } from '@deepcode/session-core';
-
 import * as api from './apiClient';
 import { activeT } from '../i18n';
 
@@ -372,7 +364,7 @@ export function probeLlmProfile(
   return api.probeLlmProfile(request);
 }
 
-export function codeSearch(request: CodeSearchInput): Promise<ApiResponse<CodeSearchResult>> {
+export function codeSearch(request: CodeGrepInput): Promise<ApiResponse<CodeGrepResult>> {
   return api.codeSearch(request);
 }
 
@@ -395,9 +387,10 @@ export function getCurrentAgentSession(
 }
 
 export function activateAgentSession(
-  sessionId: string
+  sessionId: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
-  return api.activateAgentSession(sessionId);
+  return api.activateAgentSession(sessionId, signal);
 }
 
 export function renameAgentSession(
@@ -405,6 +398,43 @@ export function renameAgentSession(
   request: RenameAgentSessionRequest
 ): Promise<ApiResponse<AgentSessionResult>> {
   return api.renameAgentSession(sessionId, request);
+}
+
+export function updateAgentSession(
+  sessionId: string,
+  request: UpdateAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return api.updateAgentSession(sessionId, request);
+}
+
+export function listAgentProjects(): Promise<ApiResponse<AgentProjectListResult>> {
+  return api.listAgentProjects();
+}
+
+export function createAgentProject(
+  request: CreateAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return api.createAgentProject(request);
+}
+
+export function updateAgentProject(
+  projectId: string,
+  request: UpdateAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return api.updateAgentProject(projectId, request);
+}
+
+export function rebindAgentProject(
+  projectId: string,
+  request: RebindAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return api.rebindAgentProject(projectId, request);
+}
+
+export function deleteAgentProject(
+  projectId: string
+): Promise<ApiResponse<AgentProjectListResult>> {
+  return api.deleteAgentProject(projectId);
 }
 
 export function archiveAgentSession(
@@ -420,64 +450,20 @@ export function deleteAgentSession(
   return api.deleteAgentSession(sessionId);
 }
 
-export function getConversationArchive(sessionId: string) {
-  return api.getConversationArchive(sessionId);
-}
-
-export function readConversationArchiveFile(
+export function getAgentTimeline(
   sessionId: string,
-  request: { path: string; runId?: string }
+  signal?: AbortSignal
 ) {
-  return api.readConversationArchiveFile(sessionId, request);
+  return api.getAgentTimeline(sessionId, signal);
 }
 
-export function appendAgentEvents(
+export function streamAgentTimeline(
   sessionId: string,
-  request: AppendAgentEventsRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.appendAgentEvents(sessionId, request);
-}
-
-export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
-  return api.getAgentSession(sessionId);
-}
-
-export function getAgentTimeline(sessionId: string) {
-  return api.getAgentTimeline(sessionId);
-}
-
-export async function getAgentSessionMemorySnapshot(
-  sessionId: string,
-  options: { projectMemoryMode?: 'confirm' | 'auto' } = {}
-): Promise<ApiResponse<SessionMemorySnapshot>> {
-  const result = await getAgentSession(sessionId);
-  if (!result.ok || !result.data) {
-    return {
-      ok: false,
-      error: result.error,
-      message: result.message ?? 'Agent session events are unavailable.',
-    };
-  }
-  const session = result.data.session;
-  const workspaceScopeKey =
-    typeof session?.workspaceScopeKey === 'string'
-      ? session.workspaceScopeKey
-      : typeof session?.workspaceId === 'string' && typeof session?.workspaceHash === 'string'
-        ? `workspace-${session.workspaceId}-${session.workspaceHash}`
-        : undefined;
-  const snapshot = buildSessionMemorySnapshot(result.data.events, {
-    sessionId,
-    workspaceScopeKey,
-    displaySessionName: typeof session?.title === 'string' ? session.title : sessionId,
-    projectMemoryMode: options.projectMemoryMode,
-  });
-  void api.persistAgentSessionMemoryArchive(sessionId, { snapshot }).catch((error) => {
-    console.warn('persist agent session memory archive failed', error);
-  });
-  return {
-    ok: true,
-    data: snapshot,
-  };
+  onEvent: Parameters<typeof api.streamAgentTimeline>[1],
+  cursor?: Parameters<typeof api.streamAgentTimeline>[2],
+  signal?: AbortSignal
+): Promise<void> {
+  return api.streamAgentTimeline(sessionId, onEvent, cursor, signal);
 }
 
 export function startAgentRun(
@@ -489,151 +475,40 @@ export function startAgentRun(
 
 export function getAgentRun(
   sessionId: string,
-  runId: string
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.getAgentRun(sessionId, runId);
-}
-
-export function streamAgentRun(
-  sessionId: string,
   runId: string,
-  onEvent: (event: api.AgentRunStreamEvent) => void,
-  cursor?: { sinceEventCount?: number; sinceDeltaSeq?: number },
   signal?: AbortSignal
-): Promise<void> {
-  return api.streamAgentRun(sessionId, runId, onEvent, cursor, signal);
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.getAgentRun(sessionId, runId, signal);
 }
 
 export function cancelAgentRunById(
   sessionId: string,
-  runId: string
+  runId: string,
+  callerRequestId: string
 ): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.cancelAgentRunById(sessionId, runId);
+  return api.cancelAgentRunById(sessionId, runId, callerRequestId);
 }
 
 export function submitAgentRunGuidance(
   sessionId: string,
   runId: string,
-  request: { guidance: string; attachments?: unknown[] }
+  request: api.AgentRunGuidanceRequest
 ): Promise<ApiResponse<api.AgentRunResult>> {
   return api.submitAgentRunGuidance(sessionId, runId, request);
 }
 
-export function cancelAgentRun(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
-  return api.cancelAgentRun(sessionId);
+export function getHostSkills(): Promise<ApiResponse<KernelHostSkillCatalogResult>> {
+  return api.getHostSkills();
 }
 
-export function getAgentEventSnapshot(
-  sessionId: string
-): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
-  return api.getAgentEventSnapshot(sessionId);
-}
-
-const agentEventSubscriptions = new Map<string, number>();
-
-export function subscribeAgentEvents(
-  sessionId: string,
-  onEvent: (event: AgentTraceEvent) => void,
-  intervalMs = 1200
-): string {
-  let lastTraceId: string | undefined;
-  let stopped = false;
-  const subscriptionId = `agent-events-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  const poll = async () => {
-    if (stopped) return;
-    const snapshot = await getAgentEventSnapshot(sessionId);
-    if (!snapshot.ok || !snapshot.data) return;
-    const events = snapshot.data.trace.events;
-    const startIndex = lastTraceId
-      ? events.findIndex((event) => event.id === lastTraceId) + 1
-      : 0;
-    const nextEvents = events.slice(Math.max(0, startIndex));
-    for (const event of nextEvents) onEvent(event);
-    if (events.length > 0) lastTraceId = events[events.length - 1].id;
-  };
-
-  void poll();
-  const handle = window.setInterval(() => {
-    void poll();
-  }, intervalMs);
-  agentEventSubscriptions.set(subscriptionId, handle);
-  return subscriptionId;
-}
-
-export function unsubscribeAgentEvents(subscriptionId: string): void {
-  const handle = agentEventSubscriptions.get(subscriptionId);
-  if (handle !== undefined) {
-    window.clearInterval(handle);
-    agentEventSubscriptions.delete(subscriptionId);
-  }
-}
-
-export async function ackAgentEvent(eventId: string): Promise<ApiResponse<{ accepted: boolean; eventId: string }>> {
-  return {
-    ok: true,
-    data: {
-      accepted: true,
-      eventId,
-    },
-  };
-}
-
-export function resolveAgentPermission(
-  permissionId: string,
-  request: ResolveAgentPermissionRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.resolveAgentPermission(permissionId, request);
-}
-
-export function resolveAgentPlan(
-  runId: string,
-  planId: string,
-  request: ResolveAgentPlanRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.resolveAgentPlan(runId, planId, request);
-}
-
-export function resolveAgentReview(
-  sessionId: string,
-  runId: string,
-  request: ResolveAgentReviewRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.resolveAgentReview(sessionId, runId, request);
-}
-
-export function submitAgentFeedback(
-  request: AgentFeedbackRequest
-): Promise<ApiResponse<AgentFeedbackResult>> {
-  return api.submitAgentFeedback(request);
-}
-
-export function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
-  return api.getAgentWorkflowConfig();
-}
-
-export function patchAgentWorkflowConfig(
-  request: PatchAgentWorkflowConfigRequest
-): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
-  return api.patchAgentWorkflowConfig(request);
-}
-
-export function listAgentTools(mode?: AgentMode): Promise<ApiResponse<ListToolsResult>> {
-  return api.listAgentTools(mode);
-}
-
-export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
-  return api.getAgentSkills();
-}
-
-export function getGitStatus(): Promise<ApiResponse<api.GitStatusResult>> {
+export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
   return api.getGitStatus();
 }
 
 export function getGitDiff(
   path?: string,
   staged?: boolean
-): Promise<ApiResponse<api.GitDiffResult>> {
+): Promise<ApiResponse<GitDiffResult>> {
   return api.getGitDiff(path, staged);
 }
 
@@ -655,12 +530,4 @@ export function setBrowserInspectMode(
   request: SetBrowserInspectModeRequest
 ): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
   return api.setBrowserInspectMode(request);
-}
-
-export function getSelectedPanelSnapshot(): Promise<ApiResponse<PanelSnapshotResult>> {
-  return api.getSelectedPanelSnapshot();
-}
-
-export function attachPanelSnapshotToAgent(): Promise<ApiResponse<AttachPanelSnapshotResult>> {
-  return api.attachPanelSnapshotToAgent();
 }

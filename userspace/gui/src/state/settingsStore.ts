@@ -16,6 +16,10 @@ import {
   patchUserSettings,
   patchWorkspaceSettings,
 } from '../services/runtimeAdapter';
+import {
+  normalizeGuiAccentColor,
+  normalizeGuiThemePreference,
+} from '../theme/deepcodeGuiTheme';
 
 export type SettingSource = 'default' | 'user' | 'workspace';
 
@@ -134,8 +138,21 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'Light', value: 'deepcode-gui-light' },
-      { label: 'Dark', value: 'deepcode-gui-dark' },
+      { label: 'System', value: 'system' },
+      { label: 'Light', value: 'light' },
+      { label: 'Dark', value: 'dark' },
+    ],
+  },
+  {
+    key: 'gui.accentColor',
+    label: 'DeepCode-GUI Accent Color',
+    description: 'Accent color used by interactive controls in the DeepCode-GUI shell.',
+    group: 'gui',
+    control: 'select',
+    options: [
+      { label: 'Blue', value: 'blue' },
+      { label: 'Purple', value: 'purple' },
+      { label: 'Green', value: 'green' },
     ],
   },
   {
@@ -288,122 +305,40 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     control: 'number',
   },
   {
-    key: 'agent.defaultMode',
-    label: 'Default Permission Mode',
-    description: 'Default permission mode for new Agent sessions.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Read Only', value: 'readOnly' },
-      { label: 'Plan', value: 'plan' },
-      { label: 'Ask Before Write', value: 'askBeforeWrite' },
-    ],
-  },
-  {
-    key: 'agent.defaultWorkflow',
-    label: 'Default Workflow',
-    description: 'Default Agent behavior when a user sends a task.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Plan First', value: 'planFirst' },
-      { label: 'Act On Request', value: 'actOnRequest' },
-    ],
-  },
-  {
-    key: 'agent.requirementConfirmationMode',
-    label: 'Requirement Confirmation',
-    description: 'Controls whether Session asks for requirement confirmation before planning side-effect work.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Auto', value: 'auto' },
-      { label: 'Always', value: 'always' },
-      { label: 'Off', value: 'off' },
-    ],
-  },
-  {
-    key: 'agent.reviewContinuationMode',
-    label: 'Review Continuation',
-    description: 'Controls whether accepted Review batches automatically generate the next Plan.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Auto', value: 'auto' },
-      { label: 'Ask', value: 'ask' },
-      { label: 'Off', value: 'off' },
-    ],
-  },
-  {
-    key: 'agent.interventionLevel',
-    label: 'User Intervention Level',
-    description: 'Controls how often Agent asks the user to choose between engineering details before planning.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Low', value: 'low' },
-      { label: 'Medium', value: 'medium' },
-      { label: 'High', value: 'high' },
-    ],
-  },
-  {
-    key: 'agent.memory.projectMode',
-    label: 'Project Memory Mode',
-    description: 'Controls whether project memory candidates require user confirmation before promotion.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Confirm', value: 'confirm' },
-      { label: 'Auto', value: 'auto' },
-    ],
-  },
-  {
-    key: 'agent.permissions.allowFileRead',
-    label: 'Allow File Read',
-    description: 'Allow Agent tools to read workspace files.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.permissions.allowFileWrite',
-    label: 'Allow File Write',
-    description: 'Allow Agent tools to request file writes. Writes still require approval.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.permissions.allowCodeSearch',
-    label: 'Allow Code Search',
-    description: 'Allow Agent tools to search code in the workspace.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.permissions.allowShellPropose',
-    label: 'Allow Shell Proposals',
-    description: 'Allow Agent to propose shell commands without executing them.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.permissions.allowShellExec',
-    label: 'Allow Shell Execution Requests',
-    description: 'Allow Agent to request or execute shell commands through the Agent permission policy.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.permissions.processExec',
-    label: 'Process Execution',
-    description: 'Permission policy for process.exec work units.',
+    key: 'agent.permissions.workspaceRead',
+    label: 'Workspace Read',
+    description: 'Permission policy for workspace read tools.',
     group: 'agent',
     control: 'select',
     options: permissionPolicyOptions(),
   },
   {
-    key: 'agent.permissions.networkEgress',
-    label: 'Network Egress',
-    description: 'Permission policy for outbound network or web evidence requests.',
+    key: 'agent.permissions.autoApprovePlans',
+    label: 'Auto-approve Plans',
+    description: 'Allow Kernel capability issuance only for persisted plans covered by an active Host trust lease.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.permissions.workspaceWrite',
+    label: 'Workspace Write',
+    description: 'Permission policy for workspace mutations.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.permissions.webRead',
+    label: 'Public Web Read',
+    description: 'Permission policy for public read-only web evidence.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.permissions.privateWebRead',
+    label: 'Private Web Read',
+    description: 'Permission policy for private-network read-only web evidence.',
     group: 'agent',
     control: 'select',
     options: permissionPolicyOptions(),
@@ -417,92 +352,23 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     options: permissionPolicyOptions(),
   },
   {
-    key: 'agent.permissions.gitPush',
-    label: 'Git Push',
-    description: 'Permission policy for pushing commits to a remote. Push is never enabled by default.',
-    group: 'agent',
-    control: 'select',
-    options: permissionPolicyOptions(),
-  },
-  {
-    key: 'agent.git.commitMessageMode',
-    label: 'Commit Message Mode',
-    description: 'Allow the Agent to ask the model for commit message suggestions from review diff facts.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Generate', value: 'generate' },
-      { label: 'Ask', value: 'ask' },
-      { label: 'Off', value: 'off' },
-    ],
-  },
-  {
-    key: 'agent.integrations.github.enabled',
-    label: 'GitHub Integration',
-    description: 'Enable GitHub metadata access through configured repository and secret references.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.integrations.github.repoUrl',
-    label: 'GitHub Repository URL',
-    description: 'Optional GitHub repository URL. Workspace git remote is used when this is empty.',
+    key: 'agent.web.search.endpointTemplate',
+    label: 'Web Search Endpoint Template',
+    description: 'HTTP endpoint template containing {query} and optional {limit}.',
     group: 'agent',
     control: 'text',
   },
   {
-    key: 'agent.integrations.github.authSecretRef',
-    label: 'GitHub Auth Secret Ref',
-    description: 'Secret reference for GitHub authentication. Tokens are not stored in this plain settings value.',
+    key: 'agent.web.search.authHeaderName',
+    label: 'Web Search Auth Header',
+    description: 'Header name used with the configured search SecretRef.',
     group: 'agent',
     control: 'text',
   },
   {
-    key: 'agent.integrations.github.defaultRemote',
-    label: 'GitHub Default Remote',
-    description: 'Git remote name used when deriving repository information.',
-    group: 'agent',
-    control: 'text',
-  },
-  {
-    key: 'agent.integrations.github.pushPolicy',
-    label: 'GitHub Push Policy',
-    description: 'Controls whether push requires manual confirmation, asks through permission policy, or may follow explicit allow settings.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Manual', value: 'manual' },
-      { label: 'Ask', value: 'ask' },
-      { label: 'Allow', value: 'allow' },
-    ],
-  },
-  {
-    key: 'agent.permissions.browserControl',
-    label: 'Browser Control',
-    description: 'Permission policy for browser.control work units.',
-    group: 'agent',
-    control: 'select',
-    options: permissionPolicyOptions(),
-  },
-  {
-    key: 'agent.permissions.providerEgress',
-    label: 'Provider Egress',
-    description: 'Permission policy for provider egress audit and external model calls.',
-    group: 'agent',
-    control: 'select',
-    options: permissionPolicyOptions(),
-  },
-  {
-    key: 'agent.shell.autoExecuteCommands',
-    label: 'Auto Execute Commands',
-    description: 'Allow approved process.exec requests to run automatically when process execution is enabled.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.shell.commandBlacklist',
-    label: 'Command Blacklist',
-    description: 'Comma-separated command fragments that always require manual approval before shell execution.',
+    key: 'agent.web.search.authSecretRef',
+    label: 'Web Search Auth Secret',
+    description: 'Secret reference used for the configured search endpoint.',
     group: 'agent',
     control: 'text',
   },
@@ -582,6 +448,12 @@ function getDefaultValue(key: string): UserSettingValue {
 
 function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   const defaultValue = getDefaultValue(key);
+  if (key === 'gui.colorTheme') {
+    return normalizeGuiThemePreference(value);
+  }
+  if (key === 'gui.accentColor') {
+    return normalizeGuiAccentColor(value);
+  }
   if (typeof defaultValue === 'boolean') return Boolean(value);
   if (typeof defaultValue === 'number') {
     const n = typeof value === 'number' ? value : Number(value);
@@ -611,9 +483,15 @@ function buildEffectiveSettings(
   overriddenKeys: string[]
 ): Pick<SettingsStateData, 'effectiveSettings' | 'sources'> {
   const normalizedWorkspace = normalizeWorkspaceSettings(workspaceSettings);
+  const normalizedUserSettings = Object.fromEntries(
+    Object.entries(userSettings).map(([key, value]) => [
+      key,
+      KNOWN_SETTING_KEYS.has(key) ? normalizeSettingValue(key, value) : value,
+    ])
+  ) as UserSettings;
   const effectiveSettings: UserSettings = {
     ...DEFAULT_USER_SETTINGS,
-    ...userSettings,
+    ...normalizedUserSettings,
     ...normalizedWorkspace,
   };
   const sources: Record<string, SettingSource> = {};

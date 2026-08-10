@@ -13,8 +13,6 @@ pub struct KernelErrorEnvelope {
 
 #[derive(Debug, Error)]
 pub enum KernelError {
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
     #[error("invalid command: {0}")]
     InvalidCommand(String),
     #[error("workspace binding is required")]
@@ -29,6 +27,13 @@ pub enum KernelError {
     PendingPermissionUnavailable(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("{message}")]
+    Structured {
+        code: &'static str,
+        stage: &'static str,
+        message: String,
+        details: Value,
+    },
     #[error("kernel error: {0}")]
     Other(String),
 }
@@ -38,7 +43,6 @@ pub type KernelResult<T> = Result<T, KernelError>;
 impl From<&KernelError> for KernelErrorEnvelope {
     fn from(value: &KernelError) -> Self {
         let code = match value {
-            KernelError::NotImplemented(_) => "not_implemented",
             KernelError::InvalidCommand(_) => "invalid_command",
             KernelError::MissingWorkspaceBinding => "workspace_binding_required",
             KernelError::WorkspaceAccessDenied(_) => "workspace_access_denied",
@@ -46,13 +50,21 @@ impl From<&KernelError> for KernelErrorEnvelope {
             KernelError::AttachmentAccessDenied(_) => "attachment_access_denied",
             KernelError::PendingPermissionUnavailable(_) => "pending_permission_unavailable",
             KernelError::PermissionDenied(_) => "permission_denied",
+            KernelError::Structured { code, .. } => code,
             KernelError::Other(_) => "kernel_error",
+        };
+        let args = match value {
+            KernelError::Structured { stage, details, .. } => Some(serde_json::json!({
+                "stage": stage,
+                "details": details,
+            })),
+            _ => None,
         };
         Self {
             code: code.to_string(),
             message: value.to_string(),
             message_key: None,
-            args: None,
+            args,
         }
     }
 }

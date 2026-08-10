@@ -1,9 +1,9 @@
 import React from 'react';
-import type { PermissionRequest } from '@deepcode/protocol';
+import type { AgentTimelinePermissionRequestView } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
 interface PermissionRequestBubbleProps {
-  request: PermissionRequest;
+  request: AgentTimelinePermissionRequestView;
   language: UiLanguage;
   onAccept: () => void;
   onReject: () => void;

@@ -4,720 +4,127 @@ use crate::*;
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSessionScopeQuery {
+    pub(crate) project_id: Option<String>,
     pub(crate) workspace_id: Option<String>,
     pub(crate) workspace_hash: Option<String>,
     pub(crate) include_archived: Option<bool>,
+    pub(crate) include_all_scopes: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentSessionRunRequest {
-    pub(crate) op: Option<String>,
+    pub(crate) op: String,
     pub(crate) content: Option<String>,
-    pub(crate) prompt: Option<String>,
-    pub(crate) attachments: Option<Vec<Value>>,
     pub(crate) workspace_path: Option<String>,
     pub(crate) no_workspace: Option<bool>,
-    pub(crate) profile_id: Option<String>,
-    pub(crate) workflow: Option<String>,
-    pub(crate) requirement_confirmation_mode: Option<String>,
-    pub(crate) review_continuation_mode: Option<String>,
-    pub(crate) intervention_level: Option<String>,
-    pub(crate) project_memory_mode: Option<Value>,
-    pub(crate) title: Option<String>,
+    pub(crate) attachments: Option<Vec<AgentInputAttachmentV2>>,
     pub(crate) decision_kind: Option<String>,
     pub(crate) decision: Option<String>,
     pub(crate) guidance: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) target_id: Option<String>,
+    pub(crate) caller_request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentRunStreamQuery {
-    pub(crate) since_event_count: Option<usize>,
-    pub(crate) since_delta_seq: Option<u64>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentRunCallerMutationRequest {
+    pub(crate) caller_request_id: String,
 }
 
-pub(crate) async fn agent_sessions_list(
-    State(state): State<AppState>,
-    Query(query): Query<AgentSessionScopeQuery>,
-) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    refresh_pending_session_titles(&mut gui);
-    let scope_key = scope_key_from_query(&query);
-    let include_archived = query.include_archived.unwrap_or(false);
-    let sessions = scoped_sessions(&gui, &scope_key, include_archived);
-    let current_session_id = current_agent_session_id_for_scope(&mut gui, &scope_key);
-    ApiResponse::ok(json!({
-        "sessions": sessions,
-        "currentSessionId": current_session_id,
-        "workspaceScopeKey": scope_key
-    }))
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentRunGuidanceMutationRequest {
+    pub(crate) guidance: String,
+    pub(crate) workspace_path: Option<String>,
+    pub(crate) no_workspace: Option<bool>,
+    pub(crate) attachments: Option<Vec<AgentInputAttachmentV2>>,
+    pub(crate) caller_request_id: String,
 }
 
-pub(crate) async fn agent_session_create(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    let id = format!("session-{}", now_millis());
-    let now = now_text();
-    let mode = body
-        .get("mode")
-        .or_else(|| body.get("initialMode"))
-        .and_then(Value::as_str)
-        .unwrap_or("plan");
-    let workspace_id = body.get("workspaceId").and_then(Value::as_str);
-    let workspace_hash = body.get("workspaceHash").and_then(Value::as_str);
-    let session = create_agent_session_value(
-        &id,
-        &now,
-        body.get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("New Agent Session"),
-        mode,
-        body.get("profileId").and_then(Value::as_str),
-        workspace_id,
-        workspace_hash,
-    );
-    let scope_key = session_scope_key(&session);
-    gui.current_session_id = Some(id.clone());
-    gui.current_session_ids_by_scope
-        .insert(scope_key, id.clone());
-    gui.session_projection_cache.insert(id.clone(), Vec::new());
-    gui.session_timeline_cache.remove(&id);
-    gui.trace_events.insert(id.clone(), Vec::new());
-    gui.sessions.insert(0, session.clone());
-    ApiResponse::ok(json!({ "session": session, "events": [] }))
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum AgentAuthorityRevokeTargetRequestV2 {
+    CapabilityLease { lease_id: String },
+    TrustPolicy { trust_policy_id: String },
 }
 
-pub(crate) async fn agent_session_current(
-    State(state): State<AppState>,
-    Query(query): Query<AgentSessionScopeQuery>,
-) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    refresh_pending_session_titles(&mut gui);
-    let scope_key = scope_key_from_query(&query);
-    let Some(session_id) = current_agent_session_id_for_scope(&mut gui, &scope_key) else {
-        return ApiResponse::ok(Value::Null);
-    };
-    session_result(&gui, &session_id)
-}
-
-pub(crate) async fn agent_session_activate(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    if has_session(&gui, &session_id) {
-        if let Some(scope_key) = session_by_id(&gui, &session_id).map(session_scope_key) {
-            gui.current_session_ids_by_scope
-                .insert(scope_key, session_id.clone());
-        }
-        gui.current_session_id = Some(session_id.clone());
-        refresh_pending_session_titles(&mut gui);
-        return session_result(&gui, &session_id);
-    }
-    ApiResponse::error("agent_session_not_found", "agent session not found")
-}
-
-pub(crate) async fn agent_session_rename(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    if let Some(session) = session_mut(&mut gui, &session_id) {
-        if let Some(title) = body.get("title").and_then(Value::as_str) {
-            session["title"] = json!(title);
-            session["titleSource"] = json!("user");
-        }
-        session["updatedAt"] = json!(now_text());
-        return session_result(&gui, &session_id);
-    }
-    ApiResponse::error("agent_session_not_found", "agent session not found")
-}
-
-pub(crate) async fn agent_session_delete(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    let safe_session_id = safe_path_segment(&session_id);
-    let (
-        sessions_dir,
-        archive_root,
-        memory_root,
-        delete_scope_key,
-        response_scope_key,
-        response_current_id,
-        response_sessions,
-    ) = {
-        let mut gui = state.gui.lock().expect("gui state lock");
-        let Some(position) = gui.sessions.iter().position(|session| {
-            session.get("id").and_then(Value::as_str) == Some(session_id.as_str())
-        }) else {
-            return ApiResponse::error("agent_session_not_found", "agent session not found");
-        };
-
-        let scope_key = session_scope_key(&gui.sessions[position]);
-        gui.sessions.remove(position);
-        gui.session_projection_cache.remove(&session_id);
-        gui.session_timeline_cache.remove(&session_id);
-        gui.trace_events.remove(&session_id);
-        gui.current_session_ids_by_scope
-            .retain(|_, current_id| current_id != &session_id);
-        if gui.current_session_id.as_deref() == Some(session_id.as_str()) {
-            gui.current_session_id = gui
-                .sessions
-                .iter()
-                .find(|session| !is_archived_session(session))
-                .and_then(|session| session.get("id").and_then(Value::as_str))
-                .map(ToOwned::to_owned);
-        }
-        let response_current_id = current_agent_session_id_for_scope(&mut gui, &scope_key);
-        let response_sessions = scoped_sessions(&gui, &scope_key, false);
-        (
-            gui.paths.sessions_dir.clone(),
-            gui.paths.conversation_archives_dir.clone(),
-            gui.paths.memory_archives_dir.clone(),
-            scope_key.clone(),
-            scope_key,
-            response_current_id,
-            response_sessions,
-        )
-    };
-
-    remove_session_storage_dir(&sessions_dir, &safe_session_id);
-    remove_conversation_archive_dirs(&archive_root, &safe_session_id);
-    let memory_cleanup = remove_session_memory_archive(
-        &memory_root,
-        &delete_scope_key,
-        &safe_session_id,
-        &session_id,
-    );
-
-    ApiResponse::ok(json!({
-        "sessions": response_sessions,
-        "currentSessionId": response_current_id,
-        "workspaceScopeKey": response_scope_key,
-        "memoryCleanup": memory_cleanup
-    }))
-}
-
-pub(crate) async fn agent_session_archive(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    let should_archive = body
-        .get("archived")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let archived_scope_key = session_by_id(&gui, &session_id).map(session_scope_key);
-    let was_global_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
-    let was_scoped_current = archived_scope_key
-        .as_ref()
-        .and_then(|scope| gui.current_session_ids_by_scope.get(scope))
-        .map(|current| current == &session_id)
-        .unwrap_or(false);
-    let mut replacement_scope: Option<(Option<String>, Option<String>, Option<String>)> = None;
-    if let Some(session) = session_mut(&mut gui, &session_id) {
-        if should_archive {
-            if was_global_current || was_scoped_current {
-                replacement_scope = Some((
-                    session
-                        .get("profileId")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    session
-                        .get("workspaceId")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    session
-                        .get("workspaceHash")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                ));
-            }
-            session["archivedAt"] = json!(now_text());
-        } else {
-            session
-                .as_object_mut()
-                .map(|object| object.remove("archivedAt"));
-        }
-    }
-    if should_archive {
-        if let Some(scope_key) = archived_scope_key.as_ref() {
-            gui.current_session_ids_by_scope.remove(scope_key);
-        }
-        if was_global_current || was_scoped_current {
-            ensure_current_agent_session_for_scope(
-                &mut gui,
-                archived_scope_key.as_deref().unwrap_or("unbound-workspace"),
-                replacement_scope,
-            );
-        }
-    }
-    let response_scope_key = archived_scope_key.unwrap_or_else(|| scope_key_from_parts(None, None));
-    let response_current_id = current_agent_session_id_for_scope(&mut gui, &response_scope_key);
-    let response_sessions = scoped_sessions(&gui, &response_scope_key, false);
-    ApiResponse::ok(json!({
-        "sessions": response_sessions,
-        "currentSessionId": response_current_id,
-        "workspaceScopeKey": response_scope_key
-    }))
-}
-
-pub(crate) async fn agent_session_events(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    session_result(&gui, &session_id)
-}
-
-pub(crate) async fn agent_session_append_events(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let incoming = body
-        .get("events")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    append_session_projection(&state, &session_id, incoming);
-    if let Some(timeline) = body.get("timeline").cloned() {
-        if let Err(error) = store_session_timeline(&state, &session_id, timeline) {
-            return ApiResponse::error("write_session_timeline_failed", error.to_string());
-        }
-    }
-    let mut gui = state.gui.lock().expect("gui state lock");
-    refresh_pending_session_titles(&mut gui);
-    session_result(&gui, &session_id)
-}
-
-pub(crate) async fn agent_session_run_start(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<AgentSessionRunRequest>,
-) -> Json<ApiResponse> {
-    let Some((session, events)) = session_payload(&state, &session_id) else {
-        return ApiResponse::error("agent_session_not_found", "agent session not found");
-    };
-    let start_event_count = events.len();
-    let run_id = format!("session-run-{}", now_millis());
-    let run = AgentRunState::running(run_id.clone(), session_id.clone(), start_event_count);
-    {
-        let mut runs = state.session_runs.lock().expect("session run state lock");
-        runs.insert(run_id.clone(), run.clone());
-    }
-
-    let intervention_level = body
-        .intervention_level
-        .clone()
-        .or_else(|| user_setting_string(&state, "agent.interventionLevel"))
-        .or_else(|| Some("medium".to_string()));
-    let project_memory_mode = normalize_project_memory_mode(
-        body.project_memory_mode.clone(),
-        user_setting_string(&state, "agent.memory.projectMode"),
-    );
-    let request = host_bridge_request(
-        &session_id,
-        &run_id,
-        &body,
-        intervention_level,
-        project_memory_mode,
-    );
-    let worker_state = state.clone();
-    let worker_session_id = session_id.clone();
-    let worker_run_id = run_id.clone();
-    thread::spawn(move || {
-        run_session_bridge_worker(
-            worker_state,
-            worker_session_id,
-            worker_run_id,
-            request,
-            start_event_count,
-        );
-    });
-
-    ApiResponse::ok(json!({
-        "run": run,
-        "session": session,
-        "events": events
-    }))
-}
-
-pub(crate) async fn agent_session_run_get(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-) -> Json<ApiResponse> {
-    run_response(&state, &session_id, &run_id)
-}
-
-pub(crate) async fn agent_session_run_cancel(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-) -> Json<ApiResponse> {
-    let changed = set_run_terminal(
-        &state,
-        &run_id,
-        "cancelled",
-        Some("Run cancelled by user.".to_string()),
-        None,
-    );
-    if changed {
-        append_session_projection(
-            &state,
-            &session_id,
-            vec![agent_event(
-                &session_id,
-                "workflow_stage",
-                json!({
-                    "stage": "session_run",
-                    "phase": "cancel",
-                    "status": "cancelled",
-                    "summary": "Run cancelled by user.",
-                    "channel": "task",
-                    "visibility": "task",
-                    "presentation": "stageSummary",
-                    "runId": run_id.clone()
-                }),
-                &now_text(),
-            )],
-        );
-    }
-    run_response(&state, &session_id, &run_id)
-}
-
-pub(crate) async fn agent_session_run_delta(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    if !run_belongs_to_session(&state, &session_id, &run_id) {
-        return ApiResponse::error("agent_run_not_found", "agent run not found");
-    }
-    {
-        let mut deltas = state
-            .session_run_deltas
-            .lock()
-            .expect("session run delta state lock");
-        let queue = deltas.entry(run_id.clone()).or_default();
-        let delta_seq = queue
-            .last()
-            .and_then(|delta| delta.get("deltaSeq").and_then(Value::as_u64))
-            .unwrap_or(0)
-            + 1;
-        let delta = normalize_run_delta(&session_id, &run_id, delta_seq, body);
-        queue.push(delta);
-        const MAX_RUN_DELTAS: usize = 2_000;
-        if queue.len() > MAX_RUN_DELTAS {
-            let overflow = queue.len() - MAX_RUN_DELTAS;
-            queue.drain(0..overflow);
-        }
-    }
-    touch_run(&state, &run_id, None);
-    run_response(&state, &session_id, &run_id)
-}
-
-pub(crate) async fn agent_session_run_guidance(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let run = {
-        let runs = state.session_runs.lock().expect("session run state lock");
-        runs.get(&run_id)
-            .filter(|run| run.session_id == session_id)
-            .cloned()
-    };
-    let Some(run) = run else {
-        return ApiResponse::error("agent_run_not_found", "agent run not found");
-    };
-    if run_status_terminal(&run.status) {
-        return ApiResponse::error(
-            "agent_run_not_active",
-            "run is not active; start a new run or resolve the pending decision",
-        );
-    }
-    let events = session_projection(&state, &session_id);
-    if pending_permission_message(&events).is_some() {
-        return ApiResponse::error(
-            "permission_pending",
-            "permission confirmation is pending; resolve it before sending guidance",
-        );
-    }
-    let guidance = body
-        .get("guidance")
-        .or_else(|| body.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if guidance.is_empty() {
-        return ApiResponse::error("empty_guidance", "guidance must not be empty");
-    }
-    let attachments = body
-        .get("attachments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let guidance_id = format!("guidance-{}", now_millis());
-    append_session_projection(
-        &state,
-        &session_id,
-        vec![agent_event(
-            &session_id,
-            "user_guidance",
-            json!({
-                "guidanceId": guidance_id,
-                "content": guidance.clone(),
-                "guidance": guidance.clone(),
-                "attachments": attachments,
-                "source": "user",
-                "targetRunId": run_id.clone(),
-                "targetInteractionKind": "runningRunGuidance",
-                "effectiveCheckpoint": "nextProviderCall",
-                "checkpointKind": "nextProviderCall",
-                "status": "queued",
-                "summary": "用户补充引导已记录，将在下一次 provider checkpoint 生效。",
-                "channel": "user",
-                "visibility": "conversation",
-                "presentation": "body"
-            }),
-            &now_text(),
-        )],
-    );
-    touch_run(&state, &run_id, Some("guidance queued".to_string()));
-    run_response(&state, &session_id, &run_id)
-}
-
-pub(crate) async fn agent_session_run_stream(
-    State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, String)>,
-    Query(query): Query<AgentRunStreamQuery>,
-) -> Response {
-    let stream_state = state.clone();
-    let stream = async_stream::stream! {
-        let mut sent_delta_seq = query.since_delta_seq.unwrap_or(0);
-        let mut sent_event_count = query.since_event_count.unwrap_or_else(|| {
-            let runs = stream_state.session_runs.lock().expect("session run state lock");
-            runs.get(&run_id).map(|run| run.start_event_count).unwrap_or(0)
-        });
-        let mut last_run_status = String::new();
-        let mut heartbeat_at = Instant::now();
-        loop {
-            let run = {
-                let runs = stream_state.session_runs.lock().expect("session run state lock");
-                runs.get(&run_id)
-                    .filter(|run| run.session_id == session_id)
-                    .cloned()
-            };
-            let Some(run) = run else {
-                yield sse_bytes("error", json!({
-                    "code": "agent_run_not_found",
-                    "message": "agent run not found",
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone()
-                }));
-                break;
-            };
-
-            if run.status != last_run_status {
-                last_run_status = run.status.clone();
-                yield sse_bytes("run", json!({
-                    "run": run.clone(),
-                    "sessionId": session_id.clone()
-                }));
-            }
-
-            let deltas = {
-                let deltas = stream_state
-                    .session_run_deltas
-                    .lock()
-                    .expect("session run delta state lock");
-                deltas.get(&run_id).cloned().unwrap_or_default()
-            };
-            for delta in deltas.iter() {
-                let Some(seq) = delta.get("deltaSeq").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if seq <= sent_delta_seq {
-                    continue;
-                }
-                yield sse_bytes("delta", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "delta": delta
-                }));
-                sent_delta_seq = seq;
-            }
-
-            let events = session_projection(&stream_state, &session_id);
-            if events.len() != sent_event_count {
-                let new_events = events.iter().skip(sent_event_count).cloned().collect::<Vec<_>>();
-                sent_event_count = events.len();
-                yield sse_bytes("events", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "events": new_events,
-                    "eventCount": sent_event_count
-                }));
-            }
-
-            if run_status_terminal(&run.status) {
-                let (terminal_events, terminal_event_count) =
-                    terminal_stream_event_tail(&events, sent_event_count);
-                sent_event_count = terminal_event_count;
-                yield sse_bytes("terminal", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "run": run.clone(),
-                    "events": terminal_events,
-                    "eventCount": sent_event_count
-                }));
-                break;
-            }
-
-            if heartbeat_at.elapsed() >= Duration::from_secs(10) {
-                heartbeat_at = Instant::now();
-                yield sse_bytes("heartbeat", json!({
-                    "sessionId": session_id.clone(),
-                    "runId": run_id.clone(),
-                    "at": now_text()
-                }));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    };
-    (
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response()
-}
-
-pub(crate) async fn agent_session_cancel(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    let active_runs = {
-        let runs = state.session_runs.lock().expect("session run state lock");
-        runs.values()
-            .filter(|run| run.session_id == session_id && run_status_active(&run.status))
-            .map(|run| run.run_id.clone())
-            .collect::<Vec<_>>()
-    };
-    for run_id in active_runs {
-        let _ = set_run_terminal(
-            &state,
-            &run_id,
-            "cancelled",
-            Some("Run cancelled by user.".to_string()),
-            None,
-        );
-    }
-    let gui = state.gui.lock().expect("gui state lock");
-    session_result(&gui, &session_id)
-}
-
-pub(crate) async fn agent_session_trace(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    let events = gui
-        .trace_events
-        .get(&session_id)
-        .cloned()
-        .unwrap_or_default();
-    ApiResponse::ok(json!({
-        "sessionId": session_id,
-        "trace": {
-            "sessionId": session_id,
-            "events": events,
-            "eventCount": events.len(),
-            "updatedAt": now_text()
-        }
-    }))
-}
-
-pub(crate) async fn agent_permission_resolve(
-    State(state): State<AppState>,
-    Path(permission_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let decision = body
-        .get("decision")
-        .and_then(Value::as_str)
-        .unwrap_or("reject")
-        .to_string();
-    let kernel_decision = if decision == "accept" {
-        deepcode_kernel_abi::PermissionDecisionKind::Accept
-    } else {
-        deepcode_kernel_abi::PermissionDecisionKind::Reject
-    };
-    let kernel_events = {
-        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
-        runtime
-            .dispatch(KernelCommand::PermissionResolve {
-                request_id: rid("agent-permission-resolve"),
-                permission_id: permission_id.clone(),
-                decision: kernel_decision,
-            })
-            .unwrap_or_else(|error| {
-                vec![KernelEvent::Error {
-                    request_id: Some(rid("agent-permission-resolve")),
-                    run_id: None,
-                    session_id: None,
-                    error: KernelErrorEnvelope::from(&error),
-                    message_key: None,
-                    args: None,
-                }]
-            })
-    };
-    let session_id = kernel_events
-        .iter()
-        .find_map(kernel_event_session_id)
-        .or_else(|| {
-            state
-                .gui
-                .lock()
-                .expect("gui state lock")
-                .current_session_id
-                .clone()
-        })
-        .unwrap_or_else(|| "session-unknown".to_string());
-    record_kernel_events(&state, &kernel_events);
-    let projection = kernel_events_to_agent_events(&session_id, &kernel_events);
-    append_session_projection(&state, &session_id, projection);
-    let gui = state.gui.lock().expect("gui state lock");
-    if gui
-        .sessions
-        .iter()
-        .any(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
-    {
-        session_result(&gui, &session_id)
-    } else {
-        ApiResponse::ok(json!({
-            "sessionId": session_id,
-            "events": gui
-                .session_projection_cache
-                .get(&session_id)
-                .cloned()
-                .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, &session_id))
-        }))
-    }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentAuthorityRevokeRequestV2 {
+    pub(crate) caller_request_id: String,
+    pub(crate) target: AgentAuthorityRevokeTargetRequestV2,
+    pub(crate) reason: String,
 }
 
 fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiResponse> {
+    run_response_with_input_admission(state, session_id, run_id, None)
+}
+
+const HOST_CALLER_MUTATION_ERROR_SCHEMA_V2: &str = "deepcode.host.caller-mutation-error.v2";
+
+fn caller_mutation_error_data(disposition: &str) -> Value {
+    json!({
+        "schemaVersion": HOST_CALLER_MUTATION_ERROR_SCHEMA_V2,
+        "disposition": disposition,
+    })
+}
+
+fn caller_mutation_rejection(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Json<ApiResponse> {
+    ApiResponse::error_with_data(code, message, caller_mutation_error_data("rejected"))
+}
+
+fn caller_mutation_rejection_response(mut response: Json<ApiResponse>) -> Json<ApiResponse> {
+    if !response.0.ok && response.0.data.is_none() {
+        response.0.data = Some(caller_mutation_error_data("rejected"));
+    }
+    response
+}
+
+fn caller_mutation_error_response(error: AgentKernelV2Error) -> Json<ApiResponse> {
+    let code = error.code;
+    let disposition = if matches!(
+        code.as_str(),
+        "host_caller_request_in_progress" | "host_user_input_admission_pending"
+    ) {
+        "pending"
+    } else if code.contains("indeterminate")
+        || matches!(
+            code.as_str(),
+            "host_user_input_projection_missing"
+                | "host_initial_input_projection_missing"
+                | "host_caller_request_recovery_required"
+                | "host_caller_request_outcome_missing"
+                | "host_caller_request_owner_missing"
+                | "host_caller_request_user_input_admission_missing"
+                | "host_user_input_admission_missing"
+                | "host_run_open_admission_incomplete"
+                | "host_run_open_startup_binding_lost"
+                | "host_kernel_caller_drive_owner_lost_before_admission"
+        )
+    {
+        "indeterminate"
+    } else {
+        "rejected"
+    };
+    ApiResponse::error_with_data(code, error.message, caller_mutation_error_data(disposition))
+}
+
+fn run_response_with_input_admission(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    input_id: Option<&str>,
+) -> Json<ApiResponse> {
     let run = {
         let runs = state.session_runs.lock().expect("session run state lock");
         runs.get(run_id)
@@ -727,1592 +134,542 @@ fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiRes
     let Some(run) = run else {
         return ApiResponse::error("agent_run_not_found", "agent run not found");
     };
-    let Some((session, events)) = session_payload(state, session_id) else {
+    let Some(session) = session_metadata_payload(state, session_id) else {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
     };
     ApiResponse::ok(json!({
         "run": run,
         "session": session,
-        "events": events
+        "inputId": input_id,
     }))
 }
 
-fn session_payload(state: &AppState, session_id: &str) -> Option<(Value, Vec<Value>)> {
-    let gui = state.gui.lock().expect("gui state lock");
-    let session = session_by_id(&gui, session_id)?.clone();
-    let events = gui
-        .session_projection_cache
-        .get(session_id)
-        .cloned()
-        .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id));
-    Some((session, events))
-}
-
-fn host_bridge_request(
-    session_id: &str,
-    host_run_id: &str,
-    body: &AgentSessionRunRequest,
-    intervention_level: Option<String>,
-    project_memory_mode: String,
-) -> Value {
-    let op = body.op.as_deref().unwrap_or_else(|| {
-        if body.decision_kind.is_some() {
-            "resolveDecision"
-        } else {
-            "ask"
-        }
-    });
-    let prompt = body
-        .prompt
-        .as_ref()
-        .or(body.content.as_ref())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    json!({
-        "op": op,
-        "apiBase": daemon_api_base(),
-        "sessionId": session_id,
-        "hostRunId": host_run_id,
-        "prompt": prompt,
-        "title": body.title.clone(),
-        "attachments": body.attachments.clone().unwrap_or_default(),
-        "workspacePath": body.workspace_path.clone(),
-        "noWorkspace": body.no_workspace.unwrap_or(false),
-        "profileId": body.profile_id.clone(),
-        "workflow": body.workflow.clone(),
-        "requirementConfirmationMode": body.requirement_confirmation_mode.clone(),
-        "reviewContinuationMode": body.review_continuation_mode.clone(),
-        "interventionLevel": intervention_level,
-        "projectMemoryMode": project_memory_mode,
-        "decisionKind": body.decision_kind.clone(),
-        "decision": body.decision.clone(),
-        "guidance": body.guidance.clone(),
-        "runId": body.run_id.clone(),
-        "targetId": body.target_id.clone()
-    })
-}
-
-fn user_setting_string(state: &AppState, key: &str) -> Option<String> {
-    let gui = state.gui.lock().expect("gui state lock");
-    gui.user_settings
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn normalize_project_memory_mode(value: Option<Value>, setting: Option<String>) -> String {
-    let raw = value
-        .as_ref()
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or(setting);
-    match raw.as_deref() {
-        Some("auto") => "auto".to_string(),
-        Some("confirm") => "confirm".to_string(),
-        _ => "confirm".to_string(),
-    }
-}
-
-fn daemon_api_base() -> String {
-    if let Ok(base_url) = std::env::var("DEEPCODE_API_URL") {
-        let trimmed = base_url.trim().trim_end_matches('/').to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = std::env::var("DEEPCODE_PORT").unwrap_or_else(|_| "31245".to_string());
-    format!("http://{host}:{port}")
-}
-
-fn run_session_bridge_worker(
-    state: AppState,
-    session_id: String,
-    run_id: String,
-    request: Value,
-    start_event_count: usize,
-) {
-    let Some(bridge) = find_session_host_bridge_daemon() else {
-        fail_run_with_event(
-            &state,
-            &session_id,
-            &run_id,
-            "session_bridge_unavailable",
-            format!(
-                "cannot find session host bridge; {}",
-                session_host_bridge_hint_daemon()
-            ),
-        );
-        return;
-    };
-    let node = find_session_host_node_daemon(&bridge);
-    let mut child = match Command::new(&node)
-        .arg(&bridge)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            fail_run_with_event(
-                &state,
-                &session_id,
-                &run_id,
-                "session_bridge_spawn_failed",
-                format!(
-                    "failed to start Node runtime `{}` for bridge `{}`: {error}; {}",
-                    node.display(),
-                    bridge.display(),
-                    session_host_bridge_hint_daemon()
-                ),
-            );
-            return;
-        }
-    };
-
-    match child.stdin.take() {
-        Some(mut stdin) => {
-            let payload = match serde_json::to_vec(&request) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    fail_run_with_event(
-                        &state,
-                        &session_id,
-                        &run_id,
-                        "session_bridge_request_encode_failed",
-                        format!("failed to encode session run request: {error}"),
-                    );
-                    return;
-                }
-            };
-            if let Err(error) = stdin.write_all(&payload) {
-                let _ = child.kill();
-                let _ = child.wait();
-                fail_run_with_event(
-                    &state,
-                    &session_id,
-                    &run_id,
-                    "session_bridge_write_failed",
-                    format!("failed to write session run request: {error}"),
-                );
-                return;
-            }
-        }
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            fail_run_with_event(
-                &state,
-                &session_id,
-                &run_id,
-                "session_bridge_stdin_unavailable",
-                "session bridge stdin is unavailable",
-            );
-            return;
-        }
-    }
-
-    match wait_for_session_bridge_output(&state, &run_id, child) {
-        Ok(output) => {
-            finish_run_from_bridge_output(&state, &session_id, &run_id, output, start_event_count)
-        }
-        Err(BridgeWorkerStop::Cancelled) => {
-            let _ = set_run_terminal(
-                &state,
-                &run_id,
-                "cancelled",
-                Some("Run cancelled by user.".to_string()),
-                None,
-            );
-        }
-        Err(BridgeWorkerStop::Failed(message)) => {
-            fail_run_with_event(
-                &state,
-                &session_id,
-                &run_id,
-                "session_bridge_failed",
-                message,
-            );
-        }
-    }
-}
-
-#[derive(Debug)]
-enum BridgeWorkerStop {
-    Cancelled,
-    Failed(String),
-}
-
-fn wait_for_session_bridge_output(
+fn run_admission_response(
     state: &AppState,
-    run_id: &str,
-    child: Child,
-) -> Result<Output, BridgeWorkerStop> {
-    wait_for_child_output(
-        child,
-        || run_cancelled(state, run_id),
-        session_host_bridge_timeout(),
+    session_id: &str,
+    admission: AgentKernelRunAdmissionV2,
+) -> Json<ApiResponse> {
+    let identity_matches = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(&admission.host_run_id).is_some_and(|run| {
+            run.session_id == session_id
+                && run.kernel_run_id.as_deref() == Some(admission.kernel_run_id.as_str())
+        })
+    };
+    if !identity_matches {
+        return ApiResponse::error(
+            "agent_run_admission_identity_conflict",
+            "Durable Run admission does not match its exact Host and Kernel Run identity.",
+        );
+    }
+    run_response_with_input_admission(
+        state,
+        session_id,
+        &admission.host_run_id,
+        Some(&admission.input_id),
     )
 }
 
-fn wait_for_child_output(
-    mut child: Child,
-    mut should_cancel: impl FnMut() -> bool,
-    timeout: Option<Duration>,
-) -> Result<Output, BridgeWorkerStop> {
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(BridgeWorkerStop::Failed(
-            "session bridge stdout is unavailable".to_string(),
-        ));
-    };
-    let Some(mut stderr) = child.stderr.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(BridgeWorkerStop::Failed(
-            "session bridge stderr is unavailable".to_string(),
-        ));
-    };
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout
-            .read_to_end(&mut output)
-            .map(|_| output)
-            .map_err(|error| format!("failed to read session bridge stdout: {error}"))
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr
-            .read_to_end(&mut output)
-            .map(|_| output)
-            .map_err(|error| format!("failed to read session bridge stderr: {error}"))
-    });
-    let started_at = Instant::now();
-    loop {
-        if should_cancel() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(BridgeWorkerStop::Cancelled);
-        }
-        if let Some(limit) = timeout {
-            if started_at.elapsed() >= limit {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(BridgeWorkerStop::Failed(format!(
-                    "session run timed out after {} ms; set DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS=0 to disable the hard timeout",
-                    limit.as_millis()
-                )));
-            }
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = stdout_reader
-                    .join()
-                    .map_err(|_| {
-                        BridgeWorkerStop::Failed(
-                            "session bridge stdout reader panicked".to_string(),
-                        )
-                    })?
-                    .map_err(BridgeWorkerStop::Failed)?;
-                let stderr = stderr_reader
-                    .join()
-                    .map_err(|_| {
-                        BridgeWorkerStop::Failed(
-                            "session bridge stderr reader panicked".to_string(),
-                        )
-                    })?
-                    .map_err(BridgeWorkerStop::Failed)?;
-                return Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(BridgeWorkerStop::Failed(format!(
-                    "failed to wait for session bridge output: {error}"
-                )));
-            }
-        }
-    }
-}
-
-fn finish_run_from_bridge_output(
+fn require_verified_selectable_session(
     state: &AppState,
     session_id: &str,
-    run_id: &str,
-    output: Output,
-    start_event_count: usize,
-) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let result = match serde_json::from_str::<Value>(stdout.trim()) {
-        Ok(result) => result,
-        Err(error) => {
-            fail_run_with_event(
-                state,
-                session_id,
-                run_id,
-                "session_bridge_invalid_json",
-                format!(
-                    "session bridge returned invalid JSON: {error}; stdout={}; stderr={}",
-                    stdout.trim(),
-                    stderr.trim()
-                ),
-            );
-            return;
-        }
+) -> Result<(), Json<ApiResponse>> {
+    let gui = state.gui.lock().expect("gui state lock");
+    verified_selectable_session(&gui, session_id).map(|_| ())
+}
+
+fn session_metadata_payload(state: &AppState, session_id: &str) -> Option<Value> {
+    let session = {
+        let gui = state.gui.lock().expect("gui state lock");
+        session_by_id(&gui, session_id)?.clone()
     };
-    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if !output.status.success() || !ok {
-        let message = result
-            .get("message")
-            .or_else(|| result.get("error"))
-            .and_then(Value::as_str)
-            .filter(|message| !message.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| {
-                let stderr = stderr.trim();
-                if stderr.is_empty() {
-                    "session bridge failed".to_string()
-                } else {
-                    stderr.to_string()
-                }
-            });
-        fail_run_with_event(state, session_id, run_id, "session_bridge_failed", message);
-        return;
-    }
-
-    let event_count = session_projection(state, session_id).len();
-    let timeline = match validated_bridge_timeline(&result, session_id, event_count) {
-        Ok(timeline) => timeline,
-        Err(message) => {
-            fail_run_with_event(
-                state,
-                session_id,
-                run_id,
-                "session_bridge_timeline_invalid",
-                message,
-            );
-            return;
-        }
-    };
-    if let Err(error) = store_session_timeline(state, session_id, timeline) {
-        fail_run_with_event(
-            state,
-            session_id,
-            run_id,
-            "write_session_timeline_failed",
-            format!("failed to persist canonical session timeline: {error}"),
-        );
-        return;
-    }
-
-    if let Some(run_status) = result.get("runStatus").and_then(Value::as_str) {
-        match run_status {
-            "waiting" => {
-                let message = result
-                    .get("terminalReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Session run is waiting for user input.")
-                    .to_string();
-                let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
-                return;
-            }
-            "failed" => {
-                let message = result
-                    .get("terminalReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Session run failed.")
-                    .to_string();
-                let _ = set_run_terminal(state, run_id, "failed", Some(message), None);
-                return;
-            }
-            "cancelled" => {
-                let message = result
-                    .get("terminalReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Session run is cancelled.")
-                    .to_string();
-                let _ = set_run_terminal(state, run_id, "cancelled", Some(message), None);
-                return;
-            }
-            "completed" => {}
-            _ => {}
-        }
-    }
-
-    let final_text = result
-        .get("finalText")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| latest_final_text(state, session_id, start_event_count));
-    let _ = set_run_terminal(state, run_id, "completed", None, final_text);
-}
-
-fn validated_bridge_timeline(
-    result: &Value,
-    session_id: &str,
-    expected_event_count: usize,
-) -> Result<Value, String> {
-    let timeline = result
-        .get("timeline")
-        .cloned()
-        .ok_or_else(|| "session bridge result is missing the canonical timeline".to_string())?;
-    if timeline.get("schemaVersion").and_then(Value::as_str) != Some("deepcode.session.timeline.v1")
-    {
-        return Err("session bridge timeline has an unsupported schema version".to_string());
-    }
-    if timeline.get("sessionId").and_then(Value::as_str) != Some(session_id) {
-        return Err("session bridge timeline does not belong to the active session".to_string());
-    }
-    if timeline.get("turns").and_then(Value::as_array).is_none() {
-        return Err("session bridge timeline is missing structured turns".to_string());
-    }
-    if timeline.get("eventCount").and_then(Value::as_u64) != Some(expected_event_count as u64) {
-        return Err(format!(
-            "session bridge timeline event count does not match committed projection: expected {expected_event_count}"
-        ));
-    }
-    Ok(timeline)
-}
-
-fn is_final_assistant_event(event: &Value) -> bool {
-    if event.get("kind").and_then(Value::as_str) != Some("assistant_msg") {
-        return false;
-    }
-    let Some(payload) = event.get("payload") else {
-        return false;
-    };
-    payload.get("channel").and_then(Value::as_str) == Some("final")
-        || payload.get("kind").and_then(Value::as_str) == Some("final")
-}
-
-fn latest_final_text(
-    state: &AppState,
-    session_id: &str,
-    start_event_count: usize,
-) -> Option<String> {
-    session_projection(state, session_id)
-        .into_iter()
-        .skip(start_event_count)
-        .rev()
-        .find_map(|event| {
-            if is_final_assistant_event(&event) {
-                event_message(&event)
-            } else {
-                None
-            }
-        })
-}
-
-fn event_message(event: &Value) -> Option<String> {
-    event
-        .get("payload")
-        .and_then(|payload| {
-            payload
-                .get("content")
-                .or_else(|| payload.get("summary"))
-                .or_else(|| payload.get("message"))
-        })
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn fail_run_with_event(
-    state: &AppState,
-    session_id: &str,
-    run_id: &str,
-    code: &str,
-    message: impl Into<String>,
-) {
-    let message = message.into();
-    let _ = set_run_terminal(state, run_id, "failed", Some(message.clone()), None);
-    append_session_projection(
-        state,
-        session_id,
-        vec![agent_event(
-            session_id,
-            "error",
-            json!({
-                "code": code,
-                "message": message,
-                "summary": message,
-                "channel": "error",
-                "visibility": "conversation",
-                "presentation": "body",
-                "runId": run_id
-            }),
-            &now_text(),
-        )],
-    );
-}
-
-fn set_run_terminal(
-    state: &AppState,
-    run_id: &str,
-    status: &str,
-    message: Option<String>,
-    final_text: Option<String>,
-) -> bool {
-    let mut runs = state.session_runs.lock().expect("session run state lock");
-    let Some(run) = runs.get_mut(run_id) else {
-        return false;
-    };
-    if run_status_terminal(&run.status) {
-        return false;
-    }
-    let now = now_text();
-    run.status = status.to_string();
-    run.updated_at = now.clone();
-    run.completed_at = Some(now);
-    run.message = message;
-    run.final_text = final_text;
-    true
-}
-
-fn touch_run(state: &AppState, run_id: &str, message: Option<String>) -> bool {
-    let mut runs = state.session_runs.lock().expect("session run state lock");
-    let Some(run) = runs.get_mut(run_id) else {
-        return false;
-    };
-    if run_status_terminal(&run.status) {
-        return false;
-    }
-    run.updated_at = now_text();
-    if let Some(message) = message {
-        run.message = Some(message);
-    }
-    true
+    Some(session)
 }
 
 fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> bool {
-    let runs = state.session_runs.lock().expect("session run state lock");
-    runs.get(run_id)
-        .map(|run| run.session_id == session_id)
-        .unwrap_or(false)
+    state
+        .session_runs
+        .lock()
+        .expect("session run state lock")
+        .get(run_id)
+        .is_some_and(|run| run.session_id == session_id)
 }
 
-fn normalize_run_delta(
-    session_id: &str,
-    host_run_id: &str,
-    delta_seq: u64,
-    mut delta: Value,
-) -> Value {
-    if let Value::Object(object) = &mut delta {
-        object
-            .entry("sessionId".to_string())
-            .or_insert_with(|| json!(session_id));
-        object
-            .entry("hostRunId".to_string())
-            .or_insert_with(|| json!(host_run_id));
-        object
-            .entry("deltaSeq".to_string())
-            .or_insert_with(|| json!(delta_seq));
-        object
-            .entry("receivedAt".to_string())
-            .or_insert_with(|| json!(now_text()));
+fn authoritative_project_run_context(
+    state: &AppState,
+    session: &Value,
+    continuing_run: bool,
+) -> Result<Option<Value>, KernelErrorEnvelope> {
+    let Some(project_id) = session
+        .get("projectId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let project = {
+        let gui = state.gui.lock().expect("gui state lock");
+        project_by_id(&gui, project_id).cloned()
     }
-    delta
+    .ok_or_else(|| KernelErrorEnvelope {
+        code: "project_root_unavailable".to_string(),
+        message: "project record is unavailable; rebind the project directory".to_string(),
+        message_key: None,
+        args: None,
+    })?;
+    let kind = project
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("blank");
+    if kind == "blank" {
+        return Ok(Some(json!({
+            "projectId": project_id,
+            "kind": "blank",
+            "rootStatus": "unbound"
+        })));
+    }
+    let stored_binding = if continuing_run {
+        session
+            .get("workspaceBinding")
+            .filter(|binding| binding.is_object())
+            .cloned()
+            .or_else(|| project_workspace_binding(&project))
+    } else {
+        project_workspace_binding(&project)
+    }
+    .ok_or_else(|| {
+        if !continuing_run {
+            set_project_root_status(state, project_id, "unavailable");
+        }
+        KernelErrorEnvelope {
+            code: "project_root_unavailable".to_string(),
+            message: "project workspace binding is unavailable; rebind the project directory"
+                .to_string(),
+            message_key: None,
+            args: None,
+        }
+    })?;
+    let resolved_binding = state
+        .host_services
+        .workspace
+        .validate_project_binding(&stored_binding)
+        .map_err(|error| {
+            if !continuing_run {
+                set_project_root_status(state, project_id, "unavailable");
+            }
+            KernelErrorEnvelope {
+                code: error.code,
+                message: format!("project workspace root is unavailable: {}", error.message),
+                message_key: error.message_key,
+                args: error.args,
+            }
+        })?;
+    if !continuing_run {
+        set_project_root_status(state, project_id, "ready");
+    }
+    Ok(Some(json!({
+        "projectId": project_id,
+        "kind": "folder",
+        "rootStatus": "ready",
+        "workspaceBinding": resolved_binding
+    })))
 }
 
-fn terminal_stream_event_tail(events: &[Value], sent_event_count: usize) -> (Vec<Value>, usize) {
-    let start = sent_event_count.min(events.len());
-    (events.iter().skip(start).cloned().collect(), events.len())
+pub(crate) fn session_run_admission_lock(
+    session_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("Session run admission lock registry");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
-fn pending_permission_message(events: &[Value]) -> Option<String> {
-    for event in events.iter().rev() {
-        match event.get("kind").and_then(Value::as_str) {
-            Some("permission_result") => return None,
-            Some("permission_request") => {
-                return Some(
-                    event_message(event)
-                        .unwrap_or_else(|| "permission confirmation is pending".to_string()),
+pub(crate) async fn agent_session_run_start(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<AgentSessionRunRequest>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return caller_mutation_rejection_response(response);
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return caller_mutation_rejection_response(response);
+    }
+    let Some(session) = session_metadata_payload(&state, &session_id) else {
+        return caller_mutation_rejection("agent_session_not_found", "agent session not found");
+    };
+    if !session_schema_is_current(&session) {
+        return caller_mutation_rejection_response(unsupported_session_schema_response());
+    }
+    match body.op.as_str() {
+        "resolveDecision" => {
+            let mutation_lock = session_run_admission_lock(&session_id);
+            let _mutation_guard = mutation_lock.lock_owned().await;
+            if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+                return caller_mutation_rejection_response(response);
+            }
+            if body.content.is_some()
+                || body.workspace_path.is_some()
+                || body.no_workspace.is_some()
+                || body.attachments.is_some()
+            {
+                return caller_mutation_rejection(
+                    "session_operation_v2_invalid",
+                    "A decision cannot alter Run content, attachments, or workspace identity.",
                 );
             }
-            _ => {}
+            return match resolve_agent_kernel_decision_v2(&state, &session_id, &body).await {
+                Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
+                Err(error) => caller_mutation_error_response(error),
+            };
         }
-    }
-    None
-}
-
-fn sse_bytes(event: &str, payload: Value) -> Result<bytes::Bytes, std::convert::Infallible> {
-    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-    Ok(bytes::Bytes::from(format!(
-        "event: {event}\ndata: {data}\n\n"
-    )))
-}
-
-fn run_cancelled(state: &AppState, run_id: &str) -> bool {
-    let runs = state.session_runs.lock().expect("session run state lock");
-    runs.get(run_id)
-        .map(|run| run.status == "cancelled")
-        .unwrap_or(false)
-}
-
-fn run_status_active(status: &str) -> bool {
-    !run_status_terminal(status)
-}
-
-fn run_status_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled" | "waiting")
-}
-
-fn session_host_bridge_timeout() -> Option<Duration> {
-    const DEFAULT_TIMEOUT_MS: u64 = 600_000;
-    let millis = std::env::var("DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_MS);
-    if millis == 0 {
-        None
-    } else {
-        Some(Duration::from_millis(millis))
-    }
-}
-
-fn find_session_host_bridge_daemon() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("DEEPCODE_SESSION_BRIDGE") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let mut roots = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            roots.push(parent.to_path_buf());
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-    for root in roots {
-        if let Some(path) = find_bridge_from_root_daemon(&root) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn find_bridge_from_root_daemon(root: &FsPath) -> Option<PathBuf> {
-    for ancestor in root.ancestors() {
-        for candidate in [
-            ancestor.join("session-core/dist/hostBridge.js"),
-            ancestor.join("session-core/hostBridge.js"),
-            ancestor.join("userspace/session-core/dist/hostBridge.js"),
-            ancestor.join("DeepCode/userspace/session-core/dist/hostBridge.js"),
-        ] {
-            if candidate.is_file() {
-                return Some(candidate);
+        "ask" => {
+            let run_start_lock = session_run_admission_lock(&session_id);
+            let _run_start_guard = run_start_lock.lock_owned().await;
+            if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+                return caller_mutation_rejection_response(response);
             }
-        }
-    }
-    None
-}
-
-fn find_session_host_node_daemon(bridge: &FsPath) -> PathBuf {
-    if let Ok(path) = std::env::var("DEEPCODE_NODE") {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-
-    let mut roots = Vec::new();
-    if let Some(parent) = bridge.parent() {
-        roots.push(parent.to_path_buf());
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            roots.push(parent.to_path_buf());
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-
-    for root in roots {
-        if let Some(node) = find_node_from_root_daemon(&root) {
-            return node;
-        }
-    }
-    PathBuf::from(node_executable_name_daemon())
-}
-
-fn find_node_from_root_daemon(root: &FsPath) -> Option<PathBuf> {
-    for ancestor in root.ancestors() {
-        for candidate in [
-            ancestor
-                .join("node/bin")
-                .join(node_executable_name_daemon()),
-            ancestor.join("bin").join(node_executable_name_daemon()),
-        ] {
-            if candidate.is_file() {
-                return Some(candidate);
+            let Some(session) = session_metadata_payload(&state, &session_id) else {
+                return caller_mutation_rejection(
+                    "agent_session_not_found",
+                    "agent session not found",
+                );
+            };
+            if !session_schema_is_current(&session) {
+                return caller_mutation_rejection_response(unsupported_session_schema_response());
             }
+            if body.decision_kind.is_some()
+                || body.decision.is_some()
+                || body.guidance.is_some()
+                || body.run_id.is_some()
+                || body.target_id.is_some()
+            {
+                return caller_mutation_rejection(
+                    "session_operation_v2_invalid",
+                    "A new ask cannot carry decision or active Run identity.",
+                );
+            }
+            return agent_session_run_open_admitted(&state, &session_id, &body, &session).await;
+        }
+        _ => {
+            return caller_mutation_rejection(
+                "session_operation_v2_unsupported",
+                "Only a new ask or an exact Plan/capability decision can enter the v2 Run path.",
+            )
         }
     }
-    None
 }
 
-fn node_executable_name_daemon() -> &'static str {
-    if cfg!(windows) {
-        "node.exe"
-    } else {
-        "node"
-    }
-}
-
-fn session_host_bridge_hint_daemon() -> &'static str {
-    "run `pnpm --filter @deepcode/session-core build`, set DEEPCODE_SESSION_BRIDGE, set DEEPCODE_NODE, or use a packaged distribution that includes session-core/dist/hostBridge.js, node_modules/@deepcode/protocol, and node/bin/node"
-}
-
-pub(crate) async fn agent_feedback() -> Json<ApiResponse> {
-    ApiResponse::ok(json!({
-        "accepted": true,
-        "message": "Feedback recorded by host compatibility layer."
-    }))
-}
-
-pub(crate) async fn agent_workflow_config_get(State(state): State<AppState>) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    ApiResponse::ok(json!({
-        "config": gui.workflow_config,
-        "storePath": gui.paths.workflow_config_path.to_string_lossy(),
-        "initialized": true
-    }))
-}
-
-pub(crate) async fn agent_workflow_config_patch(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
+async fn agent_session_run_open_admitted(
+    state: &AppState,
+    session_id: &str,
+    body: &AgentSessionRunRequest,
+    session: &Value,
 ) -> Json<ApiResponse> {
-    let config = body.get("config").cloned().unwrap_or_else(|| json!({}));
-    let mut gui = state.gui.lock().expect("gui state lock");
-    merge_object(&mut gui.workflow_config, &config);
-    match atomic_write_json(&gui.paths.workflow_config_path, &gui.workflow_config) {
-        Ok(()) => ApiResponse::ok(json!({
-            "config": gui.workflow_config,
-            "storePath": gui.paths.workflow_config_path.to_string_lossy(),
-            "initialized": true
-        })),
-        Err(error) => ApiResponse::error("write_workflow_config_failed", error),
+    match preadmit_open_agent_kernel_run_v2(state, session_id, body).await {
+        Ok(Some(admission)) => return run_admission_response(state, session_id, admission),
+        Ok(None) => {}
+        Err(error) => return caller_mutation_error_response(error),
+    }
+    let project_context = match authoritative_project_run_context(state, session, false) {
+        Ok(context) => context,
+        Err(error) => return caller_mutation_rejection(error.code, error.message),
+    };
+    if let Some(binding) = project_context
+        .as_ref()
+        .and_then(|context| context.get("workspaceBinding"))
+        .filter(|value| value.is_object())
+    {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        if let Some(stored_session) = session_mut(&mut gui, session_id) {
+            stored_session["workspaceBinding"] = binding.clone();
+            apply_workspace_binding_to_session(stored_session, binding);
+            stored_session["updatedAt"] = json!(now_text());
+        }
+        if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
+            return caller_mutation_rejection("agent_session_persist_failed", error);
+        }
+    }
+    let profile_id = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let llm_profiles = gui.llm_profiles.clone();
+        let Some(stored_session) = session_mut(&mut gui, session_id) else {
+            return caller_mutation_rejection("agent_session_not_found", "agent session not found");
+        };
+        let stored_profile_id = stored_session
+            .get("profileId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(profile_id) = stored_profile_id else {
+            return caller_mutation_rejection(
+                "llm_profile_unavailable",
+                "this Session has no selected LLM Profile; select one before starting a Run",
+            );
+        };
+        let profile_available = match effective_llm_profile_is_enabled(
+            &state,
+            &llm_profiles,
+            &profile_id,
+        ) {
+            Ok(available) => available,
+            Err(error) => {
+                return caller_mutation_rejection(
+                    error.code,
+                    "Provider Profile availability could not be verified before starting the Session Run",
+                )
+            }
+        };
+        if !profile_available {
+            return caller_mutation_rejection(
+                "llm_profile_unavailable",
+                "the Session's selected LLM Profile does not exist, is disabled, or its exact revision is unavailable; select or re-enable it explicitly",
+            );
+        }
+        profile_id
+    };
+    let start_event_count = {
+        let sessions_dir = state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .paths
+            .sessions_dir
+            .clone();
+        match read_session_kernel_v2_public_agent_events(&sessions_dir, session_id) {
+            Ok(events) => events.len(),
+            Err(error) => return caller_mutation_rejection(error.code, error.message),
+        }
+    };
+    match open_agent_kernel_run_v2(
+        state,
+        session_id,
+        body,
+        &profile_id,
+        project_context.as_ref(),
+        start_event_count,
+    )
+    .await
+    {
+        Ok(admission) => run_admission_response(state, session_id, admission),
+        Err(error) => caller_mutation_error_response(error),
     }
 }
 
-pub(crate) async fn agent_tools(State(state): State<AppState>) -> Json<ApiResponse> {
-    let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
-    match dispatch_skill(
-        &state.runtime,
-        KernelCommand::SkillDiscover {
-            request_id: rid("skill-discover"),
-        },
-    ) {
-        Ok(output) => {
-            let skills = output
-                .get("skills")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let tools = tool_catalog_snapshot
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.tool_id,
-                        "description": format!("Kernel tool {} ({})", tool.tool_id, tool.capability),
-                        "inputSchema": &tool.provider_schema,
-                        "riskLevel": tool.risk.as_str(),
-                        "needsApproval": tool.permission_mode.as_str() != "allow",
-                        "allowedModes": ["readOnly", "plan", "askBeforeWrite"],
-                        "capability": tool.capability,
-                        "family": tool.family,
-                        "operationKind": tool.operation_kind,
-                        "permissionMode": tool.permission_mode,
-                        "pathScopePolicy": tool.path_scope_policy,
-                        "executionMode": tool.execution_mode,
-                        "readOnly": tool.read_only,
-                        "catalogVersion": tool_catalog_snapshot.catalog_version,
-                        "catalogHash": &tool_catalog_snapshot.catalog_hash
-                    })
-                })
-                .collect::<Vec<_>>();
-            ApiResponse::ok(json!({
-                "skills": skills,
-                "tools": tools,
-                "catalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
-                "catalogHash": &tool_catalog_snapshot.catalog_hash,
-                "toolCatalog": tool_catalog_snapshot
-            }))
-        }
+pub(crate) async fn agent_session_run_get(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
+    if run_belongs_to_session(&state, &session_id, &run_id) {
+        return run_response(&state, &session_id, &run_id);
+    }
+    match restore_agent_kernel_run_cache_v2(&state, &session_id, &run_id) {
+        Ok(host_run_id) => run_response(&state, &session_id, &host_run_id),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
 
-pub(crate) fn create_agent_session_value(
-    id: &str,
-    now: &str,
-    title: &str,
-    mode: &str,
-    profile_id: Option<&str>,
-    workspace_id: Option<&str>,
-    workspace_hash: Option<&str>,
-) -> Value {
-    let workspace_scope_key = scope_key_from_parts(workspace_id, workspace_hash);
-    json!({
-        "id": id,
-        "title": title,
-        "mode": mode,
-        "profileId": profile_id,
-        "workspaceId": workspace_id,
-        "workspaceHash": workspace_hash,
-        "workspaceScopeKey": workspace_scope_key,
-        "titleSource": "pending",
-        "eventCount": 0,
-        "createdAt": now,
-        "updatedAt": now
-    })
-}
-
-pub(crate) fn is_archived_session(session: &Value) -> bool {
-    session.get("archivedAt").and_then(Value::as_str).is_some()
-}
-
-pub(crate) fn remove_session_storage_dir(sessions_dir: &FsPath, safe_session_id: &str) {
-    let path = sessions_dir.join(safe_session_id);
-    if path.starts_with(sessions_dir) {
-        let _ = fs::remove_dir_all(path);
+pub(crate) async fn agent_session_active_run(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
     }
-}
-
-pub(crate) fn remove_conversation_archive_dirs(archive_root: &FsPath, safe_session_id: &str) {
-    let Ok(workspaces) = fs::read_dir(archive_root) else {
-        return;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
+    }
+    let active = match state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(&session_id)
+    {
+        Ok(active) => active,
+        Err(error) => {
+            return ApiResponse::error(error.code, error.message);
+        }
     };
-    for workspace in workspaces.filter_map(Result::ok) {
-        let session_dir = workspace.path().join(safe_session_id);
-        if session_dir.starts_with(archive_root) {
-            let _ = fs::remove_dir_all(session_dir);
-        }
-    }
-}
-
-pub(crate) fn remove_session_memory_archive(
-    memory_root: &FsPath,
-    workspace_scope_key: &str,
-    safe_session_id: &str,
-    session_id: &str,
-) -> Value {
-    let safe_scope_key = safe_path_segment(workspace_scope_key);
-    let archive_dir = memory_root.join(&safe_scope_key);
-    let sessions_dir = archive_dir.join("sessions");
-    let targets = [
-        sessions_dir.join(format!("{safe_session_id}.md")),
-        sessions_dir.join(format!("{safe_session_id}.memory.json")),
-    ];
-    let mut removed_files = Vec::new();
-    let mut missing_files = Vec::new();
-    let mut errors = Vec::new();
-
-    for target in targets {
-        let display_path = target
-            .strip_prefix(memory_root)
-            .unwrap_or(target.as_path())
-            .to_string_lossy()
-            .to_string();
-        if !target.starts_with(&sessions_dir) {
-            errors.push(json!({
-                "path": display_path,
-                "code": "memory_cleanup_path_out_of_scope"
-            }));
-            continue;
-        }
-        if !target.exists() {
-            missing_files.push(json!(display_path));
-            continue;
-        }
-        match fs::remove_file(&target) {
-            Ok(()) => removed_files.push(json!(display_path)),
-            Err(error) => errors.push(json!({
-                "path": display_path,
-                "code": "memory_cleanup_remove_failed",
-                "message": error.to_string()
-            })),
-        }
-    }
-
-    let project_archive_needs_refresh = !removed_files.is_empty();
-    let manifest = append_session_memory_cleanup_manifest(
-        &archive_dir,
-        session_id,
-        safe_session_id,
-        &removed_files,
-        &missing_files,
-        &errors,
-        project_archive_needs_refresh,
-    );
-
-    json!({
-        "workspaceScopeKey": safe_scope_key,
-        "sessionId": session_id,
-        "safeSessionId": safe_session_id,
-        "removedFiles": removed_files,
-        "missingFiles": missing_files,
-        "errors": errors,
-        "projectArchiveNeedsRefresh": project_archive_needs_refresh,
-        "manifestUpdated": manifest.get("updated").and_then(Value::as_bool).unwrap_or(false),
-        "manifestError": manifest.get("error").cloned().unwrap_or(Value::Null)
-    })
-}
-
-fn append_session_memory_cleanup_manifest(
-    archive_dir: &FsPath,
-    session_id: &str,
-    safe_session_id: &str,
-    removed_files: &[Value],
-    missing_files: &[Value],
-    errors: &[Value],
-    project_archive_needs_refresh: bool,
-) -> Value {
-    if !archive_dir.exists() {
-        return json!({
-            "updated": false,
-            "error": null
-        });
-    }
-    let manifest_path = archive_dir.join("manifest.json");
-    let mut manifest = fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
-        .unwrap_or_else(|| {
-            json!({
-                "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
-                "archivePath": archive_dir.to_string_lossy()
-            })
-        });
-    if !manifest.is_object() {
-        manifest = json!({
-            "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
-            "archivePath": archive_dir.to_string_lossy()
-        });
-    }
-
-    let cleanup_event = json!({
-        "event": "session_memory_removed",
-        "sessionId": session_id,
-        "safeSessionId": safe_session_id,
-        "removedAt": now_text(),
-        "removedFiles": removed_files,
-        "missingFiles": missing_files,
-        "errors": errors,
-        "projectArchiveNeedsRefresh": project_archive_needs_refresh
-    });
-
-    if let Some(object) = manifest.as_object_mut() {
-        object.insert(
-            "projectArchiveNeedsRefresh".to_string(),
-            json!(project_archive_needs_refresh),
-        );
-        if let Some(array) = object
-            .get_mut("cleanupEvents")
-            .and_then(Value::as_array_mut)
+    let Some(active) = active else {
+        return ApiResponse::ok(Value::Null);
+    };
+    if !run_belongs_to_session(&state, &session_id, &active.host_run_id) {
+        if let Err(error) =
+            restore_agent_kernel_run_cache_v2(&state, &session_id, &active.host_run_id)
         {
-            array.push(cleanup_event);
-        } else {
-            object.insert("cleanupEvents".to_string(), json!([cleanup_event]));
+            return ApiResponse::error(error.code, error.message);
         }
-        object.insert("updatedAt".to_string(), json!(now_text()));
     }
+    run_response(&state, &session_id, &active.host_run_id)
+}
 
-    match serde_json::to_string_pretty(&manifest) {
-        Ok(content) => match fs::write(&manifest_path, content) {
-            Ok(()) => json!({
-                "updated": true,
-                "error": null
-            }),
-            Err(error) => json!({
-                "updated": false,
-                "error": error.to_string()
-            }),
-        },
-        Err(error) => json!({
-            "updated": false,
-            "error": error.to_string()
-        }),
+pub(crate) async fn agent_session_run_cancel(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<AgentRunCallerMutationRequest>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return caller_mutation_rejection_response(response);
+    }
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return caller_mutation_rejection_response(response);
+    }
+    match cancel_agent_kernel_run_v2(&state, &session_id, &run_id, &body.caller_request_id).await {
+        Ok(Some(host_run_id)) => run_response(&state, &session_id, &host_run_id),
+        Ok(None) => caller_mutation_rejection("agent_run_not_found", "agent run not found"),
+        Err(error) => caller_mutation_error_response(error),
     }
 }
 
-pub(crate) fn scope_key_from_query(query: &AgentSessionScopeQuery) -> String {
-    scope_key_from_parts(
-        query.workspace_id.as_deref(),
-        query.workspace_hash.as_deref(),
-    )
-}
-
-pub(crate) fn scope_key_from_parts(
-    workspace_id: Option<&str>,
-    workspace_hash: Option<&str>,
-) -> String {
-    match (workspace_id, workspace_hash) {
-        (Some(id), Some(hash)) if !id.trim().is_empty() && !hash.trim().is_empty() => {
-            format!(
-                "workspace-{}-{}",
-                safe_path_segment(id),
-                safe_path_segment(hash)
+pub(crate) async fn agent_session_run_guidance(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<AgentRunGuidanceMutationRequest>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return caller_mutation_rejection_response(response);
+    }
+    let mutation_lock = session_run_admission_lock(&session_id);
+    let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return caller_mutation_rejection_response(response);
+    }
+    let Some(session) = session_metadata_payload(&state, &session_id) else {
+        return caller_mutation_rejection("agent_session_not_found", "agent session not found");
+    };
+    let project_context = match authoritative_project_run_context(&state, &session, true) {
+        Ok(context) => context,
+        Err(error) => return caller_mutation_rejection(error.code, error.message),
+    };
+    let (workspace_path, no_workspace) = if let Some(project_context) = project_context.as_ref() {
+        if project_context.get("kind").and_then(Value::as_str) == Some("blank") {
+            if body.workspace_path.is_some() || body.no_workspace == Some(false) {
+                return caller_mutation_rejection(
+                    "agent_guidance_project_workspace_conflict",
+                    "The authoritative project has no workspace, but guidance requested a workspace-bound continuation.",
+                );
+            }
+            (None, true)
+        } else {
+            if body.no_workspace == Some(true) {
+                return caller_mutation_rejection(
+                    "agent_guidance_project_workspace_conflict",
+                    "The authoritative project is workspace-bound and cannot continue in no-workspace mode.",
+                );
+            }
+            let Some(authoritative_path) = project_context
+                .pointer("/workspaceBinding/openPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            else {
+                return caller_mutation_rejection(
+                    "agent_guidance_workspace_required",
+                    "Project-backed guidance has no authoritative workspace path.",
+                );
+            };
+            let requested_path = body
+                .workspace_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            (
+                Some(requested_path.unwrap_or(authoritative_path).to_string()),
+                false,
             )
         }
-        (Some(id), _) if !id.trim().is_empty() => {
-            format!("workspace-{}", safe_path_segment(id))
+    } else if body.no_workspace == Some(true) {
+        if body.workspace_path.is_some() {
+            return caller_mutation_rejection(
+                "agent_guidance_workspace_conflict",
+                "Guidance cannot request both a workspace path and no-workspace mode.",
+            );
         }
-        _ => "unbound-workspace".to_string(),
-    }
-}
-
-pub(crate) fn session_scope_key(session: &Value) -> String {
-    if let Some(scope_key) = session.get("workspaceScopeKey").and_then(Value::as_str) {
-        if !scope_key.trim().is_empty() {
-            return safe_path_segment(scope_key);
-        }
-    }
-    scope_key_from_parts(
-        session.get("workspaceId").and_then(Value::as_str),
-        session.get("workspaceHash").and_then(Value::as_str),
+        (None, true)
+    } else {
+        let Some(path) = body
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            return caller_mutation_rejection(
+                "agent_guidance_workspace_required",
+                "Guidance for a workspace-bound Run requires the current workspace path.",
+            );
+        };
+        (Some(path.to_string()), false)
+    };
+    let admission = submit_agent_kernel_user_input_v2(
+        &state,
+        &session_id,
+        &run_id,
+        &body.guidance,
+        workspace_path.as_deref(),
+        no_workspace,
+        body.attachments.as_deref(),
+        &body.caller_request_id,
     )
-}
-
-pub(crate) fn scoped_sessions(
-    gui: &GuiState,
-    scope_key: &str,
-    include_archived: bool,
-) -> Vec<Value> {
-    gui.sessions
-        .iter()
-        .filter(|session| include_archived || !is_archived_session(session))
-        .filter(|session| session_scope_key(session) == scope_key)
-        .cloned()
-        .collect()
-}
-
-pub(crate) fn session_by_id<'a>(gui: &'a GuiState, session_id: &str) -> Option<&'a Value> {
-    gui.sessions
-        .iter()
-        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
-}
-
-pub(crate) fn current_agent_session_id_for_scope(
-    gui: &mut GuiState,
-    scope_key: &str,
-) -> Option<String> {
-    if let Some(current_id) = gui.current_session_ids_by_scope.get(scope_key) {
-        if gui.sessions.iter().any(|session| {
-            session.get("id").and_then(Value::as_str) == Some(current_id.as_str())
-                && !is_archived_session(session)
-                && session_scope_key(session) == scope_key
-        }) {
-            return Some(current_id.clone());
-        }
+    .await;
+    let result = match admission {
+        Ok(admission) => await_agent_kernel_user_input_admission_v2(admission).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(receipt) => run_response_with_input_admission(
+            &state,
+            &session_id,
+            &receipt.host_run_id,
+            Some(&receipt.input_id),
+        ),
+        Err(error) => caller_mutation_error_response(error),
     }
-
-    let next_id = gui
-        .sessions
-        .iter()
-        .find(|session| !is_archived_session(session) && session_scope_key(session) == scope_key)
-        .and_then(|session| session.get("id").and_then(Value::as_str))
-        .map(ToOwned::to_owned);
-    if let Some(next_id) = next_id.as_ref() {
-        gui.current_session_ids_by_scope
-            .insert(scope_key.to_string(), next_id.clone());
-    }
-    next_id
 }
 
-pub(crate) fn ensure_current_agent_session_for_scope(
-    gui: &mut GuiState,
-    scope_key: &str,
-    fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
-) {
-    if let Some(next_id) = gui
-        .sessions
-        .iter()
-        .find(|session| !is_archived_session(session) && session_scope_key(session) == scope_key)
-        .and_then(|session| session.get("id").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
+pub(crate) async fn agent_session_run_authority_revoke(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<AgentAuthorityRevokeRequestV2>,
+) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
-        gui.current_session_ids_by_scope
-            .insert(scope_key.to_string(), next_id.clone());
-        gui.current_session_id = Some(next_id);
-        return;
+        return response;
     }
-
-    let id = format!("session-{}", now_millis());
-    let now = now_text();
-    let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
-    let session = create_agent_session_value(
-        &id,
-        &now,
-        "New Agent Session",
-        "plan",
-        profile_id.as_deref(),
-        workspace_id.as_deref(),
-        workspace_hash.as_deref(),
-    );
-    gui.current_session_id = Some(id.clone());
-    gui.current_session_ids_by_scope
-        .insert(session_scope_key(&session), id.clone());
-    gui.session_projection_cache.insert(id.clone(), Vec::new());
-    gui.trace_events.insert(id.clone(), Vec::new());
-    gui.sessions.insert(0, session);
-}
-
-pub(crate) fn compact_agent_session_title(content: &str) -> Option<String> {
-    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
+    let mutation_lock = session_run_admission_lock(&session_id);
+    let _mutation_guard = mutation_lock.lock_owned().await;
+    if let Err(response) = require_verified_selectable_session(&state, &session_id) {
+        return response;
     }
-    const TITLE_CHAR_LIMIT: usize = 28;
-    let char_count = normalized.chars().count();
-    if char_count <= TITLE_CHAR_LIMIT {
-        return Some(normalized);
+    match revoke_agent_kernel_authority_v2(&state, &session_id, &run_id, &body) {
+        Ok(result) => ApiResponse::ok(result),
+        Err(error) => ApiResponse::error(error.code, error.message),
     }
-    let title = normalized
-        .chars()
-        .take(TITLE_CHAR_LIMIT)
-        .collect::<String>();
-    Some(format!("{title}…"))
-}
-
-pub(crate) fn maybe_auto_title_session(gui: &mut GuiState, session_id: &str, content: &str) {
-    let Some(title) = compact_agent_session_title(content) else {
-        return;
-    };
-    if let Some(session) = session_mut(gui, session_id) {
-        let source = session
-            .get("titleSource")
-            .and_then(Value::as_str)
-            .unwrap_or("pending");
-        if source == "pending" {
-            session["title"] = json!(title);
-            session["titleSource"] = json!("auto");
-            session["updatedAt"] = json!(now_text());
-        }
-    }
-}
-
-pub(crate) fn first_user_message_content(events: &[Value]) -> Option<String> {
-    events.iter().find_map(|event| {
-        if event.get("kind").and_then(Value::as_str) != Some("user_msg") {
-            return None;
-        }
-        event
-            .get("payload")
-            .and_then(|payload| payload.get("content"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    })
-}
-
-pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
-    let sessions_dir = gui.paths.sessions_dir.clone();
-    let pending_ids = gui
-        .sessions
-        .iter()
-        .filter(|session| {
-            session
-                .get("titleSource")
-                .and_then(Value::as_str)
-                .unwrap_or("pending")
-                == "pending"
-        })
-        .filter_map(|session| session.get("id").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-
-    for session_id in pending_ids {
-        let events = gui
-            .session_projection_cache
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_else(|| read_session_projection_jsonl(&sessions_dir, &session_id));
-        if let Some(content) = first_user_message_content(&events) {
-            maybe_auto_title_session(gui, &session_id, &content);
-        }
-    }
-}
-
-pub(crate) fn has_session(gui: &GuiState, session_id: &str) -> bool {
-    gui.sessions.iter().any(|session| {
-        session.get("id").and_then(Value::as_str) == Some(session_id)
-            && !is_archived_session(session)
-    })
-}
-
-pub(crate) fn session_mut<'a>(gui: &'a mut GuiState, session_id: &str) -> Option<&'a mut Value> {
-    gui.sessions
-        .iter_mut()
-        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
-}
-
-pub(crate) fn update_session_event_count(gui: &mut GuiState, session_id: &str) {
-    let count = gui
-        .session_projection_cache
-        .get(session_id)
-        .map(Vec::len)
-        .unwrap_or_default();
-    if let Some(session) = session_mut(gui, session_id) {
-        session["eventCount"] = json!(count);
-        session["updatedAt"] = json!(now_text());
-    }
-}
-
-pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
-    let Some(session) = gui
-        .sessions
-        .iter()
-        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
-    else {
-        return ApiResponse::error("agent_session_not_found", "agent session not found");
-    };
-    let events = gui
-        .session_projection_cache
-        .get(session_id)
-        .cloned()
-        .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id));
-    ApiResponse::ok(json!({
-        "session": session,
-        "events": events
-    }))
-}
-
-pub(crate) fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str) -> Value {
-    json!({
-        "id": format!("evt-{}-{}", kind, now_millis()),
-        "sessionId": session_id,
-        "ts": ts,
-        "kind": kind,
-        "payload": payload
-    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bridge_output_reader_drains_payloads_larger_than_pipe_capacity() {
-        let script = "i=0; while [ \"$i\" -lt 5000 ]; do printf '0123456789abcdef0123456789abcdef\\n'; printf 'fedcba9876543210fedcba9876543210\\n' >&2; i=$((i + 1)); done";
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn bridge output fixture");
-
-        let output = wait_for_child_output(child, || false, Some(Duration::from_secs(10)))
-            .expect("drain bridge output");
-
-        assert!(output.status.success());
-        assert!(output.stdout.len() > 65_536);
-        assert!(output.stderr.len() > 65_536);
-    }
-
-    #[test]
-    fn bridge_timeline_requires_current_structured_projection() {
-        let result = json!({
-            "timeline": {
-                "schemaVersion": "deepcode.session.timeline.v1",
-                "sessionId": "session-current",
-                "generatedAt": "2026-07-11T00:00:00Z",
-                "turns": [],
-                "eventCount": 3
-            }
-        });
-        assert!(validated_bridge_timeline(&result, "session-current", 3).is_ok());
-        assert!(validated_bridge_timeline(&result, "session-other", 3).is_err());
-        assert!(validated_bridge_timeline(&result, "session-current", 4).is_err());
-    }
-
-    #[test]
-    fn bridge_timeline_rejects_missing_or_legacy_payloads() {
-        assert!(validated_bridge_timeline(&json!({}), "session-current", 0).is_err());
-        assert!(validated_bridge_timeline(
-            &json!({
-                "timeline": {
-                    "sessionId": "session-current",
-                    "turns": [],
-                    "eventCount": 0
-                }
-            }),
-            "session-current",
-            0,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn project_memory_mode_is_forwarded_to_host_bridge() {
-        let body = AgentSessionRunRequest {
-            content: Some("test request".to_string()),
-            project_memory_mode: Some(json!("auto")),
-            ..Default::default()
-        };
-        let request = host_bridge_request(
-            "session-memory-forward",
-            "run-memory-forward",
-            &body,
-            Some("medium".to_string()),
-            normalize_project_memory_mode(body.project_memory_mode.clone(), None),
-        );
-        assert_eq!(
-            request.get("projectMemoryMode").and_then(Value::as_str),
-            Some("auto")
-        );
-    }
-
-    #[test]
-    fn missing_or_invalid_project_memory_mode_defaults_to_confirm() {
-        assert_eq!(normalize_project_memory_mode(None, None), "confirm");
-        assert_eq!(
-            normalize_project_memory_mode(Some(json!("invalid")), None),
-            "confirm"
-        );
-        assert_eq!(
-            normalize_project_memory_mode(None, Some("auto".to_string())),
-            "auto"
-        );
-    }
-
-    #[test]
-    fn run_delta_normalization_attaches_monotonic_stream_cursor_fields() {
-        let delta = normalize_run_delta(
-            "session-generic",
-            "run-generic",
-            7,
-            json!({
-                "kind": "stage_delta",
-                "payload": {
-                    "status": "streaming"
-                }
-            }),
-        );
-        assert_eq!(
-            delta.get("sessionId").and_then(Value::as_str),
-            Some("session-generic")
-        );
-        assert_eq!(
-            delta.get("hostRunId").and_then(Value::as_str),
-            Some("run-generic")
-        );
-        assert_eq!(delta.get("deltaSeq").and_then(Value::as_u64), Some(7));
-        assert!(delta.get("receivedAt").and_then(Value::as_str).is_some());
-    }
-
-    #[test]
-    fn terminal_stream_event_tail_does_not_replay_sent_history() {
-        let unique = now_millis();
-        let events = vec![
-            json!({ "id": format!("event-{unique}-a") }),
-            json!({ "id": format!("event-{unique}-b") }),
-            json!({ "id": format!("event-{unique}-c") }),
-        ];
-        let (tail, count) = terminal_stream_event_tail(&events, 2);
-        let expected_tail_id = format!("event-{unique}-c");
-        assert_eq!(count, 3);
-        assert_eq!(tail.len(), 1);
-        assert_eq!(
-            tail[0].get("id").and_then(Value::as_str),
-            Some(expected_tail_id.as_str())
-        );
-
-        let (empty_tail, empty_count) = terminal_stream_event_tail(&events, count);
-        assert_eq!(empty_count, 3);
-        assert!(empty_tail.is_empty());
-    }
-
-    #[test]
-    fn session_memory_cleanup_removes_only_target_session_files() {
-        let root =
-            std::env::temp_dir().join(format!("deepcode-agent-memory-cleanup-{}", now_millis()));
-        let memory_root = root.join("memory").join("projects");
-        let scope_key = format!("workspace-{}", now_millis());
-        let session_id = format!("session-{}", now_millis());
-        let other_session_id = format!("session-{}-other", now_millis());
-        let safe_session = safe_path_segment(&session_id);
-        let safe_other_session = safe_path_segment(&other_session_id);
-        let archive_dir = memory_root.join(&scope_key);
-        let sessions_dir = archive_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create session memory dir");
-        fs::write(archive_dir.join("project.md"), "project memory").expect("project markdown");
-        fs::write(
-            archive_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&json!({
-                "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
-                "workspaceScopeKey": scope_key,
-                "cleanupEvents": []
-            }))
-            .expect("manifest json"),
-        )
-        .expect("manifest");
-        fs::write(
-            sessions_dir.join(format!("{safe_session}.md")),
-            "session markdown",
-        )
-        .expect("session markdown");
-        fs::write(
-            sessions_dir.join(format!("{safe_session}.memory.json")),
-            "{}",
-        )
-        .expect("session sidecar");
-        fs::write(
-            sessions_dir.join(format!("{safe_other_session}.md")),
-            "other session markdown",
-        )
-        .expect("other session markdown");
-        fs::write(
-            sessions_dir.join(format!("{safe_other_session}.memory.json")),
-            "{}",
-        )
-        .expect("other session sidecar");
-
-        let cleanup =
-            remove_session_memory_archive(&memory_root, &scope_key, &safe_session, &session_id);
-        assert_eq!(
-            cleanup.get("workspaceScopeKey").and_then(Value::as_str),
-            Some(scope_key.as_str())
-        );
-        assert_eq!(
-            cleanup
-                .get("removedFiles")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(2)
-        );
-        assert_eq!(
-            cleanup
-                .get("projectArchiveNeedsRefresh")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert!(!sessions_dir.join(format!("{safe_session}.md")).exists());
-        assert!(!sessions_dir
-            .join(format!("{safe_session}.memory.json"))
-            .exists());
-        assert!(sessions_dir
-            .join(format!("{safe_other_session}.md"))
-            .exists());
-        assert!(sessions_dir
-            .join(format!("{safe_other_session}.memory.json"))
-            .exists());
-
-        let manifest_content =
-            fs::read_to_string(archive_dir.join("manifest.json")).expect("manifest content");
-        let manifest: Value = serde_json::from_str(&manifest_content).expect("manifest json");
-        let cleanup_events = manifest
-            .get("cleanupEvents")
-            .and_then(Value::as_array)
-            .expect("cleanup events");
-        assert_eq!(cleanup_events.len(), 1);
-        assert_eq!(
-            cleanup_events[0].get("event").and_then(Value::as_str),
-            Some("session_memory_removed")
-        );
-        assert_eq!(
-            cleanup_events[0].get("sessionId").and_then(Value::as_str),
-            Some(session_id.as_str())
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn scoped_session_list_and_current_are_workspace_owned() {
-        let mut gui = GuiState::new();
-        let now = "2026-06-05T00:00:00Z";
-        let session_a = create_agent_session_value(
-            "session-a",
-            now,
-            "Workspace A",
-            "plan",
-            None,
-            Some("workspace-a"),
-            Some("hash-a"),
-        );
-        let session_b = create_agent_session_value(
-            "session-b",
-            now,
-            "Workspace B",
-            "plan",
-            None,
-            Some("workspace-b"),
-            Some("hash-b"),
-        );
-        let scope_a = session_scope_key(&session_a);
-        let scope_b = session_scope_key(&session_b);
-        gui.sessions = vec![session_b, session_a];
-        gui.current_session_ids_by_scope
-            .insert(scope_a.clone(), "session-a".to_string());
-        gui.current_session_ids_by_scope
-            .insert(scope_b.clone(), "session-b".to_string());
-
-        assert_eq!(
-            scoped_sessions(&gui, &scope_a, false)
-                .iter()
-                .filter_map(|session| session.get("id").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["session-a"]
-        );
-        assert_eq!(
-            scoped_sessions(&gui, &scope_b, false)
-                .iter()
-                .filter_map(|session| session.get("id").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec!["session-b"]
-        );
-        assert_eq!(
-            current_agent_session_id_for_scope(&mut gui, &scope_a).as_deref(),
-            Some("session-a")
-        );
-        assert_eq!(
-            current_agent_session_id_for_scope(&mut gui, &scope_b).as_deref(),
-            Some("session-b")
-        );
-
-        session_mut(&mut gui, "session-a").unwrap()["archivedAt"] = json!(now);
-        gui.current_session_ids_by_scope.remove(&scope_a);
-        ensure_current_agent_session_for_scope(
-            &mut gui,
-            &scope_a,
-            Some((
-                None,
-                Some("workspace-a".to_string()),
-                Some("hash-a".to_string()),
-            )),
-        );
-
-        assert_ne!(
-            current_agent_session_id_for_scope(&mut gui, &scope_a).as_deref(),
-            Some("session-b")
-        );
-        assert_eq!(
-            current_agent_session_id_for_scope(&mut gui, &scope_b).as_deref(),
-            Some("session-b")
-        );
-    }
-}
+#[path = "agent_api_tests.rs"]
+mod tests;

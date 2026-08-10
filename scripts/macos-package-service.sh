@@ -288,7 +288,7 @@ process_request() {
   clean="$(read_request_value "$request_path" clean)"
   refresh="$(read_request_value "$request_path" refresh_gui_dist)"
   kill_running="$(read_request_value "$request_path" kill_running)"
-  products="${products:-${product:-DeepCode}}"
+  products="${products:-${product:-DeepCode-GUI,DeepCode}}"
   products="$(normalize_products "$products")"
   clean="${clean:-0}"
   refresh="${refresh:-1}"
@@ -392,7 +392,7 @@ run_cmd() {
 
 submit_cmd() {
   ensure_dirs
-  local products="DeepCode"
+  local products="DeepCode-GUI,DeepCode"
   local clean=0
   local refresh=1
   local kill_running="${DEEPCODE_MACOS_KILL_RUNNING:-1}"

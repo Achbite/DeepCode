@@ -393,7 +393,7 @@ mod tests {
                         domain: None,
                         values: serde_json::json!({
                             "agent": { "defaultMode": "plan" },
-                            "policy": { "allowShellExec": false },
+                            "policy": { "processExecution": "deny" },
                             "session": { "templateLocale": "en-US" }
                         }),
                     },
@@ -406,20 +406,20 @@ mod tests {
                         domain: None,
                         values: serde_json::json!({
                             "agent": { "defaultMode": "askBeforeWrite" },
-                            "policy": { "allowShellExec": true },
+                            "policy": { "processExecution": "allow" },
                             "session": { "templateLocale": null }
                         }),
                     },
                 ],
                 kernel_invariants: Some(serde_json::json!({
-                    "policy": { "allowShellExec": false }
+                    "policy": { "processExecution": "deny" }
                 })),
                 created_at: Some("2026-05-26T00:00:00Z".to_string()),
             })
             .expect("resolve config");
 
         assert_eq!(snapshot.effective["agent"]["defaultMode"], "askBeforeWrite");
-        assert_eq!(snapshot.effective["policy"]["allowShellExec"], false);
+        assert_eq!(snapshot.effective["policy"]["processExecution"], "deny");
         assert!(snapshot.effective["session"]
             .get("templateLocale")
             .is_none());

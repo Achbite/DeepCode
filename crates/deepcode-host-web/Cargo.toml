@@ -9,6 +9,7 @@ description = "DeepCode Rust Web host adapter backed by the unified Kernel runti
 
 [dependencies]
 axum.workspace = true
+deepcode-kernel-abi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

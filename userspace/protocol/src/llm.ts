@@ -1,31 +1,75 @@
-import type { AgentConversationActivity } from './agent.js';
-import type { ToolCall, ToolDefinition } from './tools.js';
+import type { ToolCall } from './tools.js';
 
 export type LlmProviderKind =
   | 'openaiCompatible'
   | 'anthropic'
   | 'ollama';
 
+export type LlmReasoningTransport =
+  | 'openaiPlaintext'
+  | 'anthropicPlaintext'
+  | 'ollamaPlaintext';
+
+export type LlmProviderReasoningContract =
+  | {
+      kind: 'openaiCompatible';
+      reasoningTransport: 'openaiPlaintext';
+    }
+  | {
+      kind: 'anthropic';
+      reasoningTransport: 'anthropicPlaintext';
+    }
+  | {
+      kind: 'ollama';
+      reasoningTransport: 'ollamaPlaintext';
+    };
+
 export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu';
 export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
 export type LlmThinkingMode = 'enabled' | 'disabled';
 export type LlmResponseFormat = { type: 'json_object' };
 
-export interface LlmProviderProfile {
+interface LlmProviderProfileFields {
   id: string;
   name: string;
-  kind: LlmProviderKind;
-  providerFlavor?: LlmProviderFlavor;
+  providerFlavor: LlmProviderFlavor;
   baseUrl?: string;
   model: string;
   contextWindowTokens?: number;
   maxOutputTokens?: number;
-  maxTokens?: number;
   temperature?: number;
   reasoningEffort?: LlmReasoningEffort;
   thinking?: LlmThinkingMode;
   secretRef?: string;
   enabled: boolean;
+}
+
+export type LlmProviderProfile =
+  LlmProviderProfileFields & LlmProviderReasoningContract;
+
+export const LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND = {
+  openaiCompatible: 'openaiPlaintext',
+  anthropic: 'anthropicPlaintext',
+  ollama: 'ollamaPlaintext',
+} as const satisfies Readonly<Record<LlmProviderKind, LlmReasoningTransport>>;
+
+export function reasoningTransportForProviderKind<
+  Kind extends LlmProviderKind,
+>(
+  kind: Kind,
+): (typeof LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND)[Kind] {
+  return LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND[kind];
+}
+
+/** Runtime validation for the current Provider profile contract. */
+export function hasCompatibleReasoningTransport<
+  Profile extends {
+    kind: LlmProviderKind;
+    reasoningTransport?: unknown;
+  },
+>(profile: Profile): profile is Profile & LlmProviderReasoningContract {
+  return profile.reasoningTransport
+    === LLM_REASONING_TRANSPORT_BY_PROVIDER_KIND[profile.kind];
 }
 
 export const DEEPSEEK_OPENAI_BASE_URL = 'https://api.deepseek.com';
@@ -48,6 +92,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     id: 'deepseek-v4-flash-openai',
     name: 'DeepSeek V4 Flash',
     kind: 'openaiCompatible',
+    reasoningTransport: 'openaiPlaintext',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-flash',
@@ -62,6 +107,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     id: 'deepseek-v4-pro-openai',
     name: 'DeepSeek V4 Pro',
     kind: 'openaiCompatible',
+    reasoningTransport: 'openaiPlaintext',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-pro',
@@ -84,6 +130,7 @@ export interface PatchLlmProfilesRequest {
   profiles: LlmProviderProfile[];
   defaultProfileId?: string;
   secrets?: Record<string, string | null>;
+  reenableProfileIds?: string[];
 }
 
 export interface LlmChatMessage {
@@ -94,119 +141,26 @@ export interface LlmChatMessage {
   toolCallId?: string;
 }
 
+/**
+ * Provider wire metadata only. Permission, risk, and execution policy remain
+ * Kernel facts and must not be synthesized by Session into Provider tools.
+ */
+export interface ProviderWireToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+}
+
 export interface LlmChatRequest {
+  requestId: string;
+  parentRequestId?: string;
   profileId?: string;
   messages: LlmChatMessage[];
-  tools?: ToolDefinition[];
-  stream?: boolean;
+  tools?: ProviderWireToolDefinition[];
+  stream: true;
   providerUserId?: string;
   responseFormat?: LlmResponseFormat;
   providerOptions?: Record<string, unknown>;
-}
-
-export interface LlmChatChunk {
-  type: 'delta' | 'reasoning_delta' | 'tool_call' | 'part' | 'done' | 'error';
-  content?: string;
-  toolCall?: ToolCall;
-  toolCallDelta?: {
-    id?: string;
-    index?: number;
-    name?: string;
-    argumentsDelta?: string;
-  };
-  error?: string;
-  index?: number;
-  callId?: string;
-  finishReason?: string;
-  usage?: Record<string, unknown>;
-  rawProvider?: unknown;
-}
-
-export type AgentStreamPartKind =
-  | 'thinkingDelta'
-  | 'codeBlockChunk'
-  | 'actionDraftChunk'
-  | 'fileDone'
-  | 'batchDone'
-  | 'diagnostic';
-
-export interface AgentStreamPartFrame {
-  schemaVersion: 'deepcode.agent.stream.part.v1';
-  partKind: AgentStreamPartKind;
-  draftId?: string;
-  frameId?: string;
-  runId?: string;
-  targetPath?: string;
-  language?: string;
-  capability?: string;
-  blockId?: string;
-  actionId?: string;
-  sequence?: number;
-  chunk?: string;
-  contentHash?: string;
-  summary?: string;
-  diagnostic?: {
-    severity?: 'info' | 'warning' | 'error';
-    code?: string;
-    message?: string;
-  };
-  resumeHandle?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface LlmChatResult {
-  chunks: LlmChatChunk[];
-  assistantMessage?: LlmChatMessage;
-  usage?: Record<string, unknown>;
-}
-
-export type LlmChatStreamEventType =
-  | 'provider_delta'
-  | 'provider_reasoning_delta'
-  | 'provider_tool_call_delta'
-  | 'provider_usage'
-  | 'provider_done'
-  | 'provider_error';
-
-export interface LlmChatStreamEvent {
-  type: LlmChatStreamEventType;
-  chunk?: LlmChatChunk;
-  error?: string;
-  usage?: Record<string, unknown>;
-  rawProvider?: unknown;
-}
-
-export type ProjectionDeltaType =
-  | 'active_turn'
-  | 'assistant_delta'
-  | 'reasoning_delta'
-  | 'tool_call_delta'
-  | 'part_delta'
-  | 'draft_delta'
-  | 'resource_delta'
-  | 'workunit_delta'
-  | 'stage_delta'
-  | 'committed'
-  | 'error';
-
-export interface ProjectionDelta {
-  type: ProjectionDeltaType;
-  seq?: number;
-  sessionId: string;
-  runId?: string;
-  turnId?: string;
-  draftId?: string;
-  targetPath?: string;
-  itemId?: string;
-  stage?: string;
-  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'draftReady' | 'discarded' | 'skipped' | 'completed' | 'failed';
-  channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit' | 'draft';
-  source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
-  delta?: string;
-  summary?: string;
-  activity?: AgentConversationActivity;
-  payload?: unknown;
-  committedEventIds?: string[];
 }
 
 export interface LlmProbeRequest {
@@ -218,5 +172,14 @@ export interface LlmProbeResult {
   provider: LlmProviderKind;
   model?: string;
   latencyMs?: number;
+  reasoningPresent?: boolean;
+  responsePresent?: boolean;
+  nativeCompletion?: {
+    providerKind: LlmProviderKind;
+    terminalSignal: string;
+    finishReason?: 'stop' | 'tool_calls';
+  };
+  errorCode?: string;
+  httpStatus?: number;
   error?: string;
 }

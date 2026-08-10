@@ -9,7 +9,7 @@
 #   make macos-package-service -> 在 macOS 宿主机启动 Docker 可请求的打包服务
 #   make package-macos  -> 生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI
 #   make package-macos-clean -> 清理打包缓存后重新生成 Darwin GUI/TUI 本机包
-#   make package-macos-deepcode-gui -> 在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app
+#   make package-macos-deepcode-gui -> 刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App
 #
 # 适用环境：Linux / macOS / WSL（必须能直连 Docker daemon）
 # 不支持：Windows 原生 PowerShell 直接调用（请先 wsl 进入 Linux 子系统）
@@ -26,6 +26,7 @@ DOCKERFILE       ?= Dockerfile.dev
 WORKDIR_IN_CTNR  ?= /workspace
 DEEPCODE_WORKTREE_ID ?=
 DEEPCODE_WORKTREE_ROOT := $(abspath $(CURDIR))
+DEEPCODE_GIT_COMMON_DIR := $(abspath $(shell git rev-parse --git-common-dir 2>/dev/null))
 DEEPCODE_HOST_PORT ?= 31246
 DEEPCODE_CONTAINER_PORT ?= 31246
 ifeq ($(strip $(DEEPCODE_WORKTREE_ID)),)
@@ -40,6 +41,7 @@ CONTAINER_HOSTNAME ?= deepcode-dev-$(DEEPCODE_WORKTREE_ID)
 WORKTREE_LABEL_ARGS := \
 	--label com.deepcode.worktree.id=$(DEEPCODE_WORKTREE_ID) \
 	--label com.deepcode.worktree.root=$(DEEPCODE_WORKTREE_ROOT)
+WORKTREE_GIT_MOUNT_ARG := -v $(DEEPCODE_GIT_COMMON_DIR):$(DEEPCODE_GIT_COMMON_DIR):ro
 endif
 DEEPCODE_APT_MIRROR ?= https://mirrors.tuna.tsinghua.edu.cn/debian
 DEEPCODE_APT_SECURITY_MIRROR ?= https://mirrors.tuna.tsinghua.edu.cn/debian-security
@@ -112,10 +114,12 @@ endif
 RUN_ARGS := \
 	--name $(CONTAINER_NAME) \
 	--hostname $(CONTAINER_HOSTNAME) \
+	--init \
 	$(WORKTREE_LABEL_ARGS) \
 	-w $(WORKDIR_IN_CTNR) \
 	-p 127.0.0.1:$(DEEPCODE_HOST_PORT):$(DEEPCODE_CONTAINER_PORT) \
 	-v $(CURDIR):$(WORKDIR_IN_CTNR) \
+	$(WORKTREE_GIT_MOUNT_ARG) \
 	-v $(VOL_PNPM_STORE):/root/.local/share/pnpm/store \
 	-v $(VOL_CARGO_REGISTRY):/usr/local/cargo/registry \
 	-v $(VOL_CARGO_TARGET):/workspace/target \
@@ -146,16 +150,19 @@ help:
 	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
 	@echo "  make package-macos  生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI"
 	@echo "  make package-macos-clean  清理打包缓存后重新生成 macOS 本机包（保留 config/sessions/archives/kernel）"
-	@echo "  make package-macos-deepcode-gui  在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app"
+	@echo "  make package-macos-deepcode-gui  刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App"
 	@echo ""
 	@echo "进入容器后可手动执行："
 	@echo "  bash ./build.sh   编译并输出统一分发目录到 bin/"
-	@echo "  bash ./test.sh    运行稳定架构、workspace 与真实链路验证"
+	@echo "  bash ./test.sh --list  查看测试 profile 与 suite 注册"
+	@echo "  bash ./test.sh    运行默认 required 测试门禁（宿主机不会降级为静态成功）"
+	@echo "  bash ./test.sh --profile static  显式运行宿主机安全静态检查"
 
 docker-info:
 	@echo "worktreeMode=$(DEEPCODE_WORKTREE_MODE)"
 	@echo "worktreeId=$(DEEPCODE_WORKTREE_ID)"
 	@echo "worktreeRoot=$(DEEPCODE_WORKTREE_ROOT)"
+	@echo "gitCommonDir=$(DEEPCODE_GIT_COMMON_DIR)"
 	@echo "image=$(IMAGE)"
 	@echo "container=$(CONTAINER_NAME)"
 	@echo "hostname=$(CONTAINER_HOSTNAME)"
@@ -173,6 +180,10 @@ branch-hooks:
 _validate_worktree_config:
 	@if [ "$(DEEPCODE_WORKTREE_MODE)" = "1" ] && ! printf '%s' "$(DEEPCODE_WORKTREE_ID)" | grep -Eq '^[a-z0-9][a-z0-9_.-]*$$'; then \
 		echo "[make][error] DEEPCODE_WORKTREE_ID 只能包含小写字母、数字、点、下划线和连字符" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(DEEPCODE_WORKTREE_MODE)" = "1" ] && [ ! -d "$(DEEPCODE_GIT_COMMON_DIR)" ]; then \
+		echo "[make][error] worktree Git common dir 不可用: $(DEEPCODE_GIT_COMMON_DIR)" >&2; \
 		exit 1; \
 	fi
 	@case "$(DEEPCODE_HOST_PORT)" in ''|*[!0-9]*) echo "[make][error] DEEPCODE_HOST_PORT 必须是 1-65535 的整数" >&2; exit 1;; esac

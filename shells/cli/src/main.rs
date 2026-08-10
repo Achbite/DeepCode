@@ -1,17 +1,30 @@
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PermissionDecision,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
+    AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot,
+    AgentTimelineStatus, AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
+const EXIT_ACTION_REQUIRED: i32 = 5;
+const EXIT_INTERRUPTED: i32 = 130;
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_RUN_TIMEOUT_ENV: &str = "DEEPCODE_CLI_RUN_TIMEOUT_MS";
+const CLI_INTERRUPT_CLEANUP_WINDOW: Duration = Duration::from_secs(5);
+static CLI_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum CliCommandOutcome {
+    Completed,
+    ActionRequired(String),
+}
 
 #[tokio::main]
 async fn main() {
@@ -24,17 +37,61 @@ async fn main() {
         }
     };
 
-    if let Err(error) = run(command).await {
-        eprintln!("{error}");
-        std::process::exit(EXIT_DAEMON_UNAVAILABLE);
+    CLI_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    let interrupt_task = tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            CLI_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        }
+    });
+    let mut running = Box::pin(run(command));
+    let outcome = tokio::select! {
+        outcome = &mut running => outcome,
+        _ = wait_for_cli_interrupt() => {
+            match tokio::time::timeout(CLI_INTERRUPT_CLEANUP_WINDOW, &mut running).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(
+                    "CLI interrupt cleanup timed out; the owned Kernel guard was reclaimed, but an externally owned Run may still require cancellation"
+                        .to_string(),
+                ),
+            }
+        }
+    };
+    drop(running);
+    interrupt_task.abort();
+
+    if CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        if let Err(error) = outcome {
+            eprintln!("{error}");
+        } else {
+            eprintln!("CLI was interrupted by the user");
+        }
+        std::process::exit(EXIT_INTERRUPTED);
+    }
+
+    match outcome {
+        Ok(CliCommandOutcome::Completed) => {}
+        Ok(CliCommandOutcome::ActionRequired(message)) => {
+            eprintln!("{message}");
+            std::process::exit(EXIT_ACTION_REQUIRED);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(EXIT_DAEMON_UNAVAILABLE);
+        }
     }
 }
 
-async fn run(command: Command) -> Result<(), String> {
+async fn wait_for_cli_interrupt() {
+    while !CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub(crate) async fn run(command: Command) -> Result<CliCommandOutcome, String> {
     match command {
         Command::Help => {
             print_help();
-            Ok(())
+            Ok(CliCommandOutcome::Completed)
         }
         Command::Interactive {
             api,
@@ -42,14 +99,18 @@ async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            run_interactive(bootstrap.client().clone(), host).await
+            run_interactive(bootstrap.client().clone(), host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::DaemonStatus {
             api,
             no_auto_start_kernel,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_daemon_status(bootstrap.client()).await
+            print_daemon_status(bootstrap.client())
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsList {
             api,
@@ -58,7 +119,9 @@ async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_sessions(bootstrap.client(), include_archived, &host).await
+            print_sessions(bootstrap.client(), include_archived, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsNew {
             api,
@@ -67,7 +130,9 @@ async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            create_session(bootstrap.client(), title, &host).await
+            create_session(bootstrap.client(), title, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsResume {
             api,
@@ -75,7 +140,9 @@ async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            activate_and_print_timeline(bootstrap.client(), &session_id).await
+            activate_and_print_timeline(bootstrap.client(), &session_id)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsRename {
             api,
@@ -84,7 +151,20 @@ async fn run(command: Command) -> Result<(), String> {
             title,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            rename_session(bootstrap.client(), &session_id, &title).await
+            rename_session(bootstrap.client(), &session_id, &title)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
+        }
+        Command::SessionsProfile {
+            api,
+            no_auto_start_kernel,
+            session_id,
+            profile_id,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_or_update_session_profile(bootstrap.client(), &session_id, profile_id.as_deref())
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsDelete {
             api,
@@ -92,7 +172,9 @@ async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            delete_or_archive_session(bootstrap.client(), &session_id, false).await
+            delete_or_archive_session(bootstrap.client(), &session_id, false)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::SessionsArchive {
             api,
@@ -100,7 +182,9 @@ async fn run(command: Command) -> Result<(), String> {
             session_id,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            delete_or_archive_session(bootstrap.client(), &session_id, true).await
+            delete_or_archive_session(bootstrap.client(), &session_id, true)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::Timeline {
             api,
@@ -109,16 +193,19 @@ async fn run(command: Command) -> Result<(), String> {
             host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_timeline(bootstrap.client(), session_id, &host).await
+            print_timeline(bootstrap.client(), session_id, &host)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
         }
         Command::Permission {
             api,
             no_auto_start_kernel,
             permission_id,
             decision,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            resolve_permission(bootstrap.client(), &permission_id, decision).await
+            resolve_permission(bootstrap.client(), &permission_id, &decision, host).await
         }
         Command::Decision {
             api,
@@ -189,6 +276,12 @@ enum Command {
         session_id: String,
         title: String,
     },
+    SessionsProfile {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        session_id: String,
+        profile_id: Option<String>,
+    },
     SessionsDelete {
         api: Option<String>,
         no_auto_start_kernel: bool,
@@ -209,7 +302,8 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         permission_id: String,
-        decision: PermissionDecision,
+        decision: String,
+        host: SessionHostOptions,
     },
     Decision {
         api: Option<String>,
@@ -330,6 +424,24 @@ impl Command {
                     title: title.join(" "),
                 })
             }
+            [sessions, profile, session_id] if sessions == "sessions" && profile == "profile" => {
+                Ok(Command::SessionsProfile {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: session_id.to_string(),
+                    profile_id: None,
+                })
+            }
+            [sessions, profile, session_id, profile_id]
+                if sessions == "sessions" && profile == "profile" =>
+            {
+                Ok(Command::SessionsProfile {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: session_id.to_string(),
+                    profile_id: Some(profile_id.to_string()),
+                })
+            }
             [sessions, delete, session_id] if sessions == "sessions" && delete == "delete" => {
                 Ok(Command::SessionsDelete {
                     api,
@@ -363,7 +475,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Allow,
+                    decision: "accept".to_string(),
+                    host,
                 })
             }
             [permission, deny, permission_id] if permission == "permission" && deny == "deny" => {
@@ -371,7 +484,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Deny,
+                    decision: "reject".to_string(),
+                    host,
                 })
             }
             [decision_cmd, kind, decision, tail @ ..] if decision_cmd == "decision" => {
@@ -394,8 +508,10 @@ impl Command {
                 })
             }
             [kind, decision, tail @ ..]
-                if matches!(kind.as_str(), "requirement" | "plan" | "review")
-                    && matches!(decision.as_str(), "accept" | "reject" | "revise") =>
+                if matches!(
+                    (kind.as_str(), decision.as_str()),
+                    ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
+                ) =>
             {
                 let run_id = tail.first().cloned();
                 let target_id = tail.get(1).cloned();
@@ -435,585 +551,19 @@ impl Command {
 }
 
 #[derive(Debug, Clone, Default)]
-struct SessionHostOptions {
-    workspace: Option<String>,
-    no_workspace: bool,
-    session_id: Option<String>,
+pub(crate) struct SessionHostOptions {
+    pub(crate) workspace: Option<String>,
+    pub(crate) no_workspace: bool,
+    pub(crate) session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingSessionDecision {
-    run_id: String,
-    target_id: Option<String>,
+pub(crate) struct PendingSessionDecision {
+    pub(crate) run_id: String,
+    pub(crate) target_id: String,
 }
 
-async fn run_interactive(
-    client: HttpKernelClient,
-    mut host: SessionHostOptions,
-) -> Result<(), String> {
-    print_interactive_help(&host);
-    let mut line = String::new();
-    loop {
-        print!("deepcode> ");
-        io::stdout()
-            .flush()
-            .map_err(|error| format!("failed to flush prompt: {error}"))?;
-        line.clear();
-        let bytes = io::stdin()
-            .read_line(&mut line)
-            .map_err(|error| format!("failed to read stdin: {error}"))?;
-        if bytes == 0 {
-            break;
-        }
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-        match input {
-            "/help" | "help" => print_interactive_help(&host),
-            "/quit" | "/exit" | "quit" | "exit" | "q" => break,
-            "/status" | "status" => {
-                if let Err(error) = print_daemon_status(&client).await {
-                    println!("{error}");
-                }
-            }
-            "/sessions" | "sessions" => {
-                if let Err(error) = print_sessions(&client, false, &host).await {
-                    println!("{error}");
-                }
-            }
-            "/timeline" | "timeline" => {
-                if let Err(error) = print_timeline(&client, None, &host).await {
-                    println!("{error}");
-                }
-            }
-            "/workspace" | "workspace" => print_workspace_status(&host),
-            command if command.starts_with("/workspace ") || command.starts_with("workspace ") => {
-                let args = command
-                    .split_once(' ')
-                    .map(|(_, value)| value.trim())
-                    .unwrap_or_default();
-                update_workspace(&mut host, args);
-                print_workspace_status(&host);
-            }
-            command if command.starts_with("/decision ") || command.starts_with("decision ") => {
-                let args = command
-                    .split_once(' ')
-                    .map(|(_, value)| value.trim())
-                    .unwrap_or_default();
-                if let Err(error) = run_interactive_decision(&client, args, host.clone()).await {
-                    println!("{error}");
-                }
-            }
-            command if command.starts_with('/') => {
-                println!("unknown command: {command}");
-                println!("type /help to list available commands");
-            }
-            command => {
-                if let Err(error) = ask(&client, command.to_string(), false, host.clone()).await {
-                    println!("{error}");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn ask(
-    client: &HttpKernelClient,
-    prompt: String,
-    plain: bool,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let session_id = session_id_for_turn(client, &host, &prompt).await?;
-    let mut request = StartAgentRunRequest::ask(prompt);
-    request.workspace_path = workspace_path_for_host(&host);
-    request.no_workspace = Some(host.no_workspace);
-    let result = start_and_wait_for_run(client, &session_id, request, !plain).await?;
-    if plain {
-        let mut text = result.run.final_text.clone().unwrap_or_default();
-        if text.trim().is_empty() {
-            if let Ok(timeline) = client.agent_timeline(&result.run.session_id).await {
-                text = extract_plain_text(&timeline).unwrap_or_default();
-            }
-        }
-        if text.trim().is_empty() {
-            println!("({})", result.run.status);
-        } else {
-            println!("{text}");
-        }
-        return Ok(());
-    }
-    println!("session: {}", result.run.session_id);
-    let timeline = client
-        .agent_timeline(&result.run.session_id)
-        .await
-        .map_err(|error| format!("failed to read timeline: {error}"))?;
-    render_timeline(&timeline);
-    Ok(())
-}
-
-async fn run_interactive_decision(
-    client: &HttpKernelClient,
-    args: &str,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let parts = args
-        .split_whitespace()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let Some(kind) = parts.first().cloned() else {
-        return Err("usage: /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
-    };
-    let Some(decision) = parts.get(1).cloned() else {
-        return Err("usage: /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
-    };
-    let run_id = parts.get(2).cloned();
-    let target_id = parts.get(3).cloned();
-    let guidance = if parts.len() > 4 {
-        Some(parts[4..].join(" "))
-    } else {
-        None
-    };
-    resolve_session_decision(client, kind, decision, run_id, target_id, guidance, host).await
-}
-
-async fn resolve_session_decision(
-    client: &HttpKernelClient,
-    kind: String,
-    decision: String,
-    run_id: Option<String>,
-    target_id: Option<String>,
-    guidance: Option<String>,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    if !matches!(kind.as_str(), "requirement" | "plan" | "review") {
-        return Err("decision kind must be requirement, plan, or review".to_string());
-    }
-    if !matches!(decision.as_str(), "accept" | "reject" | "revise") {
-        return Err("decision must be accept, reject, or revise".to_string());
-    }
-    let session_id = if let Some(session_id) = host.session_id.clone() {
-        session_id
-    } else {
-        current_session_id(client, &host).await?.ok_or_else(|| {
-            "no current session; pass --session <id> or create a session first".to_string()
-        })?
-    };
-    let mut resolved_run_id = run_id;
-    let mut resolved_target_id = target_id;
-    if resolved_run_id.is_none()
-        || (resolved_target_id.is_none() && matches!(kind.as_str(), "requirement" | "plan"))
-    {
-        let timeline = client
-            .agent_timeline(&session_id)
-            .await
-            .map_err(|error| format!("failed to read timeline for pending decision: {error}"))?;
-        let pending = find_pending_session_decision(&timeline, &kind, resolved_run_id.as_deref())
-            .ok_or_else(|| {
-                let run_hint = resolved_run_id
-                    .as_deref()
-                    .map(|value| format!(" for run {value}"))
-                    .unwrap_or_default();
-                format!(
-                    "no pending {kind} decision{run_hint} found in current session timeline; pass run-id and target-id explicitly"
-                )
-            })?;
-        if resolved_run_id.is_none() {
-            resolved_run_id = Some(pending.run_id);
-        }
-        if resolved_target_id.is_none() {
-            resolved_target_id = pending.target_id;
-        }
-        println!(
-            "decision target: {kind} run={} target={}",
-            resolved_run_id.as_deref().unwrap_or("-"),
-            resolved_target_id.as_deref().unwrap_or("-")
-        );
-    }
-    let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
-    request.run_id = resolved_run_id;
-    request.target_id = resolved_target_id;
-    request.guidance = guidance;
-    request.workspace_path = workspace_path_for_host(&host);
-    request.no_workspace = Some(host.no_workspace);
-    let result = start_and_wait_for_run(client, &session_id, request, true).await?;
-    println!("session: {}", result.run.session_id);
-    let timeline = client
-        .agent_timeline(&result.run.session_id)
-        .await
-        .map_err(|error| format!("failed to read timeline: {error}"))?;
-    render_decision_result(&timeline);
-    Ok(())
-}
-
-async fn session_id_for_turn(
-    client: &HttpKernelClient,
-    host: &SessionHostOptions,
-    title: &str,
-) -> Result<String, String> {
-    if let Some(session_id) = host.session_id.clone() {
-        return Ok(session_id);
-    }
-    if let Some(session_id) = current_session_id(client, host).await? {
-        return Ok(session_id);
-    }
-    let scope = workspace_scope(host);
-    let result = client
-        .create_agent_session(CreateAgentSessionRequest {
-            initial_mode: Some("plan".to_string()),
-            workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
-            workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
-            title: Some(title.to_string()),
-            ..CreateAgentSessionRequest::default()
-        })
-        .await
-        .map_err(|error| format!("failed to create session: {error}"))?;
-    session_id(&result.session)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "created session has no id".to_string())
-}
-
-async fn start_and_wait_for_run(
-    client: &HttpKernelClient,
-    session_id: &str,
-    request: StartAgentRunRequest,
-    show_progress: bool,
-) -> Result<AgentRunResult, String> {
-    let mut result = client
-        .start_agent_run(session_id, request)
-        .await
-        .map_err(|error| format!("failed to start shared session run: {error}"))?;
-    let run_timeout = cli_run_timeout()?;
-    let run_started = Instant::now();
-    let mut last_progress_key = run_progress_key(&result.run);
-    let mut last_progress_emit = Instant::now();
-    if show_progress {
-        print_run_progress(&result.run);
-    }
-    while !result.run.is_terminal() {
-        if let Some(limit) = run_timeout {
-            if run_started.elapsed() >= limit {
-                return Err(format!(
-                    "shared session run {} is still {} after {} ms; inspect it with `DeepCode-CLI timeline {}` or set {CLI_RUN_TIMEOUT_ENV}=0 to wait without a CLI-side timeout",
-                    result.run.run_id,
-                    result.run.status,
-                    limit.as_millis(),
-                    result.run.session_id
-                ));
-            }
-        }
-        tokio::time::sleep(RUN_POLL_INTERVAL).await;
-        let session_id = result.run.session_id.clone();
-        let run_id = result.run.run_id.clone();
-        result = client
-            .get_agent_run(&session_id, &run_id)
-            .await
-            .map_err(|error| format!("failed to read shared session run: {error}"))?;
-        if show_progress {
-            let progress_key = run_progress_key(&result.run);
-            if progress_key != last_progress_key
-                || last_progress_emit.elapsed() >= Duration::from_secs(5)
-            {
-                print_run_progress(&result.run);
-                last_progress_key = progress_key;
-                last_progress_emit = Instant::now();
-            }
-        }
-    }
-    if show_progress && run_progress_key(&result.run) != last_progress_key {
-        print_run_progress(&result.run);
-    }
-    Ok(result)
-}
-
-fn cli_run_timeout() -> Result<Option<Duration>, String> {
-    let Ok(value) = env::var(CLI_RUN_TIMEOUT_ENV) else {
-        return Ok(None);
-    };
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "0" {
-        return Ok(None);
-    }
-    let millis = trimmed
-        .parse::<u64>()
-        .map_err(|_| format!("{CLI_RUN_TIMEOUT_ENV} must be a positive integer number of milliseconds, or 0 to disable"))?;
-    Ok(Some(Duration::from_millis(millis)))
-}
-
-fn run_progress_key(run: &deepcode_kernel_client::AgentRunStatus) -> String {
-    format!(
-        "{}|{}",
-        run.status,
-        run.message.as_deref().unwrap_or_default()
-    )
-}
-
-fn print_run_progress(run: &deepcode_kernel_client::AgentRunStatus) {
-    if let Some(message) = run
-        .message
-        .as_deref()
-        .filter(|message| !message.trim().is_empty())
-    {
-        println!("run: {} {} - {}", run.run_id, run.status, message);
-    } else {
-        println!("run: {} {}", run.run_id, run.status);
-    }
-}
-
-async fn current_session_id(
-    client: &HttpKernelClient,
-    host: &SessionHostOptions,
-) -> Result<Option<String>, String> {
-    let current = client
-        .current_agent_session(session_list_request(host, None))
-        .await
-        .map_err(|error| format!("failed to read current session: {error}"))?;
-    Ok(current
-        .as_ref()
-        .and_then(|result| session_id(&result.session))
-        .map(ToOwned::to_owned))
-}
-
-fn workspace_path(explicit: Option<String>, no_workspace: bool) -> Option<String> {
-    if no_workspace {
-        return None;
-    }
-    if let Some(path) = explicit {
-        return Some(path);
-    }
-    env::current_dir()
-        .ok()
-        .map(|path| path.to_string_lossy().to_string())
-}
-
-fn workspace_path_for_host(host: &SessionHostOptions) -> Option<String> {
-    workspace_path(host.workspace.clone(), host.no_workspace)
-}
-
-fn workspace_scope(host: &SessionHostOptions) -> Option<TerminalWorkspaceScope> {
-    let path = workspace_path_for_host(host);
-    terminal_workspace_scope(path.as_deref())
-}
-
-fn session_list_request(
-    host: &SessionHostOptions,
-    include_archived: Option<bool>,
-) -> ListAgentSessionsRequest {
-    let scope = workspace_scope(host);
-    ListAgentSessionsRequest {
-        workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
-        workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
-        include_archived,
-    }
-}
-
-fn workspace_status(host: &SessionHostOptions) -> String {
-    if host.no_workspace {
-        return "workspace: none (ordinary chat only)".to_string();
-    }
-    if host.workspace.is_some() {
-        return format!(
-            "workspace: {}",
-            workspace_path_for_host(host).unwrap_or_else(|| "-".to_string())
-        );
-    }
-    format!(
-        "workspace: cwd fallback {}",
-        workspace_path_for_host(host).unwrap_or_else(|| "-".to_string())
-    )
-}
-
-fn print_workspace_status(host: &SessionHostOptions) {
-    println!("{}", workspace_status(host));
-    if let Some(scope) = workspace_scope(host) {
-        println!("scope: {} / {}", scope.workspace_id, scope.workspace_hash);
-        println!("normalized: {}", scope.normalized_path);
-    } else {
-        println!("scope: none");
-    }
-}
-
-fn update_workspace(host: &mut SessionHostOptions, args: &str) {
-    match args.trim() {
-        "" => {}
-        "clear" | "none" | "off" => {
-            host.workspace = None;
-            host.no_workspace = true;
-        }
-        "cwd" | "." => {
-            host.workspace = env::current_dir()
-                .ok()
-                .map(|path| path.to_string_lossy().to_string());
-            host.no_workspace = false;
-        }
-        path => {
-            host.workspace = Some(path.to_string());
-            host.no_workspace = false;
-        }
-    }
-}
-
-async fn print_daemon_status(client: &HttpKernelClient) -> Result<(), String> {
-    let status = client
-        .daemon_status()
-        .await
-        .map_err(|error| format!("daemon unavailable: {error}"))?;
-    println!("daemon: {}", status.service);
-    println!("api: {}", client.base_url());
-    println!("status: {}", if status.ok { "ok" } else { "degraded" });
-    Ok(())
-}
-
-async fn print_sessions(
-    client: &HttpKernelClient,
-    include_archived: bool,
-    host: &SessionHostOptions,
-) -> Result<(), String> {
-    let result = client
-        .list_agent_sessions(session_list_request(host, Some(include_archived)))
-        .await
-        .map_err(|error| format!("failed to list sessions: {error}"))?;
-    println!("{}", workspace_status(host));
-    println!(
-        "current: {}",
-        result.current_session_id.as_deref().unwrap_or("-")
-    );
-    println!(
-        "scope: {}",
-        result.workspace_scope_key.as_deref().unwrap_or("-")
-    );
-    for session in result.sessions {
-        let id = session_id(&session).unwrap_or("unknown");
-        let title = session_title(&session);
-        let updated = session
-            .get("updatedAt")
-            .and_then(Value::as_str)
-            .unwrap_or("-");
-        println!("{id}\t{updated}\t{title}");
-    }
-    Ok(())
-}
-
-async fn create_session(
-    client: &HttpKernelClient,
-    title: Option<String>,
-    host: &SessionHostOptions,
-) -> Result<(), String> {
-    let scope = workspace_scope(host);
-    let result = client
-        .create_agent_session(CreateAgentSessionRequest {
-            initial_mode: Some("plan".to_string()),
-            workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
-            workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
-            title,
-            ..CreateAgentSessionRequest::default()
-        })
-        .await
-        .map_err(|error| format!("failed to create session: {error}"))?;
-    println!(
-        "{}\t{}",
-        session_id(&result.session).unwrap_or("unknown"),
-        session_title(&result.session)
-    );
-    Ok(())
-}
-
-async fn activate_and_print_timeline(
-    client: &HttpKernelClient,
-    session_id: &str,
-) -> Result<(), String> {
-    client
-        .activate_agent_session(session_id)
-        .await
-        .map_err(|error| format!("failed to activate session: {error}"))?;
-    print_timeline(
-        client,
-        Some(session_id.to_string()),
-        &SessionHostOptions::default(),
-    )
-    .await
-}
-
-async fn rename_session(
-    client: &HttpKernelClient,
-    target_session_id: &str,
-    title: &str,
-) -> Result<(), String> {
-    let result = client
-        .rename_agent_session(target_session_id, title)
-        .await
-        .map_err(|error| format!("failed to rename session: {error}"))?;
-    println!(
-        "renamed: {}\t{}",
-        session_id(&result.session).unwrap_or(target_session_id),
-        session_title(&result.session)
-    );
-    Ok(())
-}
-
-async fn delete_or_archive_session(
-    client: &HttpKernelClient,
-    session_id: &str,
-    archive: bool,
-) -> Result<(), String> {
-    let result = if archive {
-        client.archive_agent_session(session_id, true).await
-    } else {
-        client.delete_agent_session(session_id).await
-    }
-    .map_err(|error| format!("failed to update session: {error}"))?;
-    println!(
-        "current: {}",
-        result.current_session_id.as_deref().unwrap_or("-")
-    );
-    println!("visible sessions: {}", result.sessions.len());
-    Ok(())
-}
-
-async fn print_timeline(
-    client: &HttpKernelClient,
-    requested_session_id: Option<String>,
-    host: &SessionHostOptions,
-) -> Result<(), String> {
-    let session_id = match requested_session_id {
-        Some(id) => id,
-        None => {
-            let current = client
-                .current_agent_session(session_list_request(host, None))
-                .await
-                .map_err(|error| format!("failed to read current session: {error}"))?;
-            let Some(current) = current else {
-                return Err("no current session".to_string());
-            };
-            session_id(&current.session)
-                .ok_or_else(|| "current session has no id".to_string())?
-                .to_string()
-        }
-    };
-    let timeline = client
-        .agent_timeline(&session_id)
-        .await
-        .map_err(|error| format!("failed to read timeline: {error}"))?;
-    println!("session: {session_id}");
-    render_timeline(&timeline);
-    Ok(())
-}
-
-async fn resolve_permission(
-    client: &HttpKernelClient,
-    permission_id: &str,
-    decision: PermissionDecision,
-) -> Result<(), String> {
-    client
-        .resolve_permission(permission_id, decision)
-        .await
-        .map_err(|error| format!("failed to resolve permission: {error}"))?;
-    println!("permission {permission_id}: {}", decision.as_str());
-    Ok(())
-}
-
-async fn bootstrap_kernel(
+pub(crate) async fn bootstrap_kernel(
     api: Option<String>,
     no_auto_start_kernel: bool,
 ) -> Result<KernelBootstrap, String> {
@@ -1022,1058 +572,12 @@ async fn bootstrap_kernel(
         .map_err(|error| format!("daemon unavailable: {error}"))
 }
 
-fn render_timeline(timeline: &Value) {
-    let timeline = timeline_payload(timeline);
-    let turns = timeline
-        .get("turns")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for turn in turns {
-        let status = turn
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        println!("turn: {status}");
-        for block in turn
-            .get("blocks")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let kind = block
-                .get("narrativeKind")
-                .or_else(|| block.get("kind"))
-                .and_then(Value::as_str)
-                .unwrap_or("stage");
-            let title = block
-                .get("title")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(kind);
-            let body = timeline_block_text(block, kind);
-            println!("  {kind}: {title}");
-            for line in body.lines().take(12) {
-                println!("    {line}");
-            }
-        }
-    }
-}
+mod render;
+mod session;
 
-fn render_decision_result(timeline: &Value) {
-    if let Some(text) = extract_decision_result_text(timeline) {
-        println!("{text}");
-        return;
-    }
-    render_timeline(timeline);
-}
-
-fn extract_decision_result_text(timeline: &Value) -> Option<String> {
-    extract_plain_text(timeline)
-}
-
-fn timeline_block_text(block: &Value, kind: &str) -> String {
-    if matches!(kind, "plan" | "review") {
-        if let Some(text) = block
-            .get("structuredProjection")
-            .map(render_readable_projection)
-            .filter(|text| !text.trim().is_empty())
-        {
-            return text;
-        }
-    }
-    block
-        .get("bodyMarkdown")
-        .or_else(|| block.get("summary"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_default()
-}
-
-fn render_readable_projection(readable: &Value) -> String {
-    let mut lines = Vec::new();
-    let sections = readable.get("sections").and_then(Value::as_array);
-    let summary_is_structured = sections
-        .map(|sections| sections.iter().any(readable_section_has_summary_items))
-        .unwrap_or(false);
-    if !summary_is_structured {
-        if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
-            lines.push(summary.to_string());
-        } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
-            lines.push(
-                readable_summary_key_text(summary_key)
-                    .unwrap_or(summary_key)
-                    .to_string(),
-            );
-        }
-    }
-    if let Some(sections) = sections {
-        for section in sections {
-            if let Some(title) = readable_section_title(section) {
-                lines.push(format!("## {title}"));
-            }
-            let mut seen_section_lines: Vec<String> = Vec::new();
-            let items = section
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if items.is_empty() {
-                if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
-                    if let Some(message) = readable_empty_message(empty) {
-                        lines.push(format!("- {message}"));
-                    }
-                }
-            }
-            for item in items {
-                let item_text = readable_item_text(&item);
-                if let Some(text) = &item_text {
-                    push_unique_render_line(
-                        &mut lines,
-                        &mut seen_section_lines,
-                        format!("- {text}"),
-                    );
-                }
-                if let Some(targets) = item.get("targetRefs").and_then(Value::as_array) {
-                    let target_text = targets
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let target_is_already_visible = item_text
-                        .as_ref()
-                        .map(|text| text.contains(&target_text))
-                        .unwrap_or(false);
-                    if !target_text.is_empty() && !target_is_already_visible {
-                        push_unique_render_line(
-                            &mut lines,
-                            &mut seen_section_lines,
-                            format!("  - targets: {target_text}"),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    lines.join("\n")
-}
-
-fn push_unique_render_line(lines: &mut Vec<String>, seen: &mut Vec<String>, line: String) {
-    let normalized = normalize_render_text(&line);
-    if seen.iter().any(|item| item == &normalized) {
-        return;
-    }
-    seen.push(normalized);
-    lines.push(line);
-}
-
-fn readable_section_has_summary_items(section: &Value) -> bool {
-    let section_key = section
-        .get("sectionId")
-        .or_else(|| section.get("titleKey"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !matches!(
-        section_key,
-        "summary" | "session.projection.plan.section.summary"
-    ) {
-        return false;
-    }
-    section
-        .get("items")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().any(|item| readable_item_text(item).is_some()))
-        .unwrap_or(false)
-}
-
-fn readable_summary_key_text(key: &str) -> Option<&'static str> {
-    match key {
-        "review.summary.waitingUserReview" => {
-            Some("The current batch has executed. Review the tool facts and validation results.")
-        }
-        "review.summary.needsAttention" => {
-            Some("The current batch has failed or blocked items. Review the facts before deciding whether to revise.")
-        }
-        _ => None,
-    }
-}
-
-fn readable_item_text(item: &Value) -> Option<String> {
-    if let Some(text) = item.get("text").and_then(Value::as_str) {
-        if !text.trim().is_empty() {
-            return Some(text.to_string());
-        }
-    }
-    item.get("messageKey")
-        .and_then(Value::as_str)
-        .and_then(|key| readable_message_text(key, item))
-}
-
-fn readable_message_text(key: &str, item: &Value) -> Option<String> {
-    let arg = |name: &str| readable_message_arg(item, name).unwrap_or_default();
-    match key {
-        "session.projection.plan.boundary.notExecution" => {
-            Some("This is a plan, not an execution result.".to_string())
-        }
-        "review.summary.waitingUserReview" => Some(
-            "The current batch has executed. Review the tool facts and validation results."
-                .to_string(),
-        ),
-        "review.summary.needsAttention" => Some(
-            "The current batch has failed or blocked items. Review the facts before deciding whether to revise."
-                .to_string(),
-        ),
-        "review.changedFile" => Some(format!(
-            "{} operation={} status={}",
-            arg("path"),
-            arg("operation"),
-            arg("status")
-        )),
-        "session.projection.review.changedFileWithReason" => Some(format!(
-            "{} operation={} status={} reason={}",
-            arg("path"),
-            arg("operation"),
-            arg("status"),
-            arg("reason")
-        )),
-        "session.projection.review.count.workUnitsCompleted" => {
-            Some(format!("WorkUnits completed: {}", arg("count")))
-        }
-        "session.projection.review.count.workUnitsFailed" => {
-            Some(format!("WorkUnits failed: {}", arg("count")))
-        }
-        "session.projection.review.count.workUnitsBlocked" => {
-            Some(format!("WorkUnits blocked: {}", arg("count")))
-        }
-        "session.projection.review.count.toolFacts" => {
-            Some(format!("Tool facts: {}", arg("count")))
-        }
-        "session.projection.review.generatedArtifact" => Some(format!(
-            "{} operation={} contentHash={}",
-            arg("path"),
-            arg("operation"),
-            arg("hash")
-        )),
-        "session.projection.review.generatedArtifacts.truncated" => Some(format!(
-            "{} additional generated artifact(s) are not expanded.",
-            arg("count")
-        )),
-        "session.projection.review.pathDiagnostic" => Some(format!(
-            "{} original={} normalized={} stripped={} duplicateRootPathDetected={}",
-            arg("path"),
-            arg("original"),
-            arg("normalized"),
-            arg("stripped"),
-            arg("duplicate")
-        )),
-        "session.projection.review.pathDiagnostics.truncated" => Some(format!(
-            "{} additional path diagnostic(s) are not expanded.",
-            arg("count")
-        )),
-        "session.projection.review.git.unavailable" => {
-            Some(format!("Git diff unavailable: {}", arg("reason")))
-        }
-        "session.projection.review.git.stats" => Some(format!(
-            "Files: {}; staged diff: {} bytes; unstaged diff: {} bytes.",
-            arg("changedFiles"),
-            arg("stagedBytes"),
-            arg("unstagedBytes")
-        )),
-        "session.projection.review.git.truncated" => Some(format!(
-            "{} additional Git file(s) are not expanded.",
-            arg("count")
-        )),
-        "session.projection.review.git.diffAttached" => {
-            Some("Full diff is attached as collapsible Review evidence.".to_string())
-        }
-        "session.projection.review.audit.available" => Some(
-            "Raw Kernel facts, tool facts, and ReviewFacts are retained in developerDetails / audit refs."
-                .to_string(),
-        ),
-        "session.projection.review.audit.unavailable" => {
-            Some("No developerDetails are available.".to_string())
-        }
-        "session.projection.review.audit.ref" => Some(format!("auditRef: {}", arg("ref"))),
-        "session.projection.review.next.failed" => Some(
-            "Accept closes the current batch without retrying failed items; submit Review feedback to revise."
-                .to_string(),
-        ),
-        "session.projection.review.next.success" => Some(
-            "Accept closes the current batch; typed text is treated as Review revision feedback."
-                .to_string(),
-        ),
-        "session.projection.review.next.continuation" => Some(format!(
-            "The current plan recorded {} continuation intent(s).",
-            arg("count")
-        )),
-        "session.projection.review.next.noContinuation" => {
-            Some("The current plan did not record continuation batches.".to_string())
-        }
-        _ => None,
-    }
-}
-
-fn readable_message_arg(item: &Value, name: &str) -> Option<String> {
-    item.get("messageArgs")?
-        .get(name)?
-        .as_str()
-        .map(str::to_string)
-}
-
-fn readable_section_title(section: &Value) -> Option<String> {
-    if let Some(title) = section.get("title").and_then(Value::as_str) {
-        return Some(title.to_string());
-    }
-    let key = section
-        .get("sectionId")
-        .or_else(|| section.get("titleKey"))
-        .and_then(Value::as_str)?;
-    Some(
-        match key {
-            "summary" | "session.projection.plan.section.summary" => "Summary",
-            "tasks" | "session.projection.plan.section.tasks" => "Tasks",
-            "risks" | "session.projection.plan.section.risks" => "Risks",
-            "reviewCheckpoints" | "session.projection.plan.section.reviewCheckpoints" => {
-                "Review checkpoints"
-            }
-            "boundary" | "session.projection.plan.section.boundary" => "Boundary",
-            "executionResult" | "session.projection.review.section.executionResult" => {
-                "Execution result"
-            }
-            "execution" | "session.projection.review.section.execution" => "Execution",
-            "changedFiles" | "session.projection.review.section.changedFiles" => {
-                "Files changed in this batch"
-            }
-            "generatedArtifacts" | "session.projection.review.section.generatedArtifacts" => {
-                "Agent generated artifacts"
-            }
-            "pathDiagnostics" | "session.projection.review.section.pathDiagnostics" => {
-                "Path normalization diagnostics"
-            }
-            "gitChanges" | "session.projection.review.section.gitChanges" => "Git changes",
-            "auditDetails" | "session.projection.review.section.auditDetails" => "Audit details",
-            "originalPlan" | "session.projection.review.section.originalPlan" => {
-                "Original plan summary"
-            }
-            "validation" | "session.projection.review.section.validation" => {
-                "Validation and startup suggestions"
-            }
-            "nextDecision" | "session.projection.review.section.nextDecision" => "Next decision",
-            "audit" | "session.projection.review.section.audit" => "Audit",
-            _ => key,
-        }
-        .to_string(),
-    )
-}
-
-fn readable_empty_message(key: &str) -> Option<&'static str> {
-    match key {
-        "session.projection.plan.empty.tasks" => Some("No tasks recorded."),
-        "session.projection.plan.empty.risks" => Some("No risks recorded."),
-        "session.projection.plan.empty.reviewCheckpoints" => {
-            Some("No review checkpoints recorded.")
-        }
-        "session.projection.review.empty.changedFiles" => Some("No changed files recorded."),
-        "session.projection.review.empty.generatedArtifacts" => {
-            Some("ReviewFacts did not record generated artifacts.")
-        }
-        "session.projection.review.empty.pathDiagnostics" => {
-            Some("No path normalization diagnostics were recorded.")
-        }
-        "session.projection.review.empty.gitChanges" => Some("No Git change facts are available."),
-        "session.projection.review.empty.auditDetails" => Some("No audit details are available."),
-        "session.projection.review.empty.validation" => {
-            Some("No validation guidance was recorded.")
-        }
-        _ => None,
-    }
-}
-
-fn find_pending_session_decision(
-    timeline: &Value,
-    requested_kind: &str,
-    run_filter: Option<&str>,
-) -> Option<PendingSessionDecision> {
-    let pending = timeline_payload(timeline)
-        .get("interactionProjection")?
-        .get("pending")?;
-    let kind = pending.get("kind").and_then(Value::as_str)?;
-    if kind != requested_kind {
-        return None;
-    }
-    let run_id = pending.get("runId").and_then(Value::as_str)?.to_string();
-    if run_filter.is_some_and(|expected| expected != run_id) {
-        return None;
-    }
-    let target_id = match kind {
-        "plan" => pending.get("planId"),
-        "review" => pending.get("reviewId"),
-        "requirement" => pending.get("requirementId"),
-        _ => None,
-    }
-    .and_then(Value::as_str)
-    .map(ToOwned::to_owned);
-    Some(PendingSessionDecision { run_id, target_id })
-}
-
-fn extract_final_text(timeline: &Value) -> Option<String> {
-    let turns = timeline.get("turns").and_then(Value::as_array)?;
-    for turn in turns.iter().rev() {
-        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks.iter().rev() {
-            let narrative = block
-                .get("narrativeKind")
-                .or_else(|| block.get("kind"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if narrative != "assistantText" && narrative != "assistant" {
-                continue;
-            }
-            let text = block
-                .get("bodyMarkdown")
-                .or_else(|| block.get("summary"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
-}
-
-fn extract_plain_text(timeline: &Value) -> Option<String> {
-    extract_final_text(timeline).or_else(|| extract_pending_decision_text(timeline))
-}
-
-fn extract_pending_decision_text(timeline: &Value) -> Option<String> {
-    let timeline = timeline_payload(timeline);
-    let pending_value = timeline.get("interactionProjection")?.get("pending")?;
-    let decision_kind = pending_value.get("kind").and_then(Value::as_str)?;
-    let pending = find_pending_session_decision(timeline, decision_kind, None)?;
-    let heading = match decision_kind {
-        "plan" => "Pending plan decision",
-        "review" => "Pending review decision",
-        "requirement" => "Pending requirement decision",
-        "permission" => "Pending permission decision",
-        _ => "Pending decision",
-    };
-    let block = pending_value
-        .get("blockId")
-        .and_then(Value::as_str)
-        .and_then(|block_id| timeline_block_by_id(timeline, block_id));
-    Some(render_pending_decision_text(
-        timeline.get("sessionId").and_then(Value::as_str),
-        decision_kind,
-        heading,
-        pending_value,
-        block,
-        pending,
-    ))
-}
-
-fn render_pending_decision_text(
-    session_id: Option<&str>,
-    decision_kind: &str,
-    heading: &str,
-    pending_value: &Value,
-    block: Option<&Value>,
-    pending: PendingSessionDecision,
-) -> String {
-    let mut lines = vec![heading.to_string()];
-    if let Some(title) = pending_value
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    {
-        lines.push(title.to_string());
-    }
-    if let Some(readable) = block.and_then(|item| item.get("structuredProjection")) {
-        let rendered = render_readable_projection(readable);
-        if !rendered.trim().is_empty() {
-            lines.push(rendered);
-        }
-    } else if let Some(summary) = pending_value
-        .get("summary")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    {
-        lines.push(summary.to_string());
-    }
-    lines.push(format!(
-        "Decision target: {decision_kind} run={} target={}",
-        pending.run_id,
-        pending.target_id.as_deref().unwrap_or("-")
-    ));
-    if let Some(session_id) = session_id {
-        lines.push(format!(
-            "Accept: DeepCode-CLI --session {session_id} decision {decision_kind} accept"
-        ));
-        lines.push(format!(
-            "Revise: DeepCode-CLI --session {session_id} decision {decision_kind} revise <guidance>"
-        ));
-    }
-    lines.join("\n")
-}
-
-fn timeline_block_by_id<'a>(timeline: &'a Value, block_id: &str) -> Option<&'a Value> {
-    for turn in timeline.get("turns")?.as_array()? {
-        for block in turn.get("blocks")?.as_array()? {
-            if block.get("id").and_then(Value::as_str) == Some(block_id) {
-                return Some(block);
-            }
-        }
-    }
-    None
-}
-
-fn normalize_render_text(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn session_id(session: &Value) -> Option<&str> {
-    session.get("id").and_then(Value::as_str)
-}
-
-fn timeline_payload(timeline: &Value) -> &Value {
-    timeline.get("data").unwrap_or(timeline)
-}
-
-fn session_title(session: &Value) -> &str {
-    session
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("Untitled Session")
-}
-
-fn print_help() {
-    println!(
-        r#"DeepCode CLI Host Shell
-
-Usage:
-  DeepCode-CLI --help
-  DeepCode-CLI daemon status
-  DeepCode-CLI sessions list [--include-archived]
-  DeepCode-CLI sessions new [title]
-  DeepCode-CLI sessions resume <session-id>
-  DeepCode-CLI sessions rename <session-id> <title>
-  DeepCode-CLI sessions delete <session-id>
-  DeepCode-CLI sessions archive <session-id>
-  DeepCode-CLI timeline [session-id]
-  DeepCode-CLI permission allow <permission-id>
-  DeepCode-CLI permission deny <permission-id>
-  DeepCode-CLI decision <requirement|plan|review> <accept|reject|revise> [--session <id>] [run-id] [target-id] [guidance]
-  DeepCode-CLI ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
-
-Options:
-  --api <url>                 Kernel daemon HTTP base URL. Defaults to DEEPCODE_API_URL or http://$DEEPCODE_HOST:$DEEPCODE_PORT.
-  --no-auto-start-kernel      Do not start a local Kernel when the API is unavailable.
-  --workspace, -C             Bind the turn to a workspace path. Defaults to DEEPCODE_WORKSPACE or the current directory.
-  --no-workspace              Send an ordinary chat turn without a workspace binding.
-  --session <id>              Continue a specific Agent session.
-
-Environment:
-  DEEPCODE_KERNEL_AUTO_START=0 disables local Kernel auto-start.
-  DEEPCODE_KERNEL_BIN=/path/to/deepcode-kernel overrides Kernel binary lookup.
-  DEEPCODE_WORKSPACE=/path/to/project sets the default terminal workspace.
-  DEEPCODE_SESSION_BRIDGE=/path/to/hostBridge.js overrides daemon session-core lookup.
-  DEEPCODE_NODE=/path/to/node overrides daemon internal Node runtime lookup.
-  DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls daemon session run timeout. Defaults to 600000; 0 disables it.
-  DEEPCODE_CLI_RUN_TIMEOUT_MS stops CLI polling after the given milliseconds. Defaults to no CLI-side timeout; 0 disables it.
-
-Session Runtime:
-  Ordinary input is submitted to daemon /api/agent/sessions/:id/runs.
-  CLI only polls run status and renders shared timeline projection.
-  Decision run-id/target-id are optional when the current shared timeline has one pending matching decision.
-  If the daemon session runtime is missing, run `pnpm --filter @deepcode/session-core build`
-  or use a packaged distribution that includes session-core/dist, node_modules/@deepcode/protocol,
-  and node/bin/node.
-
-Boundary:
-  CLI/TUI/GUI/Editor are shells over the same daemon Session Runtime, Kernel permissions, and timeline projection."#
-    );
-}
-
-fn print_interactive_help(host: &SessionHostOptions) {
-    println!(
-        r#"DeepCode CLI Host Shell
-
-Core:
-  /help                 Show this command list
-  /status               Check Kernel daemon health
-  /workspace            Show current workspace binding
-  /workspace <path>     Bind terminal turns to a workspace
-  /workspace cwd        Bind to the current directory
-  /workspace clear      Clear workspace binding; ordinary chat remains available
-  /quit                 Exit
-
-Sessions:
-  /sessions             List Agent sessions for the current workspace scope
-  /timeline             Print current session timeline
-
-Permissions and decisions:
-  /decision ...         Resolve requirement/plan/review through the shared Session Runtime
-  decision plan accept  Confirm the latest pending plan in the shared timeline projection
-  decision plan revise  Submit review guidance for a pending plan
-  decision plan reject  End a pending plan
-  any text              Send a message through the shared Session Runtime
-
-Non-interactive:
-  DeepCode-CLI daemon status
-  DeepCode-CLI sessions list
-  DeepCode-CLI timeline [session-id]
-  DeepCode-CLI ask "..."          Run a live turn
-  DeepCode-CLI -p ask "..."       Print only the final answer
-
-This shell uses the same daemon Session Runtime and Kernel permission settings as the GUI/Editor."#
-    );
-    println!("{}", workspace_status(host));
-    println!("session runtime: daemon /runs");
-    println!(
-        "session run timeout: DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS, default 600000 ms, 0 disables"
-    );
-    println!("cli wait timeout: DEEPCODE_CLI_RUN_TIMEOUT_MS, default unset, 0 disables");
-    if !io::stdin().is_terminal() {
-        println!("stdin is not a terminal; EOF exits immediately.");
-    }
-}
+pub(crate) use render::*;
+pub(crate) use session::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn timeline_with_pending(kind: &str, run_id: &str, target_key: &str, target_id: &str) -> Value {
-        let mut timeline = json!({
-            "sessionId": "session-test",
-            "interactionProjection": {
-                "pending": {
-                    "kind": kind,
-                    "runId": run_id
-                }
-            },
-            "turns": []
-        });
-        timeline["interactionProjection"]["pending"][target_key] = json!(target_id);
-        timeline
-    }
-
-    fn canonical_pending_fixture(
-        raw: &Value,
-        session_id: &str,
-        kind: &str,
-        run_id: &str,
-        target_key: &str,
-        target_id: &str,
-    ) -> Value {
-        let readable_key = if kind == "review" {
-            "readableReview"
-        } else {
-            "readablePlan"
-        };
-        let readable = timeline_payload(raw)
-            .get("turns")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .flat_map(|turn| {
-                turn.get("blocks")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-            })
-            .flat_map(|block| {
-                block
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-            })
-            .find_map(|event| {
-                event
-                    .get("payload")
-                    .and_then(|payload| payload.get(readable_key))
-            })
-            .cloned()
-            .unwrap_or_else(|| json!({ "sections": [] }));
-        let mut structured = readable;
-        structured["kind"] = json!(kind);
-        let mut timeline = json!({
-            "sessionId": session_id,
-            "interactionProjection": {
-                "pending": {
-                    "kind": kind,
-                    "runId": run_id,
-                    "blockId": "pending-block"
-                }
-            },
-            "turns": [{
-                "blocks": [{
-                    "id": "pending-block",
-                    "narrativeKind": kind,
-                    "structuredProjection": structured
-                }]
-            }]
-        });
-        timeline["interactionProjection"]["pending"][target_key] = json!(target_id);
-        timeline
-    }
-
-    #[test]
-    fn selects_latest_pending_plan_from_projection_events() {
-        let timeline = timeline_with_pending("plan", "run-b", "planId", "plan-b");
-
-        let pending = find_pending_session_decision(&timeline, "plan", None).unwrap();
-        assert_eq!(
-            pending,
-            PendingSessionDecision {
-                run_id: "run-b".to_string(),
-                target_id: Some("plan-b".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn selects_pending_plan_matching_explicit_run_filter() {
-        let timeline = timeline_with_pending("plan", "run-a", "planId", "plan-a");
-
-        let pending = find_pending_session_decision(&timeline, "plan", Some("run-a")).unwrap();
-        assert_eq!(
-            pending,
-            PendingSessionDecision {
-                run_id: "run-a".to_string(),
-                target_id: Some("plan-a".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn ignores_plan_consumed_by_terminal_plan_review() {
-        let timeline = json!({ "sessionId": "session-test", "turns": [] });
-
-        assert!(find_pending_session_decision(&timeline, "plan", None).is_none());
-    }
-
-    #[test]
-    fn selects_pending_requirement_confirmation() {
-        let timeline =
-            timeline_with_pending("requirement", "run-a", "requirementId", "requirement-a");
-
-        let pending = find_pending_session_decision(&timeline, "requirement", None).unwrap();
-        assert_eq!(
-            pending,
-            PendingSessionDecision {
-                run_id: "run-a".to_string(),
-                target_id: Some("requirement-a".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn selects_pending_review_summary() {
-        let timeline = timeline_with_pending("review", "run-a", "reviewId", "review-a");
-
-        let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
-        assert_eq!(
-            pending,
-            PendingSessionDecision {
-                run_id: "run-a".to_string(),
-                target_id: Some("review-a".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn selects_confirmable_review_summary_without_status() {
-        let timeline = timeline_with_pending("review", "run-a", "reviewId", "review-a");
-
-        let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
-        assert_eq!(
-            pending,
-            PendingSessionDecision {
-                run_id: "run-a".to_string(),
-                target_id: Some("review-a".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn print_text_uses_pending_plan_projection() {
-        let timeline = json!({
-            "sessionId": "session-print",
-            "turns": [
-                {
-                    "blocks": [
-                        {
-                            "narrativeKind": "thinking",
-                            "title": "Thinking",
-                            "bodyMarkdown": "internal reasoning should stay out of compact decision output"
-                        },
-                        {
-                            "events": [
-                                {
-                                    "kind": "plan_card",
-                                    "payload": {
-                                        "confirmable": true,
-                                        "runId": "run-print",
-                                        "planId": "plan-print",
-                                        "title": "Prepare generic work",
-                                        "readablePlan": {
-                                            "summary": "Plan summary text",
-                                            "sections": [
-                                                {
-                                                    "sectionId": "tasks",
-                                                    "titleKey": "session.projection.plan.section.tasks",
-                                                    "items": [
-                                                {
-                                                    "kind": "task",
-                                                    "text": "Write generic module",
-                                                    "targetRefs": ["src/generic.ts"]
-                                                },
-                                                {
-                                                    "kind": "fact",
-                                                    "messageKey": "session.projection.plan.boundary.notExecution"
-                                                }
-                                            ]
-                                        }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
-        let timeline = canonical_pending_fixture(
-            &timeline,
-            "session-print",
-            "plan",
-            "run-print",
-            "planId",
-            "plan-print",
-        );
-
-        let text = extract_plain_text(&timeline).expect("pending plan text");
-        assert!(text.contains("Pending plan decision"));
-        assert!(text.contains("Plan summary text"));
-        assert!(text.contains("## Tasks"));
-        assert!(text.contains("Write generic module"));
-        assert!(text.contains("This is a plan, not an execution result."));
-        assert!(text.contains("Decision target: plan run=run-print target=plan-print"));
-        assert!(text.contains("DeepCode-CLI --session session-print decision plan accept"));
-        assert!(!text.contains("session.projection.plan.section.tasks"));
-    }
-
-    #[test]
-    fn print_text_deduplicates_structured_plan_summary() {
-        let timeline = json!({
-            "sessionId": "session-dedupe",
-            "turns": [
-                {
-                    "blocks": [
-                        {
-                            "events": [
-                                {
-                                    "kind": "plan_card",
-                                    "payload": {
-                                        "confirmable": true,
-                                        "runId": "run-dedupe",
-                                        "planId": "plan-dedupe",
-                                        "summary": "Shared summary",
-                                        "readablePlan": {
-                                            "summary": "Shared summary",
-                                            "sections": [
-                                                {
-                                                    "sectionId": "summary",
-                                                    "titleKey": "session.projection.plan.section.summary",
-                                                    "items": [
-                                                        {
-                                                            "kind": "text",
-                                                            "text": "Shared summary"
-                                                        }
-                                                    ]
-                                                },
-                                                {
-                                                    "sectionId": "tasks",
-                                                    "titleKey": "session.projection.plan.section.tasks",
-                                                    "items": [
-                                                        {
-                                                            "kind": "task",
-                                                            "text": "Complete generic step"
-                                                        }
-                                                    ]
-                                                }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
-        let timeline = canonical_pending_fixture(
-            &timeline,
-            "session-dedupe",
-            "plan",
-            "run-dedupe",
-            "planId",
-            "plan-dedupe",
-        );
-
-        let text = extract_plain_text(&timeline).expect("pending plan text");
-        assert_eq!(text.matches("Shared summary").count(), 1);
-        assert!(text.contains("## Summary"));
-        assert!(text.contains("## Tasks"));
-        assert!(text.contains("Complete generic step"));
-        assert!(text.contains("Decision target: plan run=run-dedupe target=plan-dedupe"));
-    }
-
-    #[test]
-    fn print_text_renders_pending_review_projection_without_raw_keys() {
-        let timeline = json!({
-            "sessionId": "session-review",
-            "turns": [
-                {
-                    "blocks": [
-                        {
-                            "events": [
-                                {
-                                    "kind": "review_summary",
-                                    "payload": {
-                                        "confirmable": true,
-                                        "status": "waitingUserReview",
-                                        "runId": "run-review",
-                                        "reviewId": "review-1",
-                                        "sourcePlanId": "plan-1",
-                                        "readableReview": {
-                                            "summaryKey": "review.summary.waitingUserReview",
-                                            "sections": [
-                                                {
-                                                    "sectionId": "executionResult",
-                                                    "titleKey": "session.projection.review.section.executionResult",
-                                                    "items": [
-                                                        {
-                                                            "kind": "fact",
-                                                            "messageKey": "session.projection.review.count.workUnitsCompleted",
-                                                            "messageArgs": { "count": "2" }
-                                                        }
-                                                    ]
-                                                },
-                                                {
-                                                    "sectionId": "changedFiles",
-                                                    "titleKey": "session.projection.review.section.changedFiles",
-                                                    "items": [
-                                                        {
-                                                            "kind": "target",
-                                                            "messageKey": "review.changedFile",
-                                                            "messageArgs": {
-                                                                "path": "src/module.txt",
-                                                                "operation": "write",
-                                                                "status": "completed"
-                                                            },
-                                                            "targetRefs": ["src/module.txt"]
-                                                        },
-                                                        {
-                                                            "kind": "target",
-                                                            "messageKey": "review.changedFile",
-                                                            "messageArgs": {
-                                                                "path": "src/module.txt",
-                                                                "operation": "write",
-                                                                "status": "completed"
-                                                            },
-                                                            "targetRefs": ["src/module.txt"]
-                                                        }
-                                                    ]
-                                                }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
-        let timeline = canonical_pending_fixture(
-            &timeline,
-            "session-review",
-            "review",
-            "run-review",
-            "reviewId",
-            "review-1",
-        );
-
-        let text = extract_plain_text(&timeline).expect("pending review text");
-        assert!(text.contains("Pending review decision"));
-        assert!(text.contains("The current batch has executed."));
-        assert!(text.contains("## Execution result"));
-        assert!(text.contains("WorkUnits completed: 2"));
-        assert!(text.contains("## Files changed in this batch"));
-        assert_eq!(
-            text.matches("src/module.txt operation=write status=completed")
-                .count(),
-            1
-        );
-        assert!(!text.contains("review.summary.waitingUserReview"));
-        assert!(!text.contains("session.projection.review.count.workUnitsCompleted"));
-        assert!(!text.contains("internal reasoning should stay out"));
-        assert!(text.contains("Decision target: review run=run-review target=review-1"));
-        assert!(text.contains("DeepCode-CLI --session session-review decision review accept"));
-    }
-
-    #[test]
-    fn print_text_uses_pending_plan_projection_from_api_wrapper() {
-        let timeline = json!({
-            "ok": true,
-            "data": {
-                "sessionId": "session-print-wrapper",
-                "turns": [
-                    {
-                        "blocks": [
-                            {
-                                "events": [
-                                    {
-                                        "kind": "plan_card",
-                                        "payload": {
-                                            "confirmable": true,
-                                            "runId": "run-wrapper",
-                                            "planId": "plan-wrapper",
-                                            "readablePlan": {
-                                                "summary": "Wrapped plan summary"
-                                            }
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
-        let canonical = canonical_pending_fixture(
-            &timeline,
-            "session-print-wrapper",
-            "plan",
-            "run-wrapper",
-            "planId",
-            "plan-wrapper",
-        );
-        let timeline = json!({ "ok": true, "data": canonical });
-
-        let text = extract_plain_text(&timeline).expect("pending plan text");
-        assert!(text.contains("Pending plan decision"));
-        assert!(text.contains("Wrapped plan summary"));
-        assert!(text.contains("Decision target: plan run=run-wrapper target=plan-wrapper"));
-        assert!(text.contains("DeepCode-CLI --session session-print-wrapper decision plan accept"));
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

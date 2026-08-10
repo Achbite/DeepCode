@@ -28,22 +28,12 @@ pub struct PluginBundleContents {
     pub workflows: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginBundlePolicy {
     pub auto_enable_skills: bool,
     pub auto_enable_mcp: bool,
     pub postinstall_allowed: bool,
-}
-
-impl Default for PluginBundlePolicy {
-    fn default() -> Self {
-        Self {
-            auto_enable_skills: false,
-            auto_enable_mcp: false,
-            postinstall_allowed: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

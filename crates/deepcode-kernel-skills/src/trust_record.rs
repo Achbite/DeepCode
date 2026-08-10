@@ -10,7 +10,7 @@ pub enum SkillTrustMode {
 }
 
 impl SkillTrustMode {
-    pub fn is_v1_runtime_enabled(&self) -> bool {
+    pub fn is_activation_eligible(&self) -> bool {
         matches!(self, Self::Declarative | Self::BrokeredScript)
     }
 
@@ -23,7 +23,6 @@ impl SkillTrustMode {
 #[serde(rename_all = "camelCase")]
 pub struct SkillTrustRecord {
     pub skill_id: String,
-    #[serde(alias = "scriptHash")]
     pub revision_hash: Option<String>,
     pub approved_capabilities: Vec<Capability>,
     pub approved_at: Option<String>,
@@ -34,7 +33,7 @@ pub struct SkillTrustRecord {
 }
 
 impl SkillTrustRecord {
-    pub fn direct_host_placeholder(skill_id: impl Into<String>) -> Self {
+    pub fn disabled_direct_host(skill_id: impl Into<String>) -> Self {
         Self {
             skill_id: skill_id.into(),
             revision_hash: None,
@@ -53,17 +52,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_host_script_is_not_v1_runtime_enabled() {
-        let record = SkillTrustRecord::direct_host_placeholder("skill.direct-host");
+    fn direct_host_script_is_not_activation_eligible() {
+        let record = SkillTrustRecord::disabled_direct_host("skill.direct-host");
 
         assert_eq!(record.trust_mode, SkillTrustMode::DirectHostScript);
-        assert!(!record.trust_mode.is_v1_runtime_enabled());
+        assert!(!record.trust_mode.is_activation_eligible());
         assert!(!record.trust_mode.requires_kernel_broker());
     }
 
     #[test]
     fn brokered_script_requires_kernel_broker() {
-        assert!(SkillTrustMode::BrokeredScript.is_v1_runtime_enabled());
+        assert!(SkillTrustMode::BrokeredScript.is_activation_eligible());
         assert!(SkillTrustMode::BrokeredScript.requires_kernel_broker());
     }
 }

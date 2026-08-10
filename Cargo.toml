@@ -1,15 +1,12 @@
 [workspace]
 members = [
   "crates/deepcode-kernel-abi",
-  "crates/deepcode-kernel-core",
   "crates/deepcode-kernel-config",
   "crates/deepcode-kernel-policy",
   "crates/deepcode-kernel-tools",
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-skills",
-  "crates/deepcode-kernel-workflow",
   "crates/deepcode-kernel-ledger",
-  "crates/deepcode-kernel-audit",
   "crates/deepcode-kernel-client",
   "crates/deepcode-kernel-daemon",
   "crates/deepcode-host-web",
@@ -22,9 +19,9 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.24"
+version = "0.5.40"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.84"
 license = "MIT"
 authors = ["DeepCode Team"]
 
@@ -42,9 +39,7 @@ deepcode-kernel-policy = { path = "crates/deepcode-kernel-policy" }
 deepcode-kernel-tools = { path = "crates/deepcode-kernel-tools" }
 deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-skills = { path = "crates/deepcode-kernel-skills" }
-deepcode-kernel-workflow = { path = "crates/deepcode-kernel-workflow" }
 deepcode-kernel-daemon = { path = "crates/deepcode-kernel-daemon" }
-deepcode-kernel-audit = { path = "crates/deepcode-kernel-audit" }
 deepcode-kernel-client = { path = "crates/deepcode-kernel-client" }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -53,8 +48,12 @@ serde_yaml = "0.9"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tower-http = { version = "0.5", features = ["fs", "cors"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
+regex = "1"
+pdf-extract = "0.9"
 sha2 = "0.10"
+unicode-normalization = "=0.1.25"
 ratatui = "0.29"
 crossterm = "0.28"
 portable-pty = "0.8"

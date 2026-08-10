@@ -98,7 +98,7 @@ export interface OpenWorkspaceRequest {
    *   - 一个目录
    *   - 一个 .code-workspace 文件
    *
-   * 必须是绝对路径；该路由是工作区入口，不受 /api/files/* 的相对路径约束。
+   * 必须是绝对路径；该 Host 管理入口不受 Agent run-relative 工具路径约束。
    */
   path: string;
 }
@@ -174,7 +174,7 @@ export interface BrowseEntry {
 export interface BrowsePathQuery {
   /**
    * 要浏览的绝对路径；不传或空字符串时由后端返回首选起点（用户主目录）。
-   * 与 /api/files/* 不同，本路由出于"打开工作区"场景必须接受绝对路径。
+   * 该 Host 管理路由出于"打开工作区"场景必须接受绝对路径。
    */
   path?: string;
 }

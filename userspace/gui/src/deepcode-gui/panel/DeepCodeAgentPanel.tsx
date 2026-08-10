@@ -1,7 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import type { AgentTimelineResult } from '@deepcode/protocol';
-import { getLlmProfiles } from '../../services/runtimeAdapter';
+import type {
+  AgentTimelineResult,
+  AgentWorkspaceBinding,
+} from '@deepcode/protocol';
+import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
+import type { AgentSessionSubmissionTarget } from '../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
@@ -11,15 +15,26 @@ import {
   type AgentComposerPendingDecision,
 } from '../../components/agent-panel/pendingDecision';
 import DeepCodeTimeline from './DeepCodeTimeline';
+import SessionModelSelector from './SessionModelSelector';
 
 interface DeepCodeAgentPanelProps {
   language: UiLanguage;
   timeline: AgentTimelineResult;
+  agentReady: boolean;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
+  projectWorkspaceBinding?: AgentWorkspaceBinding;
+  projectContext?: boolean;
+  submissionScopeId?: string | null;
   suppressPendingDecision?: boolean;
-  onBeforeSend?: () => Promise<boolean | void> | boolean | void;
-  onAfterSend?: () => Promise<void> | void;
+  onBeforeSend?: () => Promise<AgentSessionSubmissionTarget | boolean | void>
+    | AgentSessionSubmissionTarget
+    | boolean
+    | void;
+  onAfterSend?: (
+    submissionScopeId: string | null,
+    submittedDraftCleared: boolean
+  ) => Promise<void> | void;
 }
 
 function displaySessionTitle(language: UiLanguage, title?: string): string {
@@ -33,58 +48,93 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
 const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   language,
   timeline,
+  agentReady,
   forceHome = false,
   homeProjectTitle,
+  projectWorkspaceBinding,
+  projectContext = false,
+  submissionScopeId,
   suppressPendingDecision = false,
   onBeforeSend,
   onAfterSend,
 }) => {
   const session = useAgentSessionStore((s) => s.session);
-  const profileId = useAgentSessionStore((s) => s.profileId);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
+  const activeSubmissionSessionIds = useAgentSessionStore((s) => s.activeSubmissionSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
-  const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
-  const setProfileId = useAgentSessionStore((s) => s.setProfileId);
+  const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
+  const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
+  const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
+  const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
-  const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
-  const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
-  const resolveReview = useAgentSessionStore((s) => s.resolveReview);
-  const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
+  const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
+  const activeFolderId = useWorkspaceStore((s) => (
+    s.activeFolderId ?? s.getActiveFolder()?.id ?? null
+  ));
+  const attachmentWorkspaceBinding =
+    session?.workspaceBinding ?? projectWorkspaceBinding;
+  const allowGlobalAttachmentWorkspaceFallback =
+    !session?.projectId && !projectContext;
   const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
-  const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
+  const [modelAvailable, setModelAvailable] = useState(false);
+  const sessionRunning = Boolean(
+    session?.id
+    && (
+      runningSessionIds.includes(session.id)
+      || activeRunSessionIds.includes(session.id)
+      || cancellingSessionIds.includes(session.id)
+    )
+  );
+  const waitingForUser = timeline.runProjection?.status === 'waitingUser'
+    || timeline.runProjection?.wait?.kind === 'user';
 
   useEffect(() => {
-    void loadOrCreate();
+    if (forceHome || session?.projectId) return;
     void refreshSessions();
-    const loadProfiles = () => getLlmProfiles().then((result) => {
-      if (result.ok && result.data) {
-        setProfileId(profileId ?? result.data.defaultProfileId);
-      }
-    });
-    void loadProfiles();
-    window.addEventListener('deepcode:llm-profiles-updated', loadProfiles);
-    return () => window.removeEventListener('deepcode:llm-profiles-updated', loadProfiles);
-  }, [loadOrCreate, profileId, refreshSessions, setProfileId]);
+    void loadOrCreate();
+  }, [
+    forceHome,
+    loadOrCreate,
+    refreshSessions,
+    session?.projectId,
+    workspaceScopeKey,
+  ]);
 
   useEffect(() => {
-    void loadOrCreate();
-    void refreshSessions();
-  }, [loadOrCreate, refreshSessions, workspaceRevision]);
+    if (
+      attachmentWorkspaceBinding
+      && !attachmentWorkspaceBinding.activeFolderId
+    ) {
+      return;
+    }
+    synchronizeAttachmentRoot(
+      attachmentWorkspaceBinding?.activeFolderId
+        ?? (allowGlobalAttachmentWorkspaceFallback ? activeFolderId : null)
+    );
+  }, [
+    activeFolderId,
+    allowGlobalAttachmentWorkspaceFallback,
+    attachmentWorkspaceBinding,
+    synchronizeAttachmentRoot,
+  ]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;
@@ -92,9 +142,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     ? null
     : findPendingComposerDecisionFromProjection({
       timeline,
-      resolvingRequirement,
       resolvingPlan,
-      resolvingReview,
       resolvingPermission,
     });
   const pendingDecisionKey = pendingDecisionIdentity(pendingDecision);
@@ -127,6 +175,12 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
+  const profileLocked = sessionRunning || Boolean(timeline.interactionProjection?.pending);
+  const pendingSubmissionRetry = !forceHome && session?.id
+    && pendingSubmissionSessionIds.includes(session.id)
+    && !activeSubmissionSessionIds.includes(session.id)
+    ? pendingSubmissionRetryView(session.id)
+    : null;
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
@@ -136,32 +190,69 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     <AgentComposer
       messageAttachments={messageAttachments}
       sessionAttachments={sessionAttachments}
+      attachmentWorkspaceBinding={attachmentWorkspaceBinding}
+      allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
       language={language}
       loading={composerRunning}
+      submissionScopeId={submissionScopeId ?? session?.id ?? null}
+      canCancelCurrentRun={Boolean(
+        !forceHome && session?.id && activeRunSessionIds.includes(session.id)
+      )}
       onSend={async (content) => {
         requestFollowLatest();
-        const shouldContinue = await onBeforeSend?.();
-        if (shouldContinue === false) return;
-        await sendMessage(content);
-        await onAfterSend?.();
+        const prepared = await onBeforeSend?.();
+        if (prepared === false) return false;
+        const expectedTarget = typeof prepared === 'object' && prepared !== null
+          ? prepared
+          : captureSubmissionTarget();
+        if (!expectedTarget) return false;
+        return sendMessage(content, { expectedTarget });
+      }}
+      pendingSubmissionRetry={pendingSubmissionRetry}
+      onRetryPendingSubmission={async (clearOriginalMessageAttachments) => {
+        requestFollowLatest();
+        return retryPendingSubmission(clearOriginalMessageAttachments);
+      }}
+      onSubmissionSettled={(
+        admitted,
+        settledSubmissionScopeId,
+        submittedDraftCleared
+      ) => {
+        if (admitted && onAfterSend) {
+          void Promise.resolve()
+            .then(() => onAfterSend(
+              settledSubmissionScopeId,
+              submittedDraftCleared
+            ))
+            .catch(() => undefined);
+        }
       }}
       onStop={() => void cancelCurrentRun()}
       onAddAttachment={addAttachment}
       onRemoveAttachment={removeAttachment}
+      footerControls={(
+        <SessionModelSelector
+          language={language}
+          locked={profileLocked}
+          onAvailabilityChange={setModelAvailable}
+        />
+      )}
+      sendBlocked={!agentReady || !modelAvailable}
+      sendBlockedTitle={!agentReady
+        ? t(language, 'agent.readiness.pending')
+        : !modelAvailable
+        ? t(
+          language,
+          session && !session.profileId
+            ? 'agent.profile.selectionRequired'
+            : 'agent.profile.unavailable'
+        )
+        : undefined}
       pendingDecision={composerPendingDecision}
       onDecisionSubmit={(guidance, action) => {
         if (!composerPendingDecision) return;
         requestFollowLatest();
         const decision = action ?? (guidance ? 'revise' : 'accept');
-        if (composerPendingDecision.kind === 'requirement') {
-          void resolveRequirement(
-            composerPendingDecision.runId,
-            composerPendingDecision.requirementId,
-            decision,
-            guidance
-          );
-          return;
-        }
         if (composerPendingDecision.kind === 'plan') {
           void resolvePlan(
             composerPendingDecision.runId,
@@ -169,66 +260,55 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
             decision,
             guidance
           );
-          return;
-        }
-        if (composerPendingDecision.kind === 'review') {
-          void resolveReview(composerPendingDecision.runId, decision, guidance);
         }
       }}
       onDecisionReject={() => {
         if (!composerPendingDecision) return;
         requestFollowLatest();
-        if (composerPendingDecision.kind === 'requirement') {
-          void resolveRequirement(composerPendingDecision.runId, composerPendingDecision.requirementId, 'reject');
-          return;
-        }
         if (composerPendingDecision.kind === 'plan') {
           void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
-          return;
-        }
-        if (composerPendingDecision.kind === 'review') {
-          void resolveReview(composerPendingDecision.runId, 'reject');
         }
       }}
     />
   );
 
-  if (showHome) {
-    return (
-      <div className="deepcode-gui-agent-panel deepcode-gui-agent-panel--home">
-        <div className="deepcode-gui-home-panel">
-          <h1>{homePrompt}</h1>
-          {composer}
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="deepcode-gui-agent-panel">
-      <header className="deepcode-gui-agent-panel__header">
-        <div>
-          <div className="deepcode-gui-agent-panel__title">{activeSessionTitle}</div>
-          <div className="deepcode-gui-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
-        </div>
-        <button type="button" aria-label={t(language, 'deepcodeGui.session.actions')}>...</button>
-      </header>
+    <div className={`deepcode-gui-agent-panel${showHome ? ' deepcode-gui-agent-panel--home' : ''}`}>
+      {!showHome && (
+        <header className="deepcode-gui-agent-panel__header">
+          <div>
+            <div className="deepcode-gui-agent-panel__title">{activeSessionTitle}</div>
+            <div className="deepcode-gui-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
+          </div>
+          <button type="button" aria-label={t(language, 'deepcodeGui.session.actions')}>...</button>
+        </header>
+      )}
 
-      <DeepCodeTimeline
-        timeline={timeline}
-        loading={sessionRunning}
-        language={language}
-        followLatestSignal={followLatestSignal}
-        scrollWatchElement={bottomChromeElement}
-        onTypewriterBlocksChange={setTimelineTypewriterBlockIds}
-        onPlanResolve={(runId, planId, decision, guidance) => {
-          requestFollowLatest();
-          void resolvePlan(runId, planId, decision, guidance);
-        }}
-      />
+      {!showHome && (
+        <DeepCodeTimeline
+          timeline={timeline}
+          loading={sessionRunning && !waitingForUser}
+          language={language}
+          followLatestSignal={followLatestSignal}
+          scrollWatchElement={bottomChromeElement}
+          onTypewriterBlocksChange={(blockIds) => {
+            setTimelineTypewriterBlockIds(blockIds);
+          }}
+          onPlanResolve={(runId, planId, decision, guidance) => {
+            requestFollowLatest();
+            void resolvePlan(runId, planId, decision, guidance);
+          }}
+        />
+      )}
 
-      <div ref={setBottomChromeElement}>
-        {pendingPermissionRequest && (
+      <div
+        key="composer-region"
+        ref={setBottomChromeElement}
+        className={showHome ? 'deepcode-gui-home-panel' : undefined}
+      >
+        {showHome && <h1>{homePrompt}</h1>}
+
+        {!showHome && pendingPermissionRequest && (
           <PermissionRequestBubble
             request={pendingPermissionRequest}
             language={language}
@@ -249,8 +329,15 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           />
         )}
 
-        {errorMessage && (
-          <div className="deepcode-gui-agent-panel__error">{errorMessage}</div>
+        {!showHome && errorMessage && (
+          <div className="deepcode-gui-agent-panel__error">
+            <span>{errorMessage}</span>
+            {!agentReady && (
+              <button type="button" onClick={() => void loadOrCreate()}>
+                {t(language, 'deepcodeGui.statusAction.retry')}
+              </button>
+            )}
+          </div>
         )}
 
         {composer}
@@ -261,14 +348,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 
 function pendingDecisionIdentity(decision: AgentComposerPendingDecision | null): string | null {
   if (!decision) return null;
-  if (decision.kind === 'requirement') {
-    return `${decision.kind}:${decision.runId}:${decision.requirementId}`;
-  }
   if (decision.kind === 'plan') {
     return `${decision.kind}:${decision.runId}:${decision.planId}`;
-  }
-  if (decision.kind === 'review') {
-    return `${decision.kind}:${decision.runId}`;
   }
   return `${decision.kind}:${decision.requestId}`;
 }

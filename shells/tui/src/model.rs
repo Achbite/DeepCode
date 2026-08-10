@@ -1,18 +1,21 @@
-use serde_json::Value;
+use deepcode_kernel_client::{
+    AgentTimelineBlock, AgentTimelineBlockKind, AgentTimelineCurrentActivityCode,
+    AgentTimelineEntryRole, AgentTimelineSnapshot, AgentTimelineStatus,
+    AgentTimelineStructuredProjection, AgentTimelineTurnPart, AgentTimelineWaitKind,
+    AgentTimelineWorkAttentionStatus, AgentTimelineWorkOperation, AgentTimelineWorkOperationStatus,
+    AgentTimelineWorkSegment, AgentTimelineWorkSegmentLifecycle,
+};
 
 #[derive(Debug, Clone)]
 pub enum CardKind {
     User,
     Assistant,
-    Thinking,
     CommandHelp,
-    Stage,
-    Tool,
+    Notice,
     Permission,
     Plan,
     Review,
     Error,
-    BridgeError,
     Final,
     AuditStatus,
 }
@@ -24,6 +27,30 @@ pub struct CardModel {
     pub body: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CurrentWorkModel {
+    pub activity: Option<String>,
+    pub wait: Option<String>,
+    pub segments: Vec<WorkSegmentModel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkSegmentModel {
+    pub title: String,
+    pub summary: String,
+    pub expanded: bool,
+    pub attention: Option<String>,
+    pub attention_unresolved: bool,
+    pub operations: Vec<WorkOperationModel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkOperationModel {
+    pub title: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
 impl CardModel {
     pub fn command_help() -> Self {
         Self::new(CardKind::CommandHelp, "帮助", command_help())
@@ -33,8 +60,8 @@ impl CardModel {
         Self::new(CardKind::User, "你", body)
     }
 
-    pub fn stage(title: impl Into<String>, body: impl Into<String>) -> Self {
-        Self::new(CardKind::Stage, title, body)
+    pub fn notice(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self::new(CardKind::Notice, title, body)
     }
 
     pub fn error(body: impl Into<String>) -> Self {
@@ -45,69 +72,50 @@ impl CardModel {
         Self::new(CardKind::AuditStatus, title, body)
     }
 
-    pub fn from_timeline(timeline: &Value) -> Vec<Self> {
-        let turns = timeline
-            .get("turns")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+    pub fn from_timeline(timeline: &AgentTimelineSnapshot) -> Vec<Self> {
         let mut cards = Vec::new();
-        for turn in turns {
-            let blocks = turn
-                .get("blocks")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for block in blocks {
-                cards.push(Self::from_timeline_block(&block));
+        for turn in &timeline.turns {
+            for part in &turn.parts {
+                if let AgentTimelineTurnPart::Block { block_id } = part {
+                    if let Some(block) = turn.blocks.iter().find(|block| &block.id == block_id) {
+                        if let Some(card) = Self::from_timeline_block(block) {
+                            cards.push(card);
+                        }
+                    }
+                }
             }
         }
         cards
     }
 
-    fn from_timeline_block(block: &Value) -> Self {
-        let kind = block.get_str("kind").unwrap_or("stage");
-        let narrative_kind = block.get_str("narrativeKind").unwrap_or(kind);
-        let status = block.get_str("status").unwrap_or("completed");
-        let title = block
-            .get_str("title")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| timeline_kind_title(narrative_kind));
-        let summary = block.get_str("summary").unwrap_or("");
-        let body = block
-            .get_str("bodyMarkdown")
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| structured_projection_text(block))
-            .unwrap_or_else(|| summary.to_string());
-        let card_kind = match narrative_kind {
-            "user" => CardKind::User,
-            "assistant" | "assistantText" => CardKind::Final,
-            "assistantNarration" => CardKind::Assistant,
-            "thinking" => CardKind::Thinking,
-            "toolBatch" | "operationEvidence" | "verification" => CardKind::Tool,
-            "permission" => CardKind::Permission,
-            "plan" => CardKind::Plan,
-            "review" => CardKind::Review,
-            "error" => CardKind::Error,
-            "bridgeError" => CardKind::BridgeError,
-            _ => match kind {
-                "user" => CardKind::User,
-                "assistant" => CardKind::Final,
-                "toolBatch" => CardKind::Tool,
-                "permission" => CardKind::Permission,
-                "plan" => CardKind::Plan,
-                "review" => CardKind::Review,
-                "error" => CardKind::Error,
-                "bridgeError" => CardKind::BridgeError,
-                _ => CardKind::Stage,
+    fn from_timeline_block(block: &AgentTimelineBlock) -> Option<Self> {
+        let body = block_body(block);
+        let card_kind = match block.entry_role {
+            AgentTimelineEntryRole::UserMessage => CardKind::User,
+            AgentTimelineEntryRole::AgentUpdate => CardKind::Assistant,
+            AgentTimelineEntryRole::FinalAnswer => CardKind::Final,
+            AgentTimelineEntryRole::Diagnostic => CardKind::Error,
+            AgentTimelineEntryRole::Interaction => match block.kind {
+                AgentTimelineBlockKind::Permission => CardKind::Permission,
+                AgentTimelineBlockKind::Plan => CardKind::Plan,
+                AgentTimelineBlockKind::Review => CardKind::Review,
+                AgentTimelineBlockKind::Error => CardKind::Error,
+                _ => return None,
             },
         };
-        Self::new(
-            card_kind,
-            format!("{title} · {}", status_label(status)),
-            body,
-        )
+        let title = match card_kind {
+            CardKind::User => "你".to_string(),
+            CardKind::Assistant | CardKind::Final => "DeepCode".to_string(),
+            _ => {
+                let title = if block.title.trim().is_empty() {
+                    timeline_kind_title(block.kind)
+                } else {
+                    block.title.as_str()
+                };
+                format!("{title} · {}", timeline_status_label(block.status))
+            }
+        };
+        Some(Self::new(card_kind, title, body))
     }
 
     fn new(kind: CardKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -119,51 +127,377 @@ impl CardModel {
     }
 }
 
-fn structured_projection_text(block: &Value) -> Option<String> {
-    let readable = block.get("structuredProjection")?;
+impl CurrentWorkModel {
+    pub fn from_timeline(timeline: &AgentTimelineSnapshot) -> Option<Self> {
+        let run = timeline.run_projection.as_ref();
+        let turn = run
+            .and_then(|run| run.turn_id.as_deref())
+            .and_then(|turn_id| timeline.turns.iter().find(|turn| turn.id == turn_id));
+
+        let activity = run
+            .and_then(|run| run.current_activity.0.as_ref())
+            .map(|activity| {
+                activity
+                    .summary
+                    .as_deref()
+                    .filter(|summary| !summary.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| current_activity_label(activity.code).to_string())
+            });
+        let wait = run.and_then(|run| run.wait.0.as_ref()).map(|wait| {
+            let label = wait_kind_label(wait.kind);
+            wait.reason
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+                .map(|reason| format!("{label}：{reason}"))
+                .unwrap_or_else(|| label.to_string())
+        });
+
+        let mut segments = Vec::new();
+        if let Some(turn) = turn {
+            for part in &turn.parts {
+                let AgentTimelineTurnPart::WorkSegment { work_segment_id } = part else {
+                    continue;
+                };
+                if let Some(segment) = turn
+                    .work_segments
+                    .iter()
+                    .find(|segment| &segment.id == work_segment_id)
+                {
+                    segments.push(WorkSegmentModel::from_segment(segment));
+                }
+            }
+        }
+
+        (activity.is_some() || wait.is_some() || !segments.is_empty()).then_some(Self {
+            activity,
+            wait,
+            segments,
+        })
+    }
+}
+
+impl WorkSegmentModel {
+    fn from_segment(segment: &AgentTimelineWorkSegment) -> Self {
+        let attention = segment.attention.0.as_ref().map(|attention| {
+            let state = match attention.status {
+                AgentTimelineWorkAttentionStatus::Unresolved => "需要处理",
+                AgentTimelineWorkAttentionStatus::Resolved => "已处理",
+            };
+            format!("{state}：{}", attention.summary)
+        });
+        let unresolved_attention = segment.attention.0.as_ref().is_some_and(|attention| {
+            attention.status == AgentTimelineWorkAttentionStatus::Unresolved
+        });
+        let expanded =
+            segment.lifecycle == AgentTimelineWorkSegmentLifecycle::Active || unresolved_attention;
+        let operations = if expanded {
+            segment
+                .operations
+                .iter()
+                .map(WorkOperationModel::from_operation)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            title: format!("工作 · {}", work_segment_lifecycle_label(segment.lifecycle)),
+            summary: folded_operation_summary(&segment.operations),
+            expanded,
+            attention,
+            attention_unresolved: unresolved_attention,
+            operations,
+        }
+    }
+}
+
+impl WorkOperationModel {
+    fn from_operation(operation: &AgentTimelineWorkOperation) -> Self {
+        let mut details = Vec::new();
+        if let Some(action) = operation
+            .canonical_action
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            details.push(action.to_string());
+        }
+        if !operation.resource_presentation.is_empty() {
+            details.push(
+                operation
+                    .resource_presentation
+                    .iter()
+                    .map(|target| target.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        if let Some(effect) = operation
+            .effect_summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            details.push(effect.to_string());
+        }
+        if let Some(attempts) = operation
+            .attempts
+            .as_ref()
+            .filter(|attempts| !attempts.is_empty())
+        {
+            details.push(format!("attempts {}", attempts.len()));
+        }
+        if let Some(retry) = &operation.retry {
+            details.push(format!(
+                "第 {} 次尝试 · 前序 {}",
+                retry.retry_ordinal, retry.predecessor_operation_id
+            ));
+        }
+        Self {
+            title: operation
+                .display_name
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&operation.tool_id)
+                .to_string(),
+            status: work_operation_status_label(operation.status).to_string(),
+            detail: (!details.is_empty()).then(|| details.join(" · ")),
+        }
+    }
+}
+
+fn block_body(block: &AgentTimelineBlock) -> String {
+    let mut body = block
+        .body_markdown
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            block
+                .localized_content
+                .as_ref()
+                .and_then(|content| content.text.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| block.summary.clone());
+    if block.entry_role == AgentTimelineEntryRole::FinalAnswer {
+        if let Some(receipt) = block
+            .structured_projection
+            .as_ref()
+            .and_then(structured_projection_text)
+        {
+            if !receipt.trim().is_empty() {
+                return format!("{}\n\n{}", body.trim_end(), receipt);
+            }
+        }
+    } else if body.trim().is_empty() {
+        body = block
+            .structured_projection
+            .as_ref()
+            .and_then(structured_projection_text)
+            .unwrap_or_else(|| block.summary.clone());
+    }
+    body
+}
+
+fn structured_projection_text(readable: &AgentTimelineStructuredProjection) -> Option<String> {
     let rendered = render_readable_projection(readable);
     (!rendered.trim().is_empty()).then_some(rendered)
 }
 
-fn render_readable_projection(readable: &Value) -> String {
+fn render_readable_projection(readable: &AgentTimelineStructuredProjection) -> String {
     let mut lines = Vec::new();
-    if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
+    if let Some(summary) = readable.summary.as_deref() {
         lines.push(summary.to_string());
-    } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
-        lines.push(summary_key.to_string());
+    } else if let Some(summary_key) = readable.summary_key.as_deref() {
+        lines.push(
+            readable_projection_summary(summary_key, readable)
+                .unwrap_or_else(|| summary_key.to_string()),
+        );
     }
-    if let Some(sections) = readable.get("sections").and_then(Value::as_array) {
-        for section in sections {
-            if let Some(title) = section
-                .get("titleKey")
-                .or_else(|| section.get("title"))
-                .and_then(Value::as_str)
-            {
-                lines.push(format!("## {title}"));
+    for section in &readable.sections {
+        lines.push(format!("## {}", readable_section_title(section)));
+        if section.items.is_empty() {
+            if let Some(empty) = section.empty_message_key.as_deref() {
+                lines.push(format!("- {empty}"));
             }
-            let items = section
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if items.is_empty() {
-                if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
-                    lines.push(format!("- {empty}"));
-                }
+        }
+        for item in &section.items {
+            let text = item.text.clone().or_else(|| {
+                item.message_key
+                    .as_deref()
+                    .and_then(|key| readable_item_message(key, item))
+            });
+            if let Some(text) = text.filter(|value| !value.is_empty()) {
+                lines.push(format!("- {text}"));
             }
-            for item in items {
-                let text = item
-                    .get("text")
-                    .or_else(|| item.get("messageKey"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !text.is_empty() {
-                    lines.push(format!("- {text}"));
+            if let Some(resources) = &item.resource_presentation {
+                let labels = resources
+                    .iter()
+                    .map(|resource| resource.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !labels.is_empty() {
+                    lines.push(format!("  - 资源：{labels}"));
                 }
             }
         }
     }
     lines.join("\n")
+}
+
+fn readable_projection_summary(
+    key: &str,
+    readable: &AgentTimelineStructuredProjection,
+) -> Option<String> {
+    if key != "session.projection.review.summary.counts" {
+        return None;
+    }
+    let arg = |name: &str| {
+        readable
+            .message_args
+            .as_ref()
+            .and_then(|args| args.get(name))
+            .cloned()
+            .unwrap_or_else(|| "0".to_string())
+    };
+    Some(format!(
+        "计划 {} 项；实际效果 {} 项；未执行 {} 项；拒绝 {} 项；清理 {} 项；不确定 {} 项。",
+        arg("planned"),
+        arg("effects"),
+        arg("unexecuted"),
+        arg("rejected"),
+        arg("cleanup"),
+        arg("indeterminate")
+    ))
+}
+
+fn readable_item_message(
+    key: &str,
+    item: &deepcode_kernel_client::AgentTimelineStructuredProjectionItem,
+) -> Option<String> {
+    let arg = |name: &str| {
+        item.message_args
+            .as_ref()
+            .and_then(|args| args.get(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    match key {
+        "session.projection.review.item.scopeExpansion" => {
+            Some(format!("{}：已记录范围扩展", arg("tool")))
+        }
+        "session.projection.review.item.actualEffect" => {
+            Some(format!("{}：{}", arg("tool"), arg("fact")))
+        }
+        "session.projection.review.item.unexecuted" => Some(format!("{}：未执行", arg("tool"))),
+        "session.projection.review.item.denied" => {
+            Some(format!("{}：用户拒绝（{}）", arg("tool"), arg("detail")))
+        }
+        "session.projection.review.item.rejection" => {
+            Some(format!("{}：Kernel 拒绝（{}）", arg("tool"), arg("detail")))
+        }
+        "session.projection.review.item.cleanup" => Some(format!("清理：{}", arg("fact"))),
+        "session.projection.review.item.indeterminate" => {
+            Some(format!("结果不确定：{}", arg("detail")))
+        }
+        _ => None,
+    }
+}
+
+fn readable_section_title(
+    section: &deepcode_kernel_client::AgentTimelineStructuredProjectionSection,
+) -> &str {
+    match section.section_id.as_str() {
+        "scopeExpansions" => "范围扩展",
+        "actualEffects" => "实际效果",
+        "unexecuted" => "未执行",
+        "denied" => "用户拒绝",
+        "rejections" => "Kernel 拒绝",
+        "cleanup" => "清理",
+        "indeterminate" => "不确定项",
+        _ => section.title_key.as_str(),
+    }
+}
+
+fn folded_operation_summary(operations: &[AgentTimelineWorkOperation]) -> String {
+    if operations.is_empty() {
+        return "暂无工具操作".to_string();
+    }
+    let completed = operations
+        .iter()
+        .filter(|operation| operation.status == AgentTimelineWorkOperationStatus::Completed)
+        .count();
+    let active = operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.status,
+                AgentTimelineWorkOperationStatus::Preparing
+                    | AgentTimelineWorkOperationStatus::Queued
+                    | AgentTimelineWorkOperationStatus::Running
+            )
+        })
+        .count();
+    let attention = operations.len().saturating_sub(completed + active);
+    let mut labels = Vec::new();
+    if completed > 0 {
+        labels.push(format!("完成 {completed}"));
+    }
+    if active > 0 {
+        labels.push(format!("进行中 {active}"));
+    }
+    if attention > 0 {
+        labels.push(format!("需关注 {attention}"));
+    }
+    labels.join(" / ")
+}
+
+fn current_activity_label(code: AgentTimelineCurrentActivityCode) -> &'static str {
+    match code {
+        AgentTimelineCurrentActivityCode::SessionAdmitting => "正在接收请求",
+        AgentTimelineCurrentActivityCode::ProviderAwaitingFirstByte => "正在等待模型响应",
+        AgentTimelineCurrentActivityCode::ProviderReasoning => "正在思考",
+        AgentTimelineCurrentActivityCode::ProviderComposing => "正在组织回复",
+        AgentTimelineCurrentActivityCode::ResourceResolving => "正在解析资源",
+        AgentTimelineCurrentActivityCode::KernelExecuting => "正在执行工具",
+        AgentTimelineCurrentActivityCode::SessionValidating => "正在校验结果",
+        AgentTimelineCurrentActivityCode::SessionPersisting => "正在保存会话",
+        AgentTimelineCurrentActivityCode::RetryBackoff => "等待重试",
+    }
+}
+
+fn wait_kind_label(kind: AgentTimelineWaitKind) -> &'static str {
+    match kind {
+        AgentTimelineWaitKind::User => "等待用户决定",
+        AgentTimelineWaitKind::External => "等待外部结果",
+        AgentTimelineWaitKind::Paused => "已暂停",
+    }
+}
+
+fn work_segment_lifecycle_label(lifecycle: AgentTimelineWorkSegmentLifecycle) -> &'static str {
+    match lifecycle {
+        AgentTimelineWorkSegmentLifecycle::Active => "进行中",
+        AgentTimelineWorkSegmentLifecycle::Completed => "已完成",
+        AgentTimelineWorkSegmentLifecycle::Cancelled => "已取消",
+        AgentTimelineWorkSegmentLifecycle::Failed => "失败",
+    }
+}
+
+fn work_operation_status_label(status: AgentTimelineWorkOperationStatus) -> &'static str {
+    match status {
+        AgentTimelineWorkOperationStatus::Preparing => "准备中",
+        AgentTimelineWorkOperationStatus::Queued => "排队中",
+        AgentTimelineWorkOperationStatus::Running => "运行中",
+        AgentTimelineWorkOperationStatus::AwaitingCapability => "等待授权",
+        AgentTimelineWorkOperationStatus::Completed => "已完成",
+        AgentTimelineWorkOperationStatus::Denied => "已拒绝",
+        AgentTimelineWorkOperationStatus::Failed => "失败",
+        AgentTimelineWorkOperationStatus::FailedAfterObservedEffect => "生效后失败",
+        AgentTimelineWorkOperationStatus::Indeterminate => "结果不确定",
+        AgentTimelineWorkOperationStatus::Cancelled => "已取消",
+        AgentTimelineWorkOperationStatus::Stale => "已失效",
+        AgentTimelineWorkOperationStatus::Unexecuted => "未执行",
+    }
 }
 
 pub fn command_help() -> &'static str {
@@ -191,51 +525,100 @@ pub fn command_help() -> &'static str {
 /allow <id>           允许权限请求\n\
 /deny <id>            拒绝权限请求\n\
 /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]\n\
+/decision permission <accept|reject> [run-id] [target-id]\n\
 /audit                显示审计占位状态\n\
 \n\
 pending 计划/Review 时，空 Enter 或 1 表示确认；输入文本或 2 <文本> 表示提交 Review 信息；3、end、结束表示结束。\n\
+permission accept/reject 与 /allow、/deny 别名都通过共享 Session Runtime 的 canonical decision run；不会回退旧 permission endpoint。\n\
 这些命令对应 GUI composer decision / Stop 的终端输入形式；会话事实仍来自共享 daemon Session Runtime projection。\n\
 \n\
 普通文本会通过共享 daemon Session Runtime 发送；TUI 只负责展示、输入和权限确认，不持有 workflow、permission 或 tool execution 事实。"
 }
 
-fn timeline_kind_title(kind: &str) -> &'static str {
+fn timeline_kind_title(kind: AgentTimelineBlockKind) -> &'static str {
     match kind {
-        "user" => "你",
-        "assistant" => "DeepCode",
-        "assistantText" => "DeepCode",
-        "assistantNarration" => "DeepCode",
-        "thinking" => "思考",
-        "stage" => "阶段",
-        "toolBatch" => "工具",
-        "operationEvidence" => "工具证据",
-        "verification" => "验证",
-        "permission" => "权限",
-        "plan" => "计划",
-        "review" => "审查",
-        "error" => "错误",
-        "turnActions" => "操作",
-        _ => "事件",
+        AgentTimelineBlockKind::User => "你",
+        AgentTimelineBlockKind::Assistant => "DeepCode",
+        AgentTimelineBlockKind::Permission => "权限",
+        AgentTimelineBlockKind::Plan => "计划",
+        AgentTimelineBlockKind::Review => "审查",
+        AgentTimelineBlockKind::Error => "错误",
     }
 }
 
-fn status_label(status: &str) -> &'static str {
+fn timeline_status_label(status: AgentTimelineStatus) -> &'static str {
     match status {
-        "running" => "运行中",
-        "blocked" => "等待确认",
-        "failed" => "失败",
-        "completed" | "done" => "完成",
-        "pending" => "等待中",
-        _ => "未知",
+        AgentTimelineStatus::Queued => "排队中",
+        AgentTimelineStatus::Running => "运行中",
+        AgentTimelineStatus::Waiting | AgentTimelineStatus::Blocked => "等待确认",
+        AgentTimelineStatus::Completed => "完成",
+        AgentTimelineStatus::Cancelled => "已取消",
+        AgentTimelineStatus::Failed => "失败",
     }
 }
 
-pub trait ValueExt {
-    fn get_str(&self, key: &str) -> Option<&str>;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-impl ValueExt for Value {
-    fn get_str(&self, key: &str) -> Option<&str> {
-        self.get(key).and_then(Value::as_str)
+    // Supporting development contract only; real TUI rendering remains a
+    // user-experience acceptance path over the packaged application.
+    #[test]
+    fn tui_review_renders_counts_and_hides_lifecycle_noise() {
+        let readable: AgentTimelineStructuredProjection = serde_json::from_value(json!({
+            "kind": "review",
+            "schemaVersion": "deepcode.shared-conversation.readable-review.v2",
+            "summaryKey": "session.projection.review.summary.counts",
+            "messageArgs": {
+                "planned": "3",
+                "effects": "1",
+                "unexecuted": "2",
+                "rejected": "0",
+                "cleanup": "0",
+                "indeterminate": "0"
+            },
+            "sections": [{
+                "sectionId": "actualEffects",
+                "titleKey": "session.projection.review.section.actualEffects",
+                "items": [{
+                    "itemId": "fact-review-tui-raw",
+                    "kind": "actualEffects",
+                    "messageKey": "session.projection.review.item.actualEffect",
+                    "messageArgs": {
+                        "tool": "fs.write",
+                        "fact": "toolCompleted"
+                    },
+                    "status": "actualEffects",
+                    "auditRefs": [
+                        "fact-review-tui-raw",
+                        "invocation-review-tui-raw",
+                        "provider.started:raw-lifecycle",
+                        "wait.changed:raw-lifecycle",
+                        "workflow_stage:raw-lifecycle"
+                    ]
+                }]
+            }]
+        }))
+        .expect("exact typed readable Review projection");
+        let rendered = render_readable_projection(&readable);
+
+        assert!(rendered.contains(
+            "计划 3 项；实际效果 1 项；未执行 2 项；拒绝 0 项；清理 0 项；不确定 0 项。"
+        ));
+        assert!(rendered.contains("fs.write：toolCompleted"));
+        for private in [
+            "fact-review-tui-raw",
+            "invocation-review-tui-raw",
+            "provider.started",
+            "wait.changed",
+            "workflow_stage",
+            "auditRef",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "TUI readable Review leaked audit or lifecycle identity {private}: {rendered}"
+            );
+        }
     }
 }

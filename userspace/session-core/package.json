@@ -1,6 +1,6 @@
 {
   "name": "@deepcode/session-core",
-  "version": "0.5.24",
+  "version": "0.5.40",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -12,16 +12,19 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./kernel-v2": {
+      "types": "./dist/kernel-v2/index.d.ts",
+      "import": "./dist/kernel-v2/index.js",
+      "default": "./dist/kernel-v2/index.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
-    "smoke": "node dist/__tests__/agentPlanSmoke.js",
-    "smoke:timeline": "node dist/__tests__/timelineDeltaProjectionSmoke.js",
+    "build": "pnpm run clean && tsc -p tsconfig.json",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

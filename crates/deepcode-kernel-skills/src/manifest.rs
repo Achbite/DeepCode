@@ -18,7 +18,7 @@ pub struct SkillManifest {
     pub env_allowlist: Vec<String>,
     pub workspace_access: WorkspaceAccess,
     pub timeout_ms: u64,
-    #[serde(default, alias = "modelVisible")]
+    #[serde(default)]
     pub requested_model_visible: bool,
     pub requested_trust_mode: SkillTrustMode,
     #[serde(default)]
@@ -40,8 +40,8 @@ pub struct SkillManifest {
 }
 
 impl SkillManifest {
-    pub fn v1_runtime_enabled(&self) -> bool {
-        self.requested_trust_mode.is_v1_runtime_enabled()
+    pub fn is_activation_eligible(&self) -> bool {
+        self.requested_trust_mode.is_activation_eligible()
     }
 
     pub fn requires_approval(&self) -> bool {
@@ -95,8 +95,8 @@ impl Default for SkillManifestKind {
 #[serde(rename_all = "camelCase")]
 pub struct SkillEntrypoint {
     pub kind: SkillEntrypointKind,
-    pub command: Option<String>,
-    pub args: Vec<String>,
+    pub program: Option<String>,
+    pub argv: Vec<String>,
     pub script_path: Option<String>,
 }
 
@@ -210,8 +210,8 @@ mod tests {
             kind: SkillManifestKind::BrokeredScript,
             entrypoint: SkillEntrypoint {
                 kind: SkillEntrypointKind::Script,
-                command: Some("python3".to_string()),
-                args: vec!["skill.py".to_string()],
+                program: Some("python3".to_string()),
+                argv: vec!["skill.py".to_string()],
                 script_path: Some("skill.py".to_string()),
             },
             requested_capabilities: vec![Capability::workspace_read()],
@@ -233,9 +233,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_cannot_enable_direct_host_in_v1() {
+    fn manifest_cannot_activate_direct_host_process() {
         let manifest = manifest(SkillTrustMode::DirectHostScript);
-        assert!(!manifest.v1_runtime_enabled());
+        assert!(!manifest.is_activation_eligible());
         assert!(manifest.requires_approval());
     }
 
@@ -248,7 +248,7 @@ mod tests {
         manifest.workspace_access = WorkspaceAccess::None;
         manifest.invocation_policy = InvocationPolicy::ImplicitAllowed;
         manifest.output_policy = SkillOutputPolicy::TextOnly;
-        assert!(manifest.v1_runtime_enabled());
+        assert!(manifest.is_activation_eligible());
         assert!(!manifest.requires_approval());
     }
 

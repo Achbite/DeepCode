@@ -1,268 +1,238 @@
 # DeepCode
 
-> English default version: [README.md](README.md)
+> 英文说明：[README.md](README.md)
 
-DeepCode v0.5.30 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 Session 协议 / parser 和 accepted-plan 执行，使规范化 Session timeline 成为 daemon 与 UI 的统一事实投影，支持并发读取 bridge 输出、按 worktree 隔离 Docker 资源，并保证打包入口确定地使用当前 checkout，同时继续保持 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
+DeepCode 是本地优先的 AI 编程工作台。完整 Editor、简洁对话 GUI、CLI 和 TUI 共用同一个本地 Session Runtime 与 Kernel。
 
-v0.5.30 已移除废弃的子代理 / DAG 执行路径。Agent 设置不再暴露子代理运行时控制项，Parent Session 是唯一负责校验 provider 输出并提交 Kernel action 的编排权威。Kernel client DTO 中仍保留少量始终不生效的可选请求字段用于 transport 兼容；这些字段不会恢复已退出主线的运行时。
+“本地优先”表示应用、工作区访问、会话记录、权限与工具执行由本机承载。除非使用 Ollama 等本地 Provider，否则 Prompt 和选中的上下文仍会发送给你配置的 LLM Provider。
 
-发布文档当前使用 `v0.5.30 stable baseline` 口径。部分 Cargo 和 package 元数据可能仍显示 `0.5.24`；该版本元数据漂移已记录为后续发布元数据统一项，不改变本文描述的运行时边界。
+## 选择使用入口
 
-## 构建与发布模式
+| 入口 | 适合场景 | 启动文件 |
+| --- | --- | --- |
+| DeepCode Editor | 在一个工作台中使用文件树、编辑器、终端、Git、浏览器和 Agent 会话 | `DeepCode.app`、`DeepCode.exe` 或 Linux GUI launcher |
+| DeepCode-GUI | 专注对话、附件、项目会话和结果复核 | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe` |
+| CLI | 脚本、一次性提问、会话检查和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
+| TUI | 交互式终端会话 | `DeepCode-TUI.command` 或 `deepcode-tui` |
 
-常规开发、Linux/Windows 打包优先在 Docker/Colima 环境内完成：
+只要使用同一配置根，这些入口就会共享会话、模型配置、权限和 canonical timeline。
 
-```bash
-make shell
-bash ./build.sh
-bash ./test.sh
-```
+## macOS 快速开始
 
-默认 checkout 继续使用现有的 `deepcode-dev` 容器、共享依赖缓存和宿主机端口
-`31246`。长期复用的 Git worktree 可以把 `.deepcode-worktree.mk.example` 复制为
-`.deepcode-worktree.mk`，设置稳定的 worktree ID 和未占用的宿主机端口，启用本地
-容器隔离。该本地文件不会进入 Git。隔离后的 worktree 共享镜像、Cargo registry
-和 pnpm store，但分别使用独立容器、`target` volume 与 `node_modules` volume。
-运行 `make shell` 前可先用 `make docker-info` 检查最终映射。
+### 使用已有本地包
 
-默认构建目标是完整的本地分发闭环。在容器内，`bash ./build.sh` 会构建共享
-GUI assets、DeepCode-GUI assets、Linux/Windows Rust 二进制、可选 Linux Tauri
-shell，以及 portable package layout。macOS 环境下，它随后可以向宿主机打包服务
-提交请求，补齐 Darwin 原生发布产物。
-
-macOS 原生发布是 Docker-only 构建规则的显式例外。Editor app、DeepCode-GUI
-app、CLI、TUI、TUI launcher 和 Darwin Kernel 都是 macOS native artifact，必须
-由 macOS 宿主机打包步骤产出，不能用 Linux 容器内二进制替代。
-
-先在 macOS 宿主机启动一次打包服务：
+如果已经生成 `bin/macos-arm64/`：
 
 ```bash
-make macos-package-service
+open bin/macos-arm64/DeepCode.app
+open bin/macos-arm64/DeepCode-GUI.app
 ```
 
-然后进入开发容器执行常规构建：
+使用终端入口：
 
 ```bash
-bash ./build.sh
+cd bin/macos-arm64
+./DeepCode-TUI.command
+./DeepCode-CLI.command --help
 ```
 
-默认 Docker-side 构建使用 `DEEPCODE_MACOS_PACKAGE_MODE=auto`：如果宿主机打包
-服务正在运行，构建会自动提交一个 product-set 事务；如果服务未运行，Docker package
-仍会完成，macOS 打包会带明确日志跳过。需要发布验收时让 macOS 打包缺失直接失败，
-使用：
+两个 App 都会自动启动各自打包的本地 Kernel。TUI launcher 在无法连接现有 Kernel 时也会启动包内 Kernel。
 
-```bash
-DEEPCODE_MACOS_PACKAGE_MODE=require bash ./build.sh
-```
+### 从源码生成本地包
 
-macOS product set 默认是 `DeepCode-GUI,DeepCode`。两个产品复用同一次前端准备、
-Cargo 依赖检查、Darwin runtime 构建、源码指纹和发布边界。输入未变化时复用前端与
-Rust 阶段缓存；`--clean-cache` 是显式缓存失效入口。只在定向重打包时覆盖：
-
-```bash
-DEEPCODE_MACOS_PRODUCTS=DeepCode bash ./build.sh --stage package-macos
-```
-
-也可以直接在 macOS 宿主机生成完整 macOS 包：
+先启动 Docker Desktop 或 Colima，然后执行：
 
 ```bash
 make package-macos
 ```
 
-当打包后的 App 看起来仍在运行旧 Kernel 时，使用清缓存打包入口：
+输出位于 `bin/macos-arm64/`，包含两个 App、CLI/TUI launcher、Kernel、Session runtime、Web assets 和包内可写数据根。
+
+如果 App 看起来仍在使用旧资源或旧 Kernel，先退出正在运行的 DeepCode App，再执行：
 
 ```bash
 make package-macos-clean
 ```
 
-`make package-macos-clean` 会在重新构建前删除 product `.app`、根目录 sidecar binaries、打包 web assets、Tauri dist 和 macOS target release 二进制等构建/打包产物。它会保留 package-local 运行数据：`config/`、`sessions/`、`conversation-archives/` 和 `kernel/`。
+当前 macOS 包用于本机运行。它采用 ad-hoc 签名，但不是 DMG，也未使用 Developer ID 签名或公证。
 
-`make package-macos` 会调用 `scripts/package-macos.sh`，输出完整 macOS arm64
-发布包：
+## Linux 与 Windows 包
+
+开发和便携打包通过项目容器完成。Windows 用户应在 WSL 中执行以下命令；不支持从原生 PowerShell 直接构建。
+
+```bash
+make shell
+```
+
+进入容器后执行：
+
+```bash
+bash ./build.sh
+```
+
+构建结果写入：
 
 ```text
-bin/macos-arm64/
-  DeepCode.app
-  DeepCode-GUI.app
-  deepcode-kernel
-  DeepCode-TUI.command
-  DeepCode-CLI.command
-  libexec/DeepCode-TUI
-  libexec/DeepCode-CLI
-  web/
-  DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
-  config/
-  sessions/
-  conversation-archives/
-  kernel/
-  build-info.json
-  README.txt
+bin/linux-x64/
+bin/win64/
 ```
 
-本阶段 macOS 包是本机可运行包，不包含 DMG、Developer ID 签名或公证。脚本会生成 package-local 配置根，并写入 `build-info.json` 供 `/api/health` 诊断读取。
+Linux 启动方式：
 
-打包事务会写入并校验当前 commit 与源码内容指纹，在发布前先完成所有请求 App 的
-staging；如果构建期间源码发生变化，则拒绝发布混合 product set。如果
-`/api/health` 没有 `buildCommit`、`sourceFingerprint`、`protocolVersion` 或
-`toolCatalogVersion`，先退出正在运行的 App，再执行 `make package-macos-clean`，然后
-重新打开 App。
-
-## Git 分支与 PR 流程
-
-`main` 和 `dev-main` 是永久保护分支，只能通过 PR merge commit 更新。Kernel、
-Session、UI、普通修复、热修复以及明确批准的 release 工作统一使用短期任务分支。
-带防护的命令行入口、PR 路由、共享 hook、审计与合并后清理规则见
-[docs/git-branch-flow.md](docs/git-branch-flow.md)。
-
-## 当前状态
-
-- Kernel daemon 提供 `/api/health`、会话归档、工具目录、权限审计、工作区、Git、内部浏览器等 API 入口。
-- live 会话协议只接受 `deepcode.agent.protocol.v3` JSON Envelope；userspace Session DriverLoop 负责 prompt 组装、provider 调用、parser 和一次 repair。tagged Markdown 协议输出会被 Session parser 拒绝。
-- Editor 是完整工作台封装：文件树、Monaco-based editor surface、终端、Agent 面板、Git 面板、内部浏览器。右侧 Agent 面板是嵌入在编辑器里的会话框，复用 DeepCode-GUI 的 Session projection 与消息语义，不是独立 Agent runtime。
-- DeepCode-GUI 是简洁对话式 GUI，不等同于完整 Editor。
-- GUI 只读分析可以由显式附件或 Session 记忆的项目默认工作目录锚定；这不同于 Editor workspace binding，后者仍是编辑器文件树和代码修改隔离边界。
-- CLI/TUI 是命令行和终端交互入口，复用同一个 Kernel/session 事实源。普通输入、决策和 cancel 请求都通过 daemon shared Session Runtime run API 提交；TUI 在终端里渲染共享 session timeline projection。
-- Web Dev Host 仅用于开发预览和协议调试，不是正式 UI 封装。
-
-## UI 封装口径
-
-DeepCode 当前区分四套正式 UI 封装：
-
-| 名称                     | 定义                       | 当前优先级                           |
-| ------------------------ | -------------------------- | ------------------------------------ |
-| Editor / DeepCode Editor | 带编辑器的完整 GUI 打包态  | 优先承接 Git、内部浏览器、工作台组件 |
-| DeepCode-GUI / GUI(推荐) | 简洁对话式 GUI             | 等 Editor 稳定后复用同一套组件流     |
-| CLI                      | 脚本化 Host Shell          | 面向自动化和集成                     |
-| TUI                      | Ratatui/Crossterm 终端交互 | 面向轻量本地使用                     |
-
-UI shell 不拥有第二套 Kernel、Session truth、tool execution、permission 或用户偏好存储。功能组件、权限和工具调用由 Kernel/session 提供。会话编排、上下文组装、PromptEnvelope、provider lifecycle、协议解析和 repair 由 userspace Session DriverLoop 负责，UI 只负责展示、输入和交互差异。
-
-Editor workspace binding 是 Editor 的文件树展示、编辑和代码修改隔离事实。DeepCode-GUI 可以通过显式附件或 Session 项目默认工作目录携带 conversation roots，不要求必须存在 Editor workspace。写入、删除、Git、终端命令和跨项目修改仍必须进入可审查计划、Kernel policy 检查，并清晰披露目标范围。
-
-Editor 专属上下文，例如 workspace root、active file、selection、open tabs、terminal cwd，先进入 Session context assembly；Kernel 只处理 ResourceManifest、WorkspaceBinding、capability、permission、WorkUnit 和 facts。可见终端是 UI 面板，不是 Agent 命令执行事实源。
-
-## 会话协议
-
-live provider-facing 输出以 `deepcode.agent.protocol.v3` JSON Envelope 为准：
-
-```json
-{
-  "schemaVersion": "deepcode.agent.protocol.v3",
-  "proposalId": "proposal-example",
-  "kind": "answer",
-  "source": "llm",
-  "outputLanguage": "zh-CN",
-  "referencedResourcePacketRefs": [],
-  "answer": {
-    "format": "markdown",
-    "content": "..."
-  }
-}
+```bash
+cd bin/linux-x64
+./deepcode-gui
 ```
 
-`kind` 只能是：
+然后打开 [http://127.0.0.1:31245/](http://127.0.0.1:31245/)。Linux 包同时包含 `deepcode-cli` 和 `deepcode-tui`。
 
-- `answer`：只读回答、解释、身份说明、设计讨论。
-- `resourceRequest`：通过 Kernel `ResourceResolve` 补充上下文，可以引用 Session 暴露的 manifest entry id，或 Session conversation root 下的相对路径。
-- `actionBundle`：提交给 Kernel 校验的可审查 proposal，不是授权或执行事实。
+Windows 可打开 `DeepCode.exe` 使用完整 Editor，或打开 `DeepCode-GUI.exe` 使用对话 GUI。请保持 `WebView2Loader.dll` 与可执行文件在同一目录，并在目标系统安装 Microsoft Edge WebView2 Evergreen Runtime。
 
-Resource request 可以指向精确 manifest entry，也可以指向 Session
-conversation root 下的路径：
+## 配置 LLM
 
-```json
-{
-  "schemaVersion": "deepcode.agent.protocol.v3",
-  "proposalId": "proposal-context-request",
-  "kind": "resourceRequest",
-  "source": "llm",
-  "outputLanguage": "zh-CN",
-  "resourceRequest": {
-    "version": "1",
-    "id": "need-more-context",
-    "reason": "需要读取已附加项目中的更多上下文。",
-    "items": [
-      {
-        "id": "entry-readme",
-        "manifestEntryId": "manifest-entry-id",
-        "reason": "解析已知 manifest entry。"
-      },
-      {
-        "id": "project-file",
-        "rootId": "conversation-root-id",
-        "path": "relative/path.ext",
-        "reason": "解析 conversation root 下的文件。"
-      }
-    ]
-  }
-}
+首次对话前：
+
+1. 打开“设置”，选择“LLM”。
+2. 添加预设，或新建 OpenAI-compatible、Anthropic、Ollama profile。
+3. 填写 Provider Base URL、模型名，以及 Provider 要求的 API key。
+4. 启用该 profile，设置默认 profile，然后保存。
+5. 在界面提供 Probe 时，用它检查连接。
+
+打包产物可能包含 profile 预设，但不会包含你的 API key。API key 会写入当前配置根的本地 secret store；不要分享该目录。
+
+会话输入框旁的模型选择器决定当前 Session 使用的 profile。Session 已开始执行后，选择器可能暂时锁定，直到当前 run 到达安全边界。
+
+## 开始会话
+
+GUI 的常见使用流程：
+
+1. 打开或选择项目工作区；只读问题也可以直接附加所需文件。
+2. 新建 Session，并选择模型 profile。
+3. 在输入框中描述希望得到的结果。
+4. DeepCode 要求确认时，检查 Requirement 或 Plan 卡片。
+5. 根据精确目标允许或拒绝 Kernel permission。
+6. 根据结构化事实和实际变更完成最终 Review。
+
+接受 Plan 不等于授予所有权限。文件写入、删除、Git 修改和其他受控动作仍需经过 Kernel permission 与 audit 链路。
+
+普通聊天可以不绑定 workspace：GUI 中不选择项目，或在 CLI/TUI 使用 `--no-workspace`。未绑定 workspace 时，workspace 工具会 fail closed。
+
+## CLI 示例
+
+以下示例使用 macOS launcher；Linux 将 `./DeepCode-CLI.command` 替换为 `./deepcode-cli`。
+
+```bash
+./DeepCode-CLI.command daemon status
+./DeepCode-CLI.command sessions list
+./DeepCode-CLI.command ask -C /path/to/project "分析这个项目"
+./DeepCode-CLI.command -p ask --no-workspace "简要解释 RAII"
+./DeepCode-CLI.command timeline
 ```
 
-约束：
+继续已有 Session：
 
-- 协议字段、capability、tool schema、代码标识符固定使用英文。
-- 最终回答和 review 总结跟随用户语言，默认中文。
-- `resourceRequest.items[]` 必须包含 `manifestEntryId` 或 `path` 二选一。存在多个 conversation root 时，`path` 应搭配 `rootId`。
-- `path` 只由 Session 在显式附件、项目默认工作目录或已证明的 conversation roots 内解析，然后提交 Kernel `ResourceResolve`；LLM 自行生成的任意本地绝对路径无效。
-- `actionBundle.actions[].toolId` 使用 Kernel catalog id，如 `fs.write`、`fs.patch`、`fs.delete`、`web.search`、`web.fetch`。
-- 文件操作必须使用 `fs.*` catalog id；`workspace` 只表示已授权的 scope/root 概念，不再是工具命名空间。
-- 写入草案通过 top-level `codeBlocks` 表达，action 通过 `sourceBlockId` 引用。
-- v3 parser 保持 fail-closed；解析失败只允许 Session 中的一次受控 LLM repair。Kernel 只验证结构化 proposal，不组装 prompt，也不 repair 模型输出。
+```bash
+./DeepCode-CLI.command sessions resume <session-id>
+./DeepCode-CLI.command --session <session-id> ask "继续刚才的分析"
+```
 
-## Kernel 能力
+运行 `./DeepCode-CLI.command --help` 查看 permission 以及 requirement/plan/review 决策命令。
 
-当前 Kernel-visible tool catalog 包含：
+## TUI 基础用法
 
-| 能力域 | Tool ids | 当前状态 |
-| --- | --- | --- |
-| 文件与搜索 | `fs.list`、`fs.read`、`fs.diff`、`code.search` | 可执行只读 / 搜索工具 |
-| 文件修改 | `fs.write`、`fs.patch`、`fs.delete` | 只能通过 Kernel proposal review、权限门禁和 audit 执行 |
-| 联网证据 | `web.search`、`web.fetch` | 受门禁控制的只读外部证据 |
-| Git | `git.status`、`git.diff`、`git.stage`、`git.unstage`、`git.commit` | V1 正式 Git 范围，写操作受门禁控制 |
-| Git 预留 | `git.push` | reserved / blocked，不是当前可执行能力 |
-| 进程 | `shell.propose` | preview-only 命令说明 / 提案能力 |
-| 进程预留 | `process.exec` | blocked / permission preview，不是当前可执行能力 |
-| 浏览器预留 | `browser.open`、`browser.reload`、`browser.snapshot`、`browser.inspect`、`browser.click`、`browser.type`、`browser.scroll` | 已注册但 blocked / reserved |
-| Provider 预留 | `provider.call` | 已注册但 blocked / reserved；provider transport 仍归 daemon 承载 |
+以当前目录作为 workspace 启动：
 
-高风险能力必须经过 Kernel PermissionGate 与 audit 链路。`fs.delete` 对 LLM 可见，但属于高风险删除能力；用户拒绝后不得 fallback 成 shell 删除。
+```bash
+./DeepCode-TUI.command
+```
 
-## 归档与复制
+也可以指定 workspace：
 
-会话归档默认写入用户配置根下的 `conversation-archives/`。便携包或设置了 `DEEPCODE_CONFIG_DIR` 时，归档写入对应配置根。
+```bash
+./DeepCode-TUI.command -C /path/to/project
+```
 
-每个 run 保留：
+常用交互命令：
 
-- `exports/complete.md`
-- `exports/debug.json`
-- `projection.jsonl`
-- `transcript.jsonl`
+- `/help`：显示完整命令。
+- `/status`：检查本地 Kernel。
+- `/workspace`：查看或修改 workspace 绑定。
+- `/sessions`、`/new`、`/use`、`/timeline`：管理和查看 Session。
+- `/allow`、`/deny`：处理界面显示的 permission request。
+- `/decision`：处理 requirement、Plan 或 Review 决策。
+- `/cancel`：取消活动 run 请求，并刷新共享 projection。
 
-同时新增 session 级全局时序导出：
+## 本地数据与配置
 
-- `exports/chronological.md`
-- `exports/chronological-debug.json`
+打包桌面壳默认把可写数据保存在分发目录：
 
-完整时序导出包含用户消息、LLM request、provider error、plan/review、用户确认和 tool facts。GUI 的“复制完整时序对话”读取 session 级 chronological export，不再依赖某个 run 必须产生 final answer。
+```text
+config/user/local/settings/   设置与 LLM profiles
+config/user/local/secrets/    本地 secret references
+sessions/                     Session projection 与 transcript cache
+conversation-archives/        对话导出和 debug packages
+kernel/                       Kernel ledger 与 runtime records
+logs/                         launcher 或 Kernel 产生的日志
+```
 
-## LLM Provider
+使用 `DEEPCODE_CONFIG_DIR` 可以指定其他配置根。直接运行 CLI 或 daemon 时，如果未设置该变量，会使用操作系统配置目录。需要在多个入口间共享会话和 profile 时，请让它们使用同一配置根。
 
-DeepCode 支持 OpenAI-compatible、Anthropic、Ollama profile，并针对 DeepSeek V4-compatible 部署提供 best-effort 支持和优化 profile。
+分享文件前应检查内容，不要直接发布 secrets 目录、原始 conversation archive 或 debug export。
 
-这是独立工程适配，也表达对 DeepSeek 团队在开放 AI 研究、前沿模型发展以及 AGI 探索方向上贡献的技术敬意；不表示正式关系、授权、赞助、背书、伙伴关系或长期兼容承诺。
+## 常见问题
 
-## 第三方与归属
+### 没有可用模型
 
-- 编辑器表面是 Monaco-based editor surface，并提供 limited VS Code-style workspace interoperability。
-- Claude、ChatGPT、Gemini 等商业 AI coding agents 仅作为可选开发辅助工具或 architecture / workflow / UX reference；DeepCode 不是这些 Agent 或其厂商的 upstream、fork、official derivative、赞助项目、背书项目或关联项目。
-- Codicons、Monaco、Tauri、React、Rust crates、Node packages 等第三方依赖按其各自许可证使用。
+打开“设置 → LLM”，确认至少一个 profile 已启用，填写所需 API key，保存并 Probe。
 
-更多信息见：
+### 应用无法连接 Kernel
 
-- [NOTICE.md](NOTICE.md)
-- [ATTRIBUTION.md](ATTRIBUTION.md)
-- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-- [CITATION.cff](CITATION.cff)
+检查本地 health endpoint：
 
-## 许可证
+```bash
+curl http://127.0.0.1:31245/api/health
+```
 
-DeepCode 使用 MIT License。详见 [LICENSE](LICENSE)。
+桌面壳通常会自动选择或启动本地端口。直接使用 CLI/TUI 时，`DEEPCODE_API_URL` 可连接已有 daemon，`DEEPCODE_PORT` 可覆盖默认端口。
+
+### CLI/TUI 提示缺少 Session runtime
+
+优先使用完整打包产物；也可以在源码 checkout 中构建 Session runtime：
+
+```bash
+pnpm --filter @deepcode/session-core build
+```
+
+便携包必须保留 launcher 同目录下的 `session-core/`、打包 Node runtime 和 protocol package。
+
+### macOS App 看起来仍是旧版本
+
+退出全部 DeepCode App，然后执行：
+
+```bash
+make package-macos-clean
+```
+
+还可以比较 `bin/macos-arm64/build-info.json` 与 `/api/health` 中的源码身份。
+
+### 查看运行诊断
+
+使用“设置 → Runtime Doctor”、Session timeline 或包内 `logs/` 目录。会话导出位于 `conversation-archives/`。
+
+## 从源码运行 UI 调试环境
+
+启动本地对话 GUI 预览：
+
+```bash
+make dev-deepcode-gui
+```
+
+打开 [http://127.0.0.1:31246/](http://127.0.0.1:31246/)。`make docker-info` 可以查看实际使用的容器、端口、挂载和 volume。
+
+贡献者分支流程和受保护测试变更规则见 [docs/git-branch-flow.md](docs/git-branch-flow.md) 与 [docs/test-change-request.md](docs/test-change-request.md)；它们不属于普通用户使用流程。
+
+## 第三方说明与许可证
+
+详见 [NOTICE.md](NOTICE.md)、[ATTRIBUTION.md](ATTRIBUTION.md)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [CITATION.cff](CITATION.cff)。
+
+DeepCode 使用 [MIT License](LICENSE)。
