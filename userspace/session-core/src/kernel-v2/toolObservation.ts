@@ -10,8 +10,8 @@ import {
   SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
 } from './factKinds.js';
 
-export const SESSION_PROVIDER_TOOL_OBSERVATIONS_V1_SCHEMA =
-  'deepcode.session.provider-tool-observations.v1' as const;
+export const SESSION_PROVIDER_TOOL_OBSERVATIONS_V2_SCHEMA =
+  'deepcode.session.provider-tool-observations.v2' as const;
 
 type ToolObservationOutcomeV1 =
   | 'admitted'
@@ -50,33 +50,30 @@ interface ToolObservationV1 {
   indeterminateReason?: string;
   firstLedgerSequence: number;
   lastLedgerSequence: number;
-  recordedAt: string;
 }
 
 interface KernelStateObservationV1 {
   kind: 'kernelFact';
   factId: string;
   ledgerSequence: number;
-  recordedAt: string;
   domain: KernelFactProjectionV2['domain'];
   factKind: string;
-  controlEpoch?: number;
   planActionIds: string[];
   resourceRefs: string[];
 }
 
-export interface SessionProviderToolObservationSectionV1 {
-  schemaVersion: typeof SESSION_PROVIDER_TOOL_OBSERVATIONS_V1_SCHEMA;
+export interface SessionProviderToolObservationSectionV2 {
+  schemaVersion: typeof SESSION_PROVIDER_TOOL_OBSERVATIONS_V2_SCHEMA;
   snapshotHighWater: number;
   omittedCount: number;
   observations: Array<ToolObservationV1 | KernelStateObservationV1>;
 }
 
-export function sessionProviderToolObservationsV1(input: {
+export function sessionProviderToolObservationsV2(input: {
   facts: SessionProviderKernelFactsProjectionV2;
   selectedFacts: readonly KernelFactProjectionV2[];
   providerOutcomes: readonly SessionProviderOutcomeRecordV2[];
-}): SessionProviderToolObservationSectionV1 {
+}): SessionProviderToolObservationSectionV2 {
   const callsByOperation = settledCallsByOperation(input.providerOutcomes);
   const operationFacts = new Map<string, KernelFactProjectionV2[]>();
   const unscopedFacts: KernelFactProjectionV2[] = [];
@@ -102,7 +99,7 @@ export function sessionProviderToolObservationsV1(input: {
   );
 
   return {
-    schemaVersion: SESSION_PROVIDER_TOOL_OBSERVATIONS_V1_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_TOOL_OBSERVATIONS_V2_SCHEMA,
     snapshotHighWater: input.facts.snapshotHighWater,
     omittedCount:
       input.facts.omittedCount
@@ -232,7 +229,6 @@ function toolObservation(
       : {}),
     firstLedgerSequence: ordered[0]!.ledgerSequence,
     lastLedgerSequence: ordered[ordered.length - 1]!.ledgerSequence,
-    recordedAt: ordered[ordered.length - 1]!.recordedAt,
   };
 }
 
@@ -293,12 +289,8 @@ function kernelStateObservation(
     kind: 'kernelFact',
     factId: fact.factId,
     ledgerSequence: fact.ledgerSequence,
-    recordedAt: fact.recordedAt,
     domain: fact.domain,
     factKind: fact.factKind,
-    ...(fact.lineage.controlEpoch === undefined
-      ? {}
-      : { controlEpoch: fact.lineage.controlEpoch }),
     planActionIds: [...fact.lineage.planActionIds],
     resourceRefs: [...fact.lineage.resourceIds],
   };

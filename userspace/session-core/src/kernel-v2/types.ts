@@ -423,6 +423,11 @@ export interface SessionProviderFactProjectionReceiptV2 {
 export interface SessionProviderTurnInputV2 {
   providerTurnId: string;
   purpose: 'primary' | 'continuation' | 'finalAnswer';
+  /**
+   * Transport-only predecessor for a proven no-upstream-byte replay. It is
+   * never persisted in Session state or included in Provider-visible content.
+   */
+  exactReplayPredecessorId?: string;
   runId: string;
   controlEpoch: number;
   currentInput: SessionUserInputRecordV2;

@@ -1,12 +1,13 @@
 use crate::host_run_broker_v2::HostActiveRunBrokerV2;
 use crate::host_v2_storage::{
     append_json_line_durable, canonical_json_bytes, canonical_sha256,
-    reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
-    validate_safe_session_identity, validate_sha256_digest, value_without_field,
-    with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
+    reject_transport_capabilities, sha256_path_component, stable_json_sha256,
+    validate_bounded_identity, validate_safe_session_identity, validate_sha256_digest,
+    value_without_field, with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
+use crate::provider_cache_admission_v1::SessionProviderToolContextRefSidecarV1;
 use crate::provider_trace_v1::{
     ProviderTraceErrorV1, ProviderTraceIdentityV1, ProviderTraceMetadataV1, ProviderTracePurposeV1,
     ProviderTraceStoreV1, ProviderTraceTerminalKindV1, ProviderTraceTerminalRecoveryV1,
@@ -635,10 +636,14 @@ pub(crate) struct SessionKernelV2Store {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionProviderTurnAdmissionV2 {
     pub(crate) provider_turn_id: String,
+    pub(crate) run_id: String,
     pub(crate) purpose: ProviderTracePurposeV1,
     pub(crate) control_epoch: u64,
     pub(crate) current_input_id: String,
     pub(crate) current_input_digest: String,
+    pub(crate) context_assembly_digest: String,
+    pub(crate) target: Value,
+    pub(crate) tool_context_ref: SessionProviderToolContextRefSidecarV1,
     pub(crate) provider_profile_id: String,
     pub(crate) provider_profile_revision: String,
     pub(crate) plan_revision: Option<String>,
@@ -858,6 +863,7 @@ impl SessionKernelV2Store {
         provider_turn_admission_from_records(&records, run_id, provider_turn_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_provider_dispatch(
         &self,
         capability: &RunCapabilityV2,
@@ -866,6 +872,27 @@ impl SessionKernelV2Store {
         trace_store: &ProviderTraceStoreV1,
         trace_identity: ProviderTraceIdentityV1,
         exact_request_body: &[u8],
+    ) -> Result<SessionProviderTurnDispatchCommitV3, ProviderTraceErrorV1> {
+        self.commit_provider_dispatch_with_private_binding(
+            capability,
+            expected_admission,
+            exact_request_binding,
+            trace_store,
+            trace_identity,
+            exact_request_body,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_provider_dispatch_with_private_binding(
+        &self,
+        capability: &RunCapabilityV2,
+        expected_admission: &SessionProviderTurnAdmissionV2,
+        exact_request_binding: &SessionProviderDispatchBindingV2,
+        trace_store: &ProviderTraceStoreV1,
+        trace_identity: ProviderTraceIdentityV1,
+        exact_request_body: &[u8],
+        admission_sidecar: Option<&Value>,
     ) -> Result<SessionProviderTurnDispatchCommitV3, ProviderTraceErrorV1> {
         let session_id = trace_identity.session_id.clone();
         let run_id = trace_identity.run_id.clone();
@@ -1034,9 +1061,10 @@ impl SessionKernelV2Store {
                         ));
                     }
                     let mut trace = trace_store
-                        .begin_or_reopen_exact_request_only_turn(
+                        .begin_or_reopen_exact_request_only_turn_with_private_binding(
                             trace_identity,
                             exact_request_body,
+                            admission_sidecar,
                         )
                         .map_err(|error| HostV2StorageError::io(error.code, error.message))?;
                     let append_result = append_daemon_record_locked(
@@ -1749,7 +1777,22 @@ fn provider_turn_admission_from_records(
     run_id: &str,
     provider_turn_id: &str,
 ) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
-    let (checkpoint_index, checkpoint) = latest_committed_checkpoint(records)?;
+    let (checkpoint_index, checkpoint) = committed_checkpoint_chain(records)?
+        .into_iter()
+        .rev()
+        .find_map(|entry| {
+            entry
+                .checkpoint
+                .active
+                .provider_reservation
+                .as_ref()
+                .is_some_and(|reservation| {
+                    reservation.provider_turn_id == provider_turn_id
+                        && reservation.status == "active"
+                })
+                .then_some((entry.record_index, entry.checkpoint))
+        })
+        .ok_or_else(provider_turn_admission_missing)?;
     let authority = &checkpoint.authority;
     if authority.run_id != run_id {
         return Err(provider_turn_admission_invalid());
@@ -1942,10 +1985,26 @@ fn provider_turn_admission_from_records(
         };
     let admission = SessionProviderTurnAdmissionV2 {
         provider_turn_id: provider_turn_id.to_string(),
+        run_id: run_id.to_string(),
         purpose: provider_turn.purpose,
         control_epoch: authority.control_epoch,
         current_input_id: authority.current_input_id.clone(),
         current_input_digest: current_input_digest.to_string(),
+        context_assembly_digest: stable_json_sha256(&Value::Object(context_assembly.clone()))?,
+        target: provider_turn.target.clone(),
+        tool_context_ref: SessionProviderToolContextRefSidecarV1 {
+            context_version: u64::from(provider_turn.context_ref.context_version.get()),
+            catalog_digest: provider_turn
+                .context_ref
+                .catalog_digest
+                .as_str()
+                .to_string(),
+            context_digest: provider_turn
+                .context_ref
+                .context_digest
+                .as_str()
+                .to_string(),
+        },
         provider_profile_id: provider_profile_id.to_string(),
         provider_profile_revision: provider_profile_revision.to_string(),
         plan_revision,
@@ -1956,15 +2015,6 @@ fn provider_turn_admission_from_records(
     };
     validate_final_answer_dispatch_budget(records, run_id, &admission)?;
     Ok(admission)
-}
-
-fn latest_committed_checkpoint(
-    records: &[SessionKernelPersistenceRecordV3],
-) -> Result<(usize, SessionKernelCompactCheckpointV3), HostV2StorageError> {
-    committed_checkpoint_chain(records)?
-        .last()
-        .map(|entry| (entry.record_index, entry.checkpoint.clone()))
-        .ok_or_else(provider_turn_admission_missing)
 }
 
 struct CommittedCheckpointEntryV3<'a> {

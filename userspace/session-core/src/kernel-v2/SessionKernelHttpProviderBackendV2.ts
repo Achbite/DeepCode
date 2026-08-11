@@ -42,6 +42,15 @@ import {
 import {
   isExactSessionProviderOutcomeRecordV2,
 } from './providerToolCallQueue.js';
+import {
+  buildSessionProviderAdmissionSidecarV1,
+  planSessionProviderCacheLaneV1,
+  sessionProviderSemanticMessagesV1,
+} from './providerCacheLaneV1.js';
+import type {
+  SessionProviderCacheLanePlanV1,
+  SessionProviderCacheLaneResetReasonV1,
+} from './providerCacheLaneV1.js';
 import type {
   SessionKernelLlmStreamResultV2,
   SessionKernelLlmStreamToolItemV2,
@@ -77,49 +86,76 @@ implements SessionKernelProviderBackendV2 {
     input: SessionProviderTurnInputV2
   ): Promise<SessionKernelProviderBackendOutputV2> {
     assertProviderToolContextBindingV2(input);
-    const purpose = input.purpose;
-    const parentRequestId = providerContinuationParentIdV2(
+    const parentCandidateId = input.exactReplayPredecessorId
+      ?? providerContinuationParentIdV2(input, this.profileId);
+    const tools = providerWireToolDefinitionsV2(input);
+    const predecessor = parentCandidateId
+      ? await this.transport.inspectCachePredecessor(
+          parentCandidateId,
+          this.profileId,
+          input.signal
+        )
+      : undefined;
+    let cacheLane = planSessionProviderCacheLaneV1({
+      turn: input,
+      fullContextMessages: input.contextAssembly.messages,
+      tools,
+      ...(predecessor ? { predecessor } : {}),
+    });
+    let semanticMessages = sessionProviderSemanticMessagesV1(
       input,
-      this.profileId
+      cacheLane
     );
-    const request: LlmChatRequest = {
-      requestId: input.providerTurnId,
-      ...(parentRequestId ? { parentRequestId } : {}),
-      profileId: this.profileId,
-      stream: true,
-      messages: cloneJson(input.contextAssembly.messages),
-      tools: providerWireToolDefinitionsV2(input),
-      providerOptions: {
-        deepcode: {
-          sessionKernelV2: {
-            contextVersion: input.toolContext.contextRef.contextVersion,
-            catalogDigest: input.toolContext.contextRef.catalogDigest,
-            contextDigest: input.toolContext.contextRef.contextDigest,
-            factsSnapshotHighWater:
-              input.kernelFacts.snapshotHighWater,
-            factsOmittedCount: input.kernelFacts.omittedCount,
-            providerProfileRevisionDigest:
-              input.providerProfile.providerProfileRevisionDigest,
-            reasoningTransport:
-              input.providerProfile.reasoningTransport,
-            memoryContextDigest:
-              input.contextAssembly.receipt.memory.contextDigest,
-            contextAssemblyDigest: sha256Hash(
-              canonicalJson(input.contextAssembly.receipt)
-            ),
-            userTurnId: input.currentInput.inputId,
-            controlEpoch: input.controlEpoch,
-            purpose,
-          },
-        },
-      },
-    };
-    const response = await this.transport.request(
-      request,
-      input.signal,
-      input.publicTextObserver,
-      input.publicActivityObserver
+    let request = sessionProviderRequestV1(
+      input,
+      this.profileId,
+      tools,
+      semanticMessages,
+      cacheLane
     );
+    let response: SessionKernelLlmStreamResultV2;
+    try {
+      response = await this.transport.request(
+        request,
+        input.signal,
+        input.publicTextObserver,
+        input.publicActivityObserver
+      );
+    } catch (error) {
+      const resetReason = cacheLaneResetReasonForPreflightV1(error);
+      if (
+        (
+          cacheLane.mode !== 'append'
+          && cacheLane.mode !== 'exactReplay'
+        )
+        || resetReason === undefined
+        || input.signal.aborted
+      ) throw error;
+      cacheLane = planSessionProviderCacheLaneV1({
+        turn: input,
+        fullContextMessages: input.contextAssembly.messages,
+        tools,
+        ...(predecessor ? { predecessor } : {}),
+        forcedResetReason: resetReason,
+      });
+      semanticMessages = sessionProviderSemanticMessagesV1(
+        input,
+        cacheLane
+      );
+      request = sessionProviderRequestV1(
+        input,
+        this.profileId,
+        tools,
+        semanticMessages,
+        cacheLane
+      );
+      response = await this.transport.request(
+        request,
+        input.signal,
+        input.publicTextObserver,
+        input.publicActivityObserver
+      );
+    }
     return decodeSessionKernelLlmStreamResultV2(
       input,
       response,
@@ -128,11 +164,45 @@ implements SessionKernelProviderBackendV2 {
   }
 }
 
+function sessionProviderRequestV1(
+  input: SessionProviderTurnInputV2,
+  profileId: string,
+  tools: ReturnType<typeof providerWireToolDefinitionsV2>,
+  semanticMessages: LlmChatRequest['messages'],
+  cacheLane: SessionProviderCacheLanePlanV1
+): LlmChatRequest {
+  const sidecar = buildSessionProviderAdmissionSidecarV1({
+    turn: input,
+    semanticMessages,
+    fullContextMessages: input.contextAssembly.messages,
+    tools,
+    cacheLane,
+  });
+  return {
+    requestId: input.providerTurnId,
+    ...(cacheLane.predecessorRequestId
+      ? { parentRequestId: cacheLane.predecessorRequestId }
+      : {}),
+    profileId,
+    stream: true,
+    messages: semanticMessages,
+    tools,
+    providerOptions: {
+      deepcode: {
+        sessionKernelV2: sidecar,
+      },
+    },
+  };
+}
+
 function providerContinuationParentIdV2(
   input: SessionProviderTurnInputV2,
   expectedProfileId: string
 ): string | undefined {
-  if (input.purpose !== 'continuation') return undefined;
+  if (
+    input.purpose !== 'continuation'
+    || input.providerProfile.reasoningTransport !== 'openaiPlaintext'
+  ) return undefined;
   const previous = input.providerOutcomes.at(-1);
   if (
     input.providerProfile.providerProfileId !== expectedProfileId
@@ -151,6 +221,42 @@ function providerContinuationParentIdV2(
     return undefined;
   }
   return previous.providerTurnId;
+}
+
+function cacheLaneResetReasonForPreflightV1(
+  error: unknown
+): SessionProviderCacheLaneResetReasonV1 | undefined {
+  if (!(error instanceof SessionKernelProviderTransportError)) {
+    return undefined;
+  }
+  const reasons: Readonly<Record<
+    string,
+    SessionProviderCacheLaneResetReasonV1
+  >> = {
+    provider_cache_lane_reset_required_daemon_trace_unavailable:
+      'daemonTraceUnavailable',
+    provider_cache_lane_reset_required_daemon_trace_invalid:
+      'daemonTraceInvalid',
+    provider_cache_lane_reset_required_legacy_session_cold_start:
+      'legacySessionColdStart',
+    provider_cache_lane_reset_required_semantic_lane_changed:
+      'semanticLaneChanged',
+    provider_cache_lane_reset_required_provider_profile_changed:
+      'providerProfileChanged',
+    provider_cache_lane_reset_required_model_changed:
+      'modelChanged',
+    provider_cache_lane_reset_required_system_contract_changed:
+      'systemContractChanged',
+    provider_cache_lane_reset_required_tool_schema_changed:
+      'toolSchemaChanged',
+    provider_cache_lane_reset_required_response_format_changed:
+      'responseFormatChanged',
+    provider_cache_lane_reset_required_context_compaction:
+      'contextCompaction',
+    provider_cache_lane_exact_replay_mismatch:
+      'semanticLaneChanged',
+  };
+  return reasons[error.code];
 }
 
 /**
@@ -477,8 +583,8 @@ function assertProviderToolContextBindingV2(
     || (
       planningTarget
       && (
-        input.contextAssembly.messages.at(-1)?.role !== 'system'
-        || input.contextAssembly.messages.at(-1)?.content
+        input.contextAssembly.messages[2]?.role !== 'system'
+        || input.contextAssembly.messages[2]?.content
           !== sessionPlanningResponseContractReminderV2()
       )
     )

@@ -6,6 +6,9 @@ import type {
 import type {
   SessionProviderCompletionReceiptV1,
 } from './types.js';
+import type {
+  SessionProviderCacheLaneResetReasonV1,
+} from './providerCacheLaneV1.js';
 import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
 } from './types.js';
@@ -90,7 +93,51 @@ export interface SessionKernelLlmStreamResultV2 {
   completion: SessionProviderCompletionReceiptV1;
 }
 
+export type SessionKernelProviderCachePredecessorV1 =
+  | {
+      schemaVersion:
+        'deepcode.session.provider-cache-predecessor.v1';
+      status: 'available';
+      providerTurnId: string;
+      terminalKind: 'completed' | 'failed';
+      replayEligible: boolean;
+      terminalReasonCode?: string;
+      externalRequestDigest: string;
+      externalRequestBytes: number;
+      providerProfileRevisionDigest: string;
+      targetKind:
+        | 'planning'
+        | 'contextRead'
+        | 'planAction'
+        | 'finalAnswer';
+      targetBindingDigest: string;
+      toolSchemaDigest: string;
+      responseFormatDigest: string;
+      toolContextRef: {
+        contextVersion: number;
+        catalogDigest: string;
+        contextDigest: string;
+      };
+      cacheLane: {
+        laneId: string;
+        laneRevision: number;
+        stablePrefixDigest: string;
+      };
+    }
+  | {
+      schemaVersion:
+        'deepcode.session.provider-cache-predecessor.v1';
+      status: 'unavailable';
+      providerTurnId: string;
+      reasonCode: SessionProviderCacheLaneResetReasonV1;
+    };
+
 export interface SessionKernelLlmTransportV2 {
+  inspectCachePredecessor(
+    providerTurnId: string,
+    profileId: string,
+    signal: AbortSignal
+  ): Promise<SessionKernelProviderCachePredecessorV1>;
   request(
     request: LlmChatRequest,
     signal: AbortSignal,
@@ -121,6 +168,64 @@ implements SessionKernelLlmTransportV2 {
     private readonly fetchImpl: typeof fetch = fetch
   ) {
     this.#runCapability = privateAuth.runCapability;
+  }
+
+  async inspectCachePredecessor(
+    providerTurnId: string,
+    profileId: string,
+    signal: AbortSignal
+  ): Promise<SessionKernelProviderCachePredecessorV1> {
+    let response: Response;
+    try {
+      const url = new URL(
+        `${normalizeApiBase(this.apiBase)}/api/llm/cache/predecessors/${encodeURIComponent(providerTurnId)}`
+      );
+      url.searchParams.set('profileId', profileId);
+      response = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: {
+          'x-deepcode-run-capability': this.#runCapability,
+          'x-deepcode-session-id': this.sessionId,
+          'x-deepcode-run-id': this.runId,
+        },
+        signal,
+      });
+    } catch (error) {
+      if (signal.aborted) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_cancelled',
+          'Provider cache predecessor inspection was cancelled.'
+        );
+      }
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_transport_failed',
+        safeProviderTransportMessage(
+          error,
+          'Provider cache predecessor inspection failed before receiving an HTTP response.'
+        )
+      );
+    }
+    if (!response.ok) {
+      await cancelBody(response.body);
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_http_failed',
+        `Provider cache predecessor inspection failed with HTTP ${response.status}.`,
+        response.status
+      );
+    }
+    let payload: unknown;
+    try {
+      payload = await response.json() as unknown;
+    } catch {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_cache_predecessor_invalid',
+        'Provider cache predecessor response is not valid JSON.'
+      );
+    }
+    return decodeProviderCachePredecessorV1(
+      payload,
+      providerTurnId
+    );
   }
 
   async request(
@@ -1302,6 +1407,260 @@ function nativeToolIndex(value: unknown): number {
     );
   }
   return Number(value);
+}
+
+function decodeProviderCachePredecessorV1(
+  value: unknown,
+  expectedProviderTurnId: string
+): SessionKernelProviderCachePredecessorV1 {
+  const envelope = record(value, 'cachePredecessorEnvelope');
+  exactKeys(envelope, ['ok', 'data', 'error', 'message']);
+  if (envelope.ok !== true) {
+    const code = typeof envelope.error === 'string'
+      ? envelope.error
+      : 'session_kernel_provider_cache_predecessor_failed';
+    throw new SessionKernelProviderTransportError(
+      code,
+      'Provider cache predecessor inspection was rejected.'
+    );
+  }
+  const data = record(envelope.data, 'cachePredecessor');
+  const schemaVersion = identity(
+    data.schemaVersion,
+    'cachePredecessor.schemaVersion',
+    128
+  );
+  if (
+    schemaVersion
+      !== 'deepcode.session.provider-cache-predecessor.v1'
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor schema is unsupported.'
+    );
+  }
+  const providerTurnId = identity(
+    data.providerTurnId,
+    'cachePredecessor.providerTurnId',
+    512
+  );
+  if (providerTurnId !== expectedProviderTurnId) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor identity does not match the request.'
+    );
+  }
+  if (data.status === 'unavailable') {
+    exactKeys(data, [
+      'schemaVersion',
+      'status',
+      'providerTurnId',
+      'reasonCode',
+    ]);
+    const reasonCode = identity(
+      data.reasonCode,
+      'cachePredecessor.reasonCode',
+      128
+    );
+    if (!isCacheLaneResetReasonV1(reasonCode)) {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_cache_predecessor_invalid',
+        'Provider cache predecessor reset reason is unsupported.'
+      );
+    }
+    return {
+      schemaVersion,
+      status: 'unavailable',
+      providerTurnId,
+      reasonCode,
+    };
+  }
+  if (data.status !== 'available') {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor status is unsupported.'
+    );
+  }
+  exactKeys(data, [
+    'schemaVersion',
+    'status',
+    'providerTurnId',
+    'terminalKind',
+    'replayEligible',
+    'terminalReasonCode',
+    'externalRequestDigest',
+    'externalRequestBytes',
+    'providerProfileRevisionDigest',
+    'targetKind',
+    'targetBindingDigest',
+    'toolSchemaDigest',
+    'responseFormatDigest',
+    'toolContextRef',
+    'cacheLane',
+  ]);
+  const externalRequestBytes = positiveSafeInteger(
+    data.externalRequestBytes,
+    'cachePredecessor.externalRequestBytes'
+  );
+  const targetKind = identity(
+    data.targetKind,
+    'cachePredecessor.targetKind',
+    64
+  );
+  if (
+    targetKind !== 'planning'
+    && targetKind !== 'contextRead'
+    && targetKind !== 'planAction'
+    && targetKind !== 'finalAnswer'
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor target kind is unsupported.'
+    );
+  }
+  const terminalKind = identity(
+    data.terminalKind,
+    'cachePredecessor.terminalKind',
+    32
+  );
+  if (terminalKind !== 'completed' && terminalKind !== 'failed') {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor terminal kind is unsupported.'
+    );
+  }
+  if (typeof data.replayEligible !== 'boolean') {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor replay eligibility is invalid.'
+    );
+  }
+  const terminalReasonCode = data.terminalReasonCode === null
+    ? undefined
+    : identity(
+        data.terminalReasonCode,
+        'cachePredecessor.terminalReasonCode',
+        256
+      );
+  if (
+    data.replayEligible
+      !== (
+        terminalKind === 'failed'
+        && terminalReasonCode === 'provider_retryable_no_mutation'
+      )
+    || (terminalKind === 'completed' && terminalReasonCode !== undefined)
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor replay evidence is inconsistent.'
+    );
+  }
+  const toolContextRef = record(
+    data.toolContextRef,
+    'cachePredecessor.toolContextRef'
+  );
+  exactKeys(toolContextRef, [
+    'contextVersion',
+    'catalogDigest',
+    'contextDigest',
+  ]);
+  const cacheLane = record(
+    data.cacheLane,
+    'cachePredecessor.cacheLane'
+  );
+  exactKeys(cacheLane, [
+    'laneId',
+    'laneRevision',
+    'stablePrefixDigest',
+  ]);
+  return {
+    schemaVersion,
+    status: 'available',
+    providerTurnId,
+    terminalKind,
+    replayEligible: data.replayEligible,
+    ...(terminalReasonCode ? { terminalReasonCode } : {}),
+    externalRequestDigest: digest(
+      data.externalRequestDigest,
+      'cachePredecessor.externalRequestDigest'
+    ),
+    externalRequestBytes,
+    providerProfileRevisionDigest: digest(
+      data.providerProfileRevisionDigest,
+      'cachePredecessor.providerProfileRevisionDigest'
+    ),
+    targetKind,
+    targetBindingDigest: digest(
+      data.targetBindingDigest,
+      'cachePredecessor.targetBindingDigest'
+    ),
+    toolSchemaDigest: digest(
+      data.toolSchemaDigest,
+      'cachePredecessor.toolSchemaDigest'
+    ),
+    responseFormatDigest: digest(
+      data.responseFormatDigest,
+      'cachePredecessor.responseFormatDigest'
+    ),
+    toolContextRef: {
+      contextVersion: positiveSafeInteger(
+        toolContextRef.contextVersion,
+        'cachePredecessor.toolContextRef.contextVersion'
+      ),
+      catalogDigest: digest(
+        toolContextRef.catalogDigest,
+        'cachePredecessor.toolContextRef.catalogDigest'
+      ),
+      contextDigest: digest(
+        toolContextRef.contextDigest,
+        'cachePredecessor.toolContextRef.contextDigest'
+      ),
+    },
+    cacheLane: {
+      laneId: digest(
+        cacheLane.laneId,
+        'cachePredecessor.cacheLane.laneId'
+      ),
+      laneRevision: positiveSafeInteger(
+        cacheLane.laneRevision,
+        'cachePredecessor.cacheLane.laneRevision'
+      ),
+      stablePrefixDigest: digest(
+        cacheLane.stablePrefixDigest,
+        'cachePredecessor.cacheLane.stablePrefixDigest'
+      ),
+    },
+  };
+}
+
+function positiveSafeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      `Provider cache predecessor ${field} is invalid.`
+    );
+  }
+  return Number(value);
+}
+
+function isCacheLaneResetReasonV1(
+  value: string
+): value is SessionProviderCacheLaneResetReasonV1 {
+  return [
+    'coldStart',
+    'semanticLaneChanged',
+    'providerProfileChanged',
+    'modelChanged',
+    'systemContractChanged',
+    'toolSchemaChanged',
+    'responseFormatChanged',
+    'contextCompaction',
+    'rewind',
+    'daemonTraceUnavailable',
+    'daemonTraceInvalid',
+    'legacySessionColdStart',
+    'manualReset',
+  ].includes(value);
 }
 
 function providerPublicErrorMessage(code: string): string {

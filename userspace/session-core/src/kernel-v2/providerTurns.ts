@@ -451,6 +451,8 @@ export class SessionKernelProviderTurnsV2 {
         controlEpoch: state.controlEpoch,
         nextTarget: request.target,
       });
+      const exactReplayPredecessorId =
+        finalAnswerExactReplayPredecessorIdV1(state, request);
       const providerInput = {
         providerTurnId,
         purpose: request.target.kind === 'finalAnswer'
@@ -458,6 +460,9 @@ export class SessionKernelProviderTurnsV2 {
           : request.reason === 'userInput'
             ? 'primary' as const
             : 'continuation' as const,
+        ...(exactReplayPredecessorId
+          ? { exactReplayPredecessorId }
+          : {}),
         runId: state.runId,
         controlEpoch: state.controlEpoch,
         currentInput: currentSessionUserInputV2(state),
@@ -2916,6 +2921,35 @@ function finalAnswerFailureIsRetryable(error: unknown): boolean {
   return Number.isInteger(candidate?.httpStatus)
     && Number(candidate!.httpStatus) >= 500
     && Number(candidate!.httpStatus) <= 599;
+}
+
+function finalAnswerExactReplayPredecessorIdV1(
+  state: SessionKernelLoopStateV2,
+  request: SessionProviderTurnRequestV2
+): string | undefined {
+  const turn = state.providerTurn;
+  const finalAnswer = state.finalAnswer;
+  if (
+    request.target.kind !== 'finalAnswer'
+    || finalAnswer?.status !== 'pending'
+    || finalAnswer.lastErrorCode === undefined
+    || ![
+      'provider_retryable_no_mutation',
+      'session_kernel_provider_transport_failed',
+      'session_kernel_provider_stream_read_failed',
+      'session_kernel_provider_http_failed',
+    ].includes(finalAnswer.lastErrorCode)
+    || turn?.status !== 'failed'
+    || turn.purpose !== 'finalAnswer'
+    || turn.target.kind !== 'finalAnswer'
+    || !turn.dispatchRef
+    || !turn.terminalRef
+    || !sameSessionFinalAnswerBindingV3(
+      turn.target,
+      request.target
+    )
+  ) return undefined;
+  return turn.providerTurnId;
 }
 
 function finalAnswerFailedResult(

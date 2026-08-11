@@ -1072,6 +1072,160 @@ struct AuthorizedLlmChatProfile {
     profile_revision: String,
 }
 
+const PROVIDER_CACHE_PREDECESSOR_SCHEMA_V1: &str = "deepcode.session.provider-cache-predecessor.v1";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProviderCachePredecessorQueryV1 {
+    profile_id: String,
+}
+
+pub(crate) async fn provider_cache_predecessor(
+    State(state): State<AppState>,
+    Path(provider_turn_id): Path<String>,
+    Query(query): Query<ProviderCachePredecessorQueryV1>,
+    headers: axum::http::HeaderMap,
+) -> Json<ApiResponse> {
+    let required_header = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ApiResponse::error(
+                    "provider_transport_authority_required",
+                    format!("Session Provider cache inspection requires {name}"),
+                )
+            })
+    };
+    let session_id = match required_header("x-deepcode-session-id") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let run_id = match required_header("x-deepcode-run-id") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let capability = match required_header("x-deepcode-run-capability").and_then(|value| {
+        deepcode_kernel_abi::RunCapabilityV2::new(value).map_err(|_| {
+            ApiResponse::error(
+                "provider_transport_authority_invalid",
+                "Session Provider cache inspection Run capability is invalid",
+            )
+        })
+    }) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(error) =
+        crate::host_v2_storage::validate_bounded_identity(&provider_turn_id, "providerTurnId", 512)
+    {
+        return ApiResponse::error(error.code, error.message);
+    }
+    let authorized =
+        match authorize_llm_chat_transport(&state, &headers, Some(query.profile_id.as_str())) {
+            Ok(profile) => profile,
+            Err(response) => return response,
+        };
+    let _session_io_guard = session_private_io_lock(&session_id).read_owned().await;
+    let unavailable = |reason_code: &'static str| {
+        ApiResponse::ok(json!({
+            "schemaVersion": PROVIDER_CACHE_PREDECESSOR_SCHEMA_V1,
+            "status": "unavailable",
+            "providerTurnId": provider_turn_id,
+            "reasonCode": reason_code,
+        }))
+    };
+    let recovery = match state
+        .provider_trace_v1
+        .verified_cache_predecessor_summary(&session_id, &provider_turn_id)
+    {
+        Ok(recovery) => recovery,
+        Err(error) if error.code == "provider_trace_not_found" => {
+            return unavailable("daemonTraceUnavailable")
+        }
+        Err(_) => return unavailable("daemonTraceInvalid"),
+    };
+    if recovery.metadata.session_id != session_id
+        || recovery.metadata.run_id != run_id
+        || recovery.metadata.provider_turn_id != provider_turn_id
+    {
+        return unavailable("daemonTraceInvalid");
+    }
+    if recovery.metadata.model != authorized.profile.model {
+        return unavailable("modelChanged");
+    }
+    if recovery.metadata.profile_id != authorized.profile.id
+        || recovery.metadata.profile_revision != authorized.profile_revision
+    {
+        return unavailable("providerProfileChanged");
+    }
+    let (terminal_kind, replay_eligible) = match recovery.metadata.terminal_kind {
+        ProviderTraceTerminalKindV1::Completed => ("completed", false),
+        ProviderTraceTerminalKindV1::Failed
+            if recovery.reason_code.as_deref() == Some("provider_retryable_no_mutation")
+                && recovery.metadata.raw_source_bytes == 0 =>
+        {
+            ("failed", true)
+        }
+        _ => return unavailable("daemonTraceInvalid"),
+    };
+    let Some(sidecar_value) = recovery.admission_sidecar.clone() else {
+        return unavailable("legacySessionColdStart");
+    };
+    let sidecar = match SessionProviderAdmissionSidecarV1::decode_private_value(sidecar_value) {
+        Ok(sidecar) => sidecar,
+        Err(_) => return unavailable("daemonTraceInvalid"),
+    };
+    let admission = match state
+        .host_services
+        .session_kernel_v2
+        .provider_turn_admission(&session_id, &run_id, &capability, &provider_turn_id)
+    {
+        Ok(admission) => admission,
+        Err(_) => return unavailable("legacySessionColdStart"),
+    };
+    if sidecar
+        .validate_against_admission(&session_id, &authorized.profile_revision, &admission)
+        .is_err()
+        || sidecar.provider_turn_id != recovery.metadata.provider_turn_id
+        || sidecar.run_id != recovery.metadata.run_id
+        || sidecar.user_turn_id != recovery.metadata.user_turn_id
+        || sidecar.control_epoch != recovery.metadata.control_epoch
+    {
+        return unavailable("daemonTraceInvalid");
+    }
+    let target_binding_digest = match serde_json::to_value(&sidecar.target_binding)
+        .ok()
+        .and_then(|value| crate::host_v2_storage::stable_json_sha256(&value).ok())
+    {
+        Some(digest) => digest,
+        None => return unavailable("daemonTraceInvalid"),
+    };
+    ApiResponse::ok(json!({
+        "schemaVersion": PROVIDER_CACHE_PREDECESSOR_SCHEMA_V1,
+        "status": "available",
+        "providerTurnId": provider_turn_id,
+        "terminalKind": terminal_kind,
+        "replayEligible": replay_eligible,
+        "terminalReasonCode": recovery.reason_code,
+        "externalRequestDigest": recovery.metadata.request_digest,
+        "externalRequestBytes": recovery.exact_request_body.len(),
+        "providerProfileRevisionDigest": sidecar.provider_profile_revision_digest,
+        "targetKind": sidecar.target_kind,
+        "targetBindingDigest": target_binding_digest,
+        "toolSchemaDigest": sidecar.tool_schema_digest,
+        "responseFormatDigest": sidecar.response_format_digest,
+        "toolContextRef": sidecar.tool_context_ref,
+        "cacheLane": {
+            "laneId": sidecar.cache_lane.lane_id,
+            "laneRevision": sidecar.cache_lane.lane_revision,
+            "stablePrefixDigest": sidecar.cache_lane.stable_prefix_digest,
+        }
+    }))
+}
+
 fn authorize_llm_chat_transport(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1322,7 +1476,8 @@ pub(crate) async fn llm_chat_stream(
         .unwrap_or_default();
     let mut request_envelope = json!({
         "messages": messages,
-        "tools": body.get("tools").cloned().unwrap_or_else(|| json!([]))
+        "tools": body.get("tools").cloned().unwrap_or_else(|| json!([])),
+        "providerOptions": body.get("providerOptions").cloned().unwrap_or(Value::Null)
     });
     if body.get("parent_request_id").is_some() {
         return llm_stream_error_response(json!({
@@ -1370,6 +1525,7 @@ pub(crate) async fn llm_chat_stream(
         request_id,
         ProviderStreamTraceContextV1 {
             store: state.provider_trace_v1.clone(),
+            cache_telemetry_store: state.provider_cache_telemetry_v1.clone(),
             identity: trace_identity,
             dispatch_authority,
         },
@@ -1412,114 +1568,31 @@ fn provider_trace_identity_from_request(
         .session_kernel_v2
         .provider_turn_admission(&session_id, &run_id, &capability, request_id)
         .map_err(|error| (error.code.to_string(), error.message))?;
-    let trace = body
-        .get("providerOptions")
-        .and_then(|value| value.get("deepcode"))
-        .and_then(|value| value.get("sessionKernelV2"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            (
-                "provider_trace_identity_missing".to_string(),
-                "Provider request is missing Session trace identity".to_string(),
-            )
-        })?;
-    let submitted_user_turn_id = trace
-        .get("userTurnId")
+    let sidecar = SessionProviderAdmissionSidecarV1::decode(body)
+        .map_err(|(code, message)| (code.to_string(), message))?;
+    sidecar
+        .validate_request_material(body)
+        .map_err(|(code, message)| (code.to_string(), message))?;
+    sidecar
+        .validate_against_admission(&session_id, profile_revision, &admission)
+        .map_err(|(code, message)| (code.to_string(), message))?;
+    let submitted_parent = body
+        .get("parentRequestId")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                "provider_trace_user_turn_invalid".to_string(),
-                "Provider trace userTurnId must be non-empty".to_string(),
-            )
-        })?;
-    let submitted_control_epoch = trace
-        .get("controlEpoch")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            (
-                "provider_trace_control_epoch_invalid".to_string(),
-                "Provider trace controlEpoch must be a positive integer".to_string(),
-            )
-        })?;
-    let submitted_purpose = trace
-        .get("purpose")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                "provider_trace_purpose_invalid".to_string(),
-                "Provider trace purpose must be non-empty".to_string(),
-            )
-        })?;
-    let current_input = provider_current_input_context(body)?;
-    let current_input_digest = crate::host_v2_storage::canonical_sha256(&current_input)
-        .map_err(|error| (error.code.to_string(), error.message))?;
-    let current_input_record = current_input
-        .get("currentInput")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            (
-                "provider_trace_context_invalid".to_string(),
-                "Provider current-input context is invalid".to_string(),
-            )
-        })?;
-    let context_purpose = current_input
-        .get("purpose")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            (
-                "provider_trace_purpose_invalid".to_string(),
-                "Provider current-input context has no turn purpose".to_string(),
-            )
-        })?;
-    let target_kind = current_input
-        .get("target")
-        .and_then(|value| value.get("kind"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            (
-                "provider_trace_context_invalid".to_string(),
-                "Provider current-input context has no target kind".to_string(),
-            )
-        })?;
-    if current_input_digest != admission.current_input_digest
-        || current_input.get("providerTurnId").and_then(Value::as_str)
-            != Some(admission.provider_turn_id.as_str())
-        || current_input.get("runId").and_then(Value::as_str) != Some(run_id.as_str())
-        || current_input.get("controlEpoch").and_then(Value::as_u64)
-            != Some(admission.control_epoch)
-        || current_input_record.get("inputId").and_then(Value::as_str)
-            != Some(admission.current_input_id.as_str())
-        || submitted_user_turn_id != admission.current_input_id
-        || submitted_control_epoch != admission.control_epoch
-        || submitted_purpose != context_purpose
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if sidecar.provider_turn_id != request_id
+        || sidecar.run_id != run_id
         || admission.provider_profile_id != profile.id
-        || admission.provider_profile_revision != profile_revision
+        || submitted_parent != sidecar.cache_lane.predecessor_request_id.as_deref()
     {
         return Err((
             "provider_trace_identity_mismatch".to_string(),
-            "Provider trace identity does not match the durable Session turn admission".to_string(),
+            "Provider request identity does not match the durable Session admission sidecar"
+                .to_string(),
         ));
     }
-    let purpose = match context_purpose {
-        "primary" => ProviderTracePurposeV1::Primary,
-        "continuation" => ProviderTracePurposeV1::Continuation,
-        "finalAnswer" => ProviderTracePurposeV1::FinalAnswer,
-        _ => {
-            return Err((
-                "provider_trace_purpose_invalid".to_string(),
-                "Provider trace purpose is unsupported".to_string(),
-            ))
-        }
-    };
-    if matches!(purpose, ProviderTracePurposeV1::FinalAnswer) != (target_kind == "finalAnswer") {
-        return Err((
-            "provider_trace_purpose_invalid".to_string(),
-            "Provider finalAnswer purpose does not match the durable turn target".to_string(),
-        ));
-    }
+    let purpose = sidecar.purpose;
     if matches!(purpose, ProviderTracePurposeV1::FinalAnswer)
         && body
             .get("tools")
@@ -1555,41 +1628,6 @@ fn provider_trace_identity_from_request(
             admission,
         },
     ))
-}
-
-fn provider_current_input_context(body: &Value) -> Result<Value, (String, String)> {
-    let messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            (
-                "provider_trace_context_invalid".to_string(),
-                "Provider request has no message array".to_string(),
-            )
-        })?;
-    let mut matches = messages.iter().filter_map(|message| {
-        if message.get("role").and_then(Value::as_str) != Some("user") {
-            return None;
-        }
-        let content = message.get("content").and_then(Value::as_str)?;
-        let value = serde_json::from_str::<Value>(content).ok()?;
-        (value.get("schemaVersion").and_then(Value::as_str)
-            == Some("deepcode.session.provider-current-input.v2"))
-        .then_some(value)
-    });
-    let current_input = matches.next().ok_or_else(|| {
-        (
-            "provider_trace_context_invalid".to_string(),
-            "Provider request has no exact current-input context".to_string(),
-        )
-    })?;
-    if matches.next().is_some() {
-        return Err((
-            "provider_trace_context_invalid".to_string(),
-            "Provider request has multiple current-input contexts".to_string(),
-        ));
-    }
-    Ok(current_input)
 }
 
 fn llm_request_id(body: &Value) -> Result<String, String> {

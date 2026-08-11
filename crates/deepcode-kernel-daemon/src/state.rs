@@ -11,6 +11,7 @@ pub(crate) struct AppState {
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) host_services: HostServices,
     pub(crate) provider_trace_v1: ProviderTraceStoreV1,
+    pub(crate) provider_cache_telemetry_v1: ProviderCacheTelemetryStoreV1,
     pub(crate) provider_trace_export_limiter_v1:
         crate::provider_trace_api::ProviderTraceExportLimiterV1,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,

@@ -25,6 +25,8 @@ mod llm_stream_parser;
 mod llm_transport;
 mod prelude;
 mod project_store;
+mod provider_cache_admission_v1;
+mod provider_cache_telemetry_v1;
 mod provider_trace_api;
 mod provider_trace_v1;
 mod routes;
@@ -59,6 +61,8 @@ pub(crate) use llm_provider_transport::*;
 pub(crate) use llm_stream_parser::*;
 pub(crate) use llm_transport::*;
 pub(crate) use project_store::*;
+pub(crate) use provider_cache_admission_v1::*;
+pub(crate) use provider_cache_telemetry_v1::*;
 pub(crate) use provider_trace_api::*;
 pub(crate) use provider_trace_v1::*;
 pub(crate) use session_kernel_v2_store::*;
@@ -253,6 +257,8 @@ async fn main() {
     )
     .expect("open canonical Kernel v2 service");
     let provider_trace_v1 = ProviderTraceStoreV1::new(gui_state.paths.sessions_dir.clone());
+    let provider_cache_telemetry_v1 =
+        ProviderCacheTelemetryStoreV1::new(gui_state.paths.sessions_dir.clone());
     let host_services = HostServices::from_projects(
         &gui_state.projects,
         gui_state.paths.sessions_dir.clone(),
@@ -315,6 +321,7 @@ async fn main() {
         gui,
         host_services,
         provider_trace_v1,
+        provider_cache_telemetry_v1,
         provider_trace_export_limiter_v1:
             crate::provider_trace_api::ProviderTraceExportLimiterV1::default(),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),

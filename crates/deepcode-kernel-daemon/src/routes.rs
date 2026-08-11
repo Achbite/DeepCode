@@ -59,6 +59,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(provider_trace_metadata_list),
         )
         .route(
+            "/api/host/provider-cache-telemetry/:session_id",
+            get(provider_cache_telemetry_page),
+        )
+        .route(
             "/api/host/provider-traces/:session_id/:provider_turn_id/export-capability",
             post(provider_trace_export_capability_mint),
         )
@@ -69,6 +73,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/llm/chat/stream",
             post(llm_chat_stream).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/llm/cache/predecessors/:provider_turn_id",
+            get(provider_cache_predecessor),
         )
         .route("/api/runtime/shell", get(runtime_shell))
         .route("/api/terminal/capabilities", get(terminal_capabilities))
