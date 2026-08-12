@@ -981,17 +981,20 @@ fn copy_selected_file(
     Ok(())
 }
 
+#[cfg(unix)]
 fn secure_snapshot_file(path: &Path) -> Result<(), HostV2StorageError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-            HostV2StorageError::io(
-                "user_attachment_snapshot_permissions_failed",
-                format!("secure attachment snapshot {}: {error}", path.display()),
-            )
-        })?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        HostV2StorageError::io(
+            "user_attachment_snapshot_permissions_failed",
+            format!("secure attachment snapshot {}: {error}", path.display()),
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_snapshot_file(_path: &Path) -> Result<(), HostV2StorageError> {
     Ok(())
 }
 
