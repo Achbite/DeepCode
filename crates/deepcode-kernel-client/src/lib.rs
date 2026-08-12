@@ -16,10 +16,12 @@ mod bootstrap;
 mod v2;
 
 pub use agent::{
-    terminal_workspace_scope, AgentInputAttachmentKindV2, AgentInputAttachmentScopeV2,
-    AgentInputAttachmentV2, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
-    AgentRunStatus, AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
-    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentConversationTargetV1, AgentProjectConversationTargetV1,
+    AgentInputAttachmentKindV3,
+    AgentInputAttachmentScopeV3, AgentInputAttachmentV3, AgentRunCallerRequest,
+    AgentRunGuidanceRequest, AgentRunResult, AgentRunStatus, AgentSessionListResult,
+    AgentSessionResult, CreateAgentSessionRequest, ListAgentSessionsRequest,
+    StartAgentRunRequest, StartProjectAgentRunRequest, TerminalWorkspaceScope,
 };
 pub use agent_projection::{
     reduce_agent_timeline_stream_event, AgentProjectionValidationError, AgentTimelineAttachment,
@@ -550,6 +552,26 @@ impl HttpKernelClient {
         decode_api_data_with_code(value)
     }
 
+    pub async fn start_project_agent_run(
+        &self,
+        project_id: &str,
+        request: StartProjectAgentRunRequest,
+    ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/projects/{project_id}/sessions/runs"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
     pub async fn get_agent_run(
         &self,
         session_id: &str,
@@ -602,6 +624,26 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
+    pub async fn cancel_current_agent_run(
+        &self,
+        session_id: &str,
+        request: AgentRunCallerRequest,
+    ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/runs/current/cancel"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
     pub async fn submit_agent_run_guidance(
         &self,
         session_id: &str,
@@ -613,6 +655,26 @@ impl HttpKernelClient {
             .http
             .post(self.url(&format!(
                 "/api/agent/sessions/{session_id}/runs/{run_id}/guidance"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
+    pub async fn submit_current_agent_run_guidance(
+        &self,
+        session_id: &str,
+        request: AgentRunGuidanceRequest,
+    ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/runs/current/guidance"
             )))
             .json(&request)
             .send()

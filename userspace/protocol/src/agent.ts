@@ -32,6 +32,41 @@ export type AgentEventVisibility =
 
 export type AgentSessionTitleSource = 'pending' | 'auto' | 'user';
 
+/**
+ * Daemon-issued identity for the exact conversation selected by a Host.
+ *
+ * Hosts must echo this value on every Run mutation. The revision is derived
+ * from canonical Session ownership and workspace binding facts, so a stale
+ * UI selection cannot be silently redirected to another Session or project.
+ */
+export interface AgentConversationTargetV1 {
+  schemaVersion: 'deepcode.host.conversation-target.v1';
+  targetId: string;
+  targetRevision: string;
+  sessionId: string;
+  projectId?: string;
+  workspaceScopeKey: string;
+  workspaceBindingRef?: string;
+  workspaceBindingIdentity?: string;
+}
+
+/**
+ * Daemon-issued identity for a project draft before a Session exists.
+ *
+ * The revision binds the exact project record and workspace binding selected
+ * by the user. Project first-input admission rejects a stale value instead of
+ * silently redirecting the new Session to a different root.
+ */
+export interface AgentProjectConversationTargetV1 {
+  schemaVersion: 'deepcode.host.project-conversation-target.v1';
+  targetId: string;
+  targetRevision: string;
+  projectId: string;
+  workspaceScopeKey: string;
+  workspaceBindingRef?: string;
+  workspaceBindingIdentity?: string;
+}
+
 export interface AgentSession {
   id: string;
   title?: string;
@@ -41,6 +76,7 @@ export interface AgentSession {
   workspaceId?: string;
   workspaceHash?: string;
   workspaceScopeKey?: string;
+  conversationTarget: AgentConversationTargetV1;
   archivedAt?: string;
   titleSource?: AgentSessionTitleSource;
   eventCount?: number;
@@ -55,9 +91,9 @@ export interface AgentHostCallerMutationErrorV2 {
 
 export interface AgentTimelineAttachment {
   readonly kind: 'file' | 'directory';
-  readonly path: string;
-  readonly resourceId?: string;
-  readonly folderId?: string;
+  readonly attachmentId: string;
+  readonly resourceId: string;
+  readonly displayName: string;
   readonly scope: 'message' | 'session';
 }
 
@@ -79,6 +115,7 @@ export interface AgentProject {
   title: string;
   kind: AgentProjectKind;
   workspaceBinding?: AgentWorkspaceBinding;
+  conversationTarget: AgentProjectConversationTargetV1;
   rootStatus: AgentProjectRootStatus;
   createdAt: string;
   updatedAt: string;
@@ -598,18 +635,38 @@ export type AgentTimelineStreamEvent =
     };
 
 /**
- * A model-visible, workspace-relative reference supplied with one user input.
+ * A public handle for a Host-admitted user resource.
  *
- * This is context only: it carries neither an absolute Host path nor any
- * capability. Reading the referenced resource still requires a Kernel
- * contextRead tool invocation.
+ * Absolute Host paths and snapshot locations remain private to the Host. The
+ * handle grants no direct filesystem access or tool authority: the Host reads
+ * the exact user-selected resource and Session consumes its bounded snapshot
+ * as authoritative user-provided context.
  */
-export interface AgentInputAttachmentV2 {
+export interface AgentInputAttachmentV3 {
   kind: 'file' | 'directory';
-  path: string;
-  resourceId?: string;
-  folderId?: string;
+  attachmentId: string;
+  resourceId: string;
+  displayName: string;
+  /**
+   * message is consumed by one exact user-input request. session is inherited
+   * by later inputs in the same Session until its Host grant is revoked.
+   */
   scope: 'message' | 'session';
+}
+
+export interface CreateUserAttachmentGrantRequestV1 {
+  absolutePath: string;
+  scope: AgentInputAttachmentV3['scope'];
+  callerRequestId: string;
+}
+
+export interface UserAttachmentGrantResultV1 {
+  schemaVersion: 'deepcode.host.user-attachment-grant.v1';
+  attachment: AgentInputAttachmentV3;
+  snapshot: {
+    fileCount: number;
+    totalBytes: number;
+  };
 }
 
 export interface AskAgentRunRequest {
@@ -617,7 +674,8 @@ export interface AskAgentRunRequest {
   content: string;
   workspacePath?: string;
   noWorkspace?: boolean;
-  attachments?: AgentInputAttachmentV2[];
+  attachments?: AgentInputAttachmentV3[];
+  conversationTarget: AgentConversationTargetV1;
   callerRequestId: string;
 }
 
@@ -628,6 +686,7 @@ export interface ResolveAgentRunDecisionRequest {
   guidance?: string;
   runId: string;
   targetId: string;
+  conversationTarget: AgentConversationTargetV1;
   callerRequestId: string;
 }
 
@@ -639,13 +698,22 @@ export interface AgentRunGuidanceRequest {
   guidance: string;
   workspacePath?: string;
   noWorkspace?: boolean;
-  attachments?: AgentInputAttachmentV2[];
+  attachments?: AgentInputAttachmentV3[];
+  conversationTarget: AgentConversationTargetV1;
+  callerRequestId: string;
+}
+
+export interface StartProjectAgentRunRequest {
+  op: 'ask';
+  content: string;
+  profileId?: string;
+  attachments?: AgentInputAttachmentV3[];
+  conversationTarget: AgentProjectConversationTargetV1;
   callerRequestId: string;
 }
 
 export interface CreateAgentSessionRequest {
   profileId?: string;
-  projectId?: string;
   workspaceId?: string;
   workspaceHash?: string;
   title?: string;

@@ -331,8 +331,10 @@ export function decodeSessionKernelLlmStreamResultV2(
           'A Session Plan proposal may follow commentary but cannot share or precede final answer text.'
         );
       }
-      const plan = decodeProviderPlanProposalArgumentsV2(
-        control.arguments
+      const plan = normalizeProviderPlanToolIdsV2(
+        decodeProviderPlanProposalArgumentsV2(control.arguments),
+        encodedNames,
+        new Set(exposed.map((tool) => tool.toolId))
       );
       return {
         kind: 'plan',
@@ -500,6 +502,31 @@ export function decodeSessionKernelLlmStreamResultV2(
       providerResult,
       responseDigest,
     };
+}
+
+function normalizeProviderPlanToolIdsV2(
+  plan: SessionProviderPlanDraftV2,
+  encodedNames: ReadonlyMap<string, string>,
+  admittedToolIds: ReadonlySet<string>
+): SessionProviderPlanDraftV2 {
+  return {
+    ...plan,
+    actions: plan.actions.map((action) => {
+      const canonicalToolId = admittedToolIds.has(action.toolId)
+        ? action.toolId
+        : encodedNames.get(action.toolId);
+      if (!canonicalToolId || !admittedToolIds.has(canonicalToolId)) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_plan_tool_unknown',
+          'Provider Plan referenced a tool outside the exact admitted ToolContext.'
+        );
+      }
+      return {
+        ...action,
+        toolId: canonicalToolId,
+      };
+    }),
+  };
 }
 
 /**

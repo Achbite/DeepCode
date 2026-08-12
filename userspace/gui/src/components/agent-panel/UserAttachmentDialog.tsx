@@ -1,279 +1,148 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  AgentInputAttachmentV2,
-  AgentWorkspaceBinding,
-  FileTreeNode,
-  WorkspaceSpec,
+  AgentInputAttachmentV3,
+  BrowseEntry,
+  BrowsePathResult,
+  InitialLocation,
 } from '@deepcode/protocol';
-import { createWorkspaceScope } from '@deepcode/session-core';
-import { getFileTree } from '../../services/runtimeAdapter';
-import { useWorkspaceStore } from '../../state/workspaceStore';
+import {
+  browsePath,
+  createUserAttachmentGrant,
+  getInitialLocations,
+} from '../../services/runtimeAdapter';
 import { t, type UiLanguage } from '../../i18n';
 import '../workspace-open-dialog/workspaceOpenDialog.css';
 
 interface UserAttachmentDialogProps {
   visible: boolean;
   language: UiLanguage;
-  workspaceBinding?: AgentWorkspaceBinding;
-  allowGlobalWorkspaceFallback: boolean;
   onClose: () => void;
-  onPick: (attachment: AgentInputAttachmentV2) => void;
-}
-
-interface AttachmentEntry {
-  kind: AgentInputAttachmentV2['kind'];
-  path: string;
-  name: string;
-}
-
-function normalizeWorkspaceRelativePath(
-  path: string,
-  allowWorkspaceRoot = false
-): string | null {
-  if (
-    path.trim() !== path
-    || new TextEncoder().encode(path).byteLength > 4096
-    || /[\u0000-\u001f\u007f-\u009f]/u.test(path)
-  ) {
-    return null;
-  }
-  const normalized = path.replace(/\\/g, '/').replace(/\/+/g, '/');
-  if (
-    !normalized.trim()
-    || normalized.startsWith('/')
-    || /^[a-zA-Z]:\//.test(normalized)
-    || normalized.includes('\0')
-  ) {
-    return null;
-  }
-  const parts: string[] = [];
-  for (const part of normalized.split('/')) {
-    if (!part || part === '.') continue;
-    if (part === '..') return null;
-    parts.push(part);
-  }
-  if (parts.length > 0) return parts.join('/');
-  return allowWorkspaceRoot ? '.' : null;
-}
-
-function flattenNodes(
-  nodes: FileTreeNode[],
-  acc: AttachmentEntry[] = []
-): AttachmentEntry[] | null {
-  for (const node of nodes) {
-    const path = normalizeWorkspaceRelativePath(node.path);
-    if (!path) return null;
-    acc.push({
-      kind: node.type,
-      path,
-      name: node.name,
-    });
-    if (node.children && !flattenNodes(node.children, acc)) return null;
-  }
-  return acc;
-}
-
-function parentPath(path: string): string {
-  const normalized = normalizeWorkspaceRelativePath(path, true);
-  if (!normalized || normalized === '.') return '.';
-  const segments = normalized.split('/');
-  segments.pop();
-  return segments.join('/') || '.';
-}
-
-function normalizeAbsolutePath(path: string): string {
-  return path.replace(/\\/g, '/').replace(/\/+$/g, '');
-}
-
-function workspaceMatchesBinding(
-  workspace: WorkspaceSpec | null,
-  binding: AgentWorkspaceBinding
-): boolean {
-  if (!workspace) return false;
-  if (binding.workspaceHash) {
-    return createWorkspaceScope(workspace).workspaceHash
-      === binding.workspaceHash;
-  }
-  if (binding.workspaceId) {
-    return workspace.id === binding.workspaceId;
-  }
-  const openPath = binding.openPath
-    ? normalizeAbsolutePath(binding.openPath)
-    : undefined;
-  if (!openPath) return false;
-  return [
-    workspace.sourcePath,
-    ...workspace.folders.flatMap((folder) => [
-      folder.absolutePath,
-      folder.originalPath,
-    ]),
-  ].some((path) => path && normalizeAbsolutePath(path) === openPath);
+  onPick: (attachment: AgentInputAttachmentV3) => void;
 }
 
 const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
   visible,
   language,
-  workspaceBinding,
-  allowGlobalWorkspaceFallback,
   onClose,
   onPick,
 }) => {
-  const workspace = useWorkspaceStore((state) => state.current);
-  const activeFolderId = useWorkspaceStore((state) => state.activeFolderId);
-  const openWorkspace = useWorkspaceStore((state) => state.openWorkspace);
-  const [folderId, setFolderId] = useState('');
-  const [directory, setDirectory] = useState('.');
-  const [entries, setEntries] = useState<AttachmentEntry[]>([]);
-  const [selected, setSelected] = useState<AttachmentEntry | null>(null);
+  const [locations, setLocations] = useState<InitialLocation[]>([]);
+  const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
+  const [addressInput, setAddressInput] = useState('');
+  const [selected, setSelected] = useState<BrowseEntry | null>(null);
   const [query, setQuery] = useState('');
-  const [scope, setScope] = useState<AgentInputAttachmentV2['scope']>('message');
+  const [scope, setScope] = useState<AgentInputAttachmentV3['scope']>('message');
+  const [showHidden, setShowHidden] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadGenerationRef = useRef(0);
 
-  const loadDirectory = async (nextFolderId: string, nextDirectory: string): Promise<void> => {
+  const navigateTo = async (absolutePath: string): Promise<void> => {
     const generation = loadGenerationRef.current + 1;
     loadGenerationRef.current = generation;
-    const boundFolder = workspace?.folders.find((folder) => folder.id === nextFolderId);
-    const safeDirectory = normalizeWorkspaceRelativePath(nextDirectory, true);
-    if (!boundFolder || !safeDirectory) {
-      setError(t(language, 'agent.attachment.invalidWorkspacePath'));
-      return;
-    }
     setLoading(true);
     setError(null);
     setSelected(null);
-    const result = await getFileTree(nextFolderId, safeDirectory);
+    const result = await browsePath(absolutePath);
     if (loadGenerationRef.current !== generation) return;
     if (!result.ok || !result.data) {
-      setEntries([]);
+      setBrowseResult(null);
       setError(result.message ?? t(language, 'agent.attachment.loadFailed'));
       setLoading(false);
       return;
     }
-    const nextEntries = flattenNodes(result.data);
-    if (!nextEntries) {
-      setEntries([]);
-      setError(t(language, 'agent.attachment.invalidWorkspacePath'));
-      setLoading(false);
-      return;
-    }
-    setFolderId(nextFolderId);
-    setDirectory(safeDirectory);
-    setEntries(nextEntries);
+    setBrowseResult(result.data);
+    setAddressInput(result.data.absolutePath);
     setLoading(false);
   };
 
   useEffect(() => {
     if (!visible) {
       loadGenerationRef.current += 1;
+      setLocations([]);
+      setBrowseResult(null);
+      setAddressInput('');
       setSelected(null);
-      setEntries([]);
       setQuery('');
       setError(null);
-      setDirectory('.');
+      setCreating(false);
       return;
     }
-    if (workspaceBinding && !workspaceMatchesBinding(workspace, workspaceBinding)) {
-      const openPath = workspaceBinding.openPath;
-      if (!openPath) {
-        setError(t(language, 'agent.attachment.noWorkspace'));
+    let disposed = false;
+    setLoading(true);
+    setError(null);
+    void getInitialLocations().then(async (result) => {
+      if (disposed) return;
+      if (!result.ok || !result.data) {
+        setLoading(false);
+        setError(result.message ?? t(language, 'workspaceDialog.error.initialLocations'));
         return;
       }
-      const generation = loadGenerationRef.current + 1;
-      loadGenerationRef.current = generation;
-      setLoading(true);
-      setError(null);
-      void openWorkspace(openPath).then((result) => {
-        if (loadGenerationRef.current !== generation) return;
-        if (!result.ok) {
-          setError(result.message ?? t(language, 'agent.attachment.loadFailed'));
-          setLoading(false);
-        }
-      });
-      return () => {
-        loadGenerationRef.current += 1;
-      };
-    }
-    if (!workspaceBinding && !allowGlobalWorkspaceFallback) {
-      setError(t(language, 'agent.attachment.noWorkspace'));
-      return;
-    }
-    const boundFolderId = workspaceBinding?.activeFolderId;
-    const initialFolderId = workspaceBinding
-      ? (
-          boundFolderId
-          && workspace?.folders.some((folder) => folder.id === boundFolderId)
-        )
-        ? boundFolderId
-        : workspace?.folders[0]?.id
-      : (
-          activeFolderId
-          && workspace?.folders.some((folder) => folder.id === activeFolderId)
-        )
-        ? activeFolderId
-        : workspace?.folders[0]?.id;
-    if (!initialFolderId) {
-      setError(t(language, 'agent.attachment.noWorkspace'));
-      return;
-    }
-    void loadDirectory(initialFolderId, '.');
+      setLocations(result.data.locations);
+      const first = result.data.locations[0];
+      if (!first) {
+        setLoading(false);
+        return;
+      }
+      await navigateTo(first.absolutePath);
+    });
     return () => {
+      disposed = true;
       loadGenerationRef.current += 1;
     };
-  }, [
-    activeFolderId,
-    allowGlobalWorkspaceFallback,
-    language,
-    openWorkspace,
-    visible,
-    workspace,
-    workspaceBinding,
-  ]);
+    // The dialog intentionally starts from Host locations, never workspace state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
 
   useEffect(() => {
     if (!visible) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape' && !creating) onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose, visible]);
+  }, [creating, onClose, visible]);
 
   const visibleEntries = useMemo(() => {
+    if (!browseResult) return [];
     const normalizedQuery = query.trim().toLowerCase();
-    if (!normalizedQuery) return entries;
-    return entries.filter((entry) => (
-      entry.name.toLowerCase().includes(normalizedQuery)
-      || entry.path.toLowerCase().includes(normalizedQuery)
+    return browseResult.entries.filter((entry) => (
+      (showHidden || !entry.hidden)
+      && (
+        !normalizedQuery
+        || entry.name.toLowerCase().includes(normalizedQuery)
+        || entry.absolutePath.toLowerCase().includes(normalizedQuery)
+      )
     ));
-  }, [entries, query]);
+  }, [browseResult, query, showHidden]);
 
-  const pick = () => {
-    const boundFolder = workspace?.folders.find((folder) => folder.id === folderId);
-    const candidate = selected ?? {
-      kind: 'directory' as const,
-      path: directory,
-      name: directory,
-    };
-    const path = normalizeWorkspaceRelativePath(candidate.path);
-    if (!boundFolder || !path) {
-      setError(t(language, 'agent.attachment.invalidWorkspacePath'));
+  const pick = async (): Promise<void> => {
+    const absolutePath = selected?.absolutePath ?? browseResult?.absolutePath;
+    if (!absolutePath) return;
+    setCreating(true);
+    setError(null);
+    const result = await createUserAttachmentGrant({
+      absolutePath,
+      scope,
+      callerRequestId: `host-ui-user-attachment-${globalThis.crypto.randomUUID()}`,
+    });
+    if (!result.ok || !result.data) {
+      setError(result.message ?? t(language, 'agent.attachment.loadFailed'));
+      setCreating(false);
       return;
     }
-    onPick({
-      kind: candidate.kind,
-      path,
-      folderId: boundFolder.id,
-      scope,
-    });
+    onPick(result.data.attachment);
+    setCreating(false);
     onClose();
   };
 
   if (!visible) return null;
 
+  const selectedPath = selected?.absolutePath ?? browseResult?.absolutePath ?? '';
+
   return (
-    <div className="ws-open-dialog__backdrop" onClick={onClose}>
+    <div className="ws-open-dialog__backdrop" onClick={creating ? undefined : onClose}>
       <div
         className="ws-open-dialog agent-attachment-dialog"
         onClick={(event) => event.stopPropagation()}
@@ -286,6 +155,7 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
           <button
             className="ws-open-dialog__close"
             onClick={onClose}
+            disabled={creating}
             title={t(language, 'window.close')}
             type="button"
           >
@@ -294,75 +164,119 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
         </div>
 
         <div className="ws-open-dialog__addressbar agent-attachment-dialog__controls">
-          <span
-            className="agent-attachment-dialog__workspace-folder"
-            title={t(language, 'agent.attachmentDialog.workspaceFolder')}
-          >
-            {workspace?.folders.find((folder) => folder.id === folderId)?.name
-              ?? t(language, 'agent.attachment.noWorkspace')}
-          </span>
           <button
             className="ws-open-dialog__btn"
             type="button"
-            disabled={directory === '.'}
-            onClick={() => void loadDirectory(folderId, parentPath(directory))}
+            disabled={!browseResult?.parentPath || loading || creating}
+            onClick={() => browseResult?.parentPath && void navigateTo(browseResult.parentPath)}
           >
             {t(language, 'workspaceDialog.up')}
           </button>
-          <span className="agent-attachment-dialog__relative-path" title={directory}>
-            {directory}
-          </span>
+          <input
+            className="ws-open-dialog__address"
+            value={addressInput}
+            onChange={(event) => setAddressInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && addressInput.trim()) {
+                void navigateTo(addressInput.trim());
+              }
+            }}
+            placeholder={t(language, 'workspaceDialog.addressPlaceholder')}
+            disabled={creating}
+          />
+          <button
+            className="ws-open-dialog__btn"
+            type="button"
+            disabled={!addressInput.trim() || loading || creating}
+            onClick={() => void navigateTo(addressInput.trim())}
+          >
+            {t(language, 'workspaceDialog.go')}
+          </button>
           <input
             className="ws-open-dialog__address"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder={t(language, 'agent.attachmentDialog.search')}
+            disabled={creating}
           />
+          <label className="ws-open-dialog__toggle" title={t(language, 'workspaceDialog.hiddenTitle')}>
+            <input
+              type="checkbox"
+              checked={showHidden}
+              onChange={(event) => setShowHidden(event.target.checked)}
+              disabled={creating}
+            />
+            <span>{t(language, 'workspaceDialog.hidden')}</span>
+          </label>
         </div>
 
-        <main className="ws-open-dialog__main agent-attachment-dialog__main">
-          {loading && (
-            <div className="ws-open-dialog__placeholder">
-              {t(language, 'agent.attachment.loading')}
+        <div className="ws-open-dialog__body">
+          <aside className="ws-open-dialog__sidebar">
+            <div className="ws-open-dialog__sidebar-title">
+              {t(language, 'workspaceDialog.quickLocations')}
             </div>
-          )}
-          {error && <div className="ws-open-dialog__error">{error}</div>}
-          {!loading && !error && visibleEntries.length === 0 && (
-            <div className="ws-open-dialog__placeholder">
-              {t(language, 'agent.attachment.noMatches')}
-            </div>
-          )}
-          {!loading && !error && visibleEntries.length > 0 && (
-            <ul className="ws-open-dialog__entries">
-              {visibleEntries.map((entry) => {
-                const isSelected = selected?.kind === entry.kind && selected.path === entry.path;
-                return (
-                  <li
-                    key={`${entry.kind}:${entry.path}`}
-                    className={`ws-open-dialog__entry${isSelected ? ' ws-open-dialog__entry--selected' : ''}`}
-                    onClick={() => setSelected(entry)}
-                    onDoubleClick={() => {
-                      if (entry.kind === 'directory') {
-                        void loadDirectory(folderId, entry.path);
-                        return;
-                      }
-                      setSelected(entry);
-                    }}
-                    title={entry.path}
-                  >
-                    <span className="ws-open-dialog__entry-icon">
-                      {entry.kind === 'directory' ? 'DIR' : 'FILE'}
-                    </span>
-                    <span className="ws-open-dialog__entry-name">{entry.path}</span>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </main>
+            {locations.map((location) => (
+              <button
+                key={`${location.kind}:${location.absolutePath}`}
+                className="ws-open-dialog__sidebar-item"
+                type="button"
+                disabled={creating}
+                onClick={() => void navigateTo(location.absolutePath)}
+                title={location.absolutePath}
+              >
+                <span className="ws-open-dialog__sidebar-icon">
+                  {location.kind === 'home' ? 'HOME' : location.kind === 'drive' ? 'DISK' : 'WS'}
+                </span>
+                <span>{location.label}</span>
+              </button>
+            ))}
+          </aside>
+
+          <main className="ws-open-dialog__main agent-attachment-dialog__main">
+            {loading && (
+              <div className="ws-open-dialog__placeholder">
+                {t(language, 'workspaceDialog.loading')}
+              </div>
+            )}
+            {error && <div className="ws-open-dialog__error">{error}</div>}
+            {!loading && !error && visibleEntries.length === 0 && (
+              <div className="ws-open-dialog__placeholder">
+                {t(language, 'agent.attachment.noMatches')}
+              </div>
+            )}
+            {!loading && !error && visibleEntries.length > 0 && (
+              <ul className="ws-open-dialog__entries">
+                {visibleEntries.map((entry) => {
+                  const isSelected = selected?.absolutePath === entry.absolutePath;
+                  return (
+                    <li
+                      key={entry.absolutePath}
+                      className={`ws-open-dialog__entry${isSelected ? ' ws-open-dialog__entry--selected' : ''}`}
+                      onClick={() => setSelected(entry)}
+                      onDoubleClick={() => {
+                        if (entry.type === 'directory') {
+                          void navigateTo(entry.absolutePath);
+                        } else {
+                          setSelected(entry);
+                        }
+                      }}
+                      title={entry.absolutePath}
+                    >
+                      <span className="ws-open-dialog__entry-icon">
+                        {entry.type === 'directory' ? 'DIR' : 'FILE'}
+                      </span>
+                      <span className="ws-open-dialog__entry-name">{entry.name}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </main>
+        </div>
 
         <div className="ws-open-dialog__footer">
           <div className="ws-open-dialog__footer-info agent-attachment-dialog__scope">
+            <span title={selectedPath}>{t(language, 'workspaceDialog.selected')} {selectedPath}</span>
             <label>
               <input
                 type="radio"
@@ -370,6 +284,7 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
                 value="message"
                 checked={scope === 'message'}
                 onChange={() => setScope('message')}
+                disabled={creating}
               />
               {t(language, 'agent.attachmentDialog.messageScope')}
             </label>
@@ -380,18 +295,24 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
                 value="session"
                 checked={scope === 'session'}
                 onChange={() => setScope('session')}
+                disabled={creating}
               />
               {t(language, 'agent.attachmentDialog.sessionScope')}
             </label>
           </div>
           <div className="ws-open-dialog__footer-actions">
-            <button className="ws-open-dialog__btn" onClick={onClose} type="button">
+            <button
+              className="ws-open-dialog__btn"
+              onClick={onClose}
+              disabled={creating}
+              type="button"
+            >
               {t(language, 'workspaceDialog.cancel')}
             </button>
             <button
               className="ws-open-dialog__btn ws-open-dialog__btn--primary"
-              disabled={loading || !folderId || (!selected && directory === '.')}
-              onClick={pick}
+              disabled={loading || creating || !selectedPath}
+              onClick={() => void pick()}
               type="button"
             >
               {selected

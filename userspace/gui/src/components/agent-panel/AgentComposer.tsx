@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  AgentInputAttachmentV2,
-  AgentWorkspaceBinding,
+  AgentInputAttachmentV3,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -35,10 +34,8 @@ function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
 }
 
 interface AgentComposerProps {
-  messageAttachments: AgentInputAttachmentV2[];
-  sessionAttachments: AgentInputAttachmentV2[];
-  attachmentWorkspaceBinding?: AgentWorkspaceBinding;
-  allowGlobalAttachmentWorkspaceFallback: boolean;
+  messageAttachments: AgentInputAttachmentV3[];
+  sessionAttachments: AgentInputAttachmentV3[];
   language: UiLanguage;
   loading: boolean;
   onSend: (content: string) => Promise<boolean>;
@@ -54,11 +51,10 @@ interface AgentComposerProps {
   submissionScopeId?: string | null;
   canCancelCurrentRun?: boolean;
   onStop: () => void;
-  onAddAttachment: (attachment: AgentInputAttachmentV2) => void;
+  onAddAttachment: (attachment: AgentInputAttachmentV3) => void;
   onRemoveAttachment: (
-    path: string,
-    scope: AgentInputAttachmentV2['scope'],
-    folderId?: string
+    attachmentId: string,
+    scope: AgentInputAttachmentV3['scope']
   ) => void;
   footerControls?: React.ReactNode;
   sendBlocked?: boolean;
@@ -70,7 +66,7 @@ interface AgentComposerProps {
 
 export interface AgentComposerPendingSubmissionRetry {
   content: string;
-  messageAttachments: AgentInputAttachmentV2[];
+  messageAttachments: AgentInputAttachmentV3[];
   callerRequestId: string;
   disposition: 'pending' | 'indeterminate';
   message?: string;
@@ -84,26 +80,26 @@ interface AgentModifiedFileView {
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
 const PRIMARY_DECISION_OPTION_ID = '__primary__';
 
-function attachmentLabel(attachment: AgentInputAttachmentV2, language: UiLanguage): string {
+function attachmentLabel(attachment: AgentInputAttachmentV3, language: UiLanguage): string {
   const kind = attachment.kind === 'directory'
     ? t(language, 'agent.composer.dir')
     : t(language, 'agent.composer.file');
   const scope = attachment.scope === 'session'
     ? t(language, 'agent.attachmentDialog.sessionScope')
     : t(language, 'agent.attachmentDialog.messageScope');
-  return `${kind} · ${scope} · ${attachment.path}`;
+  return `${kind} · ${scope} · ${attachment.displayName}`;
 }
 
 function sameMessageAttachments(
-  current: AgentInputAttachmentV2[],
-  pending: AgentInputAttachmentV2[]
+  current: AgentInputAttachmentV3[],
+  pending: AgentInputAttachmentV3[]
 ): boolean {
   if (current.length !== pending.length) return false;
   const pendingInstances = new Set(pending);
   return current.every((attachment) => pendingInstances.has(attachment));
 }
 
-function AttachmentIcon({ kind }: Pick<AgentInputAttachmentV2, 'kind'>): React.ReactElement {
+function AttachmentIcon({ kind }: Pick<AgentInputAttachmentV3, 'kind'>): React.ReactElement {
   if (kind === 'directory') {
     return (
       <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -250,8 +246,6 @@ async function copyText(text: string): Promise<void> {
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
-  attachmentWorkspaceBinding,
-  allowGlobalAttachmentWorkspaceFallback,
   language,
   loading,
   onSend,
@@ -274,6 +268,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const [inputFocused, setInputFocused] = useState(false);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [changesOpen, setChangesOpen] = useState(true);
   const [decisionCopyStatus, setDecisionCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const [submissionPending, setSubmissionPending] = useState(false);
@@ -318,6 +313,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     pendingSubmissionRef.current = null;
     setSubmissionPending(false);
     setPendingSubmissionCancellable(false);
+    setSubmissionError(null);
     setValue('');
   }, [submissionScopeId]);
 
@@ -340,6 +336,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     const submittedRevision = draftRevisionRef.current;
     const submittedScopeId = submissionScopeId;
     const submissionToken = globalThis.crypto.randomUUID();
+    setSubmissionError(null);
     pendingSubmissionRef.current = submissionToken;
     setPendingSubmissionCancellable(canCancelCurrentRun);
     setSubmissionPending(true);
@@ -357,9 +354,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           setValue('');
           submittedDraftCleared = true;
         }
-      } catch {
-        // The store owns user-visible error projection; an unacknowledged
-        // submission deliberately retains the exact draft.
+      } catch (error) {
+        setSubmissionError(
+          error instanceof Error ? error.message : String(error)
+        );
       } finally {
         if (pendingSubmissionRef.current === submissionToken) {
           pendingSubmissionRef.current = null;
@@ -474,7 +472,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     setAttachmentError(null);
   };
 
-  const pickAttachment = (attachment: AgentInputAttachmentV2) => {
+  const pickAttachment = (attachment: AgentInputAttachmentV3) => {
     setAttachmentError(null);
     draftRevisionRef.current += 1;
     onAddAttachment(attachment);
@@ -494,7 +492,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const decisionText = pendingDecision ? composerDecisionText(pendingDecision, language) : null;
   const decisionResolving = Boolean(pendingDecision?.resolving);
   const cancellable = loading && (
-    submissionPending ? pendingSubmissionCancellable : canCancelCurrentRun
+    submissionPending
+      ? pendingSubmissionCancellable || canCancelCurrentRun
+      : canCancelCurrentRun
   );
   const sendDisabled = cancellable
     ? false
@@ -677,15 +677,14 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         <div className="agent-attachment-chips">
           {chips.map((attachment) => (
             <button
-              key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${attachment.kind}`}
+              key={`${attachment.scope}:${attachment.attachmentId}`}
               className={`agent-chip agent-chip--${attachment.scope} agent-chip--${attachment.kind}`}
               title={attachmentLabel(attachment, language)}
               onClick={() => {
                 draftRevisionRef.current += 1;
                 onRemoveAttachment(
-                  attachment.path,
-                  attachment.scope,
-                  attachment.folderId
+                  attachment.attachmentId,
+                  attachment.scope
                 );
               }}
               type="button"
@@ -694,7 +693,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                 <AttachmentIcon kind={attachment.kind} />
               </span>
               <span className="agent-chip__body">
-                <span className="agent-chip__path">{attachment.path}</span>
+                <span className="agent-chip__path">{attachment.displayName}</span>
                 <span className="agent-chip__kind">
                   {attachment.scope === 'session'
                     ? t(language, 'agent.attachmentDialog.sessionScope')
@@ -709,6 +708,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       {attachmentError && (
         <div className="agent-composer__attachment-error" role="alert">
           {attachmentError}
+        </div>
+      )}
+      {submissionError && (
+        <div className="agent-composer__attachment-error" role="alert">
+          {submissionError}
         </div>
       )}
       {MODIFIED_FILES.length > 0 && (
@@ -832,8 +836,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       <UserAttachmentDialog
         visible={attachmentDialogOpen}
         language={language}
-        workspaceBinding={attachmentWorkspaceBinding}
-        allowGlobalWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         onClose={() => setAttachmentDialogOpen(false)}
         onPick={pickAttachment}
       />

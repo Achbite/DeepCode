@@ -90,6 +90,13 @@ export interface SessionProviderAdmissionSidecarV1 {
     reviewRevision?: number;
     snapshotHighWater?: number;
   };
+  /**
+   * Session-owned canonical Kernel operation identities for the immediately
+   * preceding Provider tool turn. They are private admission metadata: the
+   * Daemon validates them against the parent trace and Kernel terminal facts,
+   * and removes them before constructing the external Provider payload.
+   */
+  continuationOperationIds?: string[];
   cacheLane: {
     laneId: string;
     laneRevision: number;
@@ -270,6 +277,11 @@ export function buildSessionProviderAdmissionSidecarV1(
       'Session Provider cache plan conflicts with current request material.'
     );
   }
+  const continuationOperationIds =
+    sessionProviderContinuationOperationIdsV1(
+      turn,
+      input.cacheLane
+    );
   return {
     schemaVersion: SESSION_PROVIDER_ADMISSION_SIDECAR_V1_SCHEMA,
     sessionId: turn.sessionMemory.sessionId,
@@ -304,8 +316,51 @@ export function buildSessionProviderAdmissionSidecarV1(
           }
         : {}),
     },
+    ...(continuationOperationIds
+      ? { continuationOperationIds }
+      : {}),
     cacheLane: cloneJson(input.cacheLane),
   };
+}
+
+function sessionProviderContinuationOperationIdsV1(
+  turn: SessionProviderTurnInputV2,
+  cacheLane: SessionProviderCacheLanePlanV1
+): string[] | undefined {
+  if (cacheLane.mode !== 'append') return undefined;
+  const predecessorId = cacheLane.predecessorRequestId;
+  const predecessor = turn.providerOutcomes.at(-1);
+  if (
+    turn.purpose !== 'continuation'
+    || !predecessorId
+    || !predecessor
+    || predecessor.providerTurnId !== predecessorId
+    || predecessor.outputKind !== 'toolIntent'
+    || predecessor.toolSettlement.status !== 'completed'
+    || predecessor.toolCalls.length
+      !== predecessor.toolCallReceipt.callCount
+    || predecessor.toolCalls.some((call, index) =>
+      call.ordinal !== index + 1
+      || call.status !== 'completed'
+    )
+  ) {
+    throw new Error(
+      'Session Provider append continuation requires one fully settled predecessor tool outcome.'
+    );
+  }
+  const operationIds = predecessor.toolCalls.map(
+    (call) => call.operationId
+  );
+  if (
+    operationIds.length === 0
+    || operationIds.length > 32
+    || new Set(operationIds).size !== operationIds.length
+  ) {
+    throw new Error(
+      'Session Provider append continuation operation identities are invalid.'
+    );
+  }
+  return [...operationIds];
 }
 
 export function sessionProviderSemanticMessagesV1(

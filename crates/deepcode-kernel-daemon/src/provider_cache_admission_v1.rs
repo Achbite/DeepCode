@@ -4,6 +4,7 @@ use crate::host_v2_storage::{
 };
 use crate::prelude::*;
 use crate::*;
+use std::collections::HashSet;
 
 pub(crate) const SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V1: &str =
     "deepcode.session.provider-admission-sidecar.v1";
@@ -152,6 +153,8 @@ pub(crate) struct SessionProviderAdmissionSidecarV1 {
     pub(crate) response_format_digest: String,
     pub(crate) tool_context_ref: SessionProviderToolContextRefSidecarV1,
     pub(crate) authority: SessionProviderAuthoritySidecarV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) continuation_operation_ids: Vec<String>,
     pub(crate) cache_lane: SessionProviderCacheLaneSidecarV1,
 }
 
@@ -413,6 +416,27 @@ impl SessionProviderAdmissionSidecarV1 {
             }
             SessionProviderCacheLaneModeV1::ExactReplay => {
                 require_cache_relation_fields(&self.cache_lane, true, true, false)?;
+            }
+        }
+        let continuation_append = self.purpose == ProviderTracePurposeV1::Continuation
+            && self.cache_lane.mode == SessionProviderCacheLaneModeV1::Append;
+        if continuation_append != !self.continuation_operation_ids.is_empty()
+            || self.continuation_operation_ids.len() > 32
+        {
+            return Err(HostV2StorageError::invalid(
+                "provider_continuation_operation_identity_invalid",
+                "Provider append continuation operation identities are missing or out of scope",
+            ));
+        }
+        let mut unique_continuation_operations =
+            HashSet::with_capacity(self.continuation_operation_ids.len());
+        for operation_id in &self.continuation_operation_ids {
+            validate_bounded_identity(operation_id, "continuationOperationId", 512)?;
+            if !unique_continuation_operations.insert(operation_id) {
+                return Err(HostV2StorageError::invalid(
+                    "provider_continuation_operation_identity_invalid",
+                    "Provider append continuation operation identities must be unique",
+                ));
             }
         }
         if self.cache_lane.supporting_reset_reasons.len() > 15

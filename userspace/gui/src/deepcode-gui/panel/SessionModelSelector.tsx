@@ -9,6 +9,9 @@ import useAppStatusStore from '../../state/appStatusStore';
 interface SessionModelSelectorProps {
   language: UiLanguage;
   locked: boolean;
+  draft?: boolean;
+  draftProfileId?: string;
+  onDraftProfileChange?: (profileId: string | undefined) => void;
   onAvailabilityChange: (available: boolean) => void;
 }
 
@@ -19,6 +22,9 @@ function profileLabel(profile: LlmProviderProfile): string {
 const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   language,
   locked,
+  draft = false,
+  draftProfileId,
+  onDraftProfileChange,
   onAvailabilityChange,
 }) => {
   const session = useAgentSessionStore((state) => state.session);
@@ -83,19 +89,24 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
   }, [loadProfiles, refreshSessionProfile]);
 
-  const selectedProfileId = session
-    ? session.profileId ?? ''
-    : defaultProfileId ?? '';
+  const usesDraftProfile = draft || !session;
+  const selectedProfileId = usesDraftProfile
+    ? draftProfileId ?? defaultProfileId ?? ''
+    : session?.profileId ?? '';
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
   );
-  const sessionProfileAvailable = Boolean(session?.profileId && selectedProfile);
+  const sessionProfileAvailable = Boolean(selectedProfile);
   useEffect(() => {
     onAvailabilityChange(loadState === 'ready' && sessionProfileAvailable);
   }, [loadState, onAvailabilityChange, sessionProfileAvailable]);
+  useEffect(() => {
+    if (!usesDraftProfile || loadState !== 'ready' || draftProfileId || !defaultProfileId) return;
+    onDraftProfileChange?.(defaultProfileId);
+  }, [defaultProfileId, draftProfileId, loadState, onDraftProfileChange, usesDraftProfile]);
   const unavailable = loadState !== 'ready' || profiles.length === 0;
-  const disabled = locked || profileSelectionBusy || unavailable || !session;
+  const disabled = locked || profileSelectionBusy || unavailable || (!draft && !session);
   const selectorTitle = locked
     ? t(language, 'agent.profile.locked')
     : loadState === 'loading'
@@ -124,7 +135,13 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           value={selectedProfile ? selectedProfileId : ''}
           disabled={disabled}
           aria-label={t(language, 'agent.profile.selector')}
-          onChange={(event) => void selectProfile(event.target.value)}
+          onChange={(event) => {
+            if (draft) {
+              onDraftProfileChange?.(event.target.value || undefined);
+              return;
+            }
+            void selectProfile(event.target.value);
+          }}
         >
           {!selectedProfile && (
             <option value="">

@@ -437,6 +437,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [memoryRefreshing, setMemoryRefreshing] = useState(false);
   const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
+  const draftTargetProjectIdRef = useRef<string | null>(draftTargetProjectId);
+  const draftSubmissionScopeIdRef = useRef<string | null>(draftSubmissionScopeId);
   const sidebarPendingActionRef = useRef<string | null>(null);
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
@@ -450,6 +452,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
+  const enterDraft = useAgentSessionStore((s) => s.enterDraft);
+  const sendProjectMessage = useAgentSessionStore((s) => s.sendProjectMessage);
   const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
@@ -463,6 +467,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     if (typeof performance === 'undefined') return;
     performance.mark('deepcode-gui:workbench-ready');
   }, []);
+
+  useEffect(() => {
+    draftTargetProjectIdRef.current = draftTargetProjectId;
+    draftSubmissionScopeIdRef.current = draftSubmissionScopeId;
+  }, [draftSubmissionScopeId, draftTargetProjectId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -480,10 +489,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       }
     };
     void loadKnownSessions();
-    const interval = window.setInterval(() => void loadKnownSessions(), 5000);
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
     };
   }, [sessions.length, activeSession?.id]);
 
@@ -524,13 +531,18 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const liveTimelineProjection = projectDraftActive
     ? timelineOrEmpty(null, 'project-draft')
     : timelineOrEmpty(timeline, activeSession?.id);
-  const agentReady = apiStatus === 'connected' && (
+  const agentReady = apiStatus === 'connected';
+  const composerReady = agentReady && (
     projectDraftActive
     || (
       !loadingSession
       && sessionSelectionReady
       && Boolean(activeSession?.id)
-      && localWorkspaceScopeKey === workspaceScopeKey
+      && localWorkspaceScopeKey === activeSession?.conversationTarget.workspaceScopeKey
+      && (activeSession?.projectId
+        ? activeSession.projectId === activeProjectId
+        : activeProjectId === null
+          && activeSession?.conversationTarget.workspaceScopeKey === workspaceScopeKey)
       && timeline?.sessionId === activeSession?.id
     )
   );
@@ -600,7 +612,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
 
   const moveSessionToProject = async (projectId: string, sessionId: string) => {
     const result = await updateAgentSession(sessionId, { projectId });
-    if (result.ok && result.data) upsertKnownSession(result.data.session);
+    if (!result.ok || !result.data) return;
+    upsertKnownSession(result.data.session);
+    if (activeSession?.id === sessionId) {
+      await activateSession(sessionId);
+    }
   };
 
   const upsertKnownSession = (session: AgentSession) => {
@@ -621,6 +637,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         : null
     );
     if (targetProjectId) {
+      enterDraft();
       return;
     }
     const nextSession = await createNewSession();
@@ -654,32 +671,38 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftTargetProjectId) {
-      return captureSubmissionTarget() ?? false;
-    }
-    if (!draftSubmissionScopeId) return false;
+    if (!draftTargetProjectId) return captureSubmissionTarget() ?? false;
+    return false;
+  };
+
+  const submitProjectDraftMessage = async (content: string, profileId?: string) => {
+    if (!draftTargetProjectId || !draftSubmissionScopeId || !draftProject) return false;
     const targetProjectId = draftTargetProjectId;
+    const submissionScopeId = draftSubmissionScopeId;
     pendingProjectSendRef.current = null;
-    const nextSession = await createNewSession({
-      projectId: targetProjectId,
-      preserveAttachments: true,
-    });
-    if (!nextSession?.id) {
-      return false;
-    }
-    const submissionTarget = captureSubmissionTarget(nextSession.id);
-    if (!submissionTarget) {
-      return false;
-    }
+    const admitted = await sendProjectMessage(
+      targetProjectId,
+      draftProject.conversationTarget,
+      submissionScopeId,
+      content,
+      profileId
+    );
+    if (!admitted) return false;
+    if (
+      draftTargetProjectIdRef.current !== targetProjectId
+      || draftSubmissionScopeIdRef.current !== submissionScopeId
+    ) return true;
+    const nextSession = useAgentSessionStore.getState().session;
+    if (!nextSession || nextSession.projectId !== targetProjectId) return true;
     pendingProjectSendRef.current = {
       projectId: targetProjectId,
       sessionId: nextSession.id,
-      submissionScopeId: draftSubmissionScopeId,
+      submissionScopeId,
     };
     upsertKnownSession(nextSession);
     setActiveProjectId(targetProjectId);
     setDraftTargetProjectId(null);
-    return submissionTarget;
+    return true;
   };
 
   const commitDraftProjectSession = async (
@@ -741,6 +764,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     const project = result.data.project;
     setProjectRecords((current) => [project, ...current.filter((item) => item.id !== project.id)]);
     setActiveProjectId(null);
+    enterDraft();
     setDraftTargetProjectId(project.id);
     setDraftSubmissionScopeId(
       `project-draft:${project.id}:${globalThis.crypto.randomUUID()}`
@@ -885,11 +909,16 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     const result = await deleteAgentProject(project.id);
     if (!result.ok || !result.data) return;
     setProjectRecords(result.data.projects);
-    setKnownSessions((current) => current.map((session) =>
-      session.projectId === project.id
-        ? { ...session, projectId: undefined, workspaceId: undefined, workspaceHash: undefined, workspaceScopeKey: 'unbound-workspace' }
-        : session
-    ));
+    const refreshedSessions = await listAgentSessions({
+      includeArchived: true,
+      includeAllScopes: true,
+    });
+    if (refreshedSessions.ok && refreshedSessions.data) {
+      setKnownSessions(refreshedSessions.data.sessions);
+      if (activeSession?.projectId === project.id) {
+        await activateSession(activeSession.id);
+      }
+    }
     setCollapsedProjectIds((current) => current.filter((id) => id !== project.id));
     if (activeProjectId === project.id) setActiveProjectId(null);
     if (draftTargetProjectId === project.id) {
@@ -957,15 +986,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <DeepCodeConversationShell
           language={language}
           timeline={liveTimelineProjection}
-          agentReady={agentReady}
+          agentReady={composerReady}
           forceHome={projectDraftActive}
           projectTitle={draftProject?.title ?? activeProject?.title ?? null}
-          projectWorkspaceBinding={
-            draftProject?.workspaceBinding ?? activeProject?.workspaceBinding
-          }
-          projectContext={Boolean(draftProject ?? activeProject)}
           submissionScopeId={composerSubmissionScopeId}
           onBeforeSend={prepareProjectDraftSession}
+          onDraftSend={projectDraftActive ? submitProjectDraftMessage : undefined}
           onAfterSend={commitDraftProjectSession}
         />
 

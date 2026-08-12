@@ -18,6 +18,7 @@ import type {
   CodeGrepResult,
   CreateAgentProjectRequest,
   CreateAgentSessionRequest,
+  CreateUserAttachmentGrantRequestV1,
   CreateTerminalSessionRequest,
   FileReadResult,
   FileTreeNode,
@@ -52,6 +53,7 @@ import type {
   TerminalWarmupStatus,
   UpdateAgentProjectRequest,
   UpdateAgentSessionRequest,
+  UserAttachmentGrantResultV1,
   WorkspaceState,
 } from '@deepcode/protocol';
 import * as api from './apiClient';
@@ -242,6 +244,18 @@ export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
 
 export function browsePath(absolutePath?: string): Promise<ApiResponse<BrowsePathResult>> {
   return api.browsePath(absolutePath);
+}
+
+export function createUserAttachmentGrant(
+  request: CreateUserAttachmentGrantRequestV1
+): Promise<ApiResponse<UserAttachmentGrantResultV1>> {
+  return api.createUserAttachmentGrant(request);
+}
+
+export function revokeUserAttachmentGrant(
+  attachmentId: string
+): Promise<ApiResponse<api.UserAttachmentRevocationResultV1>> {
+  return api.revokeUserAttachmentGrant(attachmentId);
 }
 
 export function scanSkillMount(
@@ -473,6 +487,13 @@ export function startAgentRun(
   return api.startAgentRun(sessionId, request);
 }
 
+export function startProjectAgentRun(
+  projectId: string,
+  request: api.StartProjectAgentRunRequest
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.startProjectAgentRun(projectId, request);
+}
+
 export function getAgentRun(
   sessionId: string,
   runId: string,
@@ -484,9 +505,27 @@ export function getAgentRun(
 export function cancelAgentRunById(
   sessionId: string,
   runId: string,
-  callerRequestId: string
+  callerRequestId: string,
+  conversationTarget: api.AgentConversationTargetV1
 ): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.cancelAgentRunById(sessionId, runId, callerRequestId);
+  return api.cancelAgentRunById(
+    sessionId,
+    runId,
+    callerRequestId,
+    conversationTarget
+  );
+}
+
+export function cancelCurrentAgentRun(
+  sessionId: string,
+  callerRequestId: string,
+  conversationTarget: api.AgentConversationTargetV1
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.cancelCurrentAgentRun(
+    sessionId,
+    callerRequestId,
+    conversationTarget
+  );
 }
 
 export function submitAgentRunGuidance(
@@ -495,6 +534,13 @@ export function submitAgentRunGuidance(
   request: api.AgentRunGuidanceRequest
 ): Promise<ApiResponse<api.AgentRunResult>> {
   return api.submitAgentRunGuidance(sessionId, runId, request);
+}
+
+export function submitCurrentAgentRunGuidance(
+  sessionId: string,
+  request: api.AgentRunGuidanceRequest
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.submitCurrentAgentRunGuidance(sessionId, request);
 }
 
 export function getHostSkills(): Promise<ApiResponse<KernelHostSkillCatalogResult>> {

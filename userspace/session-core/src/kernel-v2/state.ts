@@ -22,7 +22,8 @@ import {
   validateSessionToolContextStateV2,
 } from './toolContext.js';
 import {
-  validateAgentInputAttachmentsV2,
+  decodeUserAttachmentContextsV1,
+  validateAgentInputAttachmentsV3,
 } from './inputAttachmentsV2.js';
 import {
   validateSessionContextMemoryV2,
@@ -1780,7 +1781,11 @@ function validateUserInput(input: SessionUserInputRecordV2): void {
   requiredIdentity(input.inputId, 'inputId');
   requiredIdentity(input.opaqueInputRef, 'opaqueInputRef');
   requiredText(input.text, 'input.text');
-  validateAgentInputAttachmentsV2(input.attachments);
+  validateAgentInputAttachmentsV3(input.attachments);
+  decodeUserAttachmentContextsV1(
+    input.attachmentContexts,
+    input.attachments
+  );
   requiredText(input.recordedAt, 'input.recordedAt');
 }
 

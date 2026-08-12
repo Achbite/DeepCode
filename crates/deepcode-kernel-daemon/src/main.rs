@@ -40,6 +40,8 @@ mod startup_readiness_v2;
 mod state;
 mod terminal_api;
 mod terminal_runtime;
+mod user_attachment_api_v1;
+mod user_attachment_v1;
 mod utils;
 mod workspace_api;
 
@@ -70,6 +72,8 @@ pub(crate) use settings_api::*;
 pub(crate) use skill_api::*;
 pub(crate) use state::*;
 pub(crate) use terminal_api::*;
+pub(crate) use user_attachment_api_v1::*;
+pub(crate) use user_attachment_v1::*;
 pub(crate) use utils::*;
 pub(crate) use workspace_api::*;
 

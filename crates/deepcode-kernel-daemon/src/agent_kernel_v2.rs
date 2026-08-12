@@ -19,7 +19,9 @@ use crate::host_run_broker_v2::{
     HostActiveRunRecordV2, HostRunSettingsCeilingV2, HostRunWorkspaceKindV2,
 };
 use crate::host_services::{HostPreparedBoundWorkspaceV2, HostPreparedEmptyWorkspaceV2};
-use crate::host_v2_storage::{canonical_sha256, stable_json_sha256, HostV2StorageError};
+use crate::host_v2_storage::{
+    canonical_sha256, stable_json_sha256, validate_bounded_identity, HostV2StorageError,
+};
 use crate::kernel_v2_transport::{
     HostAuthorityRevokeResolveRequestV2, HostCapabilityDecisionApplyErrorV2,
     HostCapabilityDecisionKindV2, HostCapabilityDecisionRequestV2, HostResolvedAuthorityRevokeV2,
@@ -139,18 +141,6 @@ impl PreparedAgentWorkspaceV2 {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty { .. })
-    }
-
-    fn active_folder_id(&self) -> Option<&str> {
-        match self {
-            Self::Bound { workspace, .. } | Self::Empty { workspace, .. } => {
-                workspace.active_folder_id.as_deref()
-            }
-        }
-    }
-
     fn discard(self, state: &AppState) -> Result<(), AgentKernelV2Error> {
         match self {
             Self::Bound { prepared, .. } => state
@@ -223,7 +213,7 @@ enum PlanPreviewAuthorizationModeV2 {
 
 struct PreparedOpenCallerRequestV2 {
     prompt: String,
-    attachments: Vec<AgentInputAttachmentV2>,
+    attachments: Vec<AgentInputAttachmentV3>,
     caller_request_id: String,
     request_digest: String,
     host_run_id: String,
@@ -444,29 +434,25 @@ pub(crate) async fn open_agent_kernel_run_v2(
                 return Err(error);
             }
         };
-    if prepared_workspace.is_empty() && !prepared.attachments.is_empty() {
-        let error = AgentKernelV2Error::invalid(
-            "agent_input_attachment_workspace_required",
-            "Attachments require a bound workspace.",
-        );
-        settle_caller_error_outcome_v2(state, &binding, &error, false)?;
-        let _ = prepared_workspace.discard(state);
-        return Err(error);
-    }
-    if let Err(folder_error) = validate_agent_attachment_folder_binding_v2(
+    let attachment_admission = match state.host_services.user_attachments_v1.admit_input(
+        session_id,
+        &binding.caller_request_id,
         &prepared.attachments,
-        prepared_workspace.active_folder_id(),
     ) {
-        let error = AgentKernelV2Error::invalid(folder_error.code, folder_error.message);
-        settle_caller_error_outcome_v2(state, &binding, &error, false)?;
-        let _ = prepared_workspace.discard(state);
-        return Err(error);
-    }
+        Ok(admission) => admission,
+        Err(attachment_error) => {
+            let error = AgentKernelV2Error::from_storage(attachment_error);
+            settle_caller_error_outcome_v2(state, &binding, &error, false)?;
+            let _ = prepared_workspace.discard(state);
+            return Err(error);
+        }
+    };
     let initial_input = HostKernelInitialInputV2 {
         input_id: input_id.clone(),
         opaque_input_ref,
         text: prepared.prompt,
-        attachments: prepared.attachments,
+        attachments: attachment_admission.attachments,
+        attachment_contexts: attachment_admission.contexts,
         recorded_at: binding.recorded_at.clone(),
     };
     let operation = HostKernelBridgeOperationV2::InitialTurn {
@@ -728,6 +714,17 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
     body: &AgentSessionRunRequest,
 ) -> Result<String, AgentKernelV2Error> {
     let caller_request_id = required_caller_request_id_v2(Some(&body.caller_request_id))?;
+    let conversation_target_revision = body
+        .conversation_target
+        .as_ref()
+        .map(|target| target.target_revision.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "agent_conversation_target_required",
+                "Decision admission requires the exact daemon-issued conversationTarget",
+            )
+        })?;
     let route_run_id = body
         .run_id
         .as_deref()
@@ -767,6 +764,7 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
         "sessionId": session_id,
         "routeRunId": route_run_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
         "decisionKind": decision_kind,
         "decision": body.decision,
         "guidance": normalized_guidance,
@@ -1837,50 +1835,17 @@ pub(crate) fn revoke_agent_kernel_authority_v2(
     Ok(result)
 }
 
-fn validate_active_run_attachment_binding_v2(
+fn validate_active_run_attachments_v3(
     state: &AppState,
     active: &HostActiveRunRecordV2,
-    attachments: &[AgentInputAttachmentV2],
+    caller_request_id: &str,
+    attachments: &[AgentInputAttachmentV3],
 ) -> Result<(), AgentKernelV2Error> {
-    if attachments.is_empty() {
-        return Ok(());
-    }
-    if active.workspace_kind != HostRunWorkspaceKindV2::Bound {
-        return Err(AgentKernelV2Error::invalid(
-            "agent_input_attachment_workspace_required",
-            "Attachments require a bound workspace.",
-        ));
-    }
-    let workspace_binding_ref = WorkspaceBindingRefV2::new(active.workspace_binding_ref.clone())
-        .map_err(|_| {
-            AgentKernelV2Error::invalid(
-                "agent_input_attachment_workspace_unverifiable",
-                "The active Run workspace binding reference is invalid.",
-            )
-        })?;
-    let current_binding = state
+    state
         .host_services
-        .workspace
-        .resolve_exact_run_binding(&workspace_binding_ref, &active.workspace_binding_identity)
-        .map_err(|error| {
-            AgentKernelV2Error::invalid(
-                "agent_input_attachment_workspace_unverifiable",
-                format!(
-                    "The active Run workspace root cannot be proven unchanged: {}",
-                    error.message
-                ),
-            )
-        })?;
-    if let Some(authoritative_folder_id) = active.active_folder_id.as_deref() {
-        if current_binding.active_folder_id.as_deref() != Some(authoritative_folder_id) {
-            return Err(AgentKernelV2Error::invalid(
-                "agent_input_attachment_folder_binding_stale",
-                "The durable Run folder identity no longer matches its exact workspace root.",
-            ));
-        }
-    }
-    validate_agent_attachment_folder_binding_v2(attachments, active.active_folder_id.as_deref())
-        .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))
+        .user_attachments_v1
+        .validate_bound_handles(&active.session_id, caller_request_id, attachments)
+        .map_err(AgentKernelV2Error::from_storage)
 }
 
 pub(crate) async fn submit_agent_kernel_user_input_v2(
@@ -1890,15 +1855,16 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
     guidance: &str,
     workspace_path: Option<&str>,
     no_workspace: bool,
-    attachments: Option<&[AgentInputAttachmentV2]>,
+    attachments: Option<&[AgentInputAttachmentV3]>,
     caller_request_id: &str,
+    conversation_target_revision: &str,
 ) -> Result<AgentKernelUserInputAdmissionV2, AgentKernelV2Error> {
     let text = Some(guidance)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AgentKernelV2Error::invalid("empty_guidance", "guidance must not be empty"))?
         .to_string();
-    let attachments = validate_agent_input_attachments_v2(attachments)
+    let attachments = validate_agent_input_attachments_v3(attachments)
         .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
     let caller_request_id = required_caller_request_id_v2(Some(caller_request_id))?;
     let request_material = json!({
@@ -1907,6 +1873,7 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         "sessionId": session_id,
         "routeRunId": route_run_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
         "text": text,
         "workspacePath": workspace_path,
         "noWorkspace": no_workspace,
@@ -1952,12 +1919,16 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
     }
     let active = require_active_agent_kernel_run_v2(state, session_id, Some(route_run_id))?;
     validate_active_run_workspace_request_v2(state, &active, workspace_path, no_workspace)?;
-    validate_active_run_attachment_binding_v2(state, &active, &attachments)?;
     ensure_agent_run_cache_v2(state, &active)?;
     let binding = match existing {
         Some(binding) => binding,
         None => {
             let recorded_at = crate::utils::now_rfc3339_text();
+            let attachment_admission = state
+                .host_services
+                .user_attachments_v1
+                .admit_input(session_id, caller_request_id, &attachments)
+                .map_err(AgentKernelV2Error::from_storage)?;
             let material = json!({
                 "schemaVersion": "deepcode.host.agent-input.v2",
                 "sessionId": session_id,
@@ -1966,7 +1937,7 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
                 "callerRequestId": caller_request_id,
                 "requestDigest": request_digest,
                 "text": text,
-                "attachments": attachments,
+                "attachments": attachment_admission.attachments,
             });
             let input_id = typed_input_id("user", &material)?;
             let opaque_input_ref = stable_identity_v2("input-ref", &material)?;
@@ -1974,7 +1945,8 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
                 input_id: input_id.clone(),
                 opaque_input_ref: opaque_input_ref.clone(),
                 text: text.clone(),
-                attachments: attachments.clone(),
+                attachments: attachment_admission.attachments,
+                attachment_contexts: attachment_admission.contexts,
                 recorded_at: recorded_at.clone(),
             };
             let identity_operation = HostKernelBridgeOperationV2::UserInput {
@@ -2256,8 +2228,10 @@ fn durable_user_input_from_binding_v2(
             "Durable Host caller request semantic user input is invalid.",
         )
     })?;
-    validate_agent_input_attachment_slice_v2(&input.attachments)
+    validate_agent_input_attachment_slice_v3(&input.attachments)
         .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
+    validate_user_attachment_contexts_v1(&input.attachments, &input.attachment_contexts)
+        .map_err(AgentKernelV2Error::from_storage)?;
     if input.text.is_empty() || input.text.trim() != input.text {
         return Err(AgentKernelV2Error::invalid(
             "host_caller_request_semantic_input_invalid",
@@ -2281,6 +2255,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
     session_id: &str,
     route_run_id: &str,
     caller_request_id: &str,
+    conversation_target_revision: &str,
 ) -> Result<Option<String>, AgentKernelV2Error> {
     let caller_request_id = required_caller_request_id_v2(Some(caller_request_id))?;
     let request_material = json!({
@@ -2289,6 +2264,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
         "sessionId": session_id,
         "routeRunId": route_run_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
     });
     let request_digest =
         canonical_sha256(&request_material).map_err(AgentKernelV2Error::from_storage)?;
@@ -2547,10 +2523,21 @@ fn prepare_open_caller_request_v2(
             )
         })?
         .to_string();
-    let attachments = validate_agent_input_attachments_v2(body.attachments.as_deref())
+    let attachments = validate_agent_input_attachments_v3(body.attachments.as_deref())
         .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
     let caller_request_id =
         required_caller_request_id_v2(Some(&body.caller_request_id))?.to_string();
+    let conversation_target_revision = body
+        .conversation_target
+        .as_ref()
+        .map(|target| target.target_revision.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "agent_conversation_target_required",
+                "Run admission requires the exact daemon-issued conversationTarget",
+            )
+        })?;
     let no_workspace = body.no_workspace.unwrap_or(false);
     let workspace_path = (!no_workspace)
         .then(|| {
@@ -2565,6 +2552,7 @@ fn prepare_open_caller_request_v2(
         "kind": HOST_RUN_OPEN_REQUEST_KIND_V2,
         "sessionId": session_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
         "prompt": prompt,
         "attachments": attachments,
         "workspacePath": workspace_path,
@@ -2703,11 +2691,10 @@ fn prepare_agent_workspace_v2(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    deepcode_kernel_abi::validate_optional_agent_attachment_id_v2(
-        active_folder_id.as_deref(),
-        "activeFolderId",
-    )
-    .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
+    if let Some(active_folder_id) = active_folder_id.as_deref() {
+        validate_bounded_identity(active_folder_id, "activeFolderId", 512)
+            .map_err(AgentKernelV2Error::from_storage)?;
+    }
     let settings = state
         .kernel_v2
         .settings_resolver()
@@ -4859,7 +4846,12 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
             }
         };
         if let RecoveredCallerDriveActionV2::UserInput { input, .. } = &action {
-            validate_active_run_attachment_binding_v2(state, &active, &input.attachments)?;
+            validate_active_run_attachments_v3(
+                state,
+                &active,
+                &binding.caller_request_id,
+                &input.attachments,
+            )?;
         }
         let reclaimed = state
             .host_services
@@ -5869,7 +5861,12 @@ async fn resume_admitted_user_input_drive_v2(
         return Err(error);
     }
     let input = durable_user_input_from_binding_v2(&binding)?;
-    validate_active_run_attachment_binding_v2(state, &active, &input.attachments)?;
+    validate_active_run_attachments_v3(
+        state,
+        &active,
+        &binding.caller_request_id,
+        &input.attachments,
+    )?;
     let operation_request_id = caller_binding_string_v2(&binding, "operationRequestId")?;
     let owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
     let owner_for_drive = owner.clone();

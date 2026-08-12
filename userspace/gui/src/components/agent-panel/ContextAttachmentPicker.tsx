@@ -1,11 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import type { AgentInputAttachmentV2, FileTreeNode } from '@deepcode/protocol';
-import { getFileTree } from '../../services/runtimeAdapter';
+import type { AgentInputAttachmentV3, FileTreeNode } from '@deepcode/protocol';
+import {
+  createUserAttachmentGrant,
+  getFileTree,
+} from '../../services/runtimeAdapter';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 
 interface PickerItem {
-  kind: AgentInputAttachmentV2['kind'];
+  kind: AgentInputAttachmentV3['kind'];
   path: string;
   name: string;
   folderId: string;
@@ -14,7 +17,7 @@ interface PickerItem {
 interface ContextAttachmentPickerProps {
   query: string;
   language: UiLanguage;
-  onPick: (attachment: AgentInputAttachmentV2) => void;
+  onPick: (attachment: AgentInputAttachmentV3) => void;
   onError?: (message: string) => void;
 }
 
@@ -73,6 +76,7 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
   const workspace = useWorkspaceStore((state) => state.current);
   const [items, setItems] = useState<PickerItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [granting, setGranting] = useState(false);
 
   useEffect(() => {
     const folderId = activeFolderId ?? workspace?.folders[0]?.id;
@@ -120,20 +124,29 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
         <button
           key={`${item.folderId}:${item.path}`}
           type="button"
+          disabled={granting}
           onMouseDown={(event) => {
             event.preventDefault();
             const currentActiveFolderId = activeFolderId ?? workspace?.folders[0]?.id;
-            const folderStillBound = workspace?.folders.some((folder) => folder.id === item.folderId);
+            const folder = workspace?.folders.find((candidate) => candidate.id === item.folderId);
             const path = normalizeWorkspaceRelativePath(item.path);
-            if (!folderStillBound || item.folderId !== currentActiveFolderId || !path) {
+            if (!folder || item.folderId !== currentActiveFolderId || !path) {
               onError?.(t(language, 'agent.attachment.invalidWorkspacePath'));
               return;
             }
-            onPick({
-              kind: item.kind,
-              path,
-              folderId: item.folderId,
+            const absolutePath = `${folder.absolutePath.replace(/[\\/]+$/u, '')}/${path}`;
+            setGranting(true);
+            void createUserAttachmentGrant({
+              absolutePath,
               scope: 'message',
+              callerRequestId: `host-ui-user-attachment-${globalThis.crypto.randomUUID()}`,
+            }).then((result) => {
+              setGranting(false);
+              if (!result.ok || !result.data) {
+                onError?.(result.message ?? t(language, 'agent.attachment.loadFailed'));
+                return;
+              }
+              onPick(result.data.attachment);
             });
           }}
         >

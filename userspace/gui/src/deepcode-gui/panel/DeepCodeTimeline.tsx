@@ -984,11 +984,11 @@ const DeepCodeAttachmentChips: React.FC<{
   if (attachments.length === 0) return null;
   return (
     <div className="agent-message-attachments" aria-label={t(language, 'agent.message.attachments')}>
-      {attachments.map((attachment, index) => (
+      {attachments.map((attachment) => (
         <span
-          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          key={`${attachment.scope}:${attachment.attachmentId}`}
           className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
-          title={attachment.path}
+          title={attachment.displayName}
         >
           <span className="agent-message-attachment__kind">
             {attachmentKindLabel(attachment, language)}
@@ -1644,7 +1644,7 @@ function attachmentKindLabel(attachment: AgentTimelineAttachment, language: UiLa
 }
 
 function attachmentDisplayPath(attachment: AgentTimelineAttachment): string {
-  return attachment.path || '.';
+  return attachment.displayName;
 }
 
 function attachmentCopyText(attachments: AgentTimelineAttachment[], language: UiLanguage): string {

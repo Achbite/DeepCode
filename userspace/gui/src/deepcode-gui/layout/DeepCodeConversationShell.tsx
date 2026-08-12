@@ -1,7 +1,6 @@
 import React from 'react';
 import type {
   AgentTimelineResult,
-  AgentWorkspaceBinding,
 } from '@deepcode/protocol';
 import type { UiLanguage } from '../../i18n';
 import type { AgentSessionSubmissionTarget } from '../../state/agentSessionStore';
@@ -13,12 +12,11 @@ interface DeepCodeConversationShellProps {
   agentReady: boolean;
   forceHome: boolean;
   projectTitle: string | null;
-  projectWorkspaceBinding?: AgentWorkspaceBinding;
-  projectContext: boolean;
   submissionScopeId?: string | null;
   onBeforeSend: () => AgentSessionSubmissionTarget
     | false
     | Promise<AgentSessionSubmissionTarget | false>;
+  onDraftSend?: (content: string, profileId?: string) => Promise<boolean>;
   onAfterSend: (
     submissionScopeId: string | null,
     submittedDraftCleared: boolean
@@ -31,10 +29,9 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
   agentReady,
   forceHome,
   projectTitle,
-  projectWorkspaceBinding,
-  projectContext,
   submissionScopeId,
   onBeforeSend,
+  onDraftSend,
   onAfterSend,
 }) => (
   <main className="deepcode-gui-session-main">
@@ -44,11 +41,10 @@ const DeepCodeConversationShell: React.FC<DeepCodeConversationShellProps> = ({
       agentReady={agentReady}
       forceHome={forceHome}
       homeProjectTitle={projectTitle}
-      projectWorkspaceBinding={projectWorkspaceBinding}
-      projectContext={projectContext}
       submissionScopeId={submissionScopeId}
       suppressPendingDecision={forceHome}
       onBeforeSend={onBeforeSend}
+      onDraftSend={onDraftSend}
       onAfterSend={onAfterSend}
     />
   </main>

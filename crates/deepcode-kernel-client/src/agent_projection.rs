@@ -219,11 +219,9 @@ pub enum AgentTimelineAttachmentScope {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTimelineAttachment {
     pub kind: AgentTimelineAttachmentKind,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folder_id: Option<String>,
+    pub attachment_id: String,
+    pub resource_id: String,
+    pub display_name: String,
     pub scope: AgentTimelineAttachmentScope,
 }
 
@@ -1823,15 +1821,17 @@ fn validate_block(block: &AgentTimelineBlock) -> Result<(), AgentProjectionValid
     validate_language_binding(&block.language_binding, "block.languageBinding")?;
     validate_provenance(&block.provenance, "block.provenance")?;
     for attachment in block.attachments.iter().flatten() {
-        validate_identity(&attachment.path, "block.attachments.path")?;
-        validate_optional_identity(
-            attachment.resource_id.as_deref(),
-            "block.attachments.resourceId",
-        )?;
-        validate_optional_identity(
-            attachment.folder_id.as_deref(),
-            "block.attachments.folderId",
-        )?;
+        validate_identity(&attachment.attachment_id, "block.attachments.attachmentId")?;
+        validate_identity(&attachment.resource_id, "block.attachments.resourceId")?;
+        validate_identity(&attachment.display_name, "block.attachments.displayName")?;
+        if attachment.display_name.contains('/')
+            || attachment.display_name.contains('\\')
+            || matches!(attachment.display_name.as_str(), "." | "..")
+        {
+            return Err(AgentProjectionValidationError::new(
+                "block attachment displayName must not contain path separators",
+            ));
+        }
     }
     if let Some(interaction) = &block.interaction {
         validate_interaction_view(interaction)?;

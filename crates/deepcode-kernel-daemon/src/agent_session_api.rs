@@ -19,6 +19,7 @@ pub(crate) async fn agent_sessions_list(
     let sessions = if query.include_all_scopes.unwrap_or(false) {
         gui.sessions
             .iter()
+            .filter(|session| session_is_publicly_visible(session))
             .filter(|session| include_archived || !is_archived_session(session))
             .cloned()
             .collect()
@@ -32,6 +33,10 @@ pub(crate) async fn agent_sessions_list(
         .as_deref()
         .and_then(|project_id| current_agent_session_id_for_project(&gui, project_id))
         .or_else(|| current_agent_session_id_for_scope(&mut gui, &scope_key));
+    let sessions = match public_agent_session_values(sessions) {
+        Ok(sessions) => sessions,
+        Err(error) => return ApiResponse::error(error.code, error.message),
+    };
     ApiResponse::ok(json!({
         "sessions": sessions,
         "currentSessionId": current_session_id,
@@ -54,37 +59,14 @@ pub(crate) async fn agent_session_create(
         Err(error) => return ApiResponse::error("agent_session_identity_unavailable", error),
     };
     let now = now_text();
-    let project_id = body
-        .get("projectId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let project = match project_id {
-        Some(project_id) => match project_by_id(&gui, project_id) {
-            Some(project) => Some(project.clone()),
-            None => {
-                return ApiResponse::error("agent_project_not_found", "agent project not found")
-            }
-        },
-        None => None,
-    };
-    let project_binding = project.as_ref().and_then(project_workspace_binding);
-    let workspace_id = if project.is_some() {
-        project_binding
-            .as_ref()
-            .and_then(|binding| binding.get("workspaceId"))
-            .and_then(Value::as_str)
-    } else {
-        body.get("workspaceId").and_then(Value::as_str)
-    };
-    let workspace_hash = if project.is_some() {
-        project_binding
-            .as_ref()
-            .and_then(|binding| binding.get("workspaceHash"))
-            .and_then(Value::as_str)
-    } else {
-        body.get("workspaceHash").and_then(Value::as_str)
-    };
+    if body.get("projectId").is_some() {
+        return ApiResponse::error(
+            "project_session_atomic_admission_required",
+            "Project Sessions must be created together with their first user input through the atomic Project Session admission endpoint",
+        );
+    }
+    let workspace_id = body.get("workspaceId").and_then(Value::as_str);
+    let workspace_hash = body.get("workspaceHash").and_then(Value::as_str);
     let default_profile_id = match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
         Ok(profile_id) => profile_id,
         Err(error) => {
@@ -94,7 +76,7 @@ pub(crate) async fn agent_session_create(
             )
         }
     };
-    let mut session = create_agent_session_value(
+    let session = create_agent_session_value(
         &id,
         &now,
         body.get("title")
@@ -104,10 +86,6 @@ pub(crate) async fn agent_session_create(
         workspace_id,
         workspace_hash,
     );
-    if let Some(project_id) = project_id {
-        session["projectId"] = json!(project_id);
-        session["workspaceBinding"] = project_binding.clone().unwrap_or(Value::Null);
-    }
     let scope_key = session_scope_key(&session);
     let previous_current_session_id = gui.current_session_id.clone();
     let previous_scope_session_id = gui.current_session_ids_by_scope.get(&scope_key).cloned();
@@ -170,7 +148,16 @@ pub(crate) async fn agent_session_activate(
         if !readable.0.ok {
             return readable;
         }
-        if let Some(scope_key) = session_by_id(&gui, &session_id).map(session_scope_key) {
+        let generic_scope_key = session_by_id(&gui, &session_id).and_then(|session| {
+            session
+                .get("projectId")
+                .and_then(Value::as_str)
+                .is_none()
+                .then(|| session_scope_key(session))
+        });
+        gui.current_session_ids_by_scope
+            .retain(|_, current_id| current_id != &session_id);
+        if let Some(scope_key) = generic_scope_key {
             gui.current_session_ids_by_scope
                 .insert(scope_key, session_id.clone());
         }
@@ -193,38 +180,47 @@ pub(crate) async fn agent_session_rename(
     {
         return response;
     }
-    let mut gui = state.gui.lock().expect("gui state lock");
-    if !has_session(&gui, &session_id) {
-        return ApiResponse::error("agent_session_not_found", "agent session not found");
-    }
     let requested_profile_id = body
         .as_object()
         .filter(|object| object.contains_key("profileId"))
         .map(|_| body.get("profileId").cloned().unwrap_or(Value::Null));
-    let resolved_profile_id = if let Some(requested_profile_id) = requested_profile_id {
-        let in_memory_run_locked = state
-            .session_runs
-            .lock()
-            .expect("session run state lock")
-            .values()
-            .any(|run| {
-                run.session_id == session_id
-                    && !matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
-            });
-        let durable_run_locked = match state
-            .host_services
-            .active_runs_v2
-            .resolve_session_active_run(&session_id)
-        {
-            Ok(active) => active.is_some(),
+    let requested_project_id = body
+        .as_object()
+        .filter(|object| object.contains_key("projectId"))
+        .map(|_| body.get("projectId").cloned().unwrap_or(Value::Null));
+    let _project_binding_guard = if requested_project_id.is_some() {
+        Some(agent_project_binding_transition_lock().lock_owned().await)
+    } else {
+        None
+    };
+    let _run_admission_guard = if requested_profile_id.is_some() || requested_project_id.is_some() {
+        Some(session_run_admission_lock(&session_id).lock_owned().await)
+    } else {
+        None
+    };
+    if requested_profile_id.is_some() || requested_project_id.is_some() {
+        match session_has_active_run(&state, &session_id) {
+            Ok(true) if requested_project_id.is_some() => {
+                return ApiResponse::error(
+                    "agent_session_binding_locked",
+                    "Session project and workspace binding are locked while a Run is active",
+                )
+            }
+            Ok(true) => {
+                return ApiResponse::error(
+                    "agent_session_profile_locked",
+                    "session Profile is locked while a Run is active",
+                )
+            }
+            Ok(false) => {}
             Err(error) => return ApiResponse::error(error.code, error.message),
-        };
-        if in_memory_run_locked || durable_run_locked {
-            return ApiResponse::error(
-                "agent_session_profile_locked",
-                "session Profile is locked while a Run is active",
-            );
         }
+    }
+    let mut gui = state.gui.lock().expect("gui state lock");
+    if !has_session(&gui, &session_id) {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    }
+    let resolved_profile_id = if let Some(requested_profile_id) = requested_profile_id {
         let profile_id = if requested_profile_id.is_null() {
             match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
                 Ok(profile_id) => profile_id,
@@ -271,22 +267,28 @@ pub(crate) async fn agent_session_rename(
     } else {
         None
     };
-    let requested_project_id = body.get("projectId").cloned();
-    let requested_project = requested_project_id
-        .as_ref()
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|project_id| {
-            project_by_id(&gui, project_id)
-                .cloned()
-                .ok_or(("agent_project_not_found", "agent project not found"))
-        })
-        .transpose();
-    let requested_project = match requested_project {
-        Ok(project) => project,
-        Err((code, message)) => return ApiResponse::error(code, message),
+    let requested_project = match requested_project_id.as_ref() {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let Some(project_id) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return ApiResponse::error(
+                    "invalid_agent_session_project",
+                    "projectId must be a non-empty string or null",
+                );
+            };
+            let Some(project) = project_by_id(&gui, project_id).cloned() else {
+                return ApiResponse::error("agent_project_not_found", "agent project not found");
+            };
+            Some(project)
+        }
     };
+    let previous_sessions = gui.sessions.clone();
+    let previous_scope_session_ids = gui.current_session_ids_by_scope.clone();
+    let globally_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
     if let Some(session) = session_mut(&mut gui, &session_id) {
         if let Some(title) = body.get("title").and_then(Value::as_str) {
             session["title"] = json!(title);
@@ -295,6 +297,7 @@ pub(crate) async fn agent_session_rename(
         if requested_project_id.is_some() {
             if requested_project_id.as_ref().is_some_and(Value::is_null) {
                 session["projectId"] = Value::Null;
+                session["workspaceBinding"] = Value::Null;
                 session["workspaceId"] = Value::Null;
                 session["workspaceHash"] = Value::Null;
                 session["workspaceScopeKey"] = json!("unbound-workspace");
@@ -307,7 +310,17 @@ pub(crate) async fn agent_session_rename(
             session["profileId"] = json!(profile_id);
         }
         session["updatedAt"] = json!(now_text());
+        let is_project_session = session.get("projectId").and_then(Value::as_str).is_some();
+        let next_scope_key = session_scope_key(session);
+        gui.current_session_ids_by_scope
+            .retain(|_, current_id| current_id != &session_id);
+        if globally_current && !is_project_session {
+            gui.current_session_ids_by_scope
+                .insert(next_scope_key, session_id.clone());
+        }
         if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
+            gui.sessions = previous_sessions;
+            gui.current_session_ids_by_scope = previous_scope_session_ids;
             return ApiResponse::error("agent_session_persist_failed", error);
         }
         return session_result(&gui, &session_id);
@@ -406,7 +419,7 @@ pub(crate) async fn agent_session_delete(
             gui.current_session_id = gui
                 .sessions
                 .iter()
-                .find(|session| session_is_selectable(session))
+                .find(|session| session_is_publicly_selectable(session))
                 .and_then(|session| session.get("id").and_then(Value::as_str))
                 .map(ToOwned::to_owned);
         }
@@ -495,7 +508,7 @@ pub(crate) async fn agent_session_delete(
             gui.current_session_id = gui
                 .sessions
                 .iter()
-                .find(|session| session_is_selectable(session))
+                .find(|session| session_is_publicly_selectable(session))
                 .and_then(|session| session.get("id").and_then(Value::as_str))
                 .map(ToOwned::to_owned);
         }
@@ -505,6 +518,10 @@ pub(crate) async fn agent_session_delete(
         )
     };
 
+    let response_sessions = match public_agent_session_values(response_sessions) {
+        Ok(sessions) => sessions,
+        Err(error) => return ApiResponse::error(error.code, error.message),
+    };
     ApiResponse::ok(json!({
         "sessions": response_sessions,
         "currentSessionId": response_current_id,
@@ -578,64 +595,8 @@ pub(crate) async fn agent_session_archive(
         .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
         .map(session_scope_key);
     let was_global_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
-    let was_scoped_current = archived_scope_key
-        .as_ref()
-        .and_then(|scope| gui.current_session_ids_by_scope.get(scope))
-        .map(|current| current == &session_id)
-        .unwrap_or(false);
-    let replacement_profile_id = if should_archive && (was_global_current || was_scoped_current) {
-        let previous_profile_id = gui
-            .sessions
-            .iter()
-            .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
-            .and_then(|session| session.get("profileId"))
-            .and_then(Value::as_str);
-        let previous_available = match previous_profile_id {
-            Some(profile_id) => {
-                match effective_llm_profile_is_enabled(&state, &gui.llm_profiles, profile_id) {
-                    Ok(available) => available,
-                    Err(error) => {
-                        return ApiResponse::error(
-                            error.code,
-                            "Provider Profile availability could not be verified for replacement Session creation",
-                        )
-                    }
-                }
-            }
-            None => false,
-        };
-        if previous_available {
-            previous_profile_id.map(ToOwned::to_owned)
-        } else {
-            match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
-                Ok(profile_id) => profile_id,
-                Err(error) => {
-                    return ApiResponse::error(
-                        error.code,
-                        "Provider Profile availability could not be verified for replacement Session creation",
-                    )
-                }
-            }
-        }
-    } else {
-        None
-    };
-    let mut replacement_scope: Option<(Option<String>, Option<String>, Option<String>)> = None;
     if let Some(session) = session_mut(&mut gui, &session_id) {
         if should_archive {
-            if was_global_current || was_scoped_current {
-                replacement_scope = Some((
-                    replacement_profile_id.clone(),
-                    session
-                        .get("workspaceId")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    session
-                        .get("workspaceHash")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                ));
-            }
             session["archivedAt"] = json!(now_text());
         } else {
             session
@@ -647,14 +608,8 @@ pub(crate) async fn agent_session_archive(
         if let Some(scope_key) = archived_scope_key.as_ref() {
             gui.current_session_ids_by_scope.remove(scope_key);
         }
-        if was_global_current || was_scoped_current {
-            if let Err(error) = ensure_current_agent_session_for_scope(
-                &mut gui,
-                archived_scope_key.as_deref().unwrap_or("unbound-workspace"),
-                replacement_scope,
-            ) {
-                return ApiResponse::error("agent_session_replacement_failed", error);
-            }
+        if was_global_current {
+            gui.current_session_id = None;
         }
     }
     let response_scope_key = archived_scope_key.unwrap_or_else(|| scope_key_from_parts(None, None));
@@ -663,6 +618,10 @@ pub(crate) async fn agent_session_archive(
     if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
         return ApiResponse::error("agent_session_persist_failed", error);
     }
+    let response_sessions = match public_agent_session_values(response_sessions) {
+        Ok(sessions) => sessions,
+        Err(error) => return ApiResponse::error(error.code, error.message),
+    };
     ApiResponse::ok(json!({
         "sessions": response_sessions,
         "currentSessionId": response_current_id,

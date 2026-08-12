@@ -30,7 +30,7 @@ import {
   AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2,
 } from '@deepcode/protocol';
 import {
-  decodeAgentInputAttachmentsV2,
+  decodeAgentInputAttachmentsV3,
 } from './kernel-v2/inputAttachmentsV2.js';
 
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION =
@@ -2040,7 +2040,7 @@ function validResourcePresentationArray(
 function validTimelineAttachments(value: unknown): boolean {
   if (value === undefined) return true;
   try {
-    decodeAgentInputAttachmentsV2(value);
+    decodeAgentInputAttachmentsV3(value);
     return true;
   } catch {
     return false;
@@ -3735,7 +3735,7 @@ function projectionBlock(
       ? payload.providerPhase
       : undefined;
   const attachments = event.kind === 'user_msg'
-    ? decodeAgentInputAttachmentsV2(payload?.attachments)
+    ? decodeAgentInputAttachmentsV3(payload?.attachments)
     : undefined;
   return {
     id: blockId,

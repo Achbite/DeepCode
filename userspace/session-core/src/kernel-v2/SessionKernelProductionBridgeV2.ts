@@ -51,7 +51,8 @@ import {
   sessionKernelFactBarriersPendingV2,
 } from './factBarriers.js';
 import {
-  decodeAgentInputAttachmentsV2,
+  decodeAgentInputAttachmentsV3,
+  decodeUserAttachmentContextsV1,
 } from './inputAttachmentsV2.js';
 import {
   buildSessionContextMemoryV2,
@@ -962,11 +963,12 @@ export class SessionKernelProductionActorV2 {
     }
     this.terminalCancellation = identity;
     const authorityGeneration = ++this.authorityGeneration;
-    const ordinaryQuiescence =
-      this.markActiveOrdinarySuperseded('userRequested');
+    // Cancellation owns an independent control lane. Abort the ordinary
+    // operation immediately, but do not wait for its Host response receipt:
+    // the Loop's provider/request fences establish semantic quiescence.
+    this.markActiveOrdinarySuperseded('userRequested');
     const predecessor = this.inputTransitionTail;
     const transition = predecessor.then(async () => {
-      await ordinaryQuiescence;
       const activeRunner = await runner;
       const durableCancellation =
         activeRunner.snapshot().runCancellation;
@@ -1899,6 +1901,7 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       'opaqueInputRef',
       'text',
       'attachments',
+      'attachmentContexts',
       'recordedAt',
     ]
   );
@@ -1912,6 +1915,7 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       'session_kernel_production_recorded_at_invalid'
     );
   }
+  const attachments = decodeAgentInputAttachmentsV3(record.attachments);
   return {
     inputId: identity(record.inputId, 'inputId'),
     opaqueInputRef: boundedText(
@@ -1920,7 +1924,11 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       64 * 1024
     ),
     text: boundedText(record.text, 'text', 1024 * 1024),
-    attachments: decodeAgentInputAttachmentsV2(record.attachments),
+    attachments,
+    attachmentContexts: decodeUserAttachmentContextsV1(
+      record.attachmentContexts,
+      attachments
+    ),
     recordedAt,
   };
 }

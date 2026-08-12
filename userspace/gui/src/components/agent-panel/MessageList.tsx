@@ -41,18 +41,18 @@ function AttachmentChips({
   if (attachments.length === 0) return null;
   return (
     <div className="agent-message-attachments" aria-label={t(language, 'agent.message.attachments')}>
-      {attachments.map((attachment, index) => (
+      {attachments.map((attachment) => (
         <span
-          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          key={`${attachment.scope}:${attachment.attachmentId}`}
           className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
-          title={attachment.path}
+          title={attachment.displayName}
         >
           <span className="agent-message-attachment__kind">
             {attachment.kind === 'directory'
               ? t(language, 'agent.composer.dir')
               : t(language, 'agent.composer.file')}
           </span>
-          <span className="agent-message-attachment__path">{attachment.path || '.'}</span>
+          <span className="agent-message-attachment__path">{attachment.displayName}</span>
         </span>
       ))}
     </div>

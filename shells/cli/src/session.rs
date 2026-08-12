@@ -91,7 +91,11 @@ pub(crate) async fn ask(
 ) -> Result<CliCommandOutcome, String> {
     let session_id = session_id_for_turn(client, &host, &prompt).await?;
     let caller_request_id = new_cli_request_id("ask")?;
-    let mut request = StartAgentRunRequest::ask(prompt, caller_request_id);
+    let mut request = StartAgentRunRequest::ask(
+        prompt,
+        caller_request_id,
+        canonical_conversation_target(client, &session_id).await?,
+    );
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
     let (result, final_text) = match start_and_wait_for_run(client, &session_id, request, !plain)
@@ -205,7 +209,12 @@ pub(crate) async fn resolve_session_decision(
         pending.run_id, pending.target_id
     );
     let caller_request_id = new_cli_request_id("decision")?;
-    let mut request = StartAgentRunRequest::resolve_decision(kind, decision, caller_request_id);
+    let mut request = StartAgentRunRequest::resolve_decision(
+        kind,
+        decision,
+        caller_request_id,
+        canonical_conversation_target(client, &session_id).await?,
+    );
     request.run_id = Some(pending.run_id);
     request.target_id = Some(pending.target_id);
     request.guidance = guidance;
@@ -383,7 +392,13 @@ async fn cancel_exact_run_before_cli_exit(
         client.cancel_agent_run_by_id(
             &result.run.session_id,
             &result.run.run_id,
-            AgentRunCallerRequest::new(caller_request_id),
+            AgentRunCallerRequest::new(
+                caller_request_id,
+                deepcode_kernel_client::AgentConversationTargetV1::from_session(
+                    &result.session,
+                )
+                .map_err(|error| format!("failed to resolve cancellation target: {error}"))?,
+            ),
         ),
     )
     .await
@@ -898,6 +913,18 @@ async fn session_id_for_turn(
         .ok_or_else(|| "created session has no id".to_string())
 }
 
+async fn canonical_conversation_target(
+    client: &HttpKernelClient,
+    session_id: &str,
+) -> Result<deepcode_kernel_client::AgentConversationTargetV1, String> {
+    let result = client
+        .get_agent_session(session_id)
+        .await
+        .map_err(|error| format!("failed to read canonical Session target: {error}"))?;
+    deepcode_kernel_client::AgentConversationTargetV1::from_session(&result.session)
+        .map_err(|error| format!("failed to decode canonical Session target: {error}"))
+}
+
 async fn start_and_wait_for_run(
     client: &HttpKernelClient,
     session_id: &str,
@@ -1158,6 +1185,7 @@ async fn admit_cli_turn_v2(
     let mut guidance = AgentRunGuidanceRequest::new(
         request.content.unwrap_or_default(),
         request.caller_request_id,
+        request.conversation_target,
     );
     guidance.workspace_path = request.workspace_path;
     guidance.no_workspace = request.no_workspace;

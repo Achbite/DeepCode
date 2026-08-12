@@ -29,8 +29,8 @@ const AgentPanel: React.FC = () => {
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
-  const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
+  const loadCurrentSelection = useAgentSessionStore((s) => s.loadCurrentSelection);
+  const observeSessionProjection = useAgentSessionStore((s) => s.observeSessionProjection);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
@@ -41,15 +41,11 @@ const AgentPanel: React.FC = () => {
   const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
-  const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
-  const activeFolderId = useWorkspaceStore((s) => (
-    s.activeFolderId ?? s.getActiveFolder()?.id ?? null
-  ));
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -73,6 +69,12 @@ const AgentPanel: React.FC = () => {
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
   const waitingForUser = timelineProjection.runProjection?.status === 'waitingUser'
     || timelineProjection.runProjection?.wait?.kind === 'user';
+  const cancellableRun = Boolean(
+    timelineProjection.runProjection
+    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      timelineProjection.runProjection.status
+    )
+  );
   const agentReady = Boolean(
     !loading
     && selectionReady
@@ -85,32 +87,14 @@ const AgentPanel: React.FC = () => {
     && !activeSubmissionSessionIds.includes(session.id)
     ? pendingSubmissionRetryView(session.id)
     : null;
-  const attachmentWorkspaceBinding = session?.workspaceBinding;
-  const allowGlobalAttachmentWorkspaceFallback = !session?.projectId;
 
   useEffect(() => {
-    if (session?.projectId) return;
-    void loadOrCreate();
-    void refreshSessions();
-  }, [loadOrCreate, refreshSessions, session?.projectId, workspaceScopeKey]);
-
-  useEffect(() => {
-    if (
-      attachmentWorkspaceBinding
-      && !attachmentWorkspaceBinding.activeFolderId
-    ) {
-      return;
-    }
-    synchronizeAttachmentRoot(
-      attachmentWorkspaceBinding?.activeFolderId
-        ?? (allowGlobalAttachmentWorkspaceFallback ? activeFolderId : null)
-    );
-  }, [
-    activeFolderId,
-    allowGlobalAttachmentWorkspaceFallback,
-    attachmentWorkspaceBinding,
-    synchronizeAttachmentRoot,
-  ]);
+    if (!session?.id) return;
+    const release = observeSessionProjection(session.id);
+    return () => {
+      void release();
+    };
+  }, [observeSessionProjection, session?.id]);
 
   return (
     <div className="agent-panel-shell">
@@ -156,7 +140,7 @@ const AgentPanel: React.FC = () => {
         <div className="agent-panel-error">
           <span>{errorMessage}</span>
           {!agentReady && (
-            <button type="button" onClick={() => void loadOrCreate()}>
+            <button type="button" onClick={() => void loadCurrentSelection()}>
               {t(language, 'deepcodeGui.statusAction.retry')}
             </button>
           )}
@@ -166,8 +150,6 @@ const AgentPanel: React.FC = () => {
       <AgentComposer
         messageAttachments={messageAttachments}
         sessionAttachments={sessionAttachments}
-        attachmentWorkspaceBinding={attachmentWorkspaceBinding}
-        allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         language={language}
         loading={agentBusy}
         sendBlocked={!agentReady}
@@ -177,7 +159,7 @@ const AgentPanel: React.FC = () => {
         onRetryPendingSubmission={retryPendingSubmission}
         submissionScopeId={session?.id ?? null}
         canCancelCurrentRun={Boolean(
-          session?.id && activeRunSessionIds.includes(session.id)
+          session?.id && cancellableRun
         )}
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}

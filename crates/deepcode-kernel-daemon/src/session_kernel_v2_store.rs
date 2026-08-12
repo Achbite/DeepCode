@@ -14,6 +14,7 @@ use crate::provider_trace_v1::{
     ProviderTraceTerminalV1, ProviderTraceWriterV1,
 };
 use crate::session_bootstrap_v2::HostSessionPriorEventsV2;
+use crate::user_attachment_v1::{validate_user_attachment_contexts_v1, UserAttachmentContextV1};
 use crate::AppState;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -3880,6 +3881,7 @@ fn persisted_input_record_id<'a>(
         )
     })?;
     let expected_keys = [
+        "attachmentContexts",
         "attachments",
         "inputId",
         "opaqueInputRef",
@@ -3942,15 +3944,33 @@ fn persisted_input_record_id<'a>(
             )
         })?;
     validate_bounded_identity(recorded_at, "recordedAt", 1024)?;
-    deepcode_kernel_abi::decode_agent_input_attachments_v2(object.get("attachments").ok_or_else(
-        || {
+    let attachments = deepcode_kernel_abi::decode_agent_input_attachments_v3(
+        object.get("attachments").ok_or_else(|| {
             HostV2StorageError::invalid(
                 "session_kernel_input_record_invalid",
                 "Session Kernel input record has no attachments",
             )
-        },
-    )?)
+        })?,
+    )
     .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    let attachment_contexts: Vec<UserAttachmentContextV1> = serde_json::from_value(
+        object
+            .get("attachmentContexts")
+            .ok_or_else(|| {
+                HostV2StorageError::invalid(
+                    "session_kernel_input_record_invalid",
+                    "Session Kernel input record has no attachmentContexts",
+                )
+            })?
+            .clone(),
+    )
+    .map_err(|_| {
+        HostV2StorageError::invalid(
+            "session_kernel_input_record_invalid",
+            "Session Kernel attachmentContexts use an invalid strict envelope",
+        )
+    })?;
+    validate_user_attachment_contexts_v1(&attachments, &attachment_contexts)?;
     Ok(input_id)
 }
 
@@ -5773,7 +5793,7 @@ fn validate_private_projection_event_data(
                 &["controlEpoch"],
                 &[],
             )?;
-            deepcode_kernel_abi::decode_agent_input_attachments_v2(
+            deepcode_kernel_abi::decode_agent_input_attachments_v3(
                 data.get("attachments").expect("required attachments"),
             )
             .map_err(|error| {
@@ -7343,7 +7363,7 @@ fn validate_public_agent_event(
                     "Session v2 user event requires the exact nested attachment DTO",
                 )
             })?;
-        deepcode_kernel_abi::decode_agent_input_attachments_v2(attachments).map_err(|error| {
+        deepcode_kernel_abi::decode_agent_input_attachments_v3(attachments).map_err(|error| {
             HostV2StorageError::invalid(
                 "session_kernel_public_event_attachment_invalid",
                 format!(

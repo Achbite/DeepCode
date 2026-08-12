@@ -1,12 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import type {
   AgentTimelineResult,
-  AgentWorkspaceBinding,
 } from '@deepcode/protocol';
-import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import type { AgentSessionSubmissionTarget } from '../../state/agentSessionStore';
-import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
@@ -23,14 +20,13 @@ interface DeepCodeAgentPanelProps {
   agentReady: boolean;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
-  projectWorkspaceBinding?: AgentWorkspaceBinding;
-  projectContext?: boolean;
   submissionScopeId?: string | null;
   suppressPendingDecision?: boolean;
   onBeforeSend?: () => Promise<AgentSessionSubmissionTarget | boolean | void>
     | AgentSessionSubmissionTarget
     | boolean
     | void;
+  onDraftSend?: (content: string, profileId?: string) => Promise<boolean>;
   onAfterSend?: (
     submissionScopeId: string | null,
     submittedDraftCleared: boolean
@@ -51,11 +47,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   agentReady,
   forceHome = false,
   homeProjectTitle,
-  projectWorkspaceBinding,
-  projectContext = false,
   submissionScopeId,
   suppressPendingDecision = false,
   onBeforeSend,
+  onDraftSend,
   onAfterSend,
 }) => {
   const session = useAgentSessionStore((s) => s.session);
@@ -68,8 +63,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
-  const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
+  const loadCurrentSelection = useAgentSessionStore((s) => s.loadCurrentSelection);
+  const observeSessionProjection = useAgentSessionStore((s) => s.observeSessionProjection);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
   const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
   const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
@@ -77,24 +72,16 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
-  const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
-  const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
-  const activeFolderId = useWorkspaceStore((s) => (
-    s.activeFolderId ?? s.getActiveFolder()?.id ?? null
-  ));
-  const attachmentWorkspaceBinding =
-    session?.workspaceBinding ?? projectWorkspaceBinding;
-  const allowGlobalAttachmentWorkspaceFallback =
-    !session?.projectId && !projectContext;
   const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
   const [modelAvailable, setModelAvailable] = useState(false);
+  const [draftProfileId, setDraftProfileId] = useState<string | undefined>();
   const sessionRunning = Boolean(
     session?.id
     && (
@@ -105,36 +92,26 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   );
   const waitingForUser = timeline.runProjection?.status === 'waitingUser'
     || timeline.runProjection?.wait?.kind === 'user';
+  const cancellableRun = Boolean(
+    !forceHome
+    && timeline.runProjection
+    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      timeline.runProjection.status
+    )
+  );
 
   useEffect(() => {
-    if (forceHome || session?.projectId) return;
-    void refreshSessions();
-    void loadOrCreate();
-  }, [
-    forceHome,
-    loadOrCreate,
-    refreshSessions,
-    session?.projectId,
-    workspaceScopeKey,
-  ]);
+    if (!forceHome) return;
+    setDraftProfileId(undefined);
+  }, [forceHome, submissionScopeId]);
 
   useEffect(() => {
-    if (
-      attachmentWorkspaceBinding
-      && !attachmentWorkspaceBinding.activeFolderId
-    ) {
-      return;
-    }
-    synchronizeAttachmentRoot(
-      attachmentWorkspaceBinding?.activeFolderId
-        ?? (allowGlobalAttachmentWorkspaceFallback ? activeFolderId : null)
-    );
-  }, [
-    activeFolderId,
-    allowGlobalAttachmentWorkspaceFallback,
-    attachmentWorkspaceBinding,
-    synchronizeAttachmentRoot,
-  ]);
+    if (forceHome || !session?.id) return;
+    const release = observeSessionProjection(session.id);
+    return () => {
+      void release();
+    };
+  }, [forceHome, observeSessionProjection, session?.id]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;
@@ -190,16 +167,15 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     <AgentComposer
       messageAttachments={messageAttachments}
       sessionAttachments={sessionAttachments}
-      attachmentWorkspaceBinding={attachmentWorkspaceBinding}
-      allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
       language={language}
       loading={composerRunning}
       submissionScopeId={submissionScopeId ?? session?.id ?? null}
       canCancelCurrentRun={Boolean(
-        !forceHome && session?.id && activeRunSessionIds.includes(session.id)
+        session?.id && cancellableRun
       )}
       onSend={async (content) => {
         requestFollowLatest();
+        if (onDraftSend) return onDraftSend(content, draftProfileId);
         const prepared = await onBeforeSend?.();
         if (prepared === false) return false;
         const expectedTarget = typeof prepared === 'object' && prepared !== null
@@ -234,6 +210,9 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         <SessionModelSelector
           language={language}
           locked={profileLocked}
+          draft={Boolean(onDraftSend)}
+          draftProfileId={draftProfileId}
+          onDraftProfileChange={setDraftProfileId}
           onAvailabilityChange={setModelAvailable}
         />
       )}
@@ -329,11 +308,11 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           />
         )}
 
-        {!showHome && errorMessage && (
+        {errorMessage && (
           <div className="deepcode-gui-agent-panel__error">
             <span>{errorMessage}</span>
             {!agentReady && (
-              <button type="button" onClick={() => void loadOrCreate()}>
+              <button type="button" onClick={() => void loadCurrentSelection()}>
                 {t(language, 'deepcodeGui.statusAction.retry')}
               </button>
             )}

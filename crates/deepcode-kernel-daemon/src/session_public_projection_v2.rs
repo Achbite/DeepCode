@@ -456,7 +456,7 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         validate_display_hints(display_hints)?;
     }
     if let Some(attachments) = object.get("attachments") {
-        deepcode_kernel_abi::decode_agent_input_attachments_v2(attachments).map_err(|error| {
+        deepcode_kernel_abi::decode_agent_input_attachments_v3(attachments).map_err(|error| {
             format!(
                 "Session v2 public projection block {block_id} has invalid attachments: {}",
                 error.code

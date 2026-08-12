@@ -65,7 +65,22 @@ export function sessionPlanActionCompleteToolV2(): ProviderWireToolDefinition {
   };
 }
 
-export function sessionPlanProposalToolV3(): ProviderWireToolDefinition {
+export function sessionPlanProposalToolV3(
+  admittedToolIds: readonly string[]
+): ProviderWireToolDefinition {
+  if (
+    admittedToolIds.length === 0
+    || new Set(admittedToolIds).size !== admittedToolIds.length
+    || admittedToolIds.some(
+      (toolId) =>
+        !/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/u.test(toolId)
+    )
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_tool_catalog_invalid',
+      'The Session Plan control requires one non-empty exact admitted ToolId catalog.'
+    );
+  }
   return {
     name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
     description: [
@@ -104,7 +119,10 @@ export function sessionPlanProposalToolV3(): ProviderWireToolDefinition {
                   'scopeIntent',
                 ],
                 properties: {
-                  toolId: { type: 'string', minLength: 1 },
+                  toolId: {
+                    type: 'string',
+                    enum: [...admittedToolIds],
+                  },
                   scopeIntent: sessionPlanScopeIntentSchemaV3(),
                   deadline: sessionPlanDeadlineSchemaV2(),
                 },
@@ -901,15 +919,17 @@ export function materializeProviderPlanV2(
   recordedAt: string
 ): SessionNaturalLanguagePlanV2 {
   const normalized = normalizePlanDraft(draft);
-  const readyTools = new Map(
-    input.toolContext.tools.map((tool) => [tool.toolId, tool])
+  const admittedPlanningTools = new Map(
+    input.toolContext.tools
+      .filter((tool) => tool.effectClass === 'read')
+      .map((tool) => [tool.toolId, tool])
   );
   for (const action of normalized.actions) {
-    const descriptor = readyTools.get(action.toolId);
+    const descriptor = admittedPlanningTools.get(action.toolId);
     if (!descriptor || descriptor.availability !== 'ready') {
       throw new SessionKernelProviderAdapterError(
         'session_kernel_provider_plan_tool_unavailable',
-        `Provider plan requested a tool outside the current ready ToolContext: ${action.toolId}.`
+        `Provider plan requested a tool outside the exact admitted planning catalog: ${action.toolId}.`
       );
     }
     if (descriptor.authorizationShape !== action.scopeIntent.kind) {

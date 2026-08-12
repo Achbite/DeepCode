@@ -23,7 +23,7 @@ use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPri
 use crate::session_kernel_v2_store::{
     validate_session_work_authority_v3, SessionKernelV2Store, SessionWorkAuthorityV3,
 };
-use crate::AgentInputAttachmentV2;
+use crate::{AgentInputAttachmentV3, UserAttachmentContextV1};
 use deepcode_kernel_abi::v2::{
     CancellationReasonCodeV2, CancellationSourceV2, CommandRequestId, ControlFactV2, FactId,
     InputId, InvocationFactV2, KernelFactEnvelopeV2, KernelFactPayloadV2, RunId,
@@ -86,7 +86,8 @@ pub(crate) struct HostKernelInitialInputV2 {
     pub(crate) input_id: InputId,
     pub(crate) opaque_input_ref: String,
     pub(crate) text: String,
-    pub(crate) attachments: Vec<AgentInputAttachmentV2>,
+    pub(crate) attachments: Vec<AgentInputAttachmentV3>,
+    pub(crate) attachment_contexts: Vec<UserAttachmentContextV1>,
     pub(crate) recorded_at: String,
 }
 
@@ -3419,6 +3420,7 @@ fn bootstrap_initial_input(input: &HostKernelRunSpawnInputV2) -> HostKernelBoots
         opaque_input_ref: input.initial_input.opaque_input_ref.clone(),
         text: input.initial_input.text.clone(),
         attachments: input.initial_input.attachments.clone(),
+        attachment_contexts: input.initial_input.attachment_contexts.clone(),
         recorded_at: input.initial_input.recorded_at.clone(),
     }
 }
@@ -5027,8 +5029,12 @@ fn validate_spawn_input(input: &HostKernelRunSpawnInputV2) -> Result<(), HostV2S
             "Session Kernel v2 initial input exceeds the Host limit",
         ));
     }
-    crate::validate_agent_input_attachment_slice_v2(&input.initial_input.attachments)
+    crate::validate_agent_input_attachment_slice_v3(&input.initial_input.attachments)
         .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    crate::validate_user_attachment_contexts_v1(
+        &input.initial_input.attachments,
+        &input.initial_input.attachment_contexts,
+    )?;
     input.provider_profile.validate()?;
     input.prior_session_events.validate(&input.session_id)?;
     match input.workspace.workspace_kind {

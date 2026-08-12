@@ -59,6 +59,10 @@ import type {
   KernelHostInspectionResult,
   AgentRunGuidanceRequest,
   StartAgentRunRequest,
+  StartProjectAgentRunRequest,
+  AgentConversationTargetV1,
+  CreateUserAttachmentGrantRequestV1,
+  UserAttachmentGrantResultV1,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getHostAdmissionHeaders, getKernelApiBase } from './hostTarget';
@@ -70,11 +74,13 @@ interface SendJsonOptions {
 }
 
 export type {
-  AgentInputAttachmentV2,
+  AgentInputAttachmentV3,
   AgentRunGuidanceRequest,
   AskAgentRunRequest,
   ResolveAgentRunDecisionRequest,
   StartAgentRunRequest,
+  StartProjectAgentRunRequest,
+  AgentConversationTargetV1,
 } from '@deepcode/protocol';
 
 function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRequest {
@@ -85,6 +91,7 @@ function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRe
       workspacePath: request.workspacePath,
       noWorkspace: request.noWorkspace,
       attachments: request.attachments,
+      conversationTarget: request.conversationTarget,
       callerRequestId: request.callerRequestId,
     };
   }
@@ -95,6 +102,7 @@ function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRe
     guidance: request.guidance,
     runId: request.runId,
     targetId: request.targetId,
+    conversationTarget: request.conversationTarget,
     callerRequestId: request.callerRequestId,
   };
 }
@@ -528,7 +536,7 @@ export function patchWorkspaceSettings(
   );
 }
 
-// ---- 文件系统浏览（仅用于"Open Workspace"对话框）----
+// ---- Host 文件系统浏览（工作区与用户主动选择附件共用）----
 
 export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
   return getJson<InitialLocations>(`${API_BASE}/fs/initial-locations`);
@@ -539,6 +547,33 @@ export function browsePath(
 ): Promise<ApiResponse<BrowsePathResult>> {
   const qs = buildQuery({ path: absolutePath });
   return getJson<BrowsePathResult>(`${API_BASE}/fs/browse${qs}`);
+}
+
+export function createUserAttachmentGrant(
+  request: CreateUserAttachmentGrantRequestV1
+): Promise<ApiResponse<UserAttachmentGrantResultV1>> {
+  return sendJson<UserAttachmentGrantResultV1>(
+    `${API_BASE}/host/user-attachments`,
+    'POST',
+    request
+  );
+}
+
+export interface UserAttachmentRevocationResultV1 {
+  schemaVersion: 'deepcode.host.user-attachment-revocation.v1';
+  attachmentId: string;
+  resourceId: string;
+  revokedAt: string;
+}
+
+export function revokeUserAttachmentGrant(
+  attachmentId: string
+): Promise<ApiResponse<UserAttachmentRevocationResultV1>> {
+  return sendJson<UserAttachmentRevocationResultV1>(
+    `${API_BASE}/host/user-attachments/${encodeURIComponent(attachmentId)}`,
+    'DELETE',
+    {}
+  );
 }
 
 export function scanSkillMount(
@@ -854,6 +889,16 @@ export function startAgentRun(
   );
 }
 
+export function startProjectAgentRun(
+  projectId: string,
+  request: StartProjectAgentRunRequest
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendReplayableHostMutation<AgentRunResult>(
+    `${API_BASE}/agent/projects/${encodeURIComponent(projectId)}/sessions/runs`,
+    request
+  );
+}
+
 export function getAgentRun(
   sessionId: string,
   runId: string,
@@ -868,11 +913,23 @@ export function getAgentRun(
 export function cancelAgentRunById(
   sessionId: string,
   runId: string,
-  callerRequestId: string
+  callerRequestId: string,
+  conversationTarget: AgentConversationTargetV1
 ): Promise<ApiResponse<AgentRunResult>> {
   return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
-    { callerRequestId }
+    { callerRequestId, conversationTarget }
+  );
+}
+
+export function cancelCurrentAgentRun(
+  sessionId: string,
+  callerRequestId: string,
+  conversationTarget: AgentConversationTargetV1
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendReplayableHostMutation<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/current/cancel`,
+    { callerRequestId, conversationTarget }
   );
 }
 
@@ -888,6 +945,24 @@ export function submitAgentRunGuidance(
       workspacePath: request.workspacePath,
       noWorkspace: request.noWorkspace,
       attachments: request.attachments,
+      conversationTarget: request.conversationTarget,
+      callerRequestId: request.callerRequestId,
+    }
+  );
+}
+
+export function submitCurrentAgentRunGuidance(
+  sessionId: string,
+  request: AgentRunGuidanceRequest
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendReplayableHostMutation<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/current/guidance`,
+    {
+      guidance: request.guidance,
+      workspacePath: request.workspacePath,
+      noWorkspace: request.noWorkspace,
+      attachments: request.attachments,
+      conversationTarget: request.conversationTarget,
       callerRequestId: request.callerRequestId,
     }
   );

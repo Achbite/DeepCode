@@ -747,6 +747,10 @@ export class SessionKernelLoopV2 {
       requireExactRunCancellation(prior, input);
       if (prior.status === 'projected') {
         await this.ports.projection.flushPending(this.state.runId);
+        // A prior response may have observed projection delivery while the
+        // final checkpoint write failed. Reassert the terminal checkpoint
+        // before returning the canonical acknowledgement.
+        await this.saveCheckpoint();
         return completedRunCancellation(prior, this.state.controlEpoch);
       }
     }
@@ -766,6 +770,10 @@ export class SessionKernelLoopV2 {
       }
       await this.settleProviderToolCallQueue();
       let cancellation = currentRunCancellation(this.state, input);
+
+      if (cancellation.status === 'factsReconciled') {
+        return await this.finalizeRunCancellationProjection(input);
+      }
 
       await this.requests.replay('control');
       cancellation = currentRunCancellation(this.state, input);
@@ -836,40 +844,7 @@ export class SessionKernelLoopV2 {
         cancellation.status = 'factsReconciled';
         await this.saveCheckpoint();
       }
-      const event = this.event(
-        `cancel:${cancellation.cancelOperationId}:settled`,
-        'run.cancelled',
-        {
-          callerRequestId: cancellation.callerRequestId,
-          callerRequestDigest: cancellation.callerRequestDigest,
-          cancelOperationId: cancellation.cancelOperationId,
-          controlEpoch: this.state.controlEpoch,
-          cancellation: cancellation.cancellation,
-          facts: cancellation.facts,
-        },
-        cancellation.cancelledAt
-      );
-      const projection = await this.ports.projection.project(event);
-      if (
-        !projection.delivered
-        || projection.projectionId !== event.projectionId
-      ) {
-        throw new SessionKernelLoopError(
-          'session_kernel_run_cancellation_projection_unconfirmed',
-          'Session Run cancellation projection was not durably acknowledged by Host.'
-        );
-      }
-      cancellation = currentRunCancellation(this.state, input);
-      cancellation.projection = {
-        projectionId: projection.projectionId,
-        projectionDigest: projection.projectionDigest,
-      };
-      cancellation.status = 'projected';
-      await this.saveCheckpoint();
-      return completedRunCancellation(
-        cancellation,
-        this.state.controlEpoch
-      );
+      return await this.finalizeRunCancellationProjection(input);
     } finally {
       this.providers.releaseUserInputFence(fence.generation);
       if (this.runCancellationFence === fence) {
@@ -879,6 +854,57 @@ export class SessionKernelLoopV2 {
         this.authorityTransitionActive = false;
       }
     }
+  }
+
+  private async finalizeRunCancellationProjection(
+    input: SessionKernelRunCancelInputV2
+  ): Promise<SessionKernelRunCancelResultV2> {
+    let cancellation = currentRunCancellation(this.state, input);
+    if (
+      cancellation.status !== 'factsReconciled'
+      || !cancellation.cancellation
+      || !cancellation.facts
+      || !cancellation.cancelledAt
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_projection_not_ready',
+        'Session Run cancellation cannot project before canonical facts are reconciled.'
+      );
+    }
+    const event = this.event(
+      `cancel:${cancellation.cancelOperationId}:settled`,
+      'run.cancelled',
+      {
+        callerRequestId: cancellation.callerRequestId,
+        callerRequestDigest: cancellation.callerRequestDigest,
+        cancelOperationId: cancellation.cancelOperationId,
+        controlEpoch: this.state.controlEpoch,
+        cancellation: cancellation.cancellation,
+        facts: cancellation.facts,
+      },
+      cancellation.cancelledAt
+    );
+    const projection = await this.ports.projection.project(event);
+    if (
+      !projection.delivered
+      || projection.projectionId !== event.projectionId
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_projection_unconfirmed',
+        'Session Run cancellation projection was not durably acknowledged by Host.'
+      );
+    }
+    cancellation = currentRunCancellation(this.state, input);
+    cancellation.projection = {
+      projectionId: projection.projectionId,
+      projectionDigest: projection.projectionDigest,
+    };
+    cancellation.status = 'projected';
+    await this.saveCheckpoint();
+    return completedRunCancellation(
+      cancellation,
+      this.state.controlEpoch
+    );
   }
 
   private fenceForRunCancellation(): {
@@ -1795,7 +1821,11 @@ export class SessionKernelLoopV2 {
       `input:${input.inputId}`,
       'input.persisted',
       {
-        ...input,
+        inputId: input.inputId,
+        opaqueInputRef: input.opaqueInputRef,
+        text: input.text,
+        attachments: cloneJson(input.attachments),
+        recordedAt: input.recordedAt,
         controlEpoch: this.state.controlEpoch,
       },
       input.recordedAt

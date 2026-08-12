@@ -69,7 +69,8 @@ import {
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
 } from './types.js';
 import {
-  decodeAgentInputAttachmentsV2,
+  decodeAgentInputAttachmentsV3,
+  decodeUserAttachmentContextsV1,
 } from './inputAttachmentsV2.js';
 import {
   assertProviderSafeToolContextV2,
@@ -5675,6 +5676,7 @@ function decodePersistedSessionInputV2(
       'opaqueInputRef',
       'text',
       'attachments',
+      'attachmentContexts',
       'recordedAt',
     ],
     'session_kernel_persisted_input_invalid'
@@ -5702,11 +5704,16 @@ function decodePersistedSessionInputV2(
       'session_kernel_persisted_input_time_invalid'
     );
   }
+  const attachments = decodeAgentInputAttachmentsV3(record.attachments);
   return {
     inputId: requiredIdentity(record.inputId, 'inputId'),
     opaqueInputRef,
     text,
-    attachments: decodeAgentInputAttachmentsV2(record.attachments),
+    attachments,
+    attachmentContexts: decodeUserAttachmentContextsV1(
+      record.attachmentContexts,
+      attachments
+    ),
     recordedAt,
   };
 }

@@ -8,7 +8,7 @@ use crate::host_workspace_registry_v2::HostWorkspaceRehydrateRecordV2;
 use crate::session_bootstrap_v2::{
     HostProviderProfileBootstrapV2, HostSessionPriorEventsV2, HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3,
 };
-use crate::AgentInputAttachmentV2;
+use crate::{AgentInputAttachmentV3, UserAttachmentContextV1};
 use deepcode_kernel_abi::v2_command::{KernelCommandEnvelopeV2, KernelCommandV2, RunOpenReplyV2};
 use deepcode_kernel_abi::WorkspaceBindingRefV2;
 use rusqlite::{
@@ -62,7 +62,8 @@ pub(crate) struct HostKernelBootstrapInitialInputV2 {
     pub(crate) input_id: String,
     pub(crate) opaque_input_ref: String,
     pub(crate) text: String,
-    pub(crate) attachments: Vec<AgentInputAttachmentV2>,
+    pub(crate) attachments: Vec<AgentInputAttachmentV3>,
+    pub(crate) attachment_contexts: Vec<UserAttachmentContextV1>,
     pub(crate) recorded_at: String,
 }
 
@@ -476,6 +477,46 @@ impl HostKernelOperationStoreV2 {
                 return Ok(None);
             };
             decode_caller_request_binding(stored, request_kind, request_digest, true).map(Some)
+        })
+    }
+
+    pub(crate) fn caller_request_host_run_id(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        expected_request_kind: &str,
+    ) -> Result<Option<String>, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        validate_bounded_identity(caller_request_id, "callerRequestId", 512)?;
+        validate_bounded_identity(expected_request_kind, "requestKind", 128)?;
+        self.with_connection(|connection| {
+            let Some(stored) = stored_caller_request(connection, session_id, caller_request_id)?
+            else {
+                return Ok(None);
+            };
+            let request_kind = stored.request_kind.clone();
+            let request_digest = stored.request_digest.clone();
+            let binding = decode_caller_request_binding(
+                stored,
+                &request_kind,
+                &request_digest,
+                true,
+            )?;
+            if binding.request_kind != expected_request_kind {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_kind_conflict",
+                    "Caller request identity is already bound to a different command kind",
+                ));
+            }
+            let host_run_id = binding
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    corrupt("Caller request binding has no canonical Host Run identity")
+                })?;
+            validate_bounded_identity(host_run_id, "hostRunId", 512)?;
+            Ok(Some(host_run_id.to_string()))
         })
     }
 
@@ -1833,12 +1874,14 @@ impl HostKernelOperationStoreV2 {
         if require_zero_operations
             && !matches!(
                 request_kind,
-                HOST_DECISION_REQUEST_KIND_V2 | HOST_USER_INPUT_REQUEST_KIND_V2
+                HOST_RUN_OPEN_REQUEST_KIND_V2
+                    | HOST_DECISION_REQUEST_KIND_V2
+                    | HOST_USER_INPUT_REQUEST_KIND_V2
             )
         {
             return Err(HostV2StorageError::invalid(
                 "host_caller_request_abandon_kind_invalid",
-                "Only ordinary decision or user-input callers may use zero-effect abandonment",
+                "Only RunOpen, decision, or user-input callers may use zero-effect abandonment",
             ));
         }
         if !require_zero_operations
@@ -4897,8 +4940,12 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
             "Host Kernel initial input exceeds its bounded size",
         ));
     }
-    crate::validate_agent_input_attachment_slice_v2(&input.initial_input.attachments)
+    crate::validate_agent_input_attachment_slice_v3(&input.initial_input.attachments)
         .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    crate::validate_user_attachment_contexts_v1(
+        &input.initial_input.attachments,
+        &input.initial_input.attachment_contexts,
+    )?;
     input.provider_profile.validate()?;
     input.prior_session_events.validate(&input.session_id)?;
     validate_workspace_shape(

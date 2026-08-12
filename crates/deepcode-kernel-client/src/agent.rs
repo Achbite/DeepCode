@@ -1,10 +1,106 @@
 use crate::{KernelClientError, KernelClientResult};
-use deepcode_kernel_abi::validate_agent_input_attachments_v2 as validate_attachment_slice_v2;
+use deepcode_kernel_abi::validate_agent_input_attachments_v3 as validate_attachment_slice_v3;
 pub use deepcode_kernel_abi::{
-    AgentInputAttachmentKindV2, AgentInputAttachmentScopeV2, AgentInputAttachmentV2,
+    AgentInputAttachmentKindV3, AgentInputAttachmentScopeV3, AgentInputAttachmentV3,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentConversationTargetV1 {
+    pub schema_version: String,
+    pub target_id: String,
+    pub target_revision: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub workspace_scope_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentProjectConversationTargetV1 {
+    pub schema_version: String,
+    pub target_id: String,
+    pub target_revision: String,
+    pub project_id: String,
+    pub workspace_scope_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_identity: Option<String>,
+}
+
+impl AgentProjectConversationTargetV1 {
+    pub fn from_project(project: &Value) -> KernelClientResult<Self> {
+        let value = project.get("conversationTarget").cloned().ok_or_else(|| {
+            KernelClientError::Api(
+                "agent_project_conversation_target_missing: Project response has no canonical conversationTarget"
+                    .to_string(),
+            )
+        })?;
+        let target: Self = serde_json::from_value(value).map_err(|error| {
+            KernelClientError::Api(format!(
+                "agent_project_conversation_target_invalid: invalid canonical conversationTarget: {error}"
+            ))
+        })?;
+        target.validate()?;
+        Ok(target)
+    }
+
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        if self.schema_version != "deepcode.host.project-conversation-target.v1"
+            || self.target_id.trim().is_empty()
+            || self.target_revision.trim().is_empty()
+            || self.project_id.trim().is_empty()
+            || self.workspace_scope_key.trim().is_empty()
+        {
+            return Err(KernelClientError::Api(
+                "agent_project_conversation_target_invalid: project conversationTarget is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AgentConversationTargetV1 {
+    pub fn from_session(session: &Value) -> KernelClientResult<Self> {
+        let value = session.get("conversationTarget").cloned().ok_or_else(|| {
+            KernelClientError::Api(
+                "agent_conversation_target_missing: Session response has no canonical conversationTarget"
+                    .to_string(),
+            )
+        })?;
+        let target: Self = serde_json::from_value(value).map_err(|error| {
+            KernelClientError::Api(format!(
+                "agent_conversation_target_invalid: invalid canonical conversationTarget: {error}"
+            ))
+        })?;
+        target.validate()?;
+        Ok(target)
+    }
+
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        if self.schema_version != "deepcode.host.conversation-target.v1"
+            || self.target_id.trim().is_empty()
+            || self.target_revision.trim().is_empty()
+            || self.session_id.trim().is_empty()
+            || self.workspace_scope_key.trim().is_empty()
+        {
+            return Err(KernelClientError::Api(
+                "agent_conversation_target_invalid: conversationTarget is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +117,48 @@ pub struct CreateAgentSessionRequest {
     pub workspace_id: Option<String>,
     pub workspace_hash: Option<String>,
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartProjectAgentRunRequest {
+    pub op: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<AgentInputAttachmentV3>>,
+    pub conversation_target: AgentProjectConversationTargetV1,
+    pub caller_request_id: String,
+}
+
+impl StartProjectAgentRunRequest {
+    pub fn ask(
+        content: impl Into<String>,
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentProjectConversationTargetV1,
+    ) -> Self {
+        Self {
+            op: "ask".to_string(),
+            content: content.into(),
+            profile_id: None,
+            attachments: None,
+            conversation_target,
+            caller_request_id: caller_request_id.into(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()?;
+        if self.op != "ask" || self.content.trim().is_empty() {
+            return Err(KernelClientError::Api(
+                "project_session_admission_invalid: Project Session admission requires one non-empty ask"
+                    .to_string(),
+            ));
+        }
+        validate_agent_input_attachments_v3(self.attachments.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,7 +186,7 @@ pub struct StartAgentRunRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_workspace: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<AgentInputAttachmentV2>>,
+    pub attachments: Option<Vec<AgentInputAttachmentV3>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,11 +197,16 @@ pub struct StartAgentRunRequest {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+    pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
 
 impl StartAgentRunRequest {
-    pub fn ask(content: impl Into<String>, caller_request_id: impl Into<String>) -> Self {
+    pub fn ask(
+        content: impl Into<String>,
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
+    ) -> Self {
         Self {
             op: "ask".to_string(),
             content: Some(content.into()),
@@ -75,6 +218,7 @@ impl StartAgentRunRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
@@ -83,6 +227,7 @@ impl StartAgentRunRequest {
         kind: impl Into<String>,
         decision: impl Into<String>,
         caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
     ) -> Self {
         Self {
             op: "resolveDecision".to_string(),
@@ -95,26 +240,17 @@ impl StartAgentRunRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
         validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()?;
         match self.op.as_str() {
             "ask" => {
-                validate_agent_input_attachments_v2(self.attachments.as_deref())?;
-                if self.no_workspace == Some(true)
-                    && self
-                        .attachments
-                        .as_ref()
-                        .is_some_and(|attachments| !attachments.is_empty())
-                {
-                    return Err(KernelClientError::Api(
-                        "agent_input_attachment_workspace_required: attachments require a bound workspace"
-                            .to_string(),
-                    ));
-                }
+                validate_agent_input_attachments_v3(self.attachments.as_deref())?;
                 if self
                     .content
                     .as_deref()
@@ -185,18 +321,24 @@ impl StartAgentRunRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunCallerRequest {
+    pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
 
 impl AgentRunCallerRequest {
-    pub fn new(caller_request_id: impl Into<String>) -> Self {
+    pub fn new(
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
+    ) -> Self {
         Self {
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
-        validate_caller_request_id(&self.caller_request_id)
+        validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()
     }
 }
 
@@ -209,29 +351,36 @@ pub struct AgentRunGuidanceRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_workspace: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<AgentInputAttachmentV2>>,
+    pub attachments: Option<Vec<AgentInputAttachmentV3>>,
+    pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
 
 impl AgentRunGuidanceRequest {
-    pub fn new(guidance: impl Into<String>, caller_request_id: impl Into<String>) -> Self {
+    pub fn new(
+        guidance: impl Into<String>,
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
+    ) -> Self {
         Self {
             guidance: guidance.into(),
             workspace_path: None,
             no_workspace: None,
             attachments: None,
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
         validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()?;
         if self.guidance.trim().is_empty() {
             return Err(KernelClientError::Api(
                 "empty_guidance: guidance must not be empty".to_string(),
             ));
         }
-        validate_agent_input_attachments_v2(self.attachments.as_deref())?;
+        validate_agent_input_attachments_v3(self.attachments.as_deref())?;
         if self.no_workspace == Some(true) && self.workspace_path.is_some() {
             return Err(KernelClientError::Api(
                 "agent_guidance_workspace_conflict: guidance cannot request both a workspace path and no-workspace mode"
@@ -242,13 +391,13 @@ impl AgentRunGuidanceRequest {
     }
 }
 
-fn validate_agent_input_attachments_v2(
-    attachments: Option<&[AgentInputAttachmentV2]>,
+fn validate_agent_input_attachments_v3(
+    attachments: Option<&[AgentInputAttachmentV3]>,
 ) -> KernelClientResult<()> {
     let Some(attachments) = attachments else {
         return Ok(());
     };
-    validate_attachment_slice_v2(attachments)
+    validate_attachment_slice_v3(attachments)
         .map_err(|error| KernelClientError::Api(format!("{}: {}", error.code, error.message)))
 }
 

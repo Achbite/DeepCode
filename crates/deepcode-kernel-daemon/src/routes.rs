@@ -43,6 +43,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
+        .route(
+            "/api/host/user-attachments",
+            post(user_attachment_grant_create_v1),
+        )
+        .route(
+            "/api/host/user-attachments/:attachment_id",
+            delete(user_attachment_grant_revoke_v1),
+        )
         .route("/api/host/inspect", post(host_inspect))
         .route("/api/host/skills/scan-mount", post(skill_mount_scan))
         .route(
@@ -123,6 +131,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/agent/projects/:project_id/rebind",
             post(agent_project_rebind),
         )
+        .route(
+            "/api/agent/projects/:project_id/sessions/runs",
+            post(agent_project_session_run_start),
+        )
         .route("/api/agent/sessions/current", get(agent_session_current))
         .route(
             "/api/agent/sessions/:session_id/activate",
@@ -139,6 +151,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/agent/sessions/:session_id/active-run",
             get(agent_session_active_run),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/current/cancel",
+            post(agent_session_current_run_cancel),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/current/guidance",
+            post(agent_session_current_run_guidance),
         )
         .route(
             "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projections",

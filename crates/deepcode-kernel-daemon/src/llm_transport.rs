@@ -5,7 +5,7 @@ use bytes::Bytes;
 use deepcode_kernel_abi::v2::{CommandRequestId, RunId};
 use deepcode_kernel_abi::v2_command::{
     KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2,
-    KernelFactDomainProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
+    KernelFactDomainProjectionV2, KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
 };
 use deepcode_kernel_abi::{RunCapabilityV2, ToolIdV2};
 use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
@@ -1530,6 +1530,12 @@ struct ProviderContinuationToolV1 {
     output: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderContinuationOperationBindingV1 {
+    operation_id: String,
+    tool_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct ProviderNativeContinuationV1 {
     reasoning: String,
@@ -1714,24 +1720,21 @@ fn inject_provider_native_continuation(
         current_sidecar,
         dispatch_authority,
     )?;
-    let operation_ids = provider_native_continuation_operation_ids(
-        parent_request_id,
-        current_identity,
+    let operation_bindings = provider_native_continuation_operation_bindings(
         &parent_sidecar.target_binding,
         &completed.ordered_items,
+        &current_sidecar.continuation_operation_ids,
     )?;
     let tool_outputs = query_canonical_provider_tool_outputs(
         current_identity,
         dispatch_authority,
-        &operation_ids,
+        &parent_sidecar,
+        &operation_bindings,
     )?;
     let mut continuation = provider_native_continuation_from_evidence(
-        parent_request_id,
-        current_identity,
-        &parent_sidecar.target_binding,
         completed.reasoning,
         &completed.ordered_items,
-        &operation_ids,
+        &operation_bindings,
         &tool_outputs,
     )?;
     if profile.kind == "anthropic" {
@@ -1955,12 +1958,9 @@ fn provider_cache_lane_reset_required(
 }
 
 fn provider_native_continuation_from_evidence(
-    parent_request_id: &str,
-    current_identity: &ProviderTraceIdentityV1,
-    parent_target: &SessionProviderTargetBindingSidecarV1,
     reasoning: String,
     ordered_items: &[Value],
-    operation_ids: &[String],
+    operation_bindings: &[ProviderContinuationOperationBindingV1],
     tool_outputs: &HashMap<String, Value>,
 ) -> Result<ProviderNativeContinuationV1, ProviderNativeStreamTransportErrorV1> {
     let mut assistant_items = Vec::new();
@@ -2005,30 +2005,24 @@ fn provider_native_continuation_from_evidence(
                 })?;
                 let internal_name = internal_tool_name(&wire_name);
                 let tool_id = provider_wire_tool_id_v2(&wire_name)?;
-                let operation_id = operation_ids.get(tools.len()).ok_or_else(|| {
+                let operation_binding = operation_bindings.get(tools.len()).ok_or_else(|| {
                     ProviderNativeStreamTransportErrorV1::new(
                         "provider_continuation_native_history_invalid",
                     )
                 })?;
-                let expected_operation_id = provider_continuation_operation_id(
-                    current_identity,
-                    parent_request_id,
-                    parent_target,
-                    &call_id,
-                    &tool_id,
-                    tools.len(),
-                    operation_ids.len(),
-                )?;
-                if operation_id != &expected_operation_id {
+                if operation_binding.tool_id != tool_id {
                     return Err(ProviderNativeStreamTransportErrorV1::new(
                         "provider_continuation_native_history_invalid",
                     ));
                 }
-                let output = tool_outputs.get(operation_id).cloned().ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new(
-                        "provider_continuation_result_missing",
-                    )
-                })?;
+                let output = tool_outputs
+                    .get(&operation_binding.operation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_missing",
+                        )
+                    })?;
                 let tool_index = tools.len();
                 tools.push(ProviderContinuationToolV1 {
                     call_id,
@@ -2046,8 +2040,8 @@ fn provider_native_continuation_from_evidence(
             }
         }
     }
-    if tools.len() != operation_ids.len()
-        || tool_outputs.len() != operation_ids.len()
+    if tools.len() != operation_bindings.len()
+        || tool_outputs.len() != operation_bindings.len()
         || reasoning.trim().is_empty()
     {
         return Err(ProviderNativeStreamTransportErrorV1::new(
@@ -2080,57 +2074,6 @@ fn required_continuation_text(
         })
 }
 
-fn provider_continuation_operation_id(
-    current_identity: &ProviderTraceIdentityV1,
-    parent_request_id: &str,
-    parent_target: &SessionProviderTargetBindingSidecarV1,
-    call_id: &str,
-    tool_id: &str,
-    zero_based_index: usize,
-    call_count: usize,
-) -> Result<String, ProviderNativeStreamTransportErrorV1> {
-    if call_count == 1 {
-        if let SessionProviderTargetBindingSidecarV1::ContextRead { operation_id, .. } =
-            parent_target
-        {
-            return Ok(operation_id.clone());
-        }
-    }
-    let authority_key = match parent_target {
-        SessionProviderTargetBindingSidecarV1::Planning => format!("planning:{tool_id}"),
-        SessionProviderTargetBindingSidecarV1::PlanAction { plan_action_id } => {
-            format!("planAction:{plan_action_id}")
-        }
-        SessionProviderTargetBindingSidecarV1::ContextRead {
-            operation_id,
-            idempotency_key,
-            ..
-        } => format!(
-            "contextRead:{}:{}:{}",
-            operation_id,
-            idempotency_key,
-            zero_based_index + 1,
-        ),
-        SessionProviderTargetBindingSidecarV1::FinalAnswer { .. } => {
-            return Err(ProviderNativeStreamTransportErrorV1::new(
-                "provider_continuation_invalid",
-            ));
-        }
-    };
-    let digest = crate::host_v2_storage::canonical_sha256(&json!({
-        "runId": current_identity.run_id,
-        "controlEpoch": current_identity.control_epoch,
-        "providerTurnId": parent_request_id,
-        "callIdentity": format!("native:{call_id}"),
-        "authorityKey": authority_key,
-    }))
-    .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
-    let suffix = digest.strip_prefix("sha256:").ok_or_else(|| {
-        ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-    })?;
-    Ok(format!("operation-{suffix}"))
-}
-
 fn validate_provider_continuation_admission(
     current_identity: &ProviderTraceIdentityV1,
     current_sidecar: &SessionProviderAdmissionSidecarV1,
@@ -2155,23 +2098,22 @@ fn validate_provider_continuation_admission(
     Ok(())
 }
 
-fn provider_native_continuation_operation_ids(
-    parent_request_id: &str,
-    current_identity: &ProviderTraceIdentityV1,
+fn provider_native_continuation_operation_bindings(
     parent_target: &SessionProviderTargetBindingSidecarV1,
     ordered_items: &[Value],
-) -> Result<Vec<String>, ProviderNativeStreamTransportErrorV1> {
+    admitted_operation_ids: &[String],
+) -> Result<Vec<ProviderContinuationOperationBindingV1>, ProviderNativeStreamTransportErrorV1> {
     let call_count = ordered_items
         .iter()
         .filter(|item| item.get("kind").and_then(Value::as_str) == Some("toolCall"))
         .count();
-    if call_count == 0 || call_count > 32 {
+    if call_count == 0 || call_count > 32 || admitted_operation_ids.len() != call_count {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_native_history_invalid",
         ));
     }
     let mut call_ids = HashSet::with_capacity(call_count);
-    let mut operation_ids = Vec::with_capacity(call_count);
+    let mut operation_bindings = Vec::with_capacity(call_count);
     let mut unique_operation_ids = HashSet::with_capacity(call_count);
     for item in ordered_items {
         if item.get("kind").and_then(Value::as_str) != Some("toolCall") {
@@ -2182,7 +2124,7 @@ fn provider_native_continuation_operation_ids(
                 "provider_continuation_native_history_invalid",
             )
         })?;
-        if index != u64::try_from(operation_ids.len()).unwrap_or(u64::MAX) {
+        if index != u64::try_from(operation_bindings.len()).unwrap_or(u64::MAX) {
             return Err(ProviderNativeStreamTransportErrorV1::new(
                 "provider_continuation_native_history_invalid",
             ));
@@ -2201,40 +2143,62 @@ fn provider_native_continuation_operation_ids(
                 "provider_continuation_native_history_invalid",
             ));
         }
-        let operation_id = provider_continuation_operation_id(
-            current_identity,
-            parent_request_id,
-            parent_target,
-            &call_id,
-            &tool_id,
-            operation_ids.len(),
-            call_count,
-        )?;
+        let operation_id = admitted_operation_ids
+            .get(operation_bindings.len())
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new(
+                    "provider_continuation_native_history_invalid",
+                )
+            })?;
         if !unique_operation_ids.insert(operation_id.clone()) {
             return Err(ProviderNativeStreamTransportErrorV1::new(
                 "provider_continuation_native_history_invalid",
             ));
         }
-        operation_ids.push(operation_id);
+        operation_bindings.push(ProviderContinuationOperationBindingV1 {
+            operation_id,
+            tool_id,
+        });
     }
-    Ok(operation_ids)
+    if let SessionProviderTargetBindingSidecarV1::ContextRead { operation_id, .. } = parent_target {
+        if call_count == 1 && operation_bindings[0].operation_id != *operation_id {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_continuation_native_history_invalid",
+            ));
+        }
+    }
+    if matches!(
+        parent_target,
+        SessionProviderTargetBindingSidecarV1::FinalAnswer { .. }
+    ) {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_continuation_invalid",
+        ));
+    }
+    Ok(operation_bindings)
 }
 
 fn query_canonical_provider_tool_outputs(
     current_identity: &ProviderTraceIdentityV1,
     dispatch_authority: &ProviderStreamDispatchAuthorityV1,
-    operation_ids: &[String],
+    parent_sidecar: &SessionProviderAdmissionSidecarV1,
+    operation_bindings: &[ProviderContinuationOperationBindingV1],
 ) -> Result<HashMap<String, Value>, ProviderNativeStreamTransportErrorV1> {
     let run_id = RunId::new(current_identity.run_id.clone())
         .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
-    let expected = operation_ids.iter().cloned().collect::<HashSet<_>>();
-    if expected.len() != operation_ids.len() || expected.is_empty() {
+    let expected = operation_bindings
+        .iter()
+        .map(|binding| (binding.operation_id.clone(), binding.tool_id.clone()))
+        .collect::<HashMap<_, _>>();
+    if expected.len() != operation_bindings.len() || expected.is_empty() {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_native_history_invalid",
         ));
     }
 
     let mut outputs = HashMap::with_capacity(expected.len());
+    let mut admitted = HashSet::with_capacity(expected.len());
     let mut output_bytes = 0_usize;
     let mut after_ledger_sequence = 0_u64;
     let mut continuation = None;
@@ -2279,12 +2243,9 @@ fn query_canonical_provider_tool_outputs(
 
         for fact in page.facts {
             if fact.domain != KernelFactDomainProjectionV2::Invocation
-                || fact.fact_kind != "toolCompleted"
                 || fact.lineage.run_id != run_id
-                || fact
-                    .lineage
-                    .control_epoch
-                    .is_none_or(|epoch| epoch.get() != current_identity.control_epoch)
+                || fact.lineage.control_epoch.map(|epoch| epoch.get())
+                    != Some(current_identity.control_epoch)
             {
                 continue;
             }
@@ -2293,31 +2254,61 @@ fn query_canonical_provider_tool_outputs(
                 .operation_id
                 .as_ref()
                 .map(ToString::to_string)
-                .filter(|operation_id| expected.contains(operation_id))
+                .filter(|operation_id| expected.contains_key(operation_id))
             else {
                 continue;
             };
-            let output = fact.details.get("output").cloned().ok_or_else(|| {
-                ProviderNativeStreamTransportErrorV1::new("provider_continuation_result_missing")
-            })?;
-            output_bytes = output_bytes
-                .checked_add(
-                    serde_json::to_vec(&output)
-                        .map_err(|_| {
-                            ProviderNativeStreamTransportErrorV1::new(
-                                "provider_continuation_result_missing",
-                            )
-                        })?
-                        .len(),
-                )
-                .filter(|bytes| *bytes <= PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1)
-                .ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
-                })?;
-            if outputs.insert(operation_id, output).is_some() {
+            if !provider_continuation_fact_matches_parent(&fact, parent_sidecar) {
                 return Err(ProviderNativeStreamTransportErrorV1::new(
-                    "provider_continuation_result_missing",
+                    "provider_continuation_result_identity_mismatch",
                 ));
+            }
+            match fact.fact_kind.as_str() {
+                "toolIntentAdmitted" => {
+                    let tool_id = fact
+                        .details
+                        .get("toolId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProviderNativeStreamTransportErrorV1::new(
+                                "provider_continuation_result_identity_mismatch",
+                            )
+                        })?;
+                    if expected.get(&operation_id).map(String::as_str) != Some(tool_id)
+                        || !admitted.insert(operation_id)
+                    {
+                        return Err(ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_identity_mismatch",
+                        ));
+                    }
+                }
+                "toolCompleted" => {
+                    let output = fact.details.get("output").cloned().ok_or_else(|| {
+                        ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_missing",
+                        )
+                    })?;
+                    output_bytes = output_bytes
+                        .checked_add(
+                            serde_json::to_vec(&output)
+                                .map_err(|_| {
+                                    ProviderNativeStreamTransportErrorV1::new(
+                                        "provider_continuation_result_missing",
+                                    )
+                                })?
+                                .len(),
+                        )
+                        .filter(|bytes| *bytes <= PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1)
+                        .ok_or_else(|| {
+                            ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
+                        })?;
+                    if outputs.insert(operation_id, output).is_some() {
+                        return Err(ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_missing",
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -2344,12 +2335,51 @@ fn query_canonical_provider_tool_outputs(
             ));
         }
     }
-    if outputs.len() != expected.len() {
+    if admitted.len() != expected.len() || outputs.len() != expected.len() {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_result_missing",
         ));
     }
     Ok(outputs)
+}
+
+fn provider_continuation_fact_matches_parent(
+    fact: &KernelFactProjectionV2,
+    parent_sidecar: &SessionProviderAdmissionSidecarV1,
+) -> bool {
+    let authority = fact
+        .details
+        .get("identity")
+        .and_then(|identity| identity.get("authority"));
+    match &parent_sidecar.target_binding {
+        SessionProviderTargetBindingSidecarV1::Planning
+        | SessionProviderTargetBindingSidecarV1::ContextRead { .. } => {
+            fact.lineage.plan_action_ids.is_empty()
+                && authority
+                    .and_then(|value| value.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("contextRead")
+        }
+        SessionProviderTargetBindingSidecarV1::PlanAction { plan_action_id } => {
+            fact.lineage.plan_action_ids.len() == 1
+                && fact.lineage.plan_action_ids[0].as_str() == plan_action_id
+                && authority
+                    .and_then(|value| value.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("planAction")
+                && authority
+                    .and_then(|value| value.get("data"))
+                    .and_then(|value| value.get("planActionId"))
+                    .and_then(Value::as_str)
+                    == Some(plan_action_id.as_str())
+                && authority
+                    .and_then(|value| value.get("data"))
+                    .and_then(|value| value.get("planRevision"))
+                    .and_then(Value::as_str)
+                    == parent_sidecar.authority.plan_revision.as_deref()
+        }
+        SessionProviderTargetBindingSidecarV1::FinalAnswer { .. } => false,
+    }
 }
 
 fn next_provider_facts_request_id() -> Result<CommandRequestId, ProviderNativeStreamTransportErrorV1>

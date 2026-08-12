@@ -3,6 +3,233 @@ use crate::*;
 
 pub(crate) const AGENT_SESSION_SCHEMA_V2: &str = "deepcode.agent.session.v2";
 pub(crate) const SESSION_KERNEL_HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v3";
+pub(crate) const AGENT_CONVERSATION_TARGET_SCHEMA_V1: &str = "deepcode.host.conversation-target.v1";
+pub(crate) const AGENT_PROJECT_CONVERSATION_TARGET_SCHEMA_V1: &str =
+    "deepcode.host.project-conversation-target.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentConversationTargetV1 {
+    pub(crate) schema_version: String,
+    pub(crate) target_id: String,
+    pub(crate) target_revision: String,
+    pub(crate) session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_id: Option<String>,
+    pub(crate) workspace_scope_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_binding_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_binding_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentProjectConversationTargetV1 {
+    pub(crate) schema_version: String,
+    pub(crate) target_id: String,
+    pub(crate) target_revision: String,
+    pub(crate) project_id: String,
+    pub(crate) workspace_scope_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_binding_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_binding_identity: Option<String>,
+}
+
+pub(crate) fn agent_project_conversation_target_v1(
+    project: &Value,
+) -> Result<AgentProjectConversationTargetV1, crate::host_v2_storage::HostV2StorageError> {
+    let project_id = project
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            crate::host_v2_storage::HostV2StorageError::invalid(
+                "agent_project_conversation_target_invalid",
+                "Project metadata has no canonical Project identity",
+            )
+        })?;
+    let workspace_binding = project_workspace_binding(project);
+    let workspace_id = workspace_binding
+        .as_ref()
+        .and_then(|binding| binding.get("workspaceId"))
+        .and_then(Value::as_str);
+    let workspace_hash = workspace_binding
+        .as_ref()
+        .and_then(|binding| binding.get("workspaceHash"))
+        .and_then(Value::as_str);
+    let workspace_scope_key = scope_key_from_parts(workspace_id, workspace_hash);
+    let workspace_binding_ref = workspace_binding
+        .as_ref()
+        .and_then(|binding| binding.get("workspaceBindingRef"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let workspace_binding_identity = workspace_binding
+        .as_ref()
+        .and_then(|binding| binding.get("workspaceBindingIdentity"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let target_id = format!("project-conversation-{project_id}");
+    let revision_material = json!({
+        "schemaVersion": AGENT_PROJECT_CONVERSATION_TARGET_SCHEMA_V1,
+        "targetId": target_id,
+        "projectId": project_id,
+        "kind": project.get("kind").and_then(Value::as_str),
+        "rootStatus": project.get("rootStatus").and_then(Value::as_str),
+        "workspaceScopeKey": workspace_scope_key,
+        "workspaceBindingRef": workspace_binding_ref,
+        "workspaceBindingIdentity": workspace_binding_identity,
+    });
+    let target_revision = crate::host_v2_storage::canonical_sha256(&revision_material)?;
+    Ok(AgentProjectConversationTargetV1 {
+        schema_version: AGENT_PROJECT_CONVERSATION_TARGET_SCHEMA_V1.to_string(),
+        target_id,
+        target_revision,
+        project_id: project_id.to_string(),
+        workspace_scope_key,
+        workspace_binding_ref,
+        workspace_binding_identity,
+    })
+}
+
+pub(crate) fn require_agent_project_conversation_target_v1(
+    project: &Value,
+    supplied: &AgentProjectConversationTargetV1,
+) -> Result<AgentProjectConversationTargetV1, crate::host_v2_storage::HostV2StorageError> {
+    let expected = agent_project_conversation_target_v1(project)?;
+    if supplied != &expected {
+        return Err(crate::host_v2_storage::HostV2StorageError::invalid(
+            "agent_project_conversation_target_stale",
+            "The submitted Project conversationTarget no longer identifies the exact Project workspace binding",
+        ));
+    }
+    Ok(expected)
+}
+
+pub(crate) fn public_agent_project_value(
+    project: &Value,
+) -> Result<Value, crate::host_v2_storage::HostV2StorageError> {
+    let mut public = project.clone();
+    public["conversationTarget"] =
+        serde_json::to_value(agent_project_conversation_target_v1(project)?).map_err(|error| {
+            crate::host_v2_storage::HostV2StorageError::invalid(
+                "agent_project_conversation_target_invalid",
+                format!("encode canonical Project conversationTarget: {error}"),
+            )
+        })?;
+    Ok(public)
+}
+
+pub(crate) fn public_agent_project_values(
+    projects: impl IntoIterator<Item = Value>,
+) -> Result<Vec<Value>, crate::host_v2_storage::HostV2StorageError> {
+    projects
+        .into_iter()
+        .map(|project| public_agent_project_value(&project))
+        .collect()
+}
+
+pub(crate) fn agent_conversation_target_v1(
+    session: &Value,
+) -> Result<AgentConversationTargetV1, crate::host_v2_storage::HostV2StorageError> {
+    let session_id = session
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            crate::host_v2_storage::HostV2StorageError::invalid(
+                "agent_conversation_target_invalid",
+                "Session metadata has no canonical Session identity",
+            )
+        })?;
+    let project_id = session
+        .get("projectId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let workspace_scope_key = session_scope_key(session);
+    let workspace_binding_ref = session
+        .pointer("/workspaceBinding/workspaceBindingRef")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let workspace_binding_identity = session
+        .pointer("/workspaceBinding/workspaceBindingIdentity")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let target_id = format!("conversation-{session_id}");
+    let revision_material = json!({
+        "schemaVersion": AGENT_CONVERSATION_TARGET_SCHEMA_V1,
+        "targetId": target_id,
+        "sessionId": session_id,
+        "projectId": project_id,
+        "workspaceScopeKey": workspace_scope_key,
+        "workspaceBindingRef": workspace_binding_ref,
+        "workspaceBindingIdentity": workspace_binding_identity,
+    });
+    let target_revision = crate::host_v2_storage::canonical_sha256(&revision_material)?;
+    Ok(AgentConversationTargetV1 {
+        schema_version: AGENT_CONVERSATION_TARGET_SCHEMA_V1.to_string(),
+        target_id,
+        target_revision,
+        session_id: session_id.to_string(),
+        project_id,
+        workspace_scope_key,
+        workspace_binding_ref,
+        workspace_binding_identity,
+    })
+}
+
+pub(crate) fn require_agent_conversation_target_v1(
+    session: &Value,
+    supplied: Option<&AgentConversationTargetV1>,
+) -> Result<AgentConversationTargetV1, crate::host_v2_storage::HostV2StorageError> {
+    let supplied = supplied.ok_or_else(|| {
+        crate::host_v2_storage::HostV2StorageError::invalid(
+            "agent_conversation_target_required",
+            "Every Run mutation requires the exact daemon-issued conversationTarget",
+        )
+    })?;
+    let expected = agent_conversation_target_v1(session)?;
+    if supplied != &expected {
+        return Err(crate::host_v2_storage::HostV2StorageError::invalid(
+            "agent_conversation_target_stale",
+            "The submitted conversationTarget no longer identifies the exact Session ownership and workspace binding",
+        ));
+    }
+    Ok(expected)
+}
+
+pub(crate) fn public_agent_session_value(
+    session: &Value,
+) -> Result<Value, crate::host_v2_storage::HostV2StorageError> {
+    let mut public = session.clone();
+    public
+        .as_object_mut()
+        .ok_or_else(|| {
+            crate::host_v2_storage::HostV2StorageError::invalid(
+                "agent_session_invalid",
+                "Session metadata is not an object",
+            )
+        })?
+        .remove("firstInputAdmission");
+    public["conversationTarget"] = serde_json::to_value(agent_conversation_target_v1(session)?)
+        .map_err(|error| {
+            crate::host_v2_storage::HostV2StorageError::invalid(
+                "agent_conversation_target_invalid",
+                format!("encode canonical conversationTarget: {error}"),
+            )
+        })?;
+    Ok(public)
+}
+
+pub(crate) fn public_agent_session_values(
+    sessions: impl IntoIterator<Item = Value>,
+) -> Result<Vec<Value>, crate::host_v2_storage::HostV2StorageError> {
+    sessions
+        .into_iter()
+        .map(|session| public_agent_session_value(&session))
+        .collect()
+}
 
 pub(crate) async fn host_skills(State(state): State<AppState>) -> Json<ApiResponse> {
     match state.host_services.skill_admin.discover() {
@@ -78,8 +305,47 @@ pub(crate) fn session_is_verified_selectable(session: &Value) -> bool {
         && session.get("deletion").is_none()
 }
 
-pub(crate) fn session_is_selectable(session: &Value) -> bool {
-    session_is_verified_selectable(session)
+pub(crate) fn session_is_publicly_visible(session: &Value) -> bool {
+    session
+        .get("firstInputAdmission")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .is_none_or(|status| status == "admitted")
+}
+
+pub(crate) fn session_is_publicly_selectable(session: &Value) -> bool {
+    session_is_verified_selectable(session) && session_is_publicly_visible(session)
+}
+
+pub(crate) fn agent_project_binding_transition_lock() -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, OnceLock};
+
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+pub(crate) fn session_has_active_run(
+    state: &AppState,
+    session_id: &str,
+) -> Result<bool, crate::host_v2_storage::HostV2StorageError> {
+    let in_memory_active = state
+        .session_runs
+        .lock()
+        .expect("session run state lock")
+        .values()
+        .any(|run| {
+            run.session_id == session_id
+                && !matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+        });
+    if in_memory_active {
+        return Ok(true);
+    }
+    state
+        .host_services
+        .active_runs_v2
+        .resolve_session_active_run(session_id)
+        .map(|active| active.is_some())
 }
 
 pub(crate) fn allocate_agent_session_id(gui: &GuiState) -> Result<String, String> {
@@ -245,6 +511,8 @@ pub(crate) fn scoped_sessions(
 ) -> Vec<Value> {
     gui.sessions
         .iter()
+        .filter(|session| session_is_publicly_visible(session))
+        .filter(|session| session.get("projectId").and_then(Value::as_str).is_none())
         .filter(|session| include_archived || !is_archived_session(session))
         .filter(|session| session_scope_key(session) == scope_key)
         .cloned()
@@ -258,6 +526,7 @@ pub(crate) fn project_sessions(
 ) -> Vec<Value> {
     gui.sessions
         .iter()
+        .filter(|session| session_is_publicly_visible(session))
         .filter(|session| include_archived || !is_archived_session(session))
         .filter(|session| session.get("projectId").and_then(Value::as_str) == Some(project_id))
         .cloned()
@@ -272,7 +541,7 @@ pub(crate) fn current_agent_session_id_for_project(
         if gui.sessions.iter().any(|session| {
             session.get("id").and_then(Value::as_str) == Some(current_id)
                 && session.get("projectId").and_then(Value::as_str) == Some(project_id)
-                && session_is_selectable(session)
+                && session_is_publicly_selectable(session)
         }) {
             return Some(current_id.to_string());
         }
@@ -281,7 +550,7 @@ pub(crate) fn current_agent_session_id_for_project(
         .iter()
         .find(|session| {
             session.get("projectId").and_then(Value::as_str) == Some(project_id)
-                && session_is_selectable(session)
+                && session_is_publicly_selectable(session)
         })
         .and_then(|session| session.get("id").and_then(Value::as_str))
         .map(str::to_string)
@@ -350,7 +619,8 @@ pub(crate) fn current_agent_session_id_for_scope(
     if let Some(current_id) = gui.current_session_ids_by_scope.get(scope_key) {
         if gui.sessions.iter().any(|session| {
             session.get("id").and_then(Value::as_str) == Some(current_id.as_str())
-                && session_is_selectable(session)
+                && session_is_publicly_selectable(session)
+                && session.get("projectId").and_then(Value::as_str).is_none()
                 && session_scope_key(session) == scope_key
         }) {
             return Some(current_id.clone());
@@ -360,7 +630,10 @@ pub(crate) fn current_agent_session_id_for_scope(
     let next_id = gui
         .sessions
         .iter()
-        .find(|session| session_is_selectable(session) && session_scope_key(session) == scope_key)
+        .find(|session| {
+            session_is_publicly_selectable(session) && session_scope_key(session) == scope_key
+                && session.get("projectId").and_then(Value::as_str).is_none()
+        })
         .and_then(|session| session.get("id").and_then(Value::as_str))
         .map(ToOwned::to_owned);
     if let Some(next_id) = next_id.as_ref() {
@@ -368,42 +641,6 @@ pub(crate) fn current_agent_session_id_for_scope(
             .insert(scope_key.to_string(), next_id.clone());
     }
     next_id
-}
-
-pub(crate) fn ensure_current_agent_session_for_scope(
-    gui: &mut GuiState,
-    scope_key: &str,
-    fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
-) -> Result<(), String> {
-    if let Some(next_id) = gui
-        .sessions
-        .iter()
-        .find(|session| session_is_selectable(session) && session_scope_key(session) == scope_key)
-        .and_then(|session| session.get("id").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-    {
-        gui.current_session_ids_by_scope
-            .insert(scope_key.to_string(), next_id.clone());
-        gui.current_session_id = Some(next_id);
-        return Ok(());
-    }
-
-    let id = allocate_agent_session_id(gui)?;
-    let now = now_text();
-    let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
-    let session = create_agent_session_value(
-        &id,
-        &now,
-        "New Agent Session",
-        profile_id.as_deref(),
-        workspace_id.as_deref(),
-        workspace_hash.as_deref(),
-    );
-    gui.current_session_id = Some(id.clone());
-    gui.current_session_ids_by_scope
-        .insert(session_scope_key(&session), id.clone());
-    gui.sessions.insert(0, session);
-    Ok(())
 }
 
 pub(crate) fn compact_agent_session_title(content: &str) -> Option<String> {
@@ -499,5 +736,11 @@ pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiRespon
         Ok(session) => session,
         Err(response) => return response,
     };
-    ApiResponse::ok(json!({ "session": session }))
+    if !session_is_publicly_visible(session) {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    }
+    match public_agent_session_value(session) {
+        Ok(session) => ApiResponse::ok(json!({ "session": session })),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }

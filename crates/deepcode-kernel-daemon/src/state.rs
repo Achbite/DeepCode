@@ -106,7 +106,7 @@ impl GuiState {
             };
         let current_session_id = sessions
             .iter()
-            .find(|session| session_is_selectable(session))
+            .find(|session| session_is_publicly_selectable(session))
             .and_then(|session| session.get("id").and_then(Value::as_str))
             .map(ToOwned::to_owned);
         let current_session_ids_by_scope =

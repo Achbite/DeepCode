@@ -1,14 +1,14 @@
 import type {
   AgentEvent,
   AgentEventKind,
-  AgentInputAttachmentV2,
+  AgentInputAttachmentV3,
 } from '@deepcode/protocol';
 import {
   canonicalJson,
   sha256Hash,
 } from '../cache/canonicalizer.js';
 import {
-  decodeAgentInputAttachmentsV2,
+  decodeAgentInputAttachmentsV3,
 } from './inputAttachmentsV2.js';
 
 export const SESSION_PRIOR_EVENTS_SOURCE_V2_SCHEMA =
@@ -41,7 +41,7 @@ export interface SessionContextMemoryEntryV2 {
   recordedAt: string;
   role: 'user' | 'assistant';
   text: string;
-  attachments: AgentInputAttachmentV2[];
+  attachments: AgentInputAttachmentV3[];
 }
 
 export interface SessionContextMemoryV2 {
@@ -301,7 +301,7 @@ export function validateSessionContextMemoryV2(
       );
     }
     // Cross-Run memory never promotes historical message attachments.
-    if (decodeAgentInputAttachmentsV2(record.attachments).length !== 0) {
+    if (decodeAgentInputAttachmentsV3(record.attachments).length !== 0) {
       throw invalidMemory(
         'session_context_memory_attachment_forbidden',
         'Prior-session context memory cannot carry active attachments.'
@@ -476,7 +476,7 @@ function decodeConversationPayload(
     );
   }
   if (kind === 'user_msg') {
-    decodeAgentInputAttachmentsV2(record.attachments);
+    decodeAgentInputAttachmentsV3(record.attachments);
   } else if (record.projectionKind === 'provider.composing') {
     const composingText = boundedText(
       record.content,

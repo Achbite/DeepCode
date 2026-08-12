@@ -1,5 +1,5 @@
 import type {
-  AgentInputAttachmentV2,
+  AgentInputAttachmentV3,
   LlmChatMessage,
   LlmReasoningTransport,
   CapabilityScopePreviewRecordV2,
@@ -338,8 +338,31 @@ export interface SessionUserInputRecordV2 {
   inputId: string;
   opaqueInputRef: string;
   text: string;
-  attachments: AgentInputAttachmentV2[];
+  attachments: AgentInputAttachmentV3[];
+  attachmentContexts: SessionUserAttachmentContextV1[];
   recordedAt: string;
+}
+
+export interface SessionUserAttachmentContextFileV1 {
+  path: string;
+  content: string;
+  sizeBytes: number;
+  contentHash: string;
+}
+
+export interface SessionUserAttachmentContextOmissionV1 {
+  path: string;
+  reason: string;
+}
+
+export interface SessionUserAttachmentContextV1 {
+  schemaVersion: 'deepcode.host.user-attachment-context.v1';
+  attachmentId: string;
+  resourceId: string;
+  displayName: string;
+  kind: AgentInputAttachmentV3['kind'];
+  files: SessionUserAttachmentContextFileV1[];
+  omitted: SessionUserAttachmentContextOmissionV1[];
 }
 
 export type SessionProviderTurnTargetV2 =
