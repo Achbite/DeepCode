@@ -384,7 +384,9 @@ fn composer_projection_response(
         None
     };
     let selection_mutable = active_run.is_none() && pending_interaction.is_none();
-    let can_submit = selection_mutable && selected_profile_id.is_some();
+    // An active Run or interaction freezes the Profile choice, not the text
+    // input lane. Session still admits that input as canonical user guidance.
+    let can_submit = selected_profile_id.is_some();
     let mut projection = json!({
         "schemaVersion": HOST_COMPOSER_PROJECTION_SCHEMA_V1,
         "revision": "pending",
