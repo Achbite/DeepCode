@@ -175,7 +175,7 @@ export class SessionKernelLoopV2 {
         readState: () => this.state,
         saveCheckpoint: () => this.saveCheckpoint(),
         project: async (projectionId, kind, data, recordedAt) => {
-          await this.project(projectionId, kind, data, recordedAt);
+          return this.project(projectionId, kind, data, recordedAt);
         },
         reconcileFacts: () => this.reconcileFactsInternal(),
         settleProviderToolCallQueue: () =>

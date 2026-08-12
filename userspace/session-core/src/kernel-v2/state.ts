@@ -41,6 +41,7 @@ import {
   type SessionActiveWaitV2,
   type SessionKernelFactBarrierV2,
   type SessionFinalAnswerStateV3,
+  type SessionTerminalAnswerCandidateV1,
   type SessionOperationPlanActionBindingV2,
   type SessionKernelPublicRequestRecordV2,
   type SessionKernelReviewV2,
@@ -117,6 +118,7 @@ export interface SessionKernelLoopStateV2 {
   lastReviewRevision: number;
   review?: SessionKernelReviewV2;
   finalAnswer?: SessionFinalAnswerStateV3;
+  terminalAnswerCandidate?: SessionTerminalAnswerCandidateV1;
   runCancellation?: SessionRunCancellationV2;
   kernelWakeHint: boolean;
   checkpointRevision: number;
@@ -327,6 +329,12 @@ export function restoreSessionKernelLoopStateV2(
   }
   if (state.finalAnswer) {
     validateFinalAnswerStateV3(state.finalAnswer, state);
+  }
+  if (state.terminalAnswerCandidate) {
+    validateTerminalAnswerCandidateV1(
+      state.terminalAnswerCandidate,
+      state
+    );
   }
   if (state.providerToolCallQueue) {
     validateSessionProviderToolCallQueueV2(
@@ -539,6 +547,7 @@ export function recordSessionPlanV2(
     next.lineage.operations = {};
     next.lineage.invocations = {};
     next.review = undefined;
+    next.terminalAnswerCandidate = undefined;
     if (next.finalAnswer) {
       next.finalAnswer = {
         ...next.finalAnswer,
@@ -547,6 +556,7 @@ export function recordSessionPlanV2(
       };
       delete next.finalAnswer.finalText;
       delete next.finalAnswer.committedAt;
+      delete next.finalAnswer.commitKind;
     }
   }
   if (
@@ -762,6 +772,7 @@ export function recordSessionUserInputV2(
   next.lineage.invocations = {};
   next.review = undefined;
   next.finalAnswer = undefined;
+  next.terminalAnswerCandidate = undefined;
   return next;
 }
 
@@ -787,6 +798,14 @@ export function recordSessionProviderOutcomeV2(
   state.providerOutcomes = bounded.records;
   state.providerOutcomeHistoryOmittedCount +=
     bounded.omittedCount;
+}
+
+export function recordSessionTerminalAnswerCandidateV1(
+  state: SessionKernelLoopStateV2,
+  candidate: SessionTerminalAnswerCandidateV1
+): void {
+  validateTerminalAnswerCandidateV1(candidate, state);
+  state.terminalAnswerCandidate = cloneJson(candidate);
 }
 
 export function recordSessionContextReadWorkAuthorityV3(
@@ -1106,6 +1125,7 @@ export function resetSessionKernelFactProjectionV2(
     barrier.observedFactIds = [];
   }
   state.review = undefined;
+  state.terminalAnswerCandidate = undefined;
   if (state.finalAnswer) {
     state.finalAnswer = {
       ...state.finalAnswer,
@@ -1113,6 +1133,7 @@ export function resetSessionKernelFactProjectionV2(
     };
     delete state.finalAnswer.finalText;
     delete state.finalAnswer.committedAt;
+    delete state.finalAnswer.commitKind;
   }
   state.kernelWakeHint = true;
 }
@@ -2160,24 +2181,41 @@ function validateFinalAnswerStateV3(
     );
   }
   const invalidStatusShape =
-    finalAnswer.status === 'pending'
-      ? finalAnswer.physicalRequestCount >= 3
-        || finalAnswer.providerTurnId !== undefined
-        || finalAnswer.finalText !== undefined
-      : finalAnswer.status === 'requesting'
-        ? !finalAnswer.providerTurnId
-          || !finalAnswer.startedAt
+    (
+      finalAnswer.status !== 'committed'
+      && finalAnswer.commitKind !== undefined
+    )
+    || (
+      finalAnswer.commitKind !== undefined
+      && finalAnswer.commitKind !== 'candidatePromotion'
+      && finalAnswer.commitKind !== 'finalSynthesis'
+    )
+    || (
+      finalAnswer.status === 'pending'
+        ? finalAnswer.physicalRequestCount >= 3
+          || finalAnswer.providerTurnId !== undefined
           || finalAnswer.finalText !== undefined
-        : finalAnswer.status === 'stale'
-          ? finalAnswer.finalText !== undefined
-          : finalAnswer.status === 'committed'
-            ? finalAnswer.physicalRequestCount < 1
-              || !finalAnswer.providerTurnId
-              || !finalAnswer.committedAt
-              || !finalAnswer.finalText?.trim()
-            : !finalAnswer.failedAt
-              || !finalAnswer.lastErrorCode
-              || finalAnswer.finalText !== undefined;
+        : finalAnswer.status === 'requesting'
+          ? !finalAnswer.providerTurnId
+            || !finalAnswer.startedAt
+            || finalAnswer.finalText !== undefined
+          : finalAnswer.status === 'stale'
+            ? finalAnswer.finalText !== undefined
+            : finalAnswer.status === 'committed'
+              ? !finalAnswer.providerTurnId
+                || !finalAnswer.committedAt
+                || !finalAnswer.finalText?.trim()
+                || (
+                  finalAnswer.commitKind === 'candidatePromotion'
+                    ? finalAnswer.physicalRequestCount !== 0
+                    : finalAnswer.commitKind === 'finalSynthesis'
+                      ? finalAnswer.physicalRequestCount < 1
+                      : true
+                )
+              : !finalAnswer.failedAt
+                || !finalAnswer.lastErrorCode
+                || finalAnswer.finalText !== undefined
+    );
   if (invalidStatusShape) {
     throw new SessionKernelStateError(
       'session_kernel_final_answer_state_invalid',
@@ -2192,6 +2230,58 @@ function validateFinalAnswerStateV3(
     throw new SessionKernelStateError(
       'session_kernel_final_answer_text_invalid',
       'Committed final-answer text exceeds the durable size boundary.'
+    );
+  }
+}
+
+function validateTerminalAnswerCandidateV1(
+  candidate: SessionTerminalAnswerCandidateV1,
+  state: SessionKernelLoopStateV2
+): void {
+  if (
+    candidate.schemaVersion
+      !== 'deepcode.session.terminal-answer-candidate.v1'
+    || candidate.inputId !== state.currentInputId
+    || candidate.controlEpoch !== state.controlEpoch
+    || candidate.languageRevision !== candidate.controlEpoch
+    || !Number.isSafeInteger(candidate.snapshotHighWater)
+    || candidate.snapshotHighWater < 0
+    || candidate.snapshotHighWater
+      > state.lineage.cursor.snapshotHighWater
+    || !candidate.text.trim()
+    || new TextEncoder().encode(candidate.text).byteLength
+      > 1024 * 1024
+    || candidate.textDigest !== sha256Hash(candidate.text)
+    || !Array.isArray(candidate.sourceEventRefs)
+    || candidate.sourceEventRefs.length === 0
+    || new Set(candidate.sourceEventRefs).size
+      !== candidate.sourceEventRefs.length
+    || candidate.sourceEventRefs.some((ref) => !ref.trim())
+    || !state.providerOutcomes.some((outcome) =>
+      outcome.providerTurnId === candidate.providerTurnId
+      && outcome.outputKind === 'answer'
+      && outcome.recordedAt === candidate.recordedAt
+      && outcome.summary === candidate.text.slice(0, 8_192)
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_terminal_answer_candidate_invalid',
+      'Terminal answer candidate does not bind exact durable Provider and Session authority.'
+    );
+  }
+  requiredIdentity(candidate.providerTurnId, 'terminalAnswerCandidate.providerTurnId');
+  requiredText(candidate.recordedAt, 'terminalAnswerCandidate.recordedAt');
+  validateSessionWorkAuthorityShapeV3(candidate.workAuthority);
+  if (
+    !state.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      state.workAuthority
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_terminal_answer_candidate_authority_invalid',
+      'Terminal answer candidate belongs to a different work authority.'
     );
   }
 }

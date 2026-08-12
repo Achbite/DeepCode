@@ -45,6 +45,8 @@ export const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA =
   'deepcode.session.provider-turn-terminal.v3' as const;
 export const SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA =
   'deepcode.session.tool-context-snapshot.v3' as const;
+export const SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA =
+  'deepcode.session.terminal-answer-candidate.v1' as const;
 
 export type SessionWorkAuthorityV3 =
   | {
@@ -408,6 +410,26 @@ export interface SessionFinalAnswerStateV3 {
   failedAt?: string;
   finalText?: string;
   lastErrorCode?: string;
+  commitKind?: 'candidatePromotion' | 'finalSynthesis';
+}
+
+/**
+ * Durable Session-owned candidate from an already completed Provider turn.
+ * It is not final authority: the frozen Review and exact state high-water must
+ * still accept it before it can become the public terminal answer.
+ */
+export interface SessionTerminalAnswerCandidateV1 {
+  schemaVersion: typeof SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA;
+  providerTurnId: string;
+  inputId: string;
+  controlEpoch: number;
+  languageRevision: number;
+  snapshotHighWater: number;
+  workAuthority: SessionWorkAuthorityV3;
+  text: string;
+  textDigest: string;
+  sourceEventRefs: string[];
+  recordedAt: string;
 }
 
 export interface SessionProviderTurnRequestV2 {

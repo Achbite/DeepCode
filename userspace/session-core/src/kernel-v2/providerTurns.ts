@@ -19,6 +19,7 @@ import {
   currentSessionWorkAuthorityV3,
   recordSessionContextReadWorkAuthorityV3,
   recordSessionProviderOutcomeV2,
+  recordSessionTerminalAnswerCandidateV1,
   sameSessionWorkAuthorityV3,
   sessionPlanActionV2,
   type SessionKernelLoopStateV2,
@@ -71,6 +72,7 @@ import {
   SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
+import type { SessionKernelProjectionReceiptV2 } from './ports.js';
 import type {
   SessionKernelLoopResultV2,
   SessionNaturalLanguagePlanV2,
@@ -85,6 +87,9 @@ import type {
   SessionProviderTurnInputV2,
   SessionProviderTurnOutputV2,
 } from './types.js';
+import {
+  SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
+} from './types.js';
 
 export interface SessionKernelProviderTurnHostV2 {
   readState(): SessionKernelLoopStateV2;
@@ -96,7 +101,7 @@ export interface SessionKernelProviderTurnHostV2 {
     kind: SessionKernelProjectionEventV2['kind'],
     data: unknown,
     recordedAt?: string
-  ): Promise<void>;
+  ): Promise<SessionKernelProjectionReceiptV2>;
 
   reconcileFacts(): Promise<void>;
 
@@ -311,6 +316,12 @@ export class SessionKernelProviderTurnsV2 {
           'session_kernel_final_answer_binding_stale',
           'Final-answer request belongs to a superseded authority identity.'
         );
+      }
+      if (finalAnswer?.status === 'pending') {
+        const promoted = await this.promoteTerminalAnswerCandidate(
+          currentRequest.target
+        );
+        if (promoted) return promoted;
       }
       if (finalAnswer?.status === 'committed') {
         await this.ensureCommittedFinalAnswerProjected(state);
@@ -1077,6 +1088,7 @@ export class SessionKernelProviderTurnsV2 {
         providerTurnId,
         committedAt: recordedAt,
         finalText: result.text,
+        commitKind: 'finalSynthesis',
       };
     }
     current.providerTurn.status = 'completed';
@@ -1109,8 +1121,9 @@ export class SessionKernelProviderTurnsV2 {
       recordSessionProviderOutcomeV2(current, outcome);
     }
     await this.host.saveCheckpoint();
-    await this.host.project(
-      `provider:${providerTurnId}:completed`,
+    const completedProjectionId = `provider:${providerTurnId}:completed`;
+    const completedProjection = await this.host.project(
+      completedProjectionId,
       'provider.completed',
       {
         providerTurnId,
@@ -1136,6 +1149,33 @@ export class SessionKernelProviderTurnsV2 {
       },
       recordedAt
     );
+    if (
+      output.kind === 'answer'
+      && result.kind === 'answer'
+      && request.target.kind !== 'finalAnswer'
+    ) {
+      const workAuthority = currentSessionWorkAuthorityV3(current);
+      if (workAuthority?.kind === 'contextRead') {
+        recordSessionTerminalAnswerCandidateV1(current, {
+          schemaVersion: SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
+          providerTurnId,
+          inputId: current.currentInputId,
+          controlEpoch: current.controlEpoch,
+          // Every authoritative input advances the control epoch in the
+          // current Loop; this is the exact language-policy revision until
+          // the language value is restored as an independent v3 fact.
+          languageRevision: current.controlEpoch,
+          snapshotHighWater:
+            current.lineage.cursor.snapshotHighWater,
+          workAuthority: cloneJson(workAuthority),
+          text: result.text,
+          textDigest: sha256Hash(result.text),
+          sourceEventRefs: [completedProjection.projectionId],
+          recordedAt,
+        });
+        await this.host.saveCheckpoint();
+      }
+    }
     if (output.kind === 'plan') {
       const commentaryItems = publicSessionProviderOrderedItemsV2(
         output.items
@@ -1533,8 +1573,15 @@ export class SessionKernelProviderTurnsV2 {
         'Committed final answer is missing its durable Provider outcome.'
       );
     }
+    const projectionId = finalAnswer.commitKind === 'candidatePromotion'
+      ? [
+          `provider:${finalAnswer.providerTurnId}:candidate-promoted`,
+          finalAnswer.binding.reviewRevision,
+          finalAnswer.binding.snapshotHighWater,
+        ].join(':')
+      : `provider:${finalAnswer.providerTurnId}:completed`;
     await this.host.project(
-      `provider:${finalAnswer.providerTurnId}:completed`,
+      projectionId,
       'provider.completed',
       {
         providerTurnId: finalAnswer.providerTurnId,
@@ -1548,9 +1595,51 @@ export class SessionKernelProviderTurnsV2 {
         providerOutcome: outcome.providerResult,
         reviewRevision: finalAnswer.binding.reviewRevision,
         snapshotHighWater: finalAnswer.binding.snapshotHighWater,
+        ...(finalAnswer.commitKind === 'candidatePromotion'
+          ? {
+              candidateSourceEventRefs: cloneJson(
+                state.terminalAnswerCandidate?.sourceEventRefs ?? []
+              ),
+            }
+          : {}),
       },
       finalAnswer.committedAt
     );
+  }
+
+  private async promoteTerminalAnswerCandidate(
+    target: Extract<
+      SessionProviderTurnTargetV2,
+      { kind: 'finalAnswer' }
+    >
+  ): Promise<Extract<
+    SessionKernelLoopResultV2,
+    { kind: 'answer' }
+  > | undefined> {
+    const state = this.host.readState();
+    const finalAnswer = state.finalAnswer;
+    const candidate = state.terminalAnswerCandidate;
+    if (
+      finalAnswer?.status !== 'pending'
+      || finalAnswer.physicalRequestCount !== 0
+      || !sameSessionFinalAnswerBindingV3(finalAnswer.binding, target)
+      || !candidateCanPromoteToFinalAnswerV1(state, target)
+      || !candidate
+    ) {
+      return undefined;
+    }
+    state.finalAnswer = {
+      status: 'committed',
+      binding: cloneJson(finalAnswer.binding),
+      physicalRequestCount: finalAnswer.physicalRequestCount,
+      providerTurnId: candidate.providerTurnId,
+      committedAt: this.ports.clock.now(),
+      finalText: candidate.text,
+      commitKind: 'candidatePromotion',
+    };
+    await this.host.saveCheckpoint();
+    await this.ensureCommittedFinalAnswerProjected(state);
+    return { kind: 'answer', text: candidate.text };
   }
 
   private async projectFinalAnswerFailure(
@@ -2393,6 +2482,114 @@ function providerOutcomeSummary(
     return { summary: `PlanAction outcome: ${output.outcome}` };
   }
   return {};
+}
+
+function candidateCanPromoteToFinalAnswerV1(
+  state: SessionKernelLoopStateV2,
+  target: Extract<
+    SessionProviderTurnTargetV2,
+    { kind: 'finalAnswer' }
+  >
+): boolean {
+  const candidate = state.terminalAnswerCandidate;
+  const review = state.review;
+  const turn = state.providerTurn;
+  if (
+    !candidate
+    || !review
+    || review.status !== 'final'
+    || candidate.inputId !== target.inputId
+    || candidate.controlEpoch !== target.controlEpoch
+    || candidate.languageRevision !== target.controlEpoch
+    || candidate.snapshotHighWater !== target.snapshotHighWater
+    || candidate.snapshotHighWater
+      !== state.lineage.cursor.snapshotHighWater
+    || candidate.workAuthority.kind !== 'contextRead'
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      target.workAuthority
+    )
+    || !review.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      review.workAuthority,
+      target.workAuthority
+    )
+    || turn?.providerTurnId !== candidate.providerTurnId
+    || turn.status !== 'completed'
+    || !turn.response
+    || state.activeWait !== undefined
+    || Object.keys(state.publicRequests).length > 0
+    || sessionKernelFactBarriersPendingV2(state)
+    || state.pendingGuidance.length > 0
+    || state.providerToolCallQueue?.status === 'active'
+    || (
+      state.providerToolCallQueue !== undefined
+      && !state.providerToolCallQueue.outcomeRecorded
+    )
+    || state.runCancellation !== undefined
+    || review.scopeExpansions.length > 0
+    || review.denied.length > 0
+    || review.unexecuted.length > 0
+    || review.cleanup.length > 0
+    || review.indeterminate.length > 0
+    || review.priorEpochLateFacts.length > 0
+    || review.pendingCleanupCount !== 0
+    || Object.values(review.factCoverage).some(
+      (coverage) => coverage.omittedCount !== 0
+    )
+    || review.actualEffects.some(
+      (fact) => reviewFactAuthorityKindV1(fact.details) !== 'contextRead'
+    )
+    || review.rejections.some(
+      (fact) => ![
+        'invalidArguments',
+        'toolNotRegistered',
+        'toolUnavailable',
+        'staleToolContext',
+        'staleControlEpoch',
+      ].includes(reviewRejectionReasonV1(fact.details) ?? '')
+    )
+  ) {
+    return false;
+  }
+  return state.providerOutcomes.some((outcome) =>
+    outcome.providerTurnId === candidate.providerTurnId
+    && outcome.outputKind === 'answer'
+  );
+}
+
+function reviewFactAuthorityKindV1(
+  details: unknown
+): string | undefined {
+  return nestedStringV1(details, ['identity', 'authority', 'kind']);
+}
+
+function reviewRejectionReasonV1(
+  details: unknown
+): string | undefined {
+  return nestedStringV1(details, [
+    'result',
+    'data',
+    'reply',
+    'data',
+    'reason',
+  ]);
+}
+
+function nestedStringV1(
+  value: unknown,
+  path: readonly string[]
+): string | undefined {
+  let current: unknown = value;
+  for (const key of path) {
+    if (
+      !current
+      || typeof current !== 'object'
+      || Array.isArray(current)
+    ) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'string' ? current : undefined;
 }
 
 function providerRepairOperationIdV2(

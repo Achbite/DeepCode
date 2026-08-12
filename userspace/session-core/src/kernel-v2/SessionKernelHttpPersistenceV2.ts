@@ -35,6 +35,7 @@ import {
 import type {
   SessionActiveWaitV2,
   SessionFinalAnswerStateV3,
+  SessionTerminalAnswerCandidateV1,
   SessionKernelFactBarrierV2,
   SessionKernelPersistenceRecordRefV3,
   SessionKernelProjectionEventV2,
@@ -67,6 +68,7 @@ import {
   SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
   SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
+  SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
 } from './types.js';
 import {
   decodeAgentInputAttachmentsV3,
@@ -233,7 +235,12 @@ interface SessionKernelCompactProviderQueueV3 {
 
 type SessionKernelCompactFinalAnswerV3 = Omit<
   SessionFinalAnswerStateV3,
-  'physicalRequestCount' | 'finalText' | 'committedAt'
+  'physicalRequestCount' | 'finalText'
+>;
+
+type SessionKernelCompactTerminalAnswerCandidateV1 = Omit<
+  SessionTerminalAnswerCandidateV1,
+  'text'
 >;
 
 interface SessionKernelCompactCheckpointV3 {
@@ -296,6 +303,7 @@ interface SessionKernelCompactCheckpointV3 {
     >;
   };
   finalAnswer?: SessionKernelCompactFinalAnswerV3;
+  terminalAnswerCandidate?: SessionKernelCompactTerminalAnswerCandidateV1;
 }
 
 interface SessionKernelProjectionRecordV3 {
@@ -2707,7 +2715,7 @@ function decodeCompactCheckpointV3(
       'active',
       'refs',
     ],
-    ['finalAnswer'],
+    ['finalAnswer', 'terminalAnswerCandidate'],
     'session_kernel_checkpoint_invalid'
   );
   const revision = positiveSafeIntegerV3(
@@ -2856,6 +2864,12 @@ function decodeCompactCheckpointV3(
   const finalAnswer = record.finalAnswer === undefined
     ? undefined
     : decodeCompactFinalAnswerV3(record.finalAnswer);
+  const terminalAnswerCandidate =
+    record.terminalAnswerCandidate === undefined
+      ? undefined
+      : decodeCompactTerminalAnswerCandidateV1(
+          record.terminalAnswerCandidate
+        );
   const reviewFactsAfterLedgerSequence = nonnegativeSafeIntegerV3(
     cursor.reviewFactsAfterLedgerSequence,
     'reviewFactsAfterLedgerSequence'
@@ -3006,6 +3020,81 @@ function decodeCompactCheckpointV3(
       ),
     },
     ...(finalAnswer === undefined ? {} : { finalAnswer }),
+    ...(terminalAnswerCandidate === undefined
+      ? {}
+      : { terminalAnswerCandidate }),
+  };
+}
+
+function decodeCompactTerminalAnswerCandidateV1(
+  value: unknown
+): SessionKernelCompactTerminalAnswerCandidateV1 {
+  const record = exactObject(
+    value,
+    [
+      'schemaVersion',
+      'providerTurnId',
+      'inputId',
+      'controlEpoch',
+      'languageRevision',
+      'snapshotHighWater',
+      'workAuthority',
+      'textDigest',
+      'sourceEventRefs',
+      'recordedAt',
+    ],
+    'session_kernel_terminal_answer_candidate_invalid'
+  );
+  const controlEpoch = positiveSafeIntegerV3(
+    record.controlEpoch,
+    'terminalAnswerCandidate.controlEpoch'
+  );
+  const languageRevision = positiveSafeIntegerV3(
+    record.languageRevision,
+    'terminalAnswerCandidate.languageRevision'
+  );
+  const sourceEventRefs = Array.isArray(record.sourceEventRefs)
+    ? record.sourceEventRefs.map((ref) =>
+        requiredIdentity(ref, 'terminalAnswerCandidate.sourceEventRef')
+      )
+    : [];
+  if (
+    record.schemaVersion
+      !== SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA
+    || languageRevision !== controlEpoch
+    || sourceEventRefs.length === 0
+    || new Set(sourceEventRefs).size !== sourceEventRefs.length
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_terminal_answer_candidate_invalid'
+    );
+  }
+  return {
+    schemaVersion: SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
+    providerTurnId: requiredIdentity(
+      record.providerTurnId,
+      'terminalAnswerCandidate.providerTurnId'
+    ),
+    inputId: requiredIdentity(
+      record.inputId,
+      'terminalAnswerCandidate.inputId'
+    ),
+    controlEpoch,
+    languageRevision,
+    snapshotHighWater: nonnegativeSafeIntegerV3(
+      record.snapshotHighWater,
+      'terminalAnswerCandidate.snapshotHighWater'
+    ),
+    workAuthority: decodeSessionWorkAuthorityV3(record.workAuthority),
+    textDigest: requiredDigest(
+      record.textDigest,
+      'terminalAnswerCandidate.textDigest'
+    ),
+    sourceEventRefs,
+    recordedAt: requiredText(
+      record.recordedAt,
+      'terminalAnswerCandidate.recordedAt'
+    ),
   };
 }
 
@@ -3449,8 +3538,10 @@ function decodeCompactFinalAnswerV3(
       'providerTurnId',
       'startedAt',
       'staleAt',
+      'committedAt',
       'failedAt',
       'lastErrorCode',
+      'commitKind',
     ],
     'session_kernel_final_answer_checkpoint_invalid'
   );
@@ -3499,6 +3590,14 @@ function decodeCompactFinalAnswerV3(
     ...(record.staleAt === undefined
       ? {}
       : { staleAt: requiredText(record.staleAt, 'staleAt') }),
+    ...(record.committedAt === undefined
+      ? {}
+      : {
+          committedAt: requiredText(
+            record.committedAt,
+            'committedAt'
+          ),
+        }),
     ...(record.failedAt === undefined
       ? {}
       : { failedAt: requiredText(record.failedAt, 'failedAt') }),
@@ -3510,6 +3609,16 @@ function decodeCompactFinalAnswerV3(
             'lastErrorCode'
           ),
         }),
+    ...(record.commitKind === undefined
+      ? {}
+      : record.commitKind === 'candidatePromotion'
+          || record.commitKind === 'finalSynthesis'
+        ? { commitKind: record.commitKind }
+        : (() => {
+            throw new UnsupportedHistorySchemaError(
+              'session_kernel_final_answer_checkpoint_invalid'
+            );
+          })()),
   }) as SessionKernelCompactFinalAnswerV3;
 }
 
@@ -4129,6 +4238,11 @@ function compactCheckpointFromStateV3(input: {
   const finalAnswer = state.finalAnswer
     ? compactFinalAnswerV3(state.finalAnswer)
     : undefined;
+  const terminalAnswerCandidate = state.terminalAnswerCandidate
+    ? compactTerminalAnswerCandidateV1(
+        state.terminalAnswerCandidate
+      )
+    : undefined;
   return {
     schemaVersion: SESSION_KERNEL_CHECKPOINT_V3_SCHEMA,
     checkpointRevision: checkpoint.checkpointRevision,
@@ -4199,6 +4313,9 @@ function compactCheckpointFromStateV3(input: {
       planActionSettlements: settlementRefs,
     },
     ...(finalAnswer ? { finalAnswer } : {}),
+    ...(terminalAnswerCandidate
+      ? { terminalAnswerCandidate }
+      : {}),
   };
 }
 
@@ -4312,9 +4429,15 @@ function compactFinalAnswerV3(
   const {
     physicalRequestCount: _derived,
     finalText: _terminalText,
-    committedAt: _terminalRecordedAt,
     ...wire
   } = finalAnswer;
+  return cloneJson(wire);
+}
+
+function compactTerminalAnswerCandidateV1(
+  candidate: SessionTerminalAnswerCandidateV1
+): SessionKernelCompactTerminalAnswerCandidateV1 {
+  const { text: _terminalText, ...wire } = candidate;
   return cloneJson(wire);
 }
 
@@ -4512,6 +4635,15 @@ function materializeCompactCheckpointV3(input: {
     committedCheckpoints,
     recovery
   );
+  if (checkpoint.terminalAnswerCandidate) {
+    state.terminalAnswerCandidate =
+      materializeTerminalAnswerCandidateV1({
+        candidate: checkpoint.terminalAnswerCandidate,
+        state,
+        records,
+        committedProjections,
+      });
+  }
   const currentInputHasDurableToolResponse =
     checkpoint.cursor.providerTerminalRefs.some((ref) => {
       const terminal = resolveRecordRefV3(
@@ -4563,17 +4695,24 @@ function materializeCompactCheckpointV3(input: {
     );
   }
   if (checkpoint.finalAnswer) {
-    const physicalRequestCount = countMatchingFinalAnswerDispatchesV3(
-      records,
-      state.runId,
-      checkpoint.finalAnswer,
-      recovery.providerProfile
-    );
+    const physicalRequestCount =
+      checkpoint.finalAnswer.commitKind === 'candidatePromotion'
+        ? 0
+        : countMatchingFinalAnswerDispatchesV3(
+            records,
+            state.runId,
+            checkpoint.finalAnswer,
+            recovery.providerProfile
+          );
     state.finalAnswer = {
       ...cloneJson(checkpoint.finalAnswer),
       physicalRequestCount,
     } as SessionFinalAnswerStateV3;
-    recoverFinalAnswerFromTerminalV3(state, activeEvidence);
+    if (checkpoint.finalAnswer.commitKind === 'candidatePromotion') {
+      recoverPromotedCandidateFinalAnswerV1(state);
+    } else {
+      recoverFinalAnswerFromTerminalV3(state, activeEvidence);
+    }
   }
   restoreProjectionHeadsV3(state, committedProjections);
   return {
@@ -4581,6 +4720,63 @@ function materializeCompactCheckpointV3(input: {
     checkpointRevision: checkpoint.checkpointRevision,
     savedAt: checkpoint.savedAt,
     state,
+  };
+}
+
+function recoverPromotedCandidateFinalAnswerV1(
+  state: SessionKernelLoopStateV2
+): void {
+  const finalAnswer = state.finalAnswer;
+  const candidate = state.terminalAnswerCandidate;
+  const providerTurn = state.providerTurn;
+  if (
+    finalAnswer?.status !== 'committed'
+    || finalAnswer.commitKind !== 'candidatePromotion'
+    || finalAnswer.physicalRequestCount !== 0
+    || !finalAnswer.providerTurnId
+    || !finalAnswer.committedAt
+    || !candidate
+    || candidate.providerTurnId !== finalAnswer.providerTurnId
+    || candidate.inputId !== finalAnswer.binding.inputId
+    || candidate.controlEpoch !== finalAnswer.binding.controlEpoch
+    || candidate.languageRevision !== finalAnswer.binding.controlEpoch
+    || candidate.snapshotHighWater
+      !== finalAnswer.binding.snapshotHighWater
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      finalAnswer.binding.workAuthority
+    )
+    || !providerTurn
+    || providerTurn.providerTurnId !== candidate.providerTurnId
+    || providerTurn.status !== 'completed'
+    || !providerTurn.response
+    || providerTurn.purpose === 'finalAnswer'
+    || providerTurn.target.kind === 'finalAnswer'
+    || state.currentInputId !== finalAnswer.binding.inputId
+    || state.controlEpoch !== finalAnswer.binding.controlEpoch
+    || state.review?.status !== 'final'
+    || state.review.revision !== finalAnswer.binding.reviewRevision
+    || state.review.snapshotHighWater
+      !== finalAnswer.binding.snapshotHighWater
+    || !state.review.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      state.review.workAuthority,
+      finalAnswer.binding.workAuthority
+    )
+    || !state.providerOutcomes.some((outcome) =>
+      outcome.providerTurnId === candidate.providerTurnId
+      && outcome.outputKind === 'answer'
+      && outcome.recordedAt === candidate.recordedAt
+      && outcome.summary === candidate.text.slice(0, 8_192)
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_promoted_terminal_answer_invalid'
+    );
+  }
+  state.finalAnswer = {
+    ...cloneJson(finalAnswer),
+    finalText: candidate.text,
   };
 }
 
@@ -4761,6 +4957,7 @@ function recoverFinalAnswerFromTerminalV3(
     providerTurnId: terminal.data.providerTurnId,
     committedAt: terminal.recordedAt,
     finalText: text,
+    commitKind: 'finalSynthesis',
   };
   if (state.providerTurn) state.providerTurn.status = 'completed';
   const outcome = state.providerOutcomes.find((candidate) =>
@@ -5362,6 +5559,77 @@ function terminalFinalTextV3(
         .filter((item) => item.phase === 'unknown'))
     .map((item) => item.text)
     .join('');
+}
+
+function materializeTerminalAnswerCandidateV1(input: {
+  candidate: SessionKernelCompactTerminalAnswerCandidateV1;
+  state: SessionKernelLoopStateV2;
+  records: readonly SessionKernelPersistenceRecordV3[];
+  committedProjections: readonly SessionKernelPersistenceRecordV3[];
+}): SessionTerminalAnswerCandidateV1 {
+  const { candidate, state, records, committedProjections } = input;
+  const evidence = providerTurnEvidenceV3(
+    records,
+    state.runId,
+    candidate.providerTurnId
+  );
+  const terminal = evidence.terminal;
+  if (
+    !evidence.dispatch
+    || !terminal
+    || terminal.data.terminalKind !== 'completed'
+    || terminal.data.authorityBinding.inputId !== candidate.inputId
+    || terminal.data.authorityBinding.controlEpoch
+      !== candidate.controlEpoch
+    || terminal.recordedAt !== candidate.recordedAt
+    || candidate.inputId !== state.currentInputId
+    || candidate.controlEpoch !== state.controlEpoch
+    || candidate.snapshotHighWater
+      > state.lineage.cursor.snapshotHighWater
+    || !state.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      state.workAuthority
+    )
+    || !state.providerOutcomes.some((outcome) =>
+      outcome.providerTurnId === candidate.providerTurnId
+      && outcome.outputKind === 'answer'
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_terminal_answer_candidate_invalid'
+    );
+  }
+  const text = terminalFinalTextV3(
+    terminal.data.orderedItems.filter(
+      (item): item is Extract<
+        SessionProviderTerminalOrderedItemV3,
+        { kind: 'text' }
+      > => item.kind === 'text'
+    )
+  );
+  if (
+    !text.trim()
+    || sha256Hash(text) !== candidate.textDigest
+    || candidate.sourceEventRefs.some((sourceRef) =>
+      !committedProjections.some((record) => {
+        const event = (record.data as SessionKernelProjectionRecordV3).event;
+        const data = objectRecord(event.data);
+        return event.projectionId === sourceRef
+          && event.kind === 'provider.completed'
+          && data?.providerTurnId === candidate.providerTurnId
+          && data?.outputKind === 'answer';
+      })
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_terminal_answer_candidate_source_invalid'
+    );
+  }
+  return {
+    ...cloneJson(candidate),
+    text,
+  };
 }
 
 function materializeProviderReservationV3(
