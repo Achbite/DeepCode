@@ -1,7 +1,7 @@
 use crate::host_run_broker_v2::HostActiveRunBrokerV2;
 use crate::host_v2_storage::{
     append_json_line_durable, canonical_json_bytes, canonical_sha256,
-    reject_transport_capabilities, sha256_path_component, stable_json_sha256,
+    reject_transport_capabilities, sha256_path_component, sha256_prefixed, stable_json_sha256,
     validate_bounded_identity, validate_safe_session_identity, validate_sha256_digest,
     value_without_field, with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
 };
@@ -56,6 +56,8 @@ const SESSION_KERNEL_PLAN_ACTION_SETTLEMENT_RECORD_V3_SCHEMA: &str =
 const SESSION_KERNEL_PUBLIC_REQUEST_SETTLEMENT_V3_SCHEMA: &str =
     "deepcode.session.public-request-settlement.v3";
 const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA: &str = "deepcode.session.projection-record.v3";
+const SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA: &str =
+    "deepcode.session.terminal-answer-candidate.v1";
 const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-request.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA: &str =
@@ -563,9 +565,28 @@ struct SessionKernelCompactFinalAnswerV3 {
     #[serde(skip_serializing_if = "Option::is_none")]
     stale_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    committed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     failed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionKernelCompactTerminalAnswerCandidateV1 {
+    schema_version: String,
+    provider_turn_id: String,
+    input_id: String,
+    control_epoch: u64,
+    language_revision: u64,
+    snapshot_high_water: u64,
+    work_authority: SessionWorkAuthorityV3,
+    text_digest: String,
+    source_event_refs: Vec<String>,
+    recorded_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,6 +603,8 @@ struct SessionKernelCompactCheckpointV3 {
     refs: SessionKernelCompactRefsV3,
     #[serde(skip_serializing_if = "Option::is_none")]
     final_answer: Option<SessionKernelCompactFinalAnswerV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_answer_candidate: Option<SessionKernelCompactTerminalAnswerCandidateV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2196,7 +2219,123 @@ fn validate_checkpoint_work_authority_records(
     } else if checkpoint.final_answer.is_some() {
         return Err(compact_final_answer_invalid());
     }
+    validate_terminal_answer_candidate_records(records, exclusive_end, checkpoint)?;
     Ok(())
+}
+
+fn validate_terminal_answer_candidate_records(
+    records: &[SessionKernelPersistenceRecordV3],
+    exclusive_end: usize,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<(), HostV2StorageError> {
+    let Some(candidate) = &checkpoint.terminal_answer_candidate else {
+        return Ok(());
+    };
+    let before = records
+        .get(..exclusive_end)
+        .ok_or_else(terminal_answer_candidate_invalid)?;
+    let terminal_record_id =
+        provider_turn_terminal_record_id(&checkpoint.authority.run_id, &candidate.provider_turn_id);
+    let terminal_record = before
+        .iter()
+        .find(|record| record.record_id == terminal_record_id)
+        .ok_or_else(terminal_answer_candidate_invalid)?;
+    let terminal =
+        validate_provider_turn_terminal_record(terminal_record, &checkpoint.authority.run_id)?;
+    if terminal.terminal_kind != SessionProviderTurnTerminalKindV3::Completed
+        || terminal.authority_binding.input_id != candidate.input_id
+        || terminal.authority_binding.control_epoch != candidate.control_epoch
+        || terminal_record.recorded_at != candidate.recorded_at
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    let dispatch_record =
+        resolve_record_ref_before(records, exclusive_end, &terminal.dispatch_ref)?;
+    let dispatch =
+        validate_provider_turn_dispatch_record(dispatch_record, &checkpoint.authority.run_id)?;
+    if dispatch.provider_turn_id != candidate.provider_turn_id
+        || dispatch.purpose == ProviderTracePurposeV1::FinalAnswer
+        || dispatch.authority_binding != terminal.authority_binding
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    let terminal_text = provider_terminal_final_text(&terminal.ordered_items);
+    if terminal_text.trim().is_empty()
+        || sha256_prefixed(terminal_text.as_bytes()) != candidate.text_digest
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    for source_ref in &candidate.source_event_refs {
+        let mut matched = false;
+        for record in before
+            .iter()
+            .filter(|record| record.record_kind == SessionKernelPersistenceRecordKindV3::Projection)
+        {
+            let projection = decode_projection_record(record)?;
+            let Some(event) = projection.event.as_object() else {
+                return Err(terminal_answer_candidate_invalid());
+            };
+            if event.get("projectionId").and_then(Value::as_str) != Some(source_ref.as_str()) {
+                continue;
+            }
+            let data = event
+                .get("data")
+                .and_then(Value::as_object)
+                .ok_or_else(terminal_answer_candidate_invalid)?;
+            matched = event.get("kind").and_then(Value::as_str) == Some("provider.completed")
+                && data.get("providerTurnId").and_then(Value::as_str)
+                    == Some(candidate.provider_turn_id.as_str())
+                && data.get("outputKind").and_then(Value::as_str) == Some("answer");
+            break;
+        }
+        if !matched {
+            return Err(terminal_answer_candidate_invalid());
+        }
+    }
+    let reservation = checkpoint
+        .active
+        .provider_reservation
+        .as_ref()
+        .ok_or_else(terminal_answer_candidate_invalid)?;
+    let terminal_ref = SessionProviderTurnRecordRefV3 {
+        record_id: terminal_record.record_id.clone(),
+        record_digest: terminal_record.record_digest.clone(),
+    };
+    if reservation.provider_turn_id != candidate.provider_turn_id
+        || reservation.status != "completed"
+        || reservation.terminal_ref.as_ref() != Some(&terminal_ref)
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    Ok(())
+}
+
+fn provider_terminal_final_text(items: &[SessionProviderOrderedItemV3]) -> String {
+    let text_items = items
+        .iter()
+        .filter_map(|item| match item {
+            SessionProviderOrderedItemV3::Text { phase, text } => Some((phase, text)),
+            SessionProviderOrderedItemV3::ToolCall { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let first_final = text_items
+        .iter()
+        .position(|(phase, _)| matches!(phase, SessionProviderTextPhaseV3::FinalAnswer));
+    let last_commentary = text_items
+        .iter()
+        .rposition(|(phase, _)| matches!(phase, SessionProviderTextPhaseV3::Commentary));
+    text_items
+        .iter()
+        .enumerate()
+        .filter(|(index, (phase, _))| match first_final {
+            Some(first) => *index >= first,
+            None => {
+                last_commentary.is_none_or(|last| *index > last)
+                    && matches!(phase, SessionProviderTextPhaseV3::Unknown)
+            }
+        })
+        .map(|(_, (_, text))| text.as_str())
+        .collect()
 }
 
 fn validate_checkpoint_continuation(
@@ -3116,7 +3255,69 @@ fn decode_compact_checkpoint_record(
     if let Some(final_answer) = &checkpoint.final_answer {
         validate_compact_final_answer(final_answer, authority)?;
     }
+    if let Some(candidate) = &checkpoint.terminal_answer_candidate {
+        validate_compact_terminal_answer_candidate(candidate, &checkpoint)?;
+    }
+    match (
+        checkpoint
+            .final_answer
+            .as_ref()
+            .and_then(|answer| answer.commit_kind.as_deref()),
+        checkpoint.final_answer.as_ref(),
+        checkpoint.terminal_answer_candidate.as_ref(),
+    ) {
+        (Some("candidatePromotion"), Some(final_answer), Some(candidate))
+            if final_answer.provider_turn_id.as_deref()
+                == Some(candidate.provider_turn_id.as_str())
+                && final_answer.binding.input_id == candidate.input_id
+                && final_answer.binding.control_epoch == candidate.control_epoch
+                && final_answer.binding.snapshot_high_water == candidate.snapshot_high_water
+                && final_answer.binding.work_authority == candidate.work_authority => {}
+        (Some("candidatePromotion"), _, _) => {
+            return Err(compact_final_answer_invalid());
+        }
+        _ => {}
+    }
     Ok(checkpoint)
+}
+
+fn validate_compact_terminal_answer_candidate(
+    candidate: &SessionKernelCompactTerminalAnswerCandidateV1,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<(), HostV2StorageError> {
+    if candidate.schema_version != SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA
+        || candidate.control_epoch == 0
+        || candidate.control_epoch > MAX_SAFE_INTEGER_V3
+        || candidate.language_revision != candidate.control_epoch
+        || candidate.snapshot_high_water > checkpoint.cursor.snapshot_high_water
+        || candidate.input_id != checkpoint.authority.current_input_id
+        || candidate.control_epoch != checkpoint.authority.control_epoch
+        || Some(&candidate.work_authority) != checkpoint.authority.work_authority.as_ref()
+        || candidate.source_event_refs.is_empty()
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    validate_bounded_identity(
+        &candidate.provider_turn_id,
+        "terminalAnswerCandidate.providerTurnId",
+        512,
+    )?;
+    validate_bounded_identity(&candidate.input_id, "terminalAnswerCandidate.inputId", 512)?;
+    validate_session_work_authority_v3(&candidate.work_authority)?;
+    validate_sha256_digest(&candidate.text_digest, "terminalAnswerCandidate.textDigest")?;
+    validate_bounded_identity(
+        &candidate.recorded_at,
+        "terminalAnswerCandidate.recordedAt",
+        1024,
+    )?;
+    let mut source_refs = HashSet::new();
+    for source_ref in &candidate.source_event_refs {
+        validate_bounded_identity(source_ref, "terminalAnswerCandidate.sourceEventRef", 512)?;
+        if !source_refs.insert(source_ref.as_str()) {
+            return Err(terminal_answer_candidate_invalid());
+        }
+    }
+    Ok(())
 }
 
 fn validate_plan_confirmation_authority_v2(
@@ -3224,25 +3425,38 @@ fn validate_compact_final_answer(
         ("providerTurnId", final_answer.provider_turn_id.as_deref()),
         ("startedAt", final_answer.started_at.as_deref()),
         ("staleAt", final_answer.stale_at.as_deref()),
+        ("committedAt", final_answer.committed_at.as_deref()),
         ("failedAt", final_answer.failed_at.as_deref()),
         ("lastErrorCode", final_answer.last_error_code.as_deref()),
+        ("commitKind", final_answer.commit_kind.as_deref()),
     ] {
         if let Some(value) = value {
             validate_bounded_identity(value, field, 1024)?;
         }
     }
-    let shape_invalid = match final_answer.status.as_str() {
-        "pending" => final_answer.provider_turn_id.is_some(),
-        "requesting" => {
-            final_answer.provider_turn_id.is_none() || final_answer.started_at.is_none()
-        }
-        "stale" => false,
-        "committed" => final_answer.provider_turn_id.is_none(),
-        "finalAnswerFailed" => {
-            final_answer.failed_at.is_none() || final_answer.last_error_code.is_none()
-        }
-        _ => true,
-    };
+    let commit_shape_invalid = final_answer.status != "committed"
+        && (final_answer.committed_at.is_some() || final_answer.commit_kind.is_some())
+        || final_answer
+            .commit_kind
+            .as_deref()
+            .is_some_and(|kind| !matches!(kind, "candidatePromotion" | "finalSynthesis"));
+    let shape_invalid = commit_shape_invalid
+        || match final_answer.status.as_str() {
+            "pending" => final_answer.provider_turn_id.is_some(),
+            "requesting" => {
+                final_answer.provider_turn_id.is_none() || final_answer.started_at.is_none()
+            }
+            "stale" => false,
+            "committed" => {
+                final_answer.provider_turn_id.is_none()
+                    || final_answer.committed_at.is_none()
+                    || final_answer.commit_kind.is_none()
+            }
+            "finalAnswerFailed" => {
+                final_answer.failed_at.is_none() || final_answer.last_error_code.is_none()
+            }
+            _ => true,
+        };
     if shape_invalid {
         return Err(compact_final_answer_invalid());
     }
@@ -3253,6 +3467,13 @@ fn compact_final_answer_invalid() -> HostV2StorageError {
     HostV2StorageError::invalid(
         "session_kernel_checkpoint_final_answer_invalid",
         "Session Kernel compact checkpoint finalAnswer control is invalid",
+    )
+}
+
+fn terminal_answer_candidate_invalid() -> HostV2StorageError {
+    HostV2StorageError::invalid(
+        "session_kernel_terminal_answer_candidate_invalid",
+        "Session Kernel terminal answer candidate does not bind exact durable Provider and Session facts",
     )
 }
 
@@ -7011,10 +7232,11 @@ fn validate_private_provider_completed(
             "toolCallReceipt",
             "reviewRevision",
             "snapshotHighWater",
+            "candidateSourceEventRefs",
         ],
         &["providerTurnId"],
         &[],
-        &["orderedItems"],
+        &["orderedItems", "candidateSourceEventRefs"],
         &["providerOutcome", "result", "toolCallReceipt"],
         &["controlEpoch", "reviewRevision"],
         &["snapshotHighWater"],
@@ -7049,6 +7271,34 @@ fn validate_private_provider_completed(
         return Err(private_projection_data_invalid(
             "Session private final Review binding does not match a terminal Provider answer",
         ));
+    }
+    if let Some(source_refs) = data.get("candidateSourceEventRefs") {
+        let source_refs = source_refs
+            .as_array()
+            .expect("validated candidate source refs array");
+        let mut unique_refs = HashSet::new();
+        if source_refs.is_empty()
+            || !has_review_revision
+            || data.get("outputKind").and_then(Value::as_str) != Some("answer")
+            || data.get("terminalScope").and_then(Value::as_str) != Some("turn")
+        {
+            return Err(private_projection_data_invalid(
+                "Session private candidate refs do not bind a reviewed terminal answer",
+            ));
+        }
+        for source_ref in source_refs {
+            let source_ref = source_ref.as_str().ok_or_else(|| {
+                private_projection_data_invalid(
+                    "Session private candidate source ref is not an identity",
+                )
+            })?;
+            validate_bounded_identity(source_ref, "candidateSourceEventRef", 512)?;
+            if !unique_refs.insert(source_ref) {
+                return Err(private_projection_data_invalid(
+                    "Session private candidate source refs are not unique",
+                ));
+            }
+        }
     }
     Ok(())
 }
