@@ -2294,12 +2294,27 @@ fn query_canonical_provider_tool_outputs(
                         "provider_continuation_result_identity_mismatch",
                     )
                 })?;
+            let is_bound_terminal_fact =
+                binding.outcome.terminal_fact_id.as_deref() == Some(fact_id.as_str());
+            let is_bound_rejection_fact = binding
+                .outcome
+                .rejection
+                .as_ref()
+                .is_some_and(|rejection| rejection.rejection_fact_id == fact_id);
+            let is_continuation_evidence = matches!(
+                fact.fact_kind.as_str(),
+                "toolIntentAdmitted" | "toolCompleted"
+            ) || is_bound_terminal_fact
+                || is_bound_rejection_fact;
+            if !is_continuation_evidence {
+                continue;
+            }
             if !provider_continuation_fact_matches_parent(&fact, parent_sidecar) {
                 return Err(ProviderNativeStreamTransportErrorV1::new(
                     "provider_continuation_result_identity_mismatch",
                 ));
             }
-            if binding.outcome.terminal_fact_id.as_deref() == Some(fact_id.as_str()) {
+            if is_bound_terminal_fact {
                 if binding.outcome.terminal_fact_kind.as_deref() != Some(fact.fact_kind.as_str()) {
                     return Err(ProviderNativeStreamTransportErrorV1::new(
                         "provider_continuation_result_identity_mismatch",
@@ -2307,12 +2322,7 @@ fn query_canonical_provider_tool_outputs(
                 }
                 verified_negative_fact_ids.insert(fact_id.clone());
             }
-            if binding
-                .outcome
-                .rejection
-                .as_ref()
-                .is_some_and(|rejection| rejection.rejection_fact_id == fact_id)
-            {
+            if is_bound_rejection_fact {
                 verified_negative_fact_ids.insert(fact_id.clone());
             }
             match fact.fact_kind.as_str() {
