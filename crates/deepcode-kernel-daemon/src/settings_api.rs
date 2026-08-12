@@ -1072,18 +1072,19 @@ struct AuthorizedLlmChatProfile {
     profile_revision: String,
 }
 
-const PROVIDER_CACHE_PREDECESSOR_SCHEMA_V1: &str = "deepcode.session.provider-cache-predecessor.v1";
+const PROVIDER_CACHE_PREDECESSOR_SCHEMA_V2: &str = "deepcode.session.provider-cache-predecessor.v2";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProviderCachePredecessorQueryV1 {
+pub(crate) struct ProviderCachePredecessorQueryV2 {
     profile_id: String,
+    current_provider_turn_id: String,
 }
 
 pub(crate) async fn provider_cache_predecessor(
     State(state): State<AppState>,
     Path(provider_turn_id): Path<String>,
-    Query(query): Query<ProviderCachePredecessorQueryV1>,
+    Query(query): Query<ProviderCachePredecessorQueryV2>,
     headers: axum::http::HeaderMap,
 ) -> Json<ApiResponse> {
     let required_header = |name: &'static str| {
@@ -1123,6 +1124,13 @@ pub(crate) async fn provider_cache_predecessor(
     {
         return ApiResponse::error(error.code, error.message);
     }
+    if let Err(error) = crate::host_v2_storage::validate_bounded_identity(
+        &query.current_provider_turn_id,
+        "currentProviderTurnId",
+        512,
+    ) {
+        return ApiResponse::error(error.code, error.message);
+    }
     let authorized =
         match authorize_llm_chat_transport(&state, &headers, Some(query.profile_id.as_str())) {
             Ok(profile) => profile,
@@ -1131,12 +1139,29 @@ pub(crate) async fn provider_cache_predecessor(
     let _session_io_guard = session_private_io_lock(&session_id).read_owned().await;
     let unavailable = |reason_code: &'static str| {
         ApiResponse::ok(json!({
-            "schemaVersion": PROVIDER_CACHE_PREDECESSOR_SCHEMA_V1,
+            "schemaVersion": PROVIDER_CACHE_PREDECESSOR_SCHEMA_V2,
             "status": "unavailable",
             "providerTurnId": provider_turn_id,
             "reasonCode": reason_code,
         }))
     };
+    let current_admission = match state
+        .host_services
+        .session_kernel_v2
+        .provider_turn_admission(
+            &session_id,
+            &run_id,
+            &capability,
+            &query.current_provider_turn_id,
+        ) {
+        Ok(admission) => admission,
+        Err(_) => return unavailable("daemonTraceInvalid"),
+    };
+    if current_admission.provider_profile_id != authorized.profile.id
+        || current_admission.provider_profile_revision != authorized.profile_revision
+    {
+        return unavailable("providerProfileChanged");
+    }
     let recovery = match state
         .provider_trace_v1
         .verified_cache_predecessor_summary(&session_id, &provider_turn_id)
@@ -1148,7 +1173,6 @@ pub(crate) async fn provider_cache_predecessor(
         Err(_) => return unavailable("daemonTraceInvalid"),
     };
     if recovery.metadata.session_id != session_id
-        || recovery.metadata.run_id != run_id
         || recovery.metadata.provider_turn_id != provider_turn_id
     {
         return unavailable("daemonTraceInvalid");
@@ -1174,21 +1198,52 @@ pub(crate) async fn provider_cache_predecessor(
     let Some(sidecar_value) = recovery.admission_sidecar.clone() else {
         return unavailable("legacySessionColdStart");
     };
-    let sidecar = match SessionProviderAdmissionSidecarV1::decode_private_value(sidecar_value) {
+    match sidecar_value.get("schemaVersion").and_then(Value::as_str) {
+        Some(SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2) => {}
+        Some("deepcode.session.provider-admission-sidecar.v1") => {
+            return unavailable("legacySessionColdStart")
+        }
+        _ => return unavailable("daemonTraceInvalid"),
+    }
+    let sidecar = match SessionProviderAdmissionSidecarV2::decode_private_value(sidecar_value) {
         Ok(sidecar) => sidecar,
         Err(_) => return unavailable("daemonTraceInvalid"),
     };
-    let admission = match state
-        .host_services
-        .session_kernel_v2
-        .provider_turn_admission(&session_id, &run_id, &capability, &provider_turn_id)
-    {
-        Ok(admission) => admission,
-        Err(_) => return unavailable("legacySessionColdStart"),
+    let same_run = recovery.metadata.run_id == run_id;
+    let cross_run_head = current_admission
+        .provider_conversation_head
+        .as_ref()
+        .filter(|head| {
+            head.provider_turn_id == provider_turn_id
+                && head.session_id == session_id
+                && head.run_id == recovery.metadata.run_id
+                && head.user_turn_id == recovery.metadata.user_turn_id
+                && head.control_epoch == recovery.metadata.control_epoch
+                && head.provider_profile_id == recovery.metadata.profile_id
+                && head.provider == recovery.metadata.provider_kind
+                && head.model == recovery.metadata.model
+        });
+    let durable_parent_valid = if same_run {
+        state
+            .host_services
+            .session_kernel_v2
+            .provider_turn_admission(&session_id, &run_id, &capability, &provider_turn_id)
+            .ok()
+            .is_some_and(|admission| {
+                sidecar
+                    .validate_against_admission(
+                        &session_id,
+                        &authorized.profile_revision,
+                        &admission,
+                    )
+                    .is_ok()
+            })
+    } else {
+        current_admission.purpose == ProviderTracePurposeV1::Primary
+            && cross_run_head.is_some()
+            && terminal_kind == "completed"
     };
-    if sidecar
-        .validate_against_admission(&session_id, &authorized.profile_revision, &admission)
-        .is_err()
+    if !durable_parent_valid
         || sidecar.provider_turn_id != recovery.metadata.provider_turn_id
         || sidecar.run_id != recovery.metadata.run_id
         || sidecar.user_turn_id != recovery.metadata.user_turn_id
@@ -1204,15 +1259,22 @@ pub(crate) async fn provider_cache_predecessor(
         None => return unavailable("daemonTraceInvalid"),
     };
     ApiResponse::ok(json!({
-        "schemaVersion": PROVIDER_CACHE_PREDECESSOR_SCHEMA_V1,
+        "schemaVersion": PROVIDER_CACHE_PREDECESSOR_SCHEMA_V2,
         "status": "available",
+        "sessionId": recovery.metadata.session_id,
+        "runId": recovery.metadata.run_id,
+        "userTurnId": recovery.metadata.user_turn_id,
         "providerTurnId": provider_turn_id,
+        "controlEpoch": recovery.metadata.control_epoch,
         "terminalKind": terminal_kind,
         "replayEligible": replay_eligible,
         "terminalReasonCode": recovery.reason_code,
         "externalRequestDigest": recovery.metadata.request_digest,
         "externalRequestBytes": recovery.exact_request_body.len(),
         "providerProfileRevisionDigest": sidecar.provider_profile_revision_digest,
+        "providerProfileId": recovery.metadata.profile_id,
+        "provider": recovery.metadata.provider_kind,
+        "model": recovery.metadata.model,
         "targetKind": sidecar.target_kind,
         "targetBindingDigest": target_binding_digest,
         "toolSchemaDigest": sidecar.tool_schema_digest,
@@ -1221,6 +1283,7 @@ pub(crate) async fn provider_cache_predecessor(
         "cacheLane": {
             "laneId": sidecar.cache_lane.lane_id,
             "laneRevision": sidecar.cache_lane.lane_revision,
+            "relationKind": sidecar.cache_lane.relation_kind,
             "stablePrefixDigest": sidecar.cache_lane.stable_prefix_digest,
         }
     }))
@@ -1568,7 +1631,7 @@ fn provider_trace_identity_from_request(
         .session_kernel_v2
         .provider_turn_admission(&session_id, &run_id, &capability, request_id)
         .map_err(|error| (error.code.to_string(), error.message))?;
-    let sidecar = SessionProviderAdmissionSidecarV1::decode(body)
+    let sidecar = SessionProviderAdmissionSidecarV2::decode(body)
         .map_err(|(code, message)| (code.to_string(), message))?;
     sidecar
         .validate_request_material(body)
@@ -1593,17 +1656,6 @@ fn provider_trace_identity_from_request(
         ));
     }
     let purpose = sidecar.purpose;
-    if matches!(purpose, ProviderTracePurposeV1::FinalAnswer)
-        && body
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty())
-    {
-        return Err((
-            "provider_final_answer_tools_forbidden".to_string(),
-            "A finalAnswer Provider request cannot expose tools".to_string(),
-        ));
-    }
     let identity = ProviderTraceIdentityV1 {
         session_id,
         run_id,

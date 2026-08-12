@@ -57,6 +57,8 @@ pub(crate) struct ProviderCacheLaneTelemetryV1 {
     pub(crate) lane_revision: u64,
     pub(crate) relation: ProviderCacheRelationV1,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) relation_kind: Option<SessionProviderCacheLaneRelationKindV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reset_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) supporting_reset_reasons: Vec<String>,

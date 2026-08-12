@@ -8,7 +8,7 @@ import type {
 } from './types.js';
 import type {
   SessionProviderCacheLaneResetReasonV1,
-} from './providerCacheLaneV1.js';
+} from './providerCacheLaneV2.js';
 import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
 } from './types.js';
@@ -93,18 +93,25 @@ export interface SessionKernelLlmStreamResultV2 {
   completion: SessionProviderCompletionReceiptV1;
 }
 
-export type SessionKernelProviderCachePredecessorV1 =
+export type SessionKernelProviderCachePredecessorV2 =
   | {
       schemaVersion:
-        'deepcode.session.provider-cache-predecessor.v1';
+        'deepcode.session.provider-cache-predecessor.v2';
       status: 'available';
+      sessionId: string;
+      runId: string;
+      userTurnId: string;
       providerTurnId: string;
+      controlEpoch: number;
       terminalKind: 'completed' | 'failed';
       replayEligible: boolean;
       terminalReasonCode?: string;
       externalRequestDigest: string;
       externalRequestBytes: number;
       providerProfileRevisionDigest: string;
+      providerProfileId: string;
+      provider: string;
+      model: string;
       targetKind:
         | 'planning'
         | 'contextRead'
@@ -121,12 +128,18 @@ export type SessionKernelProviderCachePredecessorV1 =
       cacheLane: {
         laneId: string;
         laneRevision: number;
+        relationKind:
+          | 'bootstrap'
+          | 'sameTurnToolContinuation'
+          | 'nextUserTurn'
+          | 'exactReplay'
+          | 'reset';
         stablePrefixDigest: string;
       };
     }
   | {
       schemaVersion:
-        'deepcode.session.provider-cache-predecessor.v1';
+        'deepcode.session.provider-cache-predecessor.v2';
       status: 'unavailable';
       providerTurnId: string;
       reasonCode: SessionProviderCacheLaneResetReasonV1;
@@ -136,8 +149,9 @@ export interface SessionKernelLlmTransportV2 {
   inspectCachePredecessor(
     providerTurnId: string,
     profileId: string,
+    currentProviderTurnId: string,
     signal: AbortSignal
-  ): Promise<SessionKernelProviderCachePredecessorV1>;
+  ): Promise<SessionKernelProviderCachePredecessorV2>;
   request(
     request: LlmChatRequest,
     signal: AbortSignal,
@@ -173,14 +187,19 @@ implements SessionKernelLlmTransportV2 {
   async inspectCachePredecessor(
     providerTurnId: string,
     profileId: string,
+    currentProviderTurnId: string,
     signal: AbortSignal
-  ): Promise<SessionKernelProviderCachePredecessorV1> {
+  ): Promise<SessionKernelProviderCachePredecessorV2> {
     let response: Response;
     try {
       const url = new URL(
         `${normalizeApiBase(this.apiBase)}/api/llm/cache/predecessors/${encodeURIComponent(providerTurnId)}`
       );
       url.searchParams.set('profileId', profileId);
+      url.searchParams.set(
+        'currentProviderTurnId',
+        currentProviderTurnId
+      );
       response = await this.fetchImpl(url, {
         method: 'GET',
         headers: {
@@ -222,7 +241,7 @@ implements SessionKernelLlmTransportV2 {
         'Provider cache predecessor response is not valid JSON.'
       );
     }
-    return decodeProviderCachePredecessorV1(
+    return decodeProviderCachePredecessorV2(
       payload,
       providerTurnId
     );
@@ -1409,10 +1428,10 @@ function nativeToolIndex(value: unknown): number {
   return Number(value);
 }
 
-function decodeProviderCachePredecessorV1(
+function decodeProviderCachePredecessorV2(
   value: unknown,
   expectedProviderTurnId: string
-): SessionKernelProviderCachePredecessorV1 {
+): SessionKernelProviderCachePredecessorV2 {
   const envelope = record(value, 'cachePredecessorEnvelope');
   exactKeys(envelope, ['ok', 'data', 'error', 'message']);
   if (envelope.ok !== true) {
@@ -1432,7 +1451,7 @@ function decodeProviderCachePredecessorV1(
   );
   if (
     schemaVersion
-      !== 'deepcode.session.provider-cache-predecessor.v1'
+      !== 'deepcode.session.provider-cache-predecessor.v2'
   ) {
     throw new SessionKernelProviderTransportError(
       'session_kernel_provider_cache_predecessor_invalid',
@@ -1484,13 +1503,20 @@ function decodeProviderCachePredecessorV1(
   exactKeys(data, [
     'schemaVersion',
     'status',
+    'sessionId',
+    'runId',
+    'userTurnId',
     'providerTurnId',
+    'controlEpoch',
     'terminalKind',
     'replayEligible',
     'terminalReasonCode',
     'externalRequestDigest',
     'externalRequestBytes',
     'providerProfileRevisionDigest',
+    'providerProfileId',
+    'provider',
+    'model',
     'targetKind',
     'targetBindingDigest',
     'toolSchemaDigest',
@@ -1571,12 +1597,45 @@ function decodeProviderCachePredecessorV1(
   exactKeys(cacheLane, [
     'laneId',
     'laneRevision',
+    'relationKind',
     'stablePrefixDigest',
   ]);
+  const relationKind = identity(
+    cacheLane.relationKind,
+    'cachePredecessor.cacheLane.relationKind',
+    64
+  );
+  if (![
+    'bootstrap',
+    'sameTurnToolContinuation',
+    'nextUserTurn',
+    'exactReplay',
+    'reset',
+  ].includes(relationKind)) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor relation kind is unsupported.'
+    );
+  }
   return {
     schemaVersion,
     status: 'available',
+    sessionId: identity(
+      data.sessionId,
+      'cachePredecessor.sessionId',
+      512
+    ),
+    runId: identity(data.runId, 'cachePredecessor.runId', 512),
+    userTurnId: identity(
+      data.userTurnId,
+      'cachePredecessor.userTurnId',
+      512
+    ),
     providerTurnId,
+    controlEpoch: positiveSafeInteger(
+      data.controlEpoch,
+      'cachePredecessor.controlEpoch'
+    ),
     terminalKind,
     replayEligible: data.replayEligible,
     ...(terminalReasonCode ? { terminalReasonCode } : {}),
@@ -1589,6 +1648,17 @@ function decodeProviderCachePredecessorV1(
       data.providerProfileRevisionDigest,
       'cachePredecessor.providerProfileRevisionDigest'
     ),
+    providerProfileId: identity(
+      data.providerProfileId,
+      'cachePredecessor.providerProfileId',
+      512
+    ),
+    provider: identity(
+      data.provider,
+      'cachePredecessor.provider',
+      512
+    ),
+    model: identity(data.model, 'cachePredecessor.model', 512),
     targetKind,
     targetBindingDigest: digest(
       data.targetBindingDigest,
@@ -1625,6 +1695,12 @@ function decodeProviderCachePredecessorV1(
         cacheLane.laneRevision,
         'cachePredecessor.cacheLane.laneRevision'
       ),
+      relationKind: relationKind as
+        | 'bootstrap'
+        | 'sameTurnToolContinuation'
+        | 'nextUserTurn'
+        | 'exactReplay'
+        | 'reset',
       stablePrefixDigest: digest(
         cacheLane.stablePrefixDigest,
         'cachePredecessor.cacheLane.stablePrefixDigest'

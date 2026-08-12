@@ -44,14 +44,14 @@ import {
   isExactSessionProviderOutcomeRecordV2,
 } from './providerToolCallQueue.js';
 import {
-  buildSessionProviderAdmissionSidecarV1,
-  planSessionProviderCacheLaneV1,
-  sessionProviderSemanticMessagesV1,
-} from './providerCacheLaneV1.js';
+  buildSessionProviderAdmissionSidecarV2,
+  planSessionProviderCacheLaneV2,
+  sessionProviderSemanticMessagesV2,
+} from './providerCacheLaneV2.js';
 import type {
-  SessionProviderCacheLanePlanV1,
+  SessionProviderCacheLanePlanV2,
   SessionProviderCacheLaneResetReasonV1,
-} from './providerCacheLaneV1.js';
+} from './providerCacheLaneV2.js';
 import type {
   SessionKernelLlmStreamResultV2,
   SessionKernelLlmStreamToolItemV2,
@@ -88,22 +88,24 @@ implements SessionKernelProviderBackendV2 {
   ): Promise<SessionKernelProviderBackendOutputV2> {
     assertProviderToolContextBindingV2(input);
     const parentCandidateId = input.exactReplayPredecessorId
-      ?? providerContinuationParentIdV2(input, this.profileId);
+      ?? providerContinuationParentIdV2(input, this.profileId)
+      ?? providerConversationHeadParentIdV2(input, this.profileId);
     const tools = providerWireToolDefinitionsV2(input);
     const predecessor = parentCandidateId
       ? await this.transport.inspectCachePredecessor(
           parentCandidateId,
           this.profileId,
+          input.providerTurnId,
           input.signal
         )
       : undefined;
-    let cacheLane = planSessionProviderCacheLaneV1({
+    let cacheLane = planSessionProviderCacheLaneV2({
       turn: input,
       fullContextMessages: input.contextAssembly.messages,
       tools,
       ...(predecessor ? { predecessor } : {}),
     });
-    let semanticMessages = sessionProviderSemanticMessagesV1(
+    let semanticMessages = sessionProviderSemanticMessagesV2(
       input,
       cacheLane
     );
@@ -132,14 +134,14 @@ implements SessionKernelProviderBackendV2 {
         || resetReason === undefined
         || input.signal.aborted
       ) throw error;
-      cacheLane = planSessionProviderCacheLaneV1({
+      cacheLane = planSessionProviderCacheLaneV2({
         turn: input,
         fullContextMessages: input.contextAssembly.messages,
         tools,
         ...(predecessor ? { predecessor } : {}),
         forcedResetReason: resetReason,
       });
-      semanticMessages = sessionProviderSemanticMessagesV1(
+      semanticMessages = sessionProviderSemanticMessagesV2(
         input,
         cacheLane
       );
@@ -170,9 +172,9 @@ function sessionProviderRequestV1(
   profileId: string,
   tools: ReturnType<typeof providerWireToolDefinitionsV2>,
   semanticMessages: LlmChatRequest['messages'],
-  cacheLane: SessionProviderCacheLanePlanV1
+  cacheLane: SessionProviderCacheLanePlanV2
 ): LlmChatRequest {
-  const sidecar = buildSessionProviderAdmissionSidecarV1({
+  const sidecar = buildSessionProviderAdmissionSidecarV2({
     turn: input,
     semanticMessages,
     fullContextMessages: input.contextAssembly.messages,
@@ -233,6 +235,23 @@ function providerContinuationParentIdV2(
     return undefined;
   }
   return previous.providerTurnId;
+}
+
+function providerConversationHeadParentIdV2(
+  input: SessionProviderTurnInputV2,
+  expectedProfileId: string
+): string | undefined {
+  const head = input.sessionMemory.providerConversationHead;
+  if (
+    input.purpose !== 'primary'
+    || input.exactReplayPredecessorId
+    || !head
+    || input.providerProfile.reasoningTransport !== 'openaiPlaintext'
+    || input.providerProfile.providerProfileId !== expectedProfileId
+    || head.sessionId !== input.sessionMemory.sessionId
+    || head.providerProfileId !== expectedProfileId
+  ) return undefined;
+  return head.providerTurnId;
 }
 
 function cacheLaneResetReasonForPreflightV1(

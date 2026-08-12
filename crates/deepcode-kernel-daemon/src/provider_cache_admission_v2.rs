@@ -6,16 +6,28 @@ use crate::prelude::*;
 use crate::*;
 use std::collections::HashSet;
 
-pub(crate) const SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V1: &str =
-    "deepcode.session.provider-admission-sidecar.v1";
+pub(crate) const SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2: &str =
+    "deepcode.session.provider-admission-sidecar.v2";
+pub(crate) const SESSION_PROVIDER_CONVERSATION_HEAD_SCHEMA_V1: &str =
+    "deepcode.session.provider-conversation-head.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum SessionProviderCacheLaneModeV1 {
+pub(crate) enum SessionProviderCacheLaneModeV2 {
     Bootstrap,
     Append,
     Reset,
     ExactReplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SessionProviderCacheLaneRelationKindV2 {
+    Bootstrap,
+    SameTurnToolContinuation,
+    NextUserTurn,
+    ExactReplay,
+    Reset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +78,90 @@ pub(crate) struct SessionProviderToolContextRefSidecarV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SessionProviderAuthoritySidecarV1 {
+pub(crate) struct SessionProviderConversationHeadV1 {
+    pub(crate) schema_version: String,
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) user_turn_id: String,
+    pub(crate) provider_turn_id: String,
+    pub(crate) control_epoch: u64,
+    pub(crate) source_event_id: String,
+    pub(crate) source_event_version: u64,
+    pub(crate) source_event_digest: String,
+    pub(crate) provider_profile_id: String,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) answer_digest: String,
+    pub(crate) head_digest: String,
+}
+
+impl SessionProviderConversationHeadV1 {
+    pub(crate) fn validate(&self, expected_session_id: &str) -> Result<(), HostV2StorageError> {
+        if self.schema_version != SESSION_PROVIDER_CONVERSATION_HEAD_SCHEMA_V1
+            || self.session_id != expected_session_id
+        {
+            return Err(HostV2StorageError::invalid(
+                "provider_conversation_head_identity_invalid",
+                "Provider conversation head has an invalid schema or Session identity",
+            ));
+        }
+        validate_safe_session_identity(&self.session_id)?;
+        for (value, field, limit) in [
+            (self.run_id.as_str(), "head.runId", 512),
+            (self.user_turn_id.as_str(), "head.userTurnId", 512),
+            (self.provider_turn_id.as_str(), "head.providerTurnId", 512),
+            (self.source_event_id.as_str(), "head.sourceEventId", 512),
+            (
+                self.provider_profile_id.as_str(),
+                "head.providerProfileId",
+                512,
+            ),
+            (self.provider.as_str(), "head.provider", 512),
+            (self.model.as_str(), "head.model", 512),
+        ] {
+            validate_bounded_identity(value, field, limit)?;
+        }
+        if self.control_epoch == 0 || self.source_event_version == 0 {
+            return Err(HostV2StorageError::invalid(
+                "provider_conversation_head_version_invalid",
+                "Provider conversation head counters must be positive",
+            ));
+        }
+        for (digest, field) in [
+            (&self.source_event_digest, "head.sourceEventDigest"),
+            (&self.answer_digest, "head.answerDigest"),
+            (&self.head_digest, "head.headDigest"),
+        ] {
+            validate_sha256_digest(digest, field)?;
+        }
+        let expected_digest = stable_json_sha256(&json!({
+            "schemaVersion": self.schema_version,
+            "sessionId": self.session_id,
+            "runId": self.run_id,
+            "userTurnId": self.user_turn_id,
+            "providerTurnId": self.provider_turn_id,
+            "controlEpoch": self.control_epoch,
+            "sourceEventId": self.source_event_id,
+            "sourceEventVersion": self.source_event_version,
+            "sourceEventDigest": self.source_event_digest,
+            "providerProfileId": self.provider_profile_id,
+            "provider": self.provider,
+            "model": self.model,
+            "answerDigest": self.answer_digest,
+        }))?;
+        if self.head_digest != expected_digest {
+            return Err(HostV2StorageError::invalid(
+                "provider_conversation_head_digest_mismatch",
+                "Provider conversation head failed exact digest verification",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderAuthoritySidecarV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) plan_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,7 +174,7 @@ pub(crate) struct SessionProviderAuthoritySidecarV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum SessionProviderContinuationOutcomeStatusV1 {
+pub(crate) enum SessionProviderContinuationOutcomeStatusV2 {
     Completed,
     Aborted,
     Unexecuted,
@@ -87,7 +182,7 @@ pub(crate) enum SessionProviderContinuationOutcomeStatusV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SessionProviderContinuationRejectionV1 {
+pub(crate) struct SessionProviderContinuationRejectionV2 {
     pub(crate) reason: String,
     pub(crate) guidance: String,
     pub(crate) rejection_fact_id: String,
@@ -95,9 +190,9 @@ pub(crate) struct SessionProviderContinuationRejectionV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SessionProviderContinuationOutcomeV1 {
+pub(crate) struct SessionProviderContinuationOutcomeV2 {
     pub(crate) operation_id: String,
-    pub(crate) status: SessionProviderContinuationOutcomeStatusV1,
+    pub(crate) status: SessionProviderContinuationOutcomeStatusV2,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) terminal_fact_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,7 +200,7 @@ pub(crate) struct SessionProviderContinuationOutcomeV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) settlement_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) rejection: Option<SessionProviderContinuationRejectionV1>,
+    pub(crate) rejection: Option<SessionProviderContinuationRejectionV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +210,7 @@ pub(crate) struct SessionProviderContinuationOutcomeV1 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub(crate) enum SessionProviderTargetBindingSidecarV1 {
+pub(crate) enum SessionProviderTargetBindingSidecarV2 {
     Planning,
     ContextRead {
         operation_id: String,
@@ -136,7 +231,7 @@ pub(crate) enum SessionProviderTargetBindingSidecarV1 {
     },
 }
 
-impl SessionProviderTargetBindingSidecarV1 {
+impl SessionProviderTargetBindingSidecarV2 {
     pub(crate) fn kind_name(&self) -> &'static str {
         match self {
             Self::Planning => "planning",
@@ -149,10 +244,11 @@ impl SessionProviderTargetBindingSidecarV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SessionProviderCacheLaneSidecarV1 {
+pub(crate) struct SessionProviderCacheLaneSidecarV2 {
     pub(crate) lane_id: String,
     pub(crate) lane_revision: u64,
-    pub(crate) mode: SessionProviderCacheLaneModeV1,
+    pub(crate) mode: SessionProviderCacheLaneModeV2,
+    pub(crate) relation_kind: SessionProviderCacheLaneRelationKindV2,
     pub(crate) stable_prefix_digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) predecessor_request_id: Option<String>,
@@ -166,7 +262,7 @@ pub(crate) struct SessionProviderCacheLaneSidecarV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SessionProviderAdmissionSidecarV1 {
+pub(crate) struct SessionProviderAdmissionSidecarV2 {
     pub(crate) schema_version: String,
     pub(crate) session_id: String,
     pub(crate) run_id: String,
@@ -175,7 +271,7 @@ pub(crate) struct SessionProviderAdmissionSidecarV1 {
     pub(crate) control_epoch: u64,
     pub(crate) purpose: ProviderTracePurposeV1,
     pub(crate) target_kind: String,
-    pub(crate) target_binding: SessionProviderTargetBindingSidecarV1,
+    pub(crate) target_binding: SessionProviderTargetBindingSidecarV2,
     pub(crate) provider_profile_revision_digest: String,
     pub(crate) current_input_digest: String,
     pub(crate) context_assembly_digest: String,
@@ -183,15 +279,17 @@ pub(crate) struct SessionProviderAdmissionSidecarV1 {
     pub(crate) tool_schema_digest: String,
     pub(crate) response_format_digest: String,
     pub(crate) tool_context_ref: SessionProviderToolContextRefSidecarV1,
-    pub(crate) authority: SessionProviderAuthoritySidecarV1,
+    pub(crate) authority: SessionProviderAuthoritySidecarV2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_conversation_head: Option<SessionProviderConversationHeadV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) continuation_operation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) continuation_outcomes: Vec<SessionProviderContinuationOutcomeV1>,
-    pub(crate) cache_lane: SessionProviderCacheLaneSidecarV1,
+    pub(crate) continuation_outcomes: Vec<SessionProviderContinuationOutcomeV2>,
+    pub(crate) cache_lane: SessionProviderCacheLaneSidecarV2,
 }
 
-impl SessionProviderAdmissionSidecarV1 {
+impl SessionProviderAdmissionSidecarV2 {
     pub(crate) fn decode(request: &Value) -> Result<Self, (&'static str, String)> {
         let value = request
             .get("providerOptions")
@@ -260,7 +358,7 @@ impl SessionProviderAdmissionSidecarV1 {
         }
         if matches!(
             self.cache_lane.mode,
-            SessionProviderCacheLaneModeV1::Bootstrap | SessionProviderCacheLaneModeV1::Reset
+            SessionProviderCacheLaneModeV2::Bootstrap | SessionProviderCacheLaneModeV2::Reset
         ) {
             let system_messages = messages
                 .iter()
@@ -301,6 +399,10 @@ impl SessionProviderAdmissionSidecarV1 {
             || self.provider_profile_revision_digest != expected_profile_revision
             || self.provider_profile_revision_digest != admission.provider_profile_revision
             || self.context_assembly_digest != admission.context_assembly_digest
+            || self
+                .provider_conversation_head
+                .as_ref()
+                .is_some_and(|head| admission.provider_conversation_head.as_ref() != Some(head))
             || self.tool_context_ref != admission.tool_context_ref
             || expected_target != admission.target
             || self.authority.plan_revision != admission.plan_revision
@@ -342,7 +444,7 @@ impl SessionProviderAdmissionSidecarV1 {
     }
 
     fn validate(&self) -> Result<(), HostV2StorageError> {
-        if self.schema_version != SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V1 {
+        if self.schema_version != SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2 {
             return Err(HostV2StorageError::invalid(
                 "provider_admission_sidecar_schema_invalid",
                 "Trusted Session admission sidecar schema is unsupported",
@@ -397,7 +499,7 @@ impl SessionProviderAdmissionSidecarV1 {
         if final_answer
             != matches!(
                 self.target_binding,
-                SessionProviderTargetBindingSidecarV1::FinalAnswer { .. }
+                SessionProviderTargetBindingSidecarV2::FinalAnswer { .. }
             )
         {
             return Err(HostV2StorageError::invalid(
@@ -407,7 +509,7 @@ impl SessionProviderAdmissionSidecarV1 {
         }
         match (&self.target_binding, final_answer) {
             (
-                SessionProviderTargetBindingSidecarV1::FinalAnswer {
+                SessionProviderTargetBindingSidecarV2::FinalAnswer {
                     input_id,
                     control_epoch,
                     work_authority,
@@ -420,7 +522,7 @@ impl SessionProviderAdmissionSidecarV1 {
                 && self.authority.work_authority.as_ref() == Some(work_authority)
                 && self.authority.review_revision == Some(*review_revision)
                 && self.authority.snapshot_high_water == Some(*snapshot_high_water) => {}
-            (SessionProviderTargetBindingSidecarV1::FinalAnswer { .. }, true) => {
+            (SessionProviderTargetBindingSidecarV2::FinalAnswer { .. }, true) => {
                 return Err(HostV2StorageError::invalid(
                     "provider_admission_authority_invalid",
                     "Provider finalAnswer target conflicts with its private authority binding",
@@ -438,21 +540,69 @@ impl SessionProviderAdmissionSidecarV1 {
             }
         }
         match self.cache_lane.mode {
-            SessionProviderCacheLaneModeV1::Bootstrap => {
+            SessionProviderCacheLaneModeV2::Bootstrap => {
                 require_cache_relation_fields(&self.cache_lane, false, false, false)?;
+                if self.cache_lane.relation_kind
+                    != SessionProviderCacheLaneRelationKindV2::Bootstrap
+                {
+                    return Err(invalid_cache_relation_kind());
+                }
             }
-            SessionProviderCacheLaneModeV1::Append => {
+            SessionProviderCacheLaneModeV2::Append => {
                 require_cache_relation_fields(&self.cache_lane, true, true, false)?;
+                if !matches!(
+                    self.cache_lane.relation_kind,
+                    SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+                        | SessionProviderCacheLaneRelationKindV2::NextUserTurn
+                ) {
+                    return Err(invalid_cache_relation_kind());
+                }
             }
-            SessionProviderCacheLaneModeV1::Reset => {
+            SessionProviderCacheLaneModeV2::Reset => {
                 require_cache_relation_fields(&self.cache_lane, false, false, true)?;
+                if self.cache_lane.relation_kind != SessionProviderCacheLaneRelationKindV2::Reset {
+                    return Err(invalid_cache_relation_kind());
+                }
             }
-            SessionProviderCacheLaneModeV1::ExactReplay => {
+            SessionProviderCacheLaneModeV2::ExactReplay => {
                 require_cache_relation_fields(&self.cache_lane, true, true, false)?;
+                if self.cache_lane.relation_kind
+                    != SessionProviderCacheLaneRelationKindV2::ExactReplay
+                {
+                    return Err(invalid_cache_relation_kind());
+                }
             }
         }
-        let continuation_append = self.purpose == ProviderTracePurposeV1::Continuation
-            && self.cache_lane.mode == SessionProviderCacheLaneModeV1::Append;
+        let continuation_append = self.cache_lane.relation_kind
+            == SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation;
+        let next_user_append =
+            self.cache_lane.relation_kind == SessionProviderCacheLaneRelationKindV2::NextUserTurn;
+        if next_user_append
+            != (self.purpose == ProviderTracePurposeV1::Primary
+                && self.provider_conversation_head.is_some())
+            || (!next_user_append && self.provider_conversation_head.is_some())
+        {
+            return Err(HostV2StorageError::invalid(
+                "provider_conversation_head_relation_invalid",
+                "Provider conversation head conflicts with the cache lane relation",
+            ));
+        }
+        if let Some(head) = &self.provider_conversation_head {
+            head.validate(&self.session_id)?;
+            if head.provider_turn_id
+                != self
+                    .cache_lane
+                    .predecessor_request_id
+                    .clone()
+                    .unwrap_or_default()
+                || head.provider_profile_id.is_empty()
+            {
+                return Err(HostV2StorageError::invalid(
+                    "provider_conversation_head_relation_invalid",
+                    "Provider conversation head does not bind the admitted predecessor",
+                ));
+            }
+        }
         if continuation_append != !self.continuation_operation_ids.is_empty()
             || continuation_append != !self.continuation_outcomes.is_empty()
             || self.continuation_operation_ids.len() != self.continuation_outcomes.len()
@@ -522,19 +672,19 @@ impl SessionProviderAdmissionSidecarV1 {
                 }
             }
             let invalid_shape = match outcome.status {
-                SessionProviderContinuationOutcomeStatusV1::Completed => {
+                SessionProviderContinuationOutcomeStatusV2::Completed => {
                     outcome.settlement_reason.is_some()
                         || outcome.rejection.is_some()
                         || !has_terminal_id
                 }
-                SessionProviderContinuationOutcomeStatusV1::Aborted => {
+                SessionProviderContinuationOutcomeStatusV2::Aborted => {
                     outcome.settlement_reason.is_none()
                         || outcome.rejection.as_ref().is_some_and(|_| {
                             outcome.settlement_reason.as_deref() != Some("kernelRejected")
                                 || has_terminal_id
                         })
                 }
-                SessionProviderContinuationOutcomeStatusV1::Unexecuted => {
+                SessionProviderContinuationOutcomeStatusV2::Unexecuted => {
                     outcome.settlement_reason.is_none()
                         || has_terminal_id
                         || outcome.rejection.is_some()
@@ -563,7 +713,7 @@ impl SessionProviderAdmissionSidecarV1 {
         unique_supporting.sort_by_key(|reason| reason.wire_name());
         unique_supporting.dedup();
         if unique_supporting.len() != self.cache_lane.supporting_reset_reasons.len()
-            || (self.cache_lane.mode != SessionProviderCacheLaneModeV1::Reset
+            || (self.cache_lane.mode != SessionProviderCacheLaneModeV2::Reset
                 && !self.cache_lane.supporting_reset_reasons.is_empty())
         {
             return Err(HostV2StorageError::invalid(
@@ -575,12 +725,19 @@ impl SessionProviderAdmissionSidecarV1 {
     }
 }
 
+fn invalid_cache_relation_kind() -> HostV2StorageError {
+    HostV2StorageError::invalid(
+        "provider_cache_lane_relation_invalid",
+        "Provider cache lane mode conflicts with its exact relation kind",
+    )
+}
+
 fn validate_target_binding(
-    target: &SessionProviderTargetBindingSidecarV1,
+    target: &SessionProviderTargetBindingSidecarV2,
 ) -> Result<(), HostV2StorageError> {
     match target {
-        SessionProviderTargetBindingSidecarV1::Planning => Ok(()),
-        SessionProviderTargetBindingSidecarV1::ContextRead {
+        SessionProviderTargetBindingSidecarV2::Planning => Ok(()),
+        SessionProviderTargetBindingSidecarV2::ContextRead {
             operation_id,
             purpose,
             idempotency_key,
@@ -590,10 +747,10 @@ fn validate_target_binding(
             validate_bounded_identity(purpose, "contextReadPurpose", 2048)?;
             validate_bounded_identity(idempotency_key, "idempotencyKey", 512)
         }
-        SessionProviderTargetBindingSidecarV1::PlanAction { plan_action_id } => {
+        SessionProviderTargetBindingSidecarV2::PlanAction { plan_action_id } => {
             validate_bounded_identity(plan_action_id, "planActionId", 512)
         }
-        SessionProviderTargetBindingSidecarV1::FinalAnswer {
+        SessionProviderTargetBindingSidecarV2::FinalAnswer {
             input_id,
             control_epoch,
             review_revision,
@@ -616,7 +773,7 @@ fn validate_target_binding(
 }
 
 fn require_cache_relation_fields(
-    lane: &SessionProviderCacheLaneSidecarV1,
+    lane: &SessionProviderCacheLaneSidecarV2,
     require_predecessor: bool,
     require_external_digest: bool,
     require_reset: bool,

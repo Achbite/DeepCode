@@ -614,6 +614,13 @@ function memoryWithSelectedEntries(
     truncated:
       memory.truncated || selected.length < memory.entries.length,
     entries: selected.map(cloneJson),
+    ...(memory.providerConversationHead
+      ? {
+          providerConversationHead: cloneJson(
+            memory.providerConversationHead
+          ),
+        }
+      : {}),
   };
   return {
     ...withoutDigest,

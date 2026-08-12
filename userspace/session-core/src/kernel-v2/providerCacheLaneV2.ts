@@ -11,21 +11,31 @@ import type {
   SessionWorkAuthorityV3,
 } from './types.js';
 import type {
-  SessionKernelProviderCachePredecessorV1,
+  SessionProviderConversationHeadV1,
+} from './sessionMemory.js';
+import type {
+  SessionKernelProviderCachePredecessorV2,
 } from './providerStreamV1.js';
 
-export const SESSION_PROVIDER_ADMISSION_SIDECAR_V1_SCHEMA =
-  'deepcode.session.provider-admission-sidecar.v1' as const;
-export const SESSION_PROVIDER_CACHE_LANE_IDENTITY_V1_SCHEMA =
-  'deepcode.session.provider-cache-lane-identity.v1' as const;
+export const SESSION_PROVIDER_ADMISSION_SIDECAR_V2_SCHEMA =
+  'deepcode.session.provider-admission-sidecar.v2' as const;
+export const SESSION_PROVIDER_CACHE_LANE_IDENTITY_V2_SCHEMA =
+  'deepcode.session.provider-cache-lane-identity.v2' as const;
 export const SESSION_PROVIDER_SEMANTIC_GUIDANCE_V1_SCHEMA =
   'deepcode.session.provider-semantic-guidance.v1' as const;
 
-export type SessionProviderCacheLaneModeV1 =
+export type SessionProviderCacheLaneModeV2 =
   | 'bootstrap'
   | 'append'
   | 'reset'
   | 'exactReplay';
+
+export type SessionProviderCacheLaneRelationKindV2 =
+  | 'bootstrap'
+  | 'sameTurnToolContinuation'
+  | 'nextUserTurn'
+  | 'exactReplay'
+  | 'reset';
 
 export type SessionProviderCacheLaneResetReasonV1 =
   | 'coldStart'
@@ -42,7 +52,7 @@ export type SessionProviderCacheLaneResetReasonV1 =
   | 'legacySessionColdStart'
   | 'manualReset';
 
-export type SessionProviderTargetBindingV1 =
+export type SessionProviderTargetBindingV2 =
   | { kind: 'planning' }
   | {
       kind: 'contextRead';
@@ -63,8 +73,8 @@ export type SessionProviderTargetBindingV1 =
       snapshotHighWater: number;
     });
 
-export interface SessionProviderAdmissionSidecarV1 {
-  schemaVersion: typeof SESSION_PROVIDER_ADMISSION_SIDECAR_V1_SCHEMA;
+export interface SessionProviderAdmissionSidecarV2 {
+  schemaVersion: typeof SESSION_PROVIDER_ADMISSION_SIDECAR_V2_SCHEMA;
   sessionId: string;
   runId: string;
   providerTurnId: string;
@@ -72,7 +82,7 @@ export interface SessionProviderAdmissionSidecarV1 {
   controlEpoch: number;
   purpose: 'primary' | 'continuation' | 'finalAnswer';
   targetKind: SessionProviderTurnInputV2['target']['kind'];
-  targetBinding: SessionProviderTargetBindingV1;
+  targetBinding: SessionProviderTargetBindingV2;
   providerProfileRevisionDigest: string;
   currentInputDigest: string;
   contextAssemblyDigest: string;
@@ -90,6 +100,7 @@ export interface SessionProviderAdmissionSidecarV1 {
     reviewRevision?: number;
     snapshotHighWater?: number;
   };
+  providerConversationHead?: SessionProviderConversationHeadV1;
   /**
    * Session-owned canonical Kernel operation identities for the immediately
    * preceding Provider tool turn. They are private admission metadata: the
@@ -104,11 +115,12 @@ export interface SessionProviderAdmissionSidecarV1 {
    * Provider assistant/tool message pair; raw arguments and tool output never
    * enter this private sidecar.
    */
-  continuationOutcomes?: SessionProviderContinuationOutcomeV1[];
+  continuationOutcomes?: SessionProviderContinuationOutcomeV2[];
   cacheLane: {
     laneId: string;
     laneRevision: number;
-    mode: SessionProviderCacheLaneModeV1;
+    mode: SessionProviderCacheLaneModeV2;
+    relationKind: SessionProviderCacheLaneRelationKindV2;
     stablePrefixDigest: string;
     predecessorRequestId?: string;
     predecessorExternalDigest?: string;
@@ -117,7 +129,7 @@ export interface SessionProviderAdmissionSidecarV1 {
   };
 }
 
-export interface SessionProviderContinuationOutcomeV1 {
+export interface SessionProviderContinuationOutcomeV2 {
   operationId: string;
   status: 'completed' | 'aborted' | 'unexecuted';
   terminalFactId?: string;
@@ -130,23 +142,24 @@ export interface SessionProviderContinuationOutcomeV1 {
   };
 }
 
-export interface BuildSessionProviderAdmissionSidecarV1Input {
+export interface BuildSessionProviderAdmissionSidecarV2Input {
   turn: SessionProviderTurnInputV2;
   semanticMessages: readonly LlmChatMessage[];
   fullContextMessages: readonly LlmChatMessage[];
   tools: readonly ProviderWireToolDefinition[];
-  cacheLane: SessionProviderCacheLanePlanV1;
+  cacheLane: SessionProviderCacheLanePlanV2;
   responseFormat?: unknown;
 }
 
-export interface SessionProviderCacheMaterialV1 {
+export interface SessionProviderCacheMaterialV2 {
   stablePrefixDigest: string;
   toolSchemaDigest: string;
   responseFormatDigest: string;
 }
 
-export interface SessionProviderCacheLanePlanV1 {
-  mode: SessionProviderCacheLaneModeV1;
+export interface SessionProviderCacheLanePlanV2 {
+  mode: SessionProviderCacheLaneModeV2;
+  relationKind: SessionProviderCacheLaneRelationKindV2;
   laneId: string;
   laneRevision: number;
   stablePrefixDigest: string;
@@ -156,32 +169,32 @@ export interface SessionProviderCacheLanePlanV1 {
   supportingResetReasons?: SessionProviderCacheLaneResetReasonV1[];
 }
 
-export interface PlanSessionProviderCacheLaneV1Input {
+export interface PlanSessionProviderCacheLaneV2Input {
   turn: SessionProviderTurnInputV2;
   fullContextMessages: readonly LlmChatMessage[];
   tools: readonly ProviderWireToolDefinition[];
-  predecessor?: SessionKernelProviderCachePredecessorV1;
+  predecessor?: SessionKernelProviderCachePredecessorV2;
   forcedResetReason?: SessionProviderCacheLaneResetReasonV1;
   responseFormat?: unknown;
 }
 
-export function planSessionProviderCacheLaneV1(
-  input: PlanSessionProviderCacheLaneV1Input
-): SessionProviderCacheLanePlanV1 {
-  const material = sessionProviderCacheMaterialV1(
+export function planSessionProviderCacheLaneV2(
+  input: PlanSessionProviderCacheLaneV2Input
+): SessionProviderCacheLanePlanV2 {
+  const material = sessionProviderCacheMaterialV2(
     input.fullContextMessages,
     input.tools,
     input.responseFormat
   );
   if (input.forcedResetReason) {
     const supportingResetReasons = input.predecessor?.status === 'available'
-      ? incompatiblePredecessorReasonsV1(
+      ? incompatiblePredecessorReasonsV2(
           input.turn,
           material,
           input.predecessor
         ).filter((reason) => reason !== input.forcedResetReason)
       : [];
-    return newCacheLaneV1(
+    return newCacheLaneV2(
       input.turn,
       material,
       'reset',
@@ -200,7 +213,7 @@ export function planSessionProviderCacheLaneV1(
         === input.turn.exactReplayPredecessorId
       && predecessor.replayEligible
       && predecessor.terminalKind === 'failed'
-      && incompatiblePredecessorReasonsV1(
+      && incompatiblePredecessorReasonsV2(
         input.turn,
         material,
         predecessor
@@ -208,6 +221,7 @@ export function planSessionProviderCacheLaneV1(
     ) {
       return {
         mode: 'exactReplay',
+        relationKind: 'exactReplay',
         laneId: predecessor.cacheLane.laneId,
         laneRevision: predecessor.cacheLane.laneRevision,
         stablePrefixDigest: material.stablePrefixDigest,
@@ -215,7 +229,7 @@ export function planSessionProviderCacheLaneV1(
         predecessorExternalDigest: predecessor.externalRequestDigest,
       };
     }
-    return newCacheLaneV1(
+    return newCacheLaneV2(
       input.turn,
       material,
       'reset',
@@ -227,33 +241,47 @@ export function planSessionProviderCacheLaneV1(
         : 1
     );
   }
-  if (input.turn.purpose === 'primary') {
-    return newCacheLaneV1(input.turn, material, 'bootstrap');
-  }
+  const conversationHead =
+    input.turn.sessionMemory.providerConversationHead;
   const predecessor = input.predecessor;
+  if (input.turn.purpose === 'primary' && !conversationHead) {
+    return newCacheLaneV2(input.turn, material, 'bootstrap');
+  }
   if (!predecessor) {
-    return newCacheLaneV1(
+    return newCacheLaneV2(
       input.turn,
       material,
       'reset',
-      'semanticLaneChanged'
+      input.turn.purpose === 'primary'
+        ? 'daemonTraceUnavailable'
+        : 'semanticLaneChanged'
     );
   }
   if (predecessor.status === 'unavailable') {
-    return newCacheLaneV1(
+    return newCacheLaneV2(
       input.turn,
       material,
       'reset',
       predecessor.reasonCode
     );
   }
-  const resetReasons = incompatiblePredecessorReasonsV1(
+  const resetReasons = incompatiblePredecessorReasonsV2(
     input.turn,
     material,
     predecessor
   );
+  if (
+    input.turn.purpose === 'primary'
+    && conversationHead
+    && !providerConversationHeadMatchesPredecessorV2(
+      conversationHead,
+      predecessor
+    )
+  ) {
+    resetReasons.unshift('daemonTraceInvalid');
+  }
   if (resetReasons.length > 0) {
-    return newCacheLaneV1(
+    return newCacheLaneV2(
       input.turn,
       material,
       'reset',
@@ -264,6 +292,9 @@ export function planSessionProviderCacheLaneV1(
   }
   return {
     mode: 'append',
+    relationKind: input.turn.purpose === 'primary'
+      ? 'nextUserTurn'
+      : 'sameTurnToolContinuation',
     laneId: predecessor.cacheLane.laneId,
     laneRevision: predecessor.cacheLane.laneRevision,
     stablePrefixDigest: material.stablePrefixDigest,
@@ -272,9 +303,9 @@ export function planSessionProviderCacheLaneV1(
   };
 }
 
-export function buildSessionProviderAdmissionSidecarV1(
-  input: BuildSessionProviderAdmissionSidecarV1Input
-): SessionProviderAdmissionSidecarV1 {
+export function buildSessionProviderAdmissionSidecarV2(
+  input: BuildSessionProviderAdmissionSidecarV2Input
+): SessionProviderAdmissionSidecarV2 {
   const turn = input.turn;
   const currentInputSections = turn.contextAssembly.receipt
     .trimming.sections.filter(
@@ -285,7 +316,7 @@ export function buildSessionProviderAdmissionSidecarV1(
       'Session Provider admission requires one currentInput receipt.'
     );
   }
-  const material = sessionProviderCacheMaterialV1(
+  const material = sessionProviderCacheMaterialV2(
     input.fullContextMessages,
     input.tools,
     input.responseFormat
@@ -299,12 +330,12 @@ export function buildSessionProviderAdmissionSidecarV1(
     );
   }
   const continuation =
-    sessionProviderContinuationOutcomesV1(
+    sessionProviderContinuationOutcomesV2(
       turn,
       input.cacheLane
     );
   return {
-    schemaVersion: SESSION_PROVIDER_ADMISSION_SIDECAR_V1_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_ADMISSION_SIDECAR_V2_SCHEMA,
     sessionId: turn.sessionMemory.sessionId,
     runId: turn.runId,
     providerTurnId: turn.providerTurnId,
@@ -337,6 +368,14 @@ export function buildSessionProviderAdmissionSidecarV1(
           }
         : {}),
     },
+    ...(input.cacheLane.relationKind === 'nextUserTurn'
+      && turn.sessionMemory.providerConversationHead
+      ? {
+          providerConversationHead: cloneJson(
+            turn.sessionMemory.providerConversationHead
+          ),
+        }
+      : {}),
     ...(continuation
       ? {
           continuationOperationIds: continuation.map(
@@ -349,11 +388,14 @@ export function buildSessionProviderAdmissionSidecarV1(
   };
 }
 
-function sessionProviderContinuationOutcomesV1(
+function sessionProviderContinuationOutcomesV2(
   turn: SessionProviderTurnInputV2,
-  cacheLane: SessionProviderCacheLanePlanV1
-): SessionProviderContinuationOutcomeV1[] | undefined {
-  if (cacheLane.mode !== 'append') return undefined;
+  cacheLane: SessionProviderCacheLanePlanV2
+): SessionProviderContinuationOutcomeV2[] | undefined {
+  if (
+    cacheLane.mode !== 'append'
+    || cacheLane.relationKind !== 'sameTurnToolContinuation'
+  ) return undefined;
   const predecessorId = cacheLane.predecessorRequestId;
   const predecessor = turn.providerOutcomes.at(-1);
   if (
@@ -408,12 +450,26 @@ function sessionProviderContinuationOutcomesV1(
   }));
 }
 
-export function sessionProviderSemanticMessagesV1(
+export function sessionProviderSemanticMessagesV2(
   turn: SessionProviderTurnInputV2,
-  cacheLane: SessionProviderCacheLanePlanV1
+  cacheLane: SessionProviderCacheLanePlanV2
 ): LlmChatMessage[] {
   if (cacheLane.mode !== 'append') {
     return cloneJson(turn.contextAssembly.messages);
+  }
+  if (cacheLane.relationKind === 'nextUserTurn') {
+    const finalMessage = turn.contextAssembly.messages.at(-1);
+    if (!finalMessage || finalMessage.role !== 'user') {
+      throw new Error(
+        'Next-user-turn append requires the authoritative dynamic user frame at the request tail.'
+      );
+    }
+    return [cloneJson(finalMessage)];
+  }
+  if (cacheLane.relationKind !== 'sameTurnToolContinuation') {
+    throw new Error(
+      'Provider append relation is unsupported for semantic message assembly.'
+    );
   }
   if (turn.guidance.length === 0) return [];
   return [{
@@ -429,11 +485,11 @@ function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-export function sessionProviderCacheMaterialV1(
+export function sessionProviderCacheMaterialV2(
   fullContextMessages: readonly LlmChatMessage[],
   tools: readonly ProviderWireToolDefinition[],
   responseFormat?: unknown
-): SessionProviderCacheMaterialV1 {
+): SessionProviderCacheMaterialV2 {
   const stableSystemMessages = fullContextMessages.filter(
     (message) => message.role === 'system'
   );
@@ -454,24 +510,23 @@ export function sessionProviderCacheMaterialV1(
   };
 }
 
-function newCacheLaneV1(
+function newCacheLaneV2(
   turn: SessionProviderTurnInputV2,
-  material: SessionProviderCacheMaterialV1,
+  material: SessionProviderCacheMaterialV2,
   mode: 'bootstrap' | 'reset',
   resetReason?: SessionProviderCacheLaneResetReasonV1,
   laneRevision = 1,
   supportingResetReasons: SessionProviderCacheLaneResetReasonV1[] = []
-): SessionProviderCacheLanePlanV1 {
+): SessionProviderCacheLanePlanV2 {
   const laneIdentity = {
-    schemaVersion: SESSION_PROVIDER_CACHE_LANE_IDENTITY_V1_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_CACHE_LANE_IDENTITY_V2_SCHEMA,
     sessionId: turn.sessionMemory.sessionId,
     runId: turn.runId,
     userTurnId: turn.currentInput.inputId,
     bootstrapProviderTurnId: turn.providerTurnId,
     providerProfileRevisionDigest:
       turn.providerProfile.providerProfileRevisionDigest,
-    targetKind: turn.target.kind,
-    toolContextRef: turn.toolContext.contextRef,
+    catalogDigest: turn.toolContext.contextRef.catalogDigest,
     stablePrefixDigest: material.stablePrefixDigest,
     toolSchemaDigest: material.toolSchemaDigest,
     responseFormatDigest: material.responseFormatDigest,
@@ -483,6 +538,7 @@ function newCacheLaneV1(
   };
   return {
     mode,
+    relationKind: mode === 'bootstrap' ? 'bootstrap' : 'reset',
     laneId: sha256Hash(canonicalJson(laneIdentity)),
     laneRevision,
     stablePrefixDigest: material.stablePrefixDigest,
@@ -493,11 +549,11 @@ function newCacheLaneV1(
   };
 }
 
-function incompatiblePredecessorReasonsV1(
+function incompatiblePredecessorReasonsV2(
   turn: SessionProviderTurnInputV2,
-  material: SessionProviderCacheMaterialV1,
+  material: SessionProviderCacheMaterialV2,
   predecessor: Extract<
-    SessionKernelProviderCachePredecessorV1,
+    SessionKernelProviderCachePredecessorV2,
     { status: 'available' }
   >
 ): SessionProviderCacheLaneResetReasonV1[] {
@@ -506,14 +562,6 @@ function incompatiblePredecessorReasonsV1(
     predecessor.providerProfileRevisionDigest
       !== turn.providerProfile.providerProfileRevisionDigest
   ) reasons.push('providerProfileChanged');
-  if (predecessor.targetKind !== turn.target.kind) {
-    reasons.push('semanticLaneChanged');
-  }
-  if (
-    predecessor.targetBindingDigest
-      !== sha256Hash(canonicalJson(turn.target))
-    && !reasons.includes('semanticLaneChanged')
-  ) reasons.push('semanticLaneChanged');
   if (predecessor.toolSchemaDigest !== material.toolSchemaDigest) {
     reasons.push('toolSchemaChanged');
   }
@@ -522,8 +570,8 @@ function incompatiblePredecessorReasonsV1(
       !== material.responseFormatDigest
   ) reasons.push('responseFormatChanged');
   if (
-    canonicalJson(predecessor.toolContextRef)
-      !== canonicalJson(turn.toolContext.contextRef)
+    predecessor.toolContextRef.catalogDigest
+      !== turn.toolContext.contextRef.catalogDigest
     && !reasons.includes('toolSchemaChanged')
   ) reasons.push('toolSchemaChanged');
   if (
@@ -531,4 +579,21 @@ function incompatiblePredecessorReasonsV1(
       !== material.stablePrefixDigest
   ) reasons.push('systemContractChanged');
   return reasons;
+}
+
+function providerConversationHeadMatchesPredecessorV2(
+  head: SessionProviderConversationHeadV1,
+  predecessor: Extract<
+    SessionKernelProviderCachePredecessorV2,
+    { status: 'available' }
+  >
+): boolean {
+  return predecessor.sessionId === head.sessionId
+    && predecessor.runId === head.runId
+    && predecessor.userTurnId === head.userTurnId
+    && predecessor.providerTurnId === head.providerTurnId
+    && predecessor.controlEpoch === head.controlEpoch
+    && predecessor.providerProfileId === head.providerProfileId
+    && predecessor.provider === head.provider
+    && predecessor.model === head.model;
 }

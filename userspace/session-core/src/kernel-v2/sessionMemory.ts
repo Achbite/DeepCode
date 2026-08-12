@@ -15,6 +15,8 @@ export const SESSION_PRIOR_EVENTS_SOURCE_V2_SCHEMA =
   'deepcode.host.session-prior-events.v3' as const;
 export const SESSION_CONTEXT_MEMORY_V2_SCHEMA =
   'deepcode.session.context-memory.v2' as const;
+export const SESSION_PROVIDER_CONVERSATION_HEAD_V1_SCHEMA =
+  'deepcode.session.provider-conversation-head.v1' as const;
 
 const PUBLIC_PROJECTION_V2_SCHEMA =
   'deepcode.session.kernel-public-projection.v2';
@@ -44,6 +46,23 @@ export interface SessionContextMemoryEntryV2 {
   attachments: AgentInputAttachmentV3[];
 }
 
+export interface SessionProviderConversationHeadV1 {
+  schemaVersion: typeof SESSION_PROVIDER_CONVERSATION_HEAD_V1_SCHEMA;
+  sessionId: string;
+  runId: string;
+  userTurnId: string;
+  providerTurnId: string;
+  controlEpoch: number;
+  sourceEventId: string;
+  sourceEventVersion: number;
+  sourceEventDigest: string;
+  providerProfileId: string;
+  provider: string;
+  model: string;
+  answerDigest: string;
+  headDigest: string;
+}
+
 export interface SessionContextMemoryV2 {
   schemaVersion: typeof SESSION_CONTEXT_MEMORY_V2_SCHEMA;
   sessionId: string;
@@ -52,6 +71,7 @@ export interface SessionContextMemoryV2 {
   omittedEntryCount: number;
   truncated: boolean;
   entries: SessionContextMemoryEntryV2[];
+  providerConversationHead?: SessionProviderConversationHeadV1;
   contextDigest: string;
 }
 
@@ -225,6 +245,10 @@ export function buildSessionContextMemoryV2(
     selectedBytes += candidateBytes;
   }
   const omittedEntryCount = candidates.length - selected.length;
+  const providerConversationHead = buildProviderConversationHeadV1(
+    source,
+    input.excludeRunId
+  );
   const withoutDigest = {
     schemaVersion: SESSION_CONTEXT_MEMORY_V2_SCHEMA,
     sessionId: source.sessionId,
@@ -234,6 +258,9 @@ export function buildSessionContextMemoryV2(
     truncated: omittedEntryCount > 0
       || source.omittedEventCount > 0,
     entries: selected,
+    ...(providerConversationHead
+      ? { providerConversationHead }
+      : {}),
   };
   return {
     ...withoutDigest,
@@ -261,6 +288,13 @@ export function validateSessionContextMemoryV2(
     throw invalidMemory(
       'session_context_memory_invalid',
       'Session context memory has an invalid exact v2 shape.'
+    );
+  }
+  if (memory.providerConversationHead !== undefined) {
+    validateProviderConversationHeadV1(
+      memory.providerConversationHead,
+      memory.sessionId,
+      memory.sourceEventVersion
     );
   }
   for (const entry of memory.entries) {
@@ -316,6 +350,12 @@ export function validateSessionContextMemoryV2(
     omittedEntryCount: memory.omittedEntryCount,
     truncated: memory.truncated,
     entries: memory.entries,
+    ...(memory.providerConversationHead
+      ? {
+          providerConversationHead:
+            memory.providerConversationHead,
+        }
+      : {}),
   };
   if (
     sha256Digest(memory.contextDigest, 'contextDigest')
@@ -324,6 +364,179 @@ export function validateSessionContextMemoryV2(
     throw invalidMemory(
       'session_context_memory_digest_mismatch',
       'Session context memory failed exact digest verification.'
+    );
+  }
+}
+
+function buildProviderConversationHeadV1(
+  source: SessionPriorEventsSourceV2,
+  excludeRunId?: string
+): SessionProviderConversationHeadV1 | undefined {
+  for (let index = source.events.length - 1; index >= 0; index -= 1) {
+    const event = source.events[index]!;
+    if (event.kind !== 'assistant_msg') continue;
+    const payload = decodeConversationPayload(
+      event.payload,
+      'assistant_msg'
+    );
+    if (
+      payload.projectionKind !== 'provider.completed'
+      || (excludeRunId && payload.runId === excludeRunId)
+    ) continue;
+    const record = event.payload as Record<string, unknown>;
+    if (
+      record.answerState !== undefined
+      && record.answerState !== 'committed'
+    ) continue;
+    const providerOutcome = exactObject(
+      record.providerOutcome,
+      ['providerProfileId', 'provider', 'model'],
+      ['usage']
+    );
+    const input = precedingRunInputV1(
+      source.events,
+      index,
+      payload.runId
+    );
+    if (!input) continue;
+    const withoutDigest = {
+      schemaVersion: SESSION_PROVIDER_CONVERSATION_HEAD_V1_SCHEMA,
+      sessionId: source.sessionId,
+      runId: payload.runId,
+      userTurnId: input.inputId,
+      providerTurnId: identity(
+        record.providerTurnId,
+        'providerTurnId'
+      ),
+      controlEpoch: safePositiveCount(
+        record.controlEpoch,
+        'controlEpoch'
+      ),
+      sourceEventId: event.id,
+      sourceEventVersion: source.omittedEventCount + index + 1,
+      sourceEventDigest: sha256Hash(canonicalJson(event)),
+      providerProfileId: identity(
+        providerOutcome.providerProfileId,
+        'providerProfileId'
+      ),
+      provider: identity(providerOutcome.provider, 'provider'),
+      model: identity(providerOutcome.model, 'model'),
+      answerDigest: sha256Hash(
+        providerCompletedMemoryText(record)
+      ),
+    };
+    return {
+      ...withoutDigest,
+      headDigest: sha256Hash(canonicalJson(withoutDigest)),
+    };
+  }
+  return undefined;
+}
+
+function precedingRunInputV1(
+  events: readonly AgentEvent[],
+  beforeIndex: number,
+  runId: string
+): { inputId: string } | undefined {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.kind !== 'user_msg') continue;
+    const payload = decodeConversationPayload(event.payload, 'user_msg');
+    if (payload.runId !== runId) continue;
+    return {
+      inputId: identity(
+        (event.payload as Record<string, unknown>).inputId,
+        'inputId'
+      ),
+    };
+  }
+  return undefined;
+}
+
+function validateProviderConversationHeadV1(
+  head: SessionProviderConversationHeadV1,
+  expectedSessionId: string,
+  maximumSourceVersion: number
+): void {
+  const record = exactObject(head, [
+    'schemaVersion',
+    'sessionId',
+    'runId',
+    'userTurnId',
+    'providerTurnId',
+    'controlEpoch',
+    'sourceEventId',
+    'sourceEventVersion',
+    'sourceEventDigest',
+    'providerProfileId',
+    'provider',
+    'model',
+    'answerDigest',
+    'headDigest',
+  ]);
+  if (
+    record.schemaVersion
+      !== SESSION_PROVIDER_CONVERSATION_HEAD_V1_SCHEMA
+    || identity(record.sessionId, 'head.sessionId')
+      !== expectedSessionId
+  ) {
+    throw invalidMemory(
+      'session_provider_conversation_head_invalid',
+      'Provider conversation head has an invalid schema or Session identity.'
+    );
+  }
+  for (const field of [
+    'runId',
+    'userTurnId',
+    'providerTurnId',
+    'sourceEventId',
+    'providerProfileId',
+    'provider',
+    'model',
+  ] as const) identity(record[field], `head.${field}`);
+  const controlEpoch = safePositiveCount(
+    record.controlEpoch,
+    'head.controlEpoch'
+  );
+  const sourceEventVersion = safePositiveCount(
+    record.sourceEventVersion,
+    'head.sourceEventVersion'
+  );
+  if (
+    controlEpoch <= 0
+    || sourceEventVersion > maximumSourceVersion
+  ) {
+    throw invalidMemory(
+      'session_provider_conversation_head_invalid',
+      'Provider conversation head exceeds its frozen source bounds.'
+    );
+  }
+  for (const field of [
+    'sourceEventDigest',
+    'answerDigest',
+    'headDigest',
+  ] as const) sha256Digest(record[field], `head.${field}`);
+  const withoutDigest = {
+    schemaVersion: SESSION_PROVIDER_CONVERSATION_HEAD_V1_SCHEMA,
+    sessionId: record.sessionId,
+    runId: record.runId,
+    userTurnId: record.userTurnId,
+    providerTurnId: record.providerTurnId,
+    controlEpoch,
+    sourceEventId: record.sourceEventId,
+    sourceEventVersion,
+    sourceEventDigest: record.sourceEventDigest,
+    providerProfileId: record.providerProfileId,
+    provider: record.provider,
+    model: record.model,
+    answerDigest: record.answerDigest,
+  };
+  if (
+    record.headDigest !== sha256Hash(canonicalJson(withoutDigest))
+  ) {
+    throw invalidMemory(
+      'session_provider_conversation_head_digest_mismatch',
+      'Provider conversation head failed exact digest verification.'
     );
   }
 }
@@ -741,6 +954,17 @@ function safeCount(value: unknown, field: string): number {
     );
   }
   return Number(value);
+}
+
+function safePositiveCount(value: unknown, field: string): number {
+  const count = safeCount(value, field);
+  if (count === 0) {
+    throw invalidMemory(
+      'session_prior_event_count_invalid',
+      `${field} must be a positive safe integer.`
+    );
+  }
+  return count;
 }
 
 function sha256Digest(value: unknown, field: string): string {

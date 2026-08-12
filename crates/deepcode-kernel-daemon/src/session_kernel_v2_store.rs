@@ -7,7 +7,9 @@ use crate::host_v2_storage::{
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
-use crate::provider_cache_admission_v1::SessionProviderToolContextRefSidecarV1;
+use crate::provider_cache_admission_v2::{
+    SessionProviderConversationHeadV1, SessionProviderToolContextRefSidecarV1,
+};
 use crate::provider_trace_v1::{
     ProviderTraceErrorV1, ProviderTraceIdentityV1, ProviderTraceMetadataV1, ProviderTracePurposeV1,
     ProviderTraceStoreV1, ProviderTraceTerminalKindV1, ProviderTraceTerminalRecoveryV1,
@@ -666,6 +668,7 @@ pub(crate) struct SessionProviderTurnAdmissionV2 {
     pub(crate) current_input_id: String,
     pub(crate) current_input_digest: String,
     pub(crate) context_assembly_digest: String,
+    pub(crate) provider_conversation_head: Option<SessionProviderConversationHeadV1>,
     pub(crate) target: Value,
     pub(crate) tool_context_ref: SessionProviderToolContextRefSidecarV1,
     pub(crate) provider_profile_id: String,
@@ -1901,6 +1904,27 @@ fn provider_turn_admission_from_records(
         .and_then(|value| value.get("sections"))
         .and_then(Value::as_array)
         .ok_or_else(provider_turn_admission_invalid)?;
+    let context_memory = context_assembly
+        .get("memory")
+        .and_then(Value::as_object)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let memory_source_event_version = context_memory
+        .get("sourceEventVersion")
+        .and_then(Value::as_u64)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let provider_conversation_head = context_memory
+        .get("providerConversationHead")
+        .cloned()
+        .map(|value| {
+            let head: SessionProviderConversationHeadV1 =
+                serde_json::from_value(value).map_err(|_| provider_turn_admission_invalid())?;
+            head.validate(&current_input.session_id)?;
+            if head.source_event_version > memory_source_event_version {
+                return Err(provider_turn_admission_invalid());
+            }
+            Ok(head)
+        })
+        .transpose()?;
     let current_input_sections = sections
         .iter()
         .filter(|section| section.get("section").and_then(Value::as_str) == Some("currentInput"))
@@ -2015,6 +2039,7 @@ fn provider_turn_admission_from_records(
         current_input_id: authority.current_input_id.clone(),
         current_input_digest: current_input_digest.to_string(),
         context_assembly_digest: stable_json_sha256(&Value::Object(context_assembly.clone()))?,
+        provider_conversation_head,
         target: provider_turn.target.clone(),
         tool_context_ref: SessionProviderToolContextRefSidecarV1 {
             context_version: u64::from(provider_turn.context_ref.context_version.get()),
