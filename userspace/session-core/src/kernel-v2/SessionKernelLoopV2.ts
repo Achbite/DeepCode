@@ -2018,7 +2018,6 @@ export class SessionKernelLoopV2 {
     );
     this.state.checkpointRevision = checkpoint.checkpointRevision;
     const write = this.checkpointWrites
-      .catch(() => undefined)
       .then(() => this.ports.persistence.persistCheckpoint(checkpoint));
     this.checkpointWrites = write;
     await write;

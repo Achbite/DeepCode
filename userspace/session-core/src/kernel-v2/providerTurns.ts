@@ -1154,19 +1154,32 @@ export class SessionKernelProviderTurnsV2 {
       && result.kind === 'answer'
       && request.target.kind !== 'finalAnswer'
     ) {
-      const workAuthority = currentSessionWorkAuthorityV3(current);
+      // Projection delivery may synchronously advance or replace the host's
+      // canonical state. Bind the candidate to the post-delivery state rather
+      // than retaining the pre-delivery object captured above.
+      const latest = this.host.readState();
+      if (
+        latest.providerTurn?.providerTurnId !== providerTurnId
+        || latest.providerTurn.status !== 'completed'
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_terminal_answer_candidate_source_stale',
+          'Terminal answer candidate lost its completed Provider turn after projection delivery.'
+        );
+      }
+      const workAuthority = currentSessionWorkAuthorityV3(latest);
       if (workAuthority?.kind === 'contextRead') {
-        recordSessionTerminalAnswerCandidateV1(current, {
+        recordSessionTerminalAnswerCandidateV1(latest, {
           schemaVersion: SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
           providerTurnId,
-          inputId: current.currentInputId,
-          controlEpoch: current.controlEpoch,
+          inputId: latest.currentInputId,
+          controlEpoch: latest.controlEpoch,
           // Every authoritative input advances the control epoch in the
           // current Loop; this is the exact language-policy revision until
           // the language value is restored as an independent v3 fact.
-          languageRevision: current.controlEpoch,
+          languageRevision: latest.controlEpoch,
           snapshotHighWater:
-            current.lineage.cursor.snapshotHighWater,
+            latest.lineage.cursor.snapshotHighWater,
           workAuthority: cloneJson(workAuthority),
           text: result.text,
           textDigest: sha256Hash(result.text),

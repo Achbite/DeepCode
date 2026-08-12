@@ -1825,6 +1825,7 @@ function currentProviderCompletedProjectionData(
       toolCallReceipt: 'object',
       reviewRevision: 'positiveInteger',
       snapshotHighWater: 'nonNegativeInteger',
+      candidateSourceEventRefs: 'array',
     }
   );
   projectionEnum(data, 'outputKind', [
@@ -1865,6 +1866,25 @@ function currentProviderCompletedProjectionData(
       event.kind,
       'final Review binding does not match a terminal Provider answer'
     );
+  }
+  if (data.candidateSourceEventRefs !== undefined) {
+    const sourceRefs = (data.candidateSourceEventRefs as unknown[])
+      .map((sourceRef) => requiredIdentity(
+        sourceRef,
+        'candidateSourceEventRef'
+      ));
+    if (
+      sourceRefs.length === 0
+      || new Set(sourceRefs).size !== sourceRefs.length
+      || data.outputKind !== 'answer'
+      || data.terminalScope !== 'turn'
+      || !hasReviewRevision
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'candidate source refs do not bind a terminal reviewed answer'
+      );
+    }
   }
   return data;
 }
