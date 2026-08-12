@@ -422,7 +422,9 @@ export function sessionOrchestrationContractV2(
     ? [
         'DeepCode Session final-answer contract v2.',
         'The frozen Review and canonical facts are the only execution truth for this response.',
-        'Return one concise final answer that explains planned versus actual work, denied or unexecuted items, cleanup, and any remaining uncertainty.',
+        'Answer the user\'s current objective directly in polished Markdown. Preserve useful conclusions from the admitted work, but do not describe this response as a second or replacement answer.',
+        'Mention denied, unexecuted, cleanup, or uncertainty only when it materially changes the answer or requires user attention. The public projection supplies the canonical fact receipt, so do not repeat a plan-versus-actual ledger or manufacture headings such as Final Answer, Review Summary, or Fact Receipt.',
+        'Use descriptive headings, paragraphs, lists, code blocks, and tables only where they improve readability. Do not force a fixed report template.',
         'Do not return a Plan, tool call, ToolIntent frame, permission request, or commentary after final-answer text begins.',
       ].join('\n')
     : targetKind === 'planning'
@@ -443,6 +445,7 @@ export function sessionOrchestrationContractV2(
         'Commentary is a progress update, not private reasoning, authority, or execution evidence. Keep hidden reasoning out of commentary and let canonical Kernel facts establish what actually happened.',
         'For missing context, you may return one or more exposed read-only native tool calls. Session durably records the complete ordered call set and submits one Kernel ToolIntent at a time.',
         'For an ordinary answer, return natural assistant text. Do not wrap the answer in a JSON envelope.',
+        'Format an ordinary answer as polished, readable Markdown with descriptive headings only when useful. Do not add a synthetic Review Summary, Fact Receipt, plan-versus-actual recap, or fixed final-answer template; canonical presentation supplies execution receipts separately.',
         'When exposed, use exactly one Session control function named deepcode_session_plan_propose_v3 to propose a Plan. It is not a Kernel tool, grants no authority, and is never submitted as a ToolIntent.',
         'A Plan-control response cannot also contain a Kernel tool call or final-answer text. Each Plan action is one intended operation in the jointly executable Plan, not an alternative or recommendation.',
         'Each Plan scopeIntent must match the selected ready Kernel tool authorizationShape exactly. Use resourceScope with exact tagged requestedResources for ordinary tools; use exactInvocation rawArguments only for a tool whose immutable Kernel descriptor declares exactInvocation.',
@@ -455,6 +458,7 @@ export function sessionOrchestrationContractV2(
         'The preceding Kernel ToolContext system message is immutable. Use only its ready read tools and exact schemas.',
         'Canonical facts are the execution truth. Inspect successful non-stale results before requesting another read.',
         'When the supplied facts are sufficient, answer without another tool call.',
+        'Format the answer as polished, readable Markdown and address the user\'s objective directly. Do not add a synthetic Review Summary, Fact Receipt, plan-versus-actual recap, or fixed final-answer template.',
         'Do not repeat a semantically equivalent successful read without new facts that establish a changed resource or a distinct evidence need.',
         'Before the first Kernel tool group for a user-visible read phase, provide one short commentary sentence describing the evidence goal without claiming success. A read phase is not a Provider turn, tool call, file, target, attempt, or queue item. Keep related list, search, and read operations in one phase; if that phase already has commentary in the current-Run context, continue with tools without repeating it or announcing each target separately. Commentary must not expose private reasoning or substitute for canonical facts.',
         'Ordinary text is an answer only and never executes.',

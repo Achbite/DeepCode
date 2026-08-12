@@ -140,6 +140,10 @@ export function buildNarrativeTimelineProjection(
     );
     const block = providerOutputProjected
       ? null
+      : event.kind === 'review_summary'
+        && stringValue(payload?.status) === 'completed'
+        && !reviewRequiresStandaloneDisplay(payload)
+        ? null
       : projectionBlock(
           event,
           payload,
@@ -4058,6 +4062,7 @@ function finalBlocksWithFactReceipt(
   ) {
     return turn.blocks;
   }
+  if (reviewRequiresStandaloneDisplay(reviewPayload)) return turn.blocks;
   const receipt = structuredProjectionForEvent(
     reviewEvent,
     reviewPayload,
@@ -4091,6 +4096,65 @@ function finalBlocksWithFactReceipt(
         },
       }
     : block);
+}
+
+function reviewRequiresStandaloneDisplay(
+  payload: Record<string, unknown> | undefined
+): boolean {
+  const review = recordValue(payload?.review);
+  if (!review) return true;
+  if (
+    ['scopeExpansions', 'unexecuted', 'denied', 'cleanup', 'indeterminate']
+      .some((category) => arrayRecords(review[category]).length > 0)
+    || (nonnegativeIntegerValue(review.pendingCleanupCount) ?? 0) > 0
+  ) {
+    return true;
+  }
+  const coverage = recordValue(review.factCoverage);
+  if (
+    coverage
+    && Object.values(coverage).some((value) =>
+      (nonnegativeIntegerValue(recordValue(value)?.omittedCount) ?? 0) > 0
+    )
+  ) {
+    return true;
+  }
+  if (arrayRecords(review.actualEffects).some((item) =>
+    reviewAuthorityKind(item) !== 'contextRead'
+  )) {
+    return true;
+  }
+  const compensatedReadRejections = new Set([
+    'invalidArguments',
+    'toolNotRegistered',
+    'toolUnavailable',
+    'staleToolContext',
+    'staleControlEpoch',
+  ]);
+  return arrayRecords(review.rejections).some((item) => {
+    const reason = reviewRejectionReason(item);
+    return !reason || !compensatedReadRejections.has(reason);
+  });
+}
+
+function reviewAuthorityKind(item: Record<string, unknown>): string | undefined {
+  const details = recordValue(item.details);
+  const identity = recordValue(item.identity) ?? recordValue(details?.identity);
+  return stringValue(recordValue(identity?.authority)?.kind)
+    ?? stringValue(recordValue(details?.authority)?.kind);
+}
+
+function reviewRejectionReason(item: Record<string, unknown>): string | undefined {
+  const details = recordValue(item.details);
+  const outcome = recordValue(details?.outcome);
+  const result = recordValue(details?.result);
+  const resultData = recordValue(result?.data);
+  const reply = recordValue(resultData?.reply);
+  const replyData = recordValue(reply?.data);
+  return stringValue(item.reason)
+    ?? stringValue(details?.reason)
+    ?? stringValue(outcome?.reason)
+    ?? stringValue(replyData?.reason);
 }
 
 function workResourcePresentationByOperation(
