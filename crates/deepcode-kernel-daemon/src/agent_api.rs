@@ -30,12 +30,11 @@ pub(crate) struct AgentSessionRunRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct AgentProjectSessionRunRequest {
-    pub(crate) op: String,
+pub(crate) struct AgentConversationDraftRunRequest {
     pub(crate) content: String,
-    pub(crate) profile_id: Option<String>,
+    pub(crate) profile_id: String,
     pub(crate) attachments: Option<Vec<AgentInputAttachmentV3>>,
-    pub(crate) conversation_target: AgentProjectConversationTargetV1,
+    pub(crate) conversation_draft_target: AgentConversationDraftTargetV1,
     pub(crate) caller_request_id: String,
 }
 
@@ -339,52 +338,63 @@ pub(crate) fn session_run_admission_lock(
     lock
 }
 
-pub(crate) async fn agent_project_session_run_start(
+pub(crate) async fn agent_conversation_draft_run_start(
     State(state): State<AppState>,
-    Path(project_id): Path<String>,
-    Json(body): Json<AgentProjectSessionRunRequest>,
+    Json(body): Json<AgentConversationDraftRunRequest>,
 ) -> Json<ApiResponse> {
     if let Some(response) =
         crate::session_metadata_v2::session_metadata_unavailable_response(&state)
     {
         return caller_mutation_rejection_response(response);
     }
-    let project_id = project_id.trim();
     let caller_request_id = body.caller_request_id.trim();
-    if project_id.is_empty()
-        || caller_request_id.is_empty()
+    let profile_id = body.profile_id.trim();
+    if caller_request_id.is_empty()
         || caller_request_id.len() > 512
         || caller_request_id.chars().any(char::is_control)
+        || profile_id.is_empty()
+        || profile_id.len() > 512
+        || profile_id.chars().any(char::is_control)
     {
         return caller_mutation_rejection(
-            "project_session_admission_identity_invalid",
-            "Project and caller request identities must be non-empty bounded values",
+            "conversation_draft_admission_identity_invalid",
+            "Draft, Profile, and caller request identities must be non-empty bounded values",
         );
     }
-    if body.op != "ask" || body.content.trim().is_empty() {
+    if body.content.trim().is_empty() {
         return caller_mutation_rejection(
-            "project_session_admission_invalid",
-            "Project Session admission requires one non-empty ask",
+            "conversation_draft_admission_invalid",
+            "Conversation draft admission requires one non-empty user input",
         );
+    }
+    if let Err(error) = validate_agent_input_attachments_v3(body.attachments.as_deref()) {
+        return caller_mutation_rejection(error.code, error.message);
     }
     let request_material = json!({
-        "schemaVersion": "deepcode.host.project-session-first-input.v1",
-        "projectId": project_id,
+        "schemaVersion": "deepcode.host.conversation-draft-first-input.v1",
         "callerRequestId": caller_request_id,
         "content": body.content.trim(),
-        "profileId": body.profile_id.as_deref(),
+        "profileId": profile_id,
         "attachments": body.attachments.as_ref(),
-        "conversationTarget": &body.conversation_target,
+        "conversationDraftTarget": &body.conversation_draft_target,
     });
     let request_digest = match crate::host_v2_storage::canonical_sha256(&request_material) {
         Ok(digest) => digest,
         Err(error) => return caller_mutation_rejection(error.code, error.message),
     };
     let admission_lock = session_run_admission_lock(&format!(
-        "project-session-admission:{project_id}:{caller_request_id}"
+        "conversation-draft-admission:{}:{caller_request_id}",
+        body.conversation_draft_target.target_id()
     ));
     let _admission_guard = admission_lock.lock_owned().await;
     let _project_binding_guard = agent_project_binding_transition_lock().lock_owned().await;
+    let exact_draft_target =
+        match require_conversation_draft_target_v1(&state, &body.conversation_draft_target) {
+            Ok(target) => target,
+            Err(error) => return caller_mutation_rejection(error.code, error.message),
+        };
+    let project_id = exact_draft_target.project_id().map(str::to_string);
+    let (workspace_id, workspace_hash) = exact_draft_target.workspace_identity();
 
     let (session_id, session) = {
         let mut gui = state.gui.lock().expect("gui state lock");
@@ -400,20 +410,20 @@ pub(crate) async fn agent_project_session_run_start(
             .collect::<Vec<_>>();
         if matching.len() > 1 {
             return caller_mutation_rejection(
-                "project_session_admission_conflict",
-                "callerRequestId is bound to more than one pending Project Session",
+                "conversation_draft_admission_conflict",
+                "callerRequestId is bound to more than one pending draft Session",
             );
         }
         if let Some(existing) = matching.first().copied() {
-            if existing.get("projectId").and_then(Value::as_str) != Some(project_id)
+            if existing.get("projectId").and_then(Value::as_str) != project_id.as_deref()
                 || existing
                     .pointer("/firstInputAdmission/requestDigest")
                     .and_then(Value::as_str)
                     != Some(request_digest.as_str())
             {
                 return caller_mutation_rejection(
-                    "project_session_admission_request_conflict",
-                    "callerRequestId is already bound to different Project Session input material",
+                    "conversation_draft_admission_request_conflict",
+                    "callerRequestId is already bound to different draft Session input material",
                 );
             }
             let session_id = existing
@@ -423,49 +433,11 @@ pub(crate) async fn agent_project_session_run_start(
                 .to_string();
             (session_id, existing.clone())
         } else {
-            let Some(project) = project_by_id(&gui, project_id).cloned() else {
-                return caller_mutation_rejection(
-                    "agent_project_not_found",
-                    "agent project not found",
-                );
-            };
-            if let Err(error) = require_agent_project_conversation_target_v1(
-                &project,
-                &body.conversation_target,
-            ) {
-                return caller_mutation_rejection(error.code, error.message);
-            }
-            let profile_id = match body
-                .profile_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                Some(profile_id) => Some(profile_id.to_string()),
-                None => match preferred_effective_llm_profile_id(&state, &gui.llm_profiles) {
-                    Ok(profile_id) => profile_id,
-                    Err(error) => {
-                        return caller_mutation_rejection(
-                            error.code,
-                            "Provider Profile availability could not be verified for Project Session admission",
-                        )
-                    }
-                },
-            };
-            let Some(profile_id) = profile_id else {
-                return caller_mutation_rejection(
-                    "llm_profile_unavailable",
-                    "Project Session admission requires an enabled LLM Profile",
-                );
-            };
-            let profile_available = match effective_llm_profile_is_enabled(
-                &state,
-                &gui.llm_profiles,
-                &profile_id,
-            ) {
-                Ok(available) => available,
-                Err(error) => return caller_mutation_rejection(error.code, error.message),
-            };
+            let profile_available =
+                match effective_llm_profile_is_enabled(&state, &gui.llm_profiles, profile_id) {
+                    Ok(available) => available,
+                    Err(error) => return caller_mutation_rejection(error.code, error.message),
+                };
             if !profile_available {
                 return caller_mutation_rejection(
                     "llm_profile_unavailable",
@@ -475,10 +447,7 @@ pub(crate) async fn agent_project_session_run_start(
             let session_id = match allocate_agent_session_id(&gui) {
                 Ok(id) => id,
                 Err(error) => {
-                    return caller_mutation_rejection(
-                        "agent_session_identity_unavailable",
-                        error,
-                    )
+                    return caller_mutation_rejection("agent_session_identity_unavailable", error)
                 }
             };
             let now = now_text();
@@ -486,14 +455,23 @@ pub(crate) async fn agent_project_session_run_start(
                 &session_id,
                 &now,
                 "New Agent Session",
-                Some(&profile_id),
-                None,
-                None,
+                Some(profile_id),
+                workspace_id,
+                workspace_hash,
             );
-            session["projectId"] = json!(project_id);
-            apply_project_binding_to_session(&mut session, &project);
+            if let Some(project_id) = project_id.as_deref() {
+                let Some(project) = project_by_id(&gui, project_id).cloned() else {
+                    return caller_mutation_rejection(
+                        "agent_project_not_found",
+                        "agent project not found",
+                    );
+                };
+                session["projectId"] = json!(project_id);
+                apply_project_binding_to_session(&mut session, &project);
+            }
             session["firstInputAdmission"] = json!({
-                "schemaVersion": "deepcode.host.project-session-admission.v1",
+                "schemaVersion": "deepcode.host.conversation-draft-admission.v1",
+                "targetKind": if project_id.is_some() { "project" } else { "public" },
                 "projectId": project_id,
                 "callerRequestId": caller_request_id,
                 "requestDigest": request_digest,
@@ -531,7 +509,8 @@ pub(crate) async fn agent_project_session_run_start(
         conversation_target: Some(conversation_target),
         caller_request_id: caller_request_id.to_string(),
     };
-    let response = agent_session_run_open_admitted(&state, &session_id, &run_request, &session).await;
+    let response =
+        agent_session_run_open_admitted(&state, &session_id, &run_request, &session).await;
     if !response.0.ok {
         return response;
     }
@@ -541,11 +520,13 @@ pub(crate) async fn agent_project_session_run_start(
     let scope_key = session_scope_key(&session);
     let previous_scope_session_id = gui.current_session_ids_by_scope.get(&scope_key).cloned();
     let admitted_at = now_text();
-    let Some(stored_session) = gui.sessions.iter_mut().find(|candidate| {
-        candidate.get("id").and_then(Value::as_str) == Some(session_id.as_str())
-    }) else {
+    let Some(stored_session) = gui
+        .sessions
+        .iter_mut()
+        .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+    else {
         return ApiResponse::error_with_data(
-            "project_session_admission_finalize_missing",
+            "conversation_draft_admission_finalize_missing",
             "The admitted Run has no matching Session metadata to finalize",
             caller_mutation_error_data("indeterminate"),
         );
@@ -567,7 +548,7 @@ pub(crate) async fn agent_project_session_run_start(
             gui.current_session_ids_by_scope.insert(scope_key, previous);
         }
         return ApiResponse::error_with_data(
-            "project_session_admission_finalize_failed",
+            "conversation_draft_admission_finalize_failed",
             format!("The Run was admitted but Session activation could not be persisted: {error}"),
             caller_mutation_error_data("indeterminate"),
         );
@@ -649,10 +630,9 @@ pub(crate) async fn agent_session_run_start(
             if !session_schema_is_current(&session) {
                 return caller_mutation_rejection_response(unsupported_session_schema_response());
             }
-            if let Err(error) = require_agent_conversation_target_v1(
-                &session,
-                body.conversation_target.as_ref(),
-            ) {
+            if let Err(error) =
+                require_agent_conversation_target_v1(&session, body.conversation_target.as_ref())
+            {
                 return caller_mutation_rejection(error.code, error.message);
             }
             if body.decision_kind.is_some()
@@ -846,22 +826,16 @@ async fn agent_session_run_cancel_inner(
     let Some(session) = session_metadata_payload(&state, &session_id) else {
         return caller_mutation_rejection("agent_session_not_found", "agent session not found");
     };
-    let target = match require_agent_conversation_target_v1(
-        &session,
-        Some(&body.conversation_target),
-    ) {
-        Ok(target) => target,
-        Err(error) => return caller_mutation_rejection(error.code, error.message),
-    };
+    let target =
+        match require_agent_conversation_target_v1(&session, Some(&body.conversation_target)) {
+            Ok(target) => target,
+            Err(error) => return caller_mutation_rejection(error.code, error.message),
+        };
     let replay_run_id = if run_id.is_none() {
         match state
             .host_services
             .kernel_operations_v2
-            .caller_request_host_run_id(
-                &session_id,
-                &body.caller_request_id,
-                "agent.run.cancel.v2",
-            )
+            .caller_request_host_run_id(&session_id, &body.caller_request_id, "agent.run.cancel.v2")
         {
             Ok(run_id) => run_id,
             Err(error) => return caller_mutation_rejection(error.code, error.message),
@@ -936,13 +910,11 @@ async fn agent_session_run_guidance_inner(
     let Some(session) = session_metadata_payload(&state, &session_id) else {
         return caller_mutation_rejection("agent_session_not_found", "agent session not found");
     };
-    let target = match require_agent_conversation_target_v1(
-        &session,
-        Some(&body.conversation_target),
-    ) {
-        Ok(target) => target,
-        Err(error) => return caller_mutation_rejection(error.code, error.message),
-    };
+    let target =
+        match require_agent_conversation_target_v1(&session, Some(&body.conversation_target)) {
+            Ok(target) => target,
+            Err(error) => return caller_mutation_rejection(error.code, error.message),
+        };
     let replay_run_id = if run_id.is_none() {
         match state
             .host_services
@@ -951,8 +923,7 @@ async fn agent_session_run_guidance_inner(
                 &session_id,
                 &body.caller_request_id,
                 "agent.run.user-input.v2",
-            )
-        {
+            ) {
             Ok(run_id) => run_id,
             Err(error) => return caller_mutation_rejection(error.code, error.message),
         }

@@ -131,9 +131,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/agent/projects/:project_id/rebind",
             post(agent_project_rebind),
         )
+        .route("/api/agent/composer", get(agent_composer_projection_v1))
         .route(
-            "/api/agent/projects/:project_id/sessions/runs",
-            post(agent_project_session_run_start),
+            "/api/agent/conversation-drafts/runs",
+            post(agent_conversation_draft_run_start),
         )
         .route("/api/agent/sessions/current", get(agent_session_current))
         .route(

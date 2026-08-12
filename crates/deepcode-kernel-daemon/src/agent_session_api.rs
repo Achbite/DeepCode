@@ -215,6 +215,20 @@ pub(crate) async fn agent_session_rename(
             Ok(false) => {}
             Err(error) => return ApiResponse::error(error.code, error.message),
         }
+        match composer_pending_interaction(&state, &session_id) {
+            Ok(Some(_)) if requested_project_id.is_some() => return ApiResponse::error(
+                "agent_session_binding_locked",
+                "Session project and workspace binding are locked while an interaction is pending",
+            ),
+            Ok(Some(_)) => {
+                return ApiResponse::error(
+                    "agent_session_profile_locked",
+                    "Session Profile is locked while an interaction is pending",
+                )
+            }
+            Ok(None) => {}
+            Err(error) => return ApiResponse::error(error.code, error.message),
+        }
     }
     let mut gui = state.gui.lock().expect("gui state lock");
     if !has_session(&gui, &session_id) {

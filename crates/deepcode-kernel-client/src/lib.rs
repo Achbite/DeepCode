@@ -17,11 +17,12 @@ mod private_analysis;
 mod v2;
 
 pub use agent::{
-    terminal_workspace_scope, AgentConversationTargetV1, AgentInputAttachmentKindV3,
+    terminal_workspace_scope, AgentComposerProfileV1, AgentComposerProjectionV1,
+    AgentConversationDraftTargetV1, AgentConversationTargetV1, AgentInputAttachmentKindV3,
     AgentInputAttachmentScopeV3, AgentInputAttachmentV3, AgentProjectConversationTargetV1,
     AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult, AgentRunStatus,
     AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
-    ListAgentSessionsRequest, StartAgentRunRequest, StartProjectAgentRunRequest,
+    ListAgentSessionsRequest, StartAgentRunRequest, StartConversationDraftRunRequest,
     TerminalWorkspaceScope,
 };
 pub use agent_projection::{
@@ -569,15 +570,35 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
-    pub async fn start_agent_run(
+    pub async fn agent_composer_projection(
         &self,
-        session_id: &str,
-        request: StartAgentRunRequest,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> KernelClientResult<AgentComposerProjectionV1> {
+        let mut request = self.http.get(self.url("/api/agent/composer"));
+        if let Some(project_id) = project_id {
+            request = request.query(&[("projectId", project_id)]);
+        }
+        if let Some(session_id) = session_id {
+            request = request.query(&[("sessionId", session_id)]);
+        }
+        let value = request
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
+    pub async fn start_conversation_draft_run(
+        &self,
+        request: StartConversationDraftRunRequest,
     ) -> KernelClientResult<AgentRunResult> {
         request.validate()?;
         let value = self
             .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/runs")))
+            .post(self.url("/api/agent/conversation-drafts/runs"))
             .json(&request)
             .send()
             .await?
@@ -587,15 +608,15 @@ impl HttpKernelClient {
         decode_api_data_with_code(value)
     }
 
-    pub async fn start_project_agent_run(
+    pub async fn start_agent_run(
         &self,
-        project_id: &str,
-        request: StartProjectAgentRunRequest,
+        session_id: &str,
+        request: StartAgentRunRequest,
     ) -> KernelClientResult<AgentRunResult> {
         request.validate()?;
         let value = self
             .http
-            .post(self.url(&format!("/api/agent/projects/{project_id}/sessions/runs")))
+            .post(self.url(&format!("/api/agent/sessions/{session_id}/runs")))
             .json(&request)
             .send()
             .await?

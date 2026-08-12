@@ -93,20 +93,6 @@ pub(crate) fn agent_project_conversation_target_v1(
     })
 }
 
-pub(crate) fn require_agent_project_conversation_target_v1(
-    project: &Value,
-    supplied: &AgentProjectConversationTargetV1,
-) -> Result<AgentProjectConversationTargetV1, crate::host_v2_storage::HostV2StorageError> {
-    let expected = agent_project_conversation_target_v1(project)?;
-    if supplied != &expected {
-        return Err(crate::host_v2_storage::HostV2StorageError::invalid(
-            "agent_project_conversation_target_stale",
-            "The submitted Project conversationTarget no longer identifies the exact Project workspace binding",
-        ));
-    }
-    Ok(expected)
-}
-
 pub(crate) fn public_agent_project_value(
     project: &Value,
 ) -> Result<Value, crate::host_v2_storage::HostV2StorageError> {

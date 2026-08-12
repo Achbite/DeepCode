@@ -67,6 +67,74 @@ export interface AgentProjectConversationTargetV1 {
   workspaceBindingIdentity?: string;
 }
 
+export const HOST_CONVERSATION_DRAFT_TARGET_SCHEMA_V1 =
+  'deepcode.host.conversation-draft-target.v1' as const;
+export const HOST_COMPOSER_PROJECTION_SCHEMA_V1 =
+  'deepcode.host.composer-projection.v1' as const;
+
+/**
+ * Daemon-issued identity for a public or Project draft before a Session exists.
+ *
+ * A Host must submit this value unchanged with the first user input. The
+ * revision binds the current workspace or Project ownership facts so a stale
+ * draft cannot create a Session in another navigation target.
+ */
+export type AgentConversationDraftTargetV1 =
+  | {
+      schemaVersion: typeof HOST_CONVERSATION_DRAFT_TARGET_SCHEMA_V1;
+      kind: 'public';
+      targetId: string;
+      targetRevision: string;
+      workspaceScopeKey: string;
+      workspaceId?: string;
+      workspaceHash?: string;
+    }
+  | {
+      schemaVersion: typeof HOST_CONVERSATION_DRAFT_TARGET_SCHEMA_V1;
+      kind: 'project';
+      targetId: string;
+      targetRevision: string;
+      projectId: string;
+      workspaceScopeKey: string;
+      workspaceBindingRef?: string;
+      workspaceBindingIdentity?: string;
+    };
+
+export interface AgentComposerProfileV1 {
+  profileId: string;
+  name: string;
+  model: string;
+  providerFlavor: 'openai' | 'deepseek' | 'zhipu';
+  isDefault: boolean;
+}
+
+export type AgentComposerBlockReasonV1 =
+  | 'activeRun'
+  | 'pendingInteraction'
+  | 'noEnabledProfile'
+  | 'selectedProfileUnavailable';
+
+export interface AgentComposerActiveRunV1 {
+  hostRunId: string;
+  runId: string;
+  status: 'active' | 'retiring';
+}
+
+export interface AgentComposerProjectionV1 {
+  schemaVersion: typeof HOST_COMPOSER_PROJECTION_SCHEMA_V1;
+  revision: string;
+  conversationTarget?: AgentConversationTargetV1;
+  conversationDraftTarget?: AgentConversationDraftTargetV1;
+  enabledProfiles: AgentComposerProfileV1[];
+  defaultProfileId?: string;
+  selectedProfileId?: string;
+  selectionMutable: boolean;
+  canSubmit: boolean;
+  blockReason?: AgentComposerBlockReasonV1;
+  activeRun?: AgentComposerActiveRunV1;
+  pendingInteraction?: AgentTimelinePendingInteraction;
+}
+
 export interface AgentSession {
   id: string;
   title?: string;
@@ -748,6 +816,14 @@ export interface StartProjectAgentRunRequest {
   profileId?: string;
   attachments?: AgentInputAttachmentV3[];
   conversationTarget: AgentProjectConversationTargetV1;
+  callerRequestId: string;
+}
+
+export interface StartConversationDraftRunRequest {
+  conversationDraftTarget: AgentConversationDraftTargetV1;
+  profileId: string;
+  content: string;
+  attachments?: AgentInputAttachmentV3[];
   callerRequestId: string;
 }
 

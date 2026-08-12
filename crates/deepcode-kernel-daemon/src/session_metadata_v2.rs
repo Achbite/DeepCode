@@ -175,28 +175,66 @@ fn validate_session_metadata_entry(session: &Value) -> Result<&str, String> {
 }
 
 fn validate_first_input_admission(admission: &Value) -> Result<(), String> {
-    let admission = exact_object(
-        admission,
-        &[
-            "schemaVersion",
-            "projectId",
-            "callerRequestId",
-            "requestDigest",
-            "status",
-            "createdAt",
-            "updatedAt",
-        ],
-        &[],
-        "Session firstInputAdmission",
-    )?;
-    if required_string(admission, "schemaVersion", "Session firstInputAdmission")?
-        != "deepcode.host.project-session-admission.v1"
-    {
-        return Err(unsupported_history(
-            "Session firstInputAdmission uses an unsupported schema",
-        ));
-    }
-    required_string(admission, "projectId", "Session firstInputAdmission")?;
+    let schema = admission
+        .get("schemaVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            unsupported_history("Session firstInputAdmission has no schemaVersion")
+        })?;
+    let admission = match schema {
+        "deepcode.host.project-session-admission.v1" => {
+            let admission = exact_object(
+                admission,
+                &[
+                    "schemaVersion",
+                    "projectId",
+                    "callerRequestId",
+                    "requestDigest",
+                    "status",
+                    "createdAt",
+                    "updatedAt",
+                ],
+                &[],
+                "Session firstInputAdmission",
+            )?;
+            required_string(admission, "projectId", "Session firstInputAdmission")?;
+            admission
+        }
+        "deepcode.host.conversation-draft-admission.v1" => {
+            let admission = exact_object(
+                admission,
+                &[
+                    "schemaVersion",
+                    "targetKind",
+                    "projectId",
+                    "callerRequestId",
+                    "requestDigest",
+                    "status",
+                    "createdAt",
+                    "updatedAt",
+                ],
+                &[],
+                "Session firstInputAdmission",
+            )?;
+            match required_string(admission, "targetKind", "Session firstInputAdmission")? {
+                "public" if admission.get("projectId").is_some_and(Value::is_null) => {}
+                "project" => {
+                    required_string(admission, "projectId", "Session firstInputAdmission")?;
+                }
+                _ => {
+                    return Err(unsupported_history(
+                        "Session firstInputAdmission targetKind and projectId do not match",
+                    ))
+                }
+            }
+            admission
+        }
+        _ => {
+            return Err(unsupported_history(
+                "Session firstInputAdmission uses an unsupported schema",
+            ))
+        }
+    };
     required_string(admission, "callerRequestId", "Session firstInputAdmission")?;
     let request_digest = required_string(
         admission,

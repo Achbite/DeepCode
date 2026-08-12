@@ -36,6 +36,113 @@ pub struct AgentProjectConversationTargetV1 {
     pub workspace_binding_identity: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum AgentConversationDraftTargetV1 {
+    Public {
+        schema_version: String,
+        target_id: String,
+        target_revision: String,
+        workspace_scope_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_hash: Option<String>,
+    },
+    Project {
+        schema_version: String,
+        target_id: String,
+        target_revision: String,
+        project_id: String,
+        workspace_scope_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_binding_ref: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_binding_identity: Option<String>,
+    },
+}
+
+impl AgentConversationDraftTargetV1 {
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        let (schema_version, target_id, target_revision, workspace_scope_key) = match self {
+            Self::Public {
+                schema_version,
+                target_id,
+                target_revision,
+                workspace_scope_key,
+                ..
+            }
+            | Self::Project {
+                schema_version,
+                target_id,
+                target_revision,
+                workspace_scope_key,
+                ..
+            } => (
+                schema_version,
+                target_id,
+                target_revision,
+                workspace_scope_key,
+            ),
+        };
+        let project_valid = match self {
+            Self::Public { .. } => true,
+            Self::Project { project_id, .. } => !project_id.trim().is_empty(),
+        };
+        if schema_version != "deepcode.host.conversation-draft-target.v1"
+            || target_id.trim().is_empty()
+            || target_revision.trim().is_empty()
+            || workspace_scope_key.trim().is_empty()
+            || !project_valid
+        {
+            return Err(KernelClientError::Api(
+                "agent_conversation_draft_target_invalid: conversationDraftTarget is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComposerProfileV1 {
+    pub profile_id: String,
+    pub name: String,
+    pub model: String,
+    pub provider_flavor: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComposerProjectionV1 {
+    pub schema_version: String,
+    pub revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_target: Option<AgentConversationTargetV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_draft_target: Option<AgentConversationDraftTargetV1>,
+    pub enabled_profiles: Vec<AgentComposerProfileV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_profile_id: Option<String>,
+    pub selection_mutable: bool,
+    pub can_submit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_run: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_interaction: Option<Value>,
+}
+
 impl AgentProjectConversationTargetV1 {
     pub fn from_project(project: &Value) -> KernelClientResult<Self> {
         let value = project.get("conversationTarget").cloned().ok_or_else(|| {
@@ -121,39 +228,37 @@ pub struct CreateAgentSessionRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StartProjectAgentRunRequest {
-    pub op: String,
+pub struct StartConversationDraftRunRequest {
+    pub conversation_draft_target: AgentConversationDraftTargetV1,
+    pub profile_id: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<AgentInputAttachmentV3>>,
-    pub conversation_target: AgentProjectConversationTargetV1,
     pub caller_request_id: String,
 }
 
-impl StartProjectAgentRunRequest {
-    pub fn ask(
+impl StartConversationDraftRunRequest {
+    pub fn new(
+        conversation_draft_target: AgentConversationDraftTargetV1,
+        profile_id: impl Into<String>,
         content: impl Into<String>,
         caller_request_id: impl Into<String>,
-        conversation_target: AgentProjectConversationTargetV1,
     ) -> Self {
         Self {
-            op: "ask".to_string(),
+            conversation_draft_target,
+            profile_id: profile_id.into(),
             content: content.into(),
-            profile_id: None,
             attachments: None,
-            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
         validate_caller_request_id(&self.caller_request_id)?;
-        self.conversation_target.validate()?;
-        if self.op != "ask" || self.content.trim().is_empty() {
+        self.conversation_draft_target.validate()?;
+        if self.profile_id.trim().is_empty() || self.content.trim().is_empty() {
             return Err(KernelClientError::Api(
-                "project_session_admission_invalid: Project Session admission requires one non-empty ask"
+                "conversation_draft_admission_invalid: Draft admission requires a selected Profile and one non-empty user input"
                     .to_string(),
             ));
         }
