@@ -135,6 +135,10 @@ export const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2 =
   'deepcode.shared-conversation-projection.v2' as const;
 export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2 =
   'deepcode.shared-conversation.work-segments.v2' as const;
+export const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3 =
+  'deepcode.shared-conversation-projection.v3' as const;
+export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3 =
+  'deepcode.shared-conversation.work-segments.v3' as const;
 
 export type AgentTimelineBlockKind =
   | 'user'
@@ -233,17 +237,33 @@ export type AgentTimelineCurrentActivityCode =
   | 'session.persisting'
   | 'retry.backoff';
 
+export type AgentTimelineCurrentActivitySource =
+  | 'session'
+  | 'provider'
+  | 'resource'
+  | 'kernel'
+  | 'retry';
+
+export type AgentTimelineCurrentActivityStatus = 'active';
+
 export interface AgentTimelineCurrentActivity {
+  activityId: string;
+  revision: number;
   code: AgentTimelineCurrentActivityCode;
-  summary?: string;
-  operationId?: string;
-  workSegmentId?: string;
+  source: AgentTimelineCurrentActivitySource;
+  status: AgentTimelineCurrentActivityStatus;
+  startedAt: string;
   updatedAt: string;
+  message?: AgentTimelineLocalizedText;
+  detailBlockId?: string;
+  providerRequestId?: string;
 }
 
 export interface AgentTimelineWait {
   kind: 'user' | 'external' | 'paused';
-  reason?: string;
+  since: string;
+  reasonCode: string;
+  retryAt?: string;
   interactionId?: string;
 }
 
@@ -581,8 +601,8 @@ export interface AgentTimelineTurn {
 }
 
 export interface AgentTimelineResult {
-  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
-  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2;
+  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3;
   sessionId: string;
   revision: number;
   sourceEventVersion: number;
@@ -601,14 +621,32 @@ export type AgentTimelineSnapshot = AgentTimelineResult;
 export interface AgentTimelineRootProjectionReplacements {
   taskProjection?: AgentTimelineTaskProjection | null;
   interactionProjection?: AgentTimelineInteractionProjection | null;
-  runProjection?: AgentTimelineRunProjection | null;
   tokenUsageProjection?: AgentTimelineTokenUsageProjection | null;
   workspaceProjection?: AgentTimelineWorkspaceProjection | null;
 }
 
+export interface ConversationTextAppendV3 {
+  turnId: string;
+  blockId: string;
+  baseBlockRevision: number;
+  blockRevision: number;
+  textDelta: string;
+  sourceEventRefs: string[];
+}
+
+export type AgentTimelineDeltaOperationV3 =
+  | {
+      kind: 'text.append';
+      append: ConversationTextAppendV3;
+    }
+  | {
+      kind: 'run.updated';
+      runProjection: AgentTimelineRunProjection | null;
+    };
+
 export interface AgentTimelineDelta {
-  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
-  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2;
+  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3;
   sessionId: string;
   baseRevision: number;
   revision: number;
@@ -617,6 +655,7 @@ export interface AgentTimelineDelta {
   eventCount: number;
   turnReplacements: AgentTimelineTurn[];
   removedTurnIds: string[];
+  operations: AgentTimelineDeltaOperationV3[];
   rootReplacements: AgentTimelineRootProjectionReplacements;
 }
 

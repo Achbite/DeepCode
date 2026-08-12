@@ -53,7 +53,7 @@ impl PendingTimelineStream {
         let (sender, receiver) = tokio::sync::mpsc::channel(TIMELINE_STREAM_CHANNEL_CAPACITY);
         let task = tokio::spawn(async move {
             let mut stream = match client
-                .agent_timeline_stream_v2(&session_id, after_revision)
+                .agent_timeline_stream_v3(&session_id, after_revision)
                 .await
             {
                 Ok(stream) => stream,
@@ -404,7 +404,7 @@ impl TuiApp {
         }
         match tokio::time::timeout(
             TIMELINE_SNAPSHOT_REQUEST_WINDOW,
-            self.client.agent_timeline_v2_optional(target_session_id),
+            self.client.agent_timeline_v3_optional(target_session_id),
         )
         .await
         {
@@ -529,8 +529,7 @@ impl TuiApp {
             .wait
             .0
             .as_ref()
-            .and_then(|wait| wait.reason.as_deref())
-            .filter(|reason| !reason.trim().is_empty())
+            .map(|wait| wait.reason_code.as_str())
             .unwrap_or("Session requires an explicit user action");
         let message = format!(
             "shared session run {} requires user action: {reason}",
@@ -913,7 +912,7 @@ impl TuiApp {
             ));
             return;
         };
-        let timeline = match self.client.agent_timeline_v2(&session_id).await {
+        let timeline = match self.client.agent_timeline_v3(&session_id).await {
             Ok(timeline) => timeline,
             Err(error) => {
                 self.cards.push(CardModel::error(format!(
@@ -1372,7 +1371,7 @@ impl TuiApp {
                 .push(CardModel::error("用法：/timeline <session-id>"));
             return;
         }
-        match self.client.agent_timeline_v2(session_id).await {
+        match self.client.agent_timeline_v3(session_id).await {
             Ok(timeline) => {
                 let next_cards = CardModel::from_timeline(&timeline);
                 self.apply_timeline_snapshot(timeline, true);

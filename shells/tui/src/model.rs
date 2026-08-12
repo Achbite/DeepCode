@@ -138,19 +138,16 @@ impl CurrentWorkModel {
             .and_then(|run| run.current_activity.0.as_ref())
             .map(|activity| {
                 activity
-                    .summary
-                    .as_deref()
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.text.as_deref())
                     .filter(|summary| !summary.trim().is_empty())
                     .map(str::to_string)
                     .unwrap_or_else(|| current_activity_label(activity.code).to_string())
             });
         let wait = run.and_then(|run| run.wait.0.as_ref()).map(|wait| {
             let label = wait_kind_label(wait.kind);
-            wait.reason
-                .as_deref()
-                .filter(|reason| !reason.trim().is_empty())
-                .map(|reason| format!("{label}：{reason}"))
-                .unwrap_or_else(|| label.to_string())
+            format!("{label}：{}", wait.reason_code)
         });
 
         let mut segments = Vec::new();

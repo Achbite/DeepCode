@@ -4430,6 +4430,7 @@ struct SessionKernelTimelineDeltaV2 {
     event_count: u64,
     turn_replacements: Vec<Value>,
     removed_turn_ids: Vec<String>,
+    operations: Vec<Value>,
     root_replacements: BTreeMap<String, Value>,
 }
 
@@ -5183,10 +5184,10 @@ impl SessionKernelProjectionSinkV2 {
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
         with_storage_path_lock(&guard_path, || {
             let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
-            let records = read_public_timeline_records(&path, session_id)?;
+            let records = read_public_timeline_records_for_view(&path, session_id)?;
             records
                 .last()
-                .map(|record| normalize_latest_public_timeline(&record.timeline))
+                .map(|record| normalize_public_timeline_for_view(&record.timeline))
                 .transpose()
         })
     }
@@ -5490,8 +5491,8 @@ fn validate_projection_timeline_update(
                     "Only Provider composing projections may use a timeline delta",
                 ));
             }
-            if delta.schema_version != "deepcode.shared-conversation-projection.v2"
-                || delta.shape_version != "deepcode.shared-conversation.work-segments.v2"
+            if delta.schema_version != "deepcode.shared-conversation-projection.v3"
+                || delta.shape_version != "deepcode.shared-conversation.work-segments.v3"
                 || delta.session_id != session_id
             {
                 return Err(HostV2StorageError::invalid(
@@ -5522,7 +5523,6 @@ fn validate_projection_timeline_update(
             let allowed_roots = HashSet::from([
                 "taskProjection",
                 "interactionProjection",
-                "runProjection",
                 "tokenUsageProjection",
                 "workspaceProjection",
             ]);
@@ -5564,6 +5564,11 @@ fn validate_projection_timeline_update(
                     ));
                 }
             }
+            validate_timeline_delta_operations_v3(
+                &delta.operations,
+                &replacement_ids,
+                &removed_ids,
+            )?;
             Ok(())
         }
     }
@@ -5584,6 +5589,186 @@ fn validate_projection_snapshot(
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_identity_mismatch",
             "Session public timeline belongs to another Session",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_timeline_delta_operations_v3(
+    operations: &[Value],
+    replacement_ids: &HashSet<&str>,
+    removed_ids: &HashSet<&str>,
+) -> Result<(), HostV2StorageError> {
+    let mut run_updates = 0_u8;
+    let mut append_targets = HashSet::new();
+    for operation in operations {
+        let object = operation.as_object().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_timeline_operation_invalid",
+                "Session timeline delta operation must be an exact object",
+            )
+        })?;
+        match object.get("kind").and_then(Value::as_str) {
+            Some("run.updated") => {
+                if object.len() != 2 || !object.contains_key("runProjection") {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_run_update_invalid",
+                        "Session timeline run.updated must contain only kind and runProjection",
+                    ));
+                }
+                run_updates = run_updates.saturating_add(1);
+                if run_updates > 1 {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_run_update_duplicate",
+                        "Session timeline delta contains more than one run.updated operation",
+                    ));
+                }
+                let run_projection = object
+                    .get("runProjection")
+                    .expect("run.updated field checked");
+                if !run_projection.is_null() && !run_projection.is_object() {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_run_update_invalid",
+                        "Session timeline run.updated projection must be an object or null",
+                    ));
+                }
+            }
+            Some("text.append") => {
+                if object.len() != 2 {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_invalid",
+                        "Session timeline text.append must contain only kind and append",
+                    ));
+                }
+                let append = object
+                    .get("append")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires an append object",
+                        )
+                    })?;
+                let required = [
+                    "turnId",
+                    "blockId",
+                    "baseBlockRevision",
+                    "blockRevision",
+                    "textDelta",
+                    "sourceEventRefs",
+                ];
+                if append.len() != required.len()
+                    || required.iter().any(|field| !append.contains_key(*field))
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_invalid",
+                        "Session timeline text.append does not use the exact v3 shape",
+                    ));
+                }
+                let turn_id = append
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires turnId",
+                        )
+                    })?;
+                let block_id = append
+                    .get("blockId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires blockId",
+                        )
+                    })?;
+                validate_bounded_identity(turn_id, "textAppend.turnId", 512)?;
+                validate_bounded_identity(block_id, "textAppend.blockId", 512)?;
+                if replacement_ids.contains(turn_id) || removed_ids.contains(turn_id) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_conflict",
+                        "Session timeline text.append conflicts with a turn replacement or removal",
+                    ));
+                }
+                if !append_targets.insert((turn_id, block_id)) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_duplicate",
+                        "Session timeline delta repeats a text append target",
+                    ));
+                }
+                let base_revision = append
+                    .get("baseBlockRevision")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0 && *value <= MAX_SAFE_INTEGER_V3)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append base revision must be positive and safe",
+                        )
+                    })?;
+                let block_revision = append
+                    .get("blockRevision")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value <= MAX_SAFE_INTEGER_V3)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append revision must be safe",
+                        )
+                    })?;
+                if base_revision.checked_add(1) != Some(block_revision) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_revision_invalid",
+                        "Session timeline text.append must advance exactly one block revision",
+                    ));
+                }
+                if append
+                    .get("textDelta")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_invalid",
+                        "Session timeline text.append textDelta must be non-empty",
+                    ));
+                }
+                let source_refs = append
+                    .get("sourceEventRefs")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires sourceEventRefs",
+                        )
+                    })?;
+                let mut unique_refs = HashSet::new();
+                if source_refs.is_empty()
+                    || source_refs.iter().any(|source_ref| {
+                        source_ref
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .is_none_or(|value| !unique_refs.insert(value))
+                    })
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_source_invalid",
+                        "Session timeline text.append source refs must be non-empty and unique",
+                    ));
+                }
+            }
+            _ => {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_timeline_operation_invalid",
+                    "Session timeline delta operation kind is unsupported",
+                ))
+            }
+        }
+    }
+    if run_updates != 1 {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_timeline_run_update_missing",
+            "Provider composing timeline delta requires exactly one run.updated operation",
         ));
     }
     Ok(())
@@ -5715,6 +5900,15 @@ fn apply_projection_timeline_delta(
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX)
     });
+    for operation in &delta.operations {
+        if operation.get("kind").and_then(Value::as_str) == Some("text.append") {
+            let append = operation
+                .get("append")
+                .and_then(Value::as_object)
+                .expect("timeline text.append validated before application");
+            apply_timeline_text_append_v3(&mut turns, append)?;
+        }
+    }
     timeline.insert("schemaVersion".to_string(), json!(delta.schema_version));
     timeline.insert("shapeVersion".to_string(), json!(delta.shape_version));
     timeline.insert("sessionId".to_string(), json!(delta.session_id));
@@ -5733,7 +5927,135 @@ fn apply_projection_timeline_delta(
             timeline.insert(field.clone(), replacement.clone());
         }
     }
+    for operation in &delta.operations {
+        if operation.get("kind").and_then(Value::as_str) != Some("run.updated") {
+            continue;
+        }
+        let run_projection = operation
+            .get("runProjection")
+            .expect("timeline run.updated validated before application");
+        if run_projection.is_null() {
+            timeline.remove("runProjection");
+        } else {
+            timeline.insert("runProjection".to_string(), run_projection.clone());
+        }
+    }
     Ok(Value::Object(timeline))
+}
+
+fn apply_timeline_text_append_v3(
+    turns: &mut [Value],
+    append: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    let turn_id = append
+        .get("turnId")
+        .and_then(Value::as_str)
+        .expect("timeline text.append turnId validated");
+    let block_id = append
+        .get("blockId")
+        .and_then(Value::as_str)
+        .expect("timeline text.append blockId validated");
+    let base_revision = append
+        .get("baseBlockRevision")
+        .and_then(Value::as_u64)
+        .expect("timeline text.append base revision validated");
+    let block_revision = append
+        .get("blockRevision")
+        .and_then(Value::as_u64)
+        .expect("timeline text.append block revision validated");
+    let text_delta = append
+        .get("textDelta")
+        .and_then(Value::as_str)
+        .expect("timeline text.append text validated");
+    let source_refs = append
+        .get("sourceEventRefs")
+        .and_then(Value::as_array)
+        .expect("timeline text.append source refs validated");
+    let turn = turns
+        .iter_mut()
+        .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_timeline_text_append_turn_missing",
+                "Session timeline text.append target turn does not exist",
+            )
+        })?;
+    let blocks = turn
+        .get_mut("blocks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline turn has no blocks",
+            )
+        })?;
+    let block = blocks
+        .iter_mut()
+        .find(|block| block.get("id").and_then(Value::as_str) == Some(block_id))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_timeline_text_append_block_missing",
+                "Session timeline text.append target block does not exist",
+            )
+        })?;
+    if block.get("kind").and_then(Value::as_str) != Some("assistant")
+        || block.get("narrativeKind").and_then(Value::as_str) != Some("assistantText")
+        || block.get("revision").and_then(Value::as_u64) != Some(base_revision)
+    {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_timeline_text_append_contract_invalid",
+            "Session timeline text.append does not match the canonical assistant block",
+        ));
+    }
+    let summary = block
+        .get("summary")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline block has no summary",
+            )
+        })?;
+    let body = block
+        .get("bodyMarkdown")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let next_summary = format!("{summary}{text_delta}");
+    let next_body = format!("{body}{text_delta}");
+    let provenance = block
+        .get_mut("provenance")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline block has no provenance",
+            )
+        })?;
+    let current_refs = provenance
+        .get_mut("sourceEventRefs")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline block has no source refs",
+            )
+        })?;
+    if source_refs
+        .iter()
+        .any(|source_ref| current_refs.contains(source_ref))
+    {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_timeline_text_append_source_conflict",
+            "Session timeline text.append source refs do not monotonically extend the block",
+        ));
+    }
+    current_refs.extend(source_refs.iter().cloned());
+    block.insert("revision".to_string(), json!(block_revision));
+    block.insert("summary".to_string(), json!(next_summary));
+    block.insert("bodyMarkdown".to_string(), json!(next_body));
+    Ok(())
 }
 
 fn validate_resolved_projection_digest(
@@ -7186,9 +7508,9 @@ fn read_public_timeline_records(
         }
         reject_transport_capabilities(&record.timeline)?;
         if record.timeline.get("schemaVersion").and_then(Value::as_str)
-            != Some("deepcode.shared-conversation-projection.v2")
+            != Some("deepcode.shared-conversation-projection.v3")
             || record.timeline.get("shapeVersion").and_then(Value::as_str)
-                != Some("deepcode.shared-conversation.work-segments.v2")
+                != Some("deepcode.shared-conversation.work-segments.v3")
         {
             return Err(HostV2StorageError::conflict(
                 "UnsupportedHistorySchema",
@@ -7236,11 +7558,162 @@ fn read_public_timeline_records(
     Ok(records)
 }
 
-fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
+fn read_public_timeline_records_for_view(
+    path: &FsPath,
+    session_id: &str,
+) -> Result<Vec<HostSessionPublicTimelineRecordV2>, HostV2StorageError> {
+    let mut records: Vec<HostSessionPublicTimelineRecordV2> = Vec::new();
+    let mut projections = HashMap::new();
+    let mut history_schema: Option<&'static str> = None;
+    for value in read_bounded_json_lines(path)? {
+        let record: HostSessionPublicTimelineRecordV2 =
+            serde_json::from_value(value).map_err(|error| {
+                HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_history_corrupt",
+                    format!("decode Session public timeline record: {error}"),
+                )
+            })?;
+        if record.schema_version != HOST_SESSION_PUBLIC_TIMELINE_V2_SCHEMA
+            || canonical_sha256(&record.timeline)? != record.timeline_digest
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Session public timeline failed schema or digest validation",
+            ));
+        }
+        reject_transport_capabilities(&record.timeline)?;
+        let schema = match (
+            record.timeline.get("schemaVersion").and_then(Value::as_str),
+            record.timeline.get("shapeVersion").and_then(Value::as_str),
+        ) {
+            (
+                Some("deepcode.shared-conversation-projection.v3"),
+                Some("deepcode.shared-conversation.work-segments.v3"),
+            ) => "v3",
+            (
+                Some("deepcode.shared-conversation-projection.v2"),
+                Some("deepcode.shared-conversation.work-segments.v2"),
+            ) => "v2",
+            _ => {
+                return Err(HostV2StorageError::conflict(
+                    "UnsupportedHistorySchema",
+                    "Prior public Session projection uses an unsupported schema or shape",
+                ))
+            }
+        };
+        if history_schema.is_some_and(|existing| existing != schema) {
+            return Err(HostV2StorageError::conflict(
+                "UnsupportedHistorySchema",
+                "Mixed v2/v3 public Session projection history is not readable",
+            ));
+        }
+        history_schema = Some(schema);
+        if schema == "v3" {
+            normalize_latest_public_timeline(&record.timeline)?;
+        }
+        if record.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id)
+            || timeline_u64(&record.timeline, "revision")? != record.timeline_revision
+            || timeline_u64(&record.timeline, "sourceEventVersion")? != record.source_event_version
+            || timeline_u64(&record.timeline, "eventCount")? > record.source_event_version
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Session public timeline record has inconsistent identity or version",
+            ));
+        }
+        if let Some(existing) = projections.get(&record.projection_id) {
+            if existing != &record {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_identity_conflict",
+                    "Session public timeline history has conflicting projection content",
+                ));
+            }
+            continue;
+        }
+        if let Some(previous) = records.last() {
+            if record.timeline_revision <= previous.timeline_revision
+                || record.source_event_version <= previous.source_event_version
+            {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_history_corrupt",
+                    "Session public timeline history is not strictly monotonic",
+                ));
+            }
+        }
+        projections.insert(record.projection_id.clone(), record.clone());
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn normalize_public_timeline_for_view(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        == Some("deepcode.shared-conversation-projection.v3")
+        && timeline.get("shapeVersion").and_then(Value::as_str)
+            == Some("deepcode.shared-conversation.work-segments.v3")
+    {
+        return normalize_latest_public_timeline(timeline);
+    }
     if timeline.get("schemaVersion").and_then(Value::as_str)
         != Some("deepcode.shared-conversation-projection.v2")
         || timeline.get("shapeVersion").and_then(Value::as_str)
             != Some("deepcode.shared-conversation.work-segments.v2")
+    {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Prior public Session projection uses an unsupported schema or shape",
+        ));
+    }
+    let mut normalized = timeline.clone();
+    let object = normalized.as_object_mut().ok_or_else(|| {
+        HostV2StorageError::conflict(
+            "session_kernel_public_timeline_history_corrupt",
+            "Legacy public Session projection is not an object",
+        )
+    })?;
+    if let Some(run_projection) = object
+        .get_mut("runProjection")
+        .and_then(Value::as_object_mut)
+    {
+        let terminal = run_projection.get("phase").and_then(Value::as_str) == Some("settled")
+            && matches!(
+                run_projection.get("status").and_then(Value::as_str),
+                Some("succeeded" | "failed" | "cancelled")
+            );
+        if !terminal {
+            return Err(HostV2StorageError::conflict(
+                "session_language_policy_unavailable",
+                "Legacy v2 Session can only be viewed after its Run reached a terminal state",
+            ));
+        }
+        run_projection.insert("currentActivity".to_string(), Value::Null);
+        run_projection.insert("wait".to_string(), Value::Null);
+    }
+    object.insert(
+        "schemaVersion".to_string(),
+        json!("deepcode.shared-conversation-projection.v3"),
+    );
+    object.insert(
+        "shapeVersion".to_string(),
+        json!("deepcode.shared-conversation.work-segments.v3"),
+    );
+    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+        &normalized,
+    )
+    .map_err(|message| {
+        HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            format!("Legacy v2 Session cannot be normalized as a read-only v3 view: {message}"),
+        )
+    })?;
+    Ok(normalized)
+}
+
+fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.shared-conversation-projection.v3")
+        || timeline.get("shapeVersion").and_then(Value::as_str)
+            != Some("deepcode.shared-conversation.work-segments.v3")
     {
         return Err(HostV2StorageError::conflict(
             "UnsupportedHistorySchema",

@@ -17,7 +17,7 @@ import {
   AgentTimelineRevisionGapError,
   UnsupportedTimelineHistorySchemaError,
   applyAgentTimelineDelta,
-  assertSharedConversationProjectionV2,
+  assertSharedConversationProjectionV3,
   createWorkspaceBinding,
   createWorkspaceScope,
   createWorkspaceScopeKey,
@@ -631,7 +631,7 @@ function requireExactNativeTimeline(value: unknown): AgentTimelineResult {
   ) {
     throw new UnsupportedTimelineHistorySchemaError();
   }
-  assertSharedConversationProjectionV2(value);
+  assertSharedConversationProjectionV3(value);
   return value;
 }
 

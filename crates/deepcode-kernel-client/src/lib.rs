@@ -13,30 +13,32 @@ use thiserror::Error;
 mod agent;
 mod agent_projection;
 mod bootstrap;
+mod private_analysis;
 mod v2;
 
 pub use agent::{
-    terminal_workspace_scope, AgentConversationTargetV1, AgentProjectConversationTargetV1,
-    AgentInputAttachmentKindV3,
-    AgentInputAttachmentScopeV3, AgentInputAttachmentV3, AgentRunCallerRequest,
-    AgentRunGuidanceRequest, AgentRunResult, AgentRunStatus, AgentSessionListResult,
-    AgentSessionResult, CreateAgentSessionRequest, ListAgentSessionsRequest,
-    StartAgentRunRequest, StartProjectAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentConversationTargetV1, AgentInputAttachmentKindV3,
+    AgentInputAttachmentScopeV3, AgentInputAttachmentV3, AgentProjectConversationTargetV1,
+    AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult, AgentRunStatus,
+    AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
+    ListAgentSessionsRequest, StartAgentRunRequest, StartProjectAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 pub use agent_projection::{
     reduce_agent_timeline_stream_event, AgentProjectionValidationError, AgentTimelineAttachment,
     AgentTimelineAttachmentKind, AgentTimelineAttachmentScope, AgentTimelineBlock,
     AgentTimelineBlockKind, AgentTimelineCheckpointKind, AgentTimelineCurrentActivity,
-    AgentTimelineCurrentActivityCode, AgentTimelineDecisionRequest, AgentTimelineDecisionSource,
-    AgentTimelineDeliveryMode, AgentTimelineDelta, AgentTimelineDisplayDensity,
-    AgentTimelineDisplayHints, AgentTimelineDurability, AgentTimelineEntryRole,
-    AgentTimelineEvidenceMode, AgentTimelineExecutionPhase, AgentTimelineInteractionKind,
-    AgentTimelineInteractionOption, AgentTimelineInteractionProjection,
-    AgentTimelineInteractionState, AgentTimelineInteractionView, AgentTimelineLanguage,
-    AgentTimelineLanguageBinding, AgentTimelineLanguageBindingStatus, AgentTimelineLocalizedText,
-    AgentTimelineNarrativeKind, AgentTimelineNullableCurrentActivity,
-    AgentTimelineNullableTaskOutcome, AgentTimelineNullableWait,
-    AgentTimelineNullableWorkAttention, AgentTimelinePendingInteraction,
+    AgentTimelineCurrentActivityCode, AgentTimelineCurrentActivitySource,
+    AgentTimelineCurrentActivityStatus, AgentTimelineDecisionRequest, AgentTimelineDecisionSource,
+    AgentTimelineDeliveryMode, AgentTimelineDelta, AgentTimelineDeltaOperationV3,
+    AgentTimelineDisplayDensity, AgentTimelineDisplayHints, AgentTimelineDurability,
+    AgentTimelineEntryRole, AgentTimelineEvidenceMode, AgentTimelineExecutionPhase,
+    AgentTimelineInteractionKind, AgentTimelineInteractionOption,
+    AgentTimelineInteractionProjection, AgentTimelineInteractionState,
+    AgentTimelineInteractionView, AgentTimelineLanguage, AgentTimelineLanguageBinding,
+    AgentTimelineLanguageBindingStatus, AgentTimelineLocalizedText, AgentTimelineNarrativeKind,
+    AgentTimelineNullableCurrentActivity, AgentTimelineNullableTaskOutcome,
+    AgentTimelineNullableWait, AgentTimelineNullableWorkAttention, AgentTimelinePendingInteraction,
     AgentTimelinePendingPermission, AgentTimelinePendingPlan, AgentTimelinePermissionRequestKind,
     AgentTimelinePermissionRequestView, AgentTimelineProjectionReplacement,
     AgentTimelineProvenance, AgentTimelineProvenanceAuthority, AgentTimelineProvenanceOrigin,
@@ -54,9 +56,10 @@ pub use agent_projection::{
     AgentTimelineWaitKind, AgentTimelineWorkAttention, AgentTimelineWorkAttentionKind,
     AgentTimelineWorkAttentionStatus, AgentTimelineWorkOperation,
     AgentTimelineWorkOperationAttempt, AgentTimelineWorkOperationStatus, AgentTimelineWorkSegment,
-    AgentTimelineWorkSegmentLifecycle, AgentTimelineWorkspaceProjection,
-    AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
+    AgentTimelineWorkSegmentLifecycle, AgentTimelineWorkspaceProjection, ConversationTextAppendV3,
+    AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2, AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3,
     AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+    AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3,
 };
 
 const AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -116,6 +119,12 @@ impl AgentTimelineSseStream {
     }
 }
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
+pub use private_analysis::{
+    PrivateAnalysisBoundaryV1, PrivateAnalysisItemV1, PrivateAnalysisLeaseReceiptV1,
+    PrivateAnalysisLeaseRequestV1, PrivateAnalysisProjectionV1, PrivateAnalysisRevokeReceiptV1,
+    PrivateAnalysisStatusV1, PrivateAnalysisToolV1, PRIVATE_ANALYSIS_LEASE_HEADER_V1,
+    PRIVATE_ANALYSIS_LEASE_SCHEMA_V1, PRIVATE_ANALYSIS_PROJECTION_SCHEMA_V1,
+};
 pub use v2::{
     KernelV2ClientError, KernelV2ClientResult, KernelV2HttpErrorCode, SessionKernelV2Client,
 };
@@ -307,18 +316,18 @@ impl HttpKernelClient {
         self.health().await
     }
 
-    pub async fn agent_timeline_v2(
+    pub async fn agent_timeline_v3(
         &self,
         session_id: &str,
     ) -> KernelClientResult<AgentTimelineSnapshot> {
-        self.agent_timeline_v2_optional(session_id)
+        self.agent_timeline_v3_optional(session_id)
             .await?
             .ok_or_else(|| {
-                KernelClientError::Api("Session v2 public timeline is not available".to_string())
+                KernelClientError::Api("Session v3 public timeline is not available".to_string())
             })
     }
 
-    pub async fn agent_timeline_v2_optional(
+    pub async fn agent_timeline_v3_optional(
         &self,
         session_id: &str,
     ) -> KernelClientResult<Option<AgentTimelineSnapshot>> {
@@ -345,7 +354,7 @@ impl HttpKernelClient {
         Ok(Some(timeline))
     }
 
-    pub async fn agent_timeline_stream_v2(
+    pub async fn agent_timeline_stream_v3(
         &self,
         session_id: &str,
         after_revision: Option<u64>,
@@ -382,6 +391,32 @@ impl HttpKernelClient {
             pending: VecDeque::new(),
             ended: false,
         })
+    }
+
+    #[deprecated(note = "live conversation projection uses v3")]
+    pub async fn agent_timeline_v2(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<AgentTimelineSnapshot> {
+        self.agent_timeline_v3(session_id).await
+    }
+
+    #[deprecated(note = "live conversation projection uses v3")]
+    pub async fn agent_timeline_v2_optional(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<Option<AgentTimelineSnapshot>> {
+        self.agent_timeline_v3_optional(session_id).await
+    }
+
+    #[deprecated(note = "live conversation projection uses v3")]
+    pub async fn agent_timeline_stream_v2(
+        &self,
+        session_id: &str,
+        after_revision: Option<u64>,
+    ) -> KernelClientResult<AgentTimelineSseStream> {
+        self.agent_timeline_stream_v3(session_id, after_revision)
+            .await
     }
 
     pub async fn list_agent_sessions(
@@ -560,9 +595,7 @@ impl HttpKernelClient {
         request.validate()?;
         let value = self
             .http
-            .post(self.url(&format!(
-                "/api/agent/projects/{project_id}/sessions/runs"
-            )))
+            .post(self.url(&format!("/api/agent/projects/{project_id}/sessions/runs")))
             .json(&request)
             .send()
             .await?
@@ -683,6 +716,90 @@ impl HttpKernelClient {
             .json::<Value>()
             .await?;
         decode_api_data_with_code(value)
+    }
+
+    pub async fn mint_private_analysis_lease(
+        &self,
+        session_id: &str,
+        request: PrivateAnalysisLeaseRequestV1,
+    ) -> KernelClientResult<PrivateAnalysisLeaseReceiptV1> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/private-analysis/lease"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        let receipt: PrivateAnalysisLeaseReceiptV1 = decode_api_data(value)?;
+        if receipt.schema_version != PRIVATE_ANALYSIS_LEASE_SCHEMA_V1
+            || receipt.session_id != session_id
+            || !receipt.capability.starts_with("private-analysis-v1.")
+        {
+            return Err(KernelClientError::Api(
+                "private analysis lease receipt violates its v1 contract".to_string(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    pub async fn private_analysis_page(
+        &self,
+        session_id: &str,
+        capability: &str,
+        after_cursor: Option<&str>,
+        limit: usize,
+    ) -> KernelClientResult<PrivateAnalysisProjectionV1> {
+        let mut request = self
+            .http
+            .get(self.url(&format!(
+                "/api/agent/sessions/{session_id}/private-analysis"
+            )))
+            .header(PRIVATE_ANALYSIS_LEASE_HEADER_V1, capability)
+            .query(&[("limit", limit.to_string())]);
+        if let Some(cursor) = after_cursor {
+            request = request.query(&[("afterCursor", cursor)]);
+        }
+        let value = request.send().await?.json::<Value>().await?;
+        let projection: PrivateAnalysisProjectionV1 = decode_api_data(value)?;
+        if projection.schema_version != PRIVATE_ANALYSIS_PROJECTION_SCHEMA_V1
+            || projection.session_id != session_id
+            || projection.after_cursor.as_deref() != after_cursor
+        {
+            return Err(KernelClientError::Api(
+                "private analysis projection violates its v1 identity contract".to_string(),
+            ));
+        }
+        Ok(projection)
+    }
+
+    pub async fn revoke_private_analysis_lease(
+        &self,
+        session_id: &str,
+        capability: &str,
+    ) -> KernelClientResult<PrivateAnalysisRevokeReceiptV1> {
+        let value = self
+            .http
+            .delete(self.url(&format!(
+                "/api/agent/sessions/{session_id}/private-analysis/lease"
+            )))
+            .header(PRIVATE_ANALYSIS_LEASE_HEADER_V1, capability)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        let receipt: PrivateAnalysisRevokeReceiptV1 = decode_api_data(value)?;
+        if receipt.schema_version != PRIVATE_ANALYSIS_LEASE_SCHEMA_V1
+            || receipt.session_id != session_id
+            || !receipt.revoked
+        {
+            return Err(KernelClientError::Api(
+                "private analysis revoke receipt violates its v1 contract".to_string(),
+            ));
+        }
+        Ok(receipt)
     }
 
     fn url(&self, path: &str) -> String {

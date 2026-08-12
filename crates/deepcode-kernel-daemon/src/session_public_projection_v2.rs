@@ -1,8 +1,8 @@
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
-const PROJECTION_SCHEMA_V2: &str = "deepcode.shared-conversation-projection.v2";
-const WORK_SEGMENTS_SHAPE_V2: &str = "deepcode.shared-conversation.work-segments.v2";
+const PROJECTION_SCHEMA_V3: &str = "deepcode.shared-conversation-projection.v3";
+const WORK_SEGMENTS_SHAPE_V3: &str = "deepcode.shared-conversation.work-segments.v3";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROVIDER_USAGE_TOKENS: u64 = 1_000_000_000_000;
 
@@ -36,11 +36,11 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<(), String> {
         &allowed_root,
         "projection",
     )?;
-    if object.get("schemaVersion").and_then(Value::as_str) != Some(PROJECTION_SCHEMA_V2) {
-        return Err("Session v2 public projection has an unsupported schema".to_string());
+    if object.get("schemaVersion").and_then(Value::as_str) != Some(PROJECTION_SCHEMA_V3) {
+        return Err("Session v3 public projection has an unsupported schema".to_string());
     }
-    if object.get("shapeVersion").and_then(Value::as_str) != Some(WORK_SEGMENTS_SHAPE_V2) {
-        return Err("Session v2 public projection requires the work-segments shape".to_string());
+    if object.get("shapeVersion").and_then(Value::as_str) != Some(WORK_SEGMENTS_SHAPE_V3) {
+        return Err("Session v3 public projection requires the work-segments shape".to_string());
     }
     reject_private_projection_fields(timeline)?;
     validate_projection_identity(object)?;
@@ -77,9 +77,7 @@ struct NativeProjectionIdentities<'a> {
     turn_ids: HashSet<&'a str>,
     block_ids: HashSet<&'a str>,
     work_segment_ids: HashSet<&'a str>,
-    work_segment_turn_ids: HashMap<&'a str, &'a str>,
     operation_ids: HashSet<&'a str>,
-    operation_segment_ids: HashMap<&'a str, &'a str>,
 }
 
 fn validate_projection_identity(object: &Map<String, Value>) -> Result<(), String> {
@@ -164,7 +162,6 @@ fn validate_native_turn<'a>(
                 "Session v2 public projection repeats work segment {segment_id}"
             ));
         }
-        identities.work_segment_turn_ids.insert(segment_id, turn_id);
     }
 
     validate_turn_parts(
@@ -981,9 +978,6 @@ fn validate_work_segment<'a>(
                 "Session v2 public projection repeats operation {operation_id}"
             ));
         }
-        identities
-            .operation_segment_ids
-            .insert(operation_id, segment_id);
         local_operation_statuses.insert(operation_id, operation_status);
     }
     match object.get("attention") {
@@ -1750,28 +1744,10 @@ fn validate_run_projection(
         Some(activity) => {
             validate_current_activity(activity)?;
             let activity = activity.as_object().expect("validated currentActivity");
-            let work_segment_id = activity.get("workSegmentId").and_then(Value::as_str);
-            if let Some(work_segment_id) = work_segment_id {
-                if turn_id.is_none()
-                    || identities
-                        .work_segment_turn_ids
-                        .get(work_segment_id)
-                        .copied()
-                        != turn_id
-                {
+            if let Some(detail_block_id) = activity.get("detailBlockId").and_then(Value::as_str) {
+                if !identities.block_ids.contains(detail_block_id) {
                     return Err(
-                        "Session v2 public projection currentActivity references another turn work segment"
-                            .to_string(),
-                    );
-                }
-            }
-            if let Some(operation_id) = activity.get("operationId").and_then(Value::as_str) {
-                if work_segment_id.is_none()
-                    || identities.operation_segment_ids.get(operation_id).copied()
-                        != work_segment_id
-                {
-                    return Err(
-                        "Session v2 public projection currentActivity operation does not belong to its work segment"
+                        "Session v3 public projection currentActivity references a missing block"
                             .to_string(),
                     );
                 }
@@ -1852,14 +1828,19 @@ fn validate_run_projection_semantics(object: &Map<String, Value>) -> Result<(), 
 
 fn validate_current_activity(value: &Value) -> Result<(), String> {
     let object = value.as_object().ok_or_else(|| {
-        "Session v2 public projection currentActivity must be an object".to_string()
+        "Session v3 public projection currentActivity must be an object".to_string()
     })?;
     let allowed = HashSet::from([
+        "activityId",
+        "revision",
         "code",
-        "summary",
-        "operationId",
-        "workSegmentId",
+        "source",
+        "status",
+        "startedAt",
         "updatedAt",
+        "message",
+        "detailBlockId",
+        "providerRequestId",
     ]);
     reject_unknown_fields(
         object.keys().map(String::as_str),
@@ -1881,18 +1862,55 @@ fn validate_current_activity(value: &Value) -> Result<(), String> {
         ],
         "currentActivity.code",
     )?;
-    if object.get("code").and_then(Value::as_str) == Some("provider.reasoning")
-        && object.contains_key("summary")
-    {
+    required_identity(object.get("activityId"), "currentActivity.activityId")?;
+    if required_safe_integer(object.get("revision"), "currentActivity.revision")? == 0 {
         return Err(
-            "Session v2 public projection provider reasoning activity cannot expose a summary"
+            "Session v3 public projection currentActivity revision must be positive".to_string(),
+        );
+    }
+    validate_required_enum(
+        object.get("source"),
+        &["session", "provider", "resource", "kernel", "retry"],
+        "currentActivity.source",
+    )?;
+    validate_required_enum(object.get("status"), &["active"], "currentActivity.status")?;
+    let code = object
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected_source = if code.starts_with("provider.") {
+        "provider"
+    } else if code.starts_with("resource.") {
+        "resource"
+    } else if code.starts_with("kernel.") {
+        "kernel"
+    } else if code.starts_with("retry.") {
+        "retry"
+    } else {
+        "session"
+    };
+    if object.get("source").and_then(Value::as_str) != Some(expected_source) {
+        return Err(
+            "Session v3 public projection currentActivity source does not match its code"
                 .to_string(),
         );
     }
+    if object.get("code").and_then(Value::as_str) == Some("provider.reasoning")
+        && object.contains_key("message")
+    {
+        return Err(
+            "Session v3 public projection provider reasoning activity cannot expose a message"
+                .to_string(),
+        );
+    }
+    required_identity(object.get("startedAt"), "currentActivity.startedAt")?;
     required_identity(object.get("updatedAt"), "currentActivity.updatedAt")?;
+    if let Some(message) = object.get("message") {
+        validate_localized_text(message, "currentActivity.message")?;
+    }
     validate_optional_strings(
         object,
-        &["summary", "operationId", "workSegmentId"],
+        &["detailBlockId", "providerRequestId"],
         "currentActivity",
     )
 }
@@ -1900,15 +1918,17 @@ fn validate_current_activity(value: &Value) -> Result<(), String> {
 fn validate_wait(value: &Value) -> Result<(), String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "Session v2 public projection wait must be an object".to_string())?;
-    let allowed = HashSet::from(["kind", "reason", "interactionId"]);
+        .ok_or_else(|| "Session v3 public projection wait must be an object".to_string())?;
+    let allowed = HashSet::from(["kind", "since", "reasonCode", "retryAt", "interactionId"]);
     reject_unknown_fields(object.keys().map(String::as_str), &allowed, "wait")?;
     validate_required_enum(
         object.get("kind"),
         &["user", "external", "paused"],
         "wait.kind",
     )?;
-    validate_optional_strings(object, &["reason", "interactionId"], "wait")
+    required_identity(object.get("since"), "wait.since")?;
+    required_identity(object.get("reasonCode"), "wait.reasonCode")?;
+    validate_optional_strings(object, &["retryAt", "interactionId"], "wait")
 }
 
 fn validate_provenance(value: Option<&Value>, field: &str) -> Result<(), String> {

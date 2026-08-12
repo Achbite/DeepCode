@@ -746,6 +746,8 @@ Usage:
   DeepCode-CLI sessions delete <session-id>
   DeepCode-CLI sessions archive <session-id>
   DeepCode-CLI timeline [session-id]
+  DeepCode-CLI analysis show [--session <id>] [session-id]
+  DeepCode-CLI analysis follow [--session <id>] [session-id]
   DeepCode-CLI permission allow <permission-id>
   DeepCode-CLI permission deny <permission-id>
   DeepCode-CLI decision plan <accept|reject|revise> [--session <id>] [run-id] [plan-revision] [guidance]

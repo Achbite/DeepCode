@@ -2,8 +2,9 @@ use deepcode_kernel_client::{
     terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
     AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot,
     AgentTimelineStatus, AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
-    TerminalWorkspaceScope,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PrivateAnalysisBoundaryV1,
+    PrivateAnalysisItemV1, PrivateAnalysisLeaseRequestV1, PrivateAnalysisStatusV1,
+    StartAgentRunRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
@@ -197,6 +198,18 @@ pub(crate) async fn run(command: Command) -> Result<CliCommandOutcome, String> {
                 .await
                 .map(|_| CliCommandOutcome::Completed)
         }
+        Command::Analysis {
+            api,
+            no_auto_start_kernel,
+            session_id,
+            follow,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_private_analysis(bootstrap.client(), session_id, &host, follow)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
+        }
         Command::Permission {
             api,
             no_auto_start_kernel,
@@ -296,6 +309,13 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         session_id: Option<String>,
+        host: SessionHostOptions,
+    },
+    Analysis {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        session_id: Option<String>,
+        follow: bool,
         host: SessionHostOptions,
     },
     Permission {
@@ -468,6 +488,28 @@ impl Command {
                 session_id: Some(session_id.to_string()),
                 host,
             }),
+            [analysis, action]
+                if analysis == "analysis" && matches!(action.as_str(), "show" | "follow") =>
+            {
+                Ok(Command::Analysis {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: None,
+                    follow: action == "follow",
+                    host,
+                })
+            }
+            [analysis, action, session_id]
+                if analysis == "analysis" && matches!(action.as_str(), "show" | "follow") =>
+            {
+                Ok(Command::Analysis {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: Some(session_id.to_string()),
+                    follow: action == "follow",
+                    host,
+                })
+            }
             [permission, allow, permission_id]
                 if permission == "permission" && allow == "allow" =>
             {

@@ -24,6 +24,7 @@ mod llm_provider_transport;
 mod llm_stream_parser;
 mod llm_transport;
 mod prelude;
+mod private_analysis_v1;
 mod project_store;
 mod provider_cache_admission_v1;
 mod provider_cache_telemetry_v1;
@@ -62,6 +63,7 @@ pub(crate) use kernel_api::*;
 pub(crate) use llm_provider_transport::*;
 pub(crate) use llm_stream_parser::*;
 pub(crate) use llm_transport::*;
+pub(crate) use private_analysis_v1::*;
 pub(crate) use project_store::*;
 pub(crate) use provider_cache_admission_v1::*;
 pub(crate) use provider_cache_telemetry_v1::*;
@@ -261,6 +263,8 @@ async fn main() {
     )
     .expect("open canonical Kernel v2 service");
     let provider_trace_v1 = ProviderTraceStoreV1::new(gui_state.paths.sessions_dir.clone());
+    let private_analysis_v1 =
+        PrivateAnalysisLeaseStoreV1::new(gui_state.paths.sessions_dir.clone());
     let provider_cache_telemetry_v1 =
         ProviderCacheTelemetryStoreV1::new(gui_state.paths.sessions_dir.clone());
     let host_services = HostServices::from_projects(
@@ -325,6 +329,7 @@ async fn main() {
         gui,
         host_services,
         provider_trace_v1,
+        private_analysis_v1,
         provider_cache_telemetry_v1,
         provider_trace_export_limiter_v1:
             crate::provider_trace_api::ProviderTraceExportLimiterV1::default(),

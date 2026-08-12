@@ -259,7 +259,7 @@ function CurrentActivity({
     <div className="agent-projection-current-activity" role="status" aria-live="polite">
       <ActivityIndicator
         activityKey={activity
-          ? `${activity.code}:${activity.workSegmentId ?? ''}:${activity.operationId ?? ''}`
+          ? `${activity.activityId}:${activity.revision}`
           : 'transport-pending'}
         label={currentActivityLabel(activity, language)}
         variant={activity?.code === 'retry.backoff' ? 'retry' : 'default'}
@@ -273,6 +273,7 @@ function currentActivityLabel(
   language: UiLanguage
 ): string {
   if (!activity) return language === 'zh-CN' ? '正在处理' : 'Working';
+  if (activity.message?.text) return activity.message.text;
   const labels: Record<string, readonly [string, string]> = {
     'session.admitting': ['正在接收请求', 'Admitting request'],
     'provider.awaitingFirstByte': ['正在等待模型响应', 'Waiting for model response'],

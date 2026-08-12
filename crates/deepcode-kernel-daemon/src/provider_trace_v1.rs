@@ -231,6 +231,9 @@ pub(crate) struct ProviderTraceCompletedTerminalRecoveryV1 {
 pub(crate) struct ProviderTraceTerminalRecoveryV1 {
     pub(crate) metadata: ProviderTraceMetadataV1,
     pub(crate) reason_code: Option<String>,
+    pub(crate) started_at_unix_ms: String,
+    pub(crate) completed_at_unix_ms: String,
+    pub(crate) reasoning: String,
     pub(crate) exact_request_body: Vec<u8>,
     pub(crate) admission_sidecar: Option<Value>,
     pub(crate) completed: Option<ProviderTraceCompletedTerminalRecoveryV1>,
@@ -1856,6 +1859,8 @@ fn recover_verified_provider_trace_terminal(
     let mut completed: Option<ProviderTraceCompletedTerminalRecoveryV1> = None;
     let mut completed_sequence: Option<u64> = None;
     let mut request_seen = false;
+    let mut started_at_unix_ms: Option<String> = None;
+    let mut completed_at_unix_ms: Option<String> = None;
     let exact_request_body = Some(verified_exact_request_body);
     let admission_sidecar = verified_admission_sidecar;
     let mut reasoning = String::new();
@@ -1883,6 +1888,10 @@ fn recover_verified_provider_trace_terminal(
                     ));
                 }
                 request_seen = true;
+                started_at_unix_ms = record
+                    .get("recordedAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             Some("responseChunk") => {
                 let payload = record
@@ -2011,6 +2020,10 @@ fn recover_verified_provider_trace_terminal(
                         )
                     })?;
                 decoded.validate()?;
+                completed_at_unix_ms = record
+                    .get("recordedAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 terminal = Some(decoded);
             }
             _ => {}
@@ -2054,7 +2067,7 @@ fn recover_verified_provider_trace_terminal(
             }
             completed_evidence.exact_request_body = recovered_request_body.clone();
             completed_evidence.admission_sidecar = admission_sidecar.clone();
-            completed_evidence.reasoning = reasoning;
+            completed_evidence.reasoning = reasoning.clone();
             completed_evidence.raw_upstream_envelopes = raw_upstream_envelopes;
         }
         ProviderTraceTerminalKindV1::Failed
@@ -2072,6 +2085,11 @@ fn recover_verified_provider_trace_terminal(
     Ok(ProviderTraceTerminalRecoveryV1 {
         metadata,
         reason_code: terminal.reason_code,
+        started_at_unix_ms: started_at_unix_ms
+            .ok_or_else(provider_trace_completed_recovery_invalid)?,
+        completed_at_unix_ms: completed_at_unix_ms
+            .ok_or_else(provider_trace_completed_recovery_invalid)?,
+        reasoning,
         exact_request_body: recovered_request_body,
         admission_sidecar,
         completed,

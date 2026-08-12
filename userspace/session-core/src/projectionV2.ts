@@ -24,8 +24,8 @@ import type {
   AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
 import {
-  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3,
   AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2,
   AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2,
 } from '@deepcode/protocol';
@@ -34,9 +34,9 @@ import {
 } from './kernel-v2/inputAttachmentsV2.js';
 
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION =
-  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2;
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3;
 export const NARRATIVE_TIMELINE_SHAPE_VERSION =
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2;
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3;
 
 export interface PendingPermissionProjection {
   request: AgentTimelinePermissionRequestView;
@@ -223,7 +223,7 @@ export function buildNarrativeTimelineProjection(
       buildTokenUsageProjection(input.events),
   };
   stripUndefinedProjectionFields(projection);
-  assertNativeWriterSharedConversationProjectionV2(projection);
+  assertNativeWriterSharedConversationProjectionV3(projection);
   return projection;
 }
 
@@ -233,11 +233,11 @@ export function buildNarrativeTimelineProjection(
  * goes through the canonical full projector and reconciles at a snapshot
  * boundary.
  */
-export function appendProviderComposingProjectionV2(
+export function appendProviderComposingProjectionV3(
   current: AgentTimelineResult,
   event: AgentEvent
 ): AgentTimelineResult {
-  assertNativeWriterSharedConversationProjectionV2(current);
+  assertNativeWriterSharedConversationProjectionV3(current);
   const payload = recordValue(event.payload);
   const runId = stringValue(payload?.runId);
   const providerTurnId = stringValue(payload?.providerTurnId);
@@ -398,14 +398,18 @@ export function appendProviderComposingProjectionV2(
       ...(waiting
         ? {}
         : {
-            currentActivity: {
-              code: 'provider.composing',
-              updatedAt: event.ts,
-            },
+            currentActivity: advanceCurrentActivityV3(
+              runProjection.currentActivity,
+              runId,
+              event,
+              payload,
+              'provider.composing',
+              { detailBlockId: blockId }
+            ),
           }),
     },
   };
-  assertNativeWriterSharedConversationProjectionV2(next);
+  assertNativeWriterSharedConversationProjectionV3(next);
   return next;
 }
 
@@ -616,13 +620,13 @@ export function findLatestPendingPermission(
   return null;
 }
 
-export function assertSharedConversationProjectionV2(
+export function assertSharedConversationProjectionV3(
   value: AgentTimelineResult
 ): void {
   assertSharedConversationProjection(value);
 }
 
-function assertNativeWriterSharedConversationProjectionV2(
+function assertNativeWriterSharedConversationProjectionV3(
   value: AgentTimelineResult
 ): void {
   assertSharedConversationProjection(value);
@@ -663,7 +667,7 @@ function assertSharedConversationProjection(
       && !validRunProjection(value.runProjection)
     )
   ) {
-    throw new Error('session_projection_v2_invalid');
+    throw new Error('session_projection_v3_invalid');
   }
   const rootKeys = new Set([
     'schemaVersion',
@@ -681,14 +685,12 @@ function assertSharedConversationProjection(
     'workspaceProjection',
   ]);
   if (Object.keys(value).some((key) => !rootKeys.has(key))) {
-    throw new Error('session_projection_v2_root_field_invalid');
+    throw new Error('session_projection_v3_root_field_invalid');
   }
   const turnIds = new Set<string>();
   const blockIds = new Set<string>();
   const workSegmentIds = new Set<string>();
   const operationIds = new Set<string>();
-  const workSegmentTurnIds = new Map<string, string>();
-  const operationSegmentIds = new Map<string, string>();
   for (const [turnIndex, turn] of value.turns.entries()) {
     if (
       !recordValue(turn)
@@ -753,13 +755,11 @@ function assertSharedConversationProjection(
       }
       workSegmentIds.add(segment.id);
       localWorkSegmentIds.add(segment.id);
-      workSegmentTurnIds.set(segment.id, turn.id);
       for (const operation of segment.operations) {
         if (operationIds.has(operation.operationId)) {
           throw new Error('session_projection_v2_operation_duplicate');
         }
         operationIds.add(operation.operationId);
-        operationSegmentIds.set(operation.operationId, segment.id);
       }
     }
     const referencedBlocks = new Set<string>();
@@ -834,40 +834,33 @@ function assertSharedConversationProjection(
   }
   const currentActivity = value.runProjection?.currentActivity;
   if (currentActivity !== undefined && currentActivity !== null) {
-    const turnId = value.runProjection?.turnId;
-    const workSegmentId = currentActivity.workSegmentId;
-    const operationId = currentActivity.operationId;
     if (
-      workSegmentId !== undefined
-      && (
-        turnId === undefined
-        || workSegmentTurnIds.get(workSegmentId) !== turnId
-      )
+      currentActivity.detailBlockId !== undefined
+      && !blockIds.has(currentActivity.detailBlockId)
     ) {
-      throw new Error('session_projection_v2_activity_segment_reference_invalid');
-    }
-    if (
-      operationId !== undefined
-      && (
-        workSegmentId === undefined
-        || operationSegmentIds.get(operationId) !== workSegmentId
-      )
-    ) {
-      throw new Error('session_projection_v2_activity_operation_reference_invalid');
+      throw new Error('session_projection_v3_activity_block_reference_invalid');
     }
   }
 }
 
-export function isSharedConversationProjectionV2(
+export function isSharedConversationProjectionV3(
   value: unknown
 ): value is AgentTimelineResult {
   try {
-    assertSharedConversationProjectionV2(value as AgentTimelineResult);
+    assertSharedConversationProjectionV3(value as AgentTimelineResult);
     return true;
   } catch {
     return false;
   }
 }
+
+/** Legacy source-name aliases retained only for compile-time compatibility. */
+export const appendProviderComposingProjectionV2 =
+  appendProviderComposingProjectionV3;
+export const assertSharedConversationProjectionV2 =
+  assertSharedConversationProjectionV3;
+export const isSharedConversationProjectionV2 =
+  isSharedConversationProjectionV3;
 
 export function isSharedConversationBlockV2(
   value: unknown
@@ -4674,10 +4667,13 @@ function buildRunProjection(
     if (stringValue(payload?.runId) !== runId) continue;
     if (privateProjectionEvent(event)) {
       if (activityCodeForEvent(event, payload) === 'provider.reasoning') {
-        currentActivity = {
-          code: 'provider.reasoning',
-          updatedAt: event.ts,
-        };
+        currentActivity = advanceCurrentActivityV3(
+          currentActivity,
+          runId,
+          event,
+          payload,
+          'provider.reasoning'
+        );
       }
       continue;
     }
@@ -4695,15 +4691,21 @@ function buildRunProjection(
       && status !== 'paused'
     ) {
       const summary = stringValue(payload?.summary);
-      const operationId = stringValue(payload?.operationId);
-      const workSegmentId = stringValue(payload?.workSegmentId);
-      currentActivity = {
-        code: activityCode,
-        ...(summary ? { summary } : {}),
-        ...(operationId ? { operationId } : {}),
-        ...(workSegmentId ? { workSegmentId } : {}),
-        updatedAt: event.ts,
-      };
+      currentActivity = advanceCurrentActivityV3(
+        currentActivity,
+        runId,
+        event,
+        payload,
+        activityCode,
+        {
+          ...(summary && activityCode !== 'provider.reasoning'
+            ? { message: { text: summary } }
+            : {}),
+          ...(detailBlockIdForEvent(turns, event.id)
+            ? { detailBlockId: detailBlockIdForEvent(turns, event.id) }
+            : {}),
+        }
+      );
     }
     const projectionKind = stringValue(payload?.projectionKind);
     if (
@@ -4776,7 +4778,11 @@ function buildRunProjection(
         currentActivity = null;
         wait = {
           kind: waitKind,
-          ...(reason ? { reason } : {}),
+          since: event.ts,
+          reasonCode: reason ?? 'unknown',
+          ...(stringValue(payload?.retryAt)
+            ? { retryAt: stringValue(payload?.retryAt) }
+            : {}),
           ...(stringValue(payload?.targetId)
             ? { interactionId: stringValue(payload?.targetId) }
             : {}),
@@ -4818,33 +4824,6 @@ function buildRunProjection(
   const turn = turns.findLast((candidate) =>
     candidate.id.startsWith(`turn:${runId}:`)
   ) ?? turns.at(-1);
-  if (currentActivity?.operationId) {
-    const segment = turn?.workSegments.find((candidate) =>
-      candidate.operations.some((operation) =>
-        operation.operationId === currentActivity?.operationId
-      )
-    );
-    if (segment) {
-      currentActivity = {
-        ...currentActivity,
-        workSegmentId: segment.id,
-      };
-    } else {
-      const { operationId: _operationId, ...withoutOperation } =
-        currentActivity;
-      currentActivity = withoutOperation;
-    }
-  }
-  if (
-    currentActivity?.workSegmentId
-    && !turn?.workSegments.some((segment) =>
-      segment.id === currentActivity?.workSegmentId
-    )
-  ) {
-    const { workSegmentId: _workSegmentId, ...withoutSegment } =
-      currentActivity;
-    currentActivity = withoutSegment;
-  }
   const pendingRunId = pendingInteraction?.kind === 'plan'
     ? pendingInteraction.runId
     : pendingInteraction?.request.runId;
@@ -4858,9 +4837,17 @@ function buildRunProjection(
     status = 'waitingUser';
     phase = 'waiting';
     currentActivity = null;
+    const interactionEvent = events.findLast((event) => {
+      const payload = recordValue(event.payload);
+      return stringValue(payload?.interactionId) === pendingInteraction.interactionId
+        || stringValue(payload?.requestId) === pendingInteraction.interactionId;
+    });
     wait = {
       kind: 'user',
-      reason: pendingInteraction.kind === 'plan'
+      since: interactionEvent?.ts
+        ?? events.at(-1)?.ts
+        ?? new Date(0).toISOString(),
+      reasonCode: pendingInteraction.kind === 'plan'
         ? 'plan'
         : 'scopeExpansion',
       interactionId: pendingInteraction.interactionId,
@@ -4879,6 +4866,78 @@ function buildRunProjection(
       status: 'unavailable',
     },
   };
+}
+
+function advanceCurrentActivityV3(
+  current: AgentTimelineRunProjection['currentActivity'],
+  runId: string,
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined,
+  code: NonNullable<
+    AgentTimelineRunProjection['currentActivity']
+  >['code'],
+  presentation: Pick<
+    NonNullable<AgentTimelineRunProjection['currentActivity']>,
+    'message' | 'detailBlockId'
+  > = {}
+): NonNullable<AgentTimelineRunProjection['currentActivity']> {
+  const providerRequestId = stringValue(payload?.providerRequestId)
+    ?? stringValue(payload?.requestId);
+  const source = currentActivitySourceV3(code);
+  const sameActivity = Boolean(
+    current
+    && current.code === code
+    && current.source === source
+    && current.detailBlockId === presentation.detailBlockId
+    && current.providerRequestId === providerRequestId
+  );
+  const activityId = sameActivity
+    ? current!.activityId
+    : `activity:${runId}:${event.id}`;
+  const revision = sameActivity
+    ? incrementProjectionCounter(current!.revision, 'currentActivity.revision')
+    : 1;
+  return {
+    activityId,
+    revision,
+    code,
+    source,
+    status: 'active',
+    startedAt: sameActivity ? current!.startedAt : event.ts,
+    updatedAt: event.ts,
+    ...(presentation.message ? { message: presentation.message } : {}),
+    ...(presentation.detailBlockId
+      ? { detailBlockId: presentation.detailBlockId }
+      : {}),
+    ...(providerRequestId ? { providerRequestId } : {}),
+  };
+}
+
+function currentActivitySourceV3(
+  code: NonNullable<
+    AgentTimelineRunProjection['currentActivity']
+  >['code']
+): NonNullable<
+  AgentTimelineRunProjection['currentActivity']
+>['source'] {
+  if (code.startsWith('provider.')) return 'provider';
+  if (code.startsWith('resource.')) return 'resource';
+  if (code.startsWith('kernel.')) return 'kernel';
+  if (code.startsWith('retry.')) return 'retry';
+  return 'session';
+}
+
+function detailBlockIdForEvent(
+  turns: AgentTimelineTurn[],
+  eventId: string
+): string | undefined {
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const block = turns[turnIndex]?.blocks.findLast((candidate) =>
+      candidate.provenance.sourceEventRefs.includes(eventId)
+    );
+    if (block) return block.id;
+  }
+  return undefined;
 }
 
 function wholeTurnErrorEvent(
@@ -5926,27 +5985,42 @@ function validRunProjection(value: unknown): boolean {
     const activity = recordValue(currentActivity);
     if (
       !activity
+      || !exactOptionalKeys(activity, [
+        'activityId',
+        'revision',
+        'code',
+        'source',
+        'status',
+        'startedAt',
+        'updatedAt',
+      ], [
+        'message',
+        'detailBlockId',
+        'providerRequestId',
+      ])
+      || !nonemptyString(activity.activityId)
+      || !nonnegativeInteger(activity.revision)
+      || activity.revision === 0
       || !timelineCurrentActivityCode(activity.code)
+      || !timelineCurrentActivitySource(activity.source)
+      || activity.status !== 'active'
+      || !nonemptyString(activity.startedAt)
       || !nonemptyString(activity.updatedAt)
       || (
-        activity.summary !== undefined
-        && typeof activity.summary !== 'string'
+        activity.message !== undefined
+        && !validLocalizedText(activity.message)
       )
       || (
-        activity.operationId !== undefined
-        && !nonemptyString(activity.operationId)
+        activity.code === 'provider.reasoning'
+        && activity.message !== undefined
       )
       || (
-        activity.workSegmentId !== undefined
-        && !nonemptyString(activity.workSegmentId)
+        activity.detailBlockId !== undefined
+        && !nonemptyString(activity.detailBlockId)
       )
-      || Object.keys(activity).some(
-        (key) =>
-          key !== 'code'
-          && key !== 'summary'
-          && key !== 'operationId'
-          && key !== 'workSegmentId'
-          && key !== 'updatedAt'
+      || (
+        activity.providerRequestId !== undefined
+        && !nonemptyString(activity.providerRequestId)
       )
     ) {
       return false;
@@ -5957,20 +6031,24 @@ function validRunProjection(value: unknown): boolean {
     const waitRecord = recordValue(wait);
     if (
       !waitRecord
+      || !exactOptionalKeys(waitRecord, [
+        'kind',
+        'since',
+        'reasonCode',
+      ], [
+        'retryAt',
+        'interactionId',
+      ])
       || (
         waitRecord.kind !== 'user'
         && waitRecord.kind !== 'external'
         && waitRecord.kind !== 'paused'
       )
-      || Object.keys(waitRecord).some(
-        (key) =>
-          key !== 'kind'
-          && key !== 'reason'
-          && key !== 'interactionId'
-      )
+      || !nonemptyString(waitRecord.since)
+      || !nonemptyString(waitRecord.reasonCode)
       || (
-        waitRecord.reason !== undefined
-        && typeof waitRecord.reason !== 'string'
+        waitRecord.retryAt !== undefined
+        && !nonemptyString(waitRecord.retryAt)
       )
       || (
         waitRecord.interactionId !== undefined
@@ -6064,6 +6142,18 @@ function timelineCurrentActivityCode(
     || value === 'session.validating'
     || value === 'session.persisting'
     || value === 'retry.backoff';
+}
+
+function timelineCurrentActivitySource(
+  value: unknown
+): value is NonNullable<
+  AgentTimelineRunProjection['currentActivity']
+>['source'] {
+  return value === 'session'
+    || value === 'provider'
+    || value === 'resource'
+    || value === 'kernel'
+    || value === 'retry';
 }
 
 function workSegmentLifecycle(

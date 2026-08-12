@@ -455,7 +455,7 @@ function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): s
     .join('|');
   const activity = view.runProjection?.currentActivity;
   const activitySignature = activity
-    ? `${activity.code}:${activity.updatedAt}:${activity.operationId ?? ''}`
+    ? `${activity.activityId}:${activity.revision}:${activity.updatedAt}`
     : 'none';
   return `${lastTurn.id}:${lastTurn.status}:${loading ? 'running' : 'idle'}:${blockSignature}:${workSignature}:${activitySignature}`;
 }
@@ -657,7 +657,7 @@ const CurrentActivityLine: React.FC<{
   <div className="deepcode-gui-current-activity" role="status" aria-live="polite">
     <ActivityIndicator
       activityKey={activity
-        ? `${activity.code}:${activity.workSegmentId ?? ''}:${activity.operationId ?? ''}`
+        ? `${activity.activityId}:${activity.revision}`
         : 'transport-pending'}
       label={currentActivityLabel(activity, language)}
       variant={activity?.code === 'retry.backoff' ? 'retry' : 'default'}
@@ -832,16 +832,8 @@ function workSegmentSummary(
 
 function currentWorkOperation(
   segment: AgentTimelineWorkSegment,
-  currentActivity: AgentTimelineCurrentActivity | null
+  _currentActivity: AgentTimelineCurrentActivity | null
 ): AgentTimelineWorkOperation | undefined {
-  if (
-    currentActivity?.operationId
-    && currentActivity.workSegmentId === segment.id
-  ) {
-    return segment.operations.find((operation) =>
-      operation.operationId === currentActivity.operationId
-    );
-  }
   if (segment.activeOperationId) {
     return segment.operations.find((operation) =>
       operation.operationId === segment.activeOperationId

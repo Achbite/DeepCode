@@ -19,7 +19,7 @@ import {
   normalizeAgentTimelineSnapshot,
 } from '../timelineDelta.js';
 import {
-  appendProviderComposingProjectionV2,
+  appendProviderComposingProjectionV3,
 } from '../projectionV2.js';
 import type {
   SessionKernelHostProjectionSinkV2,
@@ -254,7 +254,7 @@ implements SessionKernelHostProjectionSinkV2 {
     let timelineUpdate:
       SessionKernelHostProjectionRequestV2['timelineUpdate'];
     if (event.kind === 'provider.composing' && this.currentTimeline) {
-      timeline = appendProviderComposingProjectionV2(
+      timeline = appendProviderComposingProjectionV3(
         this.currentTimeline,
         agentEvent
       );

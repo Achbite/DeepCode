@@ -8,6 +8,10 @@ pub const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2: &str =
     "deepcode.shared-conversation-projection.v2";
 pub const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2: &str =
     "deepcode.shared-conversation.work-segments.v2";
+pub const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3: &str =
+    "deepcode.shared-conversation-projection.v3";
+pub const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3: &str =
+    "deepcode.shared-conversation.work-segments.v3";
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -766,17 +770,42 @@ pub enum AgentTimelineCurrentActivityCode {
     RetryBackoff,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineCurrentActivitySource {
+    #[serde(rename = "session")]
+    Session,
+    #[serde(rename = "provider")]
+    Provider,
+    #[serde(rename = "resource")]
+    Resource,
+    #[serde(rename = "kernel")]
+    Kernel,
+    #[serde(rename = "retry")]
+    Retry,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineCurrentActivityStatus {
+    #[serde(rename = "active")]
+    Active,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTimelineCurrentActivity {
+    pub activity_id: String,
+    pub revision: u64,
     pub code: AgentTimelineCurrentActivityCode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_segment_id: Option<String>,
+    pub source: AgentTimelineCurrentActivitySource,
+    pub status: AgentTimelineCurrentActivityStatus,
+    pub started_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<AgentTimelineLocalizedText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_block_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -793,8 +822,10 @@ pub enum AgentTimelineWaitKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTimelineWait {
     pub kind: AgentTimelineWaitKind,
+    pub since: String,
+    pub reason_code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub retry_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_id: Option<String>,
 }
@@ -1142,11 +1173,6 @@ pub struct AgentTimelineRootProjectionReplacements {
         default,
         skip_serializing_if = "AgentTimelineProjectionReplacement::is_unchanged"
     )]
-    pub run_projection: AgentTimelineProjectionReplacement<AgentTimelineRunProjection>,
-    #[serde(
-        default,
-        skip_serializing_if = "AgentTimelineProjectionReplacement::is_unchanged"
-    )]
     pub token_usage_projection:
         AgentTimelineProjectionReplacement<AgentTimelineTokenUsageProjection>,
     #[serde(
@@ -1154,6 +1180,29 @@ pub struct AgentTimelineRootProjectionReplacements {
         skip_serializing_if = "AgentTimelineProjectionReplacement::is_unchanged"
     )]
     pub workspace_projection: AgentTimelineProjectionReplacement<AgentTimelineWorkspaceProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationTextAppendV3 {
+    pub turn_id: String,
+    pub block_id: String,
+    pub base_block_revision: u64,
+    pub block_revision: u64,
+    pub text_delta: String,
+    pub source_event_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum AgentTimelineDeltaOperationV3 {
+    #[serde(rename = "text.append")]
+    TextAppend { append: ConversationTextAppendV3 },
+    #[serde(rename = "run.updated")]
+    RunUpdated {
+        #[serde(rename = "runProjection")]
+        run_projection: Option<AgentTimelineRunProjection>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,6 +1218,7 @@ pub struct AgentTimelineDelta {
     pub event_count: u64,
     pub turn_replacements: Vec<AgentTimelineTurn>,
     pub removed_turn_ids: Vec<String>,
+    pub operations: Vec<AgentTimelineDeltaOperationV3>,
     pub root_replacements: AgentTimelineRootProjectionReplacements,
 }
 
@@ -1349,12 +1399,33 @@ impl AgentTimelineSnapshot {
             .iter()
             .map(|turn| (turn.id.as_str(), turn))
             .collect::<BTreeMap<_, _>>();
+        let appended_turn_ids = delta
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                AgentTimelineDeltaOperationV3::TextAppend { append } => {
+                    Some(append.turn_id.as_str())
+                }
+                AgentTimelineDeltaOperationV3::RunUpdated { .. } => None,
+            })
+            .collect::<HashSet<_>>();
         if removed
             .iter()
             .any(|turn_id| replacements.contains_key(turn_id))
         {
             return Err(AgentProjectionValidationError::new(
                 "timeline delta cannot replace and remove the same turn",
+            ));
+        }
+        if removed
+            .iter()
+            .any(|turn_id| appended_turn_ids.contains(turn_id))
+            || replacements
+                .keys()
+                .any(|turn_id| appended_turn_ids.contains(turn_id))
+        {
+            return Err(AgentProjectionValidationError::new(
+                "timeline delta text append conflicts with turn replacement or removal",
             ));
         }
         let mut turns = Vec::with_capacity(
@@ -1381,6 +1452,11 @@ impl AgentTimelineSnapshot {
             }
         }
         turns.sort_by_key(|turn| turn.sequence.unwrap_or(u64::MAX));
+        for operation in &delta.operations {
+            if let AgentTimelineDeltaOperationV3::TextAppend { append } = operation {
+                apply_text_append_v3(&mut turns, append)?;
+            }
+        }
 
         let mut next = self.clone();
         next.revision = delta.revision;
@@ -1389,6 +1465,11 @@ impl AgentTimelineSnapshot {
         next.event_count = delta.event_count;
         next.turns = turns;
         apply_root_replacements(&mut next, &delta.root_replacements);
+        for operation in &delta.operations {
+            if let AgentTimelineDeltaOperationV3::RunUpdated { run_projection } = operation {
+                next.run_projection = run_projection.clone();
+            }
+        }
         next.validate()?;
         Ok(next)
     }
@@ -1431,6 +1512,39 @@ impl AgentTimelineDelta {
                 return Err(AgentProjectionValidationError::new(format!(
                     "delta both replaces and removes turn {turn_id}"
                 )));
+            }
+        }
+        let mut append_targets = HashSet::new();
+        let mut run_updates = 0_u8;
+        for operation in &self.operations {
+            match operation {
+                AgentTimelineDeltaOperationV3::TextAppend { append } => {
+                    validate_text_append_v3(append)?;
+                    let target = (append.turn_id.as_str(), append.block_id.as_str());
+                    if !append_targets.insert(target) {
+                        return Err(AgentProjectionValidationError::new(
+                            "delta repeats a text append target",
+                        ));
+                    }
+                    if removed_turn_ids.contains(append.turn_id.as_str())
+                        || identities.turn_ids.contains(append.turn_id.as_str())
+                    {
+                        return Err(AgentProjectionValidationError::new(
+                            "delta text append conflicts with turn replacement or removal",
+                        ));
+                    }
+                }
+                AgentTimelineDeltaOperationV3::RunUpdated { run_projection } => {
+                    run_updates = run_updates.saturating_add(1);
+                    if run_updates > 1 {
+                        return Err(AgentProjectionValidationError::new(
+                            "delta contains more than one run.updated operation",
+                        ));
+                    }
+                    if let Some(run_projection) = run_projection {
+                        validate_run_projection(run_projection)?;
+                    }
+                }
             }
         }
         validate_root_replacements(&self.root_replacements)?;
@@ -1532,21 +1646,19 @@ struct ProjectionIdentities<'a> {
     turn_ids: HashSet<&'a str>,
     block_ids: HashSet<&'a str>,
     work_segment_ids: HashSet<&'a str>,
-    work_segment_turn_ids: HashMap<&'a str, &'a str>,
     operation_ids: HashSet<&'a str>,
-    operation_segment_ids: HashMap<&'a str, &'a str>,
 }
 
 fn validate_schema_and_shape(
     schema_version: &str,
     shape_version: &str,
 ) -> Result<(), AgentProjectionValidationError> {
-    if schema_version != AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2 {
+    if schema_version != AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3 {
         return Err(AgentProjectionValidationError::new(
             "unsupported shared conversation projection schema",
         ));
     }
-    if shape_version != AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2 {
+    if shape_version != AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3 {
         return Err(AgentProjectionValidationError::new(
             "unsupported shared conversation projection shape",
         ));
@@ -1599,9 +1711,6 @@ fn validate_turn<'a>(
                 segment.id
             )));
         }
-        identities
-            .work_segment_turn_ids
-            .insert(segment.id.as_str(), turn.id.as_str());
     }
 
     let mut referenced_blocks = HashSet::new();
@@ -1907,9 +2016,6 @@ fn validate_work_segment<'a>(
                 operation.operation_id
             )));
         }
-        identities
-            .operation_segment_ids
-            .insert(operation.operation_id.as_str(), segment.id.as_str());
     }
     if let Some(attention) = &segment.attention.0 {
         validate_identity(&attention.summary, "workSegment.attention.summary")?;
@@ -2081,29 +2187,10 @@ fn validate_optional_root_projections(
                 }
             }
             if let Some(activity) = &run.current_activity.0 {
-                if let Some(work_segment_id) = &activity.work_segment_id {
-                    let work_segment_turn_id = identities
-                        .work_segment_turn_ids
-                        .get(work_segment_id.as_str())
-                        .copied();
-                    if work_segment_turn_id.is_none()
-                        || run.turn_id.as_deref() != work_segment_turn_id
-                    {
+                if let Some(detail_block_id) = &activity.detail_block_id {
+                    if !identities.block_ids.contains(detail_block_id.as_str()) {
                         return Err(AgentProjectionValidationError::new(format!(
-                            "run projection current activity references another turn work segment {work_segment_id}"
-                        )));
-                    }
-                }
-                if let Some(operation_id) = &activity.operation_id {
-                    let operation_segment_id = identities
-                        .operation_segment_ids
-                        .get(operation_id.as_str())
-                        .copied();
-                    if operation_segment_id.is_none()
-                        || activity.work_segment_id.as_deref() != operation_segment_id
-                    {
-                        return Err(AgentProjectionValidationError::new(format!(
-                            "run projection current activity has inconsistent operation {operation_id}"
+                            "run projection current activity references missing block {detail_block_id}"
                         )));
                     }
                 }
@@ -2155,10 +2242,9 @@ fn validate_root_replacements(
 ) -> Result<(), AgentProjectionValidationError> {
     let task = replacement_ref(&replacements.task_projection);
     let interaction = replacement_ref(&replacements.interaction_projection);
-    let run = replacement_ref(&replacements.run_projection);
     let token_usage = replacement_ref(&replacements.token_usage_projection);
     let workspace = replacement_ref(&replacements.workspace_projection);
-    validate_optional_root_projections(task, interaction, run, token_usage, workspace, None)
+    validate_optional_root_projections(task, interaction, None, token_usage, workspace, None)
 }
 
 fn replacement_ref<T>(replacement: &AgentTimelineProjectionReplacement<T>) -> Option<&T> {
@@ -2178,7 +2264,6 @@ fn apply_root_replacements(
         &mut snapshot.interaction_projection,
         &replacements.interaction_projection,
     );
-    apply_projection_replacement(&mut snapshot.run_projection, &replacements.run_projection);
     apply_projection_replacement(
         &mut snapshot.token_usage_projection,
         &replacements.token_usage_projection,
@@ -2187,6 +2272,80 @@ fn apply_root_replacements(
         &mut snapshot.workspace_projection,
         &replacements.workspace_projection,
     );
+}
+
+fn validate_text_append_v3(
+    append: &ConversationTextAppendV3,
+) -> Result<(), AgentProjectionValidationError> {
+    validate_identity(&append.turn_id, "delta.textAppend.turnId")?;
+    validate_identity(&append.block_id, "delta.textAppend.blockId")?;
+    validate_safe_integer(
+        append.base_block_revision,
+        "delta.textAppend.baseBlockRevision",
+    )?;
+    validate_safe_integer(append.block_revision, "delta.textAppend.blockRevision")?;
+    if append.base_block_revision == 0
+        || append.block_revision != append.base_block_revision.saturating_add(1)
+        || append.text_delta.is_empty()
+    {
+        return Err(AgentProjectionValidationError::new(
+            "delta text append has an invalid revision or empty text",
+        ));
+    }
+    validate_identity_array(
+        &append.source_event_refs,
+        "delta.textAppend.sourceEventRefs",
+    )?;
+    if append.source_event_refs.is_empty() {
+        return Err(AgentProjectionValidationError::new(
+            "delta text append requires source event refs",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_text_append_v3(
+    turns: &mut [AgentTimelineTurn],
+    append: &ConversationTextAppendV3,
+) -> Result<(), AgentProjectionValidationError> {
+    let turn = turns
+        .iter_mut()
+        .find(|turn| turn.id == append.turn_id)
+        .ok_or_else(|| {
+            AgentProjectionValidationError::new("delta text append references a missing turn")
+        })?;
+    let block = turn
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == append.block_id)
+        .ok_or_else(|| {
+            AgentProjectionValidationError::new("delta text append references a missing block")
+        })?;
+    let current_revision = block.revision.unwrap_or(0);
+    if !matches!(block.kind, AgentTimelineBlockKind::Assistant)
+        || block.narrative_kind != Some(AgentTimelineNarrativeKind::AssistantText)
+        || current_revision != append.base_block_revision
+        || append.block_revision != append.base_block_revision.saturating_add(1)
+        || append
+            .source_event_refs
+            .iter()
+            .any(|source_ref| block.provenance.source_event_refs.contains(source_ref))
+    {
+        return Err(AgentProjectionValidationError::new(
+            "delta text append does not match the current assistant block",
+        ));
+    }
+    block.revision = Some(append.block_revision);
+    block.summary.push_str(&append.text_delta);
+    block
+        .body_markdown
+        .get_or_insert_with(String::new)
+        .push_str(&append.text_delta);
+    block
+        .provenance
+        .source_event_refs
+        .extend(append.source_event_refs.iter().cloned());
+    Ok(())
 }
 
 fn apply_projection_replacement<T: Clone>(
@@ -2212,20 +2371,82 @@ fn validate_run_projection(
     validate_language_binding(&run.language_binding, "runProjection.languageBinding")?;
     if let Some(activity) = &run.current_activity.0 {
         validate_identity(
+            &activity.activity_id,
+            "runProjection.currentActivity.activityId",
+        )?;
+        validate_safe_integer(activity.revision, "runProjection.currentActivity.revision")?;
+        if activity.revision == 0 {
+            return Err(AgentProjectionValidationError::new(
+                "runProjection.currentActivity.revision must be positive",
+            ));
+        }
+        validate_identity(
+            &activity.started_at,
+            "runProjection.currentActivity.startedAt",
+        )?;
+        validate_identity(
             &activity.updated_at,
             "runProjection.currentActivity.updatedAt",
         )?;
         validate_optional_identity(
-            activity.operation_id.as_deref(),
-            "runProjection.currentActivity.operationId",
+            activity.detail_block_id.as_deref(),
+            "runProjection.currentActivity.detailBlockId",
         )?;
         validate_optional_identity(
-            activity.work_segment_id.as_deref(),
-            "runProjection.currentActivity.workSegmentId",
+            activity.provider_request_id.as_deref(),
+            "runProjection.currentActivity.providerRequestId",
         )?;
+        if matches!(
+            activity.code,
+            AgentTimelineCurrentActivityCode::ProviderReasoning
+        ) && activity.message.is_some()
+        {
+            return Err(AgentProjectionValidationError::new(
+                "provider reasoning activity must not expose public message text",
+            ));
+        }
+        let expected_source = match activity.code {
+            AgentTimelineCurrentActivityCode::ProviderAwaitingFirstByte
+            | AgentTimelineCurrentActivityCode::ProviderReasoning
+            | AgentTimelineCurrentActivityCode::ProviderComposing => {
+                AgentTimelineCurrentActivitySource::Provider
+            }
+            AgentTimelineCurrentActivityCode::ResourceResolving => {
+                AgentTimelineCurrentActivitySource::Resource
+            }
+            AgentTimelineCurrentActivityCode::KernelExecuting => {
+                AgentTimelineCurrentActivitySource::Kernel
+            }
+            AgentTimelineCurrentActivityCode::RetryBackoff => {
+                AgentTimelineCurrentActivitySource::Retry
+            }
+            AgentTimelineCurrentActivityCode::SessionAdmitting
+            | AgentTimelineCurrentActivityCode::SessionValidating
+            | AgentTimelineCurrentActivityCode::SessionPersisting => {
+                AgentTimelineCurrentActivitySource::Session
+            }
+        };
+        if activity.source != expected_source {
+            return Err(AgentProjectionValidationError::new(
+                "runProjection.currentActivity source does not match its code",
+            ));
+        }
+        if let Some(message) = &activity.message {
+            if message.text.is_none() && message.message_key.is_none() {
+                return Err(AgentProjectionValidationError::new(
+                    "runProjection.currentActivity message requires text or messageKey",
+                ));
+            }
+            validate_optional_identity(
+                message.message_key.as_deref(),
+                "runProjection.currentActivity.message.messageKey",
+            )?;
+        }
     }
     if let Some(wait) = &run.wait.0 {
-        validate_optional_identity(wait.reason.as_deref(), "runProjection.wait.reason")?;
+        validate_identity(&wait.since, "runProjection.wait.since")?;
+        validate_identity(&wait.reason_code, "runProjection.wait.reasonCode")?;
+        validate_optional_identity(wait.retry_at.as_deref(), "runProjection.wait.retryAt")?;
         validate_optional_identity(
             wait.interaction_id.as_deref(),
             "runProjection.wait.interactionId",

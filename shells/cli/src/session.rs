@@ -180,7 +180,7 @@ pub(crate) async fn resolve_session_decision(
         })?
     };
     let timeline = client
-        .agent_timeline_v2(&session_id)
+        .agent_timeline_v3(&session_id)
         .await
         .map_err(|error| format!("failed to read timeline for pending decision: {error}"))?;
     let pending = find_pending_session_decision(&timeline, &kind, run_id.as_deref()).ok_or_else(
@@ -266,7 +266,7 @@ async fn reconcile_terminal_projection(
         }
         let timeline = match tokio::time::timeout(
             remaining,
-            client.agent_timeline_v2(&result.run.session_id),
+            client.agent_timeline_v3(&result.run.session_id),
         )
         .await
         {
@@ -394,10 +394,8 @@ async fn cancel_exact_run_before_cli_exit(
             &result.run.run_id,
             AgentRunCallerRequest::new(
                 caller_request_id,
-                deepcode_kernel_client::AgentConversationTargetV1::from_session(
-                    &result.session,
-                )
-                .map_err(|error| format!("failed to resolve cancellation target: {error}"))?,
+                deepcode_kernel_client::AgentConversationTargetV1::from_session(&result.session)
+                    .map_err(|error| format!("failed to resolve cancellation target: {error}"))?,
             ),
         ),
     )
@@ -430,7 +428,7 @@ async fn settle_admitted_run_after_cli_failure(
 
     loop {
         match client
-            .agent_timeline_v2_optional(&admitted.run.session_id)
+            .agent_timeline_v3_optional(&admitted.run.session_id)
             .await
         {
             Ok(Some(snapshot)) => {
@@ -474,7 +472,7 @@ async fn settle_admitted_run_after_cli_failure(
                         if let (Some(expected_turn_id), Ok(Some(snapshot))) = (
                             expected_turn_id.as_deref(),
                             client
-                                .agent_timeline_v2_optional(&admitted.run.session_id)
+                                .agent_timeline_v3_optional(&admitted.run.session_id)
                                 .await,
                         ) {
                             if let Ok(Some(turn_id)) =
@@ -938,7 +936,7 @@ async fn start_and_wait_for_run(
     let run_deadline = run_timeout.map(|limit| run_started + limit);
     let baseline_deadline = bounded_cli_stage_deadline(run_deadline, PROJECTION_BASELINE_WINDOW);
     let baseline_budget = baseline_deadline.saturating_duration_since(run_started);
-    let mut baseline_request = Box::pin(client.agent_timeline_v2_optional(session_id));
+    let mut baseline_request = Box::pin(client.agent_timeline_v3_optional(session_id));
     let baseline = tokio::select! {
         baseline = &mut baseline_request => baseline.map_err(|error| {
             format!("failed to establish typed Shared Projection v2 baseline: {error}")
@@ -1004,7 +1002,7 @@ async fn start_and_wait_for_run(
                 ));
             }
             _ = refresh.tick() => {
-                let mut projection = Box::pin(client.agent_timeline_v2_optional(session_id));
+                let mut projection = Box::pin(client.agent_timeline_v3_optional(session_id));
                 tokio::select! {
                     result = &mut start => {
                         break 'start settle_cli_admission_response(
@@ -1236,7 +1234,7 @@ async fn bind_live_projection_to_host_result(
         }
         let timeline = tokio::time::timeout(
             remaining,
-            client.agent_timeline_v2_optional(&result.run.session_id),
+            client.agent_timeline_v3_optional(&result.run.session_id),
         )
         .await
         .map_err(|_| {
@@ -1473,7 +1471,7 @@ async fn reconcile_live_projection_snapshot(
                 .to_string(),
         );
     }
-    let mut request = Box::pin(client.agent_timeline_v2(session_id));
+    let mut request = Box::pin(client.agent_timeline_v3(session_id));
     let timeline = tokio::select! {
         timeline = &mut request => timeline.map_err(|error| {
             format!("failed to reconcile typed Shared Projection v2 snapshot: {error}")
@@ -1522,7 +1520,7 @@ async fn reopen_live_projection_stream(
         .unwrap_or(stage_deadline);
     let open_budget = deadline.saturating_duration_since(open_started);
     tokio::select! {
-        stream = client.agent_timeline_stream_v2(
+        stream = client.agent_timeline_stream_v3(
             &result.run.session_id,
             Some(cursor.last_revision),
         ) => stream.map(Some).map_err(|error| {
@@ -2070,11 +2068,7 @@ impl LiveProjectionCursor {
         if wait.interaction_id.as_deref() == self.ignored_action_interaction_id.as_deref() {
             return None;
         }
-        let reason = wait
-            .reason
-            .as_deref()
-            .filter(|reason| !reason.trim().is_empty())
-            .unwrap_or("the Session requires an explicit user action");
+        let reason = wait.reason_code.as_str();
         Some(format!(
             "shared session run {host_run_id} requires user action: {reason}"
         ))
@@ -2401,13 +2395,7 @@ fn work_operation_status(
 }
 
 fn current_activity_key(activity: &deepcode_kernel_client::AgentTimelineCurrentActivity) -> String {
-    format!(
-        "{:?}|{}|{}|{}",
-        activity.code,
-        activity.summary.as_deref().unwrap_or_default(),
-        activity.operation_id.as_deref().unwrap_or_default(),
-        activity.work_segment_id.as_deref().unwrap_or_default()
-    )
+    format!("{}|{}", activity.activity_id, activity.revision)
 }
 
 fn current_activity_label(
@@ -2697,12 +2685,118 @@ pub(crate) async fn print_timeline(
         }
     };
     let timeline = client
-        .agent_timeline_v2(&session_id)
+        .agent_timeline_v3(&session_id)
         .await
         .map_err(|error| format!("failed to read timeline: {error}"))?;
     println!("session: {session_id}");
     render_timeline(&timeline)?;
     Ok(())
+}
+
+pub(crate) async fn print_private_analysis(
+    client: &HttpKernelClient,
+    requested_session_id: Option<String>,
+    host: &SessionHostOptions,
+    follow: bool,
+) -> Result<(), String> {
+    if let (Some(requested), Some(host_session)) =
+        (requested_session_id.as_deref(), host.session_id.as_deref())
+    {
+        if requested != host_session {
+            return Err(
+                "analysis Session conflicts with the explicit --session selection".to_string(),
+            );
+        }
+    }
+    let session_id = requested_session_id
+        .or_else(|| host.session_id.clone())
+        .or(current_session_id(client, host).await?)
+        .ok_or_else(|| "no current session is available for private analysis".to_string())?;
+    let caller_request_id = new_cli_request_id("analysis")?;
+    let lease = client
+        .mint_private_analysis_lease(
+            &session_id,
+            PrivateAnalysisLeaseRequestV1 { caller_request_id },
+        )
+        .await
+        .map_err(|error| format!("failed to create private analysis lease: {error}"))?;
+    let result = stream_private_analysis_v1(client, &session_id, &lease.capability, follow).await;
+    let revoke = client
+        .revoke_private_analysis_lease(&session_id, &lease.capability)
+        .await
+        .map_err(|error| format!("failed to revoke private analysis lease: {error}"));
+    match (result, revoke) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(revoke)) => Err(format!("{primary}; {revoke}")),
+    }
+}
+
+async fn stream_private_analysis_v1(
+    client: &HttpKernelClient,
+    session_id: &str,
+    capability: &str,
+    follow: bool,
+) -> Result<(), String> {
+    println!("session: {session_id}");
+    println!("private analysis: enabled for this CLI invocation");
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = client
+            .private_analysis_page(session_id, capability, cursor.as_deref(), 25)
+            .await
+            .map_err(|error| format!("failed to read private analysis: {error}"))?;
+        for item in &page.items {
+            render_private_analysis_item_v1(item);
+        }
+        if let Some(next_cursor) = page.next_cursor {
+            cursor = Some(next_cursor);
+        }
+        if page.has_more {
+            continue;
+        }
+        if !follow || CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn render_private_analysis_item_v1(item: &PrivateAnalysisItemV1) {
+    let boundary = match item.boundary {
+        PrivateAnalysisBoundaryV1::Primary => "primary",
+        PrivateAnalysisBoundaryV1::Continuation => "continuation",
+        PrivateAnalysisBoundaryV1::FinalAnswer => "finalAnswer",
+    };
+    let status = match item.status {
+        PrivateAnalysisStatusV1::Completed => "completed",
+        PrivateAnalysisStatusV1::Failed => "failed",
+        PrivateAnalysisStatusV1::Cancelled => "cancelled",
+        PrivateAnalysisStatusV1::LimitExceeded => "limitExceeded",
+    };
+    println!();
+    println!(
+        "--- {boundary} request {} · {status} · {}..{} ---",
+        item.request_id, item.started_at_unix_ms, item.completed_at_unix_ms
+    );
+    if let Some(reason_code) = &item.reason_code {
+        println!("reason: {reason_code}");
+    }
+    if !item.tools.is_empty() {
+        let tools = item
+            .tools
+            .iter()
+            .map(|tool| format!("{} ({})", tool.name, tool.stage))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("tools: {tools}");
+    }
+    if item.reasoning.is_empty() {
+        println!("(no reasoning text was captured)");
+    } else {
+        println!("{}", item.reasoning);
+    }
 }
 
 pub(crate) async fn resolve_permission(

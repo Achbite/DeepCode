@@ -195,6 +195,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(agent_session_timeline_stream),
         )
         .route(
+            "/api/agent/sessions/:session_id/private-analysis/lease",
+            post(private_analysis_lease_mint_v1).delete(private_analysis_lease_revoke_v1),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/private-analysis",
+            get(private_analysis_page_v1),
+        )
+        .route(
             "/api/agent/sessions/:session_id",
             get(agent_session_get)
                 .patch(agent_session_rename)
