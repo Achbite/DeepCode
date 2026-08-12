@@ -600,6 +600,12 @@ export interface AgentTimelineStructuredProjection {
 
 export type AgentTimelineDeliveryMode = 'live' | 'buffered' | 'replay';
 export type AgentTimelineProviderPhase = 'commentary' | 'final_answer';
+export type AgentTimelineAnswerState =
+  | 'streaming'
+  | 'provisional'
+  | 'committed'
+  | 'stale'
+  | 'rejected';
 
 export interface AgentTimelineBlock {
   id: string;
@@ -611,6 +617,7 @@ export interface AgentTimelineBlock {
   narrativeKind?: AgentTimelineNarrativeKind;
   entryRole: AgentTimelineEntryRole;
   providerPhase?: AgentTimelineProviderPhase;
+  answerState?: AgentTimelineAnswerState;
   title: string;
   summary: string;
   status: AgentTimelineStatus;

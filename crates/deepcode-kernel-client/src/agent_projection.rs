@@ -83,6 +83,20 @@ pub enum AgentTimelineDeliveryMode {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineAnswerState {
+    #[serde(rename = "streaming")]
+    Streaming,
+    #[serde(rename = "provisional")]
+    Provisional,
+    #[serde(rename = "committed")]
+    Committed,
+    #[serde(rename = "stale")]
+    Stale,
+    #[serde(rename = "rejected")]
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AgentTimelineBlockKind {
     #[serde(rename = "user")]
     User,
@@ -476,6 +490,8 @@ pub struct AgentTimelineBlock {
     pub entry_role: AgentTimelineEntryRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_phase: Option<AgentTimelineProviderPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_state: Option<AgentTimelineAnswerState>,
     pub title: String,
     pub summary: String,
     pub status: AgentTimelineStatus,
@@ -1873,6 +1889,8 @@ fn validate_native_block_invariants(
             block.narrative_kind == Some(AgentTimelineNarrativeKind::AssistantText)
                 && block.provenance.origin == AgentTimelineProvenanceOrigin::Provider
                 && block.provenance.authority == AgentTimelineProvenanceAuthority::Session
+                && (block.answer_state.is_none()
+                    || block.entry_role == AgentTimelineEntryRole::FinalAnswer)
                 && match block.provider_phase {
                     Some(AgentTimelineProviderPhase::Commentary) => {
                         block.entry_role == AgentTimelineEntryRole::AgentUpdate

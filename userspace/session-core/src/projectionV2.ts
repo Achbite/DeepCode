@@ -312,8 +312,16 @@ export function appendProviderComposingProjectionV3(
         revision: (existing.revision ?? 0) + 1,
         deliveryMode: 'live',
         durability: 'live',
-        entryRole: 'agentUpdate',
+        entryRole:
+          providerPhase === 'final_answer'
+          || existing.answerState === 'streaming'
+            ? 'finalAnswer'
+            : 'agentUpdate',
         ...(providerPhase ? { providerPhase } : {}),
+        ...(providerPhase === 'final_answer'
+          || existing.answerState === 'streaming'
+          ? { answerState: 'streaming' as const }
+          : {}),
         status: 'running',
         summary: combinedText,
         bodyMarkdown: combinedText,
@@ -333,8 +341,13 @@ export function appendProviderComposingProjectionV3(
         durability: 'live',
         kind: 'assistant',
         narrativeKind: 'assistantText',
-        entryRole: 'agentUpdate',
+        entryRole: providerPhase === 'final_answer'
+          ? 'finalAnswer'
+          : 'agentUpdate',
         ...(providerPhase ? { providerPhase } : {}),
+        ...(providerPhase === 'final_answer'
+          ? { answerState: 'streaming' as const }
+          : {}),
         title: 'Assistant Msg',
         summary: combinedText,
         status: 'running',
@@ -921,6 +934,7 @@ export function isSharedConversationBlockV2(
     'narrativeKind',
     'entryRole',
     'providerPhase',
+    'answerState',
     'title',
     'summary',
     'status',
@@ -957,6 +971,15 @@ function validNativeBlockSemantics(
       block.narrativeKind !== 'assistantText'
       || recordValue(block.provenance)?.origin !== 'provider'
       || recordValue(block.provenance)?.authority !== 'session'
+    ) {
+      return false;
+    }
+    if (
+      block.answerState !== undefined
+      && (
+        block.entryRole !== 'finalAnswer'
+        || !answerState(block.answerState)
+      )
     ) {
       return false;
     }
@@ -1034,6 +1057,10 @@ function validNativeBlockDetails(
     && (
       block.taskProjectionRef === undefined
       || nonemptyString(block.taskProjectionRef)
+    )
+    && (
+      block.answerState === undefined
+      || answerState(block.answerState)
     )
     && (
       block.interaction === undefined
@@ -2309,6 +2336,56 @@ function removeTurnBlock(turn: MutableTurn, blockId: string): void {
   );
 }
 
+function projectProviderAnswerStateIntoTurn(
+  turn: MutableTurn,
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined,
+  committed: boolean
+): boolean {
+  const runId = stringValue(payload?.runId);
+  const providerTurnId = stringValue(payload?.providerTurnId);
+  const settlement = answerStateValue(payload?.answerState);
+  if (
+    !runId
+    || !providerTurnId
+    || (settlement !== 'stale' && settlement !== 'rejected')
+  ) {
+    throw new Error('session_projection_provider_answer_state_invalid');
+  }
+  const blockPrefix = `provider:${runId}:${providerTurnId}:text:`;
+  let found = false;
+  turn.blocks = turn.blocks.map((block) => {
+    if (
+      !block.id.startsWith(blockPrefix)
+      || block.kind !== 'assistant'
+      || block.entryRole !== 'finalAnswer'
+      || (
+        block.answerState !== 'streaming'
+        && block.answerState !== 'provisional'
+      )
+    ) {
+      return block;
+    }
+    found = true;
+    return {
+      ...block,
+      revision: (block.revision ?? 0) + 1,
+      deliveryMode: committed ? 'replay' : 'live',
+      durability: committed ? 'committed' : 'live',
+      answerState: settlement,
+      status: 'completed',
+      provenance: {
+        ...block.provenance,
+        sourceEventRefs: appendUniqueStrings(
+          block.provenance.sourceEventRefs,
+          [event.id]
+        ),
+      },
+    };
+  });
+  return found;
+}
+
 function projectProviderOutputIntoTurn(
   turn: MutableTurn,
   event: AgentEvent,
@@ -2319,6 +2396,14 @@ function projectProviderOutputIntoTurn(
   const providerTurnId = stringValue(payload?.providerTurnId);
   if (projectionKind === 'provider.composing') {
     return projectProviderComposingIntoTurn(
+      turn,
+      event,
+      payload,
+      committed
+    );
+  }
+  if (projectionKind === 'provider.answerState') {
+    return projectProviderAnswerStateIntoTurn(
       turn,
       event,
       payload,
@@ -2362,16 +2447,19 @@ function projectProviderOutputIntoTurn(
       };
     }
   }
+  const settledAnswerState = answerStateValue(payload?.answerState);
   const privatePlanningDraft =
     projectionKind === 'provider.completed'
     && !hasTools
     && stringValue(payload?.outputKind) === 'answer'
-    && terminalScope === 'providerTurn';
+    && terminalScope === 'providerTurn'
+    && settledAnswerState !== 'provisional';
   const textRoles = providerTextSettledRoles(
     items,
     hasTools,
     stringValue(payload?.outputKind),
-    terminalScope
+    terminalScope,
+    settledAnswerState
   );
   const desiredParts: AgentTimelineTurnPart[] = [];
   const relatedBlockIds = new Set<string>();
@@ -2443,10 +2531,13 @@ function projectProviderOutputIntoTurn(
         providerTurnId,
         projectionKind: 'provider.outputText',
         outputKind: payload?.outputKind,
-        status: 'completed',
+        status: settledAnswerState === 'provisional'
+          ? 'running'
+          : 'completed',
         content: combinedText,
         ...(terminalScope ? { terminalScope } : {}),
         ...(explicitPhase ? { providerPhase: explicitPhase } : {}),
+        ...(settledAnswerState ? { answerState: settledAnswerState } : {}),
       };
       const syntheticEvent: AgentEvent = {
         id: event.id,
@@ -2472,9 +2563,18 @@ function projectProviderOutputIntoTurn(
           : 'finalAnswer';
         block.bodyMarkdown = combinedText;
         block.summary = combinedText;
+        if (settledAnswerState) {
+          block.answerState = settledAnswerState;
+          block.status = settledAnswerState === 'provisional'
+            ? 'running'
+            : 'completed';
+        }
         block.provenance.sourceEventRefs = appendUniqueStrings(
           existing?.provenance.sourceEventRefs ?? [],
-          [event.id]
+          [
+            event.id,
+            ...stringArrayValue(payload?.candidateSourceEventRefs),
+          ]
         );
         upsertTurnBlock(turn, block);
         updateTurnStatus(
@@ -2673,6 +2773,13 @@ function projectProviderComposingIntoTurn(
   block.durability = 'live';
   block.entryRole = 'agentUpdate';
   block.status = 'running';
+  if (
+    providerPhase === 'final_answer'
+    || existing?.answerState === 'streaming'
+  ) {
+    block.entryRole = 'finalAnswer';
+    block.answerState = 'streaming';
+  }
   block.bodyMarkdown = `${existing?.bodyMarkdown ?? ''}${textDelta}`;
   block.summary = block.bodyMarkdown;
   block.provenance.sourceEventRefs = appendUniqueStrings(
@@ -2691,7 +2798,14 @@ function providerTextSettledRoles(
   items: Array<Record<string, unknown>>,
   hasTools: boolean,
   outputKind: string | undefined,
-  terminalScope: string | undefined
+  terminalScope: string | undefined,
+  settledAnswerState:
+    | 'streaming'
+    | 'provisional'
+    | 'committed'
+    | 'stale'
+    | 'rejected'
+    | undefined
 ): Map<number, 'commentary' | 'finalAnswer'> {
   const roles = new Map<number, 'commentary' | 'finalAnswer'>();
   items.forEach((item, index) => {
@@ -2699,7 +2813,10 @@ function providerTextSettledRoles(
   });
   if (
     hasTools
-    || terminalScope !== 'turn'
+    || (
+      terminalScope !== 'turn'
+      && settledAnswerState !== 'provisional'
+    )
     || outputKind !== 'answer'
   ) {
     return roles;
@@ -3731,6 +3848,7 @@ function projectionBlock(
     || payload?.providerPhase === 'final_answer'
       ? payload.providerPhase
       : undefined;
+  const answerSettlement = answerStateValue(payload?.answerState);
   const attachments = event.kind === 'user_msg'
     ? decodeAgentInputAttachmentsV3(payload?.attachments)
     : undefined;
@@ -3747,6 +3865,7 @@ function projectionBlock(
         ? 'agentUpdate'
         : entry,
     ...(providerPhase ? { providerPhase } : {}),
+    ...(answerSettlement ? { answerState: answerSettlement } : {}),
     title,
     summary,
     status,
@@ -3857,18 +3976,7 @@ function updateTurnStatus(
     turn.terminalEvent = event;
     return;
   }
-  if (
-    event.kind === 'assistant_msg'
-    && (
-      payload?.providerPhase === 'final_answer'
-      || (
-        payload?.providerPhase !== 'commentary'
-        && stringValue(payload?.terminalScope) === 'turn'
-        && stringValue(payload?.outputKind) === 'answer'
-        && stringValue(payload?.status) === 'completed'
-      )
-    )
-  ) {
+  if (committedTerminalAnswerEvent(event, payload)) {
     turn.status = 'completed';
     turn.completedAt = nondecreasingTimestamp(turn.startedAt, event.ts);
     turn.terminalEvent = event;
@@ -4130,8 +4238,10 @@ function reviewRequiresStandaloneDisplay(
     'toolUnavailable',
     'staleToolContext',
     'staleControlEpoch',
+    'commandRecorded',
   ]);
   return arrayRecords(review.rejections).some((item) => {
+    if (stringValue(item.factKind) === 'commandRecorded') return false;
     const reason = reviewRejectionReason(item);
     return !reason || !compensatedReadRejections.has(reason);
   });
@@ -4688,20 +4798,7 @@ function canonicalTerminalRunEvent(
   payload: Record<string, unknown> | undefined
 ): boolean {
   if (wholeTurnErrorEvent(event, payload)) return true;
-  if (
-    event.kind === 'assistant_msg'
-    && (
-      payload?.providerPhase === 'final_answer'
-      || (
-        payload?.providerPhase !== 'commentary'
-        && stringValue(payload?.terminalScope) === 'turn'
-        && stringValue(payload?.outputKind) === 'answer'
-        && stringValue(payload?.status) === 'completed'
-      )
-    )
-  ) {
-    return true;
-  }
+  if (committedTerminalAnswerEvent(event, payload)) return true;
   if (event.kind !== 'session_run_state') return false;
   const status = stringValue(payload?.status);
   return status === 'cancelled'
@@ -4794,18 +4891,7 @@ function buildRunProjection(
       if (event.kind === 'tool_call') phase = 'executing';
       if (event.kind === 'tool_result') phase = 'validating';
     }
-    if (
-      event.kind === 'assistant_msg'
-      && (
-        payload?.providerPhase === 'final_answer'
-        || (
-        payload?.providerPhase !== 'commentary'
-          && stringValue(payload?.terminalScope) === 'turn'
-          && stringValue(payload?.outputKind) === 'answer'
-          && stringValue(payload?.status) === 'completed'
-        )
-      )
-    ) {
+    if (committedTerminalAnswerEvent(event, payload)) {
       status = 'succeeded';
       phase = 'settled';
       currentActivity = null;
@@ -4930,6 +5016,32 @@ function buildRunProjection(
       status: 'unavailable',
     },
   };
+}
+
+function committedTerminalAnswerEvent(
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): boolean {
+  if (event.kind !== 'assistant_msg') return false;
+  const projectionKind = stringValue(payload?.projectionKind);
+  const settlement = answerStateValue(payload?.answerState);
+  if (
+    projectionKind === 'provider.composing'
+    || projectionKind === 'provider.answerState'
+    || settlement === 'streaming'
+    || settlement === 'provisional'
+    || settlement === 'stale'
+    || settlement === 'rejected'
+  ) {
+    return false;
+  }
+  return payload?.providerPhase === 'final_answer'
+    || (
+      payload?.providerPhase !== 'commentary'
+      && stringValue(payload?.terminalScope) === 'turn'
+      && stringValue(payload?.outputKind) === 'answer'
+      && stringValue(payload?.status) === 'completed'
+    );
 }
 
 function advanceCurrentActivityV3(
@@ -5994,6 +6106,33 @@ function timelineStatus(value: unknown): value is AgentTimelineStatus {
     || value === 'completed'
     || value === 'cancelled'
     || value === 'failed';
+}
+
+function answerState(value: unknown): boolean {
+  return value === 'streaming'
+    || value === 'provisional'
+    || value === 'committed'
+    || value === 'stale'
+    || value === 'rejected';
+}
+
+function answerStateValue(
+  value: unknown
+):
+  | 'streaming'
+  | 'provisional'
+  | 'committed'
+  | 'stale'
+  | 'rejected'
+  | undefined {
+  return answerState(value)
+    ? value as
+      | 'streaming'
+      | 'provisional'
+      | 'committed'
+      | 'stale'
+      | 'rejected'
+    : undefined;
 }
 
 function timelineTaskProgress(

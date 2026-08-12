@@ -1677,6 +1677,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'provider.started',
   'provider.composing',
   'provider.completed',
+  'provider.answerState',
   'provider.stale',
   'toolIntent.submitted',
   'capability.awaiting',

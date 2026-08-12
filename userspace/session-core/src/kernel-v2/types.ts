@@ -943,6 +943,7 @@ export interface SessionKernelProjectionEventV2 {
     | 'provider.started'
     | 'provider.composing'
     | 'provider.completed'
+    | 'provider.answerState'
     | 'provider.stale'
     | 'toolIntent.submitted'
     | 'capability.awaiting'

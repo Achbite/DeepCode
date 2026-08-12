@@ -675,6 +675,23 @@ export class SessionKernelProviderTurnsV2 {
                       evidence
                     );
               await this.host.saveCheckpoint();
+              if (evidence.terminal?.data.terminalKind === 'completed') {
+                try {
+                  await this.host.project(
+                    `provider:${providerTurnId}:answer-rejected`,
+                    'provider.answerState',
+                    {
+                      providerTurnId,
+                      controlEpoch: latest.controlEpoch,
+                      answerState: 'rejected',
+                      reasonCode: safeErrorCode(terminalError),
+                    }
+                  );
+                } catch {
+                  // The durable failed Provider boundary remains canonical
+                  // even when its presentation settlement cannot publish.
+                }
+              }
               if (request.target.kind !== 'finalAnswer') {
                 try {
                   await this.host.project(
@@ -1121,6 +1138,22 @@ export class SessionKernelProviderTurnsV2 {
       recordSessionProviderOutcomeV2(current, outcome);
     }
     await this.host.saveCheckpoint();
+    const workAuthority = currentSessionWorkAuthorityV3(current);
+    const terminalScope =
+      output.kind === 'answer'
+      && (
+        request.target.kind === 'finalAnswer'
+        || workAuthority === undefined
+      )
+        ? 'turn' as const
+        : 'providerTurn' as const;
+    const answerState = output.kind === 'answer'
+      ? terminalScope === 'turn'
+        ? 'committed' as const
+        : workAuthority?.kind === 'contextRead'
+          ? 'provisional' as const
+          : undefined
+      : undefined;
     const completedProjectionId = `provider:${providerTurnId}:completed`;
     const completedProjection = await this.host.project(
       completedProjectionId,
@@ -1130,14 +1163,8 @@ export class SessionKernelProviderTurnsV2 {
         controlEpoch: current.providerTurn.controlEpoch,
         outputKind: output.kind,
         result,
-        terminalScope:
-          output.kind === 'answer'
-          && (
-            request.target.kind === 'finalAnswer'
-            || currentSessionWorkAuthorityV3(current) === undefined
-          )
-            ? 'turn'
-            : 'providerTurn',
+        terminalScope,
+        ...(answerState ? { answerState } : {}),
         orderedItems: publicSessionProviderOrderedItemsV2(output.items),
         providerOutcome: output.providerResult,
         ...(request.target.kind === 'finalAnswer'
@@ -1602,6 +1629,7 @@ export class SessionKernelProviderTurnsV2 {
         outputKind: 'answer',
         result: { kind: 'answer', text: finalAnswer.finalText },
         terminalScope: 'turn',
+        answerState: 'committed',
         orderedItems: publicSessionProviderOrderedItemsV2(
           providerTurn.response.items
         ),
@@ -1639,6 +1667,22 @@ export class SessionKernelProviderTurnsV2 {
       || !candidateCanPromoteToFinalAnswerV1(state, target)
       || !candidate
     ) {
+      if (candidate && finalAnswer?.status === 'pending') {
+        await this.host.project(
+          [
+            `provider:${candidate.providerTurnId}:answer-stale`,
+            target.reviewRevision,
+            target.snapshotHighWater,
+          ].join(':'),
+          'provider.answerState',
+          {
+            providerTurnId: candidate.providerTurnId,
+            controlEpoch: candidate.controlEpoch,
+            answerState: 'stale',
+            reasonCode: 'terminalAnswerCandidateNotPromotable',
+          }
+        );
+      }
       return undefined;
     }
     state.finalAnswer = {
@@ -2554,13 +2598,16 @@ function candidateCanPromoteToFinalAnswerV1(
       (fact) => reviewFactAuthorityKindV1(fact.details) !== 'contextRead'
     )
     || review.rejections.some(
-      (fact) => ![
-        'invalidArguments',
-        'toolNotRegistered',
-        'toolUnavailable',
-        'staleToolContext',
-        'staleControlEpoch',
-      ].includes(reviewRejectionReasonV1(fact.details) ?? '')
+      (fact) =>
+        fact.factKind !== 'commandRecorded'
+        && ![
+          'invalidArguments',
+          'toolNotRegistered',
+          'toolUnavailable',
+          'staleToolContext',
+          'staleControlEpoch',
+          'commandRecorded',
+        ].includes(reviewRejectionReasonV1(fact.details) ?? '')
     )
   ) {
     return false;

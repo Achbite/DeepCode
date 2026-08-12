@@ -5652,6 +5652,7 @@ fn validate_projection_request(
             | "provider.started"
             | "provider.composing"
             | "provider.completed"
+            | "provider.answerState"
             | "provider.stale"
             | "toolIntent.submitted"
             | "capability.awaiting"
@@ -6440,6 +6441,25 @@ fn validate_private_projection_event_data(
             }
         }
         "provider.completed" => validate_private_provider_completed(data)?,
+        "provider.answerState" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "controlEpoch",
+                    "answerState",
+                    "reasonCode",
+                ],
+                &[],
+                &["providerTurnId", "reasonCode"],
+                &["answerState"],
+                &[],
+                &[],
+                &["controlEpoch"],
+                &[],
+            )?;
+            require_private_enum(data, "answerState", &["stale", "rejected"])?;
+        }
         "provider.stale" => validate_private_projection_fields(
             data,
             &["providerTurnId"],
@@ -7233,6 +7253,7 @@ fn validate_private_provider_completed(
             "reviewRevision",
             "snapshotHighWater",
             "candidateSourceEventRefs",
+            "answerState",
         ],
         &["providerTurnId"],
         &[],
@@ -7253,6 +7274,19 @@ fn validate_private_provider_completed(
         ],
     )?;
     require_private_enum(data, "terminalScope", &["turn", "providerTurn"])?;
+    if let Some(answer_state) = data.get("answerState").and_then(Value::as_str) {
+        if !matches!(answer_state, "provisional" | "committed")
+            || data.get("outputKind").and_then(Value::as_str) != Some("answer")
+            || (answer_state == "provisional"
+                && data.get("terminalScope").and_then(Value::as_str) != Some("providerTurn"))
+            || (answer_state == "committed"
+                && data.get("terminalScope").and_then(Value::as_str) != Some("turn"))
+        {
+            return Err(private_projection_data_invalid(
+                "Session private answerState does not match Provider answer settlement",
+            ));
+        }
+    }
     if data.contains_key("status") {
         require_private_enum(data, "status", &["responseAccepted"])?;
     }
@@ -8467,6 +8501,7 @@ fn validate_public_agent_event_payload(
                 "providerOutcome",
                 "reviewRevision",
                 "snapshotHighWater",
+                "answerState",
             ],
             &[
                 "status",
@@ -8475,6 +8510,22 @@ fn validate_public_agent_event_payload(
                 "terminalScope",
                 "outputKind",
                 "providerOutcome",
+            ],
+        ),
+        "provider.answerState" => (
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "answerState",
+                "reasonCode",
+            ],
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "answerState",
+                "reasonCode",
             ],
         ),
         "provider.started" if payload.contains_key("currentActivityCode") => (
@@ -8741,6 +8792,13 @@ fn validate_public_agent_event_payload(
                     Some("providerTurn") => event_kind == "workflow_stage" && channel == "progress",
                     _ => false,
                 }
+        }
+        "provider.answerState" => {
+            event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "conversation"
+                && status == Some("completed")
+                && matches!(payload_text("answerState"), Some("stale" | "rejected"))
         }
         "provider.started" => {
             event_kind == "workflow_stage"
@@ -9114,6 +9172,35 @@ fn validate_public_projection_payload_types(
             if has_review_revision {
                 public_integer(payload, "reviewRevision", true)?;
                 public_integer(payload, "snapshotHighWater", false)?;
+            }
+            if let Some(answer_state) = payload.get("answerState").and_then(Value::as_str) {
+                if !matches!(answer_state, "provisional" | "committed")
+                    || payload.get("outputKind").and_then(Value::as_str) != Some("answer")
+                    || (answer_state == "provisional"
+                        && payload.get("terminalScope").and_then(Value::as_str)
+                            != Some("providerTurn"))
+                    || (answer_state == "committed"
+                        && payload.get("terminalScope").and_then(Value::as_str) != Some("turn"))
+                {
+                    return Err(public_projection_shape_invalid(
+                        "answerState does not match Provider answer settlement",
+                    ));
+                }
+            }
+        }
+        "provider.answerState" => {
+            public_string(payload, "providerTurnId", true)?;
+            public_integer(payload, "controlEpoch", true)?;
+            for field in ["status", "answerState", "reasonCode"] {
+                public_string(payload, field, false)?;
+            }
+            if !matches!(
+                payload.get("answerState").and_then(Value::as_str),
+                Some("stale" | "rejected")
+            ) {
+                return Err(public_projection_shape_invalid(
+                    "provider answer settlement state is invalid",
+                ));
             }
         }
         "provider.started" => {

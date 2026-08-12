@@ -36,21 +36,32 @@ pub(crate) fn render_timeline(timeline: &AgentTimelineSnapshot) -> Result<(), St
 }
 
 fn render_timeline_block(block: &deepcode_kernel_client::AgentTimelineBlock) -> Result<(), String> {
-    if block.entry_role == AgentTimelineEntryRole::FinalAnswer
-        && block.durability != AgentTimelineDurability::Committed
-    {
-        return Ok(());
-    }
     let kind = timeline_block_kind_label(block);
     let title = (!block.title.trim().is_empty())
         .then_some(block.title.as_str())
         .unwrap_or(kind);
     let body = timeline_block_text(block)?;
-    println!("  {kind}: {title}");
+    let answer_state = block
+        .answer_state
+        .map(answer_state_label)
+        .map(|state| format!(" [{state}]"))
+        .unwrap_or_default();
+    println!("  {kind}{answer_state}: {title}");
     for line in body.lines().take(24) {
         println!("    {line}");
     }
     Ok(())
+}
+
+fn answer_state_label(state: deepcode_kernel_client::AgentTimelineAnswerState) -> &'static str {
+    use deepcode_kernel_client::AgentTimelineAnswerState::*;
+    match state {
+        Streaming => "streaming",
+        Provisional => "provisional",
+        Committed => "committed",
+        Stale => "stale",
+        Rejected => "rejected",
+    }
 }
 
 fn timeline_block_text(
@@ -624,6 +635,9 @@ pub(crate) fn extract_committed_final_text_v2(timeline: &AgentTimelineSnapshot) 
         let block = blocks_by_id.get(block_id.as_str())?;
         if block.entry_role != AgentTimelineEntryRole::FinalAnswer
             || block.durability != AgentTimelineDurability::Committed
+            || block.answer_state.is_some_and(|state| {
+                state != deepcode_kernel_client::AgentTimelineAnswerState::Committed
+            })
         {
             continue;
         }

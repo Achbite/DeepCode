@@ -349,6 +349,7 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         "narrativeKind",
         "entryRole",
         "providerPhase",
+        "answerState",
         "title",
         "summary",
         "status",
@@ -412,6 +413,11 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         object.get("providerPhase"),
         &["commentary", "final_answer"],
         "block.providerPhase",
+    )?;
+    validate_optional_enum(
+        object.get("answerState"),
+        &["streaming", "provisional", "committed", "stale", "rejected"],
+        "block.answerState",
     )?;
     validate_native_block_semantics(object)?;
     required_identity(object.get("title"), "block.title")?;
@@ -479,6 +485,7 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
         .and_then(Value::as_str)
         .unwrap_or_default();
     let provider_phase = object.get("providerPhase").and_then(Value::as_str);
+    let answer_state = object.get("answerState").and_then(Value::as_str);
     let provenance = object.get("provenance").and_then(Value::as_object);
     let provenance_origin = provenance
         .and_then(|value| value.get("origin"))
@@ -498,6 +505,7 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
             narrative_kind == "assistantText"
                 && provenance_origin == Some("provider")
                 && provenance_authority == Some("session")
+                && (answer_state.is_none() || entry_role == "finalAnswer")
                 && match provider_phase {
                     Some("commentary") => entry_role == "agentUpdate",
                     Some("final_answer") => entry_role == "finalAnswer",

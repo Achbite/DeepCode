@@ -1230,6 +1230,7 @@ function publicPresentation(
       }
       const terminalAnswer = result?.kind === 'answer'
         && terminalScope === 'turn';
+      const answerState = textField(data, 'answerState');
       const terminalAnswerText = terminalAnswer
         ? exactTerminalAnswerText(result, decodedOrderedItems)
         : undefined;
@@ -1249,6 +1250,7 @@ function publicPresentation(
           ...(orderedItems.length > 0 ? { orderedItems } : {}),
           ...(terminalScope ? { terminalScope } : {}),
           outputKind,
+          ...(answerState ? { answerState } : {}),
           providerTurnId,
           controlEpoch,
           providerOutcome: publicProviderOutcome(data?.providerOutcome),
@@ -1261,6 +1263,19 @@ function publicPresentation(
         },
       };
     }
+    case 'provider.answerState':
+      return {
+        kind: 'workflow_stage',
+        channel: 'progress',
+        visibility: 'conversation',
+        fields: {
+          status: 'completed',
+          providerTurnId: textField(data, 'providerTurnId'),
+          controlEpoch: data?.controlEpoch,
+          answerState: textField(data, 'answerState'),
+          reasonCode: textField(data, 'reasonCode'),
+        },
+      };
     case 'provider.started': {
       const currentActivityCode = textField(
         data,
@@ -1583,6 +1598,19 @@ function currentProjectionData(
     }
     case 'provider.completed':
       return currentProviderCompletedProjectionData(event);
+    case 'provider.answerState': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          controlEpoch: 'positiveInteger',
+          answerState: 'string',
+          reasonCode: 'identity',
+        }
+      );
+      projectionEnum(data, 'answerState', ['stale', 'rejected']);
+      return data;
+    }
     case 'provider.stale':
       return exactCurrentProjectionRecord(
         event,
@@ -1826,6 +1854,7 @@ function currentProviderCompletedProjectionData(
       reviewRevision: 'positiveInteger',
       snapshotHighWater: 'nonNegativeInteger',
       candidateSourceEventRefs: 'array',
+      answerState: 'string',
     }
   );
   projectionEnum(data, 'outputKind', [
@@ -1836,6 +1865,22 @@ function currentProviderCompletedProjectionData(
     'planActionComplete',
   ]);
   projectionEnum(data, 'terminalScope', ['turn', 'providerTurn']);
+  if (data.answerState !== undefined) {
+    projectionEnum(data, 'answerState', ['provisional', 'committed']);
+    if (
+      data.outputKind !== 'answer'
+      || (
+        data.answerState === 'provisional'
+          ? data.terminalScope !== 'providerTurn'
+          : data.terminalScope !== 'turn'
+      )
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'answer state does not match Provider answer settlement'
+      );
+    }
+  }
   if (data.status !== undefined) {
     projectionEnum(data, 'status', ['responseAccepted']);
   }

@@ -459,6 +459,7 @@ function decodeConversationPayload(
             'providerOutcome',
             'reviewRevision',
             'snapshotHighWater',
+            'answerState',
           ]
   );
   if (
@@ -525,6 +526,15 @@ function decodeConversationPayload(
       throw invalidMemory(
         'session_prior_event_projection_schema_unsupported',
         'Prior final answer has an invalid Review fact binding.'
+      );
+    }
+    if (
+      record.answerState !== undefined
+      && record.answerState !== 'committed'
+    ) {
+      throw invalidMemory(
+        'session_prior_event_projection_schema_unsupported',
+        'Prior final answer has a non-committed answer state.'
       );
     }
   }
