@@ -14,6 +14,12 @@ import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ActivityIndicator from '../../components/agent-panel/ActivityIndicator';
 import {
+  AnswerSettlementStatus,
+  isAnswerBusy,
+  isAnswerCommitted,
+  isAnswerPlaybackIncremental,
+} from '../../components/agent-panel/AnswerSettlementStatus';
+import {
   FinalFactReceipt,
   hasStructuredProjection,
   StructuredProjectionContent,
@@ -444,6 +450,7 @@ function useAssistantPlayback(
         {
           content: assistantPlaybackText(block),
           deliveryMode: block.deliveryMode,
+          answerState: block.answerState,
           revision: block.revision ?? 0,
         },
       ])
@@ -467,7 +474,7 @@ function useAssistantPlayback(
   const playbackSignature = useMemo(
     () => [...targets]
       .map(([blockId, target]) =>
-        `${blockId}:${target.revision}:${target.deliveryMode ?? 'replay'}:${target.content.length}`
+        `${blockId}:${target.revision}:${target.deliveryMode ?? 'replay'}:${target.answerState ?? 'legacy'}:${target.content.length}`
       )
       .join('|'),
     [targets]
@@ -495,12 +502,20 @@ function useAssistantPlayback(
       const previous = previousContent.get(blockId);
       const currentVisible = visibleLengthsRef.current.get(blockId);
       if (previous === undefined) {
-        if (enabled && isIncrementalAssistantDelivery(target.deliveryMode)) {
+        if (
+          enabled
+          && isAnswerPlaybackIncremental(target.deliveryMode, target.answerState)
+        ) {
           enrolled.add(blockId);
           next.set(blockId, 0);
         } else {
           next.set(blockId, target.content.length);
         }
+        continue;
+      }
+      if (!isAnswerPlaybackIncremental(target.deliveryMode, target.answerState)) {
+        enrolled.delete(blockId);
+        next.set(blockId, target.content.length);
         continue;
       }
       if (!target.content.startsWith(previous) || !enabled) {
@@ -510,7 +525,7 @@ function useAssistantPlayback(
       }
       if (
         target.content.length > previous.length
-        && isIncrementalAssistantDelivery(target.deliveryMode)
+        && isAnswerPlaybackIncremental(target.deliveryMode, target.answerState)
       ) {
         enrolled.add(blockId);
       }
@@ -581,12 +596,6 @@ function isAssistantPlaybackBlock(block: AgentTimelineBlock): boolean {
   return block.kind === 'assistant'
     && (block.narrativeKind === 'assistantText' || block.narrativeKind === undefined)
     && assistantPlaybackText(block).length > 0;
-}
-
-function isIncrementalAssistantDelivery(
-  deliveryMode: AgentTimelineBlock['deliveryMode']
-): boolean {
-  return deliveryMode === 'live' || deliveryMode === 'buffered';
 }
 
 function assistantPlaybackText(block: AgentTimelineBlock): string {
@@ -1081,15 +1090,32 @@ const TimelineBlock: React.FC<{
     const content = visibleTypewriterMarkdown(block, language);
     const playbackComplete = visibleTextLength === undefined
       || visibleTextLength >= content.length;
+    const answerStateClass = block.answerState
+      ? ` deepcode-gui-assistant-text--${block.answerState}`
+      : '';
     return (
-      <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}${phaseClassName(block)}`}>
+      <article
+        className={`deepcode-gui-assistant-text${answerStateClass}${narrativeClass}${densityClass}${phaseClassName(block)}`}
+        data-answer-state={block.answerState}
+        aria-busy={isAnswerBusy(block.answerState)}
+      >
         <AssistantPlaybackMarkdown
           content={content}
           visibleTextLength={visibleTextLength}
-          streaming={block.deliveryMode === 'live' || !playbackComplete}
+          streaming={
+            isAnswerPlaybackIncremental(block.deliveryMode, block.answerState)
+            || !playbackComplete
+          }
           onVisibleContentChange={onLiveContentChange}
         />
-        {playbackComplete && block.durability === 'committed' && (
+        <AnswerSettlementStatus
+          answerState={block.answerState}
+          language={language}
+        />
+        {playbackComplete
+          && block.durability === 'committed'
+          && isAnswerCommitted(block.answerState)
+          && (
           <FinalFactReceipt
             projection={block.structuredProjection}
             language={language}
@@ -1630,6 +1656,7 @@ function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = '
 
 function isActionableAgentOutputBlock(block: AgentTimelineBlock): boolean {
   if (block.kind === 'review' || block.narrativeKind === 'review') return true;
+  if (block.kind === 'assistant' && !isAnswerCommitted(block.answerState)) return false;
   if (block.narrativeKind) return block.narrativeKind === 'assistantText';
   return block.kind === 'assistant';
 }

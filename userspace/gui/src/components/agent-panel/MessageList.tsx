@@ -10,6 +10,11 @@ import type {
   AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
 import ActivityIndicator from './ActivityIndicator';
+import {
+  AnswerSettlementStatus,
+  isAnswerBusy,
+  isAnswerCommitted,
+} from './AnswerSettlementStatus';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import {
@@ -71,14 +76,24 @@ function UserBlock({ block, language }: { block: AgentTimelineBlock; language: U
 function AssistantBlock({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   const assistantText = block.bodyMarkdown || block.summary;
   return (
-    <article className="agent-message agent-message--assistant_msg">
+    <article
+      className={`agent-message agent-message--assistant_msg${block.answerState ? ` agent-message--answer-${block.answerState}` : ''}`}
+      data-answer-state={block.answerState}
+      aria-busy={isAnswerBusy(block.answerState)}
+    >
       <div className="agent-message__body agent-message__body--markdown">
         <MarkdownContent content={assistantText} />
       </div>
-      <FinalFactReceipt
-        projection={block.structuredProjection}
+      <AnswerSettlementStatus
+        answerState={block.answerState}
         language={language}
       />
+      {isAnswerCommitted(block.answerState) && (
+        <FinalFactReceipt
+          projection={block.structuredProjection}
+          language={language}
+        />
+      )}
     </article>
   );
 }

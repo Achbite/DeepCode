@@ -648,6 +648,18 @@
   align-self: flex-start;
 }
 
+.agent-answer-settlement {
+  margin-top: 6px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.agent-answer-settlement--stale,
+.agent-answer-settlement--rejected {
+  color: var(--warning, #d9a441);
+}
+
 .agent-narrative-narration {
   align-self: flex-start;
   max-width: 92%;

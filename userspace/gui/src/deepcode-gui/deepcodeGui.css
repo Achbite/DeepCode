@@ -3221,6 +3221,18 @@ button {
   margin: 0 0 12px;
 }
 
+.deepcode-gui-assistant-text .agent-answer-settlement {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.deepcode-gui-assistant-text .agent-answer-settlement--stale,
+.deepcode-gui-assistant-text .agent-answer-settlement--rejected {
+  color: #9a6324;
+}
+
 .deepcode-gui-assistant-narration {
   max-width: min(100%, 780px);
   padding: 0 0 6px;
