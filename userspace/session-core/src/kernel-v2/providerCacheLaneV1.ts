@@ -97,6 +97,14 @@ export interface SessionProviderAdmissionSidecarV1 {
    * and removes them before constructing the external Provider payload.
    */
   continuationOperationIds?: string[];
+  /**
+   * Exact settled disposition for every operation above. Successful outputs
+   * are still loaded from authoritative Kernel facts by the Daemon. Negative
+   * dispositions carry only bounded status metadata needed to close the
+   * Provider assistant/tool message pair; raw arguments and tool output never
+   * enter this private sidecar.
+   */
+  continuationOutcomes?: SessionProviderContinuationOutcomeV1[];
   cacheLane: {
     laneId: string;
     laneRevision: number;
@@ -106,6 +114,19 @@ export interface SessionProviderAdmissionSidecarV1 {
     predecessorExternalDigest?: string;
     resetReason?: SessionProviderCacheLaneResetReasonV1;
     supportingResetReasons?: SessionProviderCacheLaneResetReasonV1[];
+  };
+}
+
+export interface SessionProviderContinuationOutcomeV1 {
+  operationId: string;
+  status: 'completed' | 'aborted' | 'unexecuted';
+  terminalFactId?: string;
+  terminalFactKind?: string;
+  settlementReason?: string;
+  rejection?: {
+    reason: string;
+    guidance: string;
+    rejectionFactId: string;
   };
 }
 
@@ -277,8 +298,8 @@ export function buildSessionProviderAdmissionSidecarV1(
       'Session Provider cache plan conflicts with current request material.'
     );
   }
-  const continuationOperationIds =
-    sessionProviderContinuationOperationIdsV1(
+  const continuation =
+    sessionProviderContinuationOutcomesV1(
       turn,
       input.cacheLane
     );
@@ -316,17 +337,22 @@ export function buildSessionProviderAdmissionSidecarV1(
           }
         : {}),
     },
-    ...(continuationOperationIds
-      ? { continuationOperationIds }
+    ...(continuation
+      ? {
+          continuationOperationIds: continuation.map(
+            (outcome) => outcome.operationId
+          ),
+          continuationOutcomes: continuation,
+        }
       : {}),
     cacheLane: cloneJson(input.cacheLane),
   };
 }
 
-function sessionProviderContinuationOperationIdsV1(
+function sessionProviderContinuationOutcomesV1(
   turn: SessionProviderTurnInputV2,
   cacheLane: SessionProviderCacheLanePlanV1
-): string[] | undefined {
+): SessionProviderContinuationOutcomeV1[] | undefined {
   if (cacheLane.mode !== 'append') return undefined;
   const predecessorId = cacheLane.predecessorRequestId;
   const predecessor = turn.providerOutcomes.at(-1);
@@ -336,21 +362,25 @@ function sessionProviderContinuationOperationIdsV1(
     || !predecessor
     || predecessor.providerTurnId !== predecessorId
     || predecessor.outputKind !== 'toolIntent'
-    || predecessor.toolSettlement.status !== 'completed'
     || predecessor.toolCalls.length
       !== predecessor.toolCallReceipt.callCount
     || predecessor.toolCalls.some((call, index) =>
       call.ordinal !== index + 1
-      || call.status !== 'completed'
+    )
+    || (
+      predecessor.toolSettlement.status === 'completed'
+      && predecessor.toolCalls.some((call) => call.status !== 'completed')
+    )
+    || (
+      predecessor.toolSettlement.status === 'aborted'
+      && predecessor.toolCalls.every((call) => call.status === 'completed')
     )
   ) {
     throw new Error(
-      'Session Provider append continuation requires one fully settled predecessor tool outcome.'
+      'Session Provider append continuation requires one exact settled predecessor tool outcome.'
     );
   }
-  const operationIds = predecessor.toolCalls.map(
-    (call) => call.operationId
-  );
+  const operationIds = predecessor.toolCalls.map((call) => call.operationId);
   if (
     operationIds.length === 0
     || operationIds.length > 32
@@ -360,7 +390,22 @@ function sessionProviderContinuationOperationIdsV1(
       'Session Provider append continuation operation identities are invalid.'
     );
   }
-  return [...operationIds];
+  return predecessor.toolCalls.map((call) => ({
+    operationId: call.operationId,
+    status: call.status,
+    ...(call.terminalFactId
+      ? { terminalFactId: call.terminalFactId }
+      : {}),
+    ...(call.terminalFactKind
+      ? { terminalFactKind: call.terminalFactKind }
+      : {}),
+    ...(call.settlementReason
+      ? { settlementReason: call.settlementReason }
+      : {}),
+    ...(call.rejection
+      ? { rejection: cloneJson(call.rejection) }
+      : {}),
+  }));
 }
 
 export function sessionProviderSemanticMessagesV1(

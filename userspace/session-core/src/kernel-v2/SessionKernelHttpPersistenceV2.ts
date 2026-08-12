@@ -82,6 +82,7 @@ import type {
   SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
+  repairedSessionProviderOutcomeV2,
   settledSessionProviderToolCallsV2,
   validateSessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
@@ -5110,6 +5111,13 @@ function materializeProviderOutcomeV3(input: {
     === reservation.providerTurnId) {
     throw new UnsupportedHistorySchemaError(
       'provider-outcome-unexpected-tool-settlement'
+    );
+  }
+  if (output.kind === 'noTool' && output.repair) {
+    return repairedSessionProviderOutcomeV2(
+      reservation.providerTurnId,
+      output,
+      terminal.recordedAt
     );
   }
   const summary = providerOutputSummaryV3(output);

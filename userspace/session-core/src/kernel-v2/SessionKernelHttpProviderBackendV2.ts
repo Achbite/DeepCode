@@ -211,12 +211,23 @@ function providerContinuationParentIdV2(
       expectedProfileId
     )
     || previous.outputKind !== 'toolIntent'
-    || previous.toolSettlement.status !== 'completed'
     || previous.providerResult.providerProfileId
       !== input.providerProfile.providerProfileId
     || previous.toolCallReceipt.providerTurnId
       !== previous.providerTurnId
     || previous.toolCallReceipt.callCount <= 0
+    || previous.toolCalls.length !== previous.toolCallReceipt.callCount
+    || previous.toolCalls.some((call, index) =>
+      call.ordinal !== index + 1
+    )
+    || (
+      previous.toolSettlement.status === 'completed'
+      && previous.toolCalls.some((call) => call.status !== 'completed')
+    )
+    || (
+      previous.toolSettlement.status === 'aborted'
+      && previous.toolCalls.every((call) => call.status === 'completed')
+    )
   ) {
     return undefined;
   }

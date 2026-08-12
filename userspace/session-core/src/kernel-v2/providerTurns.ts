@@ -52,6 +52,7 @@ import {
   prepareSessionProviderToolCallSubmissionV2,
   publicSessionProviderOrderedItemsV2,
   publicSessionProviderToolCallQueueItemsV2,
+  repairedSessionProviderOutcomeV2,
   sessionToolCorrectionForNextTurnV2,
   type SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
@@ -1079,13 +1080,19 @@ export class SessionKernelProviderTurnsV2 {
       };
     }
     current.providerTurn.status = 'completed';
-    const outcome = {
-      providerTurnId,
-      outputKind: output.kind,
-      recordedAt,
-      ...providerOutcomeSummary(output),
-      providerResult: output.providerResult,
-    };
+    const outcome = output.kind === 'noTool' && output.repair
+      ? repairedSessionProviderOutcomeV2(
+          providerTurnId,
+          output,
+          recordedAt
+        )
+      : {
+          providerTurnId,
+          outputKind: output.kind,
+          recordedAt,
+          ...providerOutcomeSummary(output),
+          providerResult: output.providerResult,
+        };
     const existingOutcome = current.providerOutcomes.find(
       (candidate) => candidate.providerTurnId === providerTurnId
     );

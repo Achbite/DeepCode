@@ -77,6 +77,37 @@ pub(crate) struct SessionProviderAuthoritySidecarV1 {
     pub(crate) snapshot_high_water: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SessionProviderContinuationOutcomeStatusV1 {
+    Completed,
+    Aborted,
+    Unexecuted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderContinuationRejectionV1 {
+    pub(crate) reason: String,
+    pub(crate) guidance: String,
+    pub(crate) rejection_fact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderContinuationOutcomeV1 {
+    pub(crate) operation_id: String,
+    pub(crate) status: SessionProviderContinuationOutcomeStatusV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_fact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_fact_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) settlement_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rejection: Option<SessionProviderContinuationRejectionV1>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -155,6 +186,8 @@ pub(crate) struct SessionProviderAdmissionSidecarV1 {
     pub(crate) authority: SessionProviderAuthoritySidecarV1,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) continuation_operation_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) continuation_outcomes: Vec<SessionProviderContinuationOutcomeV1>,
     pub(crate) cache_lane: SessionProviderCacheLaneSidecarV1,
 }
 
@@ -421,6 +454,8 @@ impl SessionProviderAdmissionSidecarV1 {
         let continuation_append = self.purpose == ProviderTracePurposeV1::Continuation
             && self.cache_lane.mode == SessionProviderCacheLaneModeV1::Append;
         if continuation_append != !self.continuation_operation_ids.is_empty()
+            || continuation_append != !self.continuation_outcomes.is_empty()
+            || self.continuation_operation_ids.len() != self.continuation_outcomes.len()
             || self.continuation_operation_ids.len() > 32
         {
             return Err(HostV2StorageError::invalid(
@@ -436,6 +471,79 @@ impl SessionProviderAdmissionSidecarV1 {
                 return Err(HostV2StorageError::invalid(
                     "provider_continuation_operation_identity_invalid",
                     "Provider append continuation operation identities must be unique",
+                ));
+            }
+        }
+        for (index, outcome) in self.continuation_outcomes.iter().enumerate() {
+            validate_bounded_identity(
+                &outcome.operation_id,
+                "continuationOutcome.operationId",
+                512,
+            )?;
+            if self.continuation_operation_ids.get(index) != Some(&outcome.operation_id) {
+                return Err(HostV2StorageError::invalid(
+                    "provider_continuation_operation_identity_invalid",
+                    "Provider continuation outcomes must exactly follow admitted operation identities",
+                ));
+            }
+            let has_terminal_id = outcome.terminal_fact_id.is_some();
+            let has_terminal_kind = outcome.terminal_fact_kind.is_some();
+            if has_terminal_id != has_terminal_kind {
+                return Err(HostV2StorageError::invalid(
+                    "provider_continuation_outcome_invalid",
+                    "Provider continuation terminal fact identity is partial",
+                ));
+            }
+            if let Some(value) = &outcome.terminal_fact_id {
+                validate_bounded_identity(value, "continuationOutcome.terminalFactId", 512)?;
+            }
+            if let Some(value) = &outcome.terminal_fact_kind {
+                validate_bounded_identity(value, "continuationOutcome.terminalFactKind", 128)?;
+            }
+            if let Some(value) = &outcome.settlement_reason {
+                validate_bounded_identity(value, "continuationOutcome.settlementReason", 256)?;
+            }
+            if let Some(rejection) = &outcome.rejection {
+                validate_bounded_identity(
+                    &rejection.reason,
+                    "continuationOutcome.rejection.reason",
+                    128,
+                )?;
+                validate_bounded_identity(
+                    &rejection.rejection_fact_id,
+                    "continuationOutcome.rejection.rejectionFactId",
+                    512,
+                )?;
+                if rejection.guidance.trim().is_empty() || rejection.guidance.len() > 64 * 1024 {
+                    return Err(HostV2StorageError::invalid(
+                        "provider_continuation_outcome_invalid",
+                        "Provider continuation rejection guidance is empty or too large",
+                    ));
+                }
+            }
+            let invalid_shape = match outcome.status {
+                SessionProviderContinuationOutcomeStatusV1::Completed => {
+                    outcome.settlement_reason.is_some()
+                        || outcome.rejection.is_some()
+                        || !has_terminal_id
+                }
+                SessionProviderContinuationOutcomeStatusV1::Aborted => {
+                    outcome.settlement_reason.is_none()
+                        || outcome.rejection.as_ref().is_some_and(|_| {
+                            outcome.settlement_reason.as_deref() != Some("kernelRejected")
+                                || has_terminal_id
+                        })
+                }
+                SessionProviderContinuationOutcomeStatusV1::Unexecuted => {
+                    outcome.settlement_reason.is_none()
+                        || has_terminal_id
+                        || outcome.rejection.is_some()
+                }
+            };
+            if invalid_shape {
+                return Err(HostV2StorageError::invalid(
+                    "provider_continuation_outcome_invalid",
+                    "Provider continuation outcome status conflicts with its evidence",
                 ));
             }
         }

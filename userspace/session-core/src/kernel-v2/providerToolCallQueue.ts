@@ -22,6 +22,7 @@ import {
   type SessionProviderSettledToolCallV2,
   type SessionProviderToolRejectionV2,
   type SessionProviderToolCallReceiptV2,
+  type SessionProviderTurnOutputV2,
   type SessionToolCorrectionV2,
   type SessionProviderTurnTargetV2,
 } from './types.js';
@@ -674,6 +675,75 @@ export function settledSessionProviderToolCallsV2(
       ? { correction: cloneJson(call.correction) }
       : {}),
   }));
+}
+
+/**
+ * Closes every Provider-native tool call when Session rejects the complete
+ * batch before Kernel admission (for example schema repair or PlanAction
+ * ownership repair). The synthetic operation identities are Session-only and
+ * never grant capability; they exist solely to preserve the native
+ * assistant(tool_calls) -> tool(result) continuation topology.
+ */
+export function repairedSessionProviderOutcomeV2(
+  providerTurnId: string,
+  output: Extract<
+    SessionProviderTurnOutputV2,
+    { kind: 'noTool' }
+  >,
+  recordedAt: string
+): SessionProviderOutcomeRecordV2 {
+  const calls = output.items.filter(
+    (item): item is Extract<
+      SessionProviderOrderedItemV2,
+      { kind: 'toolCall' }
+    > => item.kind === 'toolCall'
+  );
+  if (calls.length === 0 || calls.length > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
+    throw invalidQueue();
+  }
+  if (!output.repair) throw invalidQueue();
+  const settlementReason = output.repair.kind === 'toolArguments'
+    ? 'sessionToolArgumentsInvalid'
+    : 'sessionPlanActionOwnershipMismatch';
+  const receipt: SessionProviderToolCallReceiptV2 = {
+    schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+    providerTurnId,
+    responseDigest: output.completion.responseDigest,
+    callCount: calls.length,
+    calls: calls.map((call, index) => ({
+      ordinal: index + 1,
+      callId: call.callId,
+      toolName: call.toolName,
+      toolId: call.toolId,
+      argumentsDigest: sha256Hash(canonicalJson(call.arguments)),
+    })),
+    recordedAt,
+  };
+  return {
+    providerTurnId,
+    outputKind: 'toolIntent',
+    recordedAt,
+    ...(output.guidance ? { summary: output.guidance.slice(0, 8_192) } : {}),
+    toolCallReceipt: receipt,
+    toolSettlement: {
+      status: 'aborted',
+      settledAt: recordedAt,
+    },
+    toolCalls: calls.map((call, index) => ({
+      ordinal: index + 1,
+      operationId: `provider-repair-${sha256Hash(canonicalJson({
+        schemaVersion: 'deepcode.session.provider-repair-operation.v1',
+        providerTurnId,
+        callId: call.callId,
+        ordinal: index + 1,
+        toolId: call.toolId,
+      })).slice('sha256:'.length)}`,
+      toolId: call.toolId,
+      status: 'unexecuted',
+      settlementReason,
+    })),
+    providerResult: cloneJson(output.providerResult),
+  };
 }
 
 export function prepareSessionProviderToolCallSubmissionV2(

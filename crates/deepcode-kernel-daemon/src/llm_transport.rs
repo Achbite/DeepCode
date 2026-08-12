@@ -5,7 +5,7 @@ use bytes::Bytes;
 use deepcode_kernel_abi::v2::{CommandRequestId, RunId};
 use deepcode_kernel_abi::v2_command::{
     KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2,
-    KernelFactDomainProjectionV2, KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
+    KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
 };
 use deepcode_kernel_abi::{RunCapabilityV2, ToolIdV2};
 use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
@@ -1534,6 +1534,7 @@ struct ProviderContinuationToolV1 {
 struct ProviderContinuationOperationBindingV1 {
     operation_id: String,
     tool_id: String,
+    outcome: SessionProviderContinuationOutcomeV1,
 }
 
 #[derive(Debug, Clone)]
@@ -1724,6 +1725,7 @@ fn inject_provider_native_continuation(
         &parent_sidecar.target_binding,
         &completed.ordered_items,
         &current_sidecar.continuation_operation_ids,
+        &current_sidecar.continuation_outcomes,
     )?;
     let tool_outputs = query_canonical_provider_tool_outputs(
         current_identity,
@@ -2102,12 +2104,17 @@ fn provider_native_continuation_operation_bindings(
     parent_target: &SessionProviderTargetBindingSidecarV1,
     ordered_items: &[Value],
     admitted_operation_ids: &[String],
+    admitted_outcomes: &[SessionProviderContinuationOutcomeV1],
 ) -> Result<Vec<ProviderContinuationOperationBindingV1>, ProviderNativeStreamTransportErrorV1> {
     let call_count = ordered_items
         .iter()
         .filter(|item| item.get("kind").and_then(Value::as_str) == Some("toolCall"))
         .count();
-    if call_count == 0 || call_count > 32 || admitted_operation_ids.len() != call_count {
+    if call_count == 0
+        || call_count > 32
+        || admitted_operation_ids.len() != call_count
+        || admitted_outcomes.len() != call_count
+    {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_native_history_invalid",
         ));
@@ -2156,9 +2163,19 @@ fn provider_native_continuation_operation_bindings(
                 "provider_continuation_native_history_invalid",
             ));
         }
+        let outcome = admitted_outcomes
+            .get(operation_bindings.len())
+            .filter(|outcome| outcome.operation_id == operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new(
+                    "provider_continuation_native_history_invalid",
+                )
+            })?;
         operation_bindings.push(ProviderContinuationOperationBindingV1 {
             operation_id,
             tool_id,
+            outcome,
         });
     }
     if let SessionProviderTargetBindingSidecarV1::ContextRead { operation_id, .. } = parent_target {
@@ -2199,6 +2216,7 @@ fn query_canonical_provider_tool_outputs(
 
     let mut outputs = HashMap::with_capacity(expected.len());
     let mut admitted = HashSet::with_capacity(expected.len());
+    let mut verified_negative_fact_ids = HashSet::new();
     let mut output_bytes = 0_usize;
     let mut after_ledger_sequence = 0_u64;
     let mut continuation = None;
@@ -2242,26 +2260,60 @@ fn query_canonical_provider_tool_outputs(
         snapshot_high_water.get_or_insert(page.snapshot_high_water);
 
         for fact in page.facts {
-            if fact.domain != KernelFactDomainProjectionV2::Invocation
-                || fact.lineage.run_id != run_id
+            if fact.lineage.run_id != run_id
                 || fact.lineage.control_epoch.map(|epoch| epoch.get())
                     != Some(current_identity.control_epoch)
             {
                 continue;
             }
-            let Some(operation_id) = fact
+            let fact_id = fact.fact_id.to_string();
+            let operation_id = fact
                 .lineage
                 .operation_id
                 .as_ref()
                 .map(ToString::to_string)
                 .filter(|operation_id| expected.contains_key(operation_id))
-            else {
+                .or_else(|| {
+                    operation_bindings.iter().find_map(|binding| {
+                        binding
+                            .outcome
+                            .rejection
+                            .as_ref()
+                            .filter(|rejection| rejection.rejection_fact_id == fact_id)
+                            .map(|_| binding.operation_id.clone())
+                    })
+                });
+            let Some(operation_id) = operation_id else {
                 continue;
             };
+            let binding = operation_bindings
+                .iter()
+                .find(|binding| binding.operation_id == operation_id)
+                .ok_or_else(|| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_identity_mismatch",
+                    )
+                })?;
             if !provider_continuation_fact_matches_parent(&fact, parent_sidecar) {
                 return Err(ProviderNativeStreamTransportErrorV1::new(
                     "provider_continuation_result_identity_mismatch",
                 ));
+            }
+            if binding.outcome.terminal_fact_id.as_deref() == Some(fact_id.as_str()) {
+                if binding.outcome.terminal_fact_kind.as_deref() != Some(fact.fact_kind.as_str()) {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_identity_mismatch",
+                    ));
+                }
+                verified_negative_fact_ids.insert(fact_id.clone());
+            }
+            if binding
+                .outcome
+                .rejection
+                .as_ref()
+                .is_some_and(|rejection| rejection.rejection_fact_id == fact_id)
+            {
+                verified_negative_fact_ids.insert(fact_id.clone());
             }
             match fact.fact_kind.as_str() {
                 "toolIntentAdmitted" => {
@@ -2302,7 +2354,10 @@ fn query_canonical_provider_tool_outputs(
                         .ok_or_else(|| {
                             ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
                         })?;
-                    if outputs.insert(operation_id, output).is_some() {
+                    if binding.outcome.status
+                        != SessionProviderContinuationOutcomeStatusV1::Completed
+                        || outputs.insert(operation_id, output).is_some()
+                    {
                         return Err(ProviderNativeStreamTransportErrorV1::new(
                             "provider_continuation_result_missing",
                         ));
@@ -2335,12 +2390,88 @@ fn query_canonical_provider_tool_outputs(
             ));
         }
     }
-    if admitted.len() != expected.len() || outputs.len() != expected.len() {
+    for binding in operation_bindings {
+        match binding.outcome.status {
+            SessionProviderContinuationOutcomeStatusV1::Completed => {
+                if !admitted.contains(&binding.operation_id)
+                    || !outputs.contains_key(&binding.operation_id)
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_missing",
+                    ));
+                }
+            }
+            SessionProviderContinuationOutcomeStatusV1::Aborted
+            | SessionProviderContinuationOutcomeStatusV1::Unexecuted => {
+                if binding
+                    .outcome
+                    .terminal_fact_id
+                    .as_ref()
+                    .is_some_and(|fact_id| !verified_negative_fact_ids.contains(fact_id))
+                    || binding.outcome.rejection.as_ref().is_some_and(|rejection| {
+                        !verified_negative_fact_ids.contains(&rejection.rejection_fact_id)
+                    })
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_missing",
+                    ));
+                }
+                let output = provider_negative_tool_outcome(&binding.outcome);
+                output_bytes = output_bytes
+                    .checked_add(
+                        serde_json::to_vec(&output)
+                            .map_err(|_| {
+                                ProviderNativeStreamTransportErrorV1::new(
+                                    "provider_continuation_result_missing",
+                                )
+                            })?
+                            .len(),
+                    )
+                    .filter(|bytes| *bytes <= PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1)
+                    .ok_or_else(|| {
+                        ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
+                    })?;
+                if outputs
+                    .insert(binding.operation_id.clone(), output)
+                    .is_some()
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_missing",
+                    ));
+                }
+            }
+        }
+    }
+    if outputs.len() != expected.len() {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_result_missing",
         ));
     }
     Ok(outputs)
+}
+
+fn provider_negative_tool_outcome(outcome: &SessionProviderContinuationOutcomeV1) -> Value {
+    let mut value = json!({
+        "schemaVersion": "deepcode.session.provider-tool-outcome.v1",
+        "status": match outcome.status {
+            SessionProviderContinuationOutcomeStatusV1::Completed => "completed",
+            SessionProviderContinuationOutcomeStatusV1::Aborted => "aborted",
+            SessionProviderContinuationOutcomeStatusV1::Unexecuted => "unexecuted",
+        },
+    });
+    if let Some(reason) = &outcome.settlement_reason {
+        value["reasonCode"] = json!(reason);
+    }
+    if let Some(kind) = &outcome.terminal_fact_kind {
+        value["terminalKind"] = json!(kind);
+    }
+    if let Some(rejection) = &outcome.rejection {
+        value["rejection"] = json!({
+            "reason": rejection.reason,
+            "guidance": rejection.guidance,
+        });
+    }
+    value
 }
 
 fn provider_continuation_fact_matches_parent(
