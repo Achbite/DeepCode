@@ -2,11 +2,10 @@ import { create } from 'zustand';
 import type {
   ApiResponse,
   AgentHostCallerMutationErrorV2,
+  AgentConversationDraftTargetV1,
   AgentConversationTargetV1,
-  AgentProjectConversationTargetV1,
   AgentInputAttachmentV3,
   AgentRunGuidanceRequest,
-  AskAgentRunRequest,
   AgentSession,
   AgentTimelinePermissionRequestView,
   AgentTimelineResult,
@@ -38,7 +37,7 @@ import {
   renameAgentSession,
   revokeUserAttachmentGrant,
   startAgentRun,
-  startProjectAgentRun,
+  startConversationDraftRun,
   streamAgentTimeline,
   submitCurrentAgentRunGuidance,
   submitAgentRunGuidance,
@@ -84,11 +83,8 @@ interface AgentSessionState {
   profileSelectionBusy: boolean;
   loading: boolean;
   selectionReady: boolean;
-  runningSessionIds: string[];
-  activeRunSessionIds: string[];
   cancellingSessionIds: string[];
   activeSubmissionSessionIds: string[];
-  pendingSubmissionSessionIds: string[];
   errorMessage: string | null;
   messageAttachments: AgentInputAttachmentV3[];
   sessionAttachments: AgentInputAttachmentV3[];
@@ -104,10 +100,10 @@ interface AgentSessionActions {
   refreshSessions: () => Promise<void>;
   createNewSession: () => Promise<AgentSession | null>;
   captureSubmissionTarget: (expectedSessionId?: string) => AgentSessionSubmissionTarget | null;
-  activateSession: (sessionId: string) => Promise<void>;
+  activateSession: (sessionId: string) => Promise<boolean>;
   renameSession: (sessionId: string, title: string) => Promise<void>;
   archiveSession: (sessionId: string) => Promise<void>;
-  deleteSession: (sessionId: string) => Promise<void>;
+  deleteSession: (sessionId: string) => Promise<boolean>;
   selectProfile: (profileId: string | null) => Promise<boolean>;
   refreshSessionProfile: () => Promise<void>;
   refreshActiveSessionContext: () => Promise<void>;
@@ -118,15 +114,11 @@ interface AgentSessionActions {
   ) => void;
   clearMessageAttachments: () => void;
   sendMessage: (content: string, options?: AgentSendMessageOptions) => Promise<boolean>;
-  sendProjectMessage: (
-    projectId: string,
-    conversationTarget: AgentProjectConversationTargetV1,
-    submissionScopeId: string,
+  sendDraftMessage: (
+    conversationDraftTarget: AgentConversationDraftTargetV1,
     content: string,
-    profileId?: string
-  ) => Promise<boolean>;
-  pendingSubmissionRetryView: (sessionId?: string) => PendingSubmissionRetryView | null;
-  retryPendingSubmission: (clearOriginalMessageAttachments: boolean) => Promise<boolean>;
+    profileId: string
+  ) => Promise<AgentSession | null>;
   cancelCurrentRun: () => Promise<void>;
   acceptPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   rejectPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
@@ -136,17 +128,7 @@ interface AgentSessionActions {
 type Store = AgentSessionState & AgentSessionActions;
 
 interface AgentSendMessageOptions {
-  retryCallerRequestId?: string;
-  clearOriginalMessageAttachments?: boolean;
   expectedTarget?: AgentSessionSubmissionTarget;
-}
-
-export interface PendingSubmissionRetryView {
-  content: string;
-  messageAttachments: AgentInputAttachmentV3[];
-  callerRequestId: string;
-  disposition: 'pending' | 'indeterminate';
-  message?: string;
 }
 
 const workspaceTreeRevisionBySession = new Map<string, number>();
@@ -170,35 +152,6 @@ const canonicalTimelineStaleSessions = new Set<string>();
 const canonicalTimelineFailClosedSessions = new Set<string>();
 const canonicalTimelineGenerations = new Map<string, number>();
 const pendingHostMutationOwners = new Map<string, string>();
-const pendingProjectAdmissionIdentities = new Map<string, {
-  projectId: string;
-  fingerprint: string;
-  callerRequestId: string;
-}>();
-type PendingHostSubmissionDisposition = 'pending' | 'indeterminate';
-type PendingHostSubmission =
-  | {
-      kind: 'ask';
-      fingerprint: string;
-      callerRequestId: string;
-      disposition: PendingHostSubmissionDisposition;
-      message?: string;
-      messageAttachmentInstances: AgentInputAttachmentV3[];
-      request: AskAgentRunRequest;
-    }
-  | {
-      kind: 'input';
-      fingerprint: string;
-      callerRequestId: string;
-      disposition: PendingHostSubmissionDisposition;
-      message?: string;
-      messageAttachmentInstances: AgentInputAttachmentV3[];
-      runId: string;
-      request: AgentRunGuidanceRequest;
-    };
-const PENDING_HOST_SUBMISSIONS_STORAGE_KEY = 'deepcode.host.pending-submissions.v3';
-const LEGACY_PENDING_HOST_SUBMISSIONS_STORAGE_KEY =
-  'deepcode.host.pending-submissions.v2';
 
 function boundedStoredString(value: unknown, maxBytes: number): string | null {
   return typeof value === 'string'
@@ -239,33 +192,6 @@ function decodeStoredHostAttachment(value: unknown): AgentInputAttachmentV3 | nu
   };
 }
 
-function loadPendingHostSubmissions(): {
-  submissions: Map<string, PendingHostSubmission>;
-  invalid: boolean;
-} {
-  const submissions = new Map<string, PendingHostSubmission>();
-  if (typeof window === 'undefined' || typeof window.localStorage === 'undefined') {
-    return { submissions, invalid: false };
-  }
-  try {
-    window.localStorage.removeItem(LEGACY_PENDING_HOST_SUBMISSIONS_STORAGE_KEY);
-    window.localStorage.removeItem(PENDING_HOST_SUBMISSIONS_STORAGE_KEY);
-  } catch {
-    // Browser storage is legacy UI state. Its availability cannot gate
-    // canonical Session admission.
-  }
-  return { submissions, invalid: false };
-}
-
-function persistPendingHostSubmissions(
-  _submissions: Map<string, PendingHostSubmission>
-): boolean {
-  return true;
-}
-
-const loadedPendingHostSubmissions = loadPendingHostSubmissions();
-const pendingHostSubmissionIdentities = loadedPendingHostSubmissions.submissions;
-let pendingHostSubmissionStorageInvalid = loadedPendingHostSubmissions.invalid;
 let agentSessionSelectionGeneration = 0;
 let settledAgentSessionSelectionGeneration = 0;
 let activeAgentSessionLoadingScopeKey: string | null = null;
@@ -364,6 +290,26 @@ function submissionTargetIsCurrent(target: AgentSessionSubmissionTarget): boolea
   );
 }
 
+function sessionMatchesDraftAdmission(
+  session: AgentSession,
+  draftTarget: AgentConversationDraftTargetV1,
+  profileId: string
+): boolean {
+  const target = session.conversationTarget;
+  if (
+    session.profileId !== profileId
+    || target.sessionId !== session.id
+    || target.workspaceScopeKey !== draftTarget.workspaceScopeKey
+  ) {
+    return false;
+  }
+  if (draftTarget.kind === 'project') {
+    return session.projectId === draftTarget.projectId
+      && target.projectId === draftTarget.projectId;
+  }
+  return session.projectId === undefined && target.projectId === undefined;
+}
+
 function normalizeInputAttachment(
   attachment: AgentInputAttachmentV3
 ): AgentInputAttachmentV3 | null {
@@ -414,103 +360,6 @@ function releasePendingHostMutation(sessionId: string, ownerToken: string): void
       ),
     }));
   }
-}
-
-function hostSubmissionFingerprint(
-  content: string,
-  attachments: AgentInputAttachmentV3[]
-): string {
-  return JSON.stringify({ content, attachments });
-}
-
-function unresolvedHostSubmission(sessionId: string): PendingHostSubmission | null {
-  return pendingHostSubmissionIdentities.get(sessionId) ?? null;
-}
-
-function pendingHostSubmissionContent(submission: PendingHostSubmission): string {
-  return submission.kind === 'ask'
-    ? submission.request.content
-    : submission.request.guidance;
-}
-
-function pendingHostSubmissionAttachments(
-  submission: PendingHostSubmission
-): AgentInputAttachmentV3[] {
-  return [...(submission.request.attachments ?? [])];
-}
-
-function rememberHostSubmission<T extends PendingHostSubmission>(
-  sessionId: string,
-  submission: T
-): T | null {
-  const previous = pendingHostSubmissionIdentities.get(sessionId);
-  pendingHostSubmissionIdentities.set(sessionId, submission);
-  if (!persistPendingHostSubmissions(pendingHostSubmissionIdentities)) {
-    if (previous) {
-      pendingHostSubmissionIdentities.set(sessionId, previous);
-    } else {
-      pendingHostSubmissionIdentities.delete(sessionId);
-    }
-    pendingHostSubmissionStorageInvalid = true;
-    return null;
-  }
-  useAgentSessionStore.setState((state) => ({
-    pendingSubmissionSessionIds: state.pendingSubmissionSessionIds.includes(sessionId)
-      ? state.pendingSubmissionSessionIds
-      : [...state.pendingSubmissionSessionIds, sessionId],
-  }));
-  return submission;
-}
-
-function updateHostSubmissionDisposition(
-  sessionId: string,
-  callerRequestId: string,
-  disposition: PendingHostSubmissionDisposition,
-  message?: string
-): boolean {
-  const submission = pendingHostSubmissionIdentities.get(sessionId);
-  if (submission?.callerRequestId !== callerRequestId) return false;
-  const updated: PendingHostSubmission = {
-    ...submission,
-    disposition,
-    ...(message ? { message } : {}),
-  };
-  pendingHostSubmissionIdentities.set(sessionId, updated);
-  if (!persistPendingHostSubmissions(pendingHostSubmissionIdentities)) {
-    pendingHostSubmissionIdentities.set(sessionId, submission);
-    pendingHostSubmissionStorageInvalid = true;
-    return false;
-  }
-  useAgentSessionStore.setState((state) => ({
-    pendingSubmissionSessionIds: [...state.pendingSubmissionSessionIds],
-  }));
-  return true;
-}
-
-function settleHostSubmissionIdentity(sessionId: string, callerRequestId: string): boolean {
-  const submission = pendingHostSubmissionIdentities.get(sessionId);
-  if (submission?.callerRequestId !== callerRequestId) return true;
-  pendingHostSubmissionIdentities.delete(sessionId);
-  if (!persistPendingHostSubmissions(pendingHostSubmissionIdentities)) {
-    pendingHostSubmissionIdentities.set(sessionId, submission);
-    pendingHostSubmissionStorageInvalid = true;
-    return false;
-  }
-  useAgentSessionStore.setState((state) => ({
-    pendingSubmissionSessionIds: state.pendingSubmissionSessionIds.filter(
-      (candidate) => candidate !== sessionId
-    ),
-  }));
-  return true;
-}
-
-function messageAttachmentInstancesEqual(
-  left: AgentInputAttachmentV3[],
-  right: AgentInputAttachmentV3[]
-): boolean {
-  if (left.length !== right.length) return false;
-  const rightInstances = new Set(right);
-  return left.every((attachment) => rightInstances.has(attachment));
 }
 
 function outboundAttachments(state: Store): AgentInputAttachmentV3[] | undefined {
@@ -604,20 +453,12 @@ function cancellableTimelineRunId(
   return runId || null;
 }
 
-function addRunningSessionId(ids: string[], sessionId: string): string[] {
+function addInFlightSessionId(ids: string[], sessionId: string): string[] {
   return ids.includes(sessionId) ? ids : [...ids, sessionId];
 }
 
-function removeRunningSessionId(ids: string[], sessionId: string): string[] {
+function removeInFlightSessionId(ids: string[], sessionId: string): string[] {
   return ids.filter((id) => id !== sessionId);
-}
-
-function setProjectionRunActivity(sessionId: string, active: boolean): void {
-  useAgentSessionStore.setState((state) => ({
-    activeRunSessionIds: active
-      ? addRunningSessionId(state.activeRunSessionIds, sessionId)
-      : removeRunningSessionId(state.activeRunSessionIds, sessionId),
-  }));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -747,7 +588,7 @@ async function refreshCanonicalTimeline(
   });
   if (nextTimeline) {
     refreshWorkspaceTreeForTimeline(nextTimeline);
-    if (!await refreshActiveAgentRunIdentity(nextTimeline)) {
+    if (!await validateProjectedRunIdentity(nextTimeline)) {
       canonicalTimelineStaleSessions.add(sessionId);
       useAgentSessionStore.setState((state) => state.session?.id === sessionId
         ? { selectionReady: false }
@@ -861,11 +702,10 @@ function startCanonicalProgressWatcher(
     if (!appliedTimeline) return;
     refreshWorkspaceTreeForTimeline(appliedTimeline);
     if (isCanonicalTimelineTerminal(appliedTimeline)) {
-      setProjectionRunActivity(sessionId, false);
       stop();
       return;
     }
-    void refreshActiveAgentRunIdentity(appliedTimeline).then((ready) => {
+    void validateProjectedRunIdentity(appliedTimeline).then((ready) => {
       if (!ready) markCanonicalTimelineStale(sessionId);
     });
   };
@@ -996,15 +836,11 @@ function startCanonicalProgressWatcher(
   return watcher.acquire();
 }
 
-async function refreshActiveAgentRunIdentity(
+async function validateProjectedRunIdentity(
   timeline: AgentTimelineResult
 ): Promise<boolean> {
   const runProjection = timeline.runProjection;
   if (runProjection && !runProjection.runId.trim()) return false;
-  setProjectionRunActivity(
-    timeline.sessionId,
-    Boolean(runProjection && !isCanonicalTimelineTerminal(timeline))
-  );
   return true;
 }
 
@@ -1056,57 +892,6 @@ function hostCallerMutationDisposition(
     return response.data.disposition;
   }
   return 'indeterminate';
-}
-
-async function recordHostMutationNonAcceptance(
-  sessionId: string,
-  callerRequestId: string,
-  response: Pick<ApiResponse<unknown>, 'ok' | 'data' | 'message' | 'error'>,
-  fallbackMessage: string
-): Promise<string | null> {
-  const disposition = hostCallerMutationDisposition(response) ?? 'indeterminate';
-  const message = response.message ?? response.error ?? fallbackMessage;
-  if (disposition === 'rejected') {
-    let reconciled = false;
-    try {
-      reconciled = await refreshCanonicalTimeline(sessionId, true, true);
-    } catch {
-      reconciled = false;
-    }
-    if (!settleHostSubmissionIdentity(sessionId, callerRequestId)) {
-      return agentSessionMessage('agent.hostSubmission.storageFailed');
-    }
-    return reconciled
-      ? null
-      : agentSessionMessage('agent.hostSubmission.reconcileFailed');
-  }
-  if (!updateHostSubmissionDisposition(
-    sessionId,
-    callerRequestId,
-    disposition,
-    message
-  )) {
-    return agentSessionMessage('agent.hostSubmission.storageFailed');
-  }
-  return disposition === 'pending'
-    ? null
-    : agentSessionMessage('agent.hostSubmission.indeterminate');
-}
-
-function recordHostMutationException(
-  sessionId: string,
-  callerRequestId: string,
-  error: unknown
-): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return updateHostSubmissionDisposition(
-    sessionId,
-    callerRequestId,
-    'indeterminate',
-    message
-  )
-    ? agentSessionMessage('agent.hostSubmission.indeterminate')
-    : agentSessionMessage('agent.hostSubmission.storageFailed');
 }
 
 async function startAndWaitAgentRun(
@@ -1254,7 +1039,7 @@ async function readCanonicalHostSelection(
     const timeline = timelineAsReplay(
       requireExactNativeTimeline(timelineResult.data)
     );
-    if (!await refreshActiveAgentRunIdentity(timeline)) {
+    if (!await validateProjectedRunIdentity(timeline)) {
       return {
         kind: 'invalid',
         session,
@@ -1361,11 +1146,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   profileSelectionBusy: false,
   loading: false,
   selectionReady: false,
-  runningSessionIds: [],
-  activeRunSessionIds: [],
   cancellingSessionIds: [],
   activeSubmissionSessionIds: [],
-  pendingSubmissionSessionIds: [...pendingHostSubmissionIdentities.keys()],
   errorMessage: null,
   messageAttachments: [],
   sessionAttachments: [],
@@ -1470,7 +1252,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             const timeline = timelineAsReplay(
               requireExactNativeTimeline(timelineResult.data)
             );
-            const identityReady = await refreshActiveAgentRunIdentity(timeline);
+            const identityReady = await validateProjectedRunIdentity(timeline);
             if (!identityReady) {
               markCanonicalTimelineStale(current.data.session.id);
               throw new Error(
@@ -1692,15 +1474,21 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
 
   activateSession: async (sessionId) => {
     const selectionScopeKey = currentWorkspaceScopeKey();
+    const currentSelection = get();
     if (
-      get().session?.id === sessionId
-      && get().selectionReady
-      && get().localWorkspaceScopeKey === selectionScopeKey
-      && get().timeline?.sessionId === sessionId
+      currentSelection.session?.id === sessionId
+      && currentSelection.selectionReady
+      && currentSelection.localWorkspaceScopeKey
+        === currentSelection.session.conversationTarget.workspaceScopeKey
+      && (
+        Boolean(currentSelection.session.projectId)
+        || currentSelection.session.conversationTarget.workspaceScopeKey === selectionScopeKey
+      )
+      && currentSelection.timeline?.sessionId === sessionId
       && settledAgentSessionSelectionGeneration
         === agentSessionSelectionGeneration
     ) {
-      return;
+      return true;
     }
     const selectionGeneration = ++agentSessionSelectionGeneration;
     const previousSelection = captureAgentSessionSelection(get());
@@ -1764,7 +1552,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           const timeline = timelineAsReplay(
             requireExactNativeTimeline(timelineResult.data)
           );
-          const identityReady = await refreshActiveAgentRunIdentity(timeline);
+          const identityReady = await validateProjectedRunIdentity(timeline);
           if (
             selectionGeneration !== agentSessionSelectionGeneration
             || selectionScopeKey !== currentWorkspaceScopeKey()
@@ -1848,6 +1636,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     } finally {
       finishAgentSessionSelection(selectionGeneration, selectionScopeKey);
     }
+    const selected = get().session;
+    return selected?.id === sessionId
+      && selected.conversationTarget.sessionId === sessionId
+      && get().localWorkspaceScopeKey === selected.conversationTarget.workspaceScopeKey
+      && (
+        Boolean(selected.projectId)
+        || selected.conversationTarget.workspaceScopeKey === selectionScopeKey
+      );
   },
 
   renameSession: async (sessionId, title) => {
@@ -1865,13 +1661,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   archiveSession: async (sessionId) => {
     const result = await archiveAgentSession(sessionId, { archived: true });
     if (result.ok && result.data) {
-      setProjectionRunActivity(sessionId, false);
       const data = result.data;
       const wasActive = get().session?.id === sessionId;
       set((state) => ({
         sessions: data.sessions,
         currentSessionId: data.currentSessionId,
-        runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
         ...(wasActive ? {
           session: null,
           timeline: null,
@@ -1975,7 +1769,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           );
         }
         if (result.ok && result.data) {
-          setProjectionRunActivity(sessionId, false);
           const data = result.data;
           const selectionStillCurrent =
             selectionGeneration === agentSessionSelectionGeneration
@@ -1989,7 +1782,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
                 sessions: data.sessions,
                 currentSessionId: data.currentSessionId,
               } : {}),
-              runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
               ...(currentStillDeleted ? {
                 session: null,
                 timeline: null,
@@ -2036,12 +1828,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       !deletion.chooseNext
       || selectionGeneration !== agentSessionSelectionGeneration
       || selectionScopeKey !== currentWorkspaceScopeKey()
-    ) return;
+    ) return deletion.deleted;
     if (deletion.nextSessionId && deletion.nextSessionId !== sessionId) {
       await get().activateSession(deletion.nextSessionId);
-      return;
+      return deletion.deleted;
     }
     get().enterDraft();
+    return deletion.deleted;
   },
 
   selectProfile: async (profileId) => {
@@ -2050,9 +1843,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return false;
     const locked = state.loading
       || state.profileSelectionBusy
-      || state.runningSessionIds.includes(session.id)
-      || state.activeRunSessionIds.includes(session.id)
       || state.cancellingSessionIds.includes(session.id)
+      || cancellableTimelineRunId(state.timeline) !== null
       || Boolean(state.timeline?.interactionProjection?.pending)
       || Boolean(
         state.resolvingPermission
@@ -2158,7 +1950,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           const timeline = timelineAsReplay(
             requireExactNativeTimeline(timelineResult.data)
           );
-          if (!await refreshActiveAgentRunIdentity(timeline)) {
+          if (!await validateProjectedRunIdentity(timeline)) {
             throw new Error(agentSessionMessage('memoryV2.refreshFailed'));
           }
           if (
@@ -2264,78 +2056,25 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
   },
   clearMessageAttachments: () => set({ messageAttachments: [] }),
-  pendingSubmissionRetryView: (sessionId) => {
-    if (!sessionId) return null;
-    if (pendingHostMutationOwners.has(sessionId)) return null;
-    const pending = unresolvedHostSubmission(sessionId);
-    if (!pending) return null;
-    return {
-      content: pendingHostSubmissionContent(pending),
-      messageAttachments: [...pending.messageAttachmentInstances],
-      callerRequestId: pending.callerRequestId,
-      disposition: pending.disposition,
-      ...(pending.message ? { message: pending.message } : {}),
-    };
-  },
-  retryPendingSubmission: async (clearOriginalMessageAttachments) => {
-    const sessionId = get().session?.id;
-    if (!sessionId) return false;
-    const pending = unresolvedHostSubmission(sessionId);
-    if (!pending) return false;
-    return get().sendMessage(pendingHostSubmissionContent(pending), {
-      retryCallerRequestId: pending.callerRequestId,
-      clearOriginalMessageAttachments,
-    });
-  },
-  sendProjectMessage: async (
-    projectId,
-    conversationTarget,
-    submissionScopeId,
-    content,
-    profileId
-  ) => {
+  sendDraftMessage: async (conversationDraftTarget, content, profileId) => {
     const trimmed = content.trim();
-    if (!trimmed || !projectId.trim() || !submissionScopeId.trim()) return false;
-    // A project draft has no Session inheritance. Only resources selected for
-    // this draft may cross the atomic first-input boundary.
+    if (!trimmed || !profileId.trim()) return null;
+    // A draft has no Session inheritance. Only resources explicitly selected
+    // for this first input may cross the atomic admission boundary.
     const attachments = [...get().messageAttachments];
     const submittedMessageAttachments = [...get().messageAttachments];
-    const fingerprint = JSON.stringify({
-      content: trimmed,
-      attachments,
-      conversationTarget,
-      profileId: profileId ?? null,
-    });
-    const existingIdentity = pendingProjectAdmissionIdentities.get(submissionScopeId);
-    if (
-      existingIdentity
-      && (
-        existingIdentity.projectId !== projectId
-        || existingIdentity.fingerprint !== fingerprint
-      )
-    ) {
-      set({ errorMessage: agentSessionMessage('agent.hostSubmission.retryOriginal') });
-      return false;
-    }
-    const callerRequestId = existingIdentity?.callerRequestId
-      ?? newHostCallerRequestId('project-first-input');
-    pendingProjectAdmissionIdentities.set(submissionScopeId, {
-      projectId,
-      fingerprint,
-      callerRequestId,
-    });
+    const callerRequestId = newHostCallerRequestId('conversation-draft');
     const selectionGeneration = ++agentSessionSelectionGeneration;
     const previousSelection = captureAgentSessionSelection(get());
     set({ loading: true, selectionReady: false, errorMessage: null });
 
     let admitted;
     try {
-      admitted = await startProjectAgentRun(projectId, {
-        op: 'ask',
+      admitted = await startConversationDraftRun({
+        conversationDraftTarget,
+        profileId,
         content: trimmed,
-        ...(profileId ? { profileId } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
-        conversationTarget,
         callerRequestId,
       });
     } catch (error) {
@@ -2346,25 +2085,32 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ));
         settledAgentSessionSelectionGeneration = selectionGeneration;
       }
-      return false;
+      return null;
     }
     if (!admitted.ok || !admitted.data) {
-      if (hostCallerMutationDisposition(admitted) === 'rejected') {
-        pendingProjectAdmissionIdentities.delete(submissionScopeId);
-      }
       if (selectionGeneration === agentSessionSelectionGeneration) {
         set(restoredAgentSessionSelection(
           previousSelection,
-          admitted.message ?? admitted.error ?? 'Project Session admission failed'
+          admitted.message ?? admitted.error ?? 'Conversation draft admission failed'
         ));
         settledAgentSessionSelectionGeneration = selectionGeneration;
       }
-      return false;
+      return null;
     }
 
-    pendingProjectAdmissionIdentities.delete(submissionScopeId);
     const result = admitted.data;
     const session = result.session;
+    if (!sessionMatchesDraftAdmission(session, conversationDraftTarget, profileId)) {
+      if (selectionGeneration === agentSessionSelectionGeneration) {
+        set(restoredAgentSessionSelection(
+          previousSelection,
+          agentSessionMessage('agent.session.draftAdmissionMismatch')
+        ));
+        settledAgentSessionSelectionGeneration = selectionGeneration;
+      }
+      void get().refreshSessions();
+      return null;
+    }
     let admittedTimeline = emptyTimeline(session.id);
     let timelineReady = false;
     try {
@@ -2386,10 +2132,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ...state.sessions.filter((item) => item.id !== session.id),
         ],
       }));
-      return true;
+      return session;
     }
     if (timelineReady) {
-      await refreshActiveAgentRunIdentity(admittedTimeline);
+      await validateProjectedRunIdentity(admittedTimeline);
       canonicalTimelineStaleSessions.delete(session.id);
       canonicalTimelineFailClosedSessions.delete(session.id);
     } else {
@@ -2413,7 +2159,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       pendingPermission: pendingPermissionFromTimeline(admittedTimeline),
       resolvingPermission: null,
       resolvingPlan: null,
-      runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       loading: false,
       selectionReady: timelineReady,
       errorMessage: timelineReady
@@ -2421,17 +2166,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         : 'Canonical Session timeline is recovering after durable input admission.',
     }));
     settledAgentSessionSelectionGeneration = selectionGeneration;
-    return true;
+    return session;
   },
   sendMessage: async (content, options) => {
     const trimmed = content.trim();
     if (!trimmed) return false;
-    if (pendingHostSubmissionStorageInvalid) {
-      set({
-        errorMessage: agentSessionMessage('agent.hostSubmission.storageUnavailable'),
-      });
-      return false;
-    }
     const expectedTarget = options?.expectedTarget ?? captureCurrentSubmissionTarget();
     if (!expectedTarget || !submissionTargetIsCurrent(expectedTarget)) {
       set({
@@ -2439,11 +2178,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       });
       return false;
     }
-    const selectionReady = submissionTargetIsCurrent(expectedTarget);
     const session = get().session;
     if (
       !session
-      || !selectionReady
       || session.id !== expectedTarget.sessionId
     ) {
       set({
@@ -2457,48 +2194,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       });
       return false;
     }
-    const unresolvedAtStart = unresolvedHostSubmission(session.id);
-    const retryCallerRequestId = options?.retryCallerRequestId;
-    const replaySubmission = retryCallerRequestId !== undefined
-      && unresolvedAtStart?.callerRequestId === retryCallerRequestId
-      ? unresolvedAtStart
-      : null;
-    if (retryCallerRequestId && !replaySubmission) {
-      set({
-        errorMessage: agentSessionMessage('agent.hostSubmission.staleReplay'),
-      });
-      return false;
-    }
-    const savedMessageAttachments = replaySubmission
-      ? replaySubmission.messageAttachmentInstances
-      : [];
-    const currentMessageAttachments = get().messageAttachments;
-    const clearOriginalMessageAttachments = Boolean(
-      replaySubmission
-      && options?.clearOriginalMessageAttachments
-      && messageAttachmentInstancesEqual(currentMessageAttachments, savedMessageAttachments)
-    );
-    const submittedMessageAttachments = replaySubmission
-      ? clearOriginalMessageAttachments
-        ? [...currentMessageAttachments]
-        : []
-      : [...currentMessageAttachments];
-    const attachments = replaySubmission
-      ? pendingHostSubmissionAttachments(replaySubmission)
-      : outboundAttachments(get());
+    const submittedMessageAttachments = [...get().messageAttachments];
+    const attachments = outboundAttachments(get());
     if (!attachments) {
       set({
         errorMessage: agentSessionMessage('agent.attachment.invalidWorkspacePath'),
-      });
-      return false;
-    }
-    const submissionFingerprint = replaySubmission
-      ? replaySubmission.fingerprint
-      : hostSubmissionFingerprint(trimmed, attachments);
-    const unresolvedSubmission = unresolvedHostSubmission(session.id);
-    if (unresolvedSubmission && !replaySubmission) {
-      set({
-        errorMessage: agentSessionMessage('agent.hostSubmission.retryOriginal'),
       });
       return false;
     }
@@ -2520,34 +2220,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
     if (
       get().session?.id !== session.id
-      || (expectedTarget && !submissionTargetIsCurrent(expectedTarget))
+      || !submissionTargetIsCurrent(expectedTarget)
     ) {
       set({
         errorMessage: agentSessionMessage('agent.session.selectionChangedBeforeSend'),
       });
       return false;
     }
-    const replayAfterRefresh = retryCallerRequestId
-      ? unresolvedHostSubmission(session.id)
-      : null;
-    if (
-      retryCallerRequestId
-      && replayAfterRefresh?.callerRequestId !== retryCallerRequestId
-    ) {
-      set({
-        errorMessage: agentSessionMessage('agent.hostSubmission.settledDuringRefresh'),
-      });
-      return false;
-    }
-    const replaySubmissionAfterRefresh = replayAfterRefresh;
-    const unresolvedAfterRefresh = unresolvedHostSubmission(session.id);
-    if (unresolvedAfterRefresh && !replaySubmissionAfterRefresh) {
-      set({
-        errorMessage: agentSessionMessage('agent.hostSubmission.retryOriginal'),
-      });
-      return false;
-    }
-    const durableReplaySubmission = replaySubmissionAfterRefresh;
     const guidanceWorkspacePath = session.projectId
       ? undefined
       : currentWorkspacePath();
@@ -2559,18 +2238,59 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         };
 
     const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
-    const replayInput = durableReplaySubmission?.kind === 'input'
-      ? durableReplaySubmission
-      : null;
-    const interactionRunId = replayInput?.runId ?? (
-      durableReplaySubmission
-        ? null
-        : activeInteraction?.kind === 'permission'
-          ? permissionRequestRunId(activeInteraction.request)
-          : activeInteraction?.kind === 'plan'
-            ? activeInteraction.runId
-            : null
-    );
+    const applyAcceptedSession = (acceptedSession: AgentSession): void => {
+      set((state) => {
+        const sessions = [
+          acceptedSession,
+          ...state.sessions.filter((item) => item.id !== acceptedSession.id),
+        ];
+        if (state.session?.id !== session.id) return { sessions };
+        return {
+          session: acceptedSession,
+          sessions,
+          currentSessionId: acceptedSession.id,
+          messageAttachments: retainUnsubmittedMessageAttachments(
+            state.messageAttachments,
+            submittedMessageAttachments
+          ),
+          errorMessage: null,
+        };
+      });
+      markCanonicalTimelineStale(acceptedSession.id);
+      void refreshCanonicalTimeline(acceptedSession.id, true, true);
+    };
+    const recordNonAcceptance = (
+      response: Pick<ApiResponse<unknown>, 'ok' | 'data' | 'message' | 'error'>,
+      fallbackMessage: string
+    ): void => {
+      const disposition = hostCallerMutationDisposition(response) ?? 'indeterminate';
+      const message = response.message ?? response.error ?? fallbackMessage;
+      markCanonicalTimelineStale(session.id);
+      set((state) => state.session?.id === session.id
+        ? {
+            errorMessage: message,
+            selectionReady: disposition === 'rejected'
+              ? state.selectionReady
+              : false,
+          }
+        : state);
+      void refreshCanonicalTimeline(session.id, true, true);
+    };
+    const recordUnknownOutcome = (error: unknown): void => {
+      markCanonicalTimelineStale(session.id);
+      set((state) => state.session?.id === session.id
+        ? {
+            errorMessage: error instanceof Error ? error.message : String(error),
+            selectionReady: false,
+          }
+        : state);
+      void refreshCanonicalTimeline(session.id, true, true);
+    };
+    const interactionRunId = activeInteraction?.kind === 'permission'
+      ? permissionRequestRunId(activeInteraction.request)
+      : activeInteraction?.kind === 'plan'
+        ? activeInteraction.runId
+        : null;
     if (interactionRunId) {
       const mutationOwner = claimPendingHostMutation(session.id);
       if (!mutationOwner) {
@@ -2579,111 +2299,43 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         });
         return false;
       }
-      const callerIdentity = newHostCallerRequestId('input');
-      const submission = replayInput ?? rememberHostSubmission(session.id, {
-        kind: 'input',
-        fingerprint: submissionFingerprint,
-        callerRequestId: callerIdentity,
-        disposition: 'pending',
-        messageAttachmentInstances: submittedMessageAttachments,
-        runId: interactionRunId,
-        request: {
-          guidance: trimmed,
-          ...guidanceWorkspaceRequest,
-          ...(attachments.length > 0 ? { attachments } : {}),
-          conversationTarget: expectedTarget.conversationTarget,
-          callerRequestId: callerIdentity,
-        },
-      });
-      if (!submission) {
-        releasePendingHostMutation(session.id, mutationOwner);
-        set({
-          errorMessage: agentSessionMessage('agent.hostSubmission.identityPersistFailed'),
-        });
-        return false;
-      }
-      const callerRequestId = submission.callerRequestId;
-      set((state) => ({
-        runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-        errorMessage: null,
-      }));
+      const callerRequestId = newHostCallerRequestId('input');
+      const request: AgentRunGuidanceRequest = {
+        guidance: trimmed,
+        ...guidanceWorkspaceRequest,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        conversationTarget: expectedTarget.conversationTarget,
+        callerRequestId,
+      };
+      set({ errorMessage: null });
       const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
       try {
         const result = await submitAgentRunGuidance(
           session.id,
-          submission.runId,
-          submission.request
+          interactionRunId,
+          request
         );
         if (result.ok && result.data) {
-          if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
-            set({
-              errorMessage: agentSessionMessage('agent.hostSubmission.identitySettleFailed'),
-            });
-            return false;
-          }
-          set((state) => {
-            const sessions = [
-              result.data!.session,
-              ...state.sessions.filter(
-                (item) => item.id !== result.data!.session.id
-              ),
-            ];
-            if (state.session?.id !== session.id) return { sessions };
-            return {
-              session: result.data!.session,
-              sessions,
-              currentSessionId: result.data!.session.id,
-              messageAttachments: retainUnsubmittedMessageAttachments(
-                state.messageAttachments,
-                submittedMessageAttachments
-              ),
-              errorMessage: null,
-            };
-          });
-          markCanonicalTimelineStale(result.data.session.id);
-          void refreshCanonicalTimeline(result.data.session.id, true, true);
+          applyAcceptedSession(result.data.session);
           return true;
-        } else {
-          const failureMessage = await recordHostMutationNonAcceptance(
-            session.id,
-            callerRequestId,
-            result,
-            'New user input append failed'
-          );
-          set((state) => state.session?.id === session.id
-            ? {
-                errorMessage: failureMessage,
-              }
-            : state);
-          return false;
         }
+        recordNonAcceptance(result, 'New user input append failed');
+        return false;
       } catch (error) {
-        const failureMessage = recordHostMutationException(
-          session.id,
-          callerRequestId,
-          error
-        );
-        set((state) => state.session?.id === session.id
-          ? {
-              errorMessage: failureMessage,
-            }
-          : state);
+        recordUnknownOutcome(error);
         return false;
       } finally {
         releasePendingHostMutation(session.id, mutationOwner);
         void stopProgressWatcher();
-        set((state) => ({
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-        }));
       }
     }
-    if (!durableReplaySubmission && activeInteraction?.kind === 'permission') {
+    if (activeInteraction?.kind === 'permission') {
       set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
       return false;
     }
 
     const projectedActiveRun = cancellableTimelineRunId(get().timeline) !== null;
-    if (!durableReplaySubmission && projectedActiveRun) {
+    if (projectedActiveRun) {
       const mutationOwner = claimPendingHostMutation(session.id);
       if (!mutationOwner) {
         set({
@@ -2691,106 +2343,34 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         });
         return false;
       }
-      const callerIdentity = newHostCallerRequestId('input');
-      const submission = rememberHostSubmission(session.id, {
-        kind: 'input',
-        fingerprint: submissionFingerprint,
-        callerRequestId: callerIdentity,
-        disposition: 'pending',
-        messageAttachmentInstances: submittedMessageAttachments,
-        runId: 'current',
-        request: {
-          guidance: trimmed,
-          ...guidanceWorkspaceRequest,
-          ...(attachments.length > 0 ? { attachments } : {}),
-          conversationTarget: expectedTarget.conversationTarget,
-          callerRequestId: callerIdentity,
-        },
-      });
-      if (!submission) {
-        releasePendingHostMutation(session.id, mutationOwner);
-        set({
-          errorMessage: agentSessionMessage('agent.hostSubmission.identityPersistFailed'),
-        });
-        return false;
-      }
-      const callerRequestId = submission.callerRequestId;
-      set((state) => ({
-        runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-        errorMessage: null,
-      }));
+      const callerRequestId = newHostCallerRequestId('input');
+      const request: AgentRunGuidanceRequest = {
+        guidance: trimmed,
+        ...guidanceWorkspaceRequest,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        conversationTarget: expectedTarget.conversationTarget,
+        callerRequestId,
+      };
+      set({ errorMessage: null });
       const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
       try {
         const result = await submitCurrentAgentRunGuidance(
           session.id,
-          submission.request
+          request
         );
         if (result.ok && result.data) {
-          if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
-            set({
-              errorMessage: agentSessionMessage('agent.hostSubmission.identitySettleFailed'),
-            });
-            return false;
-          }
-          set((state) => {
-            const sessions = [
-              result.data!.session,
-              ...state.sessions.filter(
-                (item) => item.id !== result.data!.session.id
-              ),
-            ];
-            if (state.session?.id !== session.id) return { sessions };
-            return {
-              session: result.data!.session,
-              sessions,
-              currentSessionId: result.data!.session.id,
-              messageAttachments: retainUnsubmittedMessageAttachments(
-                state.messageAttachments,
-                submittedMessageAttachments
-              ),
-              errorMessage: null,
-            };
-          });
-          markCanonicalTimelineStale(result.data.session.id);
-          void refreshCanonicalTimeline(result.data.session.id, true, true);
+          applyAcceptedSession(result.data.session);
           return true;
-        } else {
-          const failureMessage = await recordHostMutationNonAcceptance(
-            session.id,
-            callerRequestId,
-            result,
-            'User guidance append failed'
-          );
-          set((state) => state.session?.id === session.id
-            ? {
-                errorMessage: failureMessage,
-              }
-            : state);
-          return false;
         }
+        recordNonAcceptance(result, 'User guidance append failed');
+        return false;
       } catch (error) {
-        const failureMessage = recordHostMutationException(
-          session.id,
-          callerRequestId,
-          error
-        );
-        set((state) => state.session?.id === session.id
-          ? {
-              errorMessage: failureMessage,
-            }
-          : state);
+        recordUnknownOutcome(error);
         return false;
       } finally {
         releasePendingHostMutation(session.id, mutationOwner);
         void stopProgressWatcher();
-        set((state) => ({
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-        }));
       }
-    }
-    if (!durableReplaySubmission && get().runningSessionIds.includes(session.id)) {
-      set({ errorMessage: agentSessionMessage('agent.hostSubmission.runIdentityUnavailable') });
-      return false;
     }
 
     const mutationOwner = claimPendingHostMutation(session.id);
@@ -2801,130 +2381,39 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       return false;
     }
     const workspacePath = session.projectId ? undefined : currentWorkspacePath();
-    const callerIdentity = newHostCallerRequestId('ask');
-    const askSubmission = durableReplaySubmission?.kind === 'ask'
-      ? durableReplaySubmission
-      : rememberHostSubmission(session.id, {
-        kind: 'ask',
-        fingerprint: submissionFingerprint,
-        callerRequestId: callerIdentity,
-        disposition: 'pending',
-        messageAttachmentInstances: submittedMessageAttachments,
-        request: {
-          op: 'ask',
-          content: trimmed,
-          ...(attachments.length > 0 ? { attachments } : {}),
-          workspacePath,
-          noWorkspace: session.projectId ? undefined : !workspacePath,
-          conversationTarget: expectedTarget.conversationTarget,
-          callerRequestId: callerIdentity,
-        },
-      });
-    if (!askSubmission) {
-      releasePendingHostMutation(session.id, mutationOwner);
-      set({
-        errorMessage: agentSessionMessage('agent.hostSubmission.identityPersistFailed'),
-      });
-      return false;
-    }
-    const callerRequestId = askSubmission.callerRequestId;
-    set((state) => ({
-      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      errorMessage: null,
-    }));
-
+    const callerRequestId = newHostCallerRequestId('ask');
+    set({ errorMessage: null });
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
-    return new Promise<boolean>((resolve) => {
-      let admissionSettled = false;
-      const settleAdmission = (admitted: boolean) => {
-        if (admissionSettled) return;
-        admissionSettled = true;
-        releasePendingHostMutation(session.id, mutationOwner);
-        resolve(admitted);
-      };
-      void (async () => {
-        try {
-          const result = await startAndWaitAgentRun(
-            session.id,
-            askSubmission.request,
-            () => {
-              if (!settleHostSubmissionIdentity(session.id, callerRequestId)) {
-                set({
-                  errorMessage: agentSessionMessage('agent.hostSubmission.identitySettleFailed'),
-                });
-                settleAdmission(false);
-                return;
-              }
-              set((state) => state.session?.id === session.id
-                ? {
-                    messageAttachments: retainUnsubmittedMessageAttachments(
-                      state.messageAttachments,
-                      submittedMessageAttachments
-                    ),
-                    errorMessage: null,
-                  }
-                : state);
-              settleAdmission(true);
-            }
-          );
-          const data = { session: result.session };
-          set((state) => {
-            const nextState: Partial<Store> = {
-              sessions: [
-                data.session,
-                ...state.sessions.filter((item) => item.id !== data.session.id),
-              ],
-              runningSessionIds: removeRunningSessionId(
-                state.runningSessionIds,
-                data.session.id
-              ),
-            };
-            if (state.session?.id === data.session.id) {
-              nextState.session = data.session;
-              nextState.currentSessionId = data.session.id;
-            }
-            return nextState;
-          });
-          markCanonicalTimelineStale(data.session.id);
-          void refreshCanonicalTimeline(data.session.id, true, true);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          const exactSubmissionStillPending =
-            unresolvedHostSubmission(session.id)?.callerRequestId === callerRequestId;
-          const failureMessage = err instanceof HostMutationOutcomeError
-            ? await recordHostMutationNonAcceptance(
-                session.id,
-                callerRequestId,
-                {
-                  ok: false,
-                  data: {
-                    schemaVersion: 'deepcode.host.caller-mutation-error.v2',
-                    disposition: err.disposition,
-                  },
-                  message,
-                },
-                message
-              )
-            : exactSubmissionStillPending
-              ? recordHostMutationException(
-                  session.id,
-                  callerRequestId,
-                  err
-                )
-              : message;
-          set((state) => ({
-            errorMessage: state.session?.id === session.id
-              ? failureMessage
-              : state.errorMessage,
-            runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-          }));
-          settleAdmission(false);
-        } finally {
-          releasePendingHostMutation(session.id, mutationOwner);
-          void stopProgressWatcher();
-        }
-      })();
-    });
+    try {
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'ask',
+        content: trimmed,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        workspacePath,
+        noWorkspace: session.projectId ? undefined : !workspacePath,
+        conversationTarget: expectedTarget.conversationTarget,
+        callerRequestId,
+      });
+      applyAcceptedSession(result.session);
+      return true;
+    } catch (error) {
+      if (error instanceof HostMutationOutcomeError) {
+        recordNonAcceptance({
+          ok: false,
+          data: {
+            schemaVersion: 'deepcode.host.caller-mutation-error.v2',
+            disposition: error.disposition,
+          },
+          message: error.message,
+        }, error.message);
+      } else {
+        recordUnknownOutcome(error);
+      }
+      return false;
+    } finally {
+      releasePendingHostMutation(session.id, mutationOwner);
+      void stopProgressWatcher();
+    }
   },
 
   cancelCurrentRun: async () => {
@@ -2932,70 +2421,63 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
     if (get().cancellingSessionIds.includes(session.id)) return;
     set((state) => ({
-      runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-      cancellingSessionIds: addRunningSessionId(state.cancellingSessionIds, session.id),
-      pendingPermission: null,
-      resolvingPermission: null,
-      resolvingPlan: null,
+      cancellingSessionIds: addInFlightSessionId(state.cancellingSessionIds, session.id),
       errorMessage: null,
     }));
 
-    let result;
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const callerRequestId = newHostCallerRequestId('cancel');
-      result = await cancelCurrentAgentRun(
+      const result = await cancelCurrentAgentRun(
         session.id,
         callerRequestId,
         session.conversationTarget
       );
-    } catch (error) {
+      if (result.ok && result.data) {
+        set((state) => {
+          const sessions = [
+            result.data!.session,
+            ...state.sessions.filter(
+              (item) => item.id !== result.data!.session.id
+            ),
+          ];
+          if (state.session?.id !== session.id) return { sessions };
+          return {
+            session: result.data!.session,
+            sessions,
+            currentSessionId: result.data!.session.id,
+            errorMessage: null,
+          };
+        });
+        markCanonicalTimelineStale(result.data.session.id);
+        void refreshCanonicalTimeline(result.data.session.id, true, true);
+        return;
+      }
       set((state) => ({
-        cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
+        errorMessage: state.session?.id === session.id
+          ? result.message ?? 'Agent run cancellation failed'
+          : state.errorMessage,
+      }));
+    } catch (error) {
+      markCanonicalTimelineStale(session.id);
+      set((state) => ({
         errorMessage: state.session?.id === session.id
           ? error instanceof Error ? error.message : String(error)
           : state.errorMessage,
+        selectionReady: state.session?.id === session.id
+          ? false
+          : state.selectionReady,
       }));
-      return;
+      void refreshCanonicalTimeline(session.id, true, true);
     } finally {
+      set((state) => ({
+        cancellingSessionIds: removeInFlightSessionId(
+          state.cancellingSessionIds,
+          session.id
+        ),
+      }));
       void stopProgressWatcher();
     }
-    if (result.ok && result.data) {
-      setProjectionRunActivity(session.id, false);
-      set((state) => {
-        const sessions = [
-          result.data!.session,
-          ...state.sessions.filter(
-            (item) => item.id !== result.data!.session.id
-          ),
-        ];
-        const nextState: Partial<Store> = {
-          sessions,
-          resolvingPermission: null,
-          resolvingPlan: null,
-          cancellingSessionIds: removeRunningSessionId(
-            state.cancellingSessionIds,
-            session.id
-          ),
-        };
-        if (state.session?.id === session.id) {
-          nextState.session = result.data!.session;
-          nextState.currentSessionId = result.data!.session.id;
-          nextState.errorMessage = null;
-        }
-        return nextState;
-      });
-      markCanonicalTimelineStale(result.data.session.id);
-      void refreshCanonicalTimeline(result.data.session.id, true, true);
-      return;
-    }
-
-    set((state) => ({
-      cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
-      errorMessage: state.session?.id === session.id
-        ? result.message ?? 'Agent run cancellation failed'
-        : state.errorMessage,
-    }));
   },
 
   acceptPermission: async (requestOverride) => {
@@ -3007,11 +2489,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
       return;
     }
-    set((state) => ({
+    set({
       resolvingPermission: { id: request.id, decision: 'accept' },
-      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
-    }));
+    });
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const result = await startAndWaitAgentRun(session.id, {
@@ -3033,10 +2514,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             ),
           ],
           resolvingPermission: null,
-          runningSessionIds: removeRunningSessionId(
-            state.runningSessionIds,
-            data.session.id
-          ),
         };
         if (state.session?.id === data.session.id) {
           nextState.session = data.session;
@@ -3052,7 +2529,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ? message
           : state.errorMessage,
         resolvingPermission: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
     } finally {
       void stopProgressWatcher();
@@ -3068,11 +2544,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
       return;
     }
-    set((state) => ({
+    set({
       resolvingPermission: { id: request.id, decision: 'reject' },
-      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
-    }));
+    });
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const result = await startAndWaitAgentRun(session.id, {
@@ -3094,10 +2569,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             ),
           ],
           resolvingPermission: null,
-          runningSessionIds: removeRunningSessionId(
-            state.runningSessionIds,
-            data.session.id
-          ),
         };
         if (state.session?.id === data.session.id) {
           nextState.session = data.session;
@@ -3113,7 +2584,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ? message
           : state.errorMessage,
         resolvingPermission: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
     } finally {
       void stopProgressWatcher();
@@ -3123,11 +2593,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   resolvePlan: async (runId, planId, decision, guidance) => {
     const session = get().session;
     if (!session || get().resolvingPlan) return;
-    set((state) => ({
+    set({
       resolvingPlan: { runId, planId, decision },
-      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
-    }));
+    });
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const result = await startAndWaitAgentRun(session.id, {
@@ -3151,10 +2620,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ],
           resolvingPermission: null,
           resolvingPlan: null,
-          runningSessionIds: removeRunningSessionId(
-            state.runningSessionIds,
-            data.session.id
-          ),
         };
         if (state.session?.id === data.session.id) {
           nextState.session = data.session;
@@ -3171,7 +2636,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ? message
           : state.errorMessage,
         resolvingPlan: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
     } finally {
       void stopProgressWatcher();

@@ -59,11 +59,16 @@ import type {
   KernelHostInspectionResult,
   AgentRunGuidanceRequest,
   StartAgentRunRequest,
-  StartProjectAgentRunRequest,
+  StartConversationDraftRunRequest,
+  AgentComposerProjectionV1,
+  PrivateAnalysisLeaseReceiptV1,
+  PrivateAnalysisProjectionV1,
+  PrivateAnalysisRevokeReceiptV1,
   AgentConversationTargetV1,
   CreateUserAttachmentGrantRequestV1,
   UserAttachmentGrantResultV1,
 } from '@deepcode/protocol';
+import { PRIVATE_ANALYSIS_LEASE_HEADER_V1 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getHostAdmissionHeaders, getKernelApiBase } from './hostTarget';
 
@@ -71,6 +76,7 @@ const API_BASE = getKernelApiBase();
 
 interface SendJsonOptions {
   signal?: AbortSignal;
+  headers?: Record<string, string>;
 }
 
 export type {
@@ -79,7 +85,9 @@ export type {
   AskAgentRunRequest,
   ResolveAgentRunDecisionRequest,
   StartAgentRunRequest,
-  StartProjectAgentRunRequest,
+  StartConversationDraftRunRequest,
+  AgentComposerProjectionV1,
+  AgentConversationDraftTargetV1,
   AgentConversationTargetV1,
 } from '@deepcode/protocol';
 
@@ -261,11 +269,12 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
 /** 通用 GET 包装 */
 async function getJson<T>(
   url: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  headers: Record<string, string> = {}
 ): Promise<ApiResponse<T>> {
   try {
     const response = await fetch(url, {
-      headers: getHostAdmissionHeaders(),
+      headers: { ...getHostAdmissionHeaders(), ...headers },
       signal,
     });
     if (!response.ok) {
@@ -294,6 +303,7 @@ async function sendJson<T>(
       headers: {
         'Content-Type': 'application/json',
         ...getHostAdmissionHeaders(),
+        ...options.headers,
       },
       body: JSON.stringify(body),
       signal: options.signal,
@@ -889,13 +899,63 @@ export function startAgentRun(
   );
 }
 
-export function startProjectAgentRun(
-  projectId: string,
-  request: StartProjectAgentRunRequest
+export function getAgentComposer(
+  request: { projectId?: string; sessionId?: string } = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<AgentComposerProjectionV1>> {
+  const qs = buildQuery({
+    projectId: request.projectId,
+    sessionId: request.sessionId,
+  });
+  return getJson<AgentComposerProjectionV1>(`${API_BASE}/agent/composer${qs}`, signal);
+}
+
+export function startConversationDraftRun(
+  request: StartConversationDraftRunRequest
 ): Promise<ApiResponse<AgentRunResult>> {
   return sendReplayableHostMutation<AgentRunResult>(
-    `${API_BASE}/agent/projects/${encodeURIComponent(projectId)}/sessions/runs`,
+    `${API_BASE}/agent/conversation-drafts/runs`,
     request
+  );
+}
+
+export function mintPrivateAnalysisLease(
+  sessionId: string,
+  callerRequestId: string
+): Promise<ApiResponse<PrivateAnalysisLeaseReceiptV1>> {
+  return sendJson<PrivateAnalysisLeaseReceiptV1>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/private-analysis/lease`,
+    'POST',
+    { callerRequestId }
+  );
+}
+
+export function getPrivateAnalysis(
+  sessionId: string,
+  capability: string,
+  request: { afterCursor?: string; limit?: number } = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<PrivateAnalysisProjectionV1>> {
+  const qs = buildQuery({
+    afterCursor: request.afterCursor,
+    limit: request.limit === undefined ? undefined : String(request.limit),
+  });
+  return getJson<PrivateAnalysisProjectionV1>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/private-analysis${qs}`,
+    signal,
+    { [PRIVATE_ANALYSIS_LEASE_HEADER_V1]: capability }
+  );
+}
+
+export function revokePrivateAnalysisLease(
+  sessionId: string,
+  capability: string
+): Promise<ApiResponse<PrivateAnalysisRevokeReceiptV1>> {
+  return sendJson<PrivateAnalysisRevokeReceiptV1>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/private-analysis/lease`,
+    'DELETE',
+    {},
+    { headers: { [PRIVATE_ANALYSIS_LEASE_HEADER_V1]: capability } }
   );
 }
 

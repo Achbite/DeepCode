@@ -20,8 +20,6 @@ const AgentPanel: React.FC = () => {
   const loading = useAgentSessionStore((s) => s.loading);
   const selectionReady = useAgentSessionStore((s) => s.selectionReady);
   const localWorkspaceScopeKey = useAgentSessionStore((s) => s.localWorkspaceScopeKey);
-  const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
-  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const activeSubmissionSessionIds = useAgentSessionStore((s) => s.activeSubmissionSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
@@ -36,9 +34,6 @@ const AgentPanel: React.FC = () => {
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
-  const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
-  const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
-  const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
@@ -49,15 +44,20 @@ const AgentPanel: React.FC = () => {
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const activeSessionRunning = Boolean(
+  const timelineProjection = timelineOrEmpty(timeline, session?.id);
+  const projectedRunActive = Boolean(
+    timelineProjection.runProjection
+    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      timelineProjection.runProjection.status
+    )
+  );
+  const activeSessionMutation = Boolean(
     session?.id
     && (
-      runningSessionIds.includes(session.id)
-      || activeRunSessionIds.includes(session.id)
+      activeSubmissionSessionIds.includes(session.id)
       || cancellingSessionIds.includes(session.id)
     )
   );
-  const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
     resolvingPlan,
@@ -66,7 +66,10 @@ const AgentPanel: React.FC = () => {
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
   const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
-  const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
+  const agentBusy = loading
+    || projectedRunActive
+    || activeSessionMutation
+    || pendingDecisionResolving;
   const waitingForUser = timelineProjection.runProjection?.status === 'waitingUser'
     || timelineProjection.runProjection?.wait?.kind === 'user';
   const cancellableRun = Boolean(
@@ -82,12 +85,6 @@ const AgentPanel: React.FC = () => {
     && localWorkspaceScopeKey === workspaceScopeKey
     && timeline?.sessionId === session.id
   );
-  const pendingSubmissionRetry = session?.id
-    && pendingSubmissionSessionIds.includes(session.id)
-    && !activeSubmissionSessionIds.includes(session.id)
-    ? pendingSubmissionRetryView(session.id)
-    : null;
-
   useEffect(() => {
     if (!session?.id) return;
     const release = observeSessionProjection(session.id);
@@ -155,8 +152,6 @@ const AgentPanel: React.FC = () => {
         sendBlocked={!agentReady}
         sendBlockedTitle={!agentReady ? t(language, 'agent.readiness.pending') : undefined}
         onSend={sendMessage}
-        pendingSubmissionRetry={pendingSubmissionRetry}
-        onRetryPendingSubmission={retryPendingSubmission}
         submissionScopeId={session?.id ?? null}
         canCancelCurrentRun={Boolean(
           session?.id && cancellableRun

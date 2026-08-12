@@ -873,16 +873,19 @@
 }
 
 .agent-markdown__table-wrap {
+  width: 100%;
   max-width: 100%;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--radius-md, 6px);
 }
 
 .agent-markdown__table {
-  width: 100%;
+  width: max-content;
+  max-width: none;
   border-collapse: collapse;
-  min-width: 360px;
+  min-width: 100%;
   font-size: 12px;
 }
 
@@ -892,13 +895,19 @@
   padding: 7px 9px;
   text-align: left;
   vertical-align: top;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
 .agent-markdown__table th {
   color: var(--text-strong, #fff);
   background: rgba(255, 255, 255, 0.045);
   font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-markdown__table code {
+  white-space: nowrap;
 }
 
 .agent-markdown__table tr:last-child td {

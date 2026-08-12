@@ -135,6 +135,55 @@ export interface AgentComposerProjectionV1 {
   pendingInteraction?: AgentTimelinePendingInteraction;
 }
 
+export const PRIVATE_ANALYSIS_PROJECTION_SCHEMA_V1 =
+  'deepcode.session.private-analysis-projection.v1' as const;
+export const PRIVATE_ANALYSIS_LEASE_SCHEMA_V1 =
+  'deepcode.session.private-analysis-lease.v1' as const;
+export const PRIVATE_ANALYSIS_LEASE_HEADER_V1 =
+  'x-deepcode-private-analysis-lease' as const;
+
+export interface PrivateAnalysisLeaseReceiptV1 {
+  schemaVersion: typeof PRIVATE_ANALYSIS_LEASE_SCHEMA_V1;
+  sessionId: string;
+  capability: string;
+  expiresInSeconds: number;
+}
+
+export interface PrivateAnalysisToolV1 {
+  name: string;
+  stage: string;
+}
+
+export interface PrivateAnalysisItemV1 {
+  analysisId: string;
+  requestId: string;
+  providerTurnId: string;
+  runId: string;
+  userTurnId: string;
+  boundary: 'primary' | 'continuation' | 'finalAnswer';
+  startedAtUnixMs: string;
+  completedAtUnixMs: string;
+  status: 'completed' | 'failed' | 'cancelled' | 'limitExceeded';
+  reasonCode?: string;
+  reasoning: string;
+  tools: PrivateAnalysisToolV1[];
+}
+
+export interface PrivateAnalysisProjectionV1 {
+  schemaVersion: typeof PRIVATE_ANALYSIS_PROJECTION_SCHEMA_V1;
+  sessionId: string;
+  afterCursor?: string;
+  nextCursor?: string;
+  hasMore: boolean;
+  items: PrivateAnalysisItemV1[];
+}
+
+export interface PrivateAnalysisRevokeReceiptV1 {
+  schemaVersion: typeof PRIVATE_ANALYSIS_LEASE_SCHEMA_V1;
+  sessionId: string;
+  revoked: boolean;
+}
+
 export interface AgentSession {
   id: string;
   title?: string;
@@ -807,15 +856,6 @@ export interface AgentRunGuidanceRequest {
   noWorkspace?: boolean;
   attachments?: AgentInputAttachmentV3[];
   conversationTarget: AgentConversationTargetV1;
-  callerRequestId: string;
-}
-
-export interface StartProjectAgentRunRequest {
-  op: 'ask';
-  content: string;
-  profileId?: string;
-  attachments?: AgentInputAttachmentV3[];
-  conversationTarget: AgentProjectConversationTargetV1;
   callerRequestId: string;
 }
 

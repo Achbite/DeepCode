@@ -610,6 +610,7 @@
     "agent.hostSubmission.identitySettleFailed": "The input was accepted, but its local replay identity did not settle safely. Retry session initialization.",
     "agent.hostSubmission.runIdentityUnavailable": "The current run identity is not ready. Refresh the session or start a new turn.",
     "agent.session.selectionChangedBeforeSend": "The selected session changed before this message was admitted. The draft was retained; send it again in the intended conversation.",
+    "agent.session.draftAdmissionMismatch": "The admitted session did not match the selected conversation target or model. The draft remains open; refresh before sending again.",
     "agent.hostSubmission.storageFailed": "The input admission state could not be stored safely. Repair local storage and retry.",
     "agent.hostSubmission.reconcileFailed": "The input was not accepted, and canonical session facts could not be reconciled yet. Retry session initialization.",
     "agent.hostSubmission.indeterminate": "Whether the input was accepted is still indeterminate. Use the retained original draft for an idempotent retry.",
@@ -1094,7 +1095,19 @@
     "requirement.optionEffect.continueWithAction": "Generate the next batch of execution actions",
     "requirement.optionEffect.skipCurrentTask": "Mark the current task as completed and advance the cursor",
     "requirement.optionEffect.replan": "Return to plan stage and re-plan",
-    "requirement.optionEffect.finishRun": "Finish this run"
+    "requirement.optionEffect.finishRun": "Finish this run",
+    "deepcodeGui.analysis.title": "Private analysis",
+    "deepcodeGui.analysis.shortLabel": "Analysis",
+    "deepcodeGui.analysis.open": "View private model analysis for this session",
+    "deepcodeGui.analysis.privateHint": "Off by default. This view exposes only raw reasoning, request boundaries, status, and tool stages; it never enters the normal conversation or copied output.",
+    "deepcodeGui.analysis.loading": "Acquiring a short-lived viewing lease…",
+    "deepcodeGui.analysis.following": "Following the current session",
+    "deepcodeGui.analysis.ready": "Loaded",
+    "deepcodeGui.analysis.empty": "No private analysis records are available for this session.",
+    "deepcodeGui.analysis.loadFailed": "Private analysis could not be read.",
+    "deepcodeGui.analysis.leaseFailed": "A private-analysis viewing lease could not be acquired.",
+    "deepcodeGui.analysis.cursorInvalid": "The private-analysis cursor did not advance as required.",
+    "deepcodeGui.analysis.pageLimit": "Private-analysis pagination exceeded this viewing limit."
   },
   "settings": {
     "workbench.language": {

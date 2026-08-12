@@ -39,10 +39,6 @@ interface AgentComposerProps {
   language: UiLanguage;
   loading: boolean;
   onSend: (content: string) => Promise<boolean>;
-  pendingSubmissionRetry?: AgentComposerPendingSubmissionRetry | null;
-  onRetryPendingSubmission?: (
-    clearOriginalMessageAttachments: boolean
-  ) => Promise<boolean>;
   onSubmissionSettled?: (
     admitted: boolean,
     submissionScopeId: string | null,
@@ -64,14 +60,6 @@ interface AgentComposerProps {
   onDecisionReject?: () => void | Promise<void>;
 }
 
-export interface AgentComposerPendingSubmissionRetry {
-  content: string;
-  messageAttachments: AgentInputAttachmentV3[];
-  callerRequestId: string;
-  disposition: 'pending' | 'indeterminate';
-  message?: string;
-}
-
 interface AgentModifiedFileView {
   path: string;
   savepoint: string;
@@ -88,15 +76,6 @@ function attachmentLabel(attachment: AgentInputAttachmentV3, language: UiLanguag
     ? t(language, 'agent.attachmentDialog.sessionScope')
     : t(language, 'agent.attachmentDialog.messageScope');
   return `${kind} · ${scope} · ${attachment.displayName}`;
-}
-
-function sameMessageAttachments(
-  current: AgentInputAttachmentV3[],
-  pending: AgentInputAttachmentV3[]
-): boolean {
-  if (current.length !== pending.length) return false;
-  const pendingInstances = new Set(pending);
-  return current.every((attachment) => pendingInstances.has(attachment));
 }
 
 function AttachmentIcon({ kind }: Pick<AgentInputAttachmentV3, 'kind'>): React.ReactElement {
@@ -249,8 +228,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   language,
   loading,
   onSend,
-  pendingSubmissionRetry,
-  onRetryPendingSubmission,
   onSubmissionSettled,
   submissionScopeId = null,
   canCancelCurrentRun = false,
@@ -358,63 +335,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         setSubmissionError(
           error instanceof Error ? error.message : String(error)
         );
-      } finally {
-        if (pendingSubmissionRef.current === submissionToken) {
-          pendingSubmissionRef.current = null;
-          setSubmissionPending(false);
-          setPendingSubmissionCancellable(false);
-        }
-        if (onSubmissionSettled) {
-          void Promise.resolve(
-            onSubmissionSettled(
-              admitted,
-              submittedScopeId,
-              submittedDraftCleared
-            )
-          ).catch(() => undefined);
-        }
-      }
-    })();
-  };
-
-  const retryPendingSubmission = () => {
-    if (
-      !pendingSubmissionRetry
-      || !onRetryPendingSubmission
-      || submissionPending
-      || pendingSubmissionRef.current
-    ) {
-      return;
-    }
-    const submittedRevision = draftRevisionRef.current;
-    const submittedScopeId = submissionScopeId;
-    const submittedDraftMatches =
-      value.trim() === pendingSubmissionRetry.content
-      && sameMessageAttachments(
-        messageAttachments,
-        pendingSubmissionRetry.messageAttachments
-      );
-    const submissionToken = `retry:${pendingSubmissionRetry.callerRequestId}`;
-    pendingSubmissionRef.current = submissionToken;
-    setPendingSubmissionCancellable(canCancelCurrentRun);
-    setSubmissionPending(true);
-    void (async () => {
-      let admitted = false;
-      let submittedDraftCleared = false;
-      try {
-        admitted = await onRetryPendingSubmission(submittedDraftMatches);
-        if (
-          admitted
-          && submittedDraftMatches
-          && submissionScopeRef.current === submittedScopeId
-          && draftRevisionRef.current === submittedRevision
-        ) {
-          draftRevisionRef.current += 1;
-          setValue('');
-          submittedDraftCleared = true;
-        }
-      } catch {
-        // The store owns the durable retry identity and user-visible error.
       } finally {
         if (pendingSubmissionRef.current === submissionToken) {
           pendingSubmissionRef.current = null;
@@ -573,31 +493,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   return (
     <div className={`agent-composer${inputFocused ? ' agent-composer--input-focused' : ''}${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
-      {pendingSubmissionRetry && (
-        <div
-          className={`agent-composer__pending-submission agent-composer__pending-submission--${pendingSubmissionRetry.disposition}`}
-          role={pendingSubmissionRetry.disposition === 'indeterminate' ? 'alert' : 'status'}
-        >
-          <span>
-            {pendingSubmissionRetry.disposition === 'pending'
-              ? language === 'zh-CN'
-                ? '请求仍在确认中。可用原请求身份安全查询，不会重复执行。'
-                : 'The request is still being confirmed. Query safely with the original request identity without duplicate execution.'
-              : language === 'zh-CN'
-                ? '上次发送的结果不确定，需要关注。请仅使用原请求身份重放。'
-                : 'The previous send has an indeterminate outcome and needs attention. Replay only with its original request identity.'}
-          </span>
-          <button
-            type="button"
-            disabled={submissionPending}
-            onClick={retryPendingSubmission}
-          >
-            {pendingSubmissionRetry.disposition === 'pending'
-              ? language === 'zh-CN' ? '确认发送结果' : 'Check send outcome'
-              : language === 'zh-CN' ? '安全重放' : 'Replay safely'}
-          </button>
-        </div>
-      )}
       {decisionText && (
         <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type {
+  AgentComposerProjectionV1,
   AgentTimelineResult,
 } from '@deepcode/protocol';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
@@ -12,12 +13,17 @@ import {
   type AgentComposerPendingDecision,
 } from '../../components/agent-panel/pendingDecision';
 import DeepCodeTimeline from './DeepCodeTimeline';
+import PrivateAnalysisViewer from './PrivateAnalysisViewer';
 import SessionModelSelector from './SessionModelSelector';
 
 interface DeepCodeAgentPanelProps {
   language: UiLanguage;
   timeline: AgentTimelineResult;
-  agentReady: boolean;
+  composer: AgentComposerProjectionV1 | null;
+  composerLoading?: boolean;
+  composerError?: string | null;
+  selectedProfileId?: string;
+  profileSelectionBusy?: boolean;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
   submissionScopeId?: string | null;
@@ -27,6 +33,8 @@ interface DeepCodeAgentPanelProps {
     | boolean
     | void;
   onDraftSend?: (content: string, profileId?: string) => Promise<boolean>;
+  onProfileChange: (profileId: string) => void | Promise<void>;
+  onComposerRetry?: () => void | Promise<void>;
   onAfterSend?: (
     submissionScopeId: string | null,
     submittedDraftCleared: boolean
@@ -44,32 +52,30 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
 const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   language,
   timeline,
-  agentReady,
+  composer: composerProjection,
+  composerLoading = false,
+  composerError,
+  selectedProfileId,
+  profileSelectionBusy = false,
   forceHome = false,
   homeProjectTitle,
   submissionScopeId,
   suppressPendingDecision = false,
   onBeforeSend,
   onDraftSend,
+  onProfileChange,
+  onComposerRetry,
   onAfterSend,
 }) => {
   const session = useAgentSessionStore((s) => s.session);
-  const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
-  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
-  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
-  const activeSubmissionSessionIds = useAgentSessionStore((s) => s.activeSubmissionSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const loadCurrentSelection = useAgentSessionStore((s) => s.loadCurrentSelection);
   const observeSessionProjection = useAgentSessionStore((s) => s.observeSessionProjection);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
   const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
-  const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
-  const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
-  const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
@@ -80,14 +86,11 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
-  const [modelAvailable, setModelAvailable] = useState(false);
-  const [draftProfileId, setDraftProfileId] = useState<string | undefined>();
+  const [analysisOpen, setAnalysisOpen] = useState(false);
   const sessionRunning = Boolean(
-    session?.id
-    && (
-      runningSessionIds.includes(session.id)
-      || activeRunSessionIds.includes(session.id)
-      || cancellingSessionIds.includes(session.id)
+    timeline.runProjection
+    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      timeline.runProjection.status
     )
   );
   const waitingForUser = timeline.runProjection?.status === 'waitingUser'
@@ -101,17 +104,16 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   );
 
   useEffect(() => {
-    if (!forceHome) return;
-    setDraftProfileId(undefined);
-  }, [forceHome, submissionScopeId]);
-
-  useEffect(() => {
     if (forceHome || !session?.id) return;
     const release = observeSessionProjection(session.id);
     return () => {
       void release();
     };
   }, [forceHome, observeSessionProjection, session?.id]);
+
+  useEffect(() => {
+    setAnalysisOpen(false);
+  }, [forceHome, session?.id]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;
@@ -152,12 +154,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
-  const profileLocked = sessionRunning || Boolean(timeline.interactionProjection?.pending);
-  const pendingSubmissionRetry = !forceHome && session?.id
-    && pendingSubmissionSessionIds.includes(session.id)
-    && !activeSubmissionSessionIds.includes(session.id)
-    ? pendingSubmissionRetryView(session.id)
-    : null;
+  const selectedProfileAvailable = Boolean(
+    selectedProfileId
+    && composerProjection?.enabledProfiles.some((profile) => profile.profileId === selectedProfileId)
+  );
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
@@ -175,7 +175,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       )}
       onSend={async (content) => {
         requestFollowLatest();
-        if (onDraftSend) return onDraftSend(content, draftProfileId);
+        if (onDraftSend) return onDraftSend(content, selectedProfileId);
         const prepared = await onBeforeSend?.();
         if (prepared === false) return false;
         const expectedTarget = typeof prepared === 'object' && prepared !== null
@@ -183,11 +183,6 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           : captureSubmissionTarget();
         if (!expectedTarget) return false;
         return sendMessage(content, { expectedTarget });
-      }}
-      pendingSubmissionRetry={pendingSubmissionRetry}
-      onRetryPendingSubmission={async (clearOriginalMessageAttachments) => {
-        requestFollowLatest();
-        return retryPendingSubmission(clearOriginalMessageAttachments);
       }}
       onSubmissionSettled={(
         admitted,
@@ -209,23 +204,24 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       footerControls={(
         <SessionModelSelector
           language={language}
-          locked={profileLocked}
-          draft={Boolean(onDraftSend)}
-          draftProfileId={draftProfileId}
-          onDraftProfileChange={setDraftProfileId}
-          onAvailabilityChange={setModelAvailable}
+          composer={composerProjection}
+          selectedProfileId={selectedProfileId}
+          busy={profileSelectionBusy}
+          onProfileChange={onProfileChange}
         />
       )}
-      sendBlocked={!agentReady || !modelAvailable}
-      sendBlockedTitle={!agentReady
+      sendBlocked={composerLoading || !composerProjection?.canSubmit || !selectedProfileAvailable}
+      sendBlockedTitle={composerLoading || !composerProjection
         ? t(language, 'agent.readiness.pending')
-        : !modelAvailable
+        : !selectedProfileAvailable
         ? t(
           language,
           session && !session.profileId
             ? 'agent.profile.selectionRequired'
             : 'agent.profile.unavailable'
         )
+        : !composerProjection.canSubmit
+        ? composerProjection.blockReason ?? t(language, 'agent.readiness.pending')
         : undefined}
       pendingDecision={composerPendingDecision}
       onDecisionSubmit={(guidance, action) => {
@@ -259,7 +255,15 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
             <div className="deepcode-gui-agent-panel__title">{activeSessionTitle}</div>
             <div className="deepcode-gui-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
           </div>
-          <button type="button" aria-label={t(language, 'deepcodeGui.session.actions')}>...</button>
+          <button
+            type="button"
+            className="deepcode-private-analysis__open"
+            onClick={() => setAnalysisOpen(true)}
+            aria-label={t(language, 'deepcodeGui.analysis.open')}
+            title={t(language, 'deepcodeGui.analysis.open')}
+          >
+            {t(language, 'deepcodeGui.analysis.shortLabel')}
+          </button>
         </header>
       )}
 
@@ -308,11 +312,11 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           />
         )}
 
-        {errorMessage && (
+        {(errorMessage || composerError) && (
           <div className="deepcode-gui-agent-panel__error">
-            <span>{errorMessage}</span>
-            {!agentReady && (
-              <button type="button" onClick={() => void loadCurrentSelection()}>
+            <span>{errorMessage ?? composerError}</span>
+            {onComposerRetry && (
+              <button type="button" onClick={() => void onComposerRetry()}>
                 {t(language, 'deepcodeGui.statusAction.retry')}
               </button>
             )}
@@ -321,6 +325,14 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 
         {composer}
       </div>
+      {analysisOpen && session?.id && (
+        <PrivateAnalysisViewer
+          key={session.id}
+          sessionId={session.id}
+          language={language}
+          onClose={() => setAnalysisOpen(false)}
+        />
+      )}
     </div>
   );
 };

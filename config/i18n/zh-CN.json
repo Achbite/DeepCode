@@ -610,6 +610,7 @@
     "agent.hostSubmission.identitySettleFailed": "输入已被接纳，但本地重放身份尚未安全结算；请重试会话初始化。",
     "agent.hostSubmission.runIdentityUnavailable": "当前运行身份尚未就绪；请刷新会话或开始新的对话轮次。",
     "agent.session.selectionChangedBeforeSend": "消息接纳前会话已发生切换；草稿已保留，请在目标对话中重新发送。",
+    "agent.session.draftAdmissionMismatch": "后端接纳的会话与当前选择的对话目标或模型不一致。草稿仍保持打开，请刷新后再发送。",
     "agent.hostSubmission.storageFailed": "无法安全保存输入接纳状态；请修复本地存储后重试。",
     "agent.hostSubmission.reconcileFailed": "输入未被接纳，且当前会话事实暂时无法完成对账；请重试会话初始化。",
     "agent.hostSubmission.indeterminate": "输入是否已被接纳仍不确定；请使用保留的原始草稿进行幂等重试。",
@@ -1094,7 +1095,19 @@
     "requirement.optionEffect.continueWithAction": "继续生成下一批执行操作",
     "requirement.optionEffect.skipCurrentTask": "将当前任务标记为完成，自动推进到下一任务",
     "requirement.optionEffect.replan": "回到计划阶段重新规划",
-    "requirement.optionEffect.finishRun": "结束本轮执行"
+    "requirement.optionEffect.finishRun": "结束本轮执行",
+    "deepcodeGui.analysis.title": "私有分析",
+    "deepcodeGui.analysis.shortLabel": "分析",
+    "deepcodeGui.analysis.open": "查看本会话的私有模型分析",
+    "deepcodeGui.analysis.privateHint": "默认关闭。这里只显示原始 reasoning、请求边界、状态和工具阶段，不会进入普通对话或复制输出。",
+    "deepcodeGui.analysis.loading": "正在获取短期查看授权…",
+    "deepcodeGui.analysis.following": "正在跟随当前会话",
+    "deepcodeGui.analysis.ready": "已加载",
+    "deepcodeGui.analysis.empty": "当前会话暂无可查看的分析记录。",
+    "deepcodeGui.analysis.loadFailed": "无法读取私有分析。",
+    "deepcodeGui.analysis.leaseFailed": "无法取得私有分析查看授权。",
+    "deepcodeGui.analysis.cursorInvalid": "私有分析游标未按合同推进。",
+    "deepcodeGui.analysis.pageLimit": "私有分析分页超过本次查看上限。"
   },
   "settings": {
     "workbench.language": {

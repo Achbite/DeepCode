@@ -487,11 +487,40 @@ export function startAgentRun(
   return api.startAgentRun(sessionId, request);
 }
 
-export function startProjectAgentRun(
-  projectId: string,
-  request: api.StartProjectAgentRunRequest
+export function getAgentComposer(
+  request: { projectId?: string; sessionId?: string } = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<api.AgentComposerProjectionV1>> {
+  return api.getAgentComposer(request, signal);
+}
+
+export function startConversationDraftRun(
+  request: api.StartConversationDraftRunRequest
 ): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.startProjectAgentRun(projectId, request);
+  return api.startConversationDraftRun(request);
+}
+
+export function mintPrivateAnalysisLease(
+  sessionId: string,
+  callerRequestId: string
+) {
+  return api.mintPrivateAnalysisLease(sessionId, callerRequestId);
+}
+
+export function getPrivateAnalysis(
+  sessionId: string,
+  capability: string,
+  request: { afterCursor?: string; limit?: number } = {},
+  signal?: AbortSignal
+) {
+  return api.getPrivateAnalysis(sessionId, capability, request, signal);
+}
+
+export function revokePrivateAnalysisLease(
+  sessionId: string,
+  capability: string
+) {
+  return api.revokePrivateAnalysisLease(sessionId, capability);
 }
 
 export function getAgentRun(
