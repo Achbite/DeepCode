@@ -432,19 +432,6 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
       case 'nativeToolCalls': {
-        const ownershipRepair = planActionOwnershipRepairV2(
-          input,
-          output.calls
-        );
-        if (ownershipRepair) {
-          return {
-            kind: 'noTool',
-            ...completionFields,
-            guidance: ownershipRepair.guidance,
-            repair: ownershipRepair.repair,
-            providerResult: output.providerResult,
-          };
-        }
         const sources = [];
         for (let index = 0; index < output.calls.length; index += 1) {
           const call = output.calls[index]!;
@@ -542,74 +529,6 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
     }
-}
-
-function planActionOwnershipRepairV2(
-  input: SessionKernelProviderAdapterInputV2,
-  calls: Readonly<Extract<
-    SessionKernelProviderBackendOutputV2,
-    { kind: 'nativeToolCalls' }
-  >['calls']>
-): {
-  guidance: string;
-  repair: Extract<
-    NonNullable<
-      Extract<
-        SessionProviderTurnOutputV2,
-        { kind: 'noTool' }
-      >['repair']
-    >,
-    { kind: 'planActionOwnership' }
-  >;
-} | undefined {
-  if (input.target.kind !== 'planAction') return undefined;
-  const plan = input.plan;
-  const currentPlanActionId = input.target.planActionId;
-  const currentIndex = plan?.actions.findIndex(
-    (action) =>
-      action.manifest.planActionId === currentPlanActionId
-  ) ?? -1;
-  if (!plan || currentIndex < 0) {
-    throw new SessionKernelProviderAdapterError(
-      'session_kernel_provider_plan_action_missing',
-      'PlanAction output admission requires its exact persisted Plan action.'
-    );
-  }
-  const current = plan.actions[currentIndex]!;
-  for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
-    const call = calls[callIndex]!;
-    const toolId = requiredToolId(call.toolId);
-    const matchesCurrent =
-      current.manifest.toolId === toolId;
-    if (matchesCurrent) continue;
-    const siblingIndexes = plan.actions.flatMap(
-      (action, index) =>
-        index > currentIndex
-        && action.manifest.toolId === toolId
-          ? [index]
-          : []
-    );
-    if (siblingIndexes.length !== 1) continue;
-    const siblingIndex = siblingIndexes[0]!;
-    const currentSequence = currentIndex + 1;
-    const siblingSequence = siblingIndex + 1;
-    return {
-      guidance: [
-        `Provider call ${String(callIndex + 1)} matches pending Plan action sequence ${String(siblingSequence)}`,
-        `while sequence ${String(currentSequence)} is current.`,
-        'No Kernel ToolIntent was created.',
-        'Replan the current work before any further execution; do not start the later action under the current PlanAction authority.',
-      ].join(' '),
-      repair: {
-        kind: 'planActionOwnership',
-        toolId,
-        callOrdinal: callIndex + 1,
-        currentSequence,
-        siblingSequence,
-      },
-    };
-  }
-  return undefined;
 }
 
 function assertCompletedProviderBackendOutputV2(
@@ -907,6 +826,40 @@ function requirePermittedTool(
       'A planning turn cannot invoke a mutation without a confirmed PlanAction.'
     );
   }
+  if (
+    input.target.kind === 'contextRead'
+    && descriptor.effectClass !== 'read'
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_context_read_mutation_forbidden',
+      'A context-read turn cannot invoke a mutation.'
+    );
+  }
+  if (input.target.kind === 'planAction') {
+    const currentPlanActionId = input.target.planActionId;
+    const current = input.plan?.actions.find(
+      (action) =>
+        action.manifest.planActionId === currentPlanActionId
+    );
+    if (!current) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_action_missing',
+        'PlanAction output admission requires its exact persisted Plan action.'
+      );
+    }
+    if (current.manifest.toolId !== toolId) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_action_tool_forbidden',
+        'A PlanAction turn may invoke only the exact tool bound to the current confirmed action.'
+      );
+    }
+  }
+  if (input.target.kind === 'finalAnswer') {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_final_answer_tool_forbidden',
+      'A final-answer Provider turn cannot return tool calls.'
+    );
+  }
   return descriptor;
 }
 
@@ -921,7 +874,6 @@ export function materializeProviderPlanV2(
   const normalized = normalizePlanDraft(draft);
   const admittedPlanningTools = new Map(
     input.toolContext.tools
-      .filter((tool) => tool.effectClass === 'read')
       .map((tool) => [tool.toolId, tool])
   );
   for (const action of normalized.actions) {

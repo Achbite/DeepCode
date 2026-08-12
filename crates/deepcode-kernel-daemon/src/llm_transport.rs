@@ -1377,7 +1377,6 @@ impl ProviderNativeStreamTransportErrorV1 {
 struct PreparedProviderNativeStreamRequestV1 {
     provider_kind: ProviderNativeStreamKindV1,
     exact_request_body: Vec<u8>,
-    tool_count: usize,
 }
 
 impl ProviderEnvelopeFramerV1 {
@@ -2883,7 +2882,6 @@ fn prepare_provider_native_stream_request(
     Ok(PreparedProviderNativeStreamRequestV1 {
         provider_kind,
         exact_request_body,
-        tool_count: tools.len(),
     })
 }
 
@@ -3378,7 +3376,6 @@ pub(crate) fn llm_stream_response(
             return;
         }
         let provider_kind = prepared.provider_kind;
-        let tool_count = prepared.tool_count;
         let prepared_cache_relation = match validate_prepared_cache_relation(
             &admission_sidecar,
             &predecessor_material,
@@ -3443,15 +3440,6 @@ pub(crate) fn llm_stream_response(
             return;
         }
         let trace_purpose = trace_identity.purpose;
-        if matches!(trace_purpose, ProviderTracePurposeV1::FinalAnswer) && tool_count != 0 {
-            cache_telemetry.local_rejection("provider_final_answer_tools_exposed");
-            yield Ok(Bytes::from(provider_public_error_event(
-                &request_id,
-                "provider_final_answer_tools_exposed",
-                "A finalAnswer Provider request must not expose tools",
-            )));
-            return;
-        }
         let quarantine_profile_id = trace_identity.profile_id.clone();
         let quarantine_profile_revision = trace_identity.profile_revision.clone();
         let quarantine_store = trace_store.clone();

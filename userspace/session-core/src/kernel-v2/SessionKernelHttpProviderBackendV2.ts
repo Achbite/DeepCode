@@ -14,7 +14,8 @@ import {
   providerCallableToolsV2,
   providerWireToolNameV2,
   providerWireToolDefinitionsV2,
-  sessionPlanningResponseContractReminderV2,
+  sessionOrchestrationContractV2,
+  sessionProviderTurnFrameV1,
 } from './providerContext.js';
 import type {
   SessionKernelProviderBackendOutputV2,
@@ -290,9 +291,7 @@ export function decodeSessionKernelLlmStreamResultV2(
       response,
       expectedProfileId
     );
-    const exposed = input.target.kind === 'finalAnswer'
-      ? []
-      : providerCallableToolsV2(input);
+    const exposed = providerCallableToolsV2(input);
     const encodedNames = new Map(
       exposed.map((tool) => [
         providerWireToolNameV2(tool.toolId),
@@ -605,7 +604,11 @@ function assertProviderToolContextBindingV2(
 ): void {
   const bundle = input.toolContext.bundle;
   const contextRef = input.toolContext.contextRef;
-  const planningTarget = input.target.kind === 'planning';
+  const messages = input.contextAssembly.messages;
+  const systemMessages = messages.filter(
+    (message) => message.role === 'system'
+  );
+  const finalMessage = messages.at(-1);
   if (
     input.toolContext.fixedPrompt !== bundle.fixedPrompt
     || canonicalJson(input.toolContext.tools)
@@ -614,17 +617,17 @@ function assertProviderToolContextBindingV2(
     || contextRef.catalogDigest !== bundle.catalogDigest
     || contextRef.contextDigest !== bundle.contextDigest
     || bundle.tools.some((tool) => tool.availability !== 'ready')
-    || input.contextAssembly.messages.length !== (planningTarget ? 9 : 8)
-    || input.contextAssembly.messages[0]?.role !== 'system'
-    || input.contextAssembly.messages[0]?.content
+    || messages.length < 3
+    || systemMessages.length !== 2
+    || messages[0]?.role !== 'system'
+    || messages[0]?.content
       !== bundle.fixedPrompt
-    || (
-      planningTarget
-      && (
-        input.contextAssembly.messages[2]?.role !== 'system'
-        || input.contextAssembly.messages[2]?.content
-          !== sessionPlanningResponseContractReminderV2()
-      )
+    || messages[1]?.role !== 'system'
+    || messages[1]?.content !== sessionOrchestrationContractV2()
+    || messages.slice(2).some((message) => message.role !== 'user')
+    || finalMessage?.role !== 'user'
+    || finalMessage.content !== canonicalJson(
+      sessionProviderTurnFrameV1(input)
     )
     || input.contextAssembly.receipt.providerProfile
       .providerProfileId
