@@ -54,7 +54,7 @@ const SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-request.v2";
 const SESSION_KERNEL_PRODUCTION_REQUEST_FRAME_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-request-frame.v2";
-const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v3";
+const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v4";
 const SESSION_KERNEL_PREFETCHED_RUN_V2_SCHEMA: &str = "deepcode.session.prefetched-kernel-run.v2";
 const SESSION_KERNEL_PRODUCTION_RESPONSE_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-response.v2";
@@ -105,7 +105,6 @@ pub(crate) enum HostKernelBridgeOperationV2 {
     ResumePlanAction {
         plan_action_id: String,
         expected_plan_revision: String,
-        provider_call_budget: u16,
         guidance: Vec<String>,
     },
     UserInput {
@@ -139,6 +138,20 @@ pub(crate) enum HostKernelBridgeOperationV2 {
         decision: HostKernelPlanDecisionV2,
         #[serde(skip_serializing_if = "Option::is_none")]
         guidance: Option<String>,
+    },
+    DecideUserIntervention {
+        interaction_id: String,
+        interaction_revision: String,
+        candidate_set_digest: String,
+        decision: HostKernelInterventionDecisionV4,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        option_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        guidance: Option<String>,
+        caller_request_id: String,
+        caller_request_digest: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancel_operation_id: Option<String>,
     },
     ObserveCapabilityDecision {
         decision: HostKernelCapabilityDecisionV2,
@@ -189,6 +202,14 @@ pub(crate) enum HostKernelPlanDecisionV2 {
     Accept,
     Reject,
     Revise,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostKernelInterventionDecisionV4 {
+    Select,
+    Revise,
+    Reject,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -3464,11 +3485,18 @@ fn production_request_frame_from_bootstrap(
     operation: &HostKernelBridgeOperationV2,
 ) -> Result<Value, HostV2StorageError> {
     validate_bridge_operation(operation)?;
-    if let HostKernelBridgeOperationV2::CancelRun {
-        cancel_operation_id,
-        ..
-    } = operation
-    {
+    let cancel_operation_id = match operation {
+        HostKernelBridgeOperationV2::CancelRun {
+            cancel_operation_id,
+            ..
+        } => Some(cancel_operation_id),
+        HostKernelBridgeOperationV2::DecideUserIntervention {
+            cancel_operation_id,
+            ..
+        } => cancel_operation_id.as_ref(),
+        _ => None,
+    };
+    if let Some(cancel_operation_id) = cancel_operation_id {
         if cancel_operation_id != operation_request_id {
             return Err(HostV2StorageError::conflict(
                 "host_kernel_cancel_operation_identity_conflict",
@@ -3562,6 +3590,70 @@ fn validate_bridge_operation(
     match operation {
         HostKernelBridgeOperationV2::PublishPlanConfirmationReady { plan_revision } => {
             crate::host_v2_storage::validate_bounded_identity(plan_revision, "planRevision", 512)?;
+        }
+        HostKernelBridgeOperationV2::DecideUserIntervention {
+            interaction_id,
+            interaction_revision,
+            candidate_set_digest,
+            decision,
+            option_id,
+            guidance,
+            caller_request_id,
+            caller_request_digest,
+            cancel_operation_id,
+        } => {
+            for (field, value) in [
+                ("interactionId", interaction_id.as_str()),
+                ("interactionRevision", interaction_revision.as_str()),
+                ("callerRequestId", caller_request_id.as_str()),
+            ] {
+                crate::host_v2_storage::validate_bounded_identity(value, field, 512)?;
+            }
+            crate::host_v2_storage::validate_sha256_digest(
+                candidate_set_digest,
+                "candidateSetDigest",
+            )?;
+            crate::host_v2_storage::validate_sha256_digest(
+                caller_request_digest,
+                "callerRequestDigest",
+            )?;
+            if let Some(option_id) = option_id {
+                crate::host_v2_storage::validate_bounded_identity(option_id, "optionId", 512)?;
+            }
+            if let Some(guidance) = guidance {
+                if guidance.trim() != guidance || guidance.len() > 64 * 1024 {
+                    return Err(HostV2StorageError::invalid(
+                        "host_kernel_intervention_guidance_invalid",
+                        "User intervention guidance must be trimmed and bounded",
+                    ));
+                }
+            }
+            if let Some(cancel_operation_id) = cancel_operation_id {
+                crate::host_v2_storage::validate_bounded_identity(
+                    cancel_operation_id,
+                    "cancelOperationId",
+                    512,
+                )?;
+            }
+            let payload_valid = match decision {
+                HostKernelInterventionDecisionV4::Select => {
+                    option_id.is_some() && cancel_operation_id.is_none()
+                }
+                HostKernelInterventionDecisionV4::Revise => {
+                    option_id.is_none()
+                        && guidance.as_deref().is_some_and(|value| !value.is_empty())
+                        && cancel_operation_id.is_none()
+                }
+                HostKernelInterventionDecisionV4::Reject => {
+                    option_id.is_none() && cancel_operation_id.is_some()
+                }
+            };
+            if !payload_valid {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_intervention_decision_invalid",
+                    "User intervention decision does not contain its exact closed payload",
+                ));
+            }
         }
         HostKernelBridgeOperationV2::FinalizeReview {
             expected_work_authority,
@@ -3786,6 +3878,7 @@ impl HostKernelBridgeOperationV2 {
                 | Self::ResumeAfterBackpressure { .. }
                 | Self::PreviewPlan { .. }
                 | Self::DecidePlan { .. }
+                | Self::DecideUserIntervention { .. }
                 | Self::FinalizeReview { .. }
                 | Self::RequestFinalAnswer { .. }
         )

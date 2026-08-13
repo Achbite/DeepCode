@@ -33,31 +33,31 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v3";
+const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v4";
 const SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA: &str =
-    "deepcode.session.kernel-persistence-record.v3";
+    "deepcode.session.kernel-persistence-record.v4";
 const SESSION_KERNEL_PERSISTENCE_APPEND_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-append-request.v2";
 const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-list-reply.v2";
 const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-append-reply.v2";
-const SESSION_KERNEL_CHECKPOINT_V3_SCHEMA: &str = "deepcode.session.kernel-checkpoint.v3";
+const SESSION_KERNEL_CHECKPOINT_V3_SCHEMA: &str = "deepcode.session.kernel-checkpoint.v4";
 const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA: &str =
     "deepcode.session.kernel-operation-result.v2";
-const SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA: &str = "deepcode.session.provider-turn-dispatch.v3";
-const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA: &str = "deepcode.session.provider-turn-terminal.v3";
+const SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA: &str = "deepcode.session.provider-turn-dispatch.v4";
+const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA: &str = "deepcode.session.provider-turn-terminal.v4";
 const SESSION_KERNEL_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA: &str =
-    "deepcode.session.tool-context-snapshot.v3";
+    "deepcode.session.tool-context-snapshot.v4";
 const SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA: &str = "deepcode.provider-stream-terminal.v1";
-const SESSION_KERNEL_REVIEW_RECORD_V3_SCHEMA: &str = "deepcode.session.review-record.v3";
+const SESSION_KERNEL_REVIEW_RECORD_V3_SCHEMA: &str = "deepcode.session.review-record.v4";
 const SESSION_KERNEL_REVIEW_PROJECTION_V2_SCHEMA: &str =
     "deepcode.session.kernel-review-projection.v2";
 const SESSION_KERNEL_PLAN_ACTION_SETTLEMENT_RECORD_V3_SCHEMA: &str =
-    "deepcode.session.plan-action-settlement-record.v3";
+    "deepcode.session.plan-action-settlement-record.v4";
 const SESSION_KERNEL_PUBLIC_REQUEST_SETTLEMENT_V3_SCHEMA: &str =
-    "deepcode.session.public-request-settlement.v3";
-const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA: &str = "deepcode.session.projection-record.v3";
+    "deepcode.session.public-request-settlement.v4";
+const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA: &str = "deepcode.session.projection-record.v4";
 const SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA: &str =
     "deepcode.session.terminal-answer-candidate.v1";
 const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
@@ -78,7 +78,6 @@ const MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_BYTES_V2: usize = 8 * 1024 * 1024;
 const MAX_PRIOR_EVENTS_PROJECTION_BYTES_V2: usize = 12 * 1024 * 1024;
 const MAX_PRIOR_EVENTS_PAGE_CACHE_V2: usize = 4;
 const MAX_SAFE_INTEGER_V3: u64 = 9_007_199_254_740_991;
-const MAX_CONTEXT_READ_WORK_AUTHORITY_OPERATIONS_V3: usize = 8_192;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -92,6 +91,8 @@ pub(crate) enum SessionWorkAuthorityV3 {
         plan_revision: String,
     },
     ContextRead {
+        batch_sequence: u64,
+        predecessor_digest: Option<String>,
         operation_ids: Vec<String>,
         digest: String,
     },
@@ -119,13 +120,24 @@ pub(crate) fn validate_session_work_authority_v3(
             validate_bounded_identity(plan_revision, "workAuthority.planRevision", 512)
         }
         SessionWorkAuthorityV3::ContextRead {
+            batch_sequence,
+            predecessor_digest,
             operation_ids,
             digest,
         } => {
-            if operation_ids.is_empty()
-                || operation_ids.len() > MAX_CONTEXT_READ_WORK_AUTHORITY_OPERATIONS_V3
+            if *batch_sequence == 0
+                || *batch_sequence > MAX_SAFE_INTEGER_V3
+                || (*batch_sequence == 1 && predecessor_digest.is_some())
+                || (*batch_sequence > 1 && predecessor_digest.is_none())
+                || operation_ids.is_empty()
             {
                 return Err(work_authority_invalid());
+            }
+            if let Some(predecessor_digest) = predecessor_digest {
+                validate_sha256_digest(
+                    predecessor_digest,
+                    "workAuthority.predecessorDigest",
+                )?;
             }
             let mut previous: Option<&str> = None;
             for operation_id in operation_ids {
@@ -140,12 +152,14 @@ pub(crate) fn validate_session_work_authority_v3(
             validate_sha256_digest(digest, "workAuthority.digest")?;
             let expected = canonical_sha256(&json!({
                 "kind": "contextRead",
+                "batchSequence": batch_sequence,
+                "predecessorDigest": predecessor_digest,
                 "operationIds": operation_ids,
             }))?;
             if digest != &expected {
                 return Err(HostV2StorageError::invalid(
                     "session_kernel_work_authority_digest_mismatch",
-                    "Context-read work authority digest does not match its exact operation identities",
+                    "Context-read work authority digest does not match its current batch and predecessor chain",
                 ));
             }
             Ok(())
@@ -425,8 +439,6 @@ struct SessionKernelCompactProviderReservationV3 {
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    remaining_tool_call_budget: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     correction: Option<SessionKernelToolCorrectionV3>,
     control_epoch: u64,
     context_ref: ToolContextRefV2,
@@ -525,6 +537,12 @@ struct SessionKernelCompactActiveV3 {
     pending_epoch_input_ref: Option<SessionProviderTurnRecordRefV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_wait: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intervention_research: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_intervention: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_intervention_decision: Option<Value>,
     pending_guidance: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_reservation: Option<SessionKernelCompactProviderReservationV3>,
@@ -675,7 +693,6 @@ pub(crate) struct SessionProviderTurnAdmissionV2 {
     pub(crate) provider_profile_revision: String,
     pub(crate) plan_revision: Option<String>,
     pub(crate) work_authority: Option<SessionWorkAuthorityV3>,
-    pub(crate) remaining_tool_call_budget: Option<u64>,
     pub(crate) review_revision: Option<u64>,
     pub(crate) snapshot_high_water: Option<u64>,
 }
@@ -1806,7 +1823,6 @@ fn provider_turn_admission_from_records(
 ) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
     let (checkpoint_index, checkpoint) = committed_checkpoint_chain(records)?
         .into_iter()
-        .rev()
         .find_map(|entry| {
             entry
                 .checkpoint
@@ -2058,7 +2074,6 @@ fn provider_turn_admission_from_records(
         provider_profile_revision: provider_profile_revision.to_string(),
         plan_revision,
         work_authority,
-        remaining_tool_call_budget: provider_turn.remaining_tool_call_budget,
         review_revision,
         snapshot_high_water,
     };
@@ -2200,7 +2215,14 @@ fn validate_checkpoint_work_authority_records(
                 }
             }
         }
-        Some(SessionWorkAuthorityV3::ContextRead { .. }) | None => {}
+        Some(SessionWorkAuthorityV3::ContextRead { .. }) => {
+            validate_context_read_work_authority_chain(
+                records,
+                exclusive_end,
+                checkpoint,
+            )?;
+        }
+        None => {}
     }
     if let Some(review_ref) = &checkpoint.refs.review {
         let review_record = resolve_record_ref_before(records, exclusive_end, review_ref)?;
@@ -2245,6 +2267,66 @@ fn validate_checkpoint_work_authority_records(
         return Err(compact_final_answer_invalid());
     }
     validate_terminal_answer_candidate_records(records, exclusive_end, checkpoint)?;
+    Ok(())
+}
+
+fn validate_context_read_work_authority_chain(
+    records: &[SessionKernelPersistenceRecordV3],
+    exclusive_end: usize,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<(), HostV2StorageError> {
+    let Some(SessionWorkAuthorityV3::ContextRead {
+        batch_sequence,
+        predecessor_digest,
+        operation_ids,
+        digest,
+    }) = checkpoint.authority.work_authority.as_ref()
+    else {
+        return Err(compact_checkpoint_authority_invalid());
+    };
+    let previous = checkpoint
+        .parent_ref
+        .as_ref()
+        .map(|parent_ref| resolve_record_ref_before(records, exclusive_end, parent_ref))
+        .transpose()?
+        .map(decode_compact_checkpoint_record)
+        .transpose()?;
+    let previous_authority = previous.as_ref().and_then(|parent| {
+        (parent.authority.control_epoch == checkpoint.authority.control_epoch)
+            .then_some(parent.authority.work_authority.as_ref())
+            .flatten()
+    });
+    match previous_authority {
+        Some(SessionWorkAuthorityV3::ContextRead {
+            batch_sequence: previous_sequence,
+            operation_ids: previous_operation_ids,
+            digest: previous_digest,
+            predecessor_digest: previous_predecessor_digest,
+        }) if previous_sequence == batch_sequence => {
+            if previous_predecessor_digest != predecessor_digest
+                || previous_operation_ids != operation_ids
+                || previous_digest != digest
+            {
+                return Err(compact_checkpoint_authority_invalid());
+            }
+        }
+        Some(SessionWorkAuthorityV3::ContextRead {
+            batch_sequence: previous_sequence,
+            digest: previous_digest,
+            ..
+        }) => {
+            if previous_sequence.checked_add(1) != Some(*batch_sequence)
+                || predecessor_digest.as_deref() != Some(previous_digest.as_str())
+            {
+                return Err(compact_checkpoint_authority_invalid());
+            }
+        }
+        Some(SessionWorkAuthorityV3::Plan { .. }) | None => {
+            if *batch_sequence != 1 || predecessor_digest.is_some() {
+                return Err(compact_checkpoint_authority_invalid());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3268,6 +3350,7 @@ fn decode_compact_checkpoint_record(
     if let Some(reservation) = &checkpoint.active.provider_reservation {
         validate_provider_reservation(reservation, authority)?;
     }
+    validate_compact_intervention_state(&checkpoint.active, authority)?;
     if let Some(review_ref) = &checkpoint.refs.review {
         validate_record_ref(review_ref, "reviewRef")?;
     }
@@ -3304,6 +3387,721 @@ fn decode_compact_checkpoint_record(
         _ => {}
     }
     Ok(checkpoint)
+}
+
+fn validate_compact_intervention_state(
+    active: &SessionKernelCompactActiveV3,
+    authority: &SessionKernelCompactAuthorityV3,
+) -> Result<(), HostV2StorageError> {
+    let research = active
+        .intervention_research
+        .as_ref()
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)
+        })
+        .transpose()?;
+    let intervention = active
+        .user_intervention
+        .as_ref()
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)
+        })
+        .transpose()?;
+    let decision = active
+        .user_intervention_decision
+        .as_ref()
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)
+        })
+        .transpose()?;
+
+    let user_intervention_wait = active
+        .active_wait
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|wait| wait.get("kind").and_then(Value::as_str) == Some("userIntervention"));
+
+    let Some(research) = research else {
+        if intervention.is_some() || decision.is_some() || user_intervention_wait.is_some() {
+            return Err(compact_intervention_state_invalid());
+        }
+        return Ok(());
+    };
+
+    validate_private_projection_fields(
+        research,
+        &[
+            "schemaVersion",
+            "runId",
+            "inputId",
+            "controlEpoch",
+            "researchId",
+            "triggerProviderTurnId",
+            "predecessorPlanRef",
+            "triggerCandidates",
+            "triggerCandidateSetDigest",
+            "evidenceProgressDigest",
+            "guidanceRevision",
+            "startedAt",
+            "updatedAt",
+        ],
+        &["previousEvidenceProgressDigest", "lastCandidateSetDigest"],
+        &[
+            "runId",
+            "inputId",
+            "researchId",
+            "triggerProviderTurnId",
+            "startedAt",
+            "updatedAt",
+        ],
+        &[],
+        &["triggerCandidates"],
+        &["predecessorPlanRef"],
+        &["controlEpoch", "guidanceRevision"],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    if research.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.intervention-research.v1")
+        || research.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
+        || research.get("inputId").and_then(Value::as_str)
+            != Some(authority.current_input_id.as_str())
+        || research.get("controlEpoch").and_then(Value::as_u64)
+            != Some(authority.control_epoch)
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    for field in [
+        "triggerCandidateSetDigest",
+        "evidenceProgressDigest",
+        "previousEvidenceProgressDigest",
+        "lastCandidateSetDigest",
+    ] {
+        if let Some(value) = research.get(field) {
+            validate_sha256_digest(
+                value
+                    .as_str()
+                    .ok_or_else(compact_intervention_state_invalid)?,
+                "interventionDigest",
+            )
+            .map_err(|_| compact_intervention_state_invalid())?;
+        }
+    }
+    let predecessor = research
+        .get("predecessorPlanRef")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    validate_private_projection_fields(
+        predecessor,
+        &["planRevision", "planDigest"],
+        &[],
+        &["planRevision"],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    validate_sha256_digest(
+        predecessor
+            .get("planDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?,
+        "interventionPredecessorPlanDigest",
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+
+    let candidates = research
+        .get("triggerCandidates")
+        .and_then(Value::as_array)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    if candidates.is_empty() || candidates.len() > 128 {
+        return Err(compact_intervention_state_invalid());
+    }
+    let mut discovery_ids = HashSet::new();
+    let mut operation_ids = HashSet::new();
+    let mut digest_candidates = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let candidate = candidate
+            .as_object()
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_private_projection_fields(
+            candidate,
+            &[
+                "discoveryId",
+                "operationId",
+                "toolId",
+                "argumentsDigest",
+                "classification",
+            ],
+            &["preview", "rejection"],
+            &["discoveryId", "operationId", "toolId"],
+            &[],
+            &[],
+            &["preview", "rejection"],
+            &[],
+            &[],
+        )
+        .map_err(|_| compact_intervention_state_invalid())?;
+        let discovery_id = candidate
+            .get("discoveryId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let operation_id = candidate
+            .get("operationId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let tool_id = candidate
+            .get("toolId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let arguments_digest = candidate
+            .get("argumentsDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_sha256_digest(arguments_digest, "interventionArgumentsDigest")
+            .map_err(|_| compact_intervention_state_invalid())?;
+        if !discovery_ids.insert(discovery_id)
+            || !operation_ids.insert(operation_id)
+            || !matches!(
+                candidate.get("classification").and_then(Value::as_str),
+                Some("planned" | "outOfPlan")
+            )
+            || candidate.contains_key("preview") == candidate.contains_key("rejection")
+        {
+            return Err(compact_intervention_state_invalid());
+        }
+
+        let mut digest_candidate = serde_json::Map::new();
+        digest_candidate.insert("discoveryId".to_string(), Value::String(discovery_id.to_string()));
+        digest_candidate.insert("operationId".to_string(), Value::String(operation_id.to_string()));
+        digest_candidate.insert("toolId".to_string(), Value::String(tool_id.to_string()));
+        digest_candidate.insert(
+            "argumentsDigest".to_string(),
+            Value::String(arguments_digest.to_string()),
+        );
+        digest_candidate.insert(
+            "classification".to_string(),
+            candidate
+                .get("classification")
+                .expect("validated intervention classification")
+                .clone(),
+        );
+        if let Some(preview_value) = candidate.get("preview") {
+            let preview = decode_private_scope_preview(preview_value, "interventionPreview")
+                .map_err(|_| compact_intervention_state_invalid())?;
+            let preview_object = preview_value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)?;
+            let origin = preview_object
+                .get("origin")
+                .and_then(Value::as_object)
+                .ok_or_else(compact_intervention_state_invalid)?;
+            let origin_data = origin
+                .get("data")
+                .and_then(Value::as_object)
+                .ok_or_else(compact_intervention_state_invalid)?;
+            if preview.run_id.as_str() != authority.run_id
+                || preview.control_epoch.get() != authority.control_epoch
+                || preview.operation_id.as_str() != operation_id
+                || preview.tool_id.as_str() != tool_id
+                || origin.get("kind").and_then(Value::as_str) != Some("planDiscovery")
+                || origin_data.get("discoveryId").and_then(Value::as_str) != Some(discovery_id)
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+            digest_candidate.insert(
+                "previewId".to_string(),
+                preview_object
+                    .get("previewId")
+                    .expect("validated intervention preview id")
+                    .clone(),
+            );
+            digest_candidate.insert(
+                "scopeDigest".to_string(),
+                preview_object
+                    .get("scopeDigest")
+                    .expect("validated intervention scope digest")
+                    .clone(),
+            );
+        } else {
+            let rejection = candidate
+                .get("rejection")
+                .and_then(Value::as_object)
+                .ok_or_else(compact_intervention_state_invalid)?;
+            validate_private_projection_fields(
+                rejection,
+                &["reason", "guidance"],
+                &[],
+                &["reason"],
+                &["guidance"],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .map_err(|_| compact_intervention_state_invalid())?;
+            if rejection
+                .get("guidance")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+            digest_candidate.insert(
+                "rejection".to_string(),
+                Value::Object(rejection.clone()),
+            );
+        }
+        digest_candidates.push(Value::Object(digest_candidate));
+    }
+    let expected_trigger_digest = canonical_sha256(&Value::Array(digest_candidates))
+        .map_err(|_| compact_intervention_state_invalid())?;
+    if research
+        .get("triggerCandidateSetDigest")
+        .and_then(Value::as_str)
+        != Some(expected_trigger_digest.as_str())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+
+    let interaction_id = format!(
+        "user-intervention-{}",
+        research
+            .get("researchId")
+            .and_then(Value::as_str)
+            .expect("validated research identity")
+    );
+    let mut option_ids = HashSet::new();
+    if let Some(intervention) = intervention {
+        validate_compact_user_intervention(
+            intervention,
+            research,
+            authority,
+            &interaction_id,
+            &mut option_ids,
+        )?;
+    }
+    if let Some(decision) = decision {
+        validate_compact_user_intervention_decision(
+            decision,
+            intervention,
+            research,
+            &interaction_id,
+            &option_ids,
+        )?;
+    }
+
+    match (intervention, decision, user_intervention_wait) {
+        (Some(card), None, Some(wait)) => {
+            validate_private_projection_fields(
+                wait,
+                &[
+                    "kind",
+                    "interactionId",
+                    "interactionRevision",
+                    "candidateSetDigest",
+                    "sinceHighWater",
+                ],
+                &[],
+                &["interactionId", "interactionRevision"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["sinceHighWater"],
+            )
+            .map_err(|_| compact_intervention_state_invalid())?;
+            if wait.get("interactionId") != card.get("interactionId")
+                || wait.get("interactionRevision") != card.get("interactionRevision")
+                || wait.get("candidateSetDigest") != card.get("candidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        (Some(_), None, None) | (_, Some(_), Some(_)) | (None, _, Some(_)) => {
+            return Err(compact_intervention_state_invalid());
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_compact_user_intervention(
+    intervention: &serde_json::Map<String, Value>,
+    research: &serde_json::Map<String, Value>,
+    authority: &SessionKernelCompactAuthorityV3,
+    expected_interaction_id: &str,
+    option_ids: &mut HashSet<String>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        intervention,
+        &[
+            "schemaVersion",
+            "runId",
+            "inputId",
+            "controlEpoch",
+            "interactionId",
+            "interactionRevision",
+            "candidateSetDigest",
+            "problemSummary",
+            "relevantFactRefs",
+            "affectedPlanActionIds",
+            "options",
+            "evidenceProgressDigest",
+            "recordedAt",
+        ],
+        &["recommendation"],
+        &[
+            "runId",
+            "inputId",
+            "interactionId",
+            "interactionRevision",
+            "recordedAt",
+        ],
+        &["problemSummary", "recommendation"],
+        &["relevantFactRefs", "affectedPlanActionIds", "options"],
+        &[],
+        &["controlEpoch"],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    let candidate_set_digest = intervention
+        .get("candidateSetDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    validate_sha256_digest(candidate_set_digest, "interventionCandidateSetDigest")
+        .map_err(|_| compact_intervention_state_invalid())?;
+    validate_sha256_digest(
+        intervention
+            .get("evidenceProgressDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?,
+        "interventionEvidenceProgressDigest",
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    if intervention.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.user-intervention.v1")
+        || intervention.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
+        || intervention.get("inputId").and_then(Value::as_str)
+            != Some(authority.current_input_id.as_str())
+        || intervention.get("controlEpoch").and_then(Value::as_u64)
+            != Some(authority.control_epoch)
+        || intervention.get("interactionId").and_then(Value::as_str)
+            != Some(expected_interaction_id)
+        || intervention.get("evidenceProgressDigest") != research.get("evidenceProgressDigest")
+        || intervention.get("interactionRevision").and_then(Value::as_str)
+            != Some(
+                format!(
+                    "intervention-revision-{}",
+                    candidate_set_digest.trim_start_matches("sha256:")
+                )
+                .as_str(),
+            )
+        || research.get("lastCandidateSetDigest") != intervention.get("candidateSetDigest")
+        || intervention
+            .get("problemSummary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    for (field, require_non_empty) in [
+        ("relevantFactRefs", false),
+        ("affectedPlanActionIds", false),
+    ] {
+        validate_private_unique_identities(
+            intervention
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(compact_intervention_state_invalid)?,
+            "interventionIdentity",
+            require_non_empty,
+        )
+        .map_err(|_| compact_intervention_state_invalid())?;
+    }
+
+    let options = intervention
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    if options.is_empty() || options.len() > 16 {
+        return Err(compact_intervention_state_invalid());
+    }
+    for option in options {
+        let option = option
+            .as_object()
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_private_projection_fields(
+            option,
+            &[
+                "optionId",
+                "kind",
+                "title",
+                "description",
+                "tradeoffs",
+                "recommended",
+                "actions",
+            ],
+            &["candidatePlan"],
+            &["optionId"],
+            &["title", "description"],
+            &["tradeoffs", "actions"],
+            &["candidatePlan"],
+            &[],
+            &[],
+        )
+        .map_err(|_| compact_intervention_state_invalid())?;
+        let option_id = option
+            .get("optionId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let kind = option
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let tradeoffs = option
+            .get("tradeoffs")
+            .and_then(Value::as_array)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let actions = option
+            .get("actions")
+            .and_then(Value::as_array)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        if !option_ids.insert(option_id.to_string())
+            || !matches!(kind, "executable" | "guidanceOnly")
+            || option.get("recommended").and_then(Value::as_bool).is_none()
+            || ["title", "description"].iter().any(|field| {
+                option
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            || tradeoffs.is_empty()
+            || tradeoffs.len() > 32
+            || tradeoffs.iter().any(|tradeoff| {
+                tradeoff
+                    .as_str()
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            || (kind == "executable") != option.contains_key("candidatePlan")
+            || (kind == "executable") != !actions.is_empty()
+        {
+            return Err(compact_intervention_state_invalid());
+        }
+        if kind == "guidanceOnly" {
+            continue;
+        }
+        let plan = option
+            .get("candidatePlan")
+            .and_then(Value::as_object)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_private_plan(plan).map_err(|_| compact_intervention_state_invalid())?;
+        if plan.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
+            || plan.get("inputId").and_then(Value::as_str)
+                != Some(authority.current_input_id.as_str())
+            || plan.get("predecessorPlanRef") != research.get("predecessorPlanRef")
+            || plan
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_none_or(|plan_actions| plan_actions.len() != actions.len())
+        {
+            return Err(compact_intervention_state_invalid());
+        }
+        let plan_actions = plan
+            .get("actions")
+            .and_then(Value::as_array)
+            .expect("validated candidate Plan actions");
+        for (candidate_action, plan_action) in actions.iter().zip(plan_actions) {
+            validate_compact_intervention_candidate_action(
+                candidate_action,
+                plan_action,
+                authority,
+                intervention,
+                option_id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_compact_intervention_candidate_action(
+    candidate_action: &Value,
+    plan_action: &Value,
+    authority: &SessionKernelCompactAuthorityV3,
+    intervention: &serde_json::Map<String, Value>,
+    option_id: &str,
+) -> Result<(), HostV2StorageError> {
+    let action = candidate_action
+        .as_object()
+        .ok_or_else(compact_intervention_state_invalid)?;
+    validate_private_projection_fields(
+        action,
+        &["planActionId", "operationId", "toolId", "summary", "preview"],
+        &[],
+        &["planActionId", "operationId", "toolId"],
+        &["summary"],
+        &[],
+        &["preview"],
+        &[],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    if action
+        .get("summary")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    let manifest = plan_action
+        .get("manifest")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    for field in ["planActionId", "operationId", "toolId"] {
+        if action.get(field) != manifest.get(field) {
+            return Err(compact_intervention_state_invalid());
+        }
+    }
+    let preview_value = action
+        .get("preview")
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let preview = decode_private_scope_preview(preview_value, "interventionCandidatePreview")
+        .map_err(|_| compact_intervention_state_invalid())?;
+    let preview_object = preview_value
+        .as_object()
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let origin = preview_object
+        .get("origin")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let origin_data = origin
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    if preview.run_id.as_str() != authority.run_id
+        || preview.control_epoch.get() != authority.control_epoch
+        || preview.plan_revision.as_str()
+            != manifest
+                .get("planRevision")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || preview.plan_action_id.as_str()
+            != action
+                .get("planActionId")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || preview.operation_id.as_str()
+            != action
+                .get("operationId")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || preview.tool_id.as_str()
+            != action
+                .get("toolId")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || origin.get("kind").and_then(Value::as_str) != Some("interventionCandidate")
+        || origin_data.get("interactionId") != intervention.get("interactionId")
+        || origin_data.get("interactionRevision") != intervention.get("interactionRevision")
+        || origin_data.get("candidateSetDigest") != intervention.get("candidateSetDigest")
+        || origin_data.get("optionId").and_then(Value::as_str) != Some(option_id)
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    Ok(())
+}
+
+fn validate_compact_user_intervention_decision(
+    decision: &serde_json::Map<String, Value>,
+    intervention: Option<&serde_json::Map<String, Value>>,
+    research: &serde_json::Map<String, Value>,
+    expected_interaction_id: &str,
+    option_ids: &HashSet<String>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        decision,
+        &[
+            "interactionId",
+            "interactionRevision",
+            "candidateSetDigest",
+            "decision",
+            "callerRequestId",
+            "recordedAt",
+        ],
+        &["optionId", "guidance"],
+        &[
+            "interactionId",
+            "interactionRevision",
+            "callerRequestId",
+            "recordedAt",
+        ],
+        &["guidance"],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    let decision_kind = decision
+        .get("decision")
+        .and_then(Value::as_str)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let option_id = decision.get("optionId").and_then(Value::as_str);
+    let guidance = decision.get("guidance").and_then(Value::as_str);
+    if !matches!(decision_kind, "select" | "revise" | "reject")
+        || decision.get("interactionId").and_then(Value::as_str)
+            != Some(expected_interaction_id)
+        || guidance.is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    match decision_kind {
+        "select" => {
+            let card = intervention.ok_or_else(compact_intervention_state_invalid)?;
+            if option_id.is_none_or(|value| !option_ids.contains(value))
+                || decision.get("interactionRevision") != card.get("interactionRevision")
+                || decision.get("candidateSetDigest") != card.get("candidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        "revise" => {
+            if option_id.is_some()
+                || guidance.is_none()
+                || intervention.is_some()
+                || decision.get("candidateSetDigest") != research.get("lastCandidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        "reject" => {
+            let card = intervention.ok_or_else(compact_intervention_state_invalid)?;
+            if option_id.is_some()
+                || decision.get("interactionRevision") != card.get("interactionRevision")
+                || decision.get("candidateSetDigest") != card.get("candidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        _ => unreachable!("validated intervention decision kind"),
+    }
+    Ok(())
+}
+
+fn compact_intervention_state_invalid() -> HostV2StorageError {
+    HostV2StorageError::invalid(
+        "session_kernel_checkpoint_intervention_invalid",
+        "Session Kernel compact checkpoint intervention state is not one exact current authority",
+    )
 }
 
 fn validate_compact_terminal_answer_candidate(
@@ -3520,12 +4318,12 @@ fn validate_provider_reservation(
     if reservation.control_epoch != authority.control_epoch
         || !matches!(
             target_kind,
-            "planning" | "planAction" | "contextRead" | "finalAnswer"
+            "planning"
+                | "planAction"
+                | "contextRead"
+                | "interventionResearch"
+                | "finalAnswer"
         )
-        || (target_kind == "planAction") != reservation.remaining_tool_call_budget.is_some()
-        || reservation
-            .remaining_tool_call_budget
-            .is_some_and(|budget| budget == 0 || budget > 256)
         || !reservation.fact_projection.is_object()
         || !reservation.context_assembly.is_object()
     {
@@ -4755,6 +5553,7 @@ pub(crate) struct SessionKernelProjectionSinkV2 {
     active_runs: HostActiveRunBrokerV2,
     projections: Arc<Mutex<HashMap<String, BTreeMap<String, (String, Value)>>>>,
     prior_event_prefixes: Arc<Mutex<HashMap<String, Arc<Vec<Value>>>>>,
+    latest_timelines: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl SessionKernelProjectionSinkV2 {
@@ -4764,6 +5563,7 @@ impl SessionKernelProjectionSinkV2 {
             active_runs,
             projections: Arc::new(Mutex::new(HashMap::new())),
             prior_event_prefixes: Arc::new(Mutex::new(HashMap::new())),
+            latest_timelines: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4790,7 +5590,7 @@ impl SessionKernelProjectionSinkV2 {
         )?;
         let path = self.projection_path(session_id, host_run_id)?;
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        let replayed = with_storage_path_lock(&guard_path, || {
+        let (replayed, timeline) = with_storage_path_lock(&guard_path, || {
             let timeline = self.preflight_public_projection(session_id, &request)?;
             let replayed = if projection_request_replayed(&path, session_id, host_run_id, &request)?
             {
@@ -4825,9 +5625,10 @@ impl SessionKernelProjectionSinkV2 {
             }
             self.publish_agent_event_locked(session_id, &request)?;
             self.publish_timeline_locked(session_id, &request, &timeline)?;
-            Ok(replayed)
+            Ok((replayed, timeline))
         })?;
         self.remember_projection(session_id, host_run_id, &request)?;
+        self.remember_latest_timeline(session_id, &timeline)?;
         Ok(SessionKernelHostProjectionReplyV2 {
             schema_version: SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA,
             projection_id: request.projection_id,
@@ -5427,15 +6228,20 @@ impl SessionKernelProjectionSinkV2 {
         &self,
         session_id: &str,
     ) -> Result<Option<Value>, HostV2StorageError> {
+        if let Some(timeline) = self.cached_latest_timeline(session_id)? {
+            return normalize_public_timeline_for_view(&timeline).map(Some);
+        }
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        with_storage_path_lock(&guard_path, || {
+        let timeline = with_storage_path_lock(&guard_path, || {
             let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
             let records = read_public_timeline_records_for_view(&path, session_id)?;
-            records
-                .last()
-                .map(|record| normalize_public_timeline_for_view(&record.timeline))
-                .transpose()
-        })
+            Ok(records.last().map(|record| record.timeline.clone()))
+        })?;
+        let Some(timeline) = timeline else {
+            return Ok(None);
+        };
+        self.remember_latest_timeline(session_id, &timeline)?;
+        normalize_public_timeline_for_view(&timeline).map(Some)
     }
 
     pub(crate) fn latest_timeline_for_run(
@@ -5444,11 +6250,21 @@ impl SessionKernelProjectionSinkV2 {
         run_id: &str,
     ) -> Result<Option<Value>, HostV2StorageError> {
         validate_bounded_identity(run_id, "runId", 512)?;
+        if let Some(timeline) = self.cached_latest_timeline(session_id)? {
+            let cached_run_id = timeline
+                .get("runProjection")
+                .and_then(Value::as_object)
+                .and_then(|run| run.get("runId"))
+                .and_then(Value::as_str);
+            if cached_run_id == Some(run_id) {
+                return normalize_latest_public_timeline(&timeline).map(Some);
+            }
+        }
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        with_storage_path_lock(&guard_path, || {
+        let (timeline, latest) = with_storage_path_lock(&guard_path, || {
             let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
             let records = read_public_timeline_records(&path, session_id)?;
-            records
+            let timeline = records
                 .iter()
                 .rev()
                 .find(|record| {
@@ -5460,9 +6276,16 @@ impl SessionKernelProjectionSinkV2 {
                         .and_then(Value::as_str)
                         == Some(run_id)
                 })
-                .map(|record| normalize_latest_public_timeline(&record.timeline))
-                .transpose()
-        })
+                .map(|record| record.timeline.clone());
+            let latest = records.last().map(|record| record.timeline.clone());
+            Ok((timeline, latest))
+        })?;
+        if let Some(latest) = latest {
+            self.remember_latest_timeline(session_id, &latest)?;
+        }
+        timeline
+            .map(|timeline| normalize_latest_public_timeline(&timeline))
+            .transpose()
     }
 
     pub(crate) fn frozen_prior_timeline(
@@ -5563,6 +6386,38 @@ impl SessionKernelProjectionSinkV2 {
             request.projection_id.clone(),
             (request.projection_digest.clone(), mapped),
         );
+        Ok(())
+    }
+
+    fn cached_latest_timeline(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Value>, HostV2StorageError> {
+        self.latest_timelines
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "session_kernel_public_timeline_cache_unavailable",
+                    "Session public timeline cache is unavailable",
+                )
+            })
+            .map(|timelines| timelines.get(session_id).cloned())
+    }
+
+    fn remember_latest_timeline(
+        &self,
+        session_id: &str,
+        timeline: &Value,
+    ) -> Result<(), HostV2StorageError> {
+        self.latest_timelines
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "session_kernel_public_timeline_cache_unavailable",
+                    "Session public timeline cache is unavailable",
+                )
+            })?
+            .insert(session_id.to_string(), timeline.clone());
         Ok(())
     }
 
@@ -5685,6 +6540,7 @@ fn validate_projection_request(
             | "authorization.decided"
             | "review.revised"
             | "planAction.completed"
+            | "userIntervention.changed"
             | "run.cancelled"
             | "wait.changed"
             | "diagnostic"
@@ -5738,8 +6594,8 @@ fn validate_projection_timeline_update(
                     "Only Provider composing projections may use a timeline delta",
                 ));
             }
-            if delta.schema_version != "deepcode.shared-conversation-projection.v3"
-                || delta.shape_version != "deepcode.shared-conversation.work-segments.v3"
+            if delta.schema_version != "deepcode.shared-conversation-projection.v4"
+                || delta.shape_version != "deepcode.shared-conversation.work-segments.v4"
                 || delta.session_id != session_id
             {
                 return Err(HostV2StorageError::invalid(
@@ -6687,6 +7543,7 @@ fn validate_private_projection_event_data(
                 &["completed", "no_op", "blocked", "skipped", "unexecuted"],
             )?;
         }
+        "userIntervention.changed" => validate_private_user_intervention(data)?,
         "run.cancelled" => validate_private_projection_fields(
             data,
             &[
@@ -6720,6 +7577,128 @@ fn validate_private_projection_event_data(
     Ok(())
 }
 
+fn validate_private_user_intervention(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    let state = data
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match state {
+        "open" => validate_private_projection_fields(
+            data,
+            &["state", "wait", "intervention"],
+            &[],
+            &[],
+            &["state"],
+            &[],
+            &["wait", "intervention"],
+            &[],
+            &[],
+        )?,
+        "accepted" => validate_private_projection_fields(
+            data,
+            &["state", "intervention", "decision", "acceptedPlanRevision"],
+            &[],
+            &["acceptedPlanRevision"],
+            &["state"],
+            &[],
+            &["intervention", "decision"],
+            &[],
+            &[],
+        )?,
+        "needsRevision" | "guidanceReplan" | "rejected" => {
+            validate_private_projection_fields(
+                data,
+                &["state", "intervention", "decision"],
+                &[],
+                &[],
+                &["state"],
+                &[],
+                &["intervention", "decision"],
+                &[],
+                &[],
+            )?;
+        }
+        _ => {
+            return Err(private_projection_data_invalid(
+                "User intervention state is not current",
+            ))
+        }
+    }
+    let intervention = data
+        .get("intervention")
+        .and_then(Value::as_object)
+        .ok_or_else(|| private_projection_data_invalid("User intervention card is invalid"))?;
+    for field in [
+        "runId",
+        "inputId",
+        "interactionId",
+        "interactionRevision",
+        "candidateSetDigest",
+        "evidenceProgressDigest",
+        "recordedAt",
+    ] {
+        let value = intervention
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid("User intervention identity is missing")
+            })?;
+        validate_bounded_identity(value, field, 64 * 1024)?;
+    }
+    if intervention.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.user-intervention.v1")
+        || intervention
+            .get("problemSummary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || intervention
+            .get("controlEpoch")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || intervention
+            .get("options")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(private_projection_data_invalid(
+            "User intervention card is incomplete",
+        ));
+    }
+    if state == "open" {
+        let wait = data
+            .get("wait")
+            .and_then(Value::as_object)
+            .ok_or_else(|| private_projection_data_invalid("User intervention wait is invalid"))?;
+        if wait.get("kind").and_then(Value::as_str) != Some("userIntervention")
+            || wait.get("interactionId") != intervention.get("interactionId")
+            || wait.get("interactionRevision") != intervention.get("interactionRevision")
+            || wait.get("candidateSetDigest") != intervention.get("candidateSetDigest")
+        {
+            return Err(private_projection_data_invalid(
+                "User intervention wait identity does not match its card",
+            ));
+        }
+    } else {
+        let decision = data
+            .get("decision")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                private_projection_data_invalid("User intervention decision is invalid")
+            })?;
+        if decision.get("interactionId") != intervention.get("interactionId")
+            || decision.get("interactionRevision") != intervention.get("interactionRevision")
+            || decision.get("candidateSetDigest") != intervention.get("candidateSetDigest")
+        {
+            return Err(private_projection_data_invalid(
+                "User intervention decision identity does not match its card",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_private_projection_fields(
     data: &serde_json::Map<String, Value>,
@@ -6732,16 +7711,22 @@ fn validate_private_projection_fields(
     positive_integers: &[&str],
     non_negative_integers: &[&str],
 ) -> Result<(), HostV2StorageError> {
-    if data
+    let unknown_fields = data
         .keys()
-        .any(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
-        || required
-            .iter()
-            .any(|field| !data.contains_key(*field) || data.get(*field) == Some(&Value::Null))
-    {
-        return Err(private_projection_data_invalid(
-            "Session private projection contains unknown fields or omits required current fields",
-        ));
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_fields = required
+        .iter()
+        .filter(|field| !data.contains_key(**field) || data.get(**field) == Some(&Value::Null))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() || !missing_fields.is_empty() {
+        return Err(private_projection_data_invalid(format!(
+            "Session private projection fields are not current (unknown: [{}]; missing: [{}])",
+            unknown_fields.join(", "),
+            missing_fields.join(", ")
+        )));
     }
     for field in identities {
         if let Some(value) = data.get(*field) {
@@ -6793,7 +7778,7 @@ fn validate_private_projection_fields(
     Ok(())
 }
 
-fn private_projection_data_invalid(message: &'static str) -> HostV2StorageError {
+fn private_projection_data_invalid(message: impl Into<String>) -> HostV2StorageError {
     HostV2StorageError::invalid("session_kernel_projection_data_invalid", message)
 }
 
@@ -6824,14 +7809,16 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
             "title",
             "objective",
             "narrative",
+            "evidence",
+            "carriedSettlementRefs",
             "actions",
             "recordedAt",
         ],
-        &[],
+        &["predecessorPlanRef"],
         &["runId", "inputId", "planRevision", "recordedAt"],
         &["title", "objective", "narrative"],
-        &["actions"],
-        &[],
+        &["carriedSettlementRefs", "actions"],
+        &["evidence", "predecessorPlanRef"],
         &[],
         &[],
     )?;
@@ -6844,6 +7831,42 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
             "Session private Plan text must be non-empty",
         ));
     }
+    validate_private_plan_evidence(
+        data.get("evidence")
+            .and_then(Value::as_object)
+            .expect("validated private Plan evidence"),
+    )?;
+    if let Some(predecessor) = data.get("predecessorPlanRef") {
+        let predecessor = predecessor
+            .as_object()
+            .expect("validated predecessor Plan ref");
+        validate_private_projection_fields(
+            predecessor,
+            &["planRevision", "planDigest"],
+            &[],
+            &["planRevision"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )?;
+        validate_sha256_digest(
+            predecessor
+                .get("planDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    private_projection_data_invalid("Predecessor Plan digest is invalid")
+                })?,
+            "predecessorPlanRef.planDigest",
+        )
+        .map_err(|_| private_projection_data_invalid("Predecessor Plan digest is invalid"))?;
+    }
+    validate_private_carried_settlements(
+        data.get("carriedSettlementRefs")
+            .and_then(Value::as_array)
+            .expect("validated carried settlement refs"),
+    )?;
     let plan_revision = data
         .get("planRevision")
         .and_then(Value::as_str)
@@ -6859,6 +7882,247 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
     }
     for action in actions {
         validate_private_plan_action(action, plan_revision)?;
+    }
+    Ok(())
+}
+
+fn validate_private_plan_evidence(
+    evidence: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        evidence,
+        &[
+            "kernelFactRefs",
+            "readResources",
+            "blockingUnknowns",
+            "nonBlockingUnknowns",
+            "coverage",
+        ],
+        &[],
+        &[],
+        &["coverage"],
+        &[
+            "kernelFactRefs",
+            "readResources",
+            "blockingUnknowns",
+            "nonBlockingUnknowns",
+        ],
+        &[],
+        &[],
+        &[],
+    )?;
+    if evidence
+        .get("coverage")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence coverage must be non-empty",
+        ));
+    }
+    let fact_refs = evidence
+        .get("kernelFactRefs")
+        .and_then(Value::as_array)
+        .expect("validated Plan fact refs");
+    if fact_refs.len() > 512 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence contains too many Kernel fact refs",
+        ));
+    }
+    validate_private_unique_identities(fact_refs, "planEvidence.kernelFactRef", false)?;
+
+    let resources = evidence
+        .get("readResources")
+        .and_then(Value::as_array)
+        .expect("validated Plan read resources");
+    if resources.len() > 512 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence contains too many read resources",
+        ));
+    }
+    let mut resource_refs = HashSet::new();
+    for resource in resources {
+        let resource = resource.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private Plan read evidence is invalid")
+        })?;
+        validate_private_projection_fields(
+            resource,
+            &["resourceRef", "digest", "summary", "factRefs"],
+            &[],
+            &["resourceRef"],
+            &["summary"],
+            &["factRefs"],
+            &[],
+            &[],
+            &[],
+        )?;
+        let resource_ref = resource
+            .get("resourceRef")
+            .and_then(Value::as_str)
+            .expect("validated resource ref");
+        if !resource_refs.insert(resource_ref) {
+            return Err(private_projection_data_invalid(
+                "Session private Plan read evidence resource refs are not unique",
+            ));
+        }
+        if resource
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(private_projection_data_invalid(
+                "Session private Plan read evidence summary must be non-empty",
+            ));
+        }
+        validate_sha256_digest(
+            resource
+                .get("digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    private_projection_data_invalid(
+                        "Session private Plan read evidence digest is invalid",
+                    )
+                })?,
+            "planEvidence.readResource.digest",
+        )
+        .map_err(|_| {
+            private_projection_data_invalid("Session private Plan read evidence digest is invalid")
+        })?;
+        validate_private_unique_identities(
+            resource
+                .get("factRefs")
+                .and_then(Value::as_array)
+                .expect("validated resource fact refs"),
+            "planEvidence.resourceFactRef",
+            true,
+        )?;
+    }
+
+    let blocking = evidence
+        .get("blockingUnknowns")
+        .and_then(Value::as_array)
+        .expect("validated blocking unknowns");
+    let non_blocking = evidence
+        .get("nonBlockingUnknowns")
+        .and_then(Value::as_array)
+        .expect("validated non-blocking unknowns");
+    if blocking.len() > 128 || non_blocking.len() > 128 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence contains too many unknowns",
+        ));
+    }
+    let mut unknown_ids = HashSet::new();
+    for unknown in blocking.iter().chain(non_blocking.iter()) {
+        let unknown = unknown.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private Plan unknown is invalid")
+        })?;
+        validate_private_projection_fields(
+            unknown,
+            &["unknownId", "question", "impact"],
+            &[],
+            &["unknownId"],
+            &["question", "impact"],
+            &[],
+            &[],
+            &[],
+            &[],
+        )?;
+        let unknown_id = unknown
+            .get("unknownId")
+            .and_then(Value::as_str)
+            .expect("validated unknown identity");
+        if !unknown_ids.insert(unknown_id)
+            || ["question", "impact"].iter().any(|field| {
+                unknown
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+        {
+            return Err(private_projection_data_invalid(
+                "Session private Plan unknowns are incomplete or not unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_carried_settlements(settlements: &[Value]) -> Result<(), HostV2StorageError> {
+    let mut action_ids = HashSet::new();
+    for settlement in settlements {
+        let settlement = settlement.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private carried settlement is invalid")
+        })?;
+        validate_private_projection_fields(
+            settlement,
+            &[
+                "planRevision",
+                "planActionId",
+                "settlementDigest",
+                "kernelFactRefs",
+            ],
+            &[],
+            &["planRevision", "planActionId"],
+            &[],
+            &["kernelFactRefs"],
+            &[],
+            &[],
+            &[],
+        )?;
+        let action_id = settlement
+            .get("planActionId")
+            .and_then(Value::as_str)
+            .expect("validated carried action identity");
+        if !action_ids.insert(action_id) {
+            return Err(private_projection_data_invalid(
+                "Session private carried PlanAction identities are not unique",
+            ));
+        }
+        validate_sha256_digest(
+            settlement
+                .get("settlementDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    private_projection_data_invalid("Carried settlement digest is invalid")
+                })?,
+            "carriedSettlement.settlementDigest",
+        )
+        .map_err(|_| private_projection_data_invalid("Carried settlement digest is invalid"))?;
+        validate_private_unique_identities(
+            settlement
+                .get("kernelFactRefs")
+                .and_then(Value::as_array)
+                .expect("validated carried settlement fact refs"),
+            "carriedSettlement.kernelFactRef",
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_private_unique_identities(
+    values: &[Value],
+    field: &'static str,
+    require_non_empty: bool,
+) -> Result<(), HostV2StorageError> {
+    if require_non_empty && values.is_empty() {
+        return Err(private_projection_data_invalid(
+            "Session private identity list must be non-empty",
+        ));
+    }
+    let mut identities = HashSet::new();
+    for value in values {
+        let value = value.as_str().ok_or_else(|| {
+            private_projection_data_invalid("Session private identity list is invalid")
+        })?;
+        validate_bounded_identity(value, field, 64 * 1024).map_err(|_| {
+            private_projection_data_invalid("Session private identity list is invalid")
+        })?;
+        if !identities.insert(value) {
+            return Err(private_projection_data_invalid(
+                "Session private identity list is not unique",
+            ));
+        }
     }
     Ok(())
 }
@@ -7296,6 +8560,7 @@ fn validate_private_provider_completed(
             "noTool",
             "toolIntent",
             "planActionComplete",
+            "intervention",
         ],
     )?;
     require_private_enum(data, "terminalScope", &["turn", "providerTurn"])?;
@@ -7396,7 +8661,7 @@ fn validate_private_tool_intent(
         &["expectedControlEpoch"],
         &[],
     )?;
-    require_private_enum(data, "authorityKind", &["planAction", "contextRead"])?;
+    require_private_enum(data, "authorityKind", &["planAction", "read"])?;
     require_private_enum(
         data,
         "replyKind",
@@ -7817,9 +9082,9 @@ fn read_public_timeline_records(
         }
         reject_transport_capabilities(&record.timeline)?;
         if record.timeline.get("schemaVersion").and_then(Value::as_str)
-            != Some("deepcode.shared-conversation-projection.v3")
+            != Some("deepcode.shared-conversation-projection.v4")
             || record.timeline.get("shapeVersion").and_then(Value::as_str)
-                != Some("deepcode.shared-conversation.work-segments.v3")
+                != Some("deepcode.shared-conversation.work-segments.v4")
         {
             return Err(HostV2StorageError::conflict(
                 "UnsupportedHistorySchema",
@@ -7896,8 +9161,8 @@ fn read_public_timeline_records_for_view(
             record.timeline.get("shapeVersion").and_then(Value::as_str),
         ) {
             (
-                Some("deepcode.shared-conversation-projection.v3"),
-                Some("deepcode.shared-conversation.work-segments.v3"),
+                Some("deepcode.shared-conversation-projection.v4"),
+                Some("deepcode.shared-conversation.work-segments.v4"),
             ) => "v3",
             (
                 Some("deepcode.shared-conversation-projection.v2"),
@@ -7957,9 +9222,9 @@ fn read_public_timeline_records_for_view(
 
 fn normalize_public_timeline_for_view(timeline: &Value) -> Result<Value, HostV2StorageError> {
     if timeline.get("schemaVersion").and_then(Value::as_str)
-        == Some("deepcode.shared-conversation-projection.v3")
+        == Some("deepcode.shared-conversation-projection.v4")
         && timeline.get("shapeVersion").and_then(Value::as_str)
-            == Some("deepcode.shared-conversation.work-segments.v3")
+            == Some("deepcode.shared-conversation.work-segments.v4")
     {
         return normalize_latest_public_timeline(timeline);
     }
@@ -8000,11 +9265,11 @@ fn normalize_public_timeline_for_view(timeline: &Value) -> Result<Value, HostV2S
     }
     object.insert(
         "schemaVersion".to_string(),
-        json!("deepcode.shared-conversation-projection.v3"),
+        json!("deepcode.shared-conversation-projection.v4"),
     );
     object.insert(
         "shapeVersion".to_string(),
-        json!("deepcode.shared-conversation.work-segments.v3"),
+        json!("deepcode.shared-conversation.work-segments.v4"),
     );
     crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
         &normalized,
@@ -8020,9 +9285,9 @@ fn normalize_public_timeline_for_view(timeline: &Value) -> Result<Value, HostV2S
 
 fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
     if timeline.get("schemaVersion").and_then(Value::as_str)
-        != Some("deepcode.shared-conversation-projection.v3")
+        != Some("deepcode.shared-conversation-projection.v4")
         || timeline.get("shapeVersion").and_then(Value::as_str)
-            != Some("deepcode.shared-conversation.work-segments.v3")
+            != Some("deepcode.shared-conversation.work-segments.v4")
     {
         return Err(HostV2StorageError::conflict(
             "UnsupportedHistorySchema",
@@ -8496,6 +9761,36 @@ fn validate_public_agent_event_payload(
                 "summary",
             ],
         ),
+        "userIntervention.changed" => (
+            &[
+                "status",
+                "decisionKind",
+                "interactionId",
+                "interactionRevision",
+                "candidateSetDigest",
+                "targetId",
+                "blockId",
+                "title",
+                "summary",
+                "intervention",
+                "decision",
+                "selectedOptionId",
+                "guidance",
+                "acceptedPlanRevision",
+            ],
+            &[
+                "status",
+                "decisionKind",
+                "interactionId",
+                "interactionRevision",
+                "candidateSetDigest",
+                "targetId",
+                "blockId",
+                "title",
+                "summary",
+                "intervention",
+            ],
+        ),
         "provider.composing" => (
             &[
                 "status",
@@ -8720,10 +10015,7 @@ fn validate_public_agent_event_payload(
                 && channel == "tool"
                 && visibility == "both"
                 && matches!(status, Some("admitted" | "awaitingCapability" | "rejected"))
-                && matches!(
-                    payload_text("authorityKind"),
-                    Some("planAction" | "contextRead")
-                )
+                && matches!(payload_text("authorityKind"), Some("planAction" | "read"))
                 && match status {
                     Some("admitted" | "awaitingCapability") => {
                         payload.contains_key("invocationId") && !payload.contains_key("replyReason")
@@ -8737,7 +10029,7 @@ fn validate_public_agent_event_payload(
                     Some("planAction") => {
                         payload.contains_key("planRevision") && payload.contains_key("planActionId")
                     }
-                    Some("contextRead") => {
+                    Some("read") => {
                         !payload.contains_key("planRevision")
                             && !payload.contains_key("planActionId")
                     }
@@ -8790,6 +10082,29 @@ fn validate_public_agent_event_payload(
                     Some("completed" | "no_op" | "blocked" | "skipped" | "unexecuted")
                 )
         }
+        "userIntervention.changed" => {
+            event_kind == "user_intervention"
+                && channel == "task"
+                && visibility == "both"
+                && payload_text("decisionKind") == Some("userIntervention")
+                && payload_text("targetId") == payload_text("interactionId")
+                && matches!(
+                    status,
+                    Some("awaitingUserDecision" | "accepted" | "rejected" | "needsRevision")
+                )
+                && match status {
+                    Some("awaitingUserDecision") => !payload.contains_key("decision"),
+                    Some("accepted") => {
+                        payload_text("decision") == Some("select")
+                            && payload.contains_key("acceptedPlanRevision")
+                    }
+                    Some("rejected") => payload_text("decision") == Some("reject"),
+                    Some("needsRevision") => {
+                        matches!(payload_text("decision"), Some("select" | "revise"))
+                    }
+                    _ => false,
+                }
+        }
         "provider.composing" => {
             event_kind == "assistant_msg"
                 && channel == "progress"
@@ -8805,7 +10120,14 @@ fn validate_public_agent_event_payload(
                 && visibility == "conversation"
                 && matches!(
                     payload_text("outputKind"),
-                    Some("plan" | "toolIntent" | "answer" | "noTool" | "planActionComplete")
+                    Some(
+                        "plan"
+                            | "toolIntent"
+                            | "answer"
+                            | "noTool"
+                            | "planActionComplete"
+                            | "intervention"
+                    )
                 )
                 && match payload_text("terminalScope") {
                     Some("turn") => {
@@ -9145,6 +10467,31 @@ fn validate_public_projection_payload_types(
             public_integer(payload, "controlEpoch", true)?;
             public_integer(payload, "snapshotHighWater", false)?;
         }
+        "userIntervention.changed" => {
+            for field in [
+                "interactionId",
+                "interactionRevision",
+                "candidateSetDigest",
+                "targetId",
+                "blockId",
+            ] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "decisionKind", "title", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            for field in ["decision", "guidance"] {
+                public_optional_string(payload, field, false)?;
+            }
+            for field in ["selectedOptionId", "acceptedPlanRevision"] {
+                public_optional_string(payload, field, true)?;
+            }
+            validate_public_user_intervention(
+                payload
+                    .get("intervention")
+                    .expect("required user intervention"),
+            )?;
+        }
         "provider.composing" => {
             public_string(payload, "providerTurnId", true)?;
             public_integer(payload, "controlEpoch", true)?;
@@ -9294,6 +10641,167 @@ fn validate_public_projection_payload_types(
             return Err(public_projection_shape_invalid(
                 "Public projection kind is not current",
             ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_user_intervention(value: &Value) -> Result<(), HostV2StorageError> {
+    let intervention = public_exact_object(
+        value,
+        &[
+            "schemaVersion",
+            "interactionId",
+            "interactionRevision",
+            "candidateSetDigest",
+            "problemSummary",
+            "relevantFacts",
+            "affectedPlanActionIds",
+            "options",
+            "allowsFreeform",
+        ],
+        &["recommendation"],
+        "User intervention",
+    )?;
+    if public_string(intervention, "schemaVersion", false)?
+        != "deepcode.session.user-intervention.v1"
+        || !public_boolean(intervention, "allowsFreeform")?
+    {
+        return Err(public_projection_shape_invalid(
+            "User intervention schema or freeform contract is invalid",
+        ));
+    }
+    for field in ["interactionId", "interactionRevision", "candidateSetDigest"] {
+        public_string(intervention, field, true)?;
+    }
+    public_string(intervention, "problemSummary", false)?;
+    public_optional_string(intervention, "recommendation", false)?;
+    validate_public_identity_array(
+        intervention
+            .get("relevantFacts")
+            .expect("required intervention fact refs"),
+        "userIntervention.relevantFacts",
+    )?;
+    validate_public_identity_array(
+        intervention
+            .get("affectedPlanActionIds")
+            .expect("required affected PlanActions"),
+        "userIntervention.affectedPlanActionIds",
+    )?;
+    let options = public_array(intervention, "options")?;
+    if options.is_empty() || options.len() > 16 {
+        return Err(public_projection_shape_invalid(
+            "User intervention must contain 1..=16 options",
+        ));
+    }
+    let mut option_ids = HashSet::new();
+    for value in options {
+        let option = public_exact_object(
+            value,
+            &["id", "label", "kind", "tradeoffs", "actions"],
+            &[
+                "description",
+                "recommended",
+                "candidatePlanRevision",
+                "candidatePlanDigest",
+            ],
+            "User intervention option",
+        )?;
+        let option_id = public_string(option, "id", true)?;
+        if !option_ids.insert(option_id) {
+            return Err(public_projection_shape_invalid(
+                "User intervention option ids must be unique",
+            ));
+        }
+        public_string(option, "label", false)?;
+        public_optional_string(option, "description", false)?;
+        if option.contains_key("recommended") {
+            public_boolean(option, "recommended")?;
+        }
+        let kind = public_string(option, "kind", false)?;
+        if !matches!(kind, "executable" | "guidanceOnly") {
+            return Err(public_projection_shape_invalid(
+                "User intervention option kind is invalid",
+            ));
+        }
+        validate_public_string_array(
+            option.get("tradeoffs").expect("required tradeoffs"),
+            "userIntervention.option.tradeoffs",
+        )?;
+        let actions = public_array(option, "actions")?;
+        let executable = kind == "executable";
+        if executable
+            != (option.contains_key("candidatePlanRevision")
+                && option.contains_key("candidatePlanDigest")
+                && !actions.is_empty())
+            || (!executable
+                && (option.contains_key("candidatePlanRevision")
+                    || option.contains_key("candidatePlanDigest")
+                    || !actions.is_empty()))
+        {
+            return Err(public_projection_shape_invalid(
+                "User intervention option authority shape is invalid",
+            ));
+        }
+        public_optional_string(option, "candidatePlanRevision", true)?;
+        public_optional_string(option, "candidatePlanDigest", true)?;
+        for action in actions {
+            let action = public_exact_object(
+                action,
+                &[
+                    "planActionId",
+                    "operationId",
+                    "toolId",
+                    "summary",
+                    "riskLevel",
+                    "canonicalTargets",
+                    "scopeDelta",
+                    "previewId",
+                    "previewDigest",
+                ],
+                &[],
+                "User intervention candidate action",
+            )?;
+            for field in [
+                "planActionId",
+                "operationId",
+                "toolId",
+                "previewId",
+                "previewDigest",
+            ] {
+                public_string(action, field, true)?;
+            }
+            public_string(action, "summary", false)?;
+            if !matches!(
+                public_string(action, "riskLevel", false)?,
+                "low" | "medium" | "high" | "critical"
+            ) {
+                return Err(public_projection_shape_invalid(
+                    "User intervention action risk is invalid",
+                ));
+            }
+            for field in ["canonicalTargets", "scopeDelta"] {
+                validate_public_string_array(
+                    action
+                        .get(field)
+                        .expect("required intervention action list"),
+                    field,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_string_array(value: &Value, field: &str) -> Result<(), HostV2StorageError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be an array")))?;
+    for value in values {
+        if value.as_str().is_none() {
+            return Err(public_projection_shape_invalid(format!(
+                "{field} must contain strings"
+            )));
         }
     }
     Ok(())
@@ -9950,6 +11458,7 @@ fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError
                     &["kind", "ordinal", "callId", "toolName", "toolId"],
                     &[
                         "operationId",
+                        "previewId",
                         "status",
                         "invocationId",
                         "terminalFactId",
@@ -9971,6 +11480,7 @@ fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError
                 }
                 for field in [
                     "operationId",
+                    "previewId",
                     "invocationId",
                     "terminalFactId",
                     "terminalFactKind",
@@ -10395,39 +11905,9 @@ fn validate_public_review_query(value: &Value) -> Result<(), HostV2StorageError>
 }
 
 fn validate_public_work_authority(value: &Value) -> Result<(), HostV2StorageError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| public_projection_shape_invalid("Review authority must be an object"))?;
-    match object.get("kind").and_then(Value::as_str) {
-        Some("plan") => {
-            let object = public_exact_object(
-                value,
-                &["kind", "planRevision"],
-                &[],
-                "Review Plan authority",
-            )?;
-            public_string(object, "planRevision", true)?;
-        }
-        Some("contextRead") => {
-            let object = public_exact_object(
-                value,
-                &["kind", "operationIds", "digest"],
-                &[],
-                "Review context authority",
-            )?;
-            public_string(object, "digest", true)?;
-            validate_public_identity_array(
-                object.get("operationIds").expect("required operation ids"),
-                "reviewAuthority.operationIds",
-            )?;
-        }
-        _ => {
-            return Err(public_projection_shape_invalid(
-                "Review authority kind is not current",
-            ))
-        }
-    }
-    Ok(())
+    decode_session_work_authority_v3(value)
+        .map(|_| ())
+        .map_err(|_| public_projection_shape_invalid("Review authority is not current"))
 }
 
 fn public_agent_event_id(event: &Value) -> Result<&str, HostV2StorageError> {

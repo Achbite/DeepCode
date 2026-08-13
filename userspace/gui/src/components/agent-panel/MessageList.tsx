@@ -153,6 +153,7 @@ function ProjectedBlock({ block, language }: { block: AgentTimelineBlock; langua
     case 'review':
       return <StructuredBlock block={block} language={language} />;
     case 'permission':
+    case 'userIntervention':
     case 'error':
       return <StatusBlock block={block} language={language} />;
   }

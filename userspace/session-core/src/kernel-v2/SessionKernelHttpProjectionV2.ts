@@ -1171,6 +1171,8 @@ function publicPresentation(
           review: cloneJson(event.data),
         },
       };
+    case 'userIntervention.changed':
+      return userInterventionPresentation(data);
     case 'planAction.completed':
       return {
         kind: 'workflow_stage',
@@ -1429,6 +1431,254 @@ function publicPresentation(
   }
 }
 
+function userInterventionPresentation(
+  data: Record<string, unknown> | undefined
+): ReturnType<typeof publicPresentation> {
+  const state = textField(data, 'state');
+  const intervention = objectRecord(data?.intervention);
+  if (!intervention) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_user_intervention_projection_invalid',
+      'User intervention projection is missing its canonical card.'
+    );
+  }
+  const interactionId = requiredIdentity(
+    intervention.interactionId,
+    'intervention.interactionId'
+  );
+  const interactionRevision = requiredIdentity(
+    intervention.interactionRevision,
+    'intervention.interactionRevision'
+  );
+  const candidateSetDigest = requiredIdentity(
+    intervention.candidateSetDigest,
+    'intervention.candidateSetDigest'
+  );
+  const runId = requiredIdentity(intervention.runId, 'intervention.runId');
+  const problemSummary = boundedPublicText(
+    intervention.problemSummary,
+    'intervention.problemSummary'
+  );
+  const decision = objectRecord(data?.decision);
+  const publicState = state === 'open'
+    ? 'awaitingUserDecision'
+    : state === 'accepted'
+      ? 'accepted'
+      : state === 'rejected'
+        ? 'rejected'
+        : 'needsRevision';
+  return {
+    kind: 'user_intervention',
+    channel: 'task',
+    visibility: 'both',
+    fields: {
+      status: publicState,
+      decisionKind: 'userIntervention',
+      interactionId,
+      interactionRevision,
+      candidateSetDigest,
+      targetId: interactionId,
+      blockId: `user-intervention:${runId}:${interactionId}`,
+      title: 'User intervention required',
+      summary: problemSummary,
+      intervention: publicUserInterventionView(intervention),
+      ...(decision
+        ? {
+            decision: textField(decision, 'decision'),
+            selectedOptionId: textField(decision, 'optionId'),
+            guidance: textField(decision, 'guidance'),
+          }
+        : {}),
+      ...(textField(data, 'acceptedPlanRevision')
+        ? { acceptedPlanRevision: textField(data, 'acceptedPlanRevision') }
+        : {}),
+    },
+  };
+}
+
+function publicUserInterventionView(
+  intervention: Record<string, unknown>
+): Record<string, unknown> {
+  const options = Array.isArray(intervention.options)
+    ? intervention.options.map((value, index) => {
+        const option = objectRecord(value);
+        if (!option) {
+          throw invalidPublicIntervention(`options[${index}]`);
+        }
+        const optionId = requiredIdentity(
+          option.optionId,
+          `intervention.options[${index}].optionId`
+        );
+        const kind = textField(option, 'kind');
+        if (kind !== 'executable' && kind !== 'guidanceOnly') {
+          throw invalidPublicIntervention(`options[${index}].kind`);
+        }
+        const candidatePlan = objectRecord(option.candidatePlan);
+        const actions = Array.isArray(option.actions)
+          ? option.actions.map((actionValue, actionIndex) => {
+              const action = objectRecord(actionValue);
+              const preview = objectRecord(action?.preview);
+              const approval = objectRecord(preview?.approvalView);
+              if (!action || !preview || !approval) {
+                throw invalidPublicIntervention(
+                  `options[${index}].actions[${actionIndex}]`
+                );
+              }
+              return {
+                planActionId: requiredIdentity(
+                  action.planActionId,
+                  'intervention.action.planActionId'
+                ),
+                operationId: requiredIdentity(
+                  action.operationId,
+                  'intervention.action.operationId'
+                ),
+                toolId: requiredIdentity(
+                  action.toolId,
+                  'intervention.action.toolId'
+                ),
+                summary: boundedPublicText(
+                  action.summary,
+                  'intervention.action.summary'
+                ),
+                riskLevel: interventionRisk(preview.risk),
+                canonicalTargets: boundedPublicTextArray(
+                  approval.canonicalTargets,
+                  'intervention.action.canonicalTargets'
+                ),
+                scopeDelta: boundedPublicTextArray(
+                  approval.scopeDelta,
+                  'intervention.action.scopeDelta'
+                ),
+                previewId: requiredIdentity(
+                  preview.previewId,
+                  'intervention.action.previewId'
+                ),
+                previewDigest: sha256Hash(canonicalJson(preview)),
+              };
+            })
+          : [];
+        if (
+          (kind === 'executable' && (!candidatePlan || actions.length === 0))
+          || (kind === 'guidanceOnly' && (candidatePlan || actions.length > 0))
+        ) {
+          throw invalidPublicIntervention(`options[${index}].authority`);
+        }
+        return {
+          id: optionId,
+          label: boundedPublicText(
+            option.title,
+            `intervention.options[${index}].title`
+          ),
+          description: boundedPublicText(
+            option.description,
+            `intervention.options[${index}].description`
+          ),
+          recommended: option.recommended === true,
+          kind,
+          tradeoffs: boundedPublicTextArray(
+            option.tradeoffs,
+            `intervention.options[${index}].tradeoffs`
+          ),
+          ...(candidatePlan
+            ? {
+                candidatePlanRevision: requiredIdentity(
+                  candidatePlan.planRevision,
+                  'intervention.candidatePlan.planRevision'
+                ),
+                candidatePlanDigest: sha256Hash(canonicalJson(candidatePlan)),
+              }
+            : {}),
+          actions,
+        };
+      })
+    : [];
+  if (options.length === 0) {
+    throw invalidPublicIntervention('options');
+  }
+  return {
+    schemaVersion: 'deepcode.session.user-intervention.v1',
+    interactionId: requiredIdentity(
+      intervention.interactionId,
+      'intervention.interactionId'
+    ),
+    interactionRevision: requiredIdentity(
+      intervention.interactionRevision,
+      'intervention.interactionRevision'
+    ),
+    candidateSetDigest: requiredIdentity(
+      intervention.candidateSetDigest,
+      'intervention.candidateSetDigest'
+    ),
+    problemSummary: boundedPublicText(
+      intervention.problemSummary,
+      'intervention.problemSummary'
+    ),
+    ...(intervention.recommendation === undefined
+      ? {}
+      : {
+          recommendation: boundedPublicText(
+            intervention.recommendation,
+            'intervention.recommendation'
+          ),
+        }),
+    relevantFacts: boundedPublicTextArray(
+      intervention.relevantFactRefs,
+      'intervention.relevantFactRefs'
+    ),
+    affectedPlanActionIds: boundedPublicTextArray(
+      intervention.affectedPlanActionIds,
+      'intervention.affectedPlanActionIds'
+    ),
+    options,
+    allowsFreeform: true,
+  };
+}
+
+function interventionRisk(
+  value: unknown
+): 'low' | 'medium' | 'high' | 'critical' {
+  if (
+    value !== 'low'
+    && value !== 'medium'
+    && value !== 'high'
+    && value !== 'critical'
+  ) {
+    throw invalidPublicIntervention('risk');
+  }
+  return value;
+}
+
+function boundedPublicText(value: unknown, field: string): string {
+  if (
+    typeof value !== 'string'
+    || !value.trim()
+    || value.trim() !== value
+    || new TextEncoder().encode(value).byteLength > 64 * 1024
+  ) {
+    throw invalidPublicIntervention(field);
+  }
+  return value;
+}
+
+function boundedPublicTextArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > 256) {
+    throw invalidPublicIntervention(field);
+  }
+  return value.map((item, index) =>
+    boundedPublicText(item, `${field}[${index}]`)
+  );
+}
+
+function invalidPublicIntervention(
+  field: string
+): SessionKernelProjectionTransportError {
+  return new SessionKernelProjectionTransportError(
+    'session_kernel_user_intervention_projection_invalid',
+    `User intervention public field ${field} is invalid.`
+  );
+}
+
 type CurrentProjectionFieldKind =
   | 'identity'
   | 'string'
@@ -1449,8 +1699,14 @@ const CURRENT_PLAN_FIELDS = {
   title: 'string',
   objective: 'string',
   narrative: 'string',
+  evidence: 'object',
+  carriedSettlementRefs: 'array',
   actions: 'array',
   recordedAt: 'identity',
+} as const satisfies CurrentProjectionFieldSchema;
+
+const CURRENT_PLAN_OPTIONAL_FIELDS = {
+  predecessorPlanRef: 'object',
 } as const satisfies CurrentProjectionFieldSchema;
 
 const CURRENT_SCOPE_PREVIEW_FIELDS = {
@@ -1461,6 +1717,7 @@ const CURRENT_SCOPE_PREVIEW_FIELDS = {
   planActionId: 'identity',
   operationId: 'identity',
   toolId: 'identity',
+  origin: 'object',
   authorizationBinding: 'object',
   canonicalScope: 'object',
   scopeDigest: 'identity',
@@ -1497,7 +1754,8 @@ function currentProjectionData(
     case 'plan.persisted': {
       const data = exactCurrentProjectionRecord(
         event,
-        CURRENT_PLAN_FIELDS
+        CURRENT_PLAN_FIELDS,
+        CURRENT_PLAN_OPTIONAL_FIELDS
       );
       validateCurrentPlan(data);
       return data;
@@ -1726,6 +1984,8 @@ function currentProjectionData(
       ]);
       return data;
     }
+    case 'userIntervention.changed':
+      return currentUserInterventionProjectionData(event);
     case 'run.cancelled':
       return exactCurrentProjectionRecord(event, {
         callerRequestId: 'identity',
@@ -1742,6 +2002,93 @@ function currentProjectionData(
     default:
       throw unsupportedProjectionKind(event);
   }
+}
+
+function currentUserInterventionProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const tagged = objectRecord(event.data);
+  const state = textField(tagged, 'state');
+  const data = state === 'open'
+    ? exactCurrentProjectionRecord(event, {
+        state: 'string',
+        wait: 'object',
+        intervention: 'object',
+      })
+    : state === 'accepted'
+      ? exactCurrentProjectionRecord(event, {
+          state: 'string',
+          intervention: 'object',
+          decision: 'object',
+          acceptedPlanRevision: 'identity',
+        })
+      : exactCurrentProjectionRecord(event, {
+          state: 'string',
+          intervention: 'object',
+          decision: 'object',
+        });
+  projectionEnum(data, 'state', [
+    'open',
+    'accepted',
+    'needsRevision',
+    'guidanceReplan',
+    'rejected',
+  ]);
+  const intervention = projectionObject(data, 'intervention');
+  for (const field of [
+    'runId',
+    'inputId',
+    'interactionId',
+    'interactionRevision',
+    'candidateSetDigest',
+    'evidenceProgressDigest',
+    'recordedAt',
+  ]) {
+    requiredIdentity(intervention[field], `intervention.${field}`);
+  }
+  if (
+    intervention.schemaVersion !== 'deepcode.session.user-intervention.v1'
+    || typeof intervention.problemSummary !== 'string'
+    || !intervention.problemSummary.trim()
+    || !Number.isSafeInteger(intervention.controlEpoch)
+    || Number(intervention.controlEpoch) <= 0
+    || !Array.isArray(intervention.relevantFactRefs)
+    || !Array.isArray(intervention.affectedPlanActionIds)
+    || !Array.isArray(intervention.options)
+    || intervention.options.length === 0
+  ) {
+    throw invalidCurrentProjectionData(
+      event.kind,
+      'user intervention payload is incomplete'
+    );
+  }
+  if (state === 'open') {
+    const wait = projectionObject(data, 'wait');
+    if (
+      wait.kind !== 'userIntervention'
+      || wait.interactionId !== intervention.interactionId
+      || wait.interactionRevision !== intervention.interactionRevision
+      || wait.candidateSetDigest !== intervention.candidateSetDigest
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'user intervention wait does not match the card identity'
+      );
+    }
+  } else {
+    const decision = projectionObject(data, 'decision');
+    if (
+      decision.interactionId !== intervention.interactionId
+      || decision.interactionRevision !== intervention.interactionRevision
+      || decision.candidateSetDigest !== intervention.candidateSetDigest
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'user intervention decision does not match the card identity'
+      );
+    }
+  }
+  return data;
 }
 
 function currentScopePreviewProjectionData(
@@ -1863,6 +2210,7 @@ function currentProviderCompletedProjectionData(
     'noTool',
     'toolIntent',
     'planActionComplete',
+    'intervention',
   ]);
   projectionEnum(data, 'terminalScope', ['turn', 'providerTurn']);
   if (data.answerState !== undefined) {
@@ -1956,7 +2304,7 @@ function currentToolIntentProjectionData(
   );
   const authorityKind = projectionEnum(data, 'authorityKind', [
     'planAction',
-    'contextRead',
+    'read',
   ]);
   const replyKind = projectionEnum(data, 'replyKind', [
     'admitted',
@@ -2135,7 +2483,8 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
   const plan = exactCurrentProjectionValue(
     data,
     'plan',
-    CURRENT_PLAN_FIELDS
+    CURRENT_PLAN_FIELDS,
+    CURRENT_PLAN_OPTIONAL_FIELDS
   );
   for (const field of ['title', 'objective', 'narrative'] as const) {
     if (!(plan[field] as string).trim()) {
@@ -2145,7 +2494,63 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
       );
     }
   }
-  projectionArray(plan, 'actions').forEach((value, index) => {
+  validateCurrentPlanEvidence(
+    projectionObject(plan, 'evidence')
+  );
+  if (plan.predecessorPlanRef !== undefined) {
+    const predecessor = exactCurrentProjectionValue(
+      plan.predecessorPlanRef,
+      'plan.predecessorPlanRef',
+      {
+        planRevision: 'identity',
+        planDigest: 'identity',
+      }
+    );
+    currentProjectionDigest(
+      predecessor.planDigest,
+      'plan.predecessorPlanRef.planDigest'
+    );
+  }
+  const carriedActionIds = new Set<string>();
+  projectionArray(plan, 'carriedSettlementRefs').forEach(
+    (value, index) => {
+      const settlement = exactCurrentProjectionValue(
+        value,
+        `plan.carriedSettlementRefs[${String(index)}]`,
+        {
+          planRevision: 'identity',
+          planActionId: 'identity',
+          settlementDigest: 'identity',
+          kernelFactRefs: 'array',
+        }
+      );
+      currentProjectionDigest(
+        settlement.settlementDigest,
+        `plan.carriedSettlementRefs[${String(index)}].settlementDigest`
+      );
+      const planActionId = settlement.planActionId as string;
+      if (carriedActionIds.has(planActionId)) {
+        throw invalidCurrentProjectionData(
+          'plan.carriedSettlementRefs',
+          'PlanAction identities must be unique'
+        );
+      }
+      carriedActionIds.add(planActionId);
+      validateCurrentIdentityArray(
+        projectionArray(settlement, 'kernelFactRefs'),
+        `plan.carriedSettlementRefs[${String(index)}].kernelFactRefs`,
+        false
+      );
+    }
+  );
+  const actions = projectionArray(plan, 'actions');
+  if (actions.length === 0 || actions.length > 128) {
+    throw invalidCurrentProjectionData(
+      'plan.actions',
+      'Plan must contain 1..=128 current mutation actions'
+    );
+  }
+  actions.forEach((value, index) => {
     const action = exactCurrentProjectionValue(
       value,
       `plan.actions[${String(index)}]`,
@@ -2193,12 +2598,195 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
   });
 }
 
+function validateCurrentPlanEvidence(
+  evidence: Record<string, unknown>
+): void {
+  const current = exactCurrentProjectionValue(
+    evidence,
+    'plan.evidence',
+    {
+      kernelFactRefs: 'array',
+      readResources: 'array',
+      blockingUnknowns: 'array',
+      nonBlockingUnknowns: 'array',
+      coverage: 'string',
+    }
+  );
+  if (!(current.coverage as string).trim()) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.coverage',
+      'coverage must be non-empty'
+    );
+  }
+  const kernelFactRefs = projectionArray(current, 'kernelFactRefs');
+  if (kernelFactRefs.length > 512) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.kernelFactRefs',
+      'Kernel fact ref list exceeds the current object bound'
+    );
+  }
+  validateCurrentIdentityArray(
+    kernelFactRefs,
+    'plan.evidence.kernelFactRefs',
+    false
+  );
+
+  const readResources = projectionArray(current, 'readResources');
+  if (readResources.length > 512) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.readResources',
+      'read evidence exceeds the current object bound'
+    );
+  }
+  const resourceRefs = new Set<string>();
+  readResources.forEach((value, index) => {
+    const resource = exactCurrentProjectionValue(
+      value,
+      `plan.evidence.readResources[${String(index)}]`,
+      {
+        resourceRef: 'identity',
+        digest: 'identity',
+        summary: 'string',
+        factRefs: 'array',
+      }
+    );
+    const resourceRef = resource.resourceRef as string;
+    if (
+      resourceRefs.has(resourceRef)
+      || !(resource.summary as string).trim()
+    ) {
+      throw invalidCurrentProjectionData(
+        'plan.evidence.readResources',
+        'resource refs must be unique and summaries must be non-empty'
+      );
+    }
+    resourceRefs.add(resourceRef);
+    currentProjectionDigest(
+      resource.digest,
+      `plan.evidence.readResources[${String(index)}].digest`
+    );
+    validateCurrentIdentityArray(
+      projectionArray(resource, 'factRefs'),
+      `plan.evidence.readResources[${String(index)}].factRefs`,
+      true
+    );
+  });
+
+  const blocking = projectionArray(current, 'blockingUnknowns');
+  const nonBlocking = projectionArray(current, 'nonBlockingUnknowns');
+  if (blocking.length > 128 || nonBlocking.length > 128) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.unknowns',
+      'unknown list exceeds the current object bound'
+    );
+  }
+  const unknownIds = new Set<string>();
+  [...blocking, ...nonBlocking].forEach((value, index) => {
+    const unknown = exactCurrentProjectionValue(
+      value,
+      `plan.evidence.unknowns[${String(index)}]`,
+      {
+        unknownId: 'identity',
+        question: 'string',
+        impact: 'string',
+      }
+    );
+    const unknownId = unknown.unknownId as string;
+    if (
+      unknownIds.has(unknownId)
+      || !(unknown.question as string).trim()
+      || !(unknown.impact as string).trim()
+    ) {
+      throw invalidCurrentProjectionData(
+        'plan.evidence.unknowns',
+        'unknown identities must be unique and text must be non-empty'
+      );
+    }
+    unknownIds.add(unknownId);
+  });
+}
+
+function validateCurrentIdentityArray(
+  values: unknown[],
+  field: string,
+  requireNonEmpty: boolean
+): void {
+  if (requireNonEmpty && values.length === 0) {
+    throw invalidCurrentProjectionData(
+      field,
+      'identity list must be non-empty'
+    );
+  }
+  const identities = new Set<string>();
+  values.forEach((value) => {
+    if (!currentProjectionIdentity(value) || identities.has(value as string)) {
+      throw invalidCurrentProjectionData(
+        field,
+        'identities must be current and unique'
+      );
+    }
+    identities.add(value as string);
+  });
+}
+
+function currentProjectionDigest(value: unknown, field: string): string {
+  if (
+    typeof value !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(value)
+  ) {
+    throw invalidCurrentProjectionData(field, 'digest is invalid');
+  }
+  return value;
+}
+
 function validateCurrentScopePreview(value: unknown, field: string): void {
   const preview = exactCurrentProjectionValue(
     value,
     field,
     CURRENT_SCOPE_PREVIEW_FIELDS
   );
+  const origin = exactCurrentProjectionValue(
+    preview.origin,
+    `${field}.origin`,
+    { kind: 'string', data: 'object' }
+  );
+  switch (projectionEnum(origin, 'kind', [
+    'plan',
+    'planDiscovery',
+    'interventionCandidate',
+  ])) {
+    case 'plan':
+      exactCurrentProjectionValue(
+        origin.data,
+        `${field}.origin.data`,
+        {}
+      );
+      break;
+    case 'planDiscovery':
+      exactCurrentProjectionValue(
+        origin.data,
+        `${field}.origin.data`,
+        { discoveryId: 'identity' }
+      );
+      break;
+    case 'interventionCandidate': {
+      const data = exactCurrentProjectionValue(
+        origin.data,
+        `${field}.origin.data`,
+        {
+          interactionId: 'identity',
+          interactionRevision: 'identity',
+          candidateSetDigest: 'identity',
+          optionId: 'identity',
+        }
+      );
+      currentProjectionDigest(
+        data.candidateSetDigest,
+        `${field}.origin.data.candidateSetDigest`
+      );
+      break;
+    }
+  }
   projectionEnum(preview, 'effectClass', ['read', 'mutation']);
   projectionEnum(preview, 'effectScope', [
     'workspaceRead',
@@ -2375,7 +2963,7 @@ function invalidCurrentProjectionData(
   return new SessionKernelProjectionTransportError(
     'session_kernel_projection_data_invalid',
     'Session ' + kind
-      + ' projection is not exact current v2 data: ' + reason + '.'
+      + ' projection is not exact current v4 data: ' + reason + '.'
   );
 }
 
@@ -2385,7 +2973,7 @@ function unsupportedProjectionKind(
   return new SessionKernelProjectionTransportError(
     'UnsupportedHistorySchema',
     'Session projection kind ' + String(event.kind)
-      + ' is not current v2.'
+      + ' is not current v4.'
   );
 }
 function providerComposingPresentation(
@@ -2903,6 +3491,7 @@ function publicOrderedProviderItems(
       'toolName',
       'toolId',
       'operationId',
+      'previewId',
       'status',
       'invocationId',
       'terminalFactId',
@@ -2943,6 +3532,14 @@ function publicOrderedProviderItems(
       toolName: requiredIdentity(item.toolName, 'toolName'),
       toolId: requiredIdentity(item.toolId, 'toolId'),
       ...(operationId ? { operationId } : {}),
+      ...(item.previewId === undefined
+        ? {}
+        : {
+            previewId: requiredIdentity(
+              item.previewId,
+              'previewId'
+            ),
+          }),
       ...(retry ? { retry } : {}),
       ...(status ? { status } : {}),
       ...(item.invocationId === undefined

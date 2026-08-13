@@ -178,9 +178,7 @@ fn validate_first_input_admission(admission: &Value) -> Result<(), String> {
     let schema = admission
         .get("schemaVersion")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            unsupported_history("Session firstInputAdmission has no schemaVersion")
-        })?;
+        .ok_or_else(|| unsupported_history("Session firstInputAdmission has no schemaVersion"))?;
     let admission = match schema {
         "deepcode.host.project-session-admission.v1" => {
             let admission = exact_object(
@@ -236,11 +234,8 @@ fn validate_first_input_admission(admission: &Value) -> Result<(), String> {
         }
     };
     required_string(admission, "callerRequestId", "Session firstInputAdmission")?;
-    let request_digest = required_string(
-        admission,
-        "requestDigest",
-        "Session firstInputAdmission",
-    )?;
+    let request_digest =
+        required_string(admission, "requestDigest", "Session firstInputAdmission")?;
     crate::host_v2_storage::validate_sha256_digest(request_digest, "requestDigest")
         .map_err(|error| unsupported_history(error.message))?;
     match required_string(admission, "status", "Session firstInputAdmission")? {

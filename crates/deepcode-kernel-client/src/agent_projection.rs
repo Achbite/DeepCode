@@ -12,6 +12,10 @@ pub const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3: &str =
     "deepcode.shared-conversation-projection.v3";
 pub const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3: &str =
     "deepcode.shared-conversation.work-segments.v3";
+pub const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4: &str =
+    "deepcode.shared-conversation-projection.v4";
+pub const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4: &str =
+    "deepcode.shared-conversation.work-segments.v4";
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -106,6 +110,8 @@ pub enum AgentTimelineBlockKind {
     Permission,
     #[serde(rename = "plan")]
     Plan,
+    #[serde(rename = "userIntervention")]
+    UserIntervention,
     #[serde(rename = "review")]
     Review,
     #[serde(rename = "error")]
@@ -122,6 +128,8 @@ pub enum AgentTimelineNarrativeKind {
     Plan,
     #[serde(rename = "permission")]
     Permission,
+    #[serde(rename = "userIntervention")]
+    UserIntervention,
     #[serde(rename = "review")]
     Review,
     #[serde(rename = "diagnostic")]
@@ -286,6 +294,8 @@ pub enum AgentTimelineCheckpointKind {
     UserGuidance,
     #[serde(rename = "permission")]
     Permission,
+    #[serde(rename = "userIntervention")]
+    UserIntervention,
     #[serde(rename = "review")]
     Review,
     #[serde(rename = "final")]
@@ -353,6 +363,8 @@ pub enum AgentTimelineInteractionKind {
     Plan,
     #[serde(rename = "permission")]
     Permission,
+    #[serde(rename = "userIntervention")]
+    UserIntervention,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -412,6 +424,8 @@ pub enum AgentTimelineStructuredProjectionKind {
     Plan,
     #[serde(rename = "review")]
     Review,
+    #[serde(rename = "userIntervention")]
+    UserIntervention,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1036,6 +1050,91 @@ pub struct AgentTimelinePendingPlan {
     pub summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineInterventionOptionKind {
+    #[serde(rename = "executable")]
+    Executable,
+    #[serde(rename = "guidanceOnly")]
+    GuidanceOnly,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AgentTimelineInterventionRiskLevel {
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "critical")]
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTimelineInterventionCandidateActionV4 {
+    pub plan_action_id: String,
+    pub operation_id: String,
+    pub tool_id: String,
+    pub summary: String,
+    pub risk_level: AgentTimelineInterventionRiskLevel,
+    pub canonical_targets: Vec<String>,
+    pub scope_delta: Vec<String>,
+    pub preview_id: String,
+    pub preview_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTimelineInterventionOptionV4 {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<bool>,
+    pub kind: AgentTimelineInterventionOptionKind,
+    pub tradeoffs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_plan_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_plan_digest: Option<String>,
+    pub actions: Vec<AgentTimelineInterventionCandidateActionV4>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTimelineUserInterventionViewV4 {
+    pub schema_version: String,
+    pub interaction_id: String,
+    pub interaction_revision: String,
+    pub candidate_set_digest: String,
+    pub problem_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+    pub relevant_facts: Vec<String>,
+    pub affected_plan_action_ids: Vec<String>,
+    pub options: Vec<AgentTimelineInterventionOptionV4>,
+    pub allows_freeform: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTimelinePendingUserInterventionV4 {
+    pub interaction_id: String,
+    pub interaction_revision: String,
+    pub target_id: String,
+    pub run_id: String,
+    pub candidate_set_digest: String,
+    pub intervention: AgentTimelineUserInterventionViewV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum AgentTimelinePendingInteraction {
@@ -1043,6 +1142,8 @@ pub enum AgentTimelinePendingInteraction {
     Permission(AgentTimelinePendingPermission),
     #[serde(rename = "plan")]
     Plan(AgentTimelinePendingPlan),
+    #[serde(rename = "userIntervention")]
+    UserIntervention(AgentTimelinePendingUserInterventionV4),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1669,12 +1770,12 @@ fn validate_schema_and_shape(
     schema_version: &str,
     shape_version: &str,
 ) -> Result<(), AgentProjectionValidationError> {
-    if schema_version != AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3 {
+    if schema_version != AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4 {
         return Err(AgentProjectionValidationError::new(
             "unsupported shared conversation projection schema",
         ));
     }
-    if shape_version != AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3 {
+    if shape_version != AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4 {
         return Err(AgentProjectionValidationError::new(
             "unsupported shared conversation projection shape",
         ));
@@ -1914,6 +2015,11 @@ fn validate_native_block_invariants(
                 && block.entry_role == AgentTimelineEntryRole::Interaction
                 && block.provider_phase.is_none()
         }
+        AgentTimelineBlockKind::UserIntervention => {
+            block.narrative_kind == Some(AgentTimelineNarrativeKind::UserIntervention)
+                && block.entry_role == AgentTimelineEntryRole::Interaction
+                && block.provider_phase.is_none()
+        }
         AgentTimelineBlockKind::Review => {
             block.narrative_kind == Some(AgentTimelineNarrativeKind::Review)
                 && block.entry_role == AgentTimelineEntryRole::Interaction
@@ -1930,7 +2036,9 @@ fn validate_native_block_invariants(
         || ((block.decision_request.is_some() || block.interaction.is_some())
             && !matches!(
                 block.kind,
-                AgentTimelineBlockKind::Plan | AgentTimelineBlockKind::Permission
+                AgentTimelineBlockKind::Plan
+                    | AgentTimelineBlockKind::Permission
+                    | AgentTimelineBlockKind::UserIntervention
             ))
     {
         return Err(AgentProjectionValidationError::new(
@@ -2189,6 +2297,111 @@ fn validate_optional_root_projections(
                     )?;
                     validate_identity(&value.run_id, "interactionProjection.pending.runId")?;
                     validate_identity(&value.plan_id, "interactionProjection.pending.planId")?;
+                    validate_optional_block_reference(value.block_id.as_deref(), identities)?;
+                }
+                AgentTimelinePendingInteraction::UserIntervention(value) => {
+                    validate_pending_interaction_identity(
+                        &value.interaction_id,
+                        &value.interaction_revision,
+                        &value.target_id,
+                    )?;
+                    validate_identity(&value.run_id, "interactionProjection.pending.runId")?;
+                    validate_identity(
+                        &value.candidate_set_digest,
+                        "interactionProjection.pending.candidateSetDigest",
+                    )?;
+                    let intervention = &value.intervention;
+                    if intervention.schema_version != "deepcode.session.user-intervention.v1"
+                        || intervention.interaction_id != value.interaction_id
+                        || intervention.interaction_revision != value.interaction_revision
+                        || intervention.candidate_set_digest != value.candidate_set_digest
+                        || !intervention.allows_freeform
+                        || intervention.options.is_empty()
+                    {
+                        return Err(AgentProjectionValidationError::new(
+                            "user intervention projection identity or schema is invalid",
+                        ));
+                    }
+                    validate_identity(
+                        &intervention.problem_summary,
+                        "interactionProjection.pending.intervention.problemSummary",
+                    )?;
+                    validate_identity_array(
+                        &intervention.relevant_facts,
+                        "interactionProjection.pending.intervention.relevantFacts",
+                    )?;
+                    validate_identity_array(
+                        &intervention.affected_plan_action_ids,
+                        "interactionProjection.pending.intervention.affectedPlanActionIds",
+                    )?;
+                    let mut option_ids = HashSet::new();
+                    for option in &intervention.options {
+                        validate_identity(
+                            &option.id,
+                            "interactionProjection.pending.intervention.options.id",
+                        )?;
+                        validate_identity(
+                            &option.label,
+                            "interactionProjection.pending.intervention.options.label",
+                        )?;
+                        if !option_ids.insert(option.id.as_str()) {
+                            return Err(AgentProjectionValidationError::new(format!(
+                                "user intervention repeats option {}",
+                                option.id
+                            )));
+                        }
+                        match option.kind {
+                            AgentTimelineInterventionOptionKind::Executable
+                                if option.actions.is_empty()
+                                    || option.candidate_plan_revision.is_none()
+                                    || option.candidate_plan_digest.is_none() =>
+                            {
+                                return Err(AgentProjectionValidationError::new(
+                                    "executable intervention option lacks a complete candidate Plan",
+                                ));
+                            }
+                            AgentTimelineInterventionOptionKind::GuidanceOnly
+                                if !option.actions.is_empty()
+                                    || option.candidate_plan_revision.is_some()
+                                    || option.candidate_plan_digest.is_some() =>
+                            {
+                                return Err(AgentProjectionValidationError::new(
+                                    "guidance-only intervention option carries executable authority",
+                                ));
+                            }
+                            _ => {}
+                        }
+                        for action in &option.actions {
+                            validate_identity(
+                                &action.plan_action_id,
+                                "interactionProjection.pending.intervention.options.actions.planActionId",
+                            )?;
+                            validate_identity(
+                                &action.operation_id,
+                                "interactionProjection.pending.intervention.options.actions.operationId",
+                            )?;
+                            validate_identity(
+                                &action.tool_id,
+                                "interactionProjection.pending.intervention.options.actions.toolId",
+                            )?;
+                            validate_identity(
+                                &action.preview_id,
+                                "interactionProjection.pending.intervention.options.actions.previewId",
+                            )?;
+                            validate_identity(
+                                &action.preview_digest,
+                                "interactionProjection.pending.intervention.options.actions.previewDigest",
+                            )?;
+                            validate_identity_array(
+                                &action.canonical_targets,
+                                "interactionProjection.pending.intervention.options.actions.canonicalTargets",
+                            )?;
+                            validate_identity_array(
+                                &action.scope_delta,
+                                "interactionProjection.pending.intervention.options.actions.scopeDelta",
+                            )?;
+                        }
+                    }
                     validate_optional_block_reference(value.block_id.as_deref(), identities)?;
                 }
             }

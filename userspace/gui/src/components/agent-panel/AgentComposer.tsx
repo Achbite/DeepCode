@@ -57,6 +57,8 @@ interface AgentComposerProps {
   sendBlockedTitle?: string;
   pendingDecision?: AgentComposerPendingDecision | null;
   onDecisionSubmit?: (guidance?: string, action?: 'accept' | 'revise') => void | Promise<void>;
+  onInterventionSelect?: (optionId: string, guidance?: string) => void | Promise<void>;
+  onInterventionRevise?: (guidance: string) => void | Promise<void>;
   onDecisionReject?: () => void | Promise<void>;
 }
 
@@ -136,6 +138,12 @@ function composerDecisionText(decision: AgentComposerPendingDecision, language: 
       title: t(language, 'agent.composer.decision.planQuestion'),
     };
   }
+  if (decision.kind === 'userIntervention') {
+    return {
+      title: decision.title || (language === 'zh-CN' ? '需要用户介入' : 'User intervention required'),
+      summary: decision.intervention.problemSummary,
+    };
+  }
   return {
     title: decision.title || t(language, 'agent.composer.decision.permission'),
     summary: decision.summary,
@@ -144,11 +152,17 @@ function composerDecisionText(decision: AgentComposerPendingDecision, language: 
 
 function decisionPlaceholder(decision: AgentComposerPendingDecision, language: UiLanguage): string {
   if (decision.kind === 'plan') return t(language, 'agent.composer.decision.planPlaceholder');
+  if (decision.kind === 'userIntervention') {
+    return language === 'zh-CN'
+      ? '可补充点评；申请修订时点评内容为必填...'
+      : 'Optional comment; guidance is required when requesting revision...';
+  }
   return t(language, 'agent.composer.decision.permissionPlaceholder');
 }
 
 function decisionSubmitLabel(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
   if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
+  if (decision.kind === 'userIntervention') return t(language, 'agent.composer.decision.submitChoice');
   return value.trim()
     ? t(language, 'agent.plan.submitReview')
     : t(language, 'agent.plan.accept');
@@ -156,6 +170,7 @@ function decisionSubmitLabel(decision: AgentComposerPendingDecision, value: stri
 
 function decisionSubmitTitle(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
   if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
+  if (decision.kind === 'userIntervention') return t(language, 'agent.composer.decision.submitChoiceTitle');
   return value.trim()
     ? t(language, 'agent.composer.decision.submitGuidanceTitle')
     : t(language, 'agent.composer.decision.acceptTitle');
@@ -163,6 +178,7 @@ function decisionSubmitTitle(decision: AgentComposerPendingDecision, value: stri
 
 function decisionPrimaryOptionLabel(decision: AgentComposerPendingDecision, language: UiLanguage): string {
   if (decision.kind === 'plan') return t(language, 'agent.composer.decision.planOption');
+  if (decision.kind === 'userIntervention') return t(language, 'agent.composer.decision.submitChoice');
   return decisionSubmitLabel(decision, '', language);
 }
 
@@ -204,6 +220,9 @@ function decisionCopyText(decision: AgentComposerPendingDecision, language: UiLa
 function decisionInstanceKey(decision: AgentComposerPendingDecision | null | undefined): string {
   if (!decision) return 'none';
   if (decision.kind === 'plan') return `${decision.kind}:${decision.runId}:${decision.planId}`;
+  if (decision.kind === 'userIntervention') {
+    return `${decision.kind}:${decision.interactionId}:${decision.interactionRevision}:${decision.candidateSetDigest}`;
+  }
   return `${decision.kind}:${decision.requestId}`;
 }
 
@@ -239,6 +258,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   sendBlockedTitle,
   pendingDecision,
   onDecisionSubmit,
+  onInterventionSelect,
+  onInterventionRevise,
   onDecisionReject,
 }) => {
   const [value, setValue] = useState('');
@@ -248,6 +269,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [changesOpen, setChangesOpen] = useState(true);
   const [decisionCopyStatus, setDecisionCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [selectedDecisionOptionId, setSelectedDecisionOptionId] = useState<string | null>(null);
   const [submissionPending, setSubmissionPending] = useState(false);
   const [pendingSubmissionCancellable, setPendingSubmissionCancellable] = useState(false);
   const draftRevisionRef = useRef(0);
@@ -277,6 +299,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   useEffect(() => {
     setDecisionCopyStatus('idle');
     focusedOptionClickConfirmRef.current = null;
+    if (pendingDecision?.kind === 'userIntervention') {
+      const defaultOption = pendingDecision.intervention.options.find((option) => option.recommended)
+        ?? pendingDecision.intervention.options[0];
+      setSelectedDecisionOptionId(defaultOption?.id ?? null);
+    } else {
+      setSelectedDecisionOptionId(null);
+    }
   }, [decisionKey]);
 
   useEffect(() => {
@@ -299,6 +328,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (submissionPending || pendingSubmissionRef.current) return;
     if (pendingDecision) {
       if (pendingDecision.resolving) return;
+      if (pendingDecision.kind === 'userIntervention') {
+        if (!selectedDecisionOptionId) return;
+        setValue('');
+        void onInterventionSelect?.(selectedDecisionOptionId, nextValue.trim() || undefined);
+        return;
+      }
       const normalized = normalizeDecisionInput(pendingDecision, nextValue);
       setValue('');
       if (normalized.action === 'reject') {
@@ -424,6 +459,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         ? true
         : pendingDecision
           ? decisionResolving
+            || (pendingDecision.kind === 'userIntervention' && !selectedDecisionOptionId)
           : submissionPending || sendBlocked || !value.trim();
   const sendLabel = decisionResolving
     ? t(language, 'agent.composer.decision.resolving')
@@ -454,12 +490,24 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   const activatePrimaryDecisionOption = (event: React.MouseEvent<HTMLButtonElement>) => {
     if (!pendingDecision || pendingDecision.resolving) return;
+    if (pendingDecision.kind === 'userIntervention') return;
     if (focusedOptionClickConfirmRef.current === PRIMARY_DECISION_OPTION_ID) {
       send();
       return;
     }
     event.currentTarget.focus();
     focusedOptionClickConfirmRef.current = null;
+  };
+
+  const requestInterventionRevision = () => {
+    if (pendingDecision?.kind !== 'userIntervention' || pendingDecision.resolving) return;
+    const guidance = value.trim();
+    if (!guidance) {
+      textareaRef.current?.focus();
+      return;
+    }
+    setValue('');
+    void onInterventionRevise?.(guidance);
   };
 
   const copyDecision = async () => {
@@ -509,6 +557,28 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             </button>
           </div>
           {decisionText.summary && <div className="agent-composer-decision__summary">{decisionText.summary}</div>}
+          {pendingDecision?.kind === 'userIntervention' && (
+            <div className="agent-composer-decision__summary">
+              {pendingDecision.intervention.recommendation && (
+                <div>
+                  <strong>{language === 'zh-CN' ? '推荐：' : 'Recommendation: '}</strong>
+                  {pendingDecision.intervention.recommendation}
+                </div>
+              )}
+              {pendingDecision.intervention.relevantFacts.length > 0 && (
+                <div>
+                  <strong>{language === 'zh-CN' ? '相关事实：' : 'Relevant facts: '}</strong>
+                  {pendingDecision.intervention.relevantFacts.join('；')}
+                </div>
+              )}
+              {pendingDecision.intervention.affectedPlanActionIds.length > 0 && (
+                <div>
+                  <strong>{language === 'zh-CN' ? '受影响动作：' : 'Affected actions: '}</strong>
+                  {pendingDecision.intervention.affectedPlanActionIds.join(', ')}
+                </div>
+              )}
+            </div>
+          )}
           {decisionResolving ? (
             <div className="agent-composer-decision__resolving">
               {t(language, 'agent.composer.decision.resolvingDetail')}
@@ -518,26 +588,74 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               <div
                 className="agent-composer-decision__options"
               >
-                <button
-                  className="agent-composer-decision__option agent-composer-decision__option--selected"
-                  type="button"
-                  disabled={decisionResolving}
-                  title={decisionSubmitTitle(pendingDecision!, '', language)}
-                  ref={defaultDecisionOptionRef}
-                  onMouseDown={(event) => armFocusedOptionClick(event, PRIMARY_DECISION_OPTION_ID)}
-                  onClick={activatePrimaryDecisionOption}
-                >
-                  <span className="agent-composer-decision__number">1</span>
-                  <span className="agent-composer-decision__option-body">
-                    <span className="agent-composer-decision__label">
-                      {decisionPrimaryOptionLabel(pendingDecision!, language)}
-                    </span>
-                  </span>
-                </button>
+                {pendingDecision?.kind === 'userIntervention'
+                  ? pendingDecision.intervention.options.map((option, index) => {
+                    const selected = selectedDecisionOptionId === option.id;
+                    const actionFacts = option.actions.flatMap((action) => [
+                      `${action.toolId} · ${action.riskLevel}`,
+                      ...action.canonicalTargets,
+                      ...action.scopeDelta,
+                    ]);
+                    const detail = [option.description, ...option.tradeoffs, ...actionFacts]
+                      .filter((value): value is string => Boolean(value?.trim()))
+                      .join(' · ');
+                    return (
+                      <button
+                        key={option.id}
+                        className={`agent-composer-decision__option${selected ? ' agent-composer-decision__option--selected' : ''}`}
+                        type="button"
+                        disabled={decisionResolving}
+                        ref={selected ? defaultDecisionOptionRef : undefined}
+                        onClick={() => setSelectedDecisionOptionId(option.id)}
+                      >
+                        <span className="agent-composer-decision__number">{index + 1}</span>
+                        <span className="agent-composer-decision__option-body">
+                          <span className="agent-composer-decision__label">
+                            {option.label}
+                            {option.recommended && (
+                              <span className="agent-composer-decision__recommended">
+                                {t(language, 'agent.composer.decision.recommended')}
+                              </span>
+                            )}
+                          </span>
+                          {detail && <span className="agent-composer-decision__description">{detail}</span>}
+                        </span>
+                      </button>
+                    );
+                  })
+                  : (
+                    <button
+                      className="agent-composer-decision__option agent-composer-decision__option--selected"
+                      type="button"
+                      disabled={decisionResolving}
+                      title={decisionSubmitTitle(pendingDecision!, '', language)}
+                      ref={defaultDecisionOptionRef}
+                      onMouseDown={(event) => armFocusedOptionClick(event, PRIMARY_DECISION_OPTION_ID)}
+                      onClick={activatePrimaryDecisionOption}
+                    >
+                      <span className="agent-composer-decision__number">1</span>
+                      <span className="agent-composer-decision__option-body">
+                        <span className="agent-composer-decision__label">
+                          {decisionPrimaryOptionLabel(pendingDecision!, language)}
+                        </span>
+                      </span>
+                    </button>
+                  )}
               </div>
               <div className="agent-composer-decision__control-row">
                 {renderDecisionInput()}
                 <div className="agent-composer-decision__actions">
+                  {pendingDecision?.kind === 'userIntervention' && (
+                    <button
+                      type="button"
+                      className="agent-composer-decision__reject"
+                      onClick={requestInterventionRevision}
+                      disabled={decisionResolving || !value.trim()}
+                      title={language === 'zh-CN' ? '根据点评重新取证并生成集中介入方案' : 'Research again and replace this intervention from the guidance'}
+                    >
+                      {language === 'zh-CN' ? '申请修订' : 'Request revision'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="agent-composer-decision__reject"
@@ -545,7 +663,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                     disabled={Boolean(pendingDecision?.resolving)}
                     title={t(language, 'agent.composer.decision.rejectTitle')}
                   >
-                    {t(language, 'agent.composer.decision.ignore')}
+                    {pendingDecision?.kind === 'userIntervention'
+                      ? (language === 'zh-CN' ? '否决并结束 Run' : 'Reject and end Run')
+                      : t(language, 'agent.composer.decision.ignore')}
                     <span className="agent-composer-decision__shortcut">
                       {t(language, 'agent.composer.decision.escape')}
                     </span>

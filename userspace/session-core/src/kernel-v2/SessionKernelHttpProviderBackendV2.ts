@@ -23,12 +23,15 @@ import type {
   SessionKernelProviderOrderedItemV2,
   SessionProviderPlanActionDraftV2,
   SessionProviderPlanDraftV2,
+  SessionProviderInterventionDraftV1,
 } from './SessionKernelProviderAdapterV2.js';
 import {
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
   SessionPlanActionCompletionOutcomeV2,
@@ -107,7 +110,8 @@ implements SessionKernelProviderBackendV2 {
     });
     let semanticMessages = sessionProviderSemanticMessagesV2(
       input,
-      cacheLane
+      cacheLane,
+      predecessor
     );
     let request = sessionProviderRequestV1(
       input,
@@ -143,7 +147,8 @@ implements SessionKernelProviderBackendV2 {
       });
       semanticMessages = sessionProviderSemanticMessagesV2(
         input,
-        cacheLane
+        cacheLane,
+        predecessor
       );
       request = sessionProviderRequestV1(
         input,
@@ -213,9 +218,20 @@ function providerContinuationParentIdV2(
       previous,
       expectedProfileId
     )
-    || previous.outputKind !== 'toolIntent'
     || previous.providerResult.providerProfileId
       !== input.providerProfile.providerProfileId
+  ) {
+    return undefined;
+  }
+  if (
+    previous.outputKind === 'plan'
+    || previous.outputKind === 'planActionComplete'
+    || previous.outputKind === 'intervention'
+  ) {
+    return previous.providerTurnId;
+  }
+  if (
+    previous.outputKind !== 'toolIntent'
     || previous.toolCallReceipt.providerTurnId
       !== previous.providerTurnId
     || previous.toolCallReceipt.callCount <= 0
@@ -328,7 +344,7 @@ export function decodeSessionKernelLlmStreamResultV2(
       );
     }
     const planProposalCalls = streamCalls.filter(
-      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
     );
     if (planProposalCalls.length > 0) {
       if (
@@ -369,9 +385,9 @@ export function decodeSessionKernelLlmStreamResultV2(
         kind: 'plan',
         plan,
         planProposal: {
-          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
           callId: requiredIdentity(control.callId, 'callId'),
-          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
           argumentsDigest: sha256Hash(canonicalJson(
             decodeProviderNativeArguments(control.arguments)
           )),
@@ -433,6 +449,67 @@ export function decodeSessionKernelLlmStreamResultV2(
           schemaVersion: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
           callId: requiredIdentity(control.callId, 'callId'),
           toolName: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+          argumentsDigest: sha256Hash(canonicalJson(decodedArguments)),
+        },
+        items: textItems.map((item) => ({
+          kind: 'text',
+          phase: 'commentary',
+          text: item.text,
+        })),
+        completion: response.completion,
+        providerResult,
+        responseDigest: response.completion.responseDigest,
+      };
+    }
+    const interventionCalls = streamCalls.filter(
+      (item) =>
+        item.name === SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME
+    );
+    if (interventionCalls.length > 0) {
+      if (
+        input.target.kind !== 'interventionResearch'
+        || interventionCalls.length !== 1
+        || streamCalls.length !== 1
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_intervention_proposal_conflict',
+          'A Session intervention proposal must be the only control or Kernel tool in one intervention research response.'
+        );
+      }
+      const control = interventionCalls[0]!;
+      const controlIndex = response.items.indexOf(control);
+      const textItems = response.items.filter(
+        (item): item is Extract<
+          SessionKernelLlmStreamResultV2['items'][number],
+          { kind: 'text' }
+        > => item.kind === 'text'
+      );
+      if (
+        response.items.slice(controlIndex + 1).some(
+          (item) => item.kind === 'text'
+        )
+        || textItems.some((item) => item.phase === 'final_answer')
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_intervention_proposal_phase_conflict',
+          'A Session intervention proposal may follow commentary but cannot share or precede final-answer text.'
+        );
+      }
+      const decodedArguments = decodeProviderNativeArguments(
+        control.arguments
+      );
+      const draft = normalizeProviderInterventionToolIdsV1(
+        decodeProviderInterventionArgumentsV1(decodedArguments),
+        encodedNames,
+        new Set(exposed.map((tool) => tool.toolId))
+      );
+      return {
+        kind: 'intervention',
+        draft,
+        control: {
+          schemaVersion: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+          callId: requiredIdentity(control.callId, 'callId'),
+          toolName: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
           argumentsDigest: sha256Hash(canonicalJson(decodedArguments)),
         },
         items: textItems.map((item) => ({
@@ -558,6 +635,28 @@ function normalizeProviderPlanToolIdsV2(
   };
 }
 
+function normalizeProviderInterventionToolIdsV1(
+  draft: SessionProviderInterventionDraftV1,
+  encodedNames: ReadonlyMap<string, string>,
+  admittedToolIds: ReadonlySet<string>
+): SessionProviderInterventionDraftV1 {
+  return {
+    ...draft,
+    options: draft.options.map((option) => ({
+      ...option,
+      ...(option.candidatePlan
+        ? {
+            candidatePlan: normalizeProviderPlanToolIdsV2(
+              option.candidatePlan,
+              encodedNames,
+              admittedToolIds
+            ),
+          }
+        : {}),
+    })),
+  };
+}
+
 /**
  * Rehydrates one daemon-written completed terminal into the exact live stream
  * result shape, then routes it through the shared sealed-response decoder.
@@ -672,7 +771,7 @@ export function decodeProviderPlanProposalArgumentsV2(
   const record = objectRecord(decoded);
   if (!record) throw invalidPlanningResult();
   exactKeys(record, ['schemaVersion', 'plan']);
-  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA) {
+  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA) {
     throw invalidPlanningResult();
   }
   return decodeProviderPlanDraft(record.plan);
@@ -701,6 +800,104 @@ export function decodeProviderPlanActionCompleteArgumentsV2(
   return record.outcome;
 }
 
+export function decodeProviderInterventionArgumentsV1(
+  value: unknown
+): SessionProviderInterventionDraftV1 {
+  const decoded = decodeRawToolArgumentsV2(value);
+  const record = objectRecord(decoded);
+  if (!record) throw invalidInterventionResult();
+  exactKeys(record, ['schemaVersion', 'intervention']);
+  if (
+    record.schemaVersion !== SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA
+  ) {
+    throw invalidInterventionResult();
+  }
+  const intervention = objectRecord(record.intervention);
+  if (!intervention) throw invalidInterventionResult();
+  exactKeys(
+    intervention,
+    ['problemSummary', 'relevantFactRefs', 'affectedPlanActionIds', 'options'],
+    ['recommendation']
+  );
+  if (
+    !Array.isArray(intervention.relevantFactRefs)
+    || !Array.isArray(intervention.affectedPlanActionIds)
+    || !Array.isArray(intervention.options)
+    || intervention.relevantFactRefs.length > 512
+    || intervention.affectedPlanActionIds.length > 256
+    || intervention.options.length < 1
+    || intervention.options.length > 16
+  ) {
+    throw invalidInterventionResult();
+  }
+  return {
+    problemSummary: requiredText(
+      intervention.problemSummary,
+      'problemSummary'
+    ),
+    ...(intervention.recommendation !== undefined
+      ? {
+          recommendation: requiredText(
+            intervention.recommendation,
+            'recommendation'
+          ),
+        }
+      : {}),
+    relevantFactRefs: intervention.relevantFactRefs.map((factRef) =>
+      requiredIdentity(factRef, 'relevantFactRef')
+    ),
+    affectedPlanActionIds: intervention.affectedPlanActionIds.map((actionId) =>
+      requiredIdentity(actionId, 'affectedPlanActionId')
+    ),
+    options: intervention.options.map((value) => {
+      const option = objectRecord(value);
+      if (!option) throw invalidInterventionResult();
+      exactKeys(
+        option,
+        [
+          'optionId',
+          'kind',
+          'title',
+          'description',
+          'tradeoffs',
+          'recommended',
+        ],
+        ['candidatePlan']
+      );
+      if (
+        (option.kind !== 'executable' && option.kind !== 'guidanceOnly')
+        || !Array.isArray(option.tradeoffs)
+        || option.tradeoffs.length < 1
+        || option.tradeoffs.length > 32
+        || typeof option.recommended !== 'boolean'
+        || (option.kind === 'executable') !== (option.candidatePlan !== undefined)
+      ) {
+        throw invalidInterventionResult();
+      }
+      return {
+        optionId: requiredIdentity(option.optionId, 'optionId'),
+        kind: option.kind,
+        title: requiredText(option.title, 'option.title'),
+        description: requiredText(option.description, 'option.description'),
+        tradeoffs: option.tradeoffs.map((tradeoff) =>
+          requiredText(tradeoff, 'option.tradeoff')
+        ),
+        recommended: option.recommended,
+        ...(option.candidatePlan !== undefined
+          ? { candidatePlan: decodeProviderPlanDraft(option.candidatePlan) }
+          : {}),
+      };
+    }),
+  };
+}
+
+function invalidInterventionResult(): SessionKernelProviderTransportError {
+  return new SessionKernelProviderTransportError(
+    'session_kernel_provider_intervention_invalid',
+    'Intervention proposal arguments are not one exact deepcode.session.intervention-proposal.v1 record.'
+  );
+}
+
 function invalidPlanActionComplete(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
     'session_kernel_provider_plan_action_complete_invalid',
@@ -715,7 +912,7 @@ function decodeProviderPlanDraft(
   if (!record) throw invalidPlanningResult();
   exactKeys(
     record,
-    ['title', 'objective', 'narrative', 'actions']
+    ['title', 'objective', 'narrative', 'evidence', 'actions']
   );
   if (!Array.isArray(record.actions)) {
     throw invalidPlanningResult();
@@ -727,7 +924,72 @@ function decodeProviderPlanDraft(
     title: requiredText(record.title, 'title'),
     objective: requiredText(record.objective, 'objective'),
     narrative: requiredText(record.narrative, 'narrative'),
+    evidence: decodePlanEvidenceV4(record.evidence),
     actions: record.actions.map(decodePlanAction),
+  };
+}
+
+function decodePlanEvidenceV4(
+  value: unknown
+): SessionProviderPlanDraftV2['evidence'] {
+  const record = objectRecord(value);
+  if (!record) throw invalidPlanningResult();
+  exactKeys(record, [
+    'kernelFactRefs',
+    'readResources',
+    'blockingUnknowns',
+    'nonBlockingUnknowns',
+    'coverage',
+  ]);
+  if (
+    !Array.isArray(record.kernelFactRefs)
+    || !Array.isArray(record.readResources)
+    || !Array.isArray(record.blockingUnknowns)
+    || !Array.isArray(record.nonBlockingUnknowns)
+    || record.kernelFactRefs.length > 512
+    || record.readResources.length > 512
+    || record.blockingUnknowns.length > 128
+    || record.nonBlockingUnknowns.length > 128
+  ) {
+    throw invalidPlanningResult();
+  }
+  const decodeUnknown = (unknown: unknown) => {
+    const item = objectRecord(unknown);
+    if (!item) throw invalidPlanningResult();
+    exactKeys(item, ['unknownId', 'question', 'impact']);
+    return {
+      unknownId: requiredIdentity(item.unknownId, 'unknownId'),
+      question: requiredText(item.question, 'question'),
+      impact: requiredText(item.impact, 'impact'),
+    };
+  };
+  return {
+    kernelFactRefs: record.kernelFactRefs.map((factRef) =>
+      requiredIdentity(factRef, 'kernelFactRef')
+    ),
+    readResources: record.readResources.map((resource) => {
+      const item = objectRecord(resource);
+      if (!item) throw invalidPlanningResult();
+      exactKeys(item, ['resourceRef', 'digest', 'summary', 'factRefs']);
+      if (
+        !Array.isArray(item.factRefs)
+        || item.factRefs.length < 1
+        || item.factRefs.length > 256
+      ) {
+        throw invalidPlanningResult();
+      }
+      return {
+        resourceRef: requiredIdentity(item.resourceRef, 'resourceRef'),
+        digest: requiredIdentity(item.digest, 'resourceDigest'),
+        summary: requiredText(item.summary, 'resourceSummary'),
+        factRefs: item.factRefs.map((factRef) =>
+          requiredIdentity(factRef, 'resourceFactRef')
+        ),
+      };
+    }),
+    blockingUnknowns: record.blockingUnknowns.map(decodeUnknown),
+    nonBlockingUnknowns: record.nonBlockingUnknowns.map(decodeUnknown),
+    coverage: requiredText(record.coverage, 'coverage'),
   };
 }
 
@@ -952,6 +1214,6 @@ function requiredText(value: unknown, _field: string): string {
 function invalidPlanningResult(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
     'session_kernel_provider_plan_proposal_invalid',
-    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v3 record.'
+    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v4 record.'
   );
 }

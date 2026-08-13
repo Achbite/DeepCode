@@ -103,6 +103,23 @@ function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRe
       callerRequestId: request.callerRequestId,
     };
   }
+  if (request.decisionKind === 'userIntervention') {
+    return {
+      op: 'resolveDecision',
+      decisionKind: request.decisionKind,
+      decision: request.decision,
+      optionId: request.optionId,
+      guidance: request.guidance,
+      runId: request.runId,
+      targetId: request.targetId,
+      interactionId: request.interactionId,
+      interactionRevision: request.interactionRevision,
+      candidateSetDigest: request.candidateSetDigest,
+      expectedProjectionCursor: request.expectedProjectionCursor,
+      conversationTarget: request.conversationTarget,
+      callerRequestId: request.callerRequestId,
+    };
+  }
   return {
     op: 'resolveDecision',
     decisionKind: request.decisionKind,

@@ -32,9 +32,11 @@ import {
   type SessionKernelCheckpointV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
+import { projectSessionProviderFactsV2 } from './providerFactProjection.js';
 import type {
   SessionActiveWaitV2,
   SessionFinalAnswerStateV3,
+  SessionInterventionResearchV4,
   SessionTerminalAnswerCandidateV1,
   SessionKernelFactBarrierV2,
   SessionKernelPersistenceRecordRefV3,
@@ -56,6 +58,8 @@ import type {
   SessionToolContextSnapshotRecordV3,
   SessionRunCancellationV2,
   SessionUserInputRecordV2,
+  SessionUserInterventionDecisionV4,
+  SessionUserInterventionV4,
   SessionWorkAuthorityV3,
 } from './types.js';
 import type {
@@ -99,9 +103,9 @@ import {
 } from './SessionKernelHttpProjectionV2.js';
 
 export const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA =
-  'deepcode.session.kernel-persistence.v3' as const;
+  'deepcode.session.kernel-persistence.v4' as const;
 export const SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA =
-  'deepcode.session.kernel-persistence-record.v3' as const;
+  'deepcode.session.kernel-persistence-record.v4' as const;
 export const SESSION_KERNEL_PERSISTENCE_APPEND_REQUEST_V2_SCHEMA =
   'deepcode.session.kernel-persistence-append-request.v2' as const;
 export const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA =
@@ -111,13 +115,13 @@ export const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA =
 export const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA =
   'deepcode.session.kernel-operation-result.v2' as const;
 export const SESSION_KERNEL_REVIEW_RECORD_V3_SCHEMA =
-  'deepcode.session.review-record.v3' as const;
+  'deepcode.session.review-record.v4' as const;
 export const SESSION_KERNEL_PLAN_ACTION_SETTLEMENT_RECORD_V3_SCHEMA =
-  'deepcode.session.plan-action-settlement-record.v3' as const;
+  'deepcode.session.plan-action-settlement-record.v4' as const;
 export const SESSION_KERNEL_PUBLIC_REQUEST_SETTLEMENT_V3_SCHEMA =
-  'deepcode.session.public-request-settlement.v3' as const;
+  'deepcode.session.public-request-settlement.v4' as const;
 export const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA =
-  'deepcode.session.projection-record.v3' as const;
+  'deepcode.session.projection-record.v4' as const;
 
 export type SessionKernelPersistenceRecordKindV3 =
   | 'storeHeader'
@@ -209,7 +213,6 @@ interface SessionKernelCompactProviderReservationV3 {
   purpose: 'primary' | 'continuation' | 'finalAnswer';
   target: SessionProviderTurnTargetV2;
   planRevision?: string;
-  remainingToolCallBudget?: number;
   correction?: import('./types.js').SessionToolCorrectionV2;
   controlEpoch: number;
   contextRef: import('@deepcode/protocol').ToolContextRefV2;
@@ -227,6 +230,7 @@ interface SessionKernelCompactProviderQueueV3 {
   terminalRef: SessionKernelPersistenceRecordRefV3;
   target: SessionProviderTurnTargetV2;
   calls: SessionProviderToolCallQueueItemV2[];
+  mutationDisposition: SessionProviderToolCallQueueV2['mutationDisposition'];
   status: SessionProviderToolCallQueueV2['status'];
   outcomeRecorded: boolean;
   settledAt?: string;
@@ -284,6 +288,9 @@ interface SessionKernelCompactCheckpointV3 {
   active: {
     pendingEpochInputRef?: SessionKernelPersistenceRecordRefV3;
     activeWait?: SessionActiveWaitV2;
+    interventionResearch?: SessionInterventionResearchV4;
+    userIntervention?: SessionUserInterventionV4;
+    userInterventionDecision?: SessionUserInterventionDecisionV4;
     pendingGuidance: string[];
     providerReservation?: SessionKernelCompactProviderReservationV3;
     providerQueue?: SessionKernelCompactProviderQueueV3;
@@ -1685,6 +1692,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'authorization.decided',
   'review.revised',
   'planAction.completed',
+  'userIntervention.changed',
   'run.cancelled',
   'wait.changed',
   'diagnostic',
@@ -2808,6 +2816,9 @@ function decodeCompactCheckpointV3(
     [
       'pendingEpochInputRef',
       'activeWait',
+      'interventionResearch',
+      'userIntervention',
+      'userInterventionDecision',
       'providerReservation',
       'providerQueue',
       'runCancellation',
@@ -2982,6 +2993,27 @@ function decodeCompactCheckpointV3(
       ...(active.activeWait === undefined
         ? {}
         : { activeWait: cloneJson(active.activeWait) as SessionActiveWaitV2 }),
+      ...(active.interventionResearch === undefined
+        ? {}
+        : {
+            interventionResearch: cloneJson(
+              active.interventionResearch
+            ) as SessionInterventionResearchV4,
+          }),
+      ...(active.userIntervention === undefined
+        ? {}
+        : {
+            userIntervention: cloneJson(
+              active.userIntervention
+            ) as SessionUserInterventionV4,
+          }),
+      ...(active.userInterventionDecision === undefined
+        ? {}
+        : {
+            userInterventionDecision: cloneJson(
+              active.userInterventionDecision
+            ) as SessionUserInterventionDecisionV4,
+          }),
       pendingGuidance: active.pendingGuidance.map((guidance) =>
         requiredText(guidance, 'pendingGuidance')
       ),
@@ -3210,7 +3242,6 @@ function decodeCompactProviderReservationV3(
       'status',
     ],
     [
-      'remainingToolCallBudget',
       'planRevision',
       'correction',
       'cancellationReason',
@@ -3232,22 +3263,6 @@ function decodeCompactProviderReservationV3(
   if ((record.purpose === 'finalAnswer') !== (target.kind === 'finalAnswer')) {
     throw new UnsupportedHistorySchemaError(
       'session_kernel_provider_reservation_invalid'
-    );
-  }
-  const remainingToolCallBudget =
-    record.remainingToolCallBudget === undefined
-      ? undefined
-      : positiveSafeIntegerV3(
-          record.remainingToolCallBudget,
-          'remainingToolCallBudget'
-        );
-  if (
-    (target.kind === 'planAction')
-      !== (remainingToolCallBudget !== undefined)
-    || (remainingToolCallBudget ?? 0) > 256
-  ) {
-    throw new UnsupportedHistorySchemaError(
-      'session_kernel_provider_reservation_budget_invalid'
     );
   }
   const allowedStatuses: readonly SessionProviderTurnRecordV2['status'][] = [
@@ -3296,9 +3311,6 @@ function decodeCompactProviderReservationV3(
             'planRevision'
           ),
         }),
-    ...(remainingToolCallBudget === undefined
-      ? {}
-      : { remainingToolCallBudget }),
     ...(record.correction === undefined
       ? {}
       : {
@@ -3358,6 +3370,19 @@ function decodeProviderTurnTargetV3(
         planActionId: requiredIdentity(
           tagged.planActionId,
           'target.planActionId'
+        ),
+      };
+    case 'interventionResearch':
+      exactObject(
+        tagged,
+        ['kind', 'researchId'],
+        'session_kernel_provider_target_invalid'
+      );
+      return {
+        kind: 'interventionResearch',
+        researchId: requiredIdentity(
+          tagged.researchId,
+          'target.researchId'
         ),
       };
     case 'contextRead':
@@ -3493,6 +3518,7 @@ function decodeCompactProviderQueueV3(
       'terminalRef',
       'target',
       'calls',
+      'mutationDisposition',
       'status',
       'outcomeRecorded',
     ],
@@ -3500,7 +3526,15 @@ function decodeCompactProviderQueueV3(
     'session_kernel_provider_queue_invalid'
   );
   if (!Array.isArray(record.calls)
-    || typeof record.outcomeRecorded !== 'boolean') {
+    || typeof record.outcomeRecorded !== 'boolean'
+    || ![
+      'notRequired',
+      'classifying',
+      'planned',
+      'initialPlanDiscovery',
+      'userIntervention',
+    ].includes(String(record.mutationDisposition))
+    || !['active', 'completed', 'aborted'].includes(String(record.status))) {
     throw new UnsupportedHistorySchemaError(
       'session_kernel_provider_queue_invalid'
     );
@@ -3513,6 +3547,8 @@ function decodeCompactProviderQueueV3(
     terminalRef: decodeRecordRefV3(record.terminalRef),
     target: cloneJson(record.target) as SessionProviderTurnTargetV2,
     calls: cloneJson(record.calls) as SessionProviderToolCallQueueItemV2[],
+    mutationDisposition: record.mutationDisposition as
+      SessionProviderToolCallQueueV2['mutationDisposition'],
     status: record.status as SessionProviderToolCallQueueV2['status'],
     outcomeRecorded: record.outcomeRecorded,
     ...(record.settledAt === undefined
@@ -3649,7 +3685,13 @@ function decodeSessionWorkAuthorityV3(
   } else if (tagged.kind === 'contextRead') {
     const record = exactObject(
       value,
-      ['kind', 'operationIds', 'digest'],
+      [
+        'kind',
+        'batchSequence',
+        'predecessorDigest',
+        'operationIds',
+        'digest',
+      ],
       'session_kernel_work_authority_invalid'
     );
     if (!Array.isArray(record.operationIds)) {
@@ -3659,6 +3701,16 @@ function decodeSessionWorkAuthorityV3(
     }
     authority = {
       kind: 'contextRead',
+      batchSequence: positiveSafeIntegerV3(
+        record.batchSequence,
+        'workAuthority.batchSequence'
+      ),
+      predecessorDigest: record.predecessorDigest === null
+        ? null
+        : requiredDigest(
+            record.predecessorDigest,
+            'workAuthority.predecessorDigest'
+          ),
       operationIds: record.operationIds.map((operationId) =>
         requiredIdentity(operationId, 'workAuthority.operationId')
       ),
@@ -4299,6 +4351,19 @@ function compactCheckpointFromStateV3(input: {
       ...(state.activeWait
         ? { activeWait: cloneJson(state.activeWait) }
         : {}),
+      ...(state.interventionResearch
+        ? { interventionResearch: cloneJson(state.interventionResearch) }
+        : {}),
+      ...(state.userIntervention
+        ? { userIntervention: cloneJson(state.userIntervention) }
+        : {}),
+      ...(state.userInterventionDecision
+        ? {
+            userInterventionDecision: cloneJson(
+              state.userInterventionDecision
+            ),
+          }
+        : {}),
       pendingGuidance: cloneJson(state.pendingGuidance),
       ...(providerReservation ? { providerReservation } : {}),
       ...(providerQueue ? { providerQueue } : {}),
@@ -4376,11 +4441,6 @@ function compactProviderReservationV3(
     ...(turn.planRevision === undefined
       ? {}
       : { planRevision: turn.planRevision }),
-    ...(turn.remainingToolCallBudget === undefined
-      ? {}
-      : {
-          remainingToolCallBudget: turn.remainingToolCallBudget,
-        }),
     ...(turn.correction === undefined
       ? {}
       : { correction: cloneJson(turn.correction) }),
@@ -4417,6 +4477,7 @@ function compactProviderQueueV3(
     terminalRef: cloneJson(terminal.ref),
     target: cloneJson(queue.target),
     calls: cloneJson(queue.calls),
+    mutationDisposition: queue.mutationDisposition,
     status: queue.status,
     outcomeRecorded: queue.outcomeRecorded,
     ...(queue.settledAt ? { settledAt: queue.settledAt } : {}),
@@ -4605,6 +4666,15 @@ function materializeCompactCheckpointV3(input: {
       ).data) as SessionUserInputRecordV2
     : undefined;
   state.activeWait = cloneJson(checkpoint.active.activeWait);
+  state.interventionResearch = cloneJson(
+    checkpoint.active.interventionResearch
+  );
+  state.userIntervention = cloneJson(
+    checkpoint.active.userIntervention
+  );
+  state.userInterventionDecision = cloneJson(
+    checkpoint.active.userInterventionDecision
+  );
   state.pendingGuidance = cloneJson(checkpoint.active.pendingGuidance);
   state.factBarriers = cloneJson(checkpoint.active.factBarriers);
   state.publicRequests = Object.fromEntries(
@@ -4664,7 +4734,7 @@ function materializeCompactCheckpointV3(input: {
     && (
       currentInputHasDurableToolResponse
       || checkpoint.active.providerQueue?.calls.some((call) =>
-        call.intent.authority.kind === 'contextRead'
+        call.intent?.authority.kind === 'read'
       )
     )
   ) {
@@ -5544,6 +5614,9 @@ function providerOutputSummaryV3(
   if (output.kind === 'planActionComplete') {
     return `PlanAction outcome: ${output.outcome}`;
   }
+  if (output.kind === 'intervention') {
+    return output.proposal.problemSummary.slice(0, 8_192);
+  }
   return `${output.plan.title}\n${output.plan.objective}`.slice(0, 8_192);
 }
 
@@ -5691,12 +5764,6 @@ function materializeProviderReservationV3(
     ...(reservation.planRevision === undefined
       ? {}
       : { planRevision: reservation.planRevision }),
-    ...(reservation.remainingToolCallBudget === undefined
-      ? {}
-      : {
-          remainingToolCallBudget:
-            reservation.remainingToolCallBudget,
-        }),
     ...(reservation.correction === undefined
       ? {}
       : { correction: cloneJson(reservation.correction) }),
@@ -5748,6 +5815,10 @@ function materializeCompletedProviderResponseV3(
       : {}),
     target: cloneJson(reservation.target),
     toolContext,
+    kernelFacts: projectSessionProviderFactsV2(
+      state,
+      reservation.target
+    ),
   };
   if (reservation.target.kind === 'planAction' && !input.plan) {
     throw new UnsupportedHistorySchemaError(
@@ -5823,6 +5894,7 @@ function materializeProviderQueueV3(
     orderedItems,
     completion: cloneJson(terminal.data.completion),
     calls: cloneJson(compact.calls),
+    mutationDisposition: compact.mutationDisposition,
     status: compact.status,
     outcomeRecorded: compact.outcomeRecorded,
     ...(compact.settledAt ? { settledAt: compact.settledAt } : {}),
@@ -5863,8 +5935,15 @@ function materializeTerminalOrderedItemsV3(
         'provider-native-tool-arguments-invalid'
       );
     }
-    if (canonicalJson(argumentsValue)
-      !== canonicalJson(call.intent.rawArguments)) {
+    const callArguments = call.intent?.rawArguments
+      ?? call.candidatePreview?.rawArguments;
+    const callToolId = call.intent?.toolId
+      ?? call.candidatePreview?.toolId;
+    if (
+      !callArguments
+      || !callToolId
+      || canonicalJson(argumentsValue) !== canonicalJson(callArguments)
+    ) {
       throw new UnsupportedHistorySchemaError(
         'provider-native-tool-queue-mismatch'
       );
@@ -5875,8 +5954,8 @@ function materializeTerminalOrderedItemsV3(
       ordinal: callIndex,
       callId: raw.callId,
       toolName: raw.name,
-      toolId: call.intent.toolId,
-      arguments: cloneJson(call.intent.rawArguments),
+      toolId: callToolId,
+      arguments: cloneJson(callArguments),
     };
   });
 }

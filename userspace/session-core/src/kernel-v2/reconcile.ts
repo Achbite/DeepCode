@@ -261,6 +261,7 @@ function resolveActiveWait(
     !wait
     || wait.kind === 'backpressure'
     || wait.kind === 'manualRecovery'
+    || wait.kind === 'userIntervention'
   ) {
     return next;
   }

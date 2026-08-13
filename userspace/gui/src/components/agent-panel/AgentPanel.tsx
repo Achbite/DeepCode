@@ -27,6 +27,7 @@ const AgentPanel: React.FC = () => {
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
+  const resolvingIntervention = useAgentSessionStore((s) => s.resolvingIntervention);
   const loadCurrentSelection = useAgentSessionStore((s) => s.loadCurrentSelection);
   const observeSessionProjection = useAgentSessionStore((s) => s.observeSessionProjection);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
@@ -40,6 +41,7 @@ const AgentPanel: React.FC = () => {
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
+  const resolveUserIntervention = useAgentSessionStore((s) => s.resolveUserIntervention);
   const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
@@ -62,6 +64,7 @@ const AgentPanel: React.FC = () => {
     timeline: timelineProjection,
     resolvingPlan,
     resolvingPermission,
+    resolvingIntervention,
   });
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
   const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
@@ -172,10 +175,47 @@ const AgentPanel: React.FC = () => {
             );
           }
         }}
+        onInterventionSelect={(optionId, guidance) => {
+          if (composerPendingDecision?.kind !== 'userIntervention') return;
+          void resolveUserIntervention({
+            runId: composerPendingDecision.runId,
+            targetId: composerPendingDecision.targetId,
+            interactionId: composerPendingDecision.interactionId,
+            interactionRevision: composerPendingDecision.interactionRevision,
+            candidateSetDigest: composerPendingDecision.candidateSetDigest,
+            expectedProjectionCursor: composerPendingDecision.projectionCursor,
+            decision: 'select',
+            optionId,
+            guidance,
+          });
+        }}
+        onInterventionRevise={(guidance) => {
+          if (composerPendingDecision?.kind !== 'userIntervention') return;
+          void resolveUserIntervention({
+            runId: composerPendingDecision.runId,
+            targetId: composerPendingDecision.targetId,
+            interactionId: composerPendingDecision.interactionId,
+            interactionRevision: composerPendingDecision.interactionRevision,
+            candidateSetDigest: composerPendingDecision.candidateSetDigest,
+            expectedProjectionCursor: composerPendingDecision.projectionCursor,
+            decision: 'revise',
+            guidance,
+          });
+        }}
         onDecisionReject={() => {
           if (!composerPendingDecision) return;
           if (composerPendingDecision.kind === 'plan') {
             void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
+          } else if (composerPendingDecision.kind === 'userIntervention') {
+            void resolveUserIntervention({
+              runId: composerPendingDecision.runId,
+              targetId: composerPendingDecision.targetId,
+              interactionId: composerPendingDecision.interactionId,
+              interactionRevision: composerPendingDecision.interactionRevision,
+              candidateSetDigest: composerPendingDecision.candidateSetDigest,
+              expectedProjectionCursor: composerPendingDecision.projectionCursor,
+              decision: 'reject',
+            });
           }
         }}
       />

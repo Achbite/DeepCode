@@ -33,6 +33,7 @@ export type SessionProviderCacheLaneModeV2 =
 export type SessionProviderCacheLaneRelationKindV2 =
   | 'bootstrap'
   | 'sameTurnToolContinuation'
+  | 'sameTurnSessionControlContinuation'
   | 'nextUserTurn'
   | 'exactReplay'
   | 'reset';
@@ -64,6 +65,10 @@ export type SessionProviderTargetBindingV2 =
   | {
       kind: 'planAction';
       planActionId: string;
+    }
+  | {
+      kind: 'interventionResearch';
+      researchId: string;
     }
   | ({ kind: 'finalAnswer' } & {
       inputId: string;
@@ -294,7 +299,10 @@ export function planSessionProviderCacheLaneV2(
     mode: 'append',
     relationKind: input.turn.purpose === 'primary'
       ? 'nextUserTurn'
-      : 'sameTurnToolContinuation',
+      : sessionProviderSameTurnRelationV2(
+          input.turn,
+          predecessor.providerTurnId
+        ),
     laneId: predecessor.cacheLane.laneId,
     laneRevision: predecessor.cacheLane.laneRevision,
     stablePrefixDigest: material.stablePrefixDigest,
@@ -452,7 +460,8 @@ function sessionProviderContinuationOutcomesV2(
 
 export function sessionProviderSemanticMessagesV2(
   turn: SessionProviderTurnInputV2,
-  cacheLane: SessionProviderCacheLanePlanV2
+  cacheLane: SessionProviderCacheLanePlanV2,
+  predecessor: SessionKernelProviderCachePredecessorV2 | undefined
 ): LlmChatMessage[] {
   if (cacheLane.mode !== 'append') {
     return cloneJson(turn.contextAssembly.messages);
@@ -466,19 +475,116 @@ export function sessionProviderSemanticMessagesV2(
     }
     return [cloneJson(finalMessage)];
   }
+  if (
+    cacheLane.relationKind
+      === 'sameTurnSessionControlContinuation'
+  ) {
+    return sessionControlTransitionMessagesV1(turn);
+  }
   if (cacheLane.relationKind !== 'sameTurnToolContinuation') {
     throw new Error(
       'Provider append relation is unsupported for semantic message assembly.'
     );
   }
-  if (turn.guidance.length === 0) return [];
-  return [{
-    role: 'user',
-    content: canonicalJson({
-      schemaVersion: SESSION_PROVIDER_SEMANTIC_GUIDANCE_V1_SCHEMA,
-      guidance: [...turn.guidance],
-    }),
-  }];
+  if (predecessor?.status !== 'available') {
+    throw new Error(
+      'Provider tool continuation requires its exact available predecessor binding.'
+    );
+  }
+  const targetBindingChanged = predecessor.targetBindingDigest
+    !== sha256Hash(canonicalJson(turn.target));
+  if (!targetBindingChanged && turn.guidance.length === 0) return [];
+  const finalMessage = turn.contextAssembly.messages.at(-1);
+  if (
+    !finalMessage
+    || finalMessage.role !== 'user'
+    || jsonMessageSchemaV1(finalMessage.content)
+      !== 'deepcode.session.provider-turn-frame.v1'
+  ) {
+    throw new Error(
+      'Provider tool continuation target transition requires the authoritative dynamic user frame at the request tail.'
+    );
+  }
+  return [cloneJson(finalMessage)];
+}
+
+function sessionProviderSameTurnRelationV2(
+  turn: SessionProviderTurnInputV2,
+  predecessorProviderTurnId: string
+): Extract<
+  SessionProviderCacheLaneRelationKindV2,
+  | 'sameTurnToolContinuation'
+  | 'sameTurnSessionControlContinuation'
+> {
+  const predecessor = turn.providerOutcomes.at(-1);
+  if (
+    !predecessor
+    || predecessor.providerTurnId !== predecessorProviderTurnId
+  ) {
+    throw new Error(
+      'Session Provider append requires the exact latest durable predecessor outcome.'
+    );
+  }
+  if (predecessor.outputKind === 'toolIntent') {
+    return 'sameTurnToolContinuation';
+  }
+  if (
+    predecessor.outputKind === 'plan'
+    || predecessor.outputKind === 'planActionComplete'
+    || predecessor.outputKind === 'intervention'
+  ) {
+    return 'sameTurnSessionControlContinuation';
+  }
+  throw new Error(
+    'Session Provider append predecessor is neither a settled Kernel tool turn nor a settled Session control turn.'
+  );
+}
+
+function sessionControlTransitionMessagesV1(
+  turn: SessionProviderTurnInputV2
+): LlmChatMessage[] {
+  if (turn.purpose !== 'continuation') {
+    throw new Error(
+      'Session control continuation must remain in the current authoritative user turn.'
+    );
+  }
+  const planMessages = turn.contextAssembly.messages.filter((message) =>
+    message.role === 'user'
+    && jsonMessageSchemaV1(message.content)
+      === 'deepcode.session.provider-plan-decision.v3'
+  );
+  const turnMessages = turn.contextAssembly.messages.filter((message) =>
+    message.role === 'user'
+    && jsonMessageSchemaV1(message.content)
+      === 'deepcode.session.provider-turn-frame.v1'
+  );
+  if (planMessages.length !== 1 || turnMessages.length !== 1) {
+    throw new Error(
+      'Session control continuation requires one current Plan view and one authoritative turn frame.'
+    );
+  }
+  return [
+    cloneJson(planMessages[0]!),
+    cloneJson(turnMessages[0]!),
+  ];
+}
+
+function jsonMessageSchemaV1(content: string): string | undefined {
+  try {
+    const decoded = JSON.parse(content) as unknown;
+    if (
+      !decoded
+      || typeof decoded !== 'object'
+      || Array.isArray(decoded)
+    ) return undefined;
+    const schemaVersion = (decoded as Record<string, unknown>)
+      .schemaVersion;
+    return typeof schemaVersion === 'string'
+      ? schemaVersion
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function cloneJson<T>(value: T): T {

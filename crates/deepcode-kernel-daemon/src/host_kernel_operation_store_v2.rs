@@ -29,7 +29,7 @@ const BOOTSTRAP_SCHEMA_V2: &str = "deepcode.host.kernel-run-bootstrap.v2";
 const CALLER_REQUEST_SCHEMA_V2: &str = "deepcode.host.caller-request.v3";
 const OPERATION_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-operation.v2";
 const ATTEMPT_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-dispatch-attempt.v2";
-const HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v3";
+const HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v4";
 const PRODUCTION_FRAME_SCHEMA_V2: &str = "deepcode.session.kernel-production-request-frame.v2";
 const PRODUCTION_REQUEST_SCHEMA_V2: &str = "deepcode.session.kernel-production-request.v2";
 const PRODUCTION_RESPONSE_SCHEMA_V2: &str = "deepcode.session.kernel-production-response.v2";
@@ -496,12 +496,8 @@ impl HostKernelOperationStoreV2 {
             };
             let request_kind = stored.request_kind.clone();
             let request_digest = stored.request_digest.clone();
-            let binding = decode_caller_request_binding(
-                stored,
-                &request_kind,
-                &request_digest,
-                true,
-            )?;
+            let binding =
+                decode_caller_request_binding(stored, &request_kind, &request_digest, true)?;
             if binding.request_kind != expected_request_kind {
                 return Err(HostV2StorageError::conflict(
                     "host_caller_request_kind_conflict",

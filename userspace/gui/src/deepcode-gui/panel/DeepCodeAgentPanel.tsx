@@ -73,6 +73,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
+  const resolvingIntervention = useAgentSessionStore((s) => s.resolvingIntervention);
   const observeSessionProjection = useAgentSessionStore((s) => s.observeSessionProjection);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
   const captureSubmissionTarget = useAgentSessionStore((s) => s.captureSubmissionTarget);
@@ -82,6 +83,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
+  const resolveUserIntervention = useAgentSessionStore((s) => s.resolveUserIntervention);
   const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
@@ -123,6 +125,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       timeline,
       resolvingPlan,
       resolvingPermission,
+      resolvingIntervention,
     });
   const pendingDecisionKey = pendingDecisionIdentity(pendingDecision);
   const pendingDecisionTypewriterActive = Boolean(
@@ -237,11 +240,50 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           );
         }
       }}
+      onInterventionSelect={(optionId, guidance) => {
+        if (composerPendingDecision?.kind !== 'userIntervention') return;
+        requestFollowLatest();
+        void resolveUserIntervention({
+          runId: composerPendingDecision.runId,
+          targetId: composerPendingDecision.targetId,
+          interactionId: composerPendingDecision.interactionId,
+          interactionRevision: composerPendingDecision.interactionRevision,
+          candidateSetDigest: composerPendingDecision.candidateSetDigest,
+          expectedProjectionCursor: composerPendingDecision.projectionCursor,
+          decision: 'select',
+          optionId,
+          guidance,
+        });
+      }}
+      onInterventionRevise={(guidance) => {
+        if (composerPendingDecision?.kind !== 'userIntervention') return;
+        requestFollowLatest();
+        void resolveUserIntervention({
+          runId: composerPendingDecision.runId,
+          targetId: composerPendingDecision.targetId,
+          interactionId: composerPendingDecision.interactionId,
+          interactionRevision: composerPendingDecision.interactionRevision,
+          candidateSetDigest: composerPendingDecision.candidateSetDigest,
+          expectedProjectionCursor: composerPendingDecision.projectionCursor,
+          decision: 'revise',
+          guidance,
+        });
+      }}
       onDecisionReject={() => {
         if (!composerPendingDecision) return;
         requestFollowLatest();
         if (composerPendingDecision.kind === 'plan') {
           void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
+        } else if (composerPendingDecision.kind === 'userIntervention') {
+          void resolveUserIntervention({
+            runId: composerPendingDecision.runId,
+            targetId: composerPendingDecision.targetId,
+            interactionId: composerPendingDecision.interactionId,
+            interactionRevision: composerPendingDecision.interactionRevision,
+            candidateSetDigest: composerPendingDecision.candidateSetDigest,
+            expectedProjectionCursor: composerPendingDecision.projectionCursor,
+            decision: 'reject',
+          });
         }
       }}
     />
@@ -341,6 +383,9 @@ function pendingDecisionIdentity(decision: AgentComposerPendingDecision | null):
   if (!decision) return null;
   if (decision.kind === 'plan') {
     return `${decision.kind}:${decision.runId}:${decision.planId}`;
+  }
+  if (decision.kind === 'userIntervention') {
+    return `${decision.kind}:${decision.interactionId}:${decision.interactionRevision}:${decision.candidateSetDigest}`;
   }
   return `${decision.kind}:${decision.requestId}`;
 }

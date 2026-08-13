@@ -1357,7 +1357,7 @@ impl AuthorityService {
         }
         let workspace = self.workspace_for_run(&request.run_id)?;
         let correlation_refs = match &request.authority {
-            InvocationAuthorityV2::ContextRead { .. } => Vec::new(),
+            InvocationAuthorityV2::Read { .. } => Vec::new(),
             InvocationAuthorityV2::PlanAction { plan_action_id, .. } => {
                 vec![deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction {
                     value: plan_action_id.to_string(),
@@ -1668,7 +1668,7 @@ impl AuthorityService {
         }
         let workspace = self.workspace_for_run(&request.run_id)?;
         let correlation_refs = match &request.authority {
-            InvocationAuthorityV2::ContextRead { .. } => Vec::new(),
+            InvocationAuthorityV2::Read { .. } => Vec::new(),
             InvocationAuthorityV2::PlanAction { plan_action_id, .. } => {
                 vec![deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction {
                     value: plan_action_id.to_string(),

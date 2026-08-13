@@ -50,12 +50,16 @@ import {
   abortSessionProviderToolCallQueueV2,
   activeSessionProviderToolCallQueueV2,
   createSessionProviderToolCallQueueV2,
+  finalizeSessionProviderMutationClassificationV4,
+  nextSessionProviderToolCallQueueWorkV4,
+  prepareSessionProviderMutationPreviewV4,
   prepareSessionProviderToolCallSubmissionV2,
   publicSessionProviderOrderedItemsV2,
   publicSessionProviderToolCallQueueItemsV2,
   repairedSessionProviderOutcomeV2,
   sessionToolCorrectionForNextTurnV2,
   type SessionProviderToolCallQueueV2,
+  type SessionProviderQueuedCallInputV4,
 } from './providerToolCallQueue.js';
 import {
   normalizeProviderKernelToolIntentV2,
@@ -63,13 +67,16 @@ import {
 } from './toolIntent.js';
 import {
   decodeCompletedProviderTerminalV3,
+  decodeProviderInterventionArgumentsV1,
   decodeProviderPlanActionCompleteArgumentsV2,
   decodeProviderPlanProposalArgumentsV2,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
+  type SessionProviderInterventionProposalV1,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
 import type { SessionKernelProjectionReceiptV2 } from './ports.js';
@@ -111,6 +118,12 @@ export interface SessionKernelProviderTurnHostV2 {
     plan: SessionNaturalLanguagePlanV2
   ): Promise<void>;
 
+  recordProviderIntervention(
+    proposal: SessionProviderInterventionProposalV1,
+    providerTurnId: string,
+    recordedAt: string
+  ): Promise<{ published: boolean; guidance?: string }>;
+
   settlePlanActionComplete(
     planActionId: string,
     outcome: SessionPlanActionSettlementV2['outcome'],
@@ -149,7 +162,7 @@ type SessionProviderEvidenceBindingInputV3 = Pick<
 
 type SessionProviderSealedInputV3 =
   SessionProviderEvidenceBindingInputV3
-  & Pick<SessionProviderTurnInputV2, 'toolContext'>;
+  & Pick<SessionProviderTurnInputV2, 'toolContext' | 'kernelFacts'>;
 
 /**
  * Provider lifecycle is Session-owned. This coordinator never sees raw
@@ -555,12 +568,6 @@ export class SessionKernelProviderTurnsV2 {
           ...(state.plan
             ? { planRevision: state.plan.planRevision }
             : {}),
-          ...(request.target.kind === 'planAction'
-            ? {
-                remainingToolCallBudget:
-                  request.remainingToolCallBudget,
-              }
-            : {}),
           ...(correction ? { correction } : {}),
           controlEpoch: state.controlEpoch,
           contextRef: binding.contextRef,
@@ -748,11 +755,18 @@ export class SessionKernelProviderTurnsV2 {
       }
       try {
         try {
+          if (!completedTerminalRecordedAt) {
+            throw new SessionKernelProviderTurnError(
+              'session_kernel_provider_terminal_evidence_mismatch',
+              'Provider output admission requires one durable terminal timestamp.'
+            );
+          }
           const admission = await this.admitProviderOutput(
             request,
             output,
             providerTurnId,
-            pendingGuidanceAtDispatch
+            pendingGuidanceAtDispatch,
+            completedTerminalRecordedAt
           );
           result = admission.result;
           queuedToolIntents = admission.queuedToolIntents;
@@ -905,7 +919,8 @@ export class SessionKernelProviderTurnsV2 {
     request: SessionProviderTurnRequestV2,
     output: SessionProviderTurnOutputV2,
     providerTurnId: string,
-    pendingGuidanceAtDispatch: readonly string[]
+    pendingGuidanceAtDispatch: readonly string[],
+    completedTerminalRecordedAt: string
   ): Promise<{
     result: SessionKernelLoopResultV2;
     queuedToolIntents: boolean;
@@ -972,6 +987,22 @@ export class SessionKernelProviderTurnsV2 {
         queuedToolIntents: false,
       };
     }
+    if (output.kind === 'intervention') {
+      const settlement = await this.host.recordProviderIntervention(
+        output.proposal,
+        providerTurnId,
+        completedTerminalRecordedAt
+      );
+      return {
+        result: {
+          kind: 'noTool',
+          ...(settlement.guidance
+            ? { guidance: settlement.guidance }
+            : {}),
+        },
+        queuedToolIntents: false,
+      };
+    }
     if (output.kind === 'noTool') {
       if (output.repair) {
         if (!output.guidance?.trim()) {
@@ -1010,20 +1041,7 @@ export class SessionKernelProviderTurnsV2 {
         queuedToolIntents: false,
       };
     }
-    if (
-      request.target.kind === 'planAction'
-      && output.sources.length > request.remainingToolCallBudget!
-    ) {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_provider_tool_call_budget_exceeded',
-        [
-          'Provider output exceeds the remaining PlanAction tool-call',
-          `budget (${output.sources.length} requested,`,
-          `${request.remainingToolCallBudget} remaining).`,
-        ].join(' ')
-      );
-    }
-    const intents = output.sources.map((source, index) =>
+    const calls = output.sources.map((source, index) =>
       this.normalizeOutput(
         source,
         request,
@@ -1032,8 +1050,11 @@ export class SessionKernelProviderTurnsV2 {
       )
     );
     const latest = this.host.readState();
-    if (intents[0]?.authority.kind === 'contextRead') {
-      recordSessionContextReadWorkAuthorityV3(latest, intents);
+    const readIntents = calls.flatMap((call) =>
+      call.dispatchKind === 'read' ? [call.intent] : []
+    );
+    if (readIntents.length > 0) {
+      recordSessionContextReadWorkAuthorityV3(latest, readIntents);
     }
     latest.providerToolCallQueue =
       createSessionProviderToolCallQueueV2({
@@ -1044,7 +1065,7 @@ export class SessionKernelProviderTurnsV2 {
         providerResult: output.providerResult,
         orderedItems: output.items,
         completion: output.completion,
-        intents,
+        calls,
         ...(latest.providerTurn?.correction
           ? { correction: latest.providerTurn.correction }
           : {}),
@@ -1394,6 +1415,7 @@ export class SessionKernelProviderTurnsV2 {
         : {}),
       target: cloneJson(turn.target),
       toolContext,
+      kernelFacts: projectSessionProviderFactsV2(state, turn.target),
     };
     if (turn.target.kind === 'planAction' && !semanticInput.plan) {
       throw new SessionKernelProviderTurnError(
@@ -1467,18 +1489,13 @@ export class SessionKernelProviderTurnsV2 {
     const request: SessionProviderTurnRequestV2 = {
       reason: 'recovery',
       target: cloneJson(turn.target),
-      ...(turn.remainingToolCallBudget === undefined
-        ? {}
-        : {
-            remainingToolCallBudget:
-              turn.remainingToolCallBudget,
-          }),
     };
     const admission = await this.admitProviderOutput(
       request,
       output,
       turn.providerTurnId,
-      this.host.readState().pendingGuidance
+      this.host.readState().pendingGuidance,
+      evidence.terminal.recordedAt
     );
     if (admission.queuedToolIntents) return;
     if (output.kind === 'toolIntent') {
@@ -1521,9 +1538,15 @@ export class SessionKernelProviderTurnsV2 {
     try {
       const submitting = queued.calls.find(
         (candidate) => candidate.status === 'submitting'
+          || candidate.status === 'previewing'
       );
       if (submitting) {
-        this.assertMayReplayQueuedSubmission(submitting.requestId!);
+        this.assertMayReplayQueuedRequest(
+          submitting.requestId!,
+          submitting.status === 'previewing'
+            ? 'capabilityPreviewBatch'
+            : 'toolIntentSubmit'
+        );
         const result = await this.submitNextQueuedIntent();
         if (this.resultIsStale(
           reservation,
@@ -1847,7 +1870,10 @@ export class SessionKernelProviderTurnsV2 {
     this.host.requireNoPendingRequests();
   }
 
-  private assertMayReplayQueuedSubmission(requestId: string): void {
+  private assertMayReplayQueuedRequest(
+    requestId: string,
+    kind: 'capabilityPreviewBatch' | 'toolIntentSubmit'
+  ): void {
     if (this.userInputFenceGeneration !== undefined) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_user_input_admission_fenced',
@@ -1861,11 +1887,12 @@ export class SessionKernelProviderTurnsV2 {
       );
     }
     const pending = this.requests.pendingRecords();
+    const lane = kind === 'toolIntentSubmit' ? 'effect' : 'query';
     if (
       pending.some((record) =>
-        record.lane !== 'effect'
+        record.lane !== lane
         || record.requestId !== requestId
-        || record.intent.kind !== 'toolIntentSubmit'
+        || record.intent.kind !== kind
       )
     ) {
       throw new SessionKernelProviderTurnError(
@@ -1889,7 +1916,7 @@ export class SessionKernelProviderTurnsV2 {
     request: SessionProviderTurnRequestV2,
     index: number,
     callCount: number
-  ): ToolIntentV2 {
+  ): SessionProviderQueuedCallInputV4 {
     const state = this.host.readState();
     const toolId = providerSourceToolId(source);
     const descriptor = state.toolContext.bundle.tools.find(
@@ -1901,102 +1928,134 @@ export class SessionKernelProviderTurnsV2 {
         `Provider requested a tool outside the current ready ToolContext: ${toolId}.`
       );
     }
-    if (request.target.kind === 'planning') {
-      if (descriptor.effectClass !== 'read') {
-        throw new SessionKernelProviderTurnError(
-          'session_kernel_planning_mutation_forbidden',
-          'A planning turn cannot invoke a mutation without a confirmed PlanAction.'
-        );
-      }
-      const identity = providerCallIdentity(
-        state,
-        source,
-        `planning:${toolId}`
-      );
-      return normalizeProviderKernelToolIntentV2(source, {
-        runId: state.runId,
-        controlEpoch: state.controlEpoch,
-        operationId: identity.operationId,
-        authority: contextReadAuthorityV2(
-          `Session planning context read using ${toolId}.`
-        ),
-        idempotencyKey: identity.idempotencyKey,
-        toolContext: state.toolContext.bundle,
-      });
-    }
     if (request.target.kind === 'finalAnswer') {
       throw new SessionKernelProviderTurnError(
         'session_kernel_final_answer_tool_forbidden',
         'A no-tools final-answer turn cannot admit a Provider tool call.'
       );
-    } else if (request.target.kind === 'planAction') {
-      const action = sessionPlanActionV2(
-        state,
-        request.target.planActionId
-      );
-      if (toolId !== action.manifest.toolId) {
-        throw new SessionKernelProviderTurnError(
-          'session_kernel_plan_action_tool_mismatch',
-          'Provider tool does not match the persisted PlanAction tool.'
-        );
-      }
-      const lease = latestPlanActionLease(
-        state,
-        action.manifest.planActionId
-      );
-      const identity = planActionProviderCallIdentity(
-        state,
-        action,
-        source,
-        index,
-        lease
-      );
-      return normalizeProviderKernelToolIntentV2(source, {
-        runId: state.runId,
-        controlEpoch: state.controlEpoch,
-        operationId: identity.operationId,
-        authority: planActionAuthorityV2({
-          planRevision: action.manifest.planRevision,
-          planActionId: action.manifest.planActionId,
-          ...(lease ? { lease } : {}),
+    }
+    if (descriptor.effectClass === 'read') {
+      const purpose = request.target.kind === 'planning'
+        ? `Session planning context read using ${toolId}.`
+        : request.target.kind === 'planAction'
+          ? `Session PlanAction supplemental read using ${toolId}.`
+          : request.target.kind === 'interventionResearch'
+            ? `Session intervention research read using ${toolId}.`
+            : request.target.purpose;
+      const contextReadIdentity = request.target.kind === 'contextRead'
+        && callCount === 1
+        ? {
+            operationId: request.target.operationId,
+            idempotencyKey: request.target.idempotencyKey,
+          }
+        : providerCallIdentity(
+            state,
+            source,
+            `${request.target.kind}:read:${toolId}:${index + 1}`
+          );
+      return {
+        dispatchKind: 'read',
+        intent: normalizeProviderKernelToolIntentV2(source, {
+          runId: state.runId,
+          controlEpoch: state.controlEpoch,
+          operationId: contextReadIdentity.operationId,
+          authority: contextReadAuthorityV2(purpose),
+          idempotencyKey: contextReadIdentity.idempotencyKey,
+          toolContext: state.toolContext.bundle,
+          ...(request.target.kind === 'contextRead' && request.target.deadline
+            ? { deadline: request.target.deadline }
+            : {}),
         }),
-        idempotencyKey: identity.idempotencyKey,
-        toolContext: state.toolContext.bundle,
-        deadline: action.deadline,
-      });
+      };
     }
-    if (descriptor.effectClass !== 'read') {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_context_read_mutation_forbidden',
-        'A contextRead turn cannot invoke a mutation tool.'
-      );
-    }
-    const contextReadIdentity = callCount === 1
-      ? {
-          operationId: request.target.operationId,
-          idempotencyKey: request.target.idempotencyKey,
-        }
+
+    const currentAction = request.target.kind === 'planAction'
+      ? sessionPlanActionV2(state, request.target.planActionId)
+      : undefined;
+    const matchesCurrentAction = currentAction?.manifest.toolId === toolId;
+    const lease = currentAction && matchesCurrentAction
+      ? latestPlanActionLease(state, currentAction.manifest.planActionId)
+      : undefined;
+    const identity = currentAction && matchesCurrentAction
+      ? planActionProviderCallIdentity(
+          state,
+          currentAction,
+          source,
+          index,
+          lease
+        )
       : providerCallIdentity(
           state,
           source,
-          [
-            'contextRead',
-            request.target.operationId,
-            request.target.idempotencyKey,
-            String(index + 1),
-          ].join(':')
+          `${request.target.kind}:planDiscovery:${toolId}:${index + 1}`
         );
-    return normalizeProviderKernelToolIntentV2(source, {
+    const parsed = normalizeProviderKernelToolIntentV2(source, {
       runId: state.runId,
       controlEpoch: state.controlEpoch,
-      operationId: contextReadIdentity.operationId,
-      authority: contextReadAuthorityV2(request.target.purpose),
-      idempotencyKey: contextReadIdentity.idempotencyKey,
+      operationId: identity.operationId,
+      authority: contextReadAuthorityV2(
+        `Preview-only mutation discovery for ${toolId}.`
+      ),
+      idempotencyKey: identity.idempotencyKey,
       toolContext: state.toolContext.bundle,
-      ...(request.target.deadline
-        ? { deadline: request.target.deadline }
+      ...(currentAction && matchesCurrentAction
+        ? { deadline: currentAction.deadline }
         : {}),
     });
+    const providerTurnId = state.providerTurn?.providerTurnId;
+    if (!providerTurnId) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_turn_missing',
+        'Mutation discovery requires the exact active Provider turn identity.'
+      );
+    }
+    const discoveryDigest = sha256Hash(canonicalJson({
+      schemaVersion: 'deepcode.session.plan-discovery-identity.v1',
+      providerTurnId,
+      callId: source.callId,
+      ordinal: index + 1,
+      operationId: identity.operationId,
+      toolId,
+      argumentsDigest: sha256Hash(canonicalJson(parsed.rawArguments)),
+    })).slice('sha256:'.length);
+    const candidatePlanRevision = currentAction && matchesCurrentAction
+      ? currentAction.manifest.planRevision
+      : `discovery-plan-${discoveryDigest}`;
+    const candidatePlanActionId = currentAction && matchesCurrentAction
+      ? currentAction.manifest.planActionId
+      : `discovery-action-${discoveryDigest}`;
+    const executableIntent = currentAction && matchesCurrentAction
+      ? normalizeProviderKernelToolIntentV2(source, {
+          runId: state.runId,
+          controlEpoch: state.controlEpoch,
+          operationId: identity.operationId,
+          authority: planActionAuthorityV2({
+            planRevision: currentAction.manifest.planRevision,
+            planActionId: currentAction.manifest.planActionId,
+            ...(lease ? { lease } : {}),
+          }),
+          idempotencyKey: identity.idempotencyKey,
+          toolContext: state.toolContext.bundle,
+          deadline: currentAction.deadline,
+        })
+      : undefined;
+    return {
+      dispatchKind: 'mutation',
+      ...(executableIntent ? { intent: executableIntent } : {}),
+      candidatePreview: {
+        runId: state.runId,
+        controlEpoch: state.controlEpoch,
+        discoveryId: `discovery-${discoveryDigest}`,
+        planRevision: candidatePlanRevision,
+        planActionId: candidatePlanActionId,
+        operationId: identity.operationId,
+        idempotencyKey: identity.idempotencyKey,
+        toolId,
+        rawArguments: parsed.rawArguments,
+        deadline: parsed.deadline,
+        toolContextRef: parsed.toolContextRef,
+      },
+    };
   }
 
   private async submitNextQueuedIntent():
@@ -2011,31 +2070,112 @@ export class SessionKernelProviderTurnsV2 {
     }
     const state = this.host.readState();
     const queue = activeSessionProviderToolCallQueueV2(state);
-    const item = queue?.calls.find((candidate) =>
-      candidate.status !== 'completed'
-    );
-    if (
-      !queue
-      || !item
-      || (
-        item.status !== 'pending'
-        && item.status !== 'submitting'
-      )
-    ) {
+    const work = nextSessionProviderToolCallQueueWorkV4(state);
+    if (!queue || !work) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_provider_tool_call_queue_missing',
         'No resumable Provider tool call is available to submit.'
       );
     }
+    if (work.kind === 'preview') {
+      const { item, candidate } = work;
+      let request: SessionKernelPublicRequestRecordV2;
+      const payload = {
+        expectedControlEpoch: candidate.controlEpoch,
+        planRevision: candidate.planRevision,
+        items: [{
+          planActionId: candidate.planActionId,
+          operationId: candidate.operationId,
+          idempotencyKey: candidate.idempotencyKey,
+          toolId: candidate.toolId,
+          rawArguments: candidate.rawArguments,
+          deadline: candidate.deadline,
+          origin: {
+            kind: 'planDiscovery' as const,
+            data: { discoveryId: candidate.discoveryId },
+          },
+        }],
+        toolContextRef: candidate.toolContextRef,
+      };
+      if (item.status === 'pending') {
+        request = this.requests.newRecord({
+          kind: 'capabilityPreviewBatch',
+          payload,
+        });
+        prepareSessionProviderMutationPreviewV4(state, {
+          operationId: candidate.operationId,
+          requestId: request.requestId,
+          requestStartedAt: request.startedAt,
+        });
+        await this.host.saveCheckpoint();
+      } else if (item.status === 'previewing') {
+        const pending = state.publicRequests.query;
+        if (pending) {
+          if (
+            pending.requestId !== item.requestId
+            || pending.intent.kind !== 'capabilityPreviewBatch'
+            || canonicalJson(pending.intent.payload) !== canonicalJson(payload)
+          ) {
+            throw new SessionKernelProviderTurnError(
+              'session_kernel_plan_discovery_request_conflict',
+              'The pending Kernel query does not match the durable mutation discovery preview.'
+            );
+          }
+          request = pending;
+        } else {
+          request = {
+            requestId: item.requestId!,
+            lane: 'query',
+            intent: { kind: 'capabilityPreviewBatch', payload },
+            startedAt: item.requestStartedAt!,
+            attemptCount: 1,
+          };
+        }
+      } else {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_discovery_queue_state_invalid',
+          'Mutation discovery preview is not in a resumable state.'
+        );
+      }
+      const current = nextSessionProviderToolCallQueueWorkV4(
+        this.host.readState()
+      );
+      if (
+        !this.boundaryIsCurrent(reservation, generation)
+        || current?.kind !== 'preview'
+        || current.item.requestId !== request.requestId
+        || current.candidate.operationId !== candidate.operationId
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_discovery_submission_superseded',
+          'Mutation discovery preview was superseded before Kernel dispatch.'
+        );
+      }
+      const outcome = await this.requests.execute(request);
+      expectSessionKernelPublicRequestOutcomeV2(
+        outcome,
+        'capabilityPreviewBatch'
+      );
+      const latest = this.host.readState();
+      if (finalizeSessionProviderMutationClassificationV4(
+        latest,
+        this.ports.clock.now()
+      )) {
+        await this.host.saveCheckpoint();
+      }
+      return { kind: 'noTool' };
+    }
+
+    const { item, intent } = work;
     let request: SessionKernelPublicRequestRecordV2;
     if (item.status === 'pending') {
-      this.refreshPendingPlanActionLease(queue.target, item.intent);
+      this.refreshPendingPlanActionLease(queue.target, intent);
       request = this.requests.newRecord({
         kind: 'toolIntentSubmit',
-        payload: { intent: item.intent },
+        payload: { intent },
       });
       prepareSessionProviderToolCallSubmissionV2(state, {
-        operationId: item.intent.operationId,
+        operationId: intent.operationId,
         requestId: request.requestId,
         requestStartedAt: request.startedAt,
       });
@@ -2047,7 +2187,7 @@ export class SessionKernelProviderTurnsV2 {
           pending.requestId !== item.requestId
           || pending.intent.kind !== 'toolIntentSubmit'
           || canonicalJson(pending.intent.payload.intent)
-            !== canonicalJson(item.intent)
+            !== canonicalJson(intent)
         ) {
           throw new SessionKernelProviderTurnError(
             'session_kernel_provider_tool_call_request_conflict',
@@ -2061,7 +2201,7 @@ export class SessionKernelProviderTurnsV2 {
           lane: 'effect',
           intent: {
             kind: 'toolIntentSubmit',
-            payload: { intent: item.intent },
+            payload: { intent },
           },
           startedAt: item.requestStartedAt!,
           attemptCount: 1,
@@ -2077,7 +2217,7 @@ export class SessionKernelProviderTurnsV2 {
       if (
         !this.boundaryIsCurrent(reservation, generation)
         || current?.requestId !== request.requestId
-        || current.intent.operationId !== item.intent.operationId
+        || current.intent?.operationId !== intent.operationId
       ) {
         throw new SessionKernelProviderTurnError(
           'session_kernel_provider_tool_call_submission_superseded',
@@ -2148,6 +2288,11 @@ export class SessionKernelProviderTurnsV2 {
     intent: ToolIntentV2
   ): void {
     if (target.kind !== 'planAction') return;
+    // PlanAction authority belongs only to mutation effects. Supplemental
+    // reads keep their independent context-read authority and are admitted by
+    // Kernel Settings, ToolContext, and canonical scope without consuming or
+    // inheriting the mutation lease.
+    if (intent.authority.kind === 'read') return;
     if (
       intent.authority.kind !== 'planAction'
       || intent.authority.data.planActionId !== target.planActionId
@@ -2215,16 +2360,6 @@ export class SessionKernelProviderTurnsV2 {
       );
     }
     if (request.target.kind === 'planAction') {
-      if (
-        !Number.isSafeInteger(request.remainingToolCallBudget)
-        || request.remainingToolCallBudget! <= 0
-        || request.remainingToolCallBudget! > 256
-      ) {
-        throw new SessionKernelProviderTurnError(
-          'session_kernel_provider_tool_call_budget_invalid',
-          'A PlanAction Provider turn requires a remaining tool-call budget between 1 and 256.'
-        );
-      }
       this.host.requirePlanProjected();
       this.host.requirePlanAccepted();
       sessionPlanActionV2(state, request.target.planActionId);
@@ -2234,11 +2369,29 @@ export class SessionKernelProviderTurnsV2 {
           `PlanAction ${request.target.planActionId} is already settled.`
         );
       }
-    } else if (request.remainingToolCallBudget !== undefined) {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_provider_tool_call_budget_unexpected',
-        'Only a PlanAction Provider turn may carry a tool-call budget.'
-      );
+    } else if (request.target.kind === 'interventionResearch') {
+      this.host.requirePlanProjected();
+      this.host.requirePlanAccepted();
+      const research = state.interventionResearch;
+      const input = currentSessionUserInputV2(state);
+      if (
+        !research
+        || state.userIntervention
+        || research.researchId !== request.target.researchId
+        || research.runId !== state.runId
+        || research.inputId !== input.inputId
+        || research.controlEpoch !== state.controlEpoch
+        || !state.plan
+        || research.predecessorPlanRef.planRevision
+          !== state.plan.planRevision
+        || research.predecessorPlanRef.planDigest
+          !== sha256Hash(canonicalJson(state.plan))
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_intervention_research_authority_mismatch',
+          'An intervention research turn must bind the exact active Run, input, control epoch, and accepted predecessor Plan.'
+        );
+      }
     }
   }
 
@@ -2538,6 +2691,13 @@ function providerOutcomeSummary(
   if (output.kind === 'planActionComplete') {
     return { summary: `PlanAction outcome: ${output.outcome}` };
   }
+  if (output.kind === 'intervention') {
+    return {
+      summary: `${output.proposal.problemSummary}\n${
+        output.proposal.options.map((option) => option.title).join('\n')
+      }`.slice(0, 8_192),
+    };
+  }
   return {};
 }
 
@@ -2595,7 +2755,7 @@ function candidateCanPromoteToFinalAnswerV1(
       (coverage) => coverage.omittedCount !== 0
     )
     || review.actualEffects.some(
-      (fact) => reviewFactAuthorityKindV1(fact.details) !== 'contextRead'
+      (fact) => reviewFactAuthorityKindV1(fact.details) !== 'read'
     )
     || review.rejections.some(
       (fact) =>
@@ -2838,7 +2998,7 @@ function terminalItemsMatchProviderOutputV3(
           import('./types.js').SessionProviderTerminalOrderedItemV3,
           { kind: 'toolCall' }
         > => item.kind === 'toolCall'
-          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
       );
       if (
         controlItems.length !== 1
@@ -2907,6 +3067,49 @@ function terminalItemsMatchProviderOutputV3(
       return false;
     }
   }
+  if (
+    targetKind === 'interventionResearch'
+    && output.kind === 'intervention'
+  ) {
+    try {
+      const controlItems = terminalItems.filter(
+        (item): item is Extract<
+          import('./types.js').SessionProviderTerminalOrderedItemV3,
+          { kind: 'toolCall' }
+        > => item.kind === 'toolCall'
+          && item.name
+            === SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME
+      );
+      if (
+        controlItems.length !== 1
+        || terminalTextItems.length + 1 !== terminalItems.length
+        || terminalItems.at(-1) !== controlItems[0]
+        || terminalTextItems.some(
+          (item) => item.phase === 'final_answer'
+        )
+      ) {
+        return false;
+      }
+      const decodedArguments = JSON.parse(
+        controlItems[0]!.arguments
+      ) as unknown;
+      const draft = decodeProviderInterventionArgumentsV1(
+        decodedArguments
+      );
+      const normalizedTextItems = terminalTextItems.map((item) => ({
+        kind: 'text' as const,
+        phase: 'commentary' as const,
+        text: item.text,
+      }));
+      return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
+        && providerInterventionMatchesDraftV1(output.proposal, draft)
+        && controlItems[0]!.callId === output.control.callId
+        && sha256Hash(canonicalJson(decodedArguments))
+          === output.control.argumentsDigest;
+    } catch {
+      return false;
+    }
+  }
   if (terminalItems.length !== outputItems.length) return false;
   return terminalItems.every((terminal, index) => {
     const output = outputItems[index];
@@ -2937,6 +3140,16 @@ function providerPlanMatchesDraftV3(
   return plan.title === draft.title
     && plan.objective === draft.objective
     && plan.narrative === draft.narrative
+    && canonicalJson(plan.evidence) === canonicalJson({
+      kernelFactRefs: [...draft.evidence.kernelFactRefs].sort(),
+      readResources: draft.evidence.readResources.map((resource) => ({
+        ...resource,
+        factRefs: [...resource.factRefs].sort(),
+      })),
+      blockingUnknowns: draft.evidence.blockingUnknowns,
+      nonBlockingUnknowns: draft.evidence.nonBlockingUnknowns,
+      coverage: draft.evidence.coverage,
+    })
     && plan.actions.length === draft.actions.length
     && draft.actions.every((actionDraft, index) => {
       const action = plan.actions[index];
@@ -2952,6 +3165,42 @@ function providerPlanMatchesDraftV3(
     });
 }
 
+function providerInterventionMatchesDraftV1(
+  proposal: SessionProviderInterventionProposalV1,
+  draft: ReturnType<typeof decodeProviderInterventionArgumentsV1>
+): boolean {
+  return proposal.problemSummary === draft.problemSummary
+    && proposal.recommendation === draft.recommendation
+    && canonicalJson(proposal.relevantFactRefs)
+      === canonicalJson([...draft.relevantFactRefs].sort())
+    && canonicalJson(proposal.affectedPlanActionIds)
+      === canonicalJson([...draft.affectedPlanActionIds].sort())
+    && proposal.options.length === draft.options.length
+    && draft.options.every((optionDraft, index) => {
+      const option = proposal.options[index];
+      if (
+        !option
+        || option.optionId !== optionDraft.optionId
+        || option.kind !== optionDraft.kind
+        || option.title !== optionDraft.title
+        || option.description !== optionDraft.description
+        || canonicalJson(option.tradeoffs)
+          !== canonicalJson(optionDraft.tradeoffs)
+        || option.recommended !== optionDraft.recommended
+      ) {
+        return false;
+      }
+      if (!optionDraft.candidatePlan) {
+        return option.candidatePlan === undefined;
+      }
+      return option.candidatePlan !== undefined
+        && providerPlanMatchesDraftV3(
+          option.candidatePlan,
+          optionDraft.candidatePlan
+        );
+    });
+}
+
 function sameProviderOutputIgnoringAdapterTimestampV3(
   left: SessionProviderTurnOutputV2,
   right: SessionProviderTurnOutputV2
@@ -2960,6 +3209,14 @@ function sameProviderOutputIgnoringAdapterTimestampV3(
     const output = cloneJson(value);
     if (output.kind === 'plan') {
       output.plan.recordedAt = '<durable-terminal-recorded-at>';
+    }
+    if (output.kind === 'intervention') {
+      output.proposal.options.forEach((option) => {
+        if (option.candidatePlan) {
+          option.candidatePlan.recordedAt =
+            '<durable-terminal-recorded-at>';
+        }
+      });
     }
     if (output.kind === 'toolIntent') {
       output.receipt.recordedAt = '<durable-terminal-recorded-at>';
@@ -3043,7 +3300,7 @@ function planManifestOperationWasPreviouslySubmitted(
 ): boolean {
   if (
     state.providerToolCallQueue?.calls.some(
-      (call) => call.intent.operationId === operationId
+      (call) => call.intent?.operationId === operationId
     )
   ) {
     return true;

@@ -2,17 +2,17 @@ import type {
   AgentEvent,
   AgentTimelineBlock,
   AgentTimelineDelta,
-  AgentTimelineDeltaOperationV3,
+  AgentTimelineDeltaOperationV4,
   AgentTimelineDeliveryMode,
   AgentTimelineResult,
   AgentTimelineRootProjectionReplacements,
   AgentTimelineSnapshot,
   AgentTimelineTurn,
-  ConversationTextAppendV3,
+  ConversationTextAppendV4,
 } from '@deepcode/protocol';
 import {
-  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3,
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3,
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
 } from '@deepcode/protocol';
 import {
   assertSharedConversationProjectionV3,
@@ -49,9 +49,9 @@ export function isNativeWorkSegmentsTimelineSnapshot(
   if (!isRecord(snapshot)) return false;
   if (
     snapshot.schemaVersion
-      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3
+      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4
     || snapshot.shapeVersion
-      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4
     || !Array.isArray(snapshot.turns)
   ) {
     return false;
@@ -163,7 +163,7 @@ export function createAgentTimelineDelta(
   );
   const nextTurnIds = new Set(next.turns.map((turn) => turn.id));
   const turnReplacements: AgentTimelineTurn[] = [];
-  const operations: AgentTimelineDeltaOperationV3[] = [];
+  const operations: AgentTimelineDeltaOperationV4[] = [];
   for (const turn of next.turns) {
     const existing = currentTurns.get(turn.id);
     if (!existing) {
@@ -189,8 +189,8 @@ export function createAgentTimelineDelta(
   }
 
   return {
-    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3,
+    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
     sessionId: next.sessionId,
     baseRevision: current.revision,
     revision: next.revision,
@@ -227,7 +227,7 @@ export function createProviderComposingTimelineDelta(
     throw new Error('provider_composing_timeline_delta_invalid');
   }
   let replacement: AgentTimelineTurn | undefined;
-  let append: ConversationTextAppendV3 | undefined;
+  let append: ConversationTextAppendV4 | undefined;
   for (let index = 0; index < current.turns.length; index += 1) {
     const before = current.turns[index]!;
     const after = next.turns[index]!;
@@ -456,8 +456,8 @@ export function timelineAsReplay(
 
 export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   return {
-    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3,
+    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
     sessionId,
     revision: 0,
     sourceEventVersion: 0,
@@ -495,9 +495,9 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     !isRecord(delta)
     || !hasExactKeys(delta, deltaKeys)
     || delta.schemaVersion
-      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3
+      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4
     || delta.shapeVersion
-      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4
     || typeof delta.sessionId !== 'string'
     || delta.sessionId.length === 0
     || !isNonnegativeSafeInteger(delta.baseRevision)
@@ -568,7 +568,7 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     ) {
       throw new Error('invalid_timeline_delta_text_append');
     }
-    const append = operation.append as unknown as ConversationTextAppendV3;
+    const append = operation.append as unknown as ConversationTextAppendV4;
     const target = `${append.turnId}\u0000${append.blockId}`;
     if (appendTargets.has(target)) {
       throw new Error('timeline_delta_text_append_duplicate');
@@ -655,7 +655,7 @@ function applyRootProjectionReplacements(
 function exactTextAppendV3(
   before: AgentTimelineTurn,
   after: AgentTimelineTurn
-): ConversationTextAppendV3 | undefined {
+): ConversationTextAppendV4 | undefined {
   if (
     before.id !== after.id
     || before.blocks.length !== after.blocks.length
@@ -666,7 +666,7 @@ function exactTextAppendV3(
   ) {
     return undefined;
   }
-  let append: ConversationTextAppendV3 | undefined;
+  let append: ConversationTextAppendV4 | undefined;
   for (let index = 0; index < before.blocks.length; index += 1) {
     const previousBlock = before.blocks[index]!;
     const nextBlock = after.blocks[index]!;
@@ -682,7 +682,7 @@ function exactBlockTextAppendV3(
   turnId: string,
   before: AgentTimelineBlock,
   after: AgentTimelineBlock
-): ConversationTextAppendV3 | undefined {
+): ConversationTextAppendV4 | undefined {
   const baseRevision = before.revision ?? 0;
   const blockRevision = after.revision ?? 0;
   const beforeBody = before.bodyMarkdown ?? '';
@@ -736,7 +736,7 @@ function exactBlockTextAppendV3(
   };
 }
 
-function validTextAppendV3(value: unknown): value is ConversationTextAppendV3 {
+function validTextAppendV3(value: unknown): value is ConversationTextAppendV4 {
   if (
     !isRecord(value)
     || !hasExactKeys(value, [
@@ -771,7 +771,7 @@ function validTextAppendV3(value: unknown): value is ConversationTextAppendV3 {
 
 function applyTextAppendV3(
   turn: AgentTimelineTurn,
-  append: ConversationTextAppendV3
+  append: ConversationTextAppendV4
 ): AgentTimelineTurn {
   if (turn.id !== append.turnId) {
     throw new Error('timeline_delta_text_append_turn_mismatch');

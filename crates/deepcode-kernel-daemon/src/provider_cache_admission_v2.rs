@@ -25,6 +25,7 @@ pub(crate) enum SessionProviderCacheLaneModeV2 {
 pub(crate) enum SessionProviderCacheLaneRelationKindV2 {
     Bootstrap,
     SameTurnToolContinuation,
+    SameTurnSessionControlContinuation,
     NextUserTurn,
     ExactReplay,
     Reset,
@@ -222,6 +223,9 @@ pub(crate) enum SessionProviderTargetBindingSidecarV2 {
     PlanAction {
         plan_action_id: String,
     },
+    InterventionResearch {
+        research_id: String,
+    },
     FinalAnswer {
         input_id: String,
         control_epoch: u64,
@@ -237,6 +241,7 @@ impl SessionProviderTargetBindingSidecarV2 {
             Self::Planning => "planning",
             Self::ContextRead { .. } => "contextRead",
             Self::PlanAction { .. } => "planAction",
+            Self::InterventionResearch { .. } => "interventionResearch",
             Self::FinalAnswer { .. } => "finalAnswer",
         }
     }
@@ -553,6 +558,7 @@ impl SessionProviderAdmissionSidecarV2 {
                 if !matches!(
                     self.cache_lane.relation_kind,
                     SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+                        | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
                         | SessionProviderCacheLaneRelationKindV2::NextUserTurn
                 ) {
                     return Err(invalid_cache_relation_kind());
@@ -575,6 +581,8 @@ impl SessionProviderAdmissionSidecarV2 {
         }
         let continuation_append = self.cache_lane.relation_kind
             == SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation;
+        let control_continuation_append = self.cache_lane.relation_kind
+            == SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation;
         let next_user_append =
             self.cache_lane.relation_kind == SessionProviderCacheLaneRelationKindV2::NextUserTurn;
         if next_user_append
@@ -611,6 +619,12 @@ impl SessionProviderAdmissionSidecarV2 {
             return Err(HostV2StorageError::invalid(
                 "provider_continuation_operation_identity_invalid",
                 "Provider append continuation operation identities are missing or out of scope",
+            ));
+        }
+        if control_continuation_append && self.purpose != ProviderTracePurposeV1::Continuation {
+            return Err(HostV2StorageError::invalid(
+                "provider_control_continuation_invalid",
+                "Session control continuation must remain in the current Provider turn authority",
             ));
         }
         let mut unique_continuation_operations =
@@ -749,6 +763,9 @@ fn validate_target_binding(
         }
         SessionProviderTargetBindingSidecarV2::PlanAction { plan_action_id } => {
             validate_bounded_identity(plan_action_id, "planActionId", 512)
+        }
+        SessionProviderTargetBindingSidecarV2::InterventionResearch { research_id } => {
+            validate_bounded_identity(research_id, "interventionResearch.researchId", 512)
         }
         SessionProviderTargetBindingSidecarV2::FinalAnswer {
             input_id,

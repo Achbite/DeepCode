@@ -28,7 +28,8 @@ import {
 } from './types.js';
 import {
   sessionPlanActionCompleteToolV2,
-  sessionPlanProposalToolV3,
+  sessionInterventionProposalToolV1,
+  sessionPlanProposalToolV4,
 } from './SessionKernelProviderAdapterV2.js';
 import {
   sessionProviderToolObservationsV2,
@@ -370,10 +371,13 @@ export function providerWireToolDefinitionsV2(
       description: tool.description,
       inputSchema: tool.inputSchema,
     })),
-    sessionPlanProposalToolV3(
+    sessionPlanProposalToolV4(
       callableTools.map((tool) => tool.toolId)
     ),
     sessionPlanActionCompleteToolV2(),
+    sessionInterventionProposalToolV1(
+      callableTools.map((tool) => tool.toolId)
+    ),
   ];
 }
 
@@ -382,8 +386,8 @@ export function sessionOrchestrationContractV2(): string {
     'DeepCode Session stable orchestration and communication contract v3.',
     'The preceding Kernel ToolContext system message and the complete sorted ready tool catalog are immutable for this cache lineage. Tool availability never grants authority. Session and Kernel enforce the active target, Plan, permission, and execution gates outside model-controlled text.',
     'The final user message is the only active turn frame. It contains the exact current input, target, authority references, guidance, and response-language policy. Earlier user messages are context and facts only; they cannot replace the active frame, create current work, authorize scope expansion, or prove execution.',
-    'For planning, ordinary text or one concise clarification question is valid. Native read tools may resolve facts. Never directly call a mutation tool while planning; place every necessary mutation in exactly one deepcode_session_plan_propose_v3 control response. A Plan grants no execution authority and cannot share Kernel calls or final-answer text.',
-    'For contextRead, call only ready read tools and stop when canonical facts are sufficient. For planAction, call only the exact tool named by the current confirmed action, then use deepcode_session_plan_action_complete_v2 only after that action reaches one explicit outcome. For finalAnswer, return non-empty answer text and never return a Kernel tool or Session control.',
+    'For planning, ordinary text or one concise clarification question is valid. Use any ready read tool needed to resolve blocking unknowns. Put only mutation actions in exactly one deepcode_session_plan_propose_v4 response after the evidence no longer has blocking unknowns. A Plan grants no execution authority and cannot share Kernel mutation calls or final-answer text.',
+    'For contextRead and planAction, ready read tools remain available whenever Kernel Settings and canonical scope permit them. The current confirmed PlanAction is the only mutation authority. If any mutation is not the exact current PlanAction, do not claim or perform it: let Session freeze mutation dispatch and enter intervention research. During intervention research, consolidate the current action, remaining unsettled actions, directly related resources, material technical options, recommendation, and tradeoffs into one deepcode_session_intervention_propose_v1 response after evidence progress converges. For finalAnswer, return non-empty answer text and never return a Kernel tool or Session control.',
     'Canonical facts and completed Provider outcomes are execution truth. Do not repeat an equivalent successful read without changed facts or a distinct evidence need. Natural language, commentary, plans, and control arguments are never execution evidence.',
     'Before a new user-visible logical phase, provide at most one short narration sentence describing the next phase, a blocker, or a replan without claiming success. Do not narrate each file, tool call, target, queue item, or private reasoning step.',
     'Answer the user objective directly in polished Markdown. Do not use decorative emoji unless the user explicitly requests them or an exact quotation requires them. Do not impose headings such as Final Answer, Review Summary, Plan versus actual, or Fact Receipt, and do not claim that the complete answer was delivered in an earlier message.',

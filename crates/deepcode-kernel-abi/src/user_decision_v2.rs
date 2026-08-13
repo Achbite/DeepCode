@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -136,6 +137,7 @@ pub enum UserDecisionV2 {
         binding: CapabilityDecisionBindingV2,
         guidance: String,
     },
+    InterventionSelect(InterventionSelectDecisionV3),
     TrustGrant(TrustGrantDecisionV2),
     Revoke(UserDecisionRevokeV2),
 }
@@ -148,7 +150,7 @@ pub fn user_decision_request_digest_v2(
     decision: &UserDecisionV2,
 ) -> Result<CommandRequestDigestV2, V2ValidationError> {
     Ok(CommandRequestDigestV2::from_raw_digest(typed_digest(
-        "deepcode.kernel.abi.v2/user-decision-request",
+        "deepcode.kernel.abi.v3/user-decision-request",
         &serde_json::json!({
             "abiVersion": KERNEL_ABI_V2_VERSION,
             "runId": run_id,
@@ -169,9 +171,64 @@ impl UserDecisionV2 {
                 binding.validate()?;
                 validate_guidance(guidance)
             }
+            Self::InterventionSelect(decision) => decision.validate(),
             Self::TrustGrant(decision) => decision.validate(),
             Self::Revoke(decision) => decision.validate(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterventionSelectDecisionV3 {
+    pub input_id: InputId,
+    pub decision_ref: UserDecisionRefV2,
+    pub interaction_id: String,
+    pub interaction_revision: String,
+    pub candidate_set_digest: String,
+    pub selected_option_id: String,
+    pub selected_bindings: Vec<CapabilityDecisionBindingV2>,
+    pub superseded_preview_ids: Vec<CapabilityScopePreviewIdV2>,
+}
+
+impl InterventionSelectDecisionV3 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_decision_identity("interactionId", &self.interaction_id)?;
+        validate_decision_identity("interactionRevision", &self.interaction_revision)?;
+        validate_decision_digest("candidateSetDigest", &self.candidate_set_digest)?;
+        validate_decision_identity("selectedOptionId", &self.selected_option_id)?;
+        if self.selected_bindings.is_empty() || self.selected_bindings.len() > 256 {
+            return Err(invalid_value(
+                "selectedBindings",
+                "must contain 1..=256 candidate bindings",
+            ));
+        }
+        if self.superseded_preview_ids.len() > 256 {
+            return Err(invalid_value(
+                "supersededPreviewIds",
+                "must contain at most 256 preview identities",
+            ));
+        }
+        let mut selected = BTreeSet::new();
+        for binding in &self.selected_bindings {
+            binding.validate()?;
+            if !selected.insert(binding.scope_preview_id.as_str()) {
+                return Err(invalid_value(
+                    "selectedBindings.scopePreviewId",
+                    "must be unique",
+                ));
+            }
+        }
+        let mut superseded = BTreeSet::new();
+        for preview_id in &self.superseded_preview_ids {
+            if selected.contains(preview_id.as_str()) || !superseded.insert(preview_id.as_str()) {
+                return Err(invalid_value(
+                    "supersededPreviewIds",
+                    "must be unique and disjoint from selected bindings",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -310,6 +367,12 @@ pub enum UserDecisionReplyV2 {
         fact_id: FactId,
         ledger_sequence: u64,
     },
+    InterventionSelected {
+        leases: Vec<CapabilityLeaseRefV2>,
+        selected_fact_ids: Vec<FactId>,
+        superseded_fact_ids: Vec<FactId>,
+        ledger_sequence: u64,
+    },
     TrustGranted {
         trust_policy_id: TrustPolicyIdV2,
         trust_lease_digest: TrustLeaseDigestV2,
@@ -342,6 +405,9 @@ impl UserDecisionReplyV2 {
             | Self::ScopeExpansionDenied {
                 ledger_sequence, ..
             }
+            | Self::InterventionSelected {
+                ledger_sequence, ..
+            }
             | Self::TrustGranted {
                 ledger_sequence, ..
             }
@@ -352,6 +418,24 @@ impl UserDecisionReplyV2 {
         };
         if ledger_sequence == Some(0) {
             return Err(invalid_value("ledgerSequence", "must be greater than zero"));
+        }
+        if let Self::InterventionSelected {
+            leases,
+            selected_fact_ids,
+            superseded_fact_ids,
+            ..
+        } = self
+        {
+            if leases.is_empty()
+                || leases.len() != selected_fact_ids.len()
+                || leases.len() > 256
+                || superseded_fact_ids.len() > 256
+            {
+                return Err(invalid_value(
+                    "interventionSelected",
+                    "must bind 1..=256 selected leases to facts and at most 256 superseded facts",
+                ));
+            }
         }
         let encoded = serde_json::to_value(self)
             .map_err(|_| invalid_value("userDecisionReply", "must serialize"))?;
@@ -381,6 +465,32 @@ fn validate_guidance(value: &str) -> Result<(), V2ValidationError> {
             "guidance",
             "must contain 1..=16384 bytes without control characters",
         ));
+    }
+    Ok(())
+}
+
+fn validate_decision_identity(field: &'static str, value: &str) -> Result<(), V2ValidationError> {
+    if value.is_empty()
+        || value.len() > 512
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid_value(
+            field,
+            "must be a 1..=512 byte identity without whitespace padding or controls",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decision_digest(field: &'static str, value: &str) -> Result<(), V2ValidationError> {
+    if value.len() != 71
+        || !value.starts_with("sha256:")
+        || !value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_value(field, "must be a lowercase sha256 digest"));
     }
     Ok(())
 }

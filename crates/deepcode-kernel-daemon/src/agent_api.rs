@@ -24,6 +24,11 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) guidance: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) target_id: Option<String>,
+    pub(crate) option_id: Option<String>,
+    pub(crate) interaction_id: Option<String>,
+    pub(crate) interaction_revision: Option<String>,
+    pub(crate) candidate_set_digest: Option<String>,
+    pub(crate) expected_projection_cursor: Option<u64>,
     pub(crate) conversation_target: Option<AgentConversationTargetV1>,
     pub(crate) caller_request_id: String,
 }
@@ -506,6 +511,11 @@ pub(crate) async fn agent_conversation_draft_run_start(
         guidance: None,
         run_id: None,
         target_id: None,
+        option_id: None,
+        interaction_id: None,
+        interaction_revision: None,
+        candidate_set_digest: None,
+        expected_projection_cursor: None,
         conversation_target: Some(conversation_target),
         caller_request_id: caller_request_id.to_string(),
     };

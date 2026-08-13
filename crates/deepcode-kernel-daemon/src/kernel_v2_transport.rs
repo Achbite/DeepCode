@@ -22,9 +22,9 @@ use deepcode_kernel_abi::v2_command::{
     ToolContextGetReplyV2,
 };
 use deepcode_kernel_abi::{
-    decode_user_decision_v2, CapabilityScopePreviewIdV2, KernelV2HttpErrorCode,
-    KernelV2HttpErrorEnvelope, RunCapabilityV2, TrustGrantDecisionV2, TrustPolicyIdV2,
-    UserDecisionEnvelopeV2, UserDecisionErrorV2, UserDecisionReplyV2,
+    decode_user_decision_v2, CapabilityScopePreviewIdV2, InterventionSelectDecisionV3,
+    KernelV2HttpErrorCode, KernelV2HttpErrorEnvelope, RunCapabilityV2, TrustGrantDecisionV2,
+    TrustPolicyIdV2, UserDecisionEnvelopeV2, UserDecisionErrorV2, UserDecisionReplyV2,
     UserDecisionResponseEnvelopeV2, UserDecisionRevokeTargetV2, UserDecisionV2,
     KERNEL_ABI_V2_VERSION,
 };
@@ -60,6 +60,17 @@ pub(crate) struct HostCapabilityDecisionRequestV2 {
     pub(crate) scope_preview_id: CapabilityScopePreviewIdV2,
     pub(crate) decision: HostCapabilityDecisionKindV2,
     pub(crate) guidance: String,
+}
+
+pub(crate) struct HostInterventionSelectionRequestV3 {
+    pub(crate) request_id: CommandRequestId,
+    pub(crate) decision_ref: UserDecisionRefV2,
+    pub(crate) interaction_id: String,
+    pub(crate) interaction_revision: String,
+    pub(crate) candidate_set_digest: String,
+    pub(crate) selected_option_id: String,
+    pub(crate) selected_preview_ids: Vec<CapabilityScopePreviewIdV2>,
+    pub(crate) superseded_preview_ids: Vec<CapabilityScopePreviewIdV2>,
 }
 
 pub(crate) struct HostTrustGrantRequestV2 {
@@ -175,6 +186,86 @@ impl KernelV2TransportState {
             request.request_id,
             pending.run_id,
             pending.expected_control_epoch,
+            decision,
+        )
+    }
+
+    /// Atomically selects one fully previewed intervention candidate set.
+    /// Every preview is rebound from Kernel state before the single user
+    /// decision command is admitted; Session and Host projections never act
+    /// as effect authority.
+    pub(crate) fn apply_host_intervention_selection(
+        &self,
+        request: HostInterventionSelectionRequestV3,
+    ) -> Result<UserDecisionResponseEnvelopeV2, HostCapabilityDecisionApplyErrorV2> {
+        if request.selected_preview_ids.is_empty() {
+            return Err(HostCapabilityDecisionApplyErrorV2::Kernel(
+                UserDecisionErrorV2::PlanBindingMismatch,
+            ));
+        }
+        let mut selected = Vec::with_capacity(request.selected_preview_ids.len());
+        let mut resolved_run = None;
+        let mut resolved_epoch = None;
+        let mut resolved_input = None;
+        for preview_id in request
+            .selected_preview_ids
+            .iter()
+            .chain(request.superseded_preview_ids.iter())
+        {
+            let pending = self
+                .service
+                .resolve_pending_capability_decision_host(
+                    preview_id.clone(),
+                    request.decision_ref.clone(),
+                )
+                .map_err(|_| {
+                    HostCapabilityDecisionApplyErrorV2::Transport(
+                        KernelV2HttpErrorCode::ServiceUnavailable,
+                    )
+                })?
+                .map_err(HostCapabilityDecisionApplyErrorV2::Kernel)?;
+            if resolved_run
+                .as_ref()
+                .is_some_and(|run_id| run_id != &pending.run_id)
+                || resolved_epoch.is_some_and(|epoch| epoch != pending.expected_control_epoch)
+                || resolved_input
+                    .as_ref()
+                    .is_some_and(|input_id| input_id != &pending.binding.input_id)
+            {
+                return Err(HostCapabilityDecisionApplyErrorV2::Kernel(
+                    UserDecisionErrorV2::PlanBindingMismatch,
+                ));
+            }
+            resolved_run.get_or_insert_with(|| pending.run_id.clone());
+            resolved_epoch.get_or_insert(pending.expected_control_epoch);
+            resolved_input.get_or_insert_with(|| pending.binding.input_id.clone());
+            if request.selected_preview_ids.contains(preview_id) {
+                selected.push(pending.binding);
+            }
+        }
+        let run_id = resolved_run.ok_or_else(|| {
+            HostCapabilityDecisionApplyErrorV2::Kernel(UserDecisionErrorV2::PlanBindingMismatch)
+        })?;
+        let expected_control_epoch = resolved_epoch.ok_or_else(|| {
+            HostCapabilityDecisionApplyErrorV2::Kernel(UserDecisionErrorV2::PlanBindingMismatch)
+        })?;
+        let input_id = resolved_input.ok_or_else(|| {
+            HostCapabilityDecisionApplyErrorV2::Kernel(UserDecisionErrorV2::PlanBindingMismatch)
+        })?;
+        let decision = UserDecisionV2::InterventionSelect(InterventionSelectDecisionV3 {
+            input_id,
+            decision_ref: request.decision_ref,
+            interaction_id: request.interaction_id,
+            interaction_revision: request.interaction_revision,
+            candidate_set_digest: request.candidate_set_digest,
+            selected_option_id: request.selected_option_id,
+            selected_bindings: selected,
+            superseded_preview_ids: request.superseded_preview_ids,
+        });
+        self.apply_host_resolved_user_decision(
+            request.request_id,
+            run_id,
+            expected_control_epoch,
             decision,
         )
     }

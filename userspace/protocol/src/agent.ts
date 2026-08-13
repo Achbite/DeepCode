@@ -8,6 +8,7 @@ export type AgentEventKind =
   | 'tool_result'
   | 'permission_request'
   | 'permission_result'
+  | 'user_intervention'
   | 'session_run_state'
   | 'workflow_stage'
   | 'error';
@@ -256,12 +257,17 @@ export const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3 =
   'deepcode.shared-conversation-projection.v3' as const;
 export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3 =
   'deepcode.shared-conversation.work-segments.v3' as const;
+export const AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4 =
+  'deepcode.shared-conversation-projection.v4' as const;
+export const AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4 =
+  'deepcode.shared-conversation.work-segments.v4' as const;
 
 export type AgentTimelineBlockKind =
   | 'user'
   | 'assistant'
   | 'permission'
   | 'plan'
+  | 'userIntervention'
   | 'review'
   | 'error';
 
@@ -270,6 +276,7 @@ export type AgentTimelineNarrativeKind =
   | 'assistantText'
   | 'plan'
   | 'permission'
+  | 'userIntervention'
   | 'review'
   | 'diagnostic';
 
@@ -400,7 +407,7 @@ export interface AgentTimelineDisplayHints {
   density?: 'normal' | 'compact' | 'debug';
   evidenceMode?: 'inline' | 'collapsed' | 'debugOnly';
   collapseAfterComplete?: boolean;
-  checkpointKind?: 'turnStart' | 'llmProposal' | 'resourceFact' | 'userGuidance' | 'permission' | 'review' | 'final' | 'diagnostic';
+  checkpointKind?: 'turnStart' | 'llmProposal' | 'resourceFact' | 'userGuidance' | 'permission' | 'userIntervention' | 'review' | 'final' | 'diagnostic';
   showInTaskList?: boolean;
   taskListLabel?: string;
   taskListSummary?: string;
@@ -451,6 +458,40 @@ export interface AgentTimelineInteractionOption {
   recommended?: boolean;
 }
 
+export interface AgentTimelineInterventionCandidateActionV4 {
+  planActionId: string;
+  operationId: string;
+  toolId: string;
+  summary: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  canonicalTargets: string[];
+  scopeDelta: string[];
+  previewId: string;
+  previewDigest: string;
+}
+
+export interface AgentTimelineInterventionOptionV4
+  extends AgentTimelineInteractionOption {
+  kind: 'executable' | 'guidanceOnly';
+  tradeoffs: string[];
+  candidatePlanRevision?: string;
+  candidatePlanDigest?: string;
+  actions: AgentTimelineInterventionCandidateActionV4[];
+}
+
+export interface AgentTimelineUserInterventionViewV4 {
+  schemaVersion: 'deepcode.session.user-intervention.v1';
+  interactionId: string;
+  interactionRevision: string;
+  candidateSetDigest: string;
+  problemSummary: string;
+  recommendation?: string;
+  relevantFacts: string[];
+  affectedPlanActionIds: string[];
+  options: AgentTimelineInterventionOptionV4[];
+  allowsFreeform: true;
+}
+
 export interface AgentTimelineDecisionRequest {
   id?: string;
   reason?: string;
@@ -494,7 +535,7 @@ export interface AgentTimelineInteractionIdentity {
 }
 
 export interface AgentTimelineInteractionView extends AgentTimelineInteractionIdentity {
-  kind: 'plan' | 'permission';
+  kind: 'plan' | 'permission' | 'userIntervention';
   runId?: string;
   state: AgentTimelineInteractionState;
   decisionRequest?: AgentTimelineDecisionRequest;
@@ -518,6 +559,15 @@ export type AgentTimelinePendingInteraction =
       kind: 'plan';
       runId: string;
       planId: string;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+    })
+  | (AgentTimelineInteractionIdentity & {
+      kind: 'userIntervention';
+      runId: string;
+      candidateSetDigest: string;
+      intervention: AgentTimelineUserInterventionViewV4;
       blockId?: string;
       title?: string;
       summary?: string;
@@ -587,7 +637,7 @@ export const AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2 =
   'deepcode.session.readable-review.v2' as const;
 
 export interface AgentTimelineStructuredProjection {
-  kind: 'plan' | 'review';
+  kind: 'plan' | 'userIntervention' | 'review';
   schemaVersion: string;
   title?: string;
   titleKey?: string;
@@ -725,8 +775,8 @@ export interface AgentTimelineTurn {
 }
 
 export interface AgentTimelineResult {
-  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3;
-  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3;
+  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4;
   sessionId: string;
   revision: number;
   sourceEventVersion: number;
@@ -749,7 +799,7 @@ export interface AgentTimelineRootProjectionReplacements {
   workspaceProjection?: AgentTimelineWorkspaceProjection | null;
 }
 
-export interface ConversationTextAppendV3 {
+export interface ConversationTextAppendV4 {
   turnId: string;
   blockId: string;
   baseBlockRevision: number;
@@ -758,10 +808,10 @@ export interface ConversationTextAppendV3 {
   sourceEventRefs: string[];
 }
 
-export type AgentTimelineDeltaOperationV3 =
+export type AgentTimelineDeltaOperationV4 =
   | {
       kind: 'text.append';
-      append: ConversationTextAppendV3;
+      append: ConversationTextAppendV4;
     }
   | {
       kind: 'run.updated';
@@ -769,8 +819,8 @@ export type AgentTimelineDeltaOperationV3 =
     };
 
 export interface AgentTimelineDelta {
-  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3;
-  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3;
+  schemaVersion: typeof AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4;
+  shapeVersion: typeof AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4;
   sessionId: string;
   baseRevision: number;
   revision: number;
@@ -779,7 +829,7 @@ export interface AgentTimelineDelta {
   eventCount: number;
   turnReplacements: AgentTimelineTurn[];
   removedTurnIds: string[];
-  operations: AgentTimelineDeltaOperationV3[];
+  operations: AgentTimelineDeltaOperationV4[];
   rootReplacements: AgentTimelineRootProjectionReplacements;
 }
 
@@ -842,7 +892,7 @@ export interface AskAgentRunRequest {
   callerRequestId: string;
 }
 
-export interface ResolveAgentRunDecisionRequest {
+export interface ResolveAgentRunStandardDecisionRequest {
   op: 'resolveDecision';
   decisionKind: 'plan' | 'permission';
   decision: 'accept' | 'reject' | 'revise';
@@ -852,6 +902,26 @@ export interface ResolveAgentRunDecisionRequest {
   conversationTarget: AgentConversationTargetV1;
   callerRequestId: string;
 }
+
+export interface ResolveAgentRunInterventionDecisionRequest {
+  op: 'resolveDecision';
+  decisionKind: 'userIntervention';
+  decision: 'select' | 'revise' | 'reject';
+  optionId?: string;
+  guidance?: string;
+  runId: string;
+  targetId: string;
+  interactionId: string;
+  interactionRevision: string;
+  candidateSetDigest: string;
+  expectedProjectionCursor: number;
+  conversationTarget: AgentConversationTargetV1;
+  callerRequestId: string;
+}
+
+export type ResolveAgentRunDecisionRequest =
+  | ResolveAgentRunStandardDecisionRequest
+  | ResolveAgentRunInterventionDecisionRequest;
 
 export type StartAgentRunRequest =
   | AskAgentRunRequest

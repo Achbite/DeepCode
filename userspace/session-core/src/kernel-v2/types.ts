@@ -26,9 +26,9 @@ import type {
 import type { ProviderKernelToolSourceV2 } from './toolIntent.js';
 
 export const SESSION_KERNEL_LOOP_V2_SCHEMA =
-  'deepcode.session.kernel-loop.v3' as const;
+  'deepcode.session.kernel-loop.v4' as const;
 export const SESSION_KERNEL_CHECKPOINT_V2_SCHEMA =
-  'deepcode.session.kernel-checkpoint.v3' as const;
+  'deepcode.session.kernel-checkpoint.v4' as const;
 export const SESSION_KERNEL_REVIEW_PROJECTION_V2 =
   'deepcode.session.kernel-review-projection.v2' as const;
 export const SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA =
@@ -40,11 +40,11 @@ export const SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA =
 export const SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA =
   'deepcode.provider-stream-terminal.v1' as const;
 export const SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA =
-  'deepcode.session.provider-turn-dispatch.v3' as const;
+  'deepcode.session.provider-turn-dispatch.v4' as const;
 export const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA =
-  'deepcode.session.provider-turn-terminal.v3' as const;
+  'deepcode.session.provider-turn-terminal.v4' as const;
 export const SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA =
-  'deepcode.session.tool-context-snapshot.v3' as const;
+  'deepcode.session.tool-context-snapshot.v4' as const;
 export const SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA =
   'deepcode.session.terminal-answer-candidate.v1' as const;
 
@@ -55,6 +55,8 @@ export type SessionWorkAuthorityV3 =
     }
   | {
       kind: 'contextRead';
+      batchSequence: number;
+      predecessorDigest: string | null;
       operationIds: string[];
       digest: string;
     };
@@ -290,6 +292,39 @@ export interface SessionPlanActionV2 {
   deadline: DeadlineRequestV2;
 }
 
+export interface SessionPlanEvidenceResourceV4 {
+  resourceRef: string;
+  digest: string;
+  summary: string;
+  factRefs: string[];
+}
+
+export interface SessionPlanUnknownV4 {
+  unknownId: string;
+  question: string;
+  impact: string;
+}
+
+export interface SessionPlanEvidenceV4 {
+  kernelFactRefs: string[];
+  readResources: SessionPlanEvidenceResourceV4[];
+  blockingUnknowns: SessionPlanUnknownV4[];
+  nonBlockingUnknowns: SessionPlanUnknownV4[];
+  coverage: string;
+}
+
+export interface SessionPredecessorPlanRefV4 {
+  planRevision: string;
+  planDigest: string;
+}
+
+export interface SessionCarriedSettlementRefV4 {
+  planRevision: string;
+  planActionId: string;
+  settlementDigest: string;
+  kernelFactRefs: string[];
+}
+
 /**
  * Plan prose remains Session-owned. ScopeManifest is the structured,
  * persistable boundary used later for Kernel preview and ToolIntent binding.
@@ -301,6 +336,9 @@ export interface SessionNaturalLanguagePlanV2 {
   title: string;
   objective: string;
   narrative: string;
+  evidence: SessionPlanEvidenceV4;
+  predecessorPlanRef?: SessionPredecessorPlanRefV4;
+  carriedSettlementRefs: SessionCarriedSettlementRefV4[];
   actions: SessionPlanActionV2[];
   recordedAt: string;
 }
@@ -382,6 +420,10 @@ export type SessionProviderTurnTargetV2 =
       idempotencyKey: string;
       deadline?: DeadlineRequestV2;
     }
+  | {
+      kind: 'interventionResearch';
+      researchId: string;
+    }
   | ({
       kind: 'finalAnswer';
     } & SessionFinalAnswerBindingV3);
@@ -442,11 +484,6 @@ export interface SessionProviderTurnRequestV2 {
     | 'finalAnswer';
   target: SessionProviderTurnTargetV2;
   guidance?: string[];
-  /**
-   * Remaining Kernel tool-call admissions for this PlanAction drive. This is
-   * Session control state and is never included in Provider context.
-   */
-  remainingToolCallBudget?: number;
 }
 
 /**
@@ -602,6 +639,16 @@ export type SessionProviderTurnOutputV2 = (
       };
     }
   | {
+      kind: 'intervention';
+      proposal: import('./SessionKernelProviderAdapterV2.js').SessionProviderInterventionProposalV1;
+      control: {
+        schemaVersion: 'deepcode.session.intervention-proposal.v1';
+        callId: string;
+        toolName: 'deepcode_session_intervention_propose_v1';
+        argumentsDigest: string;
+      };
+    }
+  | {
       kind: 'answer';
       text: string;
     }
@@ -657,7 +704,102 @@ export type SessionActiveWaitV2 =
       invocationId?: string;
       reason: 'indeterminate';
       factIds: string[];
+    }
+  | {
+      kind: 'userIntervention';
+      interactionId: string;
+      interactionRevision: string;
+      candidateSetDigest: string;
+      sinceHighWater: number;
     };
+
+export interface SessionInterventionCandidateActionV4 {
+  planActionId: string;
+  operationId: string;
+  toolId: string;
+  summary: string;
+  preview: CapabilityScopePreviewRecordV2;
+}
+
+export interface SessionInterventionOptionV4 {
+  optionId: string;
+  kind: 'executable' | 'guidanceOnly';
+  title: string;
+  description: string;
+  tradeoffs: string[];
+  recommended: boolean;
+  candidatePlan?: SessionNaturalLanguagePlanV2;
+  actions: SessionInterventionCandidateActionV4[];
+}
+
+export interface SessionUserInterventionV4 {
+  schemaVersion: 'deepcode.session.user-intervention.v1';
+  runId: string;
+  inputId: string;
+  controlEpoch: number;
+  interactionId: string;
+  interactionRevision: string;
+  candidateSetDigest: string;
+  problemSummary: string;
+  recommendation?: string;
+  relevantFactRefs: string[];
+  affectedPlanActionIds: string[];
+  options: SessionInterventionOptionV4[];
+  evidenceProgressDigest: string;
+  recordedAt: string;
+}
+
+export interface SessionUserInterventionDecisionV4 {
+  interactionId: string;
+  interactionRevision: string;
+  candidateSetDigest: string;
+  decision: 'select' | 'revise' | 'reject';
+  optionId?: string;
+  guidance?: string;
+  callerRequestId: string;
+  recordedAt: string;
+}
+
+export interface SessionUserInterventionDecisionResultV4 {
+  decision: SessionUserInterventionDecisionV4;
+  disposition:
+    | 'planAccepted'
+    | 'guidanceReplan'
+    | 'researchRevision'
+    | 'runCancellationRequired';
+  planRevision?: string;
+}
+
+export interface SessionInterventionDiscoveryCandidateV4 {
+  discoveryId: string;
+  operationId: string;
+  toolId: string;
+  argumentsDigest: string;
+  classification: 'planned' | 'outOfPlan';
+  preview?: CapabilityScopePreviewRecordV2;
+  rejection?: {
+    reason: import('@deepcode/protocol').CapabilityScopeRejectionReasonV2;
+    guidance: string;
+  };
+}
+
+export interface SessionInterventionResearchV4 {
+  schemaVersion: 'deepcode.session.intervention-research.v1';
+  runId: string;
+  inputId: string;
+  controlEpoch: number;
+  researchId: string;
+  triggerProviderTurnId: string;
+  predecessorPlanRef: SessionPredecessorPlanRefV4;
+  triggerCandidates: SessionInterventionDiscoveryCandidateV4[];
+  triggerCandidateSetDigest: string;
+  evidenceProgressDigest: string;
+  previousEvidenceProgressDigest?: string;
+  lastCandidateSetDigest?: string;
+  guidanceRevision: number;
+  startedAt: string;
+  updatedAt: string;
+}
 
 type ContextRequestPayloadV2 = {
   knownContext?: ToolContextRefV2;
@@ -731,12 +873,6 @@ export interface SessionProviderTurnRecordV2 {
   target: SessionProviderTurnTargetV2;
   /** Plan revision present in the Provider request context, if any. */
   planRevision?: string;
-  /**
-   * Exact remaining admission budget captured before dispatch. It is required
-   * only for a PlanAction turn so a sealed multi-call response can be
-   * deterministically admitted after Session restart.
-   */
-  remainingToolCallBudget?: number;
   /**
    * Durable Session-only candidate captured before the prior settled queue is
    * released. If this turn returns tools, only its first operation may consume
@@ -951,6 +1087,7 @@ export interface SessionKernelProjectionEventV2 {
     | 'authorization.decided'
     | 'review.revised'
     | 'planAction.completed'
+    | 'userIntervention.changed'
     | 'run.cancelled'
     | 'wait.changed'
     | 'diagnostic';

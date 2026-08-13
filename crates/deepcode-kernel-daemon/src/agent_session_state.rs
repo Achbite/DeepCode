@@ -2,7 +2,7 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) const AGENT_SESSION_SCHEMA_V2: &str = "deepcode.agent.session.v2";
-pub(crate) const SESSION_KERNEL_HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v3";
+pub(crate) const SESSION_KERNEL_HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v4";
 pub(crate) const AGENT_CONVERSATION_TARGET_SCHEMA_V1: &str = "deepcode.host.conversation-target.v1";
 pub(crate) const AGENT_PROJECT_CONVERSATION_TARGET_SCHEMA_V1: &str =
     "deepcode.host.project-conversation-target.v1";
@@ -617,7 +617,8 @@ pub(crate) fn current_agent_session_id_for_scope(
         .sessions
         .iter()
         .find(|session| {
-            session_is_publicly_selectable(session) && session_scope_key(session) == scope_key
+            session_is_publicly_selectable(session)
+                && session_scope_key(session) == scope_key
                 && session.get("projectId").and_then(Value::as_str).is_none()
         })
         .and_then(|session| session.get("id").and_then(Value::as_str))

@@ -67,6 +67,11 @@ type PlanResolution = {
   decision: 'accept' | 'reject' | 'revise';
 };
 
+type InterventionResolution = {
+  interactionId: string;
+  decision: 'select' | 'revise' | 'reject';
+};
+
 export interface AgentSessionSubmissionTarget {
   sessionId: string;
   selectionGeneration: number;
@@ -91,6 +96,7 @@ interface AgentSessionState {
   pendingPermission: PendingPermission | null;
   resolvingPermission: PermissionResolution | null;
   resolvingPlan: PlanResolution | null;
+  resolvingIntervention?: InterventionResolution | null;
 }
 
 interface AgentSessionActions {
@@ -123,6 +129,17 @@ interface AgentSessionActions {
   acceptPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   rejectPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
+  resolveUserIntervention: (input: {
+    runId: string;
+    targetId: string;
+    interactionId: string;
+    interactionRevision: string;
+    candidateSetDigest: string;
+    expectedProjectionCursor: number;
+    decision: 'select' | 'revise' | 'reject';
+    optionId?: string;
+    guidance?: string;
+  }) => Promise<void>;
 }
 
 type Store = AgentSessionState & AgentSessionActions;
@@ -2636,6 +2653,86 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ? message
           : state.errorMessage,
         resolvingPlan: null,
+      }));
+    } finally {
+      void stopProgressWatcher();
+    }
+  },
+
+  resolveUserIntervention: async (input) => {
+    const session = get().session;
+    const timeline = get().timeline;
+    const pending = timeline?.interactionProjection?.pending;
+    if (!session || get().resolvingIntervention) return;
+    if (
+      pending?.kind !== 'userIntervention'
+      || pending.runId !== input.runId
+      || pending.targetId !== input.targetId
+      || pending.interactionId !== input.interactionId
+      || pending.interactionRevision !== input.interactionRevision
+      || pending.candidateSetDigest !== input.candidateSetDigest
+      || timeline?.revision !== input.expectedProjectionCursor
+    ) {
+      set({
+        errorMessage: 'The user intervention changed before this decision was submitted.',
+      });
+      return;
+    }
+    if (
+      input.decision === 'select'
+      && !pending.intervention.options.some((option) => option.id === input.optionId)
+    ) {
+      set({ errorMessage: 'The selected intervention option is no longer available.' });
+      return;
+    }
+    set({
+      resolvingIntervention: {
+        interactionId: input.interactionId,
+        decision: input.decision,
+      },
+      errorMessage: null,
+    });
+    const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
+    try {
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'resolveDecision',
+        decisionKind: 'userIntervention',
+        decision: input.decision,
+        optionId: input.optionId,
+        guidance: input.guidance,
+        runId: input.runId,
+        targetId: input.targetId,
+        interactionId: input.interactionId,
+        interactionRevision: input.interactionRevision,
+        candidateSetDigest: input.candidateSetDigest,
+        expectedProjectionCursor: input.expectedProjectionCursor,
+        conversationTarget: session.conversationTarget,
+        callerRequestId: newHostCallerRequestId('intervention-decision'),
+      });
+      const data = { session: result.session };
+      set((state) => {
+        const nextState: Partial<Store> = {
+          sessions: [
+            data.session,
+            ...state.sessions.filter((item) => item.id !== data.session.id),
+          ],
+          resolvingIntervention: null,
+        };
+        if (state.session?.id === data.session.id) {
+          nextState.session = data.session;
+          nextState.currentSessionId = data.session.id;
+        }
+        return nextState;
+      });
+      markCanonicalTimelineStale(data.session.id);
+      await refreshCanonicalTimeline(data.session.id, true, true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        errorMessage: state.session?.id === session.id
+          ? message
+          : state.errorMessage,
+        resolvingIntervention: null,
       }));
     } finally {
       void stopProgressWatcher();

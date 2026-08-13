@@ -2,6 +2,7 @@ import type {
   AgentTimelinePendingInteraction,
   AgentTimelinePermissionRequestView,
   AgentTimelineResult,
+  AgentTimelineUserInterventionViewV4,
 } from '@deepcode/protocol';
 
 export type AgentComposerPendingDecision =
@@ -22,29 +23,53 @@ export type AgentComposerPendingDecision =
       title?: string;
       summary?: string;
       resolving?: boolean;
+    }
+  | {
+      kind: 'userIntervention';
+      interactionId: string;
+      interactionRevision: string;
+      candidateSetDigest: string;
+      projectionCursor: number;
+      runId: string;
+      targetId: string;
+      intervention: AgentTimelineUserInterventionViewV4;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+      resolving?: boolean;
     };
 
 export function findPendingComposerDecisionFromProjection(input: {
   timeline: AgentTimelineResult;
   resolvingPlan?: { runId: string; planId: string } | null;
   resolvingPermission?: { id: string } | null;
+  resolvingIntervention?: { interactionId: string } | null;
 }): AgentComposerPendingDecision | null {
   const active = input.timeline.interactionProjection?.pending;
-  if (!active || (active.kind !== 'plan' && active.kind !== 'permission')) return null;
+  if (!active) return null;
   return withResolvingState(active, input);
 }
 
 function withResolvingState(
-  active: Extract<AgentTimelinePendingInteraction, { kind: 'plan' | 'permission' }>,
+  active: AgentTimelinePendingInteraction,
   input: {
+    timeline: AgentTimelineResult;
     resolvingPlan?: { runId: string; planId: string } | null;
     resolvingPermission?: { id: string } | null;
+    resolvingIntervention?: { interactionId: string } | null;
   }
 ): AgentComposerPendingDecision {
   if (active.kind === 'permission') {
     return {
       ...active,
       resolving: input.resolvingPermission?.id === active.requestId,
+    };
+  }
+  if (active.kind === 'userIntervention') {
+    return {
+      ...active,
+      projectionCursor: input.timeline.revision,
+      resolving: input.resolvingIntervention?.interactionId === active.interactionId,
     };
   }
   return {

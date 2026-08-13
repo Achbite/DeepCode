@@ -49,7 +49,7 @@ LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
-KERNEL_ABI_VERSION="deepcode.kernel.abi.v2"
+KERNEL_ABI_VERSION="deepcode.kernel.abi.v3"
 TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
 SESSION_BRIDGE_NAME="hostBridgeV2.js"
 

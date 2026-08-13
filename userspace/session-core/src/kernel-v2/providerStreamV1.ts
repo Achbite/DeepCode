@@ -116,6 +116,7 @@ export type SessionKernelProviderCachePredecessorV2 =
         | 'planning'
         | 'contextRead'
         | 'planAction'
+        | 'interventionResearch'
         | 'finalAnswer';
       targetBindingDigest: string;
       toolSchemaDigest: string;
@@ -131,6 +132,7 @@ export type SessionKernelProviderCachePredecessorV2 =
         relationKind:
           | 'bootstrap'
           | 'sameTurnToolContinuation'
+          | 'sameTurnSessionControlContinuation'
           | 'nextUserTurn'
           | 'exactReplay'
           | 'reset';
@@ -1537,6 +1539,7 @@ function decodeProviderCachePredecessorV2(
     targetKind !== 'planning'
     && targetKind !== 'contextRead'
     && targetKind !== 'planAction'
+    && targetKind !== 'interventionResearch'
     && targetKind !== 'finalAnswer'
   ) {
     throw new SessionKernelProviderTransportError(
@@ -1608,6 +1611,7 @@ function decodeProviderCachePredecessorV2(
   if (![
     'bootstrap',
     'sameTurnToolContinuation',
+    'sameTurnSessionControlContinuation',
     'nextUserTurn',
     'exactReplay',
     'reset',
@@ -1698,6 +1702,7 @@ function decodeProviderCachePredecessorV2(
       relationKind: relationKind as
         | 'bootstrap'
         | 'sameTurnToolContinuation'
+        | 'sameTurnSessionControlContinuation'
         | 'nextUserTurn'
         | 'exactReplay'
         | 'reset',

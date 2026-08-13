@@ -118,6 +118,7 @@ function factMatcherForTarget(
   if (target.kind === 'contextRead') {
     return (fact) => fact.lineage.operationId === target.operationId;
   }
+  if (target.kind === 'interventionResearch') return () => true;
   const planActionId = target.planActionId;
   const operationIds = new Set(
     state.lineage.planActions[planActionId]?.operationIds ?? []
@@ -135,6 +136,7 @@ function factMatcherForActiveWait(
 ): (fact: KernelFactProjectionV2) => boolean {
   const wait = state.activeWait;
   if (!wait) return () => false;
+  if (wait.kind === 'userIntervention') return () => false;
   return (fact) =>
     fact.lineage.operationId === wait.operationId
     || (

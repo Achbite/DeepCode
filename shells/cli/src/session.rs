@@ -133,8 +133,27 @@ async fn run_interactive_decision(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let Some(kind) = parts.first().cloned() else {
-        return Err("usage: /decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
+        return Err("usage: /decision <plan|permission> ... or /decision intervention <interaction-id> <select|revise|reject> [--option <id>] [--guidance <text>]".to_string());
     };
+    if kind == "intervention" {
+        let interaction_id = parts
+            .get(1)
+            .cloned()
+            .ok_or_else(|| "intervention decision requires an interaction id".to_string())?;
+        let decision = parts.get(2).cloned().ok_or_else(|| {
+            "intervention decision requires select, revise, or reject".to_string()
+        })?;
+        let (option_id, guidance) = parse_intervention_decision_options(&decision, &parts[3..])?;
+        return resolve_user_intervention_decision(
+            client,
+            interaction_id,
+            decision,
+            option_id,
+            guidance,
+            host,
+        )
+        .await;
+    }
     let Some(decision) = parts.get(1).cloned() else {
         return Err("usage: /decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
     };
@@ -237,6 +256,86 @@ pub(crate) async fn resolve_session_decision(
     eprintln!("session: {}", result.run.session_id);
     println!("{final_text}");
     Ok(CliCommandOutcome::Completed)
+}
+
+pub(crate) async fn resolve_user_intervention_decision(
+    client: &HttpKernelClient,
+    interaction_id: String,
+    decision: String,
+    option_id: Option<String>,
+    guidance: Option<String>,
+    host: SessionHostOptions,
+) -> Result<CliCommandOutcome, String> {
+    if !matches!(decision.as_str(), "select" | "revise" | "reject") {
+        return Err("intervention decision must be select, revise, or reject".to_string());
+    }
+    if decision == "select" && option_id.as_deref().is_none_or(str::is_empty) {
+        return Err("intervention select requires an option id".to_string());
+    }
+    if decision == "revise" && guidance.as_deref().is_none_or(str::is_empty) {
+        return Err("intervention revise requires non-empty guidance".to_string());
+    }
+    if decision != "select" && option_id.is_some() {
+        return Err("only intervention select may carry an option id".to_string());
+    }
+    let session_id = if let Some(session_id) = host.session_id.clone() {
+        session_id
+    } else {
+        current_session_id(client, &host).await?.ok_or_else(|| {
+            "no current session; pass --session <id> or create a session first".to_string()
+        })?
+    };
+    let timeline = client
+        .agent_timeline_v3(&session_id)
+        .await
+        .map_err(|error| format!("failed to read user intervention projection: {error}"))?;
+    let pending = find_pending_user_intervention_decision(&timeline, &interaction_id).ok_or_else(
+        || {
+            format!(
+                "no exact pending intervention {interaction_id} is available in Shared Projection v4"
+            )
+        },
+    )?;
+    eprintln!(
+        "intervention target: run={} interaction={} revision={}",
+        pending.run_id, pending.interaction_id, pending.interaction_revision
+    );
+    let caller_request_id = new_cli_request_id("intervention-decision")?;
+    let mut request = StartAgentRunRequest::resolve_decision(
+        "userIntervention",
+        decision.clone(),
+        caller_request_id,
+        canonical_conversation_target(client, &session_id).await?,
+    );
+    request.run_id = Some(pending.run_id);
+    request.target_id = Some(pending.target_id);
+    request.option_id = option_id;
+    request.interaction_id = Some(pending.interaction_id);
+    request.interaction_revision = Some(pending.interaction_revision);
+    request.candidate_set_digest = Some(pending.candidate_set_digest);
+    request.expected_projection_cursor = Some(pending.projection_cursor);
+    request.guidance = guidance;
+
+    match start_and_wait_for_run(client, &session_id, request, true).await? {
+        StartedRunOutcome::Settled { result, final_text } => {
+            eprintln!("session: {}", result.run.session_id);
+            if decision == "reject" {
+                println!("Run cancelled after rejecting user intervention.");
+            } else if !final_text.is_empty() {
+                println!("{final_text}");
+            }
+            Ok(CliCommandOutcome::Completed)
+        }
+        StartedRunOutcome::ActionRequired(message) => {
+            Ok(CliCommandOutcome::ActionRequired(message))
+        }
+        StartedRunOutcome::Superseded {
+            host_run_id,
+            new_turn_id,
+        } => Ok(CliCommandOutcome::ActionRequired(format!(
+            "shared session run {host_run_id} continued with newer user input in turn {new_turn_id}; this intervention decision was superseded"
+        ))),
+    }
 }
 
 enum StartedRunOutcome {
@@ -374,7 +473,6 @@ async fn cancel_exact_run_before_cli_exit(
     client: &HttpKernelClient,
     result: &AgentRunResult,
 ) -> Result<(), String> {
-    const CANCEL_REQUEST_WINDOW: Duration = Duration::from_secs(4);
     if result.run.is_terminal() {
         return Ok(());
     }
@@ -387,8 +485,7 @@ async fn cancel_exact_run_before_cli_exit(
             ))
         }
     };
-    match tokio::time::timeout(
-        CANCEL_REQUEST_WINDOW,
+    let mut cancellation = Box::pin(
         client.cancel_agent_run_by_id(
             &result.run.session_id,
             &result.run.run_id,
@@ -398,18 +495,15 @@ async fn cancel_exact_run_before_cli_exit(
                     .map_err(|error| format!("failed to resolve cancellation target: {error}"))?,
             ),
         ),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!(
+    );
+    tokio::select! {
+        cancellation = &mut cancellation => cancellation.map(|_| ()).map_err(|error| format!(
             "exact cancellation for Host Run {} failed: {error}",
             result.run.run_id
         )),
-        Err(_) => Err(format!(
-            "exact cancellation for Host Run {} did not complete within {} ms",
-            result.run.run_id,
-            CANCEL_REQUEST_WINDOW.as_millis()
+        _ = wait_for_additional_cli_interrupt(1) => Err(format!(
+            "a second CLI interrupt stopped the local wait for exact cancellation of Host Run {}; inspect the canonical Run projection before assuming settlement",
+            result.run.run_id
         )),
     }
 }
@@ -932,6 +1026,9 @@ async fn start_and_wait_for_run(
     const PROJECTION_BASELINE_WINDOW: Duration = Duration::from_secs(10);
     const RUN_ADMISSION_WINDOW: Duration = Duration::from_secs(15);
     let run_timeout = cli_run_timeout()?;
+    let expects_intervention_rejection = request.op == "resolveDecision"
+        && request.decision_kind.as_deref() == Some("userIntervention")
+        && request.decision.as_deref() == Some("reject");
     let run_started = Instant::now();
     let run_deadline = run_timeout.map(|limit| run_started + limit);
     let baseline_deadline = bounded_cli_stage_deadline(run_deadline, PROJECTION_BASELINE_WINDOW);
@@ -1110,6 +1207,7 @@ async fn start_and_wait_for_run(
         live_projection,
         run_timeout,
         run_deadline,
+        expects_intervention_rejection,
     )
     .await
     {
@@ -1289,6 +1387,7 @@ async fn wait_for_started_run(
     mut live_projection: LiveProjectionCursor,
     run_timeout: Option<Duration>,
     run_deadline: Option<Instant>,
+    expects_intervention_rejection: bool,
 ) -> Result<StartedRunOutcome, String> {
     let mut projection_stream = if live_projection.bound_run_terminal().is_some() {
         None
@@ -1339,7 +1438,13 @@ async fn wait_for_started_run(
             break;
         }
         if let Some(message) = live_projection.bound_action_required(&result.run.run_id) {
-            reconcile_host_wait_after_projection(client, &result).await?;
+            reconcile_host_wait_after_projection(
+                client,
+                &result,
+                run_timeout,
+                run_deadline,
+            )
+            .await?;
             live_projection.finish_commentary_line()?;
             return Ok(StartedRunOutcome::ActionRequired(message));
         }
@@ -1424,6 +1529,13 @@ async fn wait_for_started_run(
         return Ok(StartedRunOutcome::Superseded {
             host_run_id: result.run.run_id.clone(),
             new_turn_id,
+        });
+    }
+    if result.run.status == "cancelled" && expects_intervention_rejection {
+        live_projection.finish_commentary_line()?;
+        return Ok(StartedRunOutcome::Settled {
+            result: result.clone(),
+            final_text: String::new(),
         });
     }
     if matches!(result.run.status.as_str(), "failed" | "cancelled") {
@@ -1597,28 +1709,15 @@ async fn reconcile_host_terminal_after_projection(
 async fn reconcile_host_wait_after_projection(
     client: &HttpKernelClient,
     current: &AgentRunResult,
+    run_timeout: Option<Duration>,
+    run_deadline: Option<Instant>,
 ) -> Result<(), String> {
-    const HOST_WAIT_RECONCILE_WINDOW: Duration = Duration::from_secs(4);
-    let deadline = Instant::now() + HOST_WAIT_RECONCILE_WINDOW;
-    let mut last_status = current.run.status.clone();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let mut request = Box::pin(tokio::time::timeout(
-            remaining,
-            client.get_agent_run(&current.run.session_id, &current.run.run_id),
-        ));
+        let mut request = Box::pin(
+            client.get_agent_run(&current.run.session_id, &current.run.run_id)
+        );
         let refreshed = tokio::select! {
-            refreshed = &mut request => refreshed
-                .map_err(|_| {
-                    format!(
-                        "timed out reconciling Host Run {} after canonical user-action wait",
-                        current.run.run_id
-                    )
-                })?
-                .map_err(|error| {
+            refreshed = &mut request => refreshed.map_err(|error| {
                     format!(
                         "failed to reconcile Host Run {} after canonical user-action wait: {error}",
                         current.run.run_id
@@ -1628,6 +1727,13 @@ async fn reconcile_host_wait_after_projection(
                 return Err(format!(
                     "CLI was interrupted while reconciling user-action wait for Host Run {}",
                     current.run.run_id
+                ));
+            }
+            _ = wait_for_optional_deadline(run_deadline) => {
+                return Err(format!(
+                    "canonical projection requires user action, but Host Run {} remained non-waiting before the configured CLI deadline of {} ms",
+                    current.run.run_id,
+                    run_timeout.map(|limit| limit.as_millis()).unwrap_or_default()
                 ));
             }
         };
@@ -1642,14 +1748,30 @@ async fn reconcile_host_wait_after_projection(
         if refreshed.run.status == "waiting" {
             return Ok(());
         }
-        last_status = refreshed.run.status.clone();
-        sleep_until_reconcile_retry(deadline).await;
+        if refreshed.run.is_terminal() {
+            return Err(format!(
+                "canonical projection requires user action, but Host Run {} reached terminal status {}",
+                current.run.run_id,
+                refreshed.run.status
+            ));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(RUN_POLL_INTERVAL) => {}
+            _ = wait_for_cli_interrupt() => {
+                return Err(format!(
+                    "CLI was interrupted while reconciling user-action wait for Host Run {}",
+                    current.run.run_id
+                ));
+            }
+            _ = wait_for_optional_deadline(run_deadline) => {
+                return Err(format!(
+                    "canonical projection requires user action, but Host Run {} remained non-waiting before the configured CLI deadline of {} ms",
+                    current.run.run_id,
+                    run_timeout.map(|limit| limit.as_millis()).unwrap_or_default()
+                ));
+            }
+        }
     }
-    Err(format!(
-        "canonical projection requires user action, but Host Run {} remained {last_status} after {} ms",
-        current.run.run_id,
-        HOST_WAIT_RECONCILE_WINDOW.as_millis()
-    ))
 }
 
 enum LiveProjectionExpectation {
@@ -2756,7 +2878,7 @@ async fn stream_private_analysis_v1(
         if page.has_more {
             continue;
         }
-        if !follow || CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+        if !follow || CLI_INTERRUPT_COUNT.load(Ordering::SeqCst) > 0 {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

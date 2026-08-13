@@ -16,6 +16,7 @@ import type {
   AgentTimelineTokenUsageProjection,
   AgentTimelineTurn,
   AgentTimelineTurnPart,
+  AgentTimelineUserInterventionViewV4,
   AgentTimelineResourcePresentation,
   AgentTimelineWorkAttention,
   AgentTimelineWorkOperation,
@@ -24,8 +25,8 @@ import type {
   AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
 import {
-  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3,
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3,
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
   AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2,
   AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2,
 } from '@deepcode/protocol';
@@ -34,9 +35,9 @@ import {
 } from './kernel-v2/inputAttachmentsV2.js';
 
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION =
-  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V3;
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4;
 export const NARRATIVE_TIMELINE_SHAPE_VERSION =
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V3;
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4;
 
 export interface PendingPermissionProjection {
   request: AgentTimelinePermissionRequestView;
@@ -584,6 +585,24 @@ function interactionDecisionIndex(
       });
       continue;
     }
+    if (event.kind === 'user_intervention') {
+      const targetId = stringValue(payload?.interactionId);
+      const status = stringValue(payload?.status);
+      if (!targetId || status === 'awaitingUserDecision') continue;
+      const decision = stringValue(payload?.decision) ?? status ?? 'expired';
+      decisions.set(`userIntervention:${targetId}`, {
+        state: status === 'accepted'
+          ? 'accepted'
+          : status === 'rejected'
+            ? 'rejected'
+            : status === 'needsRevision'
+              ? 'needsRevision'
+              : 'expired',
+        decision,
+        decidedAt: event.ts,
+      });
+      continue;
+    }
     if (
       event.kind === 'review_summary'
       && stringValue(payload?.status) === 'completed'
@@ -1004,6 +1023,10 @@ function validNativeBlockSemantics(
     return block.narrativeKind === 'permission'
       && block.entryRole === 'interaction';
   }
+  if (block.kind === 'userIntervention') {
+    return block.narrativeKind === 'userIntervention'
+      && block.entryRole === 'interaction';
+  }
   if (block.kind === 'review') {
     return block.narrativeKind === 'review'
       && block.entryRole === 'interaction';
@@ -1066,6 +1089,7 @@ function validNativeBlockDetails(
       block.interaction === undefined
       || block.kind === 'plan'
       || block.kind === 'permission'
+      || block.kind === 'userIntervention'
     )
     && (
       block.structuredProjection === undefined
@@ -1384,6 +1408,7 @@ function validInteractionView(value: unknown): boolean {
     && (
       interaction.kind === 'plan'
       || interaction.kind === 'permission'
+      || interaction.kind === 'userIntervention'
     )
     && interactionState(interaction.state)
     && (
@@ -1623,7 +1648,147 @@ function validInteractionProjection(value: unknown): boolean {
       && pending.planId === pending.targetId
       && validOptionalDisplayStrings(pending);
   }
+  if (pending.kind === 'userIntervention') {
+    return exactOptionalKeys(pending, [
+      'kind',
+      'interactionId',
+      'interactionRevision',
+      'targetId',
+      'runId',
+      'candidateSetDigest',
+      'intervention',
+    ], optionalDisplayKeys)
+      && nonemptyString(pending.runId)
+      && nonemptyString(pending.candidateSetDigest)
+      && pending.targetId === pending.interactionId
+      && validUserInterventionViewV4(pending.intervention)
+      && recordValue(pending.intervention)?.interactionId
+        === pending.interactionId
+      && recordValue(pending.intervention)?.interactionRevision
+        === pending.interactionRevision
+      && recordValue(pending.intervention)?.candidateSetDigest
+        === pending.candidateSetDigest
+      && validOptionalDisplayStrings(pending);
+  }
   return false;
+}
+
+function validUserInterventionViewV4(value: unknown): boolean {
+  const intervention = recordValue(value);
+  if (
+    !intervention
+    || !exactOptionalKeys(intervention, [
+      'schemaVersion',
+      'interactionId',
+      'interactionRevision',
+      'candidateSetDigest',
+      'problemSummary',
+      'relevantFacts',
+      'affectedPlanActionIds',
+      'options',
+      'allowsFreeform',
+    ], ['recommendation'])
+    || intervention.schemaVersion
+      !== 'deepcode.session.user-intervention.v1'
+    || !nonemptyString(intervention.interactionId)
+    || !nonemptyString(intervention.interactionRevision)
+    || !nonemptyString(intervention.candidateSetDigest)
+    || typeof intervention.problemSummary !== 'string'
+    || !stringArray(intervention.relevantFacts)
+    || !stringArray(intervention.affectedPlanActionIds)
+    || intervention.allowsFreeform !== true
+    || (
+      intervention.recommendation !== undefined
+      && typeof intervention.recommendation !== 'string'
+    )
+    || !Array.isArray(intervention.options)
+    || intervention.options.length === 0
+  ) {
+    return false;
+  }
+  const optionIds = new Set<string>();
+  return intervention.options.every((value) => {
+    const option = recordValue(value);
+    if (
+      !option
+      || !exactOptionalKeys(option, [
+        'id',
+        'label',
+        'kind',
+        'tradeoffs',
+        'actions',
+      ], [
+        'description',
+        'recommended',
+        'candidatePlanRevision',
+        'candidatePlanDigest',
+      ])
+      || !nonemptyString(option.id)
+      || optionIds.has(option.id)
+      || !nonemptyString(option.label)
+      || (option.kind !== 'executable' && option.kind !== 'guidanceOnly')
+      || !stringArray(option.tradeoffs)
+      || !Array.isArray(option.actions)
+      || (
+        option.description !== undefined
+        && typeof option.description !== 'string'
+      )
+      || (
+        option.recommended !== undefined
+        && typeof option.recommended !== 'boolean'
+      )
+      || (
+        option.kind === 'executable'
+        && (
+          !nonemptyString(option.candidatePlanRevision)
+          || !nonemptyString(option.candidatePlanDigest)
+          || option.actions.length === 0
+        )
+      )
+      || (
+        option.kind === 'guidanceOnly'
+        && (
+          option.candidatePlanRevision !== undefined
+          || option.candidatePlanDigest !== undefined
+          || option.actions.length !== 0
+        )
+      )
+    ) {
+      return false;
+    }
+    optionIds.add(option.id);
+    return option.actions.every((actionValue) => {
+      const action = recordValue(actionValue);
+      return Boolean(
+        action
+        && exactOptionalKeys(action, [
+          'planActionId',
+          'operationId',
+          'toolId',
+          'summary',
+          'riskLevel',
+          'canonicalTargets',
+          'scopeDelta',
+          'previewId',
+          'previewDigest',
+        ], [])
+        && nonemptyString(action.planActionId)
+        && nonemptyString(action.operationId)
+        && nonemptyString(action.toolId)
+        && typeof action.summary === 'string'
+        && (
+          action.riskLevel === 'low'
+          || action.riskLevel === 'medium'
+          || action.riskLevel === 'high'
+          || action.riskLevel === 'critical'
+        )
+        && stringArray(action.canonicalTargets)
+        && stringArray(action.scopeDelta)
+        && nonemptyString(action.previewId)
+        && nonemptyString(action.previewDigest)
+      );
+    });
+  });
 }
 
 function interactionProjectionReferencesExist(
@@ -3879,7 +4044,10 @@ function projectionBlock(
       ? {
           interaction: {
             interactionId: interaction.interactionId,
-            interactionRevision: event.id,
+            interactionRevision:
+              event.kind === 'user_intervention'
+                ? stringValue(payload?.interactionRevision) ?? event.id
+                : event.id,
             targetId: interaction.targetId,
             kind: interaction.kind,
             runId,
@@ -3918,6 +4086,7 @@ function semanticHistoryBlockEvent(
     || event.kind === 'assistant_msg'
     || event.kind === 'plan_card'
     || event.kind === 'permission_request'
+    || event.kind === 'user_intervention'
     || (
       event.kind === 'review_summary'
       && stringValue(payload?.status) === 'completed'
@@ -3948,6 +4117,10 @@ function logicalBlockId(
   }
   if (event.kind === 'permission_request') {
     return `permission:${runId}:${permissionIdentity(payload) ?? event.id}`;
+  }
+  if (event.kind === 'user_intervention') {
+    return stringValue(payload?.blockId)
+      ?? `user-intervention:${runId}:${stringValue(payload?.interactionId) ?? event.id}`;
   }
   if (event.kind === 'review_summary') {
     return `review:${runId}:${stringValue(payload?.reviewId) ?? event.id}`;
@@ -4779,6 +4952,45 @@ function buildInteractionProjection(
       if (!id || pending.requestId === id) pending = undefined;
       continue;
     }
+    if (event.kind === 'user_intervention') {
+      const intervention = recordValue(payload?.intervention);
+      const interactionId = stringValue(payload?.interactionId);
+      const interactionRevision = stringValue(payload?.interactionRevision);
+      const candidateSetDigest = stringValue(payload?.candidateSetDigest);
+      const status = stringValue(payload?.status);
+      if (
+        !intervention
+        || !interactionId
+        || !interactionRevision
+        || !candidateSetDigest
+        || !validUserInterventionViewV4(intervention)
+      ) {
+        continue;
+      }
+      if (status === 'awaitingUserDecision') {
+        pending = {
+          kind: 'userIntervention',
+          interactionId,
+          interactionRevision,
+          targetId: interactionId,
+          runId,
+          candidateSetDigest,
+          intervention: JSON.parse(
+            JSON.stringify(intervention)
+          ) as AgentTimelineUserInterventionViewV4,
+          blockId: logicalBlockId(event, payload),
+          title: eventTitle(event, payload),
+          summary: eventSummary(event, payload),
+        };
+      } else if (
+        pending?.kind === 'userIntervention'
+        && pending.interactionId === interactionId
+        && pending.interactionRevision === interactionRevision
+      ) {
+        pending = undefined;
+      }
+      continue;
+    }
   }
   return pending ? { pending } : undefined;
 }
@@ -4788,9 +5000,9 @@ function pendingInteractionRunId(
     | NonNullable<AgentTimelineInteractionProjection['pending']>
     | undefined
 ): string | undefined {
-  return pending?.kind === 'plan'
-    ? pending.runId
-    : pending?.request.runId;
+  if (!pending) return undefined;
+  if (pending.kind === 'permission') return pending.request.runId;
+  return pending.runId;
 }
 
 function canonicalTerminalRunEvent(
@@ -4974,9 +5186,7 @@ function buildRunProjection(
   const turn = turns.findLast((candidate) =>
     candidate.id.startsWith(`turn:${runId}:`)
   ) ?? turns.at(-1);
-  const pendingRunId = pendingInteraction?.kind === 'plan'
-    ? pendingInteraction.runId
-    : pendingInteraction?.request.runId;
+  const pendingRunId = pendingInteractionRunId(pendingInteraction);
   if (
     pendingInteraction
     && pendingRunId === runId
@@ -5517,7 +5727,7 @@ function interactionForEvent(
 ): {
   interactionId: string;
   targetId: string;
-  kind: 'plan' | 'permission';
+  kind: 'plan' | 'permission' | 'userIntervention';
   decisionRequest?: AgentTimelineDecisionRequest;
 } | null {
   if (event.kind === 'plan_card' && payload?.confirmable !== false) {
@@ -5539,6 +5749,39 @@ function interactionForEvent(
           decisionRequest: standardDecisionRequest(),
         }
       : null;
+  }
+  if (event.kind === 'user_intervention') {
+    const intervention = recordValue(payload?.intervention);
+    const interactionId = stringValue(payload?.interactionId);
+    if (
+      !interactionId
+      || !intervention
+      || !validUserInterventionViewV4(intervention)
+    ) {
+      return null;
+    }
+    return {
+      interactionId,
+      targetId: interactionId,
+      kind: 'userIntervention',
+      ...(stringValue(payload?.status) === 'awaitingUserDecision'
+        ? {
+            decisionRequest: {
+              allowsFreeform: true,
+              options: arrayRecords(intervention.options).map((option) => ({
+                id: stringValue(option.id)!,
+                label: stringValue(option.label)!,
+                ...(stringValue(option.description)
+                  ? { description: stringValue(option.description) }
+                  : {}),
+                ...(typeof option.recommended === 'boolean'
+                  ? { recommended: option.recommended }
+                  : {}),
+              })),
+            },
+          }
+        : {}),
+    };
   }
   return null;
 }
@@ -5985,7 +6228,11 @@ function eventStatus(
   if (status === 'denied' || status === 'rejected' || status === 'needsRevision') {
     return 'blocked';
   }
-  if (event.kind === 'permission_request' || event.kind === 'plan_card') {
+  if (
+    event.kind === 'permission_request'
+    || event.kind === 'plan_card'
+    || event.kind === 'user_intervention'
+  ) {
     return 'waiting';
   }
   if (event.kind === 'error') return 'failed';
@@ -6040,6 +6287,7 @@ function eventNarrativeKind(kind: string): AgentTimelineNarrativeKind {
   if (kind === 'assistant_msg') return 'assistantText';
   if (kind === 'plan_card' || kind === 'plan_review') return 'plan';
   if (kind === 'permission_request' || kind === 'permission_result') return 'permission';
+  if (kind === 'user_intervention') return 'userIntervention';
   if (kind === 'review_summary') return 'review';
   if (kind === 'error') return 'diagnostic';
   throw new Error('session_projection_v2_history_block_kind_invalid');
@@ -6051,6 +6299,7 @@ function eventEntryRole(kind: string): AgentTimelineBlock['entryRole'] {
   if (
     kind === 'plan_card'
     || kind === 'permission_request'
+    || kind === 'user_intervention'
     || kind === 'review_summary'
   ) {
     return 'interaction';
@@ -6064,6 +6313,7 @@ function eventBlockKind(kind: string): AgentTimelineBlock['kind'] {
   if (kind === 'assistant_msg') return 'assistant';
   if (kind === 'plan_card' || kind === 'plan_review') return 'plan';
   if (kind === 'permission_request' || kind === 'permission_result') return 'permission';
+  if (kind === 'user_intervention') return 'userIntervention';
   if (kind === 'review_summary') return 'review';
   if (kind === 'error') return 'error';
   throw new Error('session_projection_v2_history_block_kind_invalid');

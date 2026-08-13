@@ -1224,20 +1224,20 @@ pub(crate) async fn provider_cache_predecessor(
                 && head.model == recovery.metadata.model
         });
     let durable_parent_valid = if same_run {
-        state
-            .host_services
-            .session_kernel_v2
-            .provider_turn_admission(&session_id, &run_id, &capability, &provider_turn_id)
-            .ok()
-            .is_some_and(|admission| {
-                sidecar
-                    .validate_against_admission(
-                        &session_id,
-                        &authorized.profile_revision,
-                        &admission,
-                    )
-                    .is_ok()
-            })
+        match state.host_services.session_kernel_v2.provider_turn_admission(
+            &session_id,
+            &run_id,
+            &capability,
+            &provider_turn_id,
+        ) {
+            Ok(admission) => sidecar.validate_against_admission(
+                &session_id,
+                &authorized.profile_revision,
+                &admission,
+            )
+            .is_ok(),
+            Err(_) => false,
+        }
     } else {
         current_admission.purpose == ProviderTracePurposeV1::Primary
             && cross_run_head.is_some()

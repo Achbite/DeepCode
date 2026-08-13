@@ -879,6 +879,7 @@ function eventKind(value: unknown): AgentEventKind {
     'tool_result',
     'permission_request',
     'permission_result',
+    'user_intervention',
     'session_run_state',
     'workflow_stage',
     'error',

@@ -302,6 +302,16 @@ pub struct StartAgentRunRequest {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_set_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_projection_cursor: Option<u64>,
     pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
@@ -323,6 +333,11 @@ impl StartAgentRunRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            option_id: None,
+            interaction_id: None,
+            interaction_revision: None,
+            candidate_set_digest: None,
+            expected_projection_cursor: None,
             conversation_target,
             caller_request_id: caller_request_id.into(),
         }
@@ -345,6 +360,11 @@ impl StartAgentRunRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            option_id: None,
+            interaction_id: None,
+            interaction_revision: None,
+            candidate_set_digest: None,
+            expected_projection_cursor: None,
             conversation_target,
             caller_request_id: caller_request_id.into(),
         }
@@ -371,6 +391,11 @@ impl StartAgentRunRequest {
                     || self.guidance.is_some()
                     || self.run_id.is_some()
                     || self.target_id.is_some()
+                    || self.option_id.is_some()
+                    || self.interaction_id.is_some()
+                    || self.interaction_revision.is_some()
+                    || self.candidate_set_digest.is_some()
+                    || self.expected_projection_cursor.is_some()
                 {
                     return Err(KernelClientError::Api(
                         "session_operation_v2_invalid: ask cannot carry decision identity"
@@ -380,7 +405,7 @@ impl StartAgentRunRequest {
             }
             "resolveDecision" => {
                 let kind = self.decision_kind.as_deref();
-                if !matches!(kind, Some("plan" | "permission"))
+                if !matches!(kind, Some("plan" | "permission" | "userIntervention"))
                     || self
                         .decision
                         .as_deref()
@@ -399,6 +424,52 @@ impl StartAgentRunRequest {
                 {
                     return Err(KernelClientError::Api(
                         "session_interaction_identity_required: decision requires plan/permission, decision, runId, and targetId".to_string(),
+                    ));
+                }
+                if kind == Some("userIntervention") {
+                    let decision = self.decision.as_deref();
+                    if !matches!(decision, Some("select" | "revise" | "reject"))
+                        || self
+                            .interaction_id
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                        || self
+                            .interaction_revision
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                        || self
+                            .candidate_set_digest
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                        || self.expected_projection_cursor.is_none()
+                        || (decision == Some("select")
+                            && self
+                                .option_id
+                                .as_deref()
+                                .map(str::trim)
+                                .is_none_or(str::is_empty))
+                        || (decision == Some("revise")
+                            && self
+                                .guidance
+                                .as_deref()
+                                .map(str::trim)
+                                .is_none_or(str::is_empty))
+                    {
+                        return Err(KernelClientError::Api(
+                            "session_intervention_identity_required: intervention decisions require exact interaction revision, candidate-set digest, projection cursor, and decision payload".to_string(),
+                        ));
+                    }
+                } else if self.option_id.is_some()
+                    || self.interaction_id.is_some()
+                    || self.interaction_revision.is_some()
+                    || self.candidate_set_digest.is_some()
+                    || self.expected_projection_cursor.is_some()
+                {
+                    return Err(KernelClientError::Api(
+                        "session_operation_v2_invalid: plan and permission decisions cannot carry intervention identity".to_string(),
                     ));
                 }
                 if self.content.is_some()

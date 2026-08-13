@@ -27,7 +27,7 @@ use deepcode_kernel_abi::v2_command::{
     CapabilityApprovalViewV2, CapabilityResourcePresentationKindV2,
     CapabilityResourcePresentationV2, CapabilityScopeDispositionV2,
     CapabilityScopePreviewBatchReplyV2, CapabilityScopePreviewBatchV2,
-    CapabilityScopePreviewRecordV2, CapabilityScopePreviewReplyV2,
+    CapabilityScopePreviewOriginV3, CapabilityScopePreviewRecordV2, CapabilityScopePreviewReplyV2,
     CapabilityScopeRejectionReasonV2, CommandHandlingV2, ControlEpochAdvanceV2, DeadlineRequestV2,
     EpochPreconditionV2, InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2,
     KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
@@ -42,12 +42,13 @@ use deepcode_kernel_abi::{
     tool_contract_digest_v2, trust_lease_digest_v2, user_decision_request_digest_v2,
     CapabilityAuthorizationBindingV2, CapabilityAuthorizationDigestV2, CapabilityDecisionBindingV2,
     CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
-    CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2, RunCapabilityV2, ScopeIntentV2,
-    ToolAuthorizationShapeV2, ToolAvailabilityV2, ToolContextBundleV2, ToolContextRefV2,
-    ToolContextVersionV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
-    ToolIntentAuthorityV2, ToolInventoryV2, TrustGrantDecisionV2, TrustLeaseDigestV2,
-    TrustPolicyIdV2, UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionRevokeTargetV2,
-    UserDecisionRevokeV2, UserDecisionV2, WorkspaceBindingRefV2, TOOL_CONTEXT_FORMAT_V2,
+    CapabilityScopePreviewIdV2, InterventionSelectDecisionV3, PlanActionIdV2, PlanRevisionV2,
+    RunCapabilityV2, ScopeIntentV2, ToolAuthorizationShapeV2, ToolAvailabilityV2,
+    ToolContextBundleV2, ToolContextRefV2, ToolContextVersionV2, ToolDescriptorV2,
+    ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2, ToolIntentAuthorityV2, ToolInventoryV2,
+    TrustGrantDecisionV2, TrustLeaseDigestV2, TrustPolicyIdV2, UserDecisionErrorV2,
+    UserDecisionReplyV2, UserDecisionRevokeTargetV2, UserDecisionRevokeV2, UserDecisionV2,
+    WorkspaceBindingRefV2, TOOL_CONTEXT_FORMAT_V2,
 };
 use deepcode_kernel_ledger::v2::CanonicalFactStore;
 use deepcode_kernel_ledger::v2::{
@@ -876,6 +877,7 @@ fn recover_authority_material(
                     identity,
                     preview_id,
                     tool_id,
+                    origin,
                     authorization_binding,
                     scope_digest,
                     tool_contract_digest,
@@ -892,6 +894,7 @@ fn recover_authority_material(
                     || identity.operation_id != durable.record.operation_id
                     || preview_id != &durable.record.preview_id
                     || tool_id != &durable.record.tool_id
+                    || origin != &durable.record.origin
                     || authorization_binding != &durable.record.authorization_binding
                     || scope_digest != &durable.record.scope_digest
                     || tool_contract_digest != &durable.record.tool_contract_digest
@@ -1483,6 +1486,14 @@ fn user_decision_settlement_fact(reply: &UserDecisionReplyV2) -> Option<FactId> 
         | UserDecisionReplyV2::ScopeExpansionDenied { fact_id, .. }
         | UserDecisionReplyV2::TrustGranted { fact_id, .. }
         | UserDecisionReplyV2::Revoked { fact_id, .. } => Some(fact_id.clone()),
+        UserDecisionReplyV2::InterventionSelected {
+            selected_fact_ids,
+            superseded_fact_ids,
+            ..
+        } => superseded_fact_ids
+            .last()
+            .or_else(|| selected_fact_ids.last())
+            .cloned(),
         UserDecisionReplyV2::Stale { .. } | UserDecisionReplyV2::Error(_) => None,
     }
 }
@@ -2778,7 +2789,7 @@ impl KernelSessionServiceV2 {
         for intent in &pending {
             let lease = match &intent.authority {
                 ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
-                ToolIntentAuthorityV2::ContextRead { .. } => None,
+                ToolIntentAuthorityV2::Read { .. } => None,
             };
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
@@ -3059,7 +3070,7 @@ impl KernelSessionServiceV2 {
         for pending in &pending {
             let lease = match &pending.authority {
                 ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
-                ToolIntentAuthorityV2::ContextRead { .. } => None,
+                ToolIntentAuthorityV2::Read { .. } => None,
             };
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
@@ -3352,7 +3363,7 @@ impl KernelSessionServiceV2 {
         for pending in &pending {
             let lease = match &pending.authority {
                 ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
-                ToolIntentAuthorityV2::ContextRead { .. } => None,
+                ToolIntentAuthorityV2::Read { .. } => None,
             };
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
@@ -3738,6 +3749,12 @@ impl KernelSessionServiceV2 {
                     true,
                     public_command.clone(),
                 )?,
+            UserDecisionV2::InterventionSelect(decision) => self.select_intervention_candidates(
+                &run_id,
+                expected_control_epoch,
+                decision,
+                public_command.clone(),
+            )?,
             UserDecisionV2::TrustGrant(decision) => self.grant_trust(
                 &run_id,
                 expected_control_epoch,
@@ -4230,59 +4247,108 @@ impl KernelSessionServiceV2 {
                     continue;
                 }
             };
-            if descriptor.authorization_shape != item.scope_intent.authorization_shape() {
-                results.push(reject(
-                    CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
-                    "Use the authorization shape declared by the current Kernel ToolContext.",
-                ));
-                continue;
-            }
-            let prepared_authorization = match &item.scope_intent {
-                ScopeIntentV2::ResourceScope {
-                    requested_resources,
-                } => self
-                    .inner
-                    .authority
-                    .canonical_scope_for_requested_resources(
+            let prepared_authorization = match (
+                &item.origin,
+                item.scope_intent.as_ref(),
+                item.raw_arguments.as_ref(),
+            ) {
+                (
+                    CapabilityScopePreviewOriginV3::PlanDiscovery { .. },
+                    None,
+                    Some(raw_arguments),
+                ) => canonical_invocation(&item.tool_id, raw_arguments).and_then(|invocation| {
+                    let (scope, deadline) = self.inner.authority.canonical_scope_for_tool(
                         &command.run_id,
+                        &item.operation_id,
                         command.expected_control_epoch,
-                        &item.tool_id,
-                        descriptor.effect_scope,
-                        requested_resources,
+                        &item.idempotency_key,
+                        &invocation,
                         item.deadline,
-                    )
-                    .map(|(scope, targets, deadline)| {
-                        (
-                            CapabilityAuthorizationBindingV2::ResourceScope {},
-                            scope,
-                            targets,
-                            deadline,
-                        )
-                    }),
-                ScopeIntentV2::ExactInvocation { raw_arguments } => {
-                    let invocation = canonical_invocation(&item.tool_id, raw_arguments);
-                    invocation.and_then(|invocation| {
-                        let (scope, deadline) = self.inner.authority.canonical_scope_for_tool(
-                            &command.run_id,
-                            &item.operation_id,
-                            command.expected_control_epoch,
-                            &item.idempotency_key,
-                            &invocation,
-                            item.deadline,
-                            vec![CorrelationRefV2::PlanAction {
-                                value: item.plan_action_id.to_string(),
-                            }],
-                        )?;
-                        let targets = authorization_targets_for_invocation(&invocation, &scope)?;
-                        let invocation_digest =
-                            exact_invocation_digest_v2(&invocation).map_err(|_| storage_fault())?;
-                        Ok((
-                            CapabilityAuthorizationBindingV2::ExactInvocation { invocation_digest },
-                            scope,
-                            targets,
-                            deadline,
-                        ))
-                    })
+                        vec![CorrelationRefV2::PlanAction {
+                            value: item.plan_action_id.to_string(),
+                        }],
+                    )?;
+                    let targets = authorization_targets_for_invocation(&invocation, &scope)?;
+                    let authorization_binding = match descriptor.authorization_shape {
+                        ToolAuthorizationShapeV2::ResourceScope => {
+                            CapabilityAuthorizationBindingV2::ResourceScope {}
+                        }
+                        ToolAuthorizationShapeV2::ExactInvocation => {
+                            CapabilityAuthorizationBindingV2::ExactInvocation {
+                                invocation_digest: exact_invocation_digest_v2(&invocation)
+                                    .map_err(|_| storage_fault())?,
+                            }
+                        }
+                    };
+                    Ok((authorization_binding, scope, targets, deadline))
+                }),
+                (_, Some(scope_intent), None) => {
+                    if descriptor.authorization_shape != scope_intent.authorization_shape() {
+                        results.push(reject(
+                            CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
+                            "Use the authorization shape declared by the current Kernel ToolContext.",
+                        ));
+                        continue;
+                    }
+                    match scope_intent {
+                        ScopeIntentV2::ResourceScope {
+                            requested_resources,
+                        } => self
+                            .inner
+                            .authority
+                            .canonical_scope_for_requested_resources(
+                                &command.run_id,
+                                command.expected_control_epoch,
+                                &item.tool_id,
+                                descriptor.effect_scope,
+                                requested_resources,
+                                item.deadline,
+                            )
+                            .map(|(scope, targets, deadline)| {
+                                (
+                                    CapabilityAuthorizationBindingV2::ResourceScope {},
+                                    scope,
+                                    targets,
+                                    deadline,
+                                )
+                            }),
+                        ScopeIntentV2::ExactInvocation { raw_arguments } => {
+                            let invocation = canonical_invocation(&item.tool_id, raw_arguments);
+                            invocation.and_then(|invocation| {
+                                let (scope, deadline) =
+                                    self.inner.authority.canonical_scope_for_tool(
+                                        &command.run_id,
+                                        &item.operation_id,
+                                        command.expected_control_epoch,
+                                        &item.idempotency_key,
+                                        &invocation,
+                                        item.deadline,
+                                        vec![CorrelationRefV2::PlanAction {
+                                            value: item.plan_action_id.to_string(),
+                                        }],
+                                    )?;
+                                let targets =
+                                    authorization_targets_for_invocation(&invocation, &scope)?;
+                                let invocation_digest = exact_invocation_digest_v2(&invocation)
+                                    .map_err(|_| storage_fault())?;
+                                Ok((
+                                    CapabilityAuthorizationBindingV2::ExactInvocation {
+                                        invocation_digest,
+                                    },
+                                    scope,
+                                    targets,
+                                    deadline,
+                                ))
+                            })
+                        }
+                    }
+                }
+                _ => {
+                    results.push(reject(
+                        CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
+                        "Use raw arguments only for Plan discovery and scope intent for final candidates.",
+                    ));
+                    continue;
                 }
             };
             let (authorization_binding, canonical_scope, targets, effective_deadline_ms) =
@@ -4304,6 +4370,7 @@ impl KernelSessionServiceV2 {
                 item.plan_action_id.clone(),
                 item.operation_id.clone(),
                 item.tool_id.clone(),
+                item.origin.clone(),
                 authorization_binding,
                 canonical_scope,
                 targets,
@@ -4585,7 +4652,7 @@ impl KernelSessionServiceV2 {
                 plan_action_id,
                 ..
             } => (plan_revision, plan_action_id),
-            ToolIntentAuthorityV2::ContextRead { .. } => {
+            ToolIntentAuthorityV2::Read { .. } => {
                 return Err(invalid_field(
                     "authority",
                     InvalidFieldViolationV2::InvalidRelation,
@@ -4837,6 +4904,319 @@ impl KernelSessionServiceV2 {
         ))
     }
 
+    fn select_intervention_candidates(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        decision: InterventionSelectDecisionV3,
+        public_command: PublicCommandContext,
+    ) -> AuthorityResult<(UserDecisionReplyV2, bool)> {
+        let run = self.run_record(run_id)?;
+        if run.control_epoch != control_epoch {
+            return Ok((
+                UserDecisionReplyV2::Stale {
+                    submitted: control_epoch,
+                    current: run.control_epoch,
+                },
+                false,
+            ));
+        }
+        if run.current_input_id != decision.input_id {
+            return Ok((
+                UserDecisionReplyV2::Error(UserDecisionErrorV2::PlanBindingMismatch),
+                false,
+            ));
+        }
+
+        let mut selected = Vec::with_capacity(decision.selected_bindings.len());
+        for binding in &decision.selected_bindings {
+            if binding.input_id != decision.input_id
+                || binding.decision_ref != decision.decision_ref
+            {
+                return Ok((
+                    UserDecisionReplyV2::Error(UserDecisionErrorV2::PlanBindingMismatch),
+                    false,
+                ));
+            }
+            let preview = match self.resolve_decision_preview(run_id, control_epoch, binding)? {
+                Ok(preview) => preview,
+                Err(error) => return Ok((UserDecisionReplyV2::Error(error), false)),
+            };
+            match &preview.record.origin {
+                CapabilityScopePreviewOriginV3::InterventionCandidate {
+                    interaction_id,
+                    interaction_revision,
+                    candidate_set_digest,
+                    option_id,
+                } if interaction_id == &decision.interaction_id
+                    && interaction_revision == &decision.interaction_revision
+                    && candidate_set_digest == &decision.candidate_set_digest
+                    && option_id == &decision.selected_option_id => {}
+                _ => {
+                    return Ok((
+                        UserDecisionReplyV2::Error(UserDecisionErrorV2::PlanBindingMismatch),
+                        false,
+                    ))
+                }
+            }
+            selected.push(preview);
+        }
+
+        let selected_ids = selected
+            .iter()
+            .map(|preview| preview.record.preview_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let superseded_ids = decision
+            .superseded_preview_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let (all_candidates, superseded) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if selected.iter().any(|preview| {
+                state.pending.contains_key(&preview.record.preview_id)
+                    || state.leases.values().any(|lease| {
+                        lease.run_id == *run_id
+                            && lease.control_epoch == control_epoch
+                            && lease.plan_revision == preview.record.plan_revision
+                            && lease.plan_action_id == preview.record.plan_action_id
+                            && lease.tool_id == preview.record.tool_id
+                    })
+            }) {
+                return Ok((
+                    UserDecisionReplyV2::Error(UserDecisionErrorV2::PlanBindingMismatch),
+                    false,
+                ));
+            }
+            let all_candidates = state
+                .previews
+                .values()
+                .filter(|preview| {
+                    preview.record.run_id == *run_id
+                        && preview.record.control_epoch == control_epoch
+                        && matches!(
+                            &preview.record.origin,
+                            CapabilityScopePreviewOriginV3::InterventionCandidate {
+                                interaction_id,
+                                interaction_revision,
+                                candidate_set_digest,
+                                ..
+                            } if interaction_id == &decision.interaction_id
+                                && interaction_revision == &decision.interaction_revision
+                                && candidate_set_digest == &decision.candidate_set_digest
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let superseded = decision
+                .superseded_preview_ids
+                .iter()
+                .map(|preview_id| state.previews.get(preview_id).cloned())
+                .collect::<Option<Vec<_>>>();
+            (all_candidates, superseded)
+        };
+        let Some(superseded) = superseded else {
+            return Ok((
+                UserDecisionReplyV2::Error(UserDecisionErrorV2::ScopePreviewNotFound),
+                false,
+            ));
+        };
+        let candidate_ids = all_candidates
+            .iter()
+            .map(|preview| preview.record.preview_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if candidate_ids.is_empty()
+            || candidate_ids.len() != selected_ids.len() + superseded_ids.len()
+            || !selected_ids.is_disjoint(&superseded_ids)
+            || !selected_ids
+                .union(&superseded_ids)
+                .all(|id| candidate_ids.contains(id))
+            || !candidate_ids
+                .iter()
+                .all(|id| selected_ids.contains(id) || superseded_ids.contains(id))
+        {
+            return Ok((
+                UserDecisionReplyV2::Error(UserDecisionErrorV2::PlanBindingMismatch),
+                false,
+            ));
+        }
+        let current_context = self
+            .build_tool_context(run_id, run.context_version)?
+            .context_ref();
+        for preview in &superseded {
+            match &preview.record.origin {
+                CapabilityScopePreviewOriginV3::InterventionCandidate {
+                    interaction_id,
+                    interaction_revision,
+                    candidate_set_digest,
+                    option_id,
+                } if interaction_id == &decision.interaction_id
+                    && interaction_revision == &decision.interaction_revision
+                    && candidate_set_digest == &decision.candidate_set_digest
+                    && option_id != &decision.selected_option_id
+                    && preview.record.context_ref == current_context => {}
+                _ => {
+                    return Ok((
+                        UserDecisionReplyV2::Error(UserDecisionErrorV2::ToolContextStale),
+                        false,
+                    ))
+                }
+            }
+        }
+
+        let mut payloads = Vec::with_capacity(selected.len() + superseded.len());
+        let mut mutations = Vec::with_capacity(selected.len() * 2 + superseded.len());
+        let mut durable_leases = Vec::with_capacity(selected.len());
+        let mut lease_refs = Vec::with_capacity(selected.len());
+        for preview in &selected {
+            let lease = CapabilityLeaseRefV2 {
+                lease_id: self.inner.ids.lease_id(),
+                version: CapabilityLeaseVersionV2::new(1).map_err(|_| storage_fault())?,
+                scope_digest: preview.record.scope_digest.clone(),
+            };
+            let identity = CapabilityLeaseFactIdentityV2 {
+                run_id: run_id.clone(),
+                control_epoch,
+                plan_revision: preview.record.plan_revision.clone(),
+                plan_action_id: preview.record.plan_action_id.clone(),
+                operation_id: preview.record.operation_id.clone(),
+                preview_id: preview.record.preview_id.clone(),
+                lease_id: lease.lease_id.clone(),
+                lease_version: lease.version,
+                causation_fact_id: preview.preview_fact_id.clone(),
+                correlation_set: plan_action_correlations(&preview.record.plan_action_id)?,
+            };
+            let fact_index = payloads.len();
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::CapabilityIssued {
+                    identity,
+                    tool_id: preview.record.tool_id.clone(),
+                    scope_digest: preview.record.scope_digest.clone(),
+                    authorization_digest: preview.authorization_digest.clone(),
+                    tool_contract_digest: preview.record.tool_contract_digest.clone(),
+                    context_ref: preview.record.context_ref.clone(),
+                },
+            ));
+            let durable = DurableCapabilityLeaseV2 {
+                reference: lease.clone(),
+                run_id: run_id.clone(),
+                control_epoch,
+                plan_revision: preview.record.plan_revision.clone(),
+                plan_action_id: preview.record.plan_action_id.clone(),
+                tool_id: preview.record.tool_id.clone(),
+                context_ref: preview.record.context_ref.clone(),
+                authorization_binding: preview.record.authorization_binding.clone(),
+                approved_targets: preview.approved_targets.clone(),
+                decision_ref: Some(decision.decision_ref.clone()),
+                issuance_operation_id: preview.record.operation_id.clone(),
+                preview_id: preview.record.preview_id.clone(),
+            };
+            mutations.push(AuthorityMaterialMutationV2::Put {
+                material: capability_lease_material(&durable, AUTHORITY_MATERIAL_ACTIVE)?,
+                fact_index,
+            });
+            mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: scope_preview_material(&preview.durable(), AUTHORITY_MATERIAL_STALE)?,
+                fact_index,
+            });
+            durable_leases.push(durable);
+            lease_refs.push(lease);
+        }
+        for preview in &superseded {
+            let fact_index = payloads.len();
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::InterventionCandidateSuperseded {
+                    identity: AuthorizationIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch,
+                        plan_revision: preview.record.plan_revision.clone(),
+                        plan_action_id: preview.record.plan_action_id.clone(),
+                        operation_id: preview.record.operation_id.clone(),
+                        causation_fact_id: preview.preview_fact_id.clone(),
+                        correlation_set: plan_action_correlations(&preview.record.plan_action_id)?,
+                    },
+                    preview_id: preview.record.preview_id.clone(),
+                    interaction_id: decision.interaction_id.clone(),
+                    interaction_revision: decision.interaction_revision.clone(),
+                    candidate_set_digest: decision.candidate_set_digest.clone(),
+                    selected_option_id: decision.selected_option_id.clone(),
+                },
+            ));
+            mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: scope_preview_material(&preview.durable(), AUTHORITY_MATERIAL_STALE)?,
+                fact_index,
+            });
+        }
+
+        let selected_count = selected.len();
+        let settlement_index = payloads.len().checked_sub(1).ok_or_else(storage_fault)?;
+        let receipt_lease_refs = lease_refs.clone();
+        let receipt_run_id = run_id.clone();
+        let outcome = self
+            .inner
+            .authority
+            .append_payloads_with_public_receipt_and_authority_material_builder(
+                payloads,
+                Some(settlement_index),
+                mutations,
+                move |fact_ids, ledger_sequences| {
+                    let reply = UserDecisionReplyV2::InterventionSelected {
+                        leases: receipt_lease_refs,
+                        selected_fact_ids: fact_ids[..selected_count].to_vec(),
+                        superseded_fact_ids: fact_ids[selected_count..].to_vec(),
+                        ledger_sequence: *ledger_sequences.last().ok_or_else(storage_fault)?,
+                    };
+                    public_receipt(
+                        public_command.request_id,
+                        public_command.request_digest,
+                        public_command.command_kind,
+                        Some(receipt_run_id),
+                        &DurablePublicReplyV2::UserDecision { reply },
+                        None,
+                    )
+                },
+            )?;
+        if outcome.facts.len() != selected_count + superseded.len() {
+            return Err(storage_fault());
+        }
+        let durable_reply = receipt_outcome(outcome.receipt)?;
+        let DurablePublicReplyV2::UserDecision { reply } = durable_reply else {
+            return Err(storage_fault());
+        };
+        let UserDecisionReplyV2::InterventionSelected {
+            leases: reply_leases,
+            selected_fact_ids,
+            superseded_fact_ids,
+            ..
+        } = &reply
+        else {
+            return Err(storage_fault());
+        };
+        if reply_leases != &lease_refs
+            || selected_fact_ids.len() != selected_count
+            || superseded_fact_ids.len() != superseded.len()
+        {
+            return Err(storage_fault());
+        }
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            for preview in selected.iter().chain(superseded.iter()) {
+                state.previews.remove(&preview.record.preview_id);
+                state.preview_runs.remove(&preview.record.preview_id);
+            }
+            for (index, durable) in durable_leases.into_iter().enumerate() {
+                let fact = outcome.facts.get(index).ok_or_else(storage_fault)?;
+                let lease = durable.into_record(fact.fact_id.clone(), fact.ledger_sequence);
+                state.leases.insert(lease.reference.lease_id.clone(), lease);
+            }
+        }
+        Ok((reply, true))
+    }
+
     fn deny_capability_decision(
         &self,
         run_id: &RunId,
@@ -4867,7 +5247,7 @@ impl KernelSessionServiceV2 {
             .map(|pending| {
                 let lease = match &pending.authority {
                     ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
-                    ToolIntentAuthorityV2::ContextRead { .. } => None,
+                    ToolIntentAuthorityV2::Read { .. } => None,
                 };
                 Ok(AuthorityMaterialMutationV2::Replace {
                     expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
@@ -5494,6 +5874,7 @@ impl KernelSessionServiceV2 {
         plan_action_id: PlanActionIdV2,
         operation_id: OperationId,
         tool_id: ToolIdV2,
+        origin: CapabilityScopePreviewOriginV3,
         authorization_binding: CapabilityAuthorizationBindingV2,
         canonical_resource_scope: ResourceScopeV2,
         approved_targets: Vec<ScopeTargetKey>,
@@ -5521,6 +5902,7 @@ impl KernelSessionServiceV2 {
             "planRevision": plan_revision,
             "planActionId": plan_action_id,
             "toolId": tool_id,
+            "origin": origin,
             "authorizationBinding": authorization_binding,
             "targets": approved_targets,
             "canonicalResourceScope": canonical_resource_scope,
@@ -5541,6 +5923,7 @@ impl KernelSessionServiceV2 {
             "planActionId": plan_action_id,
             "operationId": operation_id,
             "toolId": tool_id,
+            "origin": origin,
             "authorizationBinding": authorization_binding,
             "scopeDigest": scope_digest,
             "decisionClass": decision_class,
@@ -5557,32 +5940,35 @@ impl KernelSessionServiceV2 {
             .get(run_id)
             .map(|settings| settings.auto_approve_plans)
             .ok_or_else(storage_fault)?;
-        let automatic_decision_ref =
-            if auto_approve_plans && descriptor.effect_class != ToolEffectClassV2::Read {
-                self.inner
-                    .state
-                    .lock()
-                    .map_err(|_| storage_fault())?
-                    .trusts
-                    .values()
-                    .find(|trust| {
-                        trust.run_id == *run_id
-                            && trust.control_epoch == control_epoch
-                            && trust.plan_revision == plan_revision
-                            && trust.plan_action_id == plan_action_id
-                            && trust.tool_id == tool_id
-                            && trust.workspace_binding_digest == run.workspace_binding_digest
-                            && trust.context_ref == context_ref
-                            && trust.authorization_binding == authorization_binding
-                            && target_set_contains(&trust.approved_targets, &approved_targets)
-                            && trust.expires_at.as_ref().is_none_or(recorded_at_is_future)
-                    })
-                    .map(|trust| trust.decision_ref.clone())
-            } else {
-                None
-            };
-        let disposition = if descriptor.effect_class == ToolEffectClassV2::Read
-            || automatic_decision_ref.is_some()
+        let automatic_decision_ref = if !origin.is_preview_only()
+            && auto_approve_plans
+            && descriptor.effect_class != ToolEffectClassV2::Read
+        {
+            self.inner
+                .state
+                .lock()
+                .map_err(|_| storage_fault())?
+                .trusts
+                .values()
+                .find(|trust| {
+                    trust.run_id == *run_id
+                        && trust.control_epoch == control_epoch
+                        && trust.plan_revision == plan_revision
+                        && trust.plan_action_id == plan_action_id
+                        && trust.tool_id == tool_id
+                        && trust.workspace_binding_digest == run.workspace_binding_digest
+                        && trust.context_ref == context_ref
+                        && trust.authorization_binding == authorization_binding
+                        && target_set_contains(&trust.approved_targets, &approved_targets)
+                        && trust.expires_at.as_ref().is_none_or(recorded_at_is_future)
+                })
+                .map(|trust| trust.decision_ref.clone())
+        } else {
+            None
+        };
+        let disposition = if !origin.is_preview_only()
+            && (descriptor.effect_class == ToolEffectClassV2::Read
+                || automatic_decision_ref.is_some())
         {
             CapabilityScopeDispositionV2::AutoIssuable
         } else {
@@ -5624,6 +6010,7 @@ impl KernelSessionServiceV2 {
             plan_action_id: plan_action_id.clone(),
             operation_id: operation_id.clone(),
             tool_id: tool_id.clone(),
+            origin,
             authorization_binding: authorization_binding.clone(),
             canonical_scope: canonical_resource_scope,
             scope_digest: scope_digest.clone(),
@@ -5654,6 +6041,7 @@ impl KernelSessionServiceV2 {
             },
             preview_id,
             tool_id,
+            origin: record.origin.clone(),
             authorization_binding,
             scope_digest,
             tool_contract_digest: descriptor.contract_digest,
@@ -5887,10 +6275,8 @@ impl KernelSessionServiceV2 {
         }
         let invocation = canonical_invocation(&command.tool_id, &command.raw_arguments)?;
         match command.authority.clone() {
-            ToolIntentAuthorityV2::ContextRead { .. } => {
-                if descriptor.effect_class != ToolEffectClassV2::Read
-                    || descriptor.effect_scope != ToolEffectScopeV2::WorkspaceRead
-                {
+            ToolIntentAuthorityV2::Read { .. } => {
+                if descriptor.effect_class != ToolEffectClassV2::Read {
                     return Err(invalid_field(
                         "authority",
                         InvalidFieldViolationV2::InvalidRelation,
@@ -6247,6 +6633,7 @@ impl KernelSessionServiceV2 {
             plan_action_id,
             command.operation_id.clone(),
             command.tool_id.clone(),
+            CapabilityScopePreviewOriginV3::Plan {},
             authorization_binding,
             canonical_scope,
             targets,
@@ -6295,7 +6682,7 @@ impl KernelSessionServiceV2 {
         );
         let pending_lease = match &durable_pending.authority {
             ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
-            ToolIntentAuthorityV2::ContextRead { .. } => None,
+            ToolIntentAuthorityV2::Read { .. } => None,
         };
         let pending_material =
             pending_intent_material(&durable_pending, AUTHORITY_MATERIAL_AWAITING, pending_lease)?;
@@ -6453,7 +6840,7 @@ impl KernelSessionServiceV2 {
         self.execute_direct_tool_intent(
             command,
             invocation,
-            InvocationAuthorityV2::ContextRead {
+            InvocationAuthorityV2::Read {
                 tool_context_ref,
                 settings_digest,
                 policy_evaluation_digest,

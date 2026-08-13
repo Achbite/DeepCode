@@ -170,8 +170,8 @@ fn empty_timeline_for_verified_session(session: &Value, session_id: &str) -> Opt
         return None;
     }
     let timeline = json!({
-        "schemaVersion": "deepcode.shared-conversation-projection.v3",
-        "shapeVersion": "deepcode.shared-conversation.work-segments.v3",
+        "schemaVersion": "deepcode.shared-conversation-projection.v4",
+        "shapeVersion": "deepcode.shared-conversation.work-segments.v4",
         "sessionId": session_id,
         "revision": 0,
         "sourceEventVersion": 0,

@@ -59,6 +59,7 @@ import {
 } from './factBarriers.js';
 import {
   abortSessionProviderToolCallQueueV2,
+  markSessionProviderMutationPreviewedV4,
   markSessionProviderToolCallSubmittedV2,
 } from './providerToolCallQueue.js';
 
@@ -771,16 +772,34 @@ function applyPublicRequestOutcome(
               'Capability preview batch item lost its persisted PlanAction correlation.'
             );
           }
-          if (result.kind === 'previewed') {
-            nextPreviews[result.data.preview.operationId] =
-              result.data.preview;
-          } else {
-            delete nextPreviews[item.operationId];
-            appendUniqueGuidance(nextGuidance, result.data.guidance);
+          if (item.origin.kind === 'plan') {
+            if (result.kind === 'previewed') {
+              nextPreviews[result.data.preview.operationId] =
+                result.data.preview;
+            } else {
+              delete nextPreviews[item.operationId];
+              appendUniqueGuidance(nextGuidance, result.data.guidance);
+            }
           }
         }
         state.previews = nextPreviews;
         state.pendingGuidance = nextGuidance;
+        if (record.intent.payload.items.some(
+          (item) => item.origin.kind === 'planDiscovery'
+        )) {
+          if (
+            record.intent.payload.items.length !== 1
+            || !markSessionProviderMutationPreviewedV4(state, {
+              requestId: record.requestId,
+              reply: outcome.reply,
+            })
+          ) {
+            throw new SessionKernelPublicRequestError(
+              'session_kernel_plan_discovery_preview_correlation_mismatch',
+              'Plan-discovery preview does not match the durable Provider mutation candidate.'
+            );
+          }
+        }
       }
       break;
     case 'toolIntentSubmit':

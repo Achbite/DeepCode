@@ -808,10 +808,65 @@ impl TuiApp {
             .collect::<Vec<_>>();
         let Some(kind) = parts.first().cloned() else {
             self.cards.push(CardModel::error(
-                "用法：/decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
+                "用法：/decision <plan|permission> ... 或 /decision intervention <interaction-id> <select|revise|reject> [--option <id>] [--guidance <text>]",
             ));
             return;
         };
+        if kind == "intervention" {
+            let Some(interaction_id) = parts.get(1).cloned() else {
+                self.cards
+                    .push(CardModel::error("介入决定缺少 interaction id。"));
+                return;
+            };
+            let Some(decision) = parts.get(2).cloned() else {
+                self.cards.push(CardModel::error(
+                    "介入决定必须是 select、revise 或 reject。",
+                ));
+                return;
+            };
+            let mut option_id = None;
+            let mut guidance = None;
+            let mut index = 3;
+            while index < parts.len() {
+                match parts[index].as_str() {
+                    "--option" => {
+                        option_id = parts.get(index + 1).cloned();
+                        if option_id.is_none() {
+                            self.cards
+                                .push(CardModel::error("--option 缺少 option id。"));
+                            return;
+                        }
+                        index += 2;
+                    }
+                    "--guidance" => {
+                        let value = parts[index + 1..].join(" ");
+                        if value.trim().is_empty() {
+                            self.cards
+                                .push(CardModel::error("--guidance 缺少点评文本。"));
+                            return;
+                        }
+                        guidance = Some(value);
+                        index = parts.len();
+                    }
+                    other => {
+                        self.cards.push(CardModel::error(format!(
+                            "未知介入参数 {other}；只能使用 --option 或 --guidance。"
+                        )));
+                        return;
+                    }
+                }
+            }
+            self.start_decision_request(
+                "userIntervention".to_string(),
+                decision,
+                None,
+                Some(interaction_id),
+                guidance,
+                option_id,
+            )
+            .await;
+            return;
+        }
         let Some(decision) = parts.get(1).cloned() else {
             self.cards.push(CardModel::error(
                 "用法：/decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
@@ -848,6 +903,7 @@ impl TuiApp {
             } else {
                 None
             },
+            None,
         )
         .await;
     }
@@ -873,6 +929,63 @@ impl TuiApp {
                 Some(pending.run_id),
                 Some(pending.target_id),
                 None,
+                None,
+            )
+            .await;
+            return;
+        }
+        if pending.kind == "userIntervention" {
+            let trimmed = line.trim();
+            let mut parts = trimmed.split_whitespace();
+            let action = parts.next().unwrap_or_default();
+            let (decision, option_id, guidance) = match action {
+                "reject" | "拒绝" => (
+                    "reject".to_string(),
+                    None,
+                    parts.next().map(|first| {
+                        std::iter::once(first)
+                            .chain(parts)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }),
+                ),
+                "revise" | "修订" => {
+                    let guidance = parts.collect::<Vec<_>>().join(" ");
+                    if guidance.trim().is_empty() {
+                        self.cards
+                            .push(CardModel::error("介入修订必须提供 guidance：revise <text>"));
+                        return;
+                    }
+                    ("revise".to_string(), None, Some(guidance))
+                }
+                "select" | "选择" => {
+                    let Some(option_id) = parts.next().map(ToOwned::to_owned) else {
+                        self.cards.push(CardModel::error(
+                            "介入选择必须提供 option id：select <option-id> [comment]",
+                        ));
+                        return;
+                    };
+                    let guidance = parts.collect::<Vec<_>>().join(" ");
+                    (
+                        "select".to_string(),
+                        Some(option_id),
+                        (!guidance.trim().is_empty()).then_some(guidance),
+                    )
+                }
+                _ => {
+                    self.cards.push(CardModel::error(
+                        "介入输入必须使用 select <option-id> [comment]、revise <guidance> 或 reject [comment]。",
+                    ));
+                    return;
+                }
+            };
+            self.start_decision_request(
+                pending.kind,
+                decision,
+                Some(pending.run_id),
+                Some(pending.target_id),
+                guidance,
+                option_id,
             )
             .await;
             return;
@@ -884,6 +997,7 @@ impl TuiApp {
             Some(pending.run_id),
             Some(pending.target_id),
             parsed.guidance,
+            None,
         )
         .await;
     }
@@ -895,11 +1009,18 @@ impl TuiApp {
         run_id: Option<String>,
         target_id: Option<String>,
         guidance: Option<String>,
+        option_id: Option<String>,
     ) {
         if !matches!(
             (kind.as_str(), decision.as_str()),
-            ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
+            ("plan", "accept" | "reject" | "revise")
+                | ("permission", "accept" | "reject")
+                | ("userIntervention", "select" | "revise" | "reject")
         ) || (kind == "permission" && guidance.is_some())
+            || (kind == "userIntervention"
+                && ((decision == "select" && option_id.is_none())
+                    || (decision == "revise" && guidance.as_deref().is_none_or(str::is_empty))
+                    || (decision != "select" && option_id.is_some())))
         {
             self.cards.push(CardModel::error(
                 "decision kind、decision 或 guidance 不符合 canonical Session decision contract。",
@@ -941,6 +1062,17 @@ impl TuiApp {
             self.timeline = Some(timeline);
             return;
         }
+        if kind == "userIntervention"
+            && option_id
+                .as_deref()
+                .is_some_and(|selected| !pending.option_ids.iter().any(|id| id == selected))
+        {
+            self.cards.push(CardModel::error(
+                "所选介入方案已失效，请刷新 timeline 后重新选择。",
+            ));
+            self.timeline = Some(timeline);
+            return;
+        }
         let caller_request_id = match new_tui_request_id("decision") {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -955,6 +1087,7 @@ impl TuiApp {
                 return;
             }
         };
+        let intervention_decision = kind == "userIntervention";
         let mut request = StartAgentRunRequest::resolve_decision(
             kind,
             decision,
@@ -962,8 +1095,15 @@ impl TuiApp {
             conversation_target,
         );
         request.run_id = Some(pending.run_id);
-        request.target_id = Some(pending.target_id);
+        request.target_id = Some(pending.target_id.clone());
         request.guidance = guidance;
+        if intervention_decision {
+            request.option_id = option_id;
+            request.interaction_id = Some(pending.target_id.clone());
+            request.interaction_revision = pending.interaction_revision;
+            request.candidate_set_digest = pending.candidate_set_digest;
+            request.expected_projection_cursor = pending.projection_cursor;
+        }
         self.status = format!("API {} · running", self.client.base_url());
         self.running_preview_active = true;
         self.start_run_request(RunOperation::Decision, session_id, request)
@@ -1527,6 +1667,7 @@ impl TuiApp {
             None,
             Some(permission_id.to_string()),
             None,
+            None,
         )
         .await;
     }
@@ -1554,6 +1695,10 @@ struct PendingDecision {
     kind: String,
     run_id: String,
     target_id: String,
+    interaction_revision: Option<String>,
+    candidate_set_digest: Option<String>,
+    projection_cursor: Option<u64>,
+    option_ids: Vec<String>,
 }
 
 struct ParsedDecisionInput {
@@ -1613,6 +1758,10 @@ fn latest_pending_decision(timeline: Option<&AgentTimelineSnapshot>) -> Option<P
             kind: "plan".to_string(),
             run_id: plan.run_id.clone(),
             target_id: plan.target_id.clone(),
+            interaction_revision: None,
+            candidate_set_digest: None,
+            projection_cursor: None,
+            option_ids: Vec::new(),
         }),
         AgentTimelinePendingInteraction::Permission(permission) => {
             if permission.request.id != permission.request_id
@@ -1624,8 +1773,26 @@ fn latest_pending_decision(timeline: Option<&AgentTimelineSnapshot>) -> Option<P
                 kind: "permission".to_string(),
                 run_id: permission.request.run_id.clone()?,
                 target_id: permission.target_id.clone(),
+                interaction_revision: None,
+                candidate_set_digest: None,
+                projection_cursor: None,
+                option_ids: Vec::new(),
             })
         }
+        AgentTimelinePendingInteraction::UserIntervention(intervention) => Some(PendingDecision {
+            kind: "userIntervention".to_string(),
+            run_id: intervention.run_id.clone(),
+            target_id: intervention.target_id.clone(),
+            interaction_revision: Some(intervention.interaction_revision.clone()),
+            candidate_set_digest: Some(intervention.candidate_set_digest.clone()),
+            projection_cursor: Some(timeline?.revision),
+            option_ids: intervention
+                .intervention
+                .options
+                .iter()
+                .map(|option| option.id.clone())
+                .collect(),
+        }),
     }
 }
 

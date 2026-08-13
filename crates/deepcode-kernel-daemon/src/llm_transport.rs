@@ -1586,7 +1586,8 @@ fn inject_provider_native_continuation(
         })?;
     if parent_request_id == current_identity.provider_turn_id
         || match current_sidecar.cache_lane.relation_kind {
-            SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation => {
+            SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+            | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation => {
                 current_identity.purpose != ProviderTracePurposeV1::Continuation
             }
             SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
@@ -1793,6 +1794,31 @@ fn inject_provider_native_continuation(
             }
             provider_native_continuation_messages(provider_kind, continuation)?
         }
+        SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation => {
+            validate_provider_continuation_admission(
+                current_identity,
+                current_sidecar,
+                dispatch_authority,
+            )?;
+            let mut continuation = provider_native_session_control_continuation(
+                completed.reasoning,
+                &completed.ordered_items,
+                &parent_sidecar.target_binding,
+                current_sidecar,
+            )?;
+            if profile.kind == "anthropic" {
+                continuation.anthropic_signature = Some(anthropic_thinking_signature(
+                    &completed.raw_upstream_envelopes,
+                    &continuation.reasoning,
+                )?);
+            } else if profile.kind == "openaiCompatible" {
+                continuation.openai_reasoning_field = Some(openai_reasoning_field(
+                    &completed.raw_upstream_envelopes,
+                    &continuation.reasoning,
+                )?);
+            }
+            provider_native_continuation_messages(provider_kind, continuation)?
+        }
         SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
             let head = current_sidecar
                 .provider_conversation_head
@@ -1947,6 +1973,7 @@ fn validate_provider_cache_lane_predecessor(
     }
     match current.cache_lane.relation_kind {
         SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+        | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
         | SessionProviderCacheLaneRelationKindV2::ExactReplay => {
             if current.run_id != parent.run_id
                 || current.user_turn_id != parent.user_turn_id
@@ -2150,6 +2177,121 @@ fn provider_native_continuation_from_evidence(
         reasoning,
         assistant_items,
         tools,
+        anthropic_signature: None,
+        openai_reasoning_field: None,
+    })
+}
+
+fn provider_native_session_control_continuation(
+    reasoning: String,
+    ordered_items: &[Value],
+    parent_target: &SessionProviderTargetBindingSidecarV2,
+    current_sidecar: &SessionProviderAdmissionSidecarV2,
+) -> Result<ProviderNativeContinuationV1, ProviderNativeStreamTransportErrorV1> {
+    let (expected_tool_name, allowed_next_targets): (&str, &[&str]) = match parent_target {
+        SessionProviderTargetBindingSidecarV2::Planning => (
+            "deepcode_session_plan_propose_v4",
+            &["planning", "planAction"],
+        ),
+        SessionProviderTargetBindingSidecarV2::PlanAction { .. } => (
+            "deepcode_session_plan_action_complete_v2",
+            &["planAction", "finalAnswer"],
+        ),
+        SessionProviderTargetBindingSidecarV2::InterventionResearch { .. } => (
+            "deepcode_session_intervention_propose_v1",
+            &["interventionResearch", "planning", "planAction"],
+        ),
+        SessionProviderTargetBindingSidecarV2::ContextRead { .. }
+        | SessionProviderTargetBindingSidecarV2::FinalAnswer { .. } => {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_control_continuation_invalid",
+            ));
+        }
+    };
+    let next_target = current_sidecar.target_binding.kind_name();
+    if !allowed_next_targets.contains(&next_target) {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_control_continuation_invalid",
+        ));
+    }
+
+    let expected_wire_name = if expected_tool_name.starts_with("deepcode_session_") {
+        expected_tool_name.to_string()
+    } else {
+        provider_tool_name(expected_tool_name)
+    };
+
+    let mut assistant_items = Vec::new();
+    let mut control_tool = None;
+    for item in ordered_items {
+        match item.get("kind").and_then(Value::as_str) {
+            Some("text") => {
+                let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_native_history_invalid",
+                    )
+                })?;
+                if !text.is_empty() {
+                    assistant_items
+                        .push(ProviderContinuationAssistantItemV1::Text(text.to_string()));
+                }
+            }
+            Some("toolCall") if control_tool.is_none() => {
+                if item.get("index").and_then(Value::as_u64) != Some(0) {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_native_history_invalid",
+                    ));
+                }
+                let call_id = required_continuation_text(item, "callId")?;
+                let wire_name = required_continuation_text(item, "name")?;
+                if wire_name != expected_wire_name {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_control_continuation_invalid",
+                    ));
+                }
+                let arguments_text = required_continuation_text(item, "arguments")?;
+                let arguments = serde_json::from_str::<Value>(&arguments_text).map_err(|_| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_native_history_invalid",
+                    )
+                })?;
+                let mut output = json!({
+                    "schemaVersion": "deepcode.session.control-continuation-result.v1",
+                    "status": "settled",
+                    "control": expected_tool_name,
+                    "nextTargetKind": next_target,
+                });
+                if let Some(plan_revision) = &current_sidecar.authority.plan_revision {
+                    output["planRevision"] = json!(plan_revision);
+                }
+                control_tool = Some(ProviderContinuationToolV1 {
+                    call_id,
+                    wire_name: wire_name.clone(),
+                    internal_name: internal_tool_name(&wire_name),
+                    arguments,
+                    output,
+                });
+                assistant_items.push(ProviderContinuationAssistantItemV1::Tool(0));
+            }
+            _ => {
+                return Err(ProviderNativeStreamTransportErrorV1::new(
+                    "provider_continuation_native_history_invalid",
+                ));
+            }
+        }
+    }
+    let tool = control_tool.ok_or_else(|| {
+        ProviderNativeStreamTransportErrorV1::new("provider_control_continuation_invalid")
+    })?;
+    if reasoning.trim().is_empty() {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_continuation_native_history_invalid",
+        ));
+    }
+    Ok(ProviderNativeContinuationV1 {
+        reasoning,
+        assistant_items,
+        tools: vec![tool],
         anthropic_signature: None,
         openai_reasoning_field: None,
     })
@@ -2664,22 +2806,29 @@ fn provider_continuation_fact_matches_parent(
         .details
         .get("identity")
         .and_then(|identity| identity.get("authority"));
-    match &parent_sidecar.target_binding {
-        SessionProviderTargetBindingSidecarV2::Planning
-        | SessionProviderTargetBindingSidecarV2::ContextRead { .. } => {
+    match authority
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+    {
+        // Reads retain context-read authority even when they supplement an
+        // accepted PlanAction. The canonical Kernel fact proves the effect was
+        // admitted as a read; the Provider target must not rewrite it into the
+        // PlanAction mutation authority.
+        Some("read") => {
             fact.lineage.plan_action_ids.is_empty()
-                && authority
-                    .and_then(|value| value.get("kind"))
-                    .and_then(Value::as_str)
-                    == Some("contextRead")
+                && !matches!(
+                    parent_sidecar.target_binding,
+                    SessionProviderTargetBindingSidecarV2::FinalAnswer { .. }
+                )
         }
-        SessionProviderTargetBindingSidecarV2::PlanAction { plan_action_id } => {
+        Some("planAction") => {
+            let SessionProviderTargetBindingSidecarV2::PlanAction { plan_action_id } =
+                &parent_sidecar.target_binding
+            else {
+                return false;
+            };
             fact.lineage.plan_action_ids.len() == 1
                 && fact.lineage.plan_action_ids[0].as_str() == plan_action_id
-                && authority
-                    .and_then(|value| value.get("kind"))
-                    .and_then(Value::as_str)
-                    == Some("planAction")
                 && authority
                     .and_then(|value| value.get("data"))
                     .and_then(|value| value.get("planActionId"))
@@ -2691,7 +2840,7 @@ fn provider_continuation_fact_matches_parent(
                     .and_then(Value::as_str)
                     == parent_sidecar.authority.plan_revision.as_deref()
         }
-        SessionProviderTargetBindingSidecarV2::FinalAnswer { .. } => false,
+        _ => false,
     }
 }
 
@@ -3162,7 +3311,11 @@ fn provider_dispatch_binding_from_exact_request(
     let target_kind = required_text(target.get("kind"))?;
     if !matches!(
         target_kind.as_str(),
-        "planning" | "planAction" | "contextRead" | "finalAnswer"
+        "planning"
+            | "planAction"
+            | "contextRead"
+            | "interventionResearch"
+            | "finalAnswer"
     ) {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_dispatch_request_identity_invalid",

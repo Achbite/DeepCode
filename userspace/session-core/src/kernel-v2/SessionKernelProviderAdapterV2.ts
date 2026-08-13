@@ -29,10 +29,14 @@ import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
 } from './types.js';
 
-export const SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA =
-  'deepcode.session.plan-proposal.v3' as const;
-export const SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME =
-  'deepcode_session_plan_propose_v3' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA =
+  'deepcode.session.plan-proposal.v4' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME =
+  'deepcode_session_plan_propose_v4' as const;
+export const SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA =
+  'deepcode.session.intervention-proposal.v1' as const;
+export const SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME =
+  'deepcode_session_intervention_propose_v1' as const;
 export const SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA =
   'deepcode.session.plan-action-complete.v2' as const;
 export const SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME =
@@ -65,7 +69,7 @@ export function sessionPlanActionCompleteToolV2(): ProviderWireToolDefinition {
   };
 }
 
-export function sessionPlanProposalToolV3(
+export function sessionPlanProposalToolV4(
   admittedToolIds: readonly string[]
 ): ProviderWireToolDefinition {
   if (
@@ -82,7 +86,7 @@ export function sessionPlanProposalToolV3(
     );
   }
   return {
-    name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+    name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
     description: [
       'Session-only structured Plan control; it never executes a Kernel tool.',
       'Call it exactly once only when every action is necessary for an explicit immediate requested outcome, honors every preserve constraint, and excludes deferred or conditional work.',
@@ -97,16 +101,23 @@ export function sessionPlanProposalToolV3(
       properties: {
         schemaVersion: {
           type: 'string',
-          const: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+          const: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
         },
         plan: {
           type: 'object',
           additionalProperties: false,
-          required: ['title', 'objective', 'narrative', 'actions'],
+          required: [
+            'title',
+            'objective',
+            'narrative',
+            'evidence',
+            'actions',
+          ],
           properties: {
             title: { type: 'string', minLength: 1 },
             objective: { type: 'string', minLength: 1 },
             narrative: { type: 'string', minLength: 1 },
+            evidence: sessionPlanEvidenceSchemaV4(),
             actions: {
               type: 'array',
               minItems: 1,
@@ -125,6 +136,157 @@ export function sessionPlanProposalToolV3(
                   },
                   scopeIntent: sessionPlanScopeIntentSchemaV3(),
                   deadline: sessionPlanDeadlineSchemaV2(),
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+function sessionPlanEvidenceSchemaV4(): unknown {
+  const unknownSchema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['unknownId', 'question', 'impact'],
+    properties: {
+      unknownId: { type: 'string', minLength: 1 },
+      question: { type: 'string', minLength: 1 },
+      impact: { type: 'string', minLength: 1 },
+    },
+  };
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'kernelFactRefs',
+      'readResources',
+      'blockingUnknowns',
+      'nonBlockingUnknowns',
+      'coverage',
+    ],
+    properties: {
+      kernelFactRefs: {
+        type: 'array',
+        maxItems: 512,
+        items: { type: 'string', minLength: 1 },
+      },
+      readResources: {
+        type: 'array',
+        maxItems: 512,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['resourceRef', 'digest', 'summary', 'factRefs'],
+          properties: {
+            resourceRef: { type: 'string', minLength: 1 },
+            digest: { type: 'string', minLength: 1 },
+            summary: { type: 'string', minLength: 1 },
+            factRefs: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 256,
+              items: { type: 'string', minLength: 1 },
+            },
+          },
+        },
+      },
+      blockingUnknowns: {
+        type: 'array',
+        maxItems: 128,
+        items: unknownSchema,
+      },
+      nonBlockingUnknowns: {
+        type: 'array',
+        maxItems: 128,
+        items: unknownSchema,
+      },
+      coverage: { type: 'string', minLength: 1 },
+    },
+  };
+}
+
+export function sessionInterventionProposalToolV1(
+  admittedToolIds: readonly string[]
+): ProviderWireToolDefinition {
+  const planDefinition = sessionPlanProposalToolV4(admittedToolIds);
+  const planSchema = (
+    planDefinition.inputSchema as {
+      properties: { plan: unknown };
+    }
+  ).properties.plan;
+  return {
+    name: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
+    description: [
+      'Session-only control for one consolidated user intervention after out-of-plan mutation intent has been frozen.',
+      'Use it only after directly relevant read evidence has converged.',
+      'Executable options require a complete candidate Plan containing only unsettled mutation work; guidance-only options must omit candidatePlan.',
+      'Explain the recommendation and material tradeoffs. This control grants no effect authority and cannot share Kernel mutation calls or final-answer text.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['schemaVersion', 'intervention'],
+      properties: {
+        schemaVersion: {
+          type: 'string',
+          const: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+        },
+        intervention: {
+          type: 'object',
+          additionalProperties: false,
+          required: [
+            'problemSummary',
+            'relevantFactRefs',
+            'affectedPlanActionIds',
+            'options',
+          ],
+          properties: {
+            problemSummary: { type: 'string', minLength: 1 },
+            recommendation: { type: 'string', minLength: 1 },
+            relevantFactRefs: {
+              type: 'array',
+              maxItems: 512,
+              items: { type: 'string', minLength: 1 },
+            },
+            affectedPlanActionIds: {
+              type: 'array',
+              maxItems: 256,
+              items: { type: 'string', minLength: 1 },
+            },
+            options: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 16,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: [
+                  'optionId',
+                  'kind',
+                  'title',
+                  'description',
+                  'tradeoffs',
+                  'recommended',
+                ],
+                properties: {
+                  optionId: { type: 'string', minLength: 1 },
+                  kind: {
+                    type: 'string',
+                    enum: ['executable', 'guidanceOnly'],
+                  },
+                  title: { type: 'string', minLength: 1 },
+                  description: { type: 'string', minLength: 1 },
+                  tradeoffs: {
+                    type: 'array',
+                    minItems: 1,
+                    maxItems: 32,
+                    items: { type: 'string', minLength: 1 },
+                  },
+                  recommended: { type: 'boolean' },
+                  candidatePlan: planSchema,
                 },
               },
             },
@@ -276,6 +438,27 @@ export interface SessionProviderPlanActionDraftV2 {
   deadline?: DeadlineRequestV2;
 }
 
+export interface SessionProviderPlanEvidenceResourceDraftV4 {
+  resourceRef: string;
+  digest: string;
+  summary: string;
+  factRefs: string[];
+}
+
+export interface SessionProviderPlanUnknownDraftV4 {
+  unknownId: string;
+  question: string;
+  impact: string;
+}
+
+export interface SessionProviderPlanEvidenceDraftV4 {
+  kernelFactRefs: string[];
+  readResources: SessionProviderPlanEvidenceResourceDraftV4[];
+  blockingUnknowns: SessionProviderPlanUnknownDraftV4[];
+  nonBlockingUnknowns: SessionProviderPlanUnknownDraftV4[];
+  coverage: string;
+}
+
 /**
  * Provider-owned prose and requested scope only. Authority identities are
  * deliberately absent and are minted by Session after validation.
@@ -284,7 +467,36 @@ export interface SessionProviderPlanDraftV2 {
   title: string;
   objective: string;
   narrative: string;
+  evidence: SessionProviderPlanEvidenceDraftV4;
   actions: SessionProviderPlanActionDraftV2[];
+}
+
+export interface SessionProviderInterventionOptionDraftV1 {
+  optionId: string;
+  kind: 'executable' | 'guidanceOnly';
+  title: string;
+  description: string;
+  tradeoffs: string[];
+  recommended: boolean;
+  candidatePlan?: SessionProviderPlanDraftV2;
+}
+
+export interface SessionProviderInterventionDraftV1 {
+  problemSummary: string;
+  recommendation?: string;
+  relevantFactRefs: string[];
+  affectedPlanActionIds: string[];
+  options: SessionProviderInterventionOptionDraftV1[];
+}
+
+export interface SessionProviderInterventionOptionV1
+  extends Omit<SessionProviderInterventionOptionDraftV1, 'candidatePlan'> {
+  candidatePlan?: SessionNaturalLanguagePlanV2;
+}
+
+export interface SessionProviderInterventionProposalV1
+  extends Omit<SessionProviderInterventionDraftV1, 'options'> {
+  options: SessionProviderInterventionOptionV1[];
 }
 
 export type SessionKernelProviderOrderedItemV2 =
@@ -295,9 +507,21 @@ export type SessionKernelProviderBackendOutputV2 = (
       kind: 'plan';
       plan: SessionProviderPlanDraftV2;
       planProposal: {
-        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA;
+        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA;
         callId: string;
-        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME;
+        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME;
+        argumentsDigest: string;
+      };
+    }
+  | {
+      kind: 'intervention';
+      draft: SessionProviderInterventionDraftV1;
+      control: {
+        schemaVersion:
+          typeof SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA;
+        callId: string;
+        toolName:
+          typeof SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME;
         argumentsDigest: string;
       };
     }
@@ -361,7 +585,9 @@ export type SessionKernelProviderAdapterInputV2 = Pick<
   | 'plan'
   | 'target'
   | 'toolContext'
->;
+> & {
+  kernelFacts?: SessionProviderTurnInputV2['kernelFacts'];
+};
 
 /**
  * Only provider-native Kernel tool calls enter the executable lane. The
@@ -429,6 +655,24 @@ export function adaptSessionKernelProviderBackendOutputV2(
             output.plan,
             recordedAt
           ),
+          providerResult: output.providerResult,
+        };
+      case 'intervention':
+        if (input.target.kind !== 'interventionResearch') {
+          throw new SessionKernelProviderAdapterError(
+            'session_kernel_provider_intervention_target_invalid',
+            'A Provider intervention is accepted only for the active intervention research turn.'
+          );
+        }
+        return {
+          kind: 'intervention',
+          ...completionFields,
+          proposal: materializeProviderInterventionV1(
+            input,
+            output.draft,
+            recordedAt
+          ),
+          control: cloneJson(output.control),
           providerResult: output.providerResult,
         };
       case 'nativeToolCalls': {
@@ -552,9 +796,9 @@ function assertCompletedProviderBackendOutputV2(
   if (output.kind === 'plan') {
     if (
       output.planProposal.schemaVersion
-        !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA
       || output.planProposal.toolName
-        !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
     ) {
       throw providerCompletionInvalid();
     }
@@ -584,6 +828,21 @@ function assertCompletedProviderBackendOutputV2(
     requiredDigest(
       output.control.argumentsDigest,
       'planActionComplete.argumentsDigest'
+    );
+  }
+  if (output.kind === 'intervention') {
+    if (
+      output.control.schemaVersion
+        !== SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA
+      || output.control.toolName
+        !== SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME
+    ) {
+      throw providerCompletionInvalid();
+    }
+    requiredIdentity(output.control.callId, 'intervention.callId');
+    requiredDigest(
+      output.control.argumentsDigest,
+      'intervention.argumentsDigest'
     );
   }
   requiredDigest(completion.reasoningDigest, 'reasoningDigest');
@@ -720,6 +979,7 @@ function assertCompletedProviderBackendOutputV2(
         orderedTools.length > 0
         || output.kind === 'plan'
         || output.kind === 'planActionComplete'
+        || output.kind === 'intervention'
           ? native.finishReason !== 'tool_calls'
           : native.finishReason !== 'stop'
       )
@@ -817,43 +1077,6 @@ function requirePermittedTool(
       `Provider requested a tool outside the current ready ToolContext: ${toolId}.`
     );
   }
-  if (
-    input.target.kind === 'planning'
-    && descriptor.effectClass !== 'read'
-  ) {
-    throw new SessionKernelProviderAdapterError(
-      'session_kernel_provider_planning_mutation_forbidden',
-      'A planning turn cannot invoke a mutation without a confirmed PlanAction.'
-    );
-  }
-  if (
-    input.target.kind === 'contextRead'
-    && descriptor.effectClass !== 'read'
-  ) {
-    throw new SessionKernelProviderAdapterError(
-      'session_kernel_provider_context_read_mutation_forbidden',
-      'A context-read turn cannot invoke a mutation.'
-    );
-  }
-  if (input.target.kind === 'planAction') {
-    const currentPlanActionId = input.target.planActionId;
-    const current = input.plan?.actions.find(
-      (action) =>
-        action.manifest.planActionId === currentPlanActionId
-    );
-    if (!current) {
-      throw new SessionKernelProviderAdapterError(
-        'session_kernel_provider_plan_action_missing',
-        'PlanAction output admission requires its exact persisted Plan action.'
-      );
-    }
-    if (current.manifest.toolId !== toolId) {
-      throw new SessionKernelProviderAdapterError(
-        'session_kernel_provider_plan_action_tool_forbidden',
-        'A PlanAction turn may invoke only the exact tool bound to the current confirmed action.'
-      );
-    }
-  }
   if (input.target.kind === 'finalAnswer') {
     throw new SessionKernelProviderAdapterError(
       'session_kernel_provider_final_answer_tool_forbidden',
@@ -866,12 +1089,62 @@ function requirePermittedTool(
 export function materializeProviderPlanV2(
   input: Pick<
     SessionProviderTurnInputV2,
-    'providerTurnId' | 'runId' | 'currentInput' | 'toolContext'
-  >,
+    | 'providerTurnId'
+    | 'runId'
+    | 'currentInput'
+    | 'toolContext'
+    | 'plan'
+  > & { kernelFacts?: SessionProviderTurnInputV2['kernelFacts'] },
   draft: SessionProviderPlanDraftV2,
   recordedAt: string
 ): SessionNaturalLanguagePlanV2 {
   const normalized = normalizePlanDraft(draft);
+  if (normalized.evidence.blockingUnknowns.length > 0) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_blocking_unknowns',
+      'An executable mutation Plan cannot be admitted while blocking unknowns remain.'
+    );
+  }
+  const exactFacts = input.kernelFacts
+    ? new Map(input.kernelFacts.facts.map((fact) => [fact.factId, fact]))
+    : undefined;
+  const evidenceFactRefs = new Set(normalized.evidence.kernelFactRefs);
+  for (const resource of normalized.evidence.readResources) {
+    resource.factRefs.forEach((factRef) => evidenceFactRefs.add(factRef));
+  }
+  for (const factRef of evidenceFactRefs) {
+    if (exactFacts && !exactFacts.has(factRef)) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_evidence_stale',
+        `Plan evidence references a Kernel fact outside the exact current snapshot: ${factRef}.`
+      );
+    }
+  }
+  for (const resource of normalized.evidence.readResources) {
+    if (!/^sha256:[0-9a-f]{64}$/u.test(resource.digest)) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_resource_digest_invalid',
+        `Plan evidence resource ${resource.resourceRef} lacks a canonical digest.`
+      );
+    }
+    const facts = exactFacts
+      ? resource.factRefs.map((factRef) => exactFacts.get(factRef)!)
+      : [];
+    if (
+      exactFacts
+      && (
+        !facts.some((fact) =>
+          fact.lineage.resourceIds.includes(resource.resourceRef)
+        )
+        || !facts.some((fact) => canonicalJson(fact).includes(resource.digest))
+      )
+    ) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_resource_evidence_mismatch',
+        `Plan evidence resource ${resource.resourceRef} is not bound to its claimed fact and digest.`
+      );
+    }
+  }
   const admittedPlanningTools = new Map(
     input.toolContext.tools
       .map((tool) => [tool.toolId, tool])
@@ -882,6 +1155,12 @@ export function materializeProviderPlanV2(
       throw new SessionKernelProviderAdapterError(
         'session_kernel_provider_plan_tool_unavailable',
         `Provider plan requested a tool outside the exact admitted planning catalog: ${action.toolId}.`
+      );
+    }
+    if (descriptor.effectClass !== 'mutation') {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_read_action_invalid',
+        `Provider Plan actions are mutation-only; ${action.toolId} must be executed as an automatically admitted read instead.`
       );
     }
     if (descriptor.authorizationShape !== action.scopeIntent.kind) {
@@ -911,6 +1190,16 @@ export function materializeProviderPlanV2(
     title: normalized.title,
     objective: normalized.objective,
     narrative: normalized.narrative,
+    evidence: normalized.evidence,
+    ...(input.plan
+      ? {
+          predecessorPlanRef: {
+            planRevision: input.plan.planRevision,
+            planDigest: sha256Hash(canonicalJson(input.plan)),
+          },
+        }
+      : {}),
+    carriedSettlementRefs: [],
     actions: normalized.actions.map((action, index) => {
       const ordinal = String(index + 1).padStart(4, '0');
       const planActionId = `plan-action-${digest}-${ordinal}`;
@@ -956,6 +1245,44 @@ function normalizePlanDraft(
       'plan.narrative',
       64 * 1024
     ),
+    evidence: {
+      kernelFactRefs: uniqueSortedIdentities(
+        draft.evidence.kernelFactRefs,
+        'plan.evidence.kernelFactRefs'
+      ),
+      readResources: draft.evidence.readResources.map((resource) => ({
+        resourceRef: requiredIdentity(
+          resource.resourceRef,
+          'plan.evidence.resourceRef'
+        ),
+        digest: requiredDigest(
+          resource.digest,
+          'plan.evidence.resourceDigest'
+        ),
+        summary: requiredText(
+          resource.summary,
+          'plan.evidence.resourceSummary',
+          64 * 1024
+        ),
+        factRefs: uniqueSortedIdentities(
+          resource.factRefs,
+          'plan.evidence.resourceFactRefs'
+        ),
+      })),
+      blockingUnknowns: normalizePlanUnknownsV4(
+        draft.evidence.blockingUnknowns,
+        'plan.evidence.blockingUnknowns'
+      ),
+      nonBlockingUnknowns: normalizePlanUnknownsV4(
+        draft.evidence.nonBlockingUnknowns,
+        'plan.evidence.nonBlockingUnknowns'
+      ),
+      coverage: requiredText(
+        draft.evidence.coverage,
+        'plan.evidence.coverage',
+        64 * 1024
+      ),
+    },
     actions: draft.actions.map((action) => {
       if (
         action.scopeIntent.kind === 'resourceScope'
@@ -994,6 +1321,158 @@ function normalizePlanDraft(
       };
     }),
   };
+}
+
+function normalizeInterventionDraftV1(
+  draft: SessionProviderInterventionDraftV1
+): SessionProviderInterventionDraftV1 {
+  if (draft.options.length < 1 || draft.options.length > 16) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_intervention_options_invalid',
+      'Provider intervention options must contain 1..=16 entries.'
+    );
+  }
+  const optionIds = new Set<string>();
+  return {
+    problemSummary: requiredText(
+      draft.problemSummary,
+      'intervention.problemSummary',
+      64 * 1024
+    ),
+    ...(draft.recommendation !== undefined
+      ? {
+          recommendation: requiredText(
+            draft.recommendation,
+            'intervention.recommendation',
+            64 * 1024
+          ),
+        }
+      : {}),
+    relevantFactRefs: uniqueSortedIdentities(
+      draft.relevantFactRefs,
+      'intervention.relevantFactRefs'
+    ),
+    affectedPlanActionIds: uniqueSortedIdentities(
+      draft.affectedPlanActionIds,
+      'intervention.affectedPlanActionIds'
+    ),
+    options: draft.options.map((option) => {
+      const optionId = requiredIdentity(
+        option.optionId,
+        'intervention.optionId'
+      );
+      if (!optionIds.add(optionId)) {
+        throw new SessionKernelProviderAdapterError(
+          'session_kernel_provider_intervention_option_duplicate',
+          `Provider intervention repeats optionId ${optionId}.`
+        );
+      }
+      if (
+        (option.kind === 'executable') !== Boolean(option.candidatePlan)
+      ) {
+        throw new SessionKernelProviderAdapterError(
+          'session_kernel_provider_intervention_option_shape_invalid',
+          'Executable intervention options require candidatePlan and guidance-only options must omit it.'
+        );
+      }
+      if (option.tradeoffs.length < 1 || option.tradeoffs.length > 32) {
+        throw new SessionKernelProviderAdapterError(
+          'session_kernel_provider_intervention_tradeoffs_invalid',
+          'Each intervention option must contain 1..=32 material tradeoffs.'
+        );
+      }
+      return {
+        optionId,
+        kind: option.kind,
+        title: requiredText(
+          option.title,
+          'intervention.option.title',
+          64 * 1024
+        ),
+        description: requiredText(
+          option.description,
+          'intervention.option.description',
+          64 * 1024
+        ),
+        tradeoffs: option.tradeoffs.map((tradeoff) => requiredText(
+          tradeoff,
+          'intervention.option.tradeoff',
+          64 * 1024
+        )),
+        recommended: option.recommended,
+        ...(option.candidatePlan
+          ? { candidatePlan: normalizePlanDraft(option.candidatePlan) }
+          : {}),
+      };
+    }),
+  };
+}
+
+function materializeProviderInterventionV1(
+  input: SessionKernelProviderAdapterInputV2,
+  draft: SessionProviderInterventionDraftV1,
+  recordedAt: string
+): SessionProviderInterventionProposalV1 {
+  const normalized = normalizeInterventionDraftV1(draft);
+  return {
+    ...normalized,
+    options: normalized.options.map((option) => {
+      const { candidatePlan, ...presentation } = option;
+      return {
+        ...presentation,
+        ...(candidatePlan
+        ? {
+            candidatePlan: materializeProviderPlanV2(
+              input,
+              candidatePlan,
+              recordedAt
+            ),
+          }
+        : {}),
+      };
+    }),
+  };
+}
+
+function uniqueSortedIdentities(
+  values: readonly string[],
+  field: string
+): string[] {
+  const normalized = values.map((value) => requiredIdentity(value, field));
+  if (new Set(normalized).size !== normalized.length) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_evidence_duplicate',
+      `${field} must contain unique identities.`
+    );
+  }
+  return normalized.sort();
+}
+
+function normalizePlanUnknownsV4(
+  values: readonly SessionProviderPlanUnknownDraftV4[],
+  field: string
+): SessionProviderPlanUnknownDraftV4[] {
+  if (values.length > 128) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_unknowns_invalid',
+      `${field} exceeds the bounded evidence contract.`
+    );
+  }
+  const ids = new Set<string>();
+  return values.map((value) => {
+    const unknownId = requiredIdentity(value.unknownId, `${field}.unknownId`);
+    if (!ids.add(unknownId)) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_unknowns_duplicate',
+        `${field} repeats unknownId ${unknownId}.`
+      );
+    }
+    return {
+      unknownId,
+      question: requiredText(value.question, `${field}.question`, 64 * 1024),
+      impact: requiredText(value.impact, `${field}.impact`, 64 * 1024),
+    };
+  });
 }
 
 const SUPPORTED_TOOL_SCHEMA_KEYWORDS_V2 = new Set([

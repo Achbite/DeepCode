@@ -98,6 +98,7 @@ impl CardModel {
             AgentTimelineEntryRole::Interaction => match block.kind {
                 AgentTimelineBlockKind::Permission => CardKind::Permission,
                 AgentTimelineBlockKind::Plan => CardKind::Plan,
+                AgentTimelineBlockKind::UserIntervention => CardKind::Plan,
                 AgentTimelineBlockKind::Review => CardKind::Review,
                 AgentTimelineBlockKind::Error => CardKind::Error,
                 _ => return None,
@@ -523,9 +524,13 @@ pub fn command_help() -> &'static str {
 /deny <id>            拒绝权限请求\n\
 /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]\n\
 /decision permission <accept|reject> [run-id] [target-id]\n\
+/decision intervention <interaction-id> select --option <id> [--guidance <text>]\n\
+/decision intervention <interaction-id> revise --guidance <text>\n\
+/decision intervention <interaction-id> reject [--guidance <text>]\n\
 /audit                显示审计占位状态\n\
 \n\
 pending 计划/Review 时，空 Enter 或 1 表示确认；输入文本或 2 <文本> 表示提交 Review 信息；3、end、结束表示结束。\n\
+pending 用户介入时，使用 select <option-id> [comment]、revise <guidance> 或 reject [comment]；否决会结束 Run。\n\
 permission accept/reject 与 /allow、/deny 别名都通过共享 Session Runtime 的 canonical decision run；不会回退旧 permission endpoint。\n\
 这些命令对应 GUI composer decision / Stop 的终端输入形式；会话事实仍来自共享 daemon Session Runtime projection。\n\
 \n\
@@ -538,6 +543,7 @@ fn timeline_kind_title(kind: AgentTimelineBlockKind) -> &'static str {
         AgentTimelineBlockKind::Assistant => "DeepCode",
         AgentTimelineBlockKind::Permission => "权限",
         AgentTimelineBlockKind::Plan => "计划",
+        AgentTimelineBlockKind::UserIntervention => "需要用户介入",
         AgentTimelineBlockKind::Review => "审查",
         AgentTimelineBlockKind::Error => "错误",
     }
