@@ -1588,6 +1588,24 @@ async function outOfPlanMutationFreezesEffectAndPublishesOneConsolidatedInterven
   assert.equal(harness.calls('submitToolIntent').length, 0);
   assert.equal(harness.loop.snapshot().activeWait?.kind, 'userIntervention');
   assert.equal(intervention.options.length, 2);
+  const durableWait = clone(harness.loop.snapshot());
+  const restoredWait = restoreSessionKernelLoopStateV2(
+    checkpointFromStateV3(durableWait),
+    {
+      runId: durableWait.runId,
+      workspaceBindingDigest: durableWait.workspaceBindingDigest,
+      sessionMemory: durableWait.sessionMemory,
+      providerProfile: durableWait.providerProfile,
+    }
+  );
+  assert.equal(
+    restoredWait.providerOutcomes.find((outcome) =>
+      outcome.providerTurnId === restoredWait.providerTurn.providerTurnId
+    )?.outputKind,
+    'intervention',
+    'a private Session control must remain recoverable before facts reconciliation'
+  );
+  assert.equal(restoredWait.activeWait?.kind, 'userIntervention');
   assert.deepEqual(
     intervention.affectedPlanActionIds,
     [plan.actions[0].manifest.planActionId]

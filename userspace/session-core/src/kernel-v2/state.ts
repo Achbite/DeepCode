@@ -442,7 +442,12 @@ export function restoreSessionKernelLoopStateV2(
     boundedOutcomes.omittedCount;
   state.planActionSettlements ??= {};
   if (state.providerTurn) {
-    validateProviderTurnResponse(state.providerTurn);
+    validateProviderTurnResponse(
+      state.providerTurn,
+      [...state.providerOutcomes].reverse().find((outcome) =>
+        outcome.providerTurnId === state.providerTurn?.providerTurnId
+      )
+    );
   }
   if (state.finalAnswer) {
     validateFinalAnswerStateV3(state.finalAnswer, state);
@@ -2666,7 +2671,8 @@ function validateProviderProfile(
 }
 
 function validateProviderTurnResponse(
-  turn: SessionProviderTurnRecordV2
+  turn: SessionProviderTurnRecordV2,
+  outcome?: SessionProviderOutcomeRecordV2
 ): void {
   const statusIsValid = [
     'active',
@@ -2788,7 +2794,17 @@ function validateProviderTurnResponse(
     providerNativeToolCount += 1;
   }
   const native = completion.nativeCompletion;
-  const sessionControlToolCount = turn.target.kind === 'planning'
+  const settledSessionControl = outcome?.outputKind === 'plan'
+    || outcome?.outputKind === 'planActionComplete'
+    || outcome?.outputKind === 'intervention';
+  const pendingSessionControl = turn.status === 'active'
+    && (
+      turn.target.kind === 'planning'
+      || turn.target.kind === 'planAction'
+      || turn.target.kind === 'interventionResearch'
+    );
+  const sessionControlToolCount = settledSessionControl
+    || pendingSessionControl
     ? 1
     : 0;
   const planningInvalid = (
