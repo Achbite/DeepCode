@@ -103,7 +103,7 @@ async function sharedProjectionAcceptsOnlyExactWorkSegmentsShape() {
   });
   assert.throws(
     () => normalizeAgentTimelineSnapshot(legacyFieldOnCurrentShape),
-    /session_projection_v2_root_field_invalid/u,
+    /session_projection_v3_root_field_invalid/u,
     'current shape must reject every removed compatibility field'
   );
 
@@ -197,7 +197,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
         operationId: 'operation-read',
         toolId: 'fs.read',
         expectedControlEpoch: 1,
-        authorityKind: 'contextRead',
+        authorityKind: 'read',
         replyKind: 'admitted',
         invocationId: 'invocation-read',
       }
@@ -304,7 +304,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
         operationId: 'operation-raw-arguments-rejected',
         toolId: 'fs.read',
         expectedControlEpoch: 1,
-        authorityKind: 'contextRead',
+        authorityKind: 'read',
         replyKind: 'admitted',
         invocationId: 'invocation-raw-arguments-rejected',
         rawArguments: { path: rawArgumentsSentinel },
@@ -324,7 +324,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
       operationId: 'operation-raw-arguments-omitted',
       toolId: 'fs.read',
       expectedControlEpoch: 1,
-      authorityKind: 'contextRead',
+      authorityKind: 'read',
       replyKind: 'admitted',
       invocationId: 'invocation-raw-arguments-omitted',
     }
@@ -997,6 +997,14 @@ function threeActionPlan(runId, identity = 'authority') {
     title: `Reviewed ${identity} plan`,
     objective: `Exercise exact ${identity} PlanAction projection.`,
     narrative: `Use only the exact accepted ${identity} Plan.`,
+    evidence: {
+      kernelFactRefs: [],
+      readResources: [],
+      blockingUnknowns: [],
+      nonBlockingUnknowns: [],
+      coverage: `All ${identity} mutation targets are explicitly scoped.`,
+    },
+    carriedSettlementRefs: [],
     actions: [
       action(1, `${identity}-first.txt`),
       action(2, `${identity}-second.txt`),
@@ -1062,6 +1070,10 @@ function scopePreviewsForPlan(plan) {
       planActionId: action.manifest.planActionId,
       operationId: action.manifest.operationId,
       toolId: action.manifest.toolId,
+      origin: {
+        kind: 'plan',
+        data: {},
+      },
       authorizationBinding: {
         kind: 'resourceScope',
         data: {},

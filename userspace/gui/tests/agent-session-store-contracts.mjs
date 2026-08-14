@@ -227,10 +227,19 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 function sessionRecord(id, title = id) {
+  const projectId = `project-${id}`;
   return {
     id,
     title,
-    projectId: `project-${id}`,
+    projectId,
+    conversationTarget: {
+      schemaVersion: 'deepcode.host.conversation-target.v1',
+      targetId: `target-${id}`,
+      targetRevision: `target-revision-${id}`,
+      sessionId: id,
+      projectId,
+      workspaceScopeKey: 'no-workspace',
+    },
     eventCount: 0,
     createdAt: NOW,
     updatedAt: NOW,
@@ -239,8 +248,8 @@ function sessionRecord(id, title = id) {
 
 function emptyTimeline(sessionId, revision = 0) {
   return {
-    schemaVersion: 'deepcode.shared-conversation-projection.v2',
-    shapeVersion: 'deepcode.shared-conversation.work-segments.v2',
+    schemaVersion: 'deepcode.shared-conversation-projection.v4',
+    shapeVersion: 'deepcode.shared-conversation.work-segments.v4',
     sessionId,
     revision,
     sourceEventVersion: revision,
@@ -263,6 +272,67 @@ function activeTimeline(sessionId, kernelRunId, revision = 1) {
       languageBinding: {
         language: 'neutral',
         status: 'unavailable',
+      },
+    },
+  };
+}
+
+function interventionTimeline(sessionId, runId, revision = 7) {
+  const interactionId = `intervention-${sessionId}`;
+  const interactionRevision = `intervention-revision-${sessionId}`;
+  const candidateSetDigest = `sha256:${'c'.repeat(64)}`;
+  const intervention = {
+    schemaVersion: 'deepcode.session.user-intervention.v1',
+    interactionId,
+    interactionRevision,
+    candidateSetDigest,
+    problemSummary: 'The next mutation expands the accepted Plan.',
+    recommendation: 'Choose the reviewed executable option.',
+    relevantFacts: ['kernel-fact-1'],
+    affectedPlanActionIds: ['plan-action-1'],
+    options: [
+      {
+        id: 'option-executable',
+        label: 'Expand the Plan once',
+        description: 'Use the Kernel-reviewed replacement Plan.',
+        kind: 'executable',
+        recommended: true,
+        tradeoffs: ['Expands the approved mutation surface.'],
+        candidatePlanRevision: 'candidate-plan-revision-2',
+        candidatePlanDigest: `sha256:${'d'.repeat(64)}`,
+        actions: [{
+          planActionId: 'plan-action-2',
+          operationId: 'operation-2',
+          toolId: 'fs.write',
+          summary: 'Write the newly required file.',
+          riskLevel: 'medium',
+          canonicalTargets: ['workspace:expanded.txt'],
+          scopeDelta: ['workspace:expanded.txt'],
+          previewId: 'preview-2',
+          previewDigest: `sha256:${'e'.repeat(64)}`,
+        }],
+      },
+      {
+        id: 'option-guidance',
+        label: 'Keep the current boundary',
+        kind: 'guidanceOnly',
+        tradeoffs: ['Requires replanning without new mutation authority.'],
+        actions: [],
+      },
+    ],
+    allowsFreeform: true,
+  };
+  return {
+    ...activeTimeline(sessionId, runId, revision),
+    interactionProjection: {
+      pending: {
+        kind: 'userIntervention',
+        interactionId,
+        interactionRevision,
+        targetId: interactionId,
+        runId,
+        candidateSetDigest,
+        intervention,
       },
     },
   };
@@ -1069,8 +1139,8 @@ const contractCases = [
       const heldTimeline = holdRequests(scenario, 'timeline');
       const heldGuidance = holdRequests(scenario, 'guidance');
       const gapDelta = {
-        schemaVersion: 'deepcode.shared-conversation-projection.v2',
-        shapeVersion: 'deepcode.shared-conversation.work-segments.v2',
+        schemaVersion: 'deepcode.shared-conversation-projection.v4',
+        shapeVersion: 'deepcode.shared-conversation.work-segments.v4',
         sessionId,
         baseRevision: 99,
         revision: 100,
@@ -1079,6 +1149,7 @@ const contractCases = [
         eventCount: 100,
         turnReplacements: [],
         removedTurnIds: [],
+        operations: [],
         rootReplacements: {},
       };
       assert.throws(
@@ -1090,7 +1161,7 @@ const contractCases = [
           error?.code === 'AgentTimelineRevisionGap'
           && error.expectedBaseRevision === 1
           && error.receivedBaseRevision === 99,
-        'the stream fixture must be valid v2 and fail only on its revision gap'
+        'the stream fixture must be valid v4 and fail only on its revision gap'
       );
       let streamSequence = 0;
       scenario.handlers.set('timelineStream', (context) => {
@@ -1236,9 +1307,9 @@ const contractCases = [
         1
       ));
       await second;
-      assert(
-        scenario.recordsOf('timeline').length > preMutationFetchCount,
-        'the stale pre-mutation generation did not trigger a new force-fresh fetch'
+      await waitFor(
+        () => scenario.recordsOf('timeline').length > preMutationFetchCount,
+        'the stale pre-mutation generation to trigger a new force-fresh fetch'
       );
       assert.equal(
         scenario.recordsOf('guidance').length,
@@ -1257,7 +1328,7 @@ const contractCases = [
       );
       assert.match(
         store.getState().errorMessage ?? '',
-        /Agent 会话仍在准备中/
+        /消息接纳前会话已发生切换/
       );
 
       scenario.handlers.delete('timeline');
@@ -1271,15 +1342,15 @@ const contractCases = [
       assert.equal(scenario.recordsOf('guidance').length, 2);
       assert.equal(
         scenario.recordsOf('guidance').at(-1)?.runId,
-        'host-stale-a',
-        'force-fresh did not recover the canonical Host route'
+        'current',
+        'the thin shell did not use the canonical current-Run guidance route'
       );
       scenario.handlers.delete('timelineStream');
       await cleanupStore(store);
     },
   },
   {
-    id: 'host_active_identity_survives_unknown_get_until_terminal_status',
+    id: 'canonical_current_run_routes_require_no_ui_identity_reconciliation',
     async run(host) {
       const sessionId = 'identity-a';
       const scenario = new Scenario(this.id, [sessionId]);
@@ -1291,19 +1362,18 @@ const contractCases = [
       host.register(scenario);
       const store = await freshStore(this.id);
       await activate(store, sessionId);
-      scenario.handlers.set('runGet', (context) => {
-        context.error(503, 'Host run status unknown');
-        return true;
-      });
-      await store.getState().sendMessage('trigger unknown status refresh');
-      await waitFor(
-        () => scenario.recordsOf('runGet').length >= 2,
-        'unknown Host run refresh'
+      await store.getState().sendMessage('canonical current guidance');
+      assert.equal(
+        scenario.recordsOf('guidance').at(-1)?.runId,
+        'current',
+        'the GUI mapped canonical Run state back to a Host-owned Run identity'
       );
-
-      scenario.handlers.delete('runGet');
+      assert.equal(
+        scenario.recordsOf('runGet').length,
+        0,
+        'the GUI performed a second-source Host Run reconciliation'
+      );
       scenario.handlers.set('cancel', (context) => {
-        scenario.setRunStatus(context.route.runId, 'cancelled');
         scenario.timelines.set(sessionId, emptyTimeline(sessionId, 2));
         context.data(scenario.runResult(
           sessionId,
@@ -1315,8 +1385,8 @@ const contractCases = [
       await store.getState().cancelCurrentRun();
       assert.equal(
         scenario.recordsOf('cancel').at(-1)?.runId,
-        'host-identity-a',
-        'unknown GET cleared the Host-active identity'
+        'current',
+        'the GUI did not use the canonical current-Run cancellation route'
       );
       await waitFor(
         () => !store.getState().timeline?.runProjection,
@@ -1326,8 +1396,13 @@ const contractCases = [
       await store.getState().cancelCurrentRun();
       assert.equal(
         scenario.recordsOf('cancel').length,
-        cancelCount,
-        'terminal Host status did not clear the active identity'
+        cancelCount + 1,
+        'the GUI retained a local terminal identity gate instead of deferring to the canonical current-Run route'
+      );
+      assert.equal(
+        scenario.recordsOf('cancel').at(-1)?.runId,
+        'current',
+        'repeat cancellation reconstructed a stale Host Run identity'
       );
       scenario.handlers.delete('cancel');
       await cleanupStore(store);
@@ -1431,7 +1506,6 @@ const contractCases = [
           });
         };
         hangOnce(runScenario, 'timeline');
-        hangOnce(runScenario, 'runGet');
         let firstTimelineStream = true;
         runScenario.handlers.set('timelineStream', (context) => {
           context.sseOpen();
@@ -1449,7 +1523,6 @@ const contractCases = [
           activationStore.getState().activateSession(activationSession);
         await waitFor(
           () => runScenario.recordsOf('timeline').length > 0
-            && runScenario.recordsOf('runGet').length > 0
             && runScenario.recordsOf('timelineStream').length > 0
             && activationScenario.recordsOf('activate').length > 0,
           'all bounded Host requests'
@@ -1472,7 +1545,6 @@ const contractCases = [
         await waitFor(
           () => [
             [runScenario, 'timeline'],
-            [runScenario, 'runGet'],
             [activationScenario, 'activate'],
           ].every(([scenario, kind]) =>
             scenario.recordsOf(kind).some((record) => record.aborted)
@@ -1482,7 +1554,6 @@ const contractCases = [
         );
         for (const [scenario, kind] of [
           [runScenario, 'timeline'],
-          [runScenario, 'runGet'],
           [activationScenario, 'activate'],
         ]) {
           assert(
@@ -1490,9 +1561,10 @@ const contractCases = [
             `${kind} request did not observe AbortSignal cancellation`
           );
         }
-        assert(
-          runStore.getState().runningSessionIds.includes(runSession),
-          'an admitted nonterminal Run was cleared by an observation timeout'
+        assert.equal(
+          runScenario.recordsOf('runGet').length,
+          0,
+          'the GUI created a second Run-status observation source'
         );
         assert.equal(
           activationStore.getState().loading,
@@ -1500,19 +1572,14 @@ const contractCases = [
           'bounded activation failure left the GUI loading'
         );
 
-        const admittedRun = [...runScenario.runRoutes.values()].find(
-          (route) => route.sessionId === runSession
-        );
-        assert(admittedRun, 'bounded Run admission identity is missing');
-        runScenario.setRunStatus(admittedRun.hostRunId, 'completed');
         runScenario.timelines.set(runSession, emptyTimeline(runSession, 2));
         runScenario.handlers.delete('timeline');
-        runScenario.handlers.delete('runGet');
         runScenario.handlers.delete('timelineStream');
         await runStore.getState().refreshActiveSessionContext();
-        await waitFor(
-          () => !runStore.getState().runningSessionIds.includes(runSession),
-          'terminal bounded Run bookkeeping'
+        assert.equal(
+          runStore.getState().timeline?.runProjection,
+          undefined,
+          'terminal canonical projection did not replace the stale live view'
         );
       } finally {
         runScenario.handlers.clear();
@@ -1523,7 +1590,7 @@ const contractCases = [
     },
   },
   {
-    id: 'mutation_completion_updates_origin_bookkeeping_without_switching_session',
+    id: 'mutation_completion_updates_session_index_without_switching_selection',
     async run(host) {
       const sessionA = 'bookkeeping-a';
       const sessionB = 'bookkeeping-b';
@@ -1550,17 +1617,13 @@ const contractCases = [
         'A bookkeeping updated',
         'origin Session bookkeeping was not retained'
       );
-      assert(
-        !state.runningSessionIds.includes(sessionA),
-        'origin Session running bookkeeping was not settled'
-      );
       assert.equal(state.timeline?.sessionId, sessionB);
       scenario.handlers.delete('guidance');
       await cleanupStore(store);
     },
   },
   {
-    id: 'cancel_does_not_clear_unrelated_session_loading_or_identity',
+    id: 'cancel_does_not_clear_unrelated_session_activation',
     async run(host) {
       const sessionA = 'cancel-a';
       const sessionB = 'cancel-b';
@@ -1575,11 +1638,6 @@ const contractCases = [
       const store = await freshStore(this.id);
       await activate(store, sessionB);
       await activate(store, sessionA);
-      assert(
-        store.getState().activeRunSessionIds.includes(sessionB),
-        'precondition: Session B identity was not observable'
-      );
-
       const heldActivation = [];
       scenario.handlers.set('activate', (context) => {
         if (context.route.sessionId !== sessionC) return false;
@@ -1599,17 +1657,9 @@ const contractCases = [
         true,
         'cancel cleared unrelated Session activation loading'
       );
-      assert(
-        stateAfterCancel.activeRunSessionIds.includes(sessionB),
-        'cancel cleared unrelated Session B identity'
-      );
-      assert(
-        !stateAfterCancel.activeRunSessionIds.includes(sessionA),
-        'cancel did not clear the explicitly cancelled Session A identity'
-      );
       assert.equal(
         scenario.recordsOf('cancel').at(-1)?.runId,
-        'host-cancel-a'
+        'current'
       );
 
       host.currentSessionId = sessionC;
@@ -1622,275 +1672,93 @@ const contractCases = [
     },
   },
   {
-    id: 'active_submission_warning_requires_ownerless_durable_request',
+    id: 'user_intervention_decisions_are_structured_and_keep_business_facts_out_of_local_storage',
     async run(host) {
-      const storageKey = 'deepcode.host.pending-submissions.v2';
-      const previousLocalStorage = window.localStorage;
-      const localStorageEntries = new Map();
-      window.localStorage = {
-        getItem(key) {
-          return localStorageEntries.get(String(key)) ?? null;
+      const decisionCases = [
+        {
+          decision: 'select',
+          optionId: 'option-executable',
+          guidance: 'Use this option but keep the reviewed target exact.',
         },
-        setItem(key, value) {
-          localStorageEntries.set(String(key), String(value));
+        {
+          decision: 'revise',
+          guidance: 'Compare one narrower technical option.',
         },
-        removeItem(key) {
-          localStorageEntries.delete(String(key));
+        {
+          decision: 'reject',
+          guidance: 'Do not expand this Run.',
         },
-        clear() {
-          localStorageEntries.clear();
-        },
-      };
-      window.localStorage.clear();
-      try {
-        const successSessionId = 'submission-active-success-a';
-        const successScenario = new Scenario(this.id, [successSessionId]);
-        successScenario.timelines.set(
-          successSessionId,
-          emptyTimeline(successSessionId)
+      ];
+      for (const decisionCase of decisionCases) {
+        const sessionId = `intervention-${decisionCase.decision}`;
+        const runId = `run-${decisionCase.decision}`;
+        const scenario = new Scenario(
+          `${this.id}-${decisionCase.decision}`,
+          [sessionId]
         );
-        host.register(successScenario);
-        const successStore = await freshStore(`${this.id}-success`);
-        await activate(successStore, successSessionId);
-        assert.equal(
-          successStore.getState().selectionReady,
-          true,
-          `success Session activation was not ready: ${String(
-            successStore.getState().errorMessage
-          )}`
-        );
-        const heldStarts = holdRequests(successScenario, 'start');
-        const visibleSuccessWarnings = [];
-        const unsubscribeSuccess = successStore.subscribe((state) => {
-          const warning = state.pendingSubmissionRetryView(successSessionId);
-          if (warning) visibleSuccessWarnings.push(warning);
-        });
-
-        const sendSuccess = successStore.getState().sendMessage(
-          'restore the clean development environment'
-        );
-        let earlySuccessResult;
-        void sendSuccess.then((result) => {
-          earlySuccessResult = result;
-        });
-        await waitFor(
-          () => heldStarts.length === 1 || earlySuccessResult !== undefined,
-          'the actively owned caller submission'
-        );
-        assert.equal(
-          heldStarts.length,
-          1,
-          `submission settled before Host admission: ${String(
-            successStore.getState().errorMessage
-          )}`
-        );
-        const activeState = successStore.getState();
-        assert.deepEqual(
-          activeState.activeSubmissionSessionIds,
-          [successSessionId],
-          'the in-flight submission owner was not observable exactly once'
-        );
-        assert.deepEqual(
-          activeState.pendingSubmissionSessionIds,
-          [successSessionId],
-          'the durable submission identity was not observable exactly once'
-        );
-        assert.equal(
-          activeState.pendingSubmissionRetryView(successSessionId),
-          null,
-          'an actively owned submission was exposed as a recovery warning'
-        );
-        const storedWhileActive = JSON.parse(
-          window.localStorage.getItem(storageKey)
-        );
-        assert.equal(storedWhileActive.submissions.length, 1);
-        const successCallerRequestId =
-          storedWhileActive.submissions[0].submission.callerRequestId;
-        assert.equal(
-          heldStarts[0].record.body.callerRequestId,
-          successCallerRequestId,
-          'the active request did not use its durable caller identity'
-        );
-
-        const successRunId = 'host-submission-active-success-a';
-        successScenario.runRoutes.set(successRunId, {
-          hostRunId: successRunId,
-          status: 'waiting',
-          sessionId: successSessionId,
-        });
-        successScenario.handlers.delete('start');
-        heldStarts[0].data(successScenario.runResult(
-          successSessionId,
-          successRunId,
-          'waiting'
-        ));
-        assert.equal(await sendSuccess, true);
-        await waitFor(
-          () => !successStore.getState().activeSubmissionSessionIds.includes(
-            successSessionId
-          ),
-          'successful submission owner release'
-        );
-        assert.equal(
-          successStore.getState().pendingSubmissionRetryView(successSessionId),
-          null
-        );
-        assert.deepEqual(
-          visibleSuccessWarnings,
-          [],
-          'successful admission briefly exposed a recovery warning'
-        );
-        assert.equal(
-          JSON.parse(window.localStorage.getItem(storageKey)).submissions.length,
-          0,
-          'successful admission left a durable recovery identity'
-        );
-        unsubscribeSuccess();
-        await cleanupStore(successStore);
-
-        const recoverySessionId = 'submission-ownerless-recovery-a';
-        const recoveryScenario = new Scenario(
-          `${this.id}-recovery`,
-          [recoverySessionId]
-        );
-        recoveryScenario.timelines.set(
-          recoverySessionId,
-          emptyTimeline(recoverySessionId)
-        );
-        host.register(recoveryScenario);
-        let startMode = 'pending';
-        recoveryScenario.handlers.set('start', (context) => {
-          if (startMode === 'success') return false;
-          if (startMode === 'indeterminate') {
-            context.destroy();
-            return true;
-          }
-          context.response.writeHead(200, {
-            'content-type': 'application/json',
-          });
-          context.response.end(JSON.stringify({
-            ok: false,
-            error: 'caller_submission_pending',
-            message: 'Caller submission is still reconciling.',
-            data: {
-              schemaVersion: 'deepcode.host.caller-mutation-error.v2',
-              disposition: 'pending',
-            },
-          }));
+        const timeline = interventionTimeline(sessionId, runId);
+        scenario.timelines.set(sessionId, timeline);
+        scenario.handlers.set('start', (context) => {
+          scenario.timelines.set(
+            sessionId,
+            emptyTimeline(sessionId, timeline.revision + 1)
+          );
+          context.data(scenario.runResult(
+            sessionId,
+            `host-${decisionCase.decision}`,
+            decisionCase.decision === 'reject' ? 'cancelled' : 'running'
+          ));
           return true;
         });
-        const recoveryStore = await freshStore(`${this.id}-recovery`);
-        await activate(recoveryStore, recoverySessionId);
-        assert.equal(
-          await recoveryStore.getState().sendMessage('recover this request'),
-          false
+        host.register(scenario);
+        const store = await freshStore(
+          `${this.id}-${decisionCase.decision}`
         );
-        const pendingView = recoveryStore.getState()
-          .pendingSubmissionRetryView(recoverySessionId);
-        assert.equal(pendingView?.disposition, 'pending');
-        assert(
-          !recoveryStore.getState().activeSubmissionSessionIds.includes(
-            recoverySessionId
-          ),
-          'the failed request retained a live submission owner'
-        );
-        assert.equal(
-          recoveryStore.getState().pendingSubmissionSessionIds.filter(
-            (sessionId) => sessionId === recoverySessionId
-          ).length,
-          1,
-          'the ownerless pending identity was duplicated'
-        );
-        const recoveryCallerRequestId = pendingView?.callerRequestId;
-        assert(recoveryCallerRequestId);
-
-        startMode = 'indeterminate';
-        assert.equal(
-          await recoveryStore.getState().retryPendingSubmission(false),
-          false
-        );
-        const indeterminateView = recoveryStore.getState()
-          .pendingSubmissionRetryView(recoverySessionId);
-        assert.equal(indeterminateView?.disposition, 'indeterminate');
-        assert.equal(
-          indeterminateView?.callerRequestId,
-          recoveryCallerRequestId,
-          'indeterminate reconciliation replaced the durable caller identity'
-        );
-        assert.equal(
-          recoveryScenario.recordsOf('start').length,
-          3,
-          'network uncertainty did not perform exactly one replayable transport retry'
-        );
-        assert.deepEqual(
-          [...new Set(recoveryScenario.recordsOf('start').map(
-            (record) => record.body.callerRequestId
-          ))],
-          [recoveryCallerRequestId],
-          'transport retry created a second logical caller identity'
-        );
-        const storedOwnerless = JSON.parse(
-          window.localStorage.getItem(storageKey)
-        );
-        assert.equal(storedOwnerless.submissions.length, 1);
-        assert.equal(
-          storedOwnerless.submissions[0].submission.callerRequestId,
-          recoveryCallerRequestId
-        );
-        await cleanupStore(recoveryStore);
-
-        const restartedStore = await freshStore(`${this.id}-restart`);
-        assert.deepEqual(
-          restartedStore.getState().pendingSubmissionSessionIds,
-          [recoverySessionId],
-          'restart did not recover the ownerless durable request'
-        );
-        assert.equal(
-          restartedStore.getState().pendingSubmissionRetryView(
-            recoverySessionId
-          )?.callerRequestId,
-          recoveryCallerRequestId,
-          'restart changed the durable caller identity'
-        );
-        await activate(restartedStore, recoverySessionId);
-        const restartedWarnings = [];
-        const unsubscribeRestarted = restartedStore.subscribe((state) => {
-          const warning = state.pendingSubmissionRetryView(recoverySessionId);
-          if (warning) restartedWarnings.push(warning);
+        await activate(store, sessionId);
+        const pending = timeline.interactionProjection.pending;
+        await store.getState().resolveUserIntervention({
+          runId,
+          targetId: pending.targetId,
+          interactionId: pending.interactionId,
+          interactionRevision: pending.interactionRevision,
+          candidateSetDigest: pending.candidateSetDigest,
+          expectedProjectionCursor: timeline.revision,
+          decision: decisionCase.decision,
+          ...(decisionCase.optionId
+            ? { optionId: decisionCase.optionId }
+            : {}),
+          guidance: decisionCase.guidance,
         });
-        startMode = 'success';
+        const request = scenario.recordsOf('start').at(-1)?.body;
+        assert.equal(request?.op, 'resolveDecision');
+        assert.equal(request?.decisionKind, 'userIntervention');
+        assert.equal(request?.decision, decisionCase.decision);
+        assert.equal(request?.optionId, decisionCase.optionId);
+        assert.equal(request?.guidance, decisionCase.guidance);
+        assert.equal(request?.interactionId, pending.interactionId);
         assert.equal(
-          await restartedStore.getState().retryPendingSubmission(false),
-          true
-        );
-        assert.deepEqual(
-          [...new Set(recoveryScenario.recordsOf('start').map(
-            (record) => record.body.callerRequestId
-          ))],
-          [recoveryCallerRequestId],
-          'restart recovery submitted a duplicate logical identity'
-        );
-        assert.deepEqual(
-          restartedWarnings,
-          [],
-          'successful restart recovery flashed a warning while actively owned'
+          request?.interactionRevision,
+          pending.interactionRevision
         );
         assert.equal(
-          restartedStore.getState().pendingSubmissionRetryView(
-            recoverySessionId
-          ),
-          null
+          request?.candidateSetDigest,
+          pending.candidateSetDigest
         );
         assert.equal(
-          JSON.parse(window.localStorage.getItem(storageKey)).submissions.length,
-          0,
-          'successful restart recovery did not settle durable identity'
+          request?.expectedProjectionCursor,
+          timeline.revision
         );
-        unsubscribeRestarted();
-        await cleanupStore(restartedStore);
-      } finally {
-        window.localStorage.clear();
-        window.localStorage = previousLocalStorage;
+        assert.equal(
+          request?.conversationTarget?.targetId,
+          `target-${sessionId}`
+        );
+        assert.equal(store.getState().resolvingIntervention, null);
+        assert.equal(
+          window.localStorage.getItem('deepcode.host.pending-submissions.v2'),
+          null,
+          'the GUI persisted canonical decision or Run facts in localStorage'
+        );
+        await cleanupStore(store);
       }
     },
   },

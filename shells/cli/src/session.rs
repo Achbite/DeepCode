@@ -2978,7 +2978,8 @@ mod tests {
                 "currentActivity": null,
                 "wait": {
                     "kind": "user",
-                    "reason": "Review the exact Plan scope.",
+                    "since": "2026-08-05T00:00:00.000Z",
+                    "reasonCode": "planDecisionRequired",
                     "interactionId": interaction_id
                 },
                 "languageBinding": {
@@ -2995,6 +2996,16 @@ mod tests {
             "plan",
             "accept",
             "cli-decision-contract-request",
+            deepcode_kernel_client::AgentConversationTargetV1 {
+                schema_version: "deepcode.host.conversation-target.v1".to_string(),
+                target_id: "conversation-target-cli-decision-contract".to_string(),
+                target_revision: "target-revision-cli-decision-contract".to_string(),
+                session_id: "session-cli-decision-contract".to_string(),
+                project_id: None,
+                workspace_scope_key: "workspace-cli-decision-contract".to_string(),
+                workspace_binding_ref: None,
+                workspace_binding_identity: None,
+            },
         );
         request.run_id = Some("kernel-run-cli-decision-contract".to_string());
         request.target_id = Some("interaction-baseline".to_string());
@@ -3049,6 +3060,6 @@ mod tests {
             .bound_action_required("host-run-decision")
             .expect("only a different post-baseline interaction requires user action");
         assert!(message.contains("host-run-decision"));
-        assert!(message.contains("Review the exact Plan scope."));
+        assert!(message.contains("planDecisionRequired"));
     }
 }

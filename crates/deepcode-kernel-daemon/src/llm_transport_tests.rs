@@ -10,6 +10,7 @@ fn test_profile() -> ResolvedLlmProfile {
         provider_flavor: Some("deepseek".to_string()),
         base_url: Some("https://api.example.test/v1".to_string()),
         model: "deepseek-v4-pro".to_string(),
+        context_window_tokens: Some(128_000),
         max_output_tokens: Some(1024),
         temperature: None,
         reasoning_effort: None,
@@ -181,6 +182,47 @@ fn openai_request_body_normalizes_internal_tool_messages() {
     assert!(tool.get("toolCallId").is_none());
     assert_eq!(tool["tool_call_id"].as_str(), Some("call-generic"));
     assert_eq!(tool["content"].as_str(), Some("{\"ok\":true}"));
+}
+
+#[test]
+fn deepseek_tool_continuation_replays_reasoning_content_without_rewriting_it() {
+    let reasoning = "private reasoning bytes must remain exact";
+    let body = openai_compatible_request_body(
+        &test_profile(),
+        vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "reasoningContent": reasoning,
+                "toolCalls": [{
+                    "id": "call-deepseek-read",
+                    "name": "fs.read",
+                    "arguments": { "path": "README.md" }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "toolCallId": "call-deepseek-read",
+                "content": { "ok": true }
+            }),
+        ],
+        &[],
+        None,
+        true,
+    );
+
+    let assistant = &body["messages"][0];
+    assert_eq!(assistant["content"].as_str(), Some(""));
+    assert_eq!(assistant["reasoning_content"].as_str(), Some(reasoning));
+    assert!(assistant.get("reasoningContent").is_none());
+    assert_eq!(
+        assistant["tool_calls"][0]["function"]["name"].as_str(),
+        Some("fs__read")
+    );
+    assert_eq!(
+        body["messages"][1]["tool_call_id"].as_str(),
+        Some("call-deepseek-read")
+    );
 }
 
 #[test]

@@ -10,6 +10,8 @@ import {
   SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
   SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
@@ -17,6 +19,7 @@ import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
+  adaptSessionKernelProviderBackendOutputV2,
   buildSessionPlanConfirmationAuthorityV2,
   canonicalJson,
   checkpointSessionKernelStateV2,
@@ -109,6 +112,7 @@ export function createInput(overrides = {}) {
     opaqueInputRef: overrides.opaqueInputRef ?? 'session-input:initial',
     text: overrides.text ?? 'Inspect the current workspace safely.',
     attachments: clone(overrides.attachments ?? []),
+    attachmentContexts: clone(overrides.attachmentContexts ?? []),
     recordedAt: overrides.recordedAt ?? NOW,
   };
 }
@@ -183,6 +187,17 @@ export function createPlan(overrides = {}) {
     objective: overrides.objective ?? 'Write one file inside the workspace.',
     narrative: overrides.narrative
       ?? 'Use the approved PlanAction and report canonical facts.',
+    evidence: clone(overrides.evidence ?? {
+      kernelFactRefs: [],
+      readResources: [],
+      blockingUnknowns: [],
+      nonBlockingUnknowns: [],
+      coverage: 'The requested workspace mutation is fully scoped by the user input.',
+    }),
+    ...(overrides.predecessorPlanRef
+      ? { predecessorPlanRef: clone(overrides.predecessorPlanRef) }
+      : {}),
+    carriedSettlementRefs: clone(overrides.carriedSettlementRefs ?? []),
     actions: clone(overrides.actions ?? [action]),
     recordedAt: overrides.recordedAt ?? NOW,
   };
@@ -229,7 +244,139 @@ export function createPreviewBatch(request, runId) {
     })),
   };
 }
+export function createPlanDiscoveryPreviewBatch(request, approvedPreview) {
+  return {
+    runId: approvedPreview.runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => {
+      assert.equal(item.origin.kind, 'planDiscovery');
+      return {
+        kind: 'previewed',
+        data: {
+          preview: {
+            ...clone(approvedPreview),
+            previewId: `preview-${item.origin.data.discoveryId}`,
+            planRevision: request.planRevision,
+            planActionId: item.planActionId,
+            operationId: item.operationId,
+            toolId: item.toolId,
+            origin: clone(item.origin),
+          },
+        },
+      };
+    }),
+  };
+}
+export function createOutOfPlanDiscoveryPreviewBatch(
+  request,
+  approvedPreview,
+  path = 'expanded.txt'
+) {
+  assert.equal(request.items.length, 1);
+  const item = request.items[0];
+  assert.equal(item.origin.kind, 'planDiscovery');
+  assert.equal(previewItemPath(item), path);
+  const preview = scopedPreviewForItem(
+    request,
+    item,
+    approvedPreview,
+    `preview-${item.origin.data.discoveryId}`,
+    path
+  );
+  return {
+    runId: approvedPreview.runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: [{ kind: 'previewed', data: { preview } }],
+  };
+}
+export function createInterventionCandidatePreviewBatch(
+  request,
+  approvedPreview
+) {
+  return {
+    runId: approvedPreview.runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => {
+      assert.equal(item.origin.kind, 'interventionCandidate');
+      const path = previewItemPath(item);
+      return {
+        kind: 'previewed',
+        data: {
+          preview: scopedPreviewForItem(
+            request,
+            item,
+            approvedPreview,
+            [
+              'preview-intervention',
+              item.origin.data.optionId,
+              item.planActionId,
+            ].join('-'),
+            path
+          ),
+        },
+      };
+    }),
+  };
+}
+function scopedPreviewForItem(
+  request,
+  item,
+  approvedPreview,
+  previewId,
+  path
+) {
+  const canonicalResourceRef = `workspace:Write:${path}`;
+  const scopeDigest = sha256Hash(canonicalJson({
+    kind: 'workspace',
+    path,
+    access: 'write',
+  }));
+  return {
+    ...clone(approvedPreview),
+    previewId,
+    planRevision: request.planRevision,
+    planActionId: item.planActionId,
+    operationId: item.operationId,
+    toolId: item.toolId,
+    origin: clone(item.origin),
+    scopeDigest,
+    authorizationDigest: sha256Hash(canonicalJson({
+      previewId,
+      scopeDigest,
+      origin: item.origin,
+    })),
+    canonicalScope: {
+      kind: 'workspace',
+      data: {
+        targets: [{
+          ...clone(approvedPreview.canonicalScope.data.targets[0]),
+          relativePath: path,
+        }],
+      },
+    },
+    approvalView: {
+      ...clone(approvedPreview.approvalView),
+      scopeDigest,
+      canonicalTargets: [canonicalResourceRef],
+      resourcePresentation: [{
+        canonicalResourceRef,
+        kind: 'workspacePath',
+        label: path,
+        workspaceRelativePath: path,
+      }],
+      summary: `Mutate using ${item.toolId} within 1 canonical target(s)`,
+    },
+  };
+}
 function previewItemPath(item) {
+  if (item.rawArguments) {
+    const path = item.rawArguments.path;
+    assert.equal(typeof path, 'string');
+    return path;
+  }
   if (item.scopeIntent.kind === 'exactInvocation') {
     const path = item.scopeIntent.data.rawArguments.path;
     assert.equal(typeof path, 'string');
@@ -325,7 +472,7 @@ export function admittedReply(harness, request, overrides = {}) {
   const suffix = intent.operationId.slice(-16);
   const invocationId = overrides.invocationId ?? `invocation-${suffix}`;
   const attemptId = overrides.attemptId ?? `attempt-${suffix}`;
-  const contextRead = intent.authority.kind === 'contextRead';
+  const contextRead = intent.authority.kind === 'read';
   const mutationContextRead = contextRead && intent.toolContextRef.contextVersion === 3;
   const expanded = !contextRead
     && intent.rawArguments.path === 'expanded.txt';
@@ -1066,6 +1213,48 @@ export function providerPlanActionComplete(
   });
 }
 
+export function providerIntervention(
+  draft,
+  callId = 'intervention-proposal-1'
+) {
+  const controlArguments = {
+    schemaVersion: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+    intervention: clone(draft),
+  };
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'intervention',
+    callId,
+    controlArguments,
+  }));
+  return (input) => {
+    const output = adaptSessionKernelProviderBackendOutputV2(input, {
+      kind: 'intervention',
+      draft: clone(draft),
+      control: {
+        schemaVersion: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+        callId,
+        toolName: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
+        argumentsDigest: sha256Hash(canonicalJson(controlArguments)),
+      },
+      items: [],
+      completion: createProviderCompletionReceipt(responseDigest, {
+        hasToolCalls: true,
+        reasoningTransport: input.providerProfile.reasoningTransport,
+      }),
+      providerResult: {
+        providerProfileId: 'provider-profile-v2-contract',
+        provider: 'contract-provider',
+        model: 'contract-model',
+      },
+      responseDigest,
+    }, NOW);
+    return {
+      ...output,
+      testInterventionDraft: clone(draft),
+    };
+  };
+}
+
 export function providerOrderedToolItems(calls) {
   return calls.map((call, index) => ({
     kind: 'toolCall',
@@ -1174,6 +1363,18 @@ function createProviderEvidence(input, output, options = {}) {
       arguments: canonicalJson({
         schemaVersion: output.control.schemaVersion,
         outcome: output.outcome,
+      }),
+    });
+  }
+  if (output.kind === 'intervention') {
+    orderedItems.push({
+      kind: 'toolCall',
+      index: orderedItems.length,
+      callId: output.control.callId,
+      name: output.control.toolName,
+      arguments: canonicalJson({
+        schemaVersion: output.control.schemaVersion,
+        intervention: output.testInterventionDraft,
       }),
     });
   }

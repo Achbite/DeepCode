@@ -1,10 +1,13 @@
 import {
   HttpSessionKernelProviderBackendV2,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
   StrictSessionKernelProviderAdapterV2,
   buildSessionProviderContextV2,
   canonicalJson,
+  providerWireToolNameV2,
   sha256Hash,
 } from '../../dist/index.js';
 
@@ -291,15 +294,8 @@ async function providerProfileWithoutReasoningTransportIsNotCurrentSchema() {
 }
 
 async function planningContextSeparatesIntentFactsAndExecutionAuthority() {
-  const toolContext = {
-    formatVersion: 'deepcode.kernel.tool-context.v2',
-    contextVersion: 1,
-    catalogDigest: `sha256:${'a'.repeat(64)}`,
-    contextDigest: `sha256:${'b'.repeat(64)}`,
-    fixedPrompt: 'Kernel-owned planning context with no ready native tools.',
-    tools: [],
-  };
-  const initial = createInitialState({ toolContext });
+  const initial = createInitialState();
+  const toolContext = initial.toolContext;
   initial.initialInput.text = [
     'Restore the current workspace to its clean state.',
     'Preserve the established workflow.',
@@ -387,52 +383,49 @@ async function planningContextSeparatesIntentFactsAndExecutionAuthority() {
 
   const messages = contextAssembly.messages;
   assert.equal(messages[1].role, 'system');
-  assert.equal(messages.at(-1).role, 'system');
+  assert.equal(messages.at(-1).role, 'user');
   assert.equal(
-    messages.slice(2, -1).every((message) => message.role === 'user'),
+    messages.slice(2).every((message) => message.role === 'user'),
     true,
-    'the trusted planning reminder must follow all untrusted context sections'
+    'all dynamic context and the active turn frame must remain untrusted user messages'
   );
-  const currentInput = JSON.parse(messages[2].content);
+  const currentInput = JSON.parse(messages.at(-1).content);
+  assert.equal(
+    currentInput.schemaVersion,
+    'deepcode.session.provider-turn-frame.v1'
+  );
   assert.equal(currentInput.currentInput.text, initial.initialInput.text);
+  assert.deepEqual(currentInput.target, { kind: 'planning' });
 
   const contract = messages[1].content;
-  assert.match(contract, /does not require a Plan/u);
   assert.match(
     contract,
-    /exact current input is the controlling semantic source/u
+    /complete sorted ready tool catalog are immutable/u
   );
-  assert.match(contract, /never grants tool execution authority/u);
-  assert.match(contract, /state and execution truth only/u);
-  assert.match(contract, /never create a user goal/u);
+  assert.match(contract, /Tool availability never grants authority/u);
   assert.match(
     contract,
-    /Preserve constraints outrank inferred completeness/u
+    /For planning, ordinary text or one concise clarification question is valid/u
   );
   assert.match(
     contract,
-    /Deferred or conditional work is non-executable until a new current input explicitly activates it/u
+    /Put only mutation actions/u
   );
   assert.match(
     contract,
-    /ask one concise natural-language clarification question instead/u
-  );
-
-  const reminder = messages.at(-1).content;
-  assert.match(reminder, /planning lane does not require a Plan/u);
-  assert.match(
-    reminder,
-    /clarification question and no tool or Plan control/u
+    /ready read tools remain available whenever Kernel Settings and canonical scope permit them/u
   );
   assert.match(
-    reminder,
-    /canonical facts may resolve state but never create goals/u
+    contract,
+    /current confirmed PlanAction is the only mutation authority/u
   );
-  assert.match(reminder, /honors preserve constraints/u);
-  assert.match(reminder, /excludes deferred or conditional work/u);
+  assert.match(
+    contract,
+    /consolidate the current action, remaining unsettled actions, directly related resources, material technical options, recommendation, and tradeoffs/u
+  );
 
   const planControls = wireRequest.tools.filter(
-    (tool) => tool.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+    (tool) => tool.name === SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
   );
   assert.equal(planControls.length, 1);
   const planDescription = planControls[0].description;
@@ -442,7 +435,16 @@ async function planningContextSeparatesIntentFactsAndExecutionAuthority() {
   assert.match(planDescription, /Workspace facts describe state only/u);
   assert.match(planDescription, /current input did not request/u);
   assert.match(planDescription, /needs clarification, do not call it/u);
-  assert.equal(wireRequest.tools.length, 1);
+  assert.deepEqual(
+    wireRequest.tools.map((tool) => tool.name),
+    [
+      ...toolContext.tools.map((tool) => providerWireToolNameV2(tool.toolId)),
+      SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+      SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+      SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
+    ],
+    'planning must retain the complete stable ready tool and Session control surface'
+  );
 }
 
 async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSettlement() {
@@ -469,7 +471,7 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
       delete value.plan.actions[0]
         .scopeIntent.data.requestedResources[0].data.access;
       const proposalArguments = {
-        schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+        schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
         plan: value.plan,
       };
       value.planProposal.argumentsDigest = sha256Hash(
@@ -730,7 +732,7 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
 
 function sealedPlanningOutput(draft, commentary) {
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
     plan: draft,
   };
   const responseDigest = sha256Hash(canonicalJson({
@@ -741,9 +743,9 @@ function sealedPlanningOutput(draft, commentary) {
     kind: 'plan',
     plan: clone(draft),
     planProposal: {
-      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
       callId: 'provider-plan-lifecycle-contract',
-      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
       argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
     },
     items: [{ kind: 'text', phase: 'commentary', text: commentary }],
@@ -764,6 +766,13 @@ function planningDraft() {
     title: 'Write reviewed output',
     objective: 'Write one exact workspace file.',
     narrative: 'Preview the exact scope before requesting approval.',
+    evidence: {
+      kernelFactRefs: [],
+      readResources: [],
+      blockingUnknowns: [],
+      nonBlockingUnknowns: [],
+      coverage: 'The requested write target is explicitly scoped.',
+    },
     actions: [{
       toolId: 'fs.write',
       scopeIntent: {
@@ -789,7 +798,7 @@ function installPlanningTerminalEvidence(
   const map = harness.store.providerEvidence;
   const originalSet = map.set;
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
     plan: draft,
   };
   map.set = function setPlanningEvidence(providerTurnId, evidence) {
@@ -798,7 +807,7 @@ function installPlanningTerminalEvidence(
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,
       callId,
-      name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
       arguments: canonicalJson(proposalArguments),
     });
     if (options.duplicateControl) {
@@ -806,7 +815,7 @@ function installPlanningTerminalEvidence(
         kind: 'toolCall',
         index: terminal.data.orderedItems.length,
         callId: `${callId}-duplicate`,
-        name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+        name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
         arguments: canonicalJson(proposalArguments),
       });
     }

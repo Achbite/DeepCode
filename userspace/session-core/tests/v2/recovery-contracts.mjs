@@ -11,22 +11,24 @@ import {
   NOW,
   admittedReply,
   assert,
-  awaitingCapabilityReply,
   checkpointFromStateV3,
   createFactsPage,
   createCorpusToolContext,
   createDurablePersistenceHarness,
   createDurableRecordV3,
-  createExpandedPreview,
+  createInterventionCandidatePreviewBatch,
   createFailedProviderEvidence,
   createInitialState,
+  createOutOfPlanDiscoveryPreviewBatch,
   createPlan,
+  createPlanDiscoveryPreviewBatch,
   createSessionHarness,
   createToolContextSnapshotRecordV3,
   corpusFact,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
   providerAnswer,
+  providerIntervention,
   providerEvidenceRecordsV3,
   providerPlanActionComplete,
   providerToolIntent,
@@ -39,12 +41,12 @@ import {
 
 export const contractCases = [
   {
-    id: 'session_schema_accepts_only_current_v3_history',
-    run: sessionSchemaAcceptsOnlyCurrentV3History,
+    id: 'session_schema_accepts_only_current_v4_history',
+    run: sessionSchemaAcceptsOnlyCurrentV4History,
   },
   {
-    id: 'active_v3_compact_checkpoint_and_public_settlement_restore_only_committed_refs',
-    run: activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs,
+    id: 'active_v4_compact_checkpoint_and_public_settlement_restore_only_committed_refs',
+    run: activeV4CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs,
   },
   {
     id: 'completed_and_noncompleted_provider_terminal_recovery_never_reissues_unresolved_request',
@@ -87,12 +89,12 @@ export const contractCases = [
     run: contextInvalidationRefreshesOnceAtTheNextProviderBoundary,
   },
   {
-    id: 'capability_allow_continues_the_same_invocation_with_a_new_lease',
-    run: capabilityAllowContinuesSameInvocationWithNewLease,
+    id: 'out_of_plan_mutation_freezes_effect_and_publishes_one_consolidated_intervention',
+    run: outOfPlanMutationFreezesEffectAndPublishesOneConsolidatedIntervention,
   },
   {
-    id: 'capability_deny_guides_next_turn_without_session_manufactured_effect',
-    run: capabilityDenyGuidesNextTurnWithoutSessionManufacturedEffect,
+    id: 'intervention_revision_preserves_identity_and_rejection_requires_run_cancellation',
+    run: interventionRevisionPreservesIdentityAndRejectionRequiresRunCancellation,
   },
   {
     id: 'fact_reconciliation_follows_multi_page_continuation',
@@ -108,7 +110,7 @@ export const contractCases = [
   },
 ];
 
-async function sessionSchemaAcceptsOnlyCurrentV3History() {
+async function sessionSchemaAcceptsOnlyCurrentV4History() {
   const current = createDurablePersistenceHarness();
   assert.equal(
     await current.persistence.loadCheckpoint(
@@ -118,6 +120,7 @@ async function sessionSchemaAcceptsOnlyCurrentV3History() {
     undefined
   );
   for (const historySchema of [
+    'deepcode.session.kernel-persistence.v3',
     'deepcode.session.kernel-persistence.v2',
     'deepcode.session.kernel-checkpoint.v2',
     'deepcode.session.kernel-persistence.v1',
@@ -150,7 +153,7 @@ async function sessionSchemaAcceptsOnlyCurrentV3History() {
   );
 }
 
-async function activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs() {
+async function activeV4CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs() {
   const durable = createDurablePersistenceHarness({
     sessionId: 'session-compact-settlement-contract',
   });
@@ -962,12 +965,6 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
       value.state.providerToolCallQueue.calls[0].requestId = undefined;
     },
     (value) => {
-      value.state.providerToolCallQueue.target = {
-        kind: 'planAction',
-        planActionId: 'plan-action-forged',
-      };
-    },
-    (value) => {
       value.state.providerToolCallQueue.calls[1].intent.operationId =
         value.state.providerToolCallQueue.calls[0].intent.operationId;
     },
@@ -1006,6 +1003,15 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
   }
   const correlationCorruptions = [
     {
+      label: 'Provider queue target differs from its durable Provider turn',
+      corrupt(value) {
+        value.state.providerToolCallQueue.target = {
+          kind: 'planAction',
+          planActionId: 'plan-action-forged',
+        };
+      },
+    },
+    {
       label: 'missing ContextRead work authority',
       corrupt(value) {
         value.state.workAuthority = undefined;
@@ -1015,11 +1021,17 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
       label: 'ContextRead work authority missing the queued operation',
       corrupt(value) {
         const operationIds = ['operation-unrelated-context-read'];
+        const { batchSequence, predecessorDigest } =
+          value.state.workAuthority;
         value.state.workAuthority = {
           kind: 'contextRead',
+          batchSequence,
+          predecessorDigest,
           operationIds,
           digest: sha256Hash(canonicalJson({
             kind: 'contextRead',
+            batchSequence,
+            predecessorDigest,
             operationIds,
           })),
         };
@@ -1151,7 +1163,8 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(first, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(first, plan);
   const admitted = corpusFact('invocationToolIntentAdmitted', {
     factId: 'fact-admitted-before-restart',
     ledgerSequence: 6,
@@ -1230,6 +1243,8 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
     { path: 'output.txt', content: 'contract output' },
     'provider-call-restart-reuse'
   ));
+  restarted.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   restarted.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(restarted, request, {
@@ -1237,7 +1252,7 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
       attemptId: 'attempt-restart-reuse',
     })
   );
-  await restarted.loop.runProviderTurn({
+  const classified = await restarted.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -1245,6 +1260,9 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const readmitted = await restarted.loop.resumePendingProviderToolCalls();
+  assert.equal(readmitted.kind, 'admitted');
   assert.deepEqual(
     restarted.calls('submitToolIntent').at(-1).intent.authority.data.lease,
     replayedLease,
@@ -1262,7 +1280,8 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(harness, plan);
   harness.enqueueProvider(
     providerToolIntent(
       'fs.write',
@@ -1270,6 +1289,8 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
       'provider-call-indeterminate'
     )
   );
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   harness.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(harness, request, {
@@ -1277,7 +1298,7 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
       attemptId: 'attempt-indeterminate',
     })
   );
-  const admitted = await harness.loop.runProviderTurn({
+  const classified = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -1285,6 +1306,8 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
 
   harness.appendFacts(corpusFact('invocationToolIndeterminate', {
@@ -1560,7 +1583,103 @@ function withToolContextCatalog(toolContext, catalogDigest) {
   return forged;
 }
 
-async function capabilityAllowContinuesSameInvocationWithNewLease() {
+async function outOfPlanMutationFreezesEffectAndPublishesOneConsolidatedIntervention() {
+  const { harness, plan, intervention } = await prepareOpenIntervention();
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(harness.loop.snapshot().activeWait?.kind, 'userIntervention');
+  assert.equal(intervention.options.length, 2);
+  assert.deepEqual(
+    intervention.affectedPlanActionIds,
+    [plan.actions[0].manifest.planActionId]
+  );
+  const executable = intervention.options.find(
+    (option) => option.kind === 'executable'
+  );
+  assert.ok(executable);
+  assert.equal(executable.actions.length, 1);
+  assert.equal(
+    executable.actions[0].preview.origin.kind,
+    'interventionCandidate'
+  );
+  assert.equal(
+    executable.actions[0].preview.disposition,
+    'requiresUserDecision'
+  );
+  const guidanceOnly = intervention.options.find(
+    (option) => option.kind === 'guidanceOnly'
+  );
+  const decision = await harness.loop.decideUserIntervention({
+    interactionId: intervention.interactionId,
+    interactionRevision: intervention.interactionRevision,
+    candidateSetDigest: intervention.candidateSetDigest,
+    decision: 'select',
+    optionId: guidanceOnly.optionId,
+    guidance: 'Keep the original mutation boundary.',
+    callerRequestId: 'caller-guidance-only-1',
+  });
+  assert.equal(decision.disposition, 'guidanceReplan');
+  assert.equal(harness.loop.snapshot().activeWait, undefined);
+  assert.equal(harness.loop.snapshot().userIntervention, undefined);
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(
+    harness.kernelState.facts.some((fact) => fact.domain === 'effect'),
+    false
+  );
+}
+
+async function interventionRevisionPreservesIdentityAndRejectionRequiresRunCancellation() {
+  const { harness, intervention, preview } = await prepareOpenIntervention();
+  const revised = await harness.loop.decideUserIntervention({
+    interactionId: intervention.interactionId,
+    interactionRevision: intervention.interactionRevision,
+    candidateSetDigest: intervention.candidateSetDigest,
+    decision: 'revise',
+    guidance: 'Compare one narrower alternative before asking again.',
+    callerRequestId: 'caller-revise-intervention-1',
+  });
+  assert.equal(revised.disposition, 'researchRevision');
+  const research = harness.loop.snapshot().interventionResearch;
+  assert.equal(research.guidanceRevision, 2);
+  assert.equal(harness.loop.snapshot().userIntervention, undefined);
+
+  const draft = interventionDraft('Revised consolidated intervention');
+  harness.enqueueProvider(providerIntervention(
+    draft,
+    'intervention-proposal-revised'
+  ));
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createInterventionCandidatePreviewBatch(request, preview));
+  const regenerated = await harness.loop.runProviderTurn({
+    reason: 'recovery',
+    target: {
+      kind: 'interventionResearch',
+      researchId: research.researchId,
+    },
+  });
+  assert.equal(regenerated.kind, 'noTool');
+  const next = harness.loop.snapshot().userIntervention;
+  assert.equal(next.interactionId, intervention.interactionId);
+  assert.notEqual(next.interactionRevision, intervention.interactionRevision);
+  assert.notEqual(next.candidateSetDigest, intervention.candidateSetDigest);
+
+  const rejected = await harness.loop.decideUserIntervention({
+    interactionId: next.interactionId,
+    interactionRevision: next.interactionRevision,
+    candidateSetDigest: next.candidateSetDigest,
+    decision: 'reject',
+    guidance: 'Do not expand this Run.',
+    callerRequestId: 'caller-reject-intervention-1',
+  });
+  assert.equal(rejected.disposition, 'runCancellationRequired');
+  assert.equal(harness.loop.snapshot().activeWait, undefined);
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(
+    harness.kernelState.facts.some((fact) => fact.domain === 'effect'),
+    false
+  );
+}
+
+async function prepareOpenIntervention() {
   const harness = await openSessionHarness({
     initial: { runId: 'run-1' },
   });
@@ -1570,221 +1689,93 @@ async function capabilityAllowContinuesSameInvocationWithNewLease() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(harness, plan);
-  const issued = corpusFact('authorizationCapabilityIssued', {
-    factId: 'fact-capability-issued-before-expansion',
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const expandedLease = corpusFact(
-    'authorizationExpansionAllowed'
-  ).lineage.capabilityLease;
-  harness.appendFacts(issued);
-  await harness.loop.reconcileFacts(0);
-
+  const { preview } = await persistPreviewAndAcceptPlan(harness, plan);
   harness.enqueueProvider(providerToolIntent(
     'fs.write',
     { path: 'expanded.txt', content: 'expanded' },
-    'provider-call-expand-allow'
+    'provider-call-out-of-plan'
   ));
-  harness.enqueueKernel('submitToolIntent', (request) =>
-    awaitingCapabilityReply(
-      harness,
-      request,
-      createExpandedPreview(request, 'allow'),
-      { invocationId: 'invocation-golden-expanded-1' }
-    ));
-  const waiting = await harness.loop.runProviderTurn({
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createOutOfPlanDiscoveryPreviewBatch(request, preview));
+  const frozen = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
       planActionId: 'plan-action-golden-1',
     },
-    remainingToolCallBudget: 32,
   });
-  assert.equal(waiting.kind, 'awaitingCapability');
-  assert.deepEqual(harness.loop.snapshot().activeWait, {
-    kind: 'capability',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    previewId: 'preview-golden-expanded-allow-1',
-    sinceHighWater: harness.kernelState.snapshotHighWater,
-  });
-
-  const allowed = corpusFact('authorizationExpansionAllowed', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const continued = corpusFact('invocationExpandedToolIntentAdmitted', {
-    ledgerSequence: harness.nextFactSequence() + 1,
-    runSequence: harness.nextRunSequence() + 1,
-  });
-  harness.appendFacts(allowed, continued);
-  assert.equal(
-    'invocationId' in allowed.lineage,
-    false,
-    'ExpansionAllowed authorizes scope but does not impersonate admission'
-  );
-  assert.equal(
-    continued.lineage.invocationId,
-    waiting.invocationId
-  );
-  assert.equal(
-    continued.lineage.attemptId,
-    'attempt-golden-expanded-2'
-  );
-  assert.deepEqual(
-    continued.lineage.capabilityLease,
-    expandedLease
-  );
-  await harness.loop.observeCapabilityDecision({
-    decision: 'allow',
-    previewId: 'preview-golden-expanded-allow-1',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
-  });
-
-  assert.deepEqual(harness.loop.snapshot().activeWait, {
-    kind: 'invocation',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    sinceHighWater: allowed.ledgerSequence,
-  });
-  assert.deepEqual(
-    harness.loop.snapshot().lineage.operations[
-      waiting.operationId
-    ].leases,
-    [expandedLease]
-  );
-  assert.equal(harness.calls('submitToolIntent').length, 1);
-
-  const observed = corpusFact('effectExpandedToolObserved', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const completed = corpusFact('invocationExpandedToolCompleted', {
-    factId: 'fact-expanded-invocation-completed',
-    ledgerSequence: harness.nextFactSequence() + 1,
-    runSequence: harness.nextRunSequence() + 1,
-    identities: {
-      expandedObservedFactId: observed.factId,
-    },
-  });
-  harness.appendFacts(observed, completed);
-  await harness.loop.notifyKernelWakeHint({
-    waitKind: 'invocation',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
-  });
+  assert.equal(frozen.kind, 'noTool');
+  const research = harness.loop.snapshot().interventionResearch;
+  assert.ok(research);
   assert.equal(harness.loop.snapshot().activeWait, undefined);
 
-  const observedBeforeSupersession =
-    harness.loop.snapshot().lineage.cursor.snapshotHighWater;
-  const superseded = corpusFact(
-    'authorizationLeaseSuperseded',
-    {
-      ledgerSequence: harness.nextFactSequence(),
-      runSequence: harness.nextRunSequence(),
-    }
-  );
-  assert.deepEqual(
-    superseded.lineage.capabilityLease,
-    expandedLease
-  );
-  harness.appendFacts(superseded);
-  await harness.loop.reconcileFacts(observedBeforeSupersession);
-  assert.deepEqual(
-    Object.values(harness.loop.snapshot().lineage.operations)
-      .flatMap((operation) => operation.leases),
-    [],
-    'lease supersession must remove every old copy through the superseded version'
-  );
+  harness.enqueueProvider(providerIntervention(interventionDraft()));
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createInterventionCandidatePreviewBatch(request, preview));
+  const published = await harness.loop.runProviderTurn({
+    reason: 'recovery',
+    target: {
+      kind: 'interventionResearch',
+      researchId: research.researchId,
+    },
+  });
+  assert.equal(published.kind, 'noTool');
+  const intervention = harness.loop.snapshot().userIntervention;
+  assert.ok(intervention);
+  return { harness, plan, intervention, preview };
 }
 
-async function capabilityDenyGuidesNextTurnWithoutSessionManufacturedEffect() {
-  const harness = await openSessionHarness({
-    initial: { runId: 'run-1' },
-  });
-  const plan = createPlan({
-    runId: 'run-1',
-    planRevision: 'plan-revision-golden-deny-1',
-    planActionId: 'plan-action-golden-deny-1',
-    operationId: 'planned-operation-golden-deny-output',
-  });
-  await persistPreviewAndAcceptPlan(harness, plan);
-  const issued = corpusFact('authorizationCapabilityIssuedDeny', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  harness.appendFacts(issued);
-  await harness.loop.reconcileFacts(0);
-  const issuedLease = issued.lineage.capabilityLease;
-  harness.enqueueProvider(providerToolIntent(
-    'fs.write',
-    { path: 'expanded.txt', content: 'expanded' },
-    'provider-call-expand-deny'
-  ));
-  harness.enqueueKernel('submitToolIntent', (request) =>
-    awaitingCapabilityReply(
-      harness,
-      request,
-      createExpandedPreview(request, 'deny'),
-      { invocationId: 'invocation-golden-expanded-deny-1' }
-    ));
-  const waiting = await harness.loop.runProviderTurn({
-    reason: 'planExecution',
-    target: {
-      kind: 'planAction',
-      planActionId: 'plan-action-golden-deny-1',
-    },
-    remainingToolCallBudget: 32,
-  });
-  assert.equal(harness.loop.snapshot().activeWait?.kind, 'capability');
-  assert.deepEqual(
-    harness.calls('submitToolIntent').at(-1).intent.authority.data.lease,
-    issuedLease,
-    'the denied expansion request must still carry the existing v1 lease'
-  );
-  const denied = corpusFact('authorizationExpansionDenied', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const guidance = denied.details.guidance;
-  const effectCountBefore =
-    harness.kernelState.facts.filter(
-      (fact) => fact.domain === 'effect'
-    ).length;
-  harness.appendFacts(denied);
-  harness.enqueueProvider(providerAnswer('replanned after denial'));
-  const resumed = await harness.loop.observeCapabilityDecision({
-    decision: 'deny',
-    previewId: 'preview-golden-expanded-deny-1',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    planActionId: 'plan-action-golden-deny-1',
-    expectedPlanRevision: 'plan-revision-golden-deny-1',
-    nextTurn: {
-      reason: 'recovery',
-      target: { kind: 'planning' },
-    },
-  });
-  assert.deepEqual(resumed, {
-    kind: 'answer',
-    text: 'replanned after denial',
-  });
-  assert.deepEqual(harness.providerInputs.at(-1).guidance, [guidance]);
-  assert.equal(harness.calls('submitToolIntent').length, 1);
-  assert.equal(
-    harness.kernelState.facts.filter(
-      (fact) => fact.domain === 'effect'
-    ).length,
-    effectCountBefore,
-    'Session reconciliation must not manufacture an effect'
-  );
+function interventionDraft(
+  problemSummary = 'The requested mutation expands the accepted Plan scope.'
+) {
+  return {
+    problemSummary,
+    recommendation: 'Choose the reviewed executable revision only if the expanded file is required.',
+    relevantFactRefs: [],
+    affectedPlanActionIds: ['plan-action-golden-1'],
+    options: [
+      {
+        optionId: 'option-expanded',
+        kind: 'executable',
+        title: 'Expand the Plan once',
+        description: 'Add the newly discovered workspace write to a replacement Plan revision.',
+        tradeoffs: ['Expands the mutation surface but preserves Kernel review.'],
+        recommended: true,
+        candidatePlan: {
+          title: 'Write reviewed expanded output',
+          objective: 'Write the newly discovered file after explicit user selection.',
+          narrative: 'Carry completed work and execute only the reviewed remaining mutation.',
+          evidence: {
+            kernelFactRefs: [],
+            readResources: [],
+            blockingUnknowns: [],
+            nonBlockingUnknowns: [],
+            coverage: 'The expanded target is represented by one candidate-only preview.',
+          },
+          actions: [{
+            toolId: 'fs.write',
+            scopeIntent: {
+              kind: 'resourceScope',
+              data: {
+                requestedResources: [{
+                  kind: 'workspacePath',
+                  data: { path: 'expanded.txt', access: 'write' },
+                }],
+              },
+            },
+          }],
+        },
+      },
+      {
+        optionId: 'option-guidance',
+        kind: 'guidanceOnly',
+        title: 'Keep the original boundary',
+        description: 'Replan without adding the newly discovered mutation.',
+        tradeoffs: ['May leave the optional expanded output unfinished.'],
+        recommended: false,
+      },
+    ],
+  };
 }
 
 async function factReconciliationFollowsMultiPageContinuation() {
@@ -1956,18 +1947,21 @@ async function createCompletedProviderDurableHistory(sessionId) {
 async function createCompletedToolProviderDurableHistory(sessionId) {
   const live = await openSessionHarness();
   const plan = createPlan();
-  await persistPreviewAndAcceptPlan(live, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(live, plan);
   live.enqueueProvider(providerToolIntent(
     'fs.write',
     { path: 'output.txt', content: 'contract output' },
     'provider-call-durable-tool-history'
   ));
+  live.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   live.enqueueKernel('submitToolIntent', (request) =>
     admittedReply(live, request, {
       invocationId: 'invocation-durable-tool-history',
       attemptId: 'attempt-durable-tool-history',
     }));
-  const admitted = await live.loop.runProviderTurn({
+  const classified = await live.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -1975,6 +1969,8 @@ async function createCompletedToolProviderDurableHistory(sessionId) {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const admitted = await live.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
   appendMutationCompletion(
     live,
@@ -2054,7 +2050,7 @@ async function createNoncompletedProviderHistory(options) {
       `provider-turn:${source.completedState.providerTurn.providerTurnId}:terminal`,
     recordedAt: '2026-07-29T00:00:30.000Z',
     data: {
-      schemaVersion: 'deepcode.session.provider-turn-terminal.v3',
+      schemaVersion: 'deepcode.session.provider-turn-terminal.v4',
       providerTurnId: source.completedState.providerTurn.providerTurnId,
       dispatchRef: {
         recordId: source.evidence.dispatch.recordId,
@@ -2124,18 +2120,21 @@ async function createUnresolvedProviderHistory() {
 async function prepareFinalAnswerHarness() {
   const harness = await openSessionHarness();
   const plan = createPlan();
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(harness, plan);
   harness.enqueueProvider(providerToolIntent(
     'fs.write',
     { path: 'output.txt', content: 'contract output' },
     'provider-call-final-answer-tool'
   ));
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   harness.enqueueKernel('submitToolIntent', (request) =>
     admittedReply(harness, request, {
       invocationId: 'invocation-final-answer-tool',
       attemptId: 'attempt-final-answer-tool',
     }));
-  const admitted = await harness.loop.runProviderTurn({
+  const classified = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -2143,6 +2142,8 @@ async function prepareFinalAnswerHarness() {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
   appendMutationCompletion(
     harness,

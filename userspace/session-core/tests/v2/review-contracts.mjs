@@ -24,6 +24,7 @@ import {
   createFactsPage,
   createInitialState,
   createPlan,
+  createPlanDiscoveryPreviewBatch,
   createPreview,
   corpusFact,
   openSessionHarness,
@@ -189,7 +190,7 @@ async function providerTokenUsageProjectionIsCanonicalDigestSafe() {
 async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   const harness = await openSessionHarness();
   const plan = createPlan();
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview } = await persistPreviewAndAcceptPlan(harness, plan);
   harness.enqueueProvider(providerToolIntents([
     {
       callId: 'provider-call-review-queue-1',
@@ -203,13 +204,21 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     },
   ]));
   harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, preview)
+  );
+  harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, preview)
+  );
+  harness.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(harness, request, {
       invocationId: 'invocation-review-queue-1',
       attemptId: 'attempt-review-queue-1',
     })
   );
-  const admitted = await harness.loop.runProviderTurn({
+  const classified = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -217,6 +226,11 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     },
     remainingToolCallBudget: 2,
   });
+  assert.equal(classified.kind, 'noTool');
+  const secondClassification =
+    await harness.loop.resumePendingProviderToolCalls();
+  assert.equal(secondClassification.kind, 'noTool');
+  const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
   assert.equal(
     harness.loop.snapshot().providerToolCallQueue.outcomeRecorded,

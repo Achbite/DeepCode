@@ -16,6 +16,7 @@ import {
   corpusFact,
   createProviderCompletionReceipt,
   createPlan,
+  createPlanDiscoveryPreviewBatch,
   createToolContext,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
@@ -44,8 +45,8 @@ export const contractCases = [
     run: providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission,
   },
   {
-    id: 'provider_tool_call_budget_rejects_whole_response_before_submission',
-    run: providerToolCallBudgetRejectsWholeResponseBeforeSubmission,
+    id: 'provider_tool_call_envelope_is_bounded_before_submission',
+    run: providerToolCallEnvelopeIsBoundedBeforeSubmission,
   },
   {
     id: 'ordinary_narration_never_submits_an_intent',
@@ -143,7 +144,7 @@ async function providerNativeCallBecomesOneStrictContextReadIntent() {
   assert.equal(intent.toolId, 'fs.read');
   assert.deepEqual(intent.rawArguments, { path: 'README.md' });
   assert.deepEqual(intent.authority, {
-    kind: 'contextRead',
+    kind: 'read',
     data: {
       purpose: 'Session planning context read using fs.read.',
     },
@@ -367,48 +368,13 @@ async function providerNativeCallsCreateSafeOrderedQueueAndSerializeSubmission()
   );
 }
 
-async function providerToolCallBudgetRejectsWholeResponseBeforeSubmission() {
+async function providerToolCallEnvelopeIsBoundedBeforeSubmission() {
   const harness = await openSessionHarness();
-  const plan = createPlan();
-  await persistPreviewAndAcceptPlan(harness, plan);
-  harness.enqueueProvider(providerToolIntents([
-    {
-      callId: 'provider-call-budget-write-1',
-      toolId: 'fs.write',
-      arguments: { path: 'output.txt', content: 'contract output' },
-    },
-    {
-      callId: 'provider-call-budget-write-2',
-      toolId: 'fs.write',
-      arguments: { path: 'output.txt', content: 'contract output' },
-    },
-  ]));
-
-  await assert.rejects(
-    harness.loop.runProviderTurn({
-      reason: 'planExecution',
-      target: {
-        kind: 'planAction',
-        planActionId: plan.actions[0].manifest.planActionId,
-      },
-      remainingToolCallBudget: 1,
-    }),
-    (error) =>
-      error?.code === 'session_kernel_provider_tool_call_budget_exceeded'
-  );
-  assert.equal(harness.calls('submitToolIntent').length, 0);
-  assert.equal(
-    harness.loop.snapshot().providerToolCallQueue,
-    undefined,
-    'budget rejection must not persist a partial queue'
-  );
-  assert.equal(harness.loop.snapshot().providerTurn.status, 'failed');
-  assert.deepEqual(
-    harness.loop.snapshot().operationPlanActionBindings,
-    {},
-    'whole-response rejection must not leave hidden dynamic PlanAction bindings'
-  );
-
+  harness.enqueueProvider(providerAnswer('baseline envelope input'));
+  await harness.loop.runProviderTurn({
+    reason: 'userInput',
+    target: { kind: 'planning' },
+  });
   const tooManyCalls = Array.from({ length: 33 }, (_, index) => ({
     callId: `provider-call-over-limit-${index + 1}`,
     toolName: 'write_file',
@@ -568,7 +534,10 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview: approvedPreview } = await persistPreviewAndAcceptPlan(
+    harness,
+    plan
+  );
   const lineageBeforeFirstSubmit =
     harness.loop.snapshot().lineage;
   harness.enqueueProvider(
@@ -580,6 +549,10 @@ async function planActionAuthorityComesFromPersistedSessionState() {
   );
   let firstReply;
   harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, approvedPreview)
+  );
+  harness.enqueueKernel(
     'submitToolIntent',
     (request) => {
       firstReply = admittedReply(harness, request, {
@@ -590,7 +563,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     }
   );
 
-  const firstResult = await harness.loop.runProviderTurn({
+  const firstClassification = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -598,6 +571,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(firstClassification.kind, 'noTool');
+  const firstResult = await harness.loop.resumePendingProviderToolCalls();
 
   assert.equal(firstResult.kind, 'admitted');
   const firstIntent = harness.calls('submitToolIntent').at(-1).intent;
@@ -631,8 +606,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     ).map(
       (tool) => tool.toolId
     ),
-    ['fs.write'],
-    'a PlanAction Provider turn exposes only its persisted tool'
+    ['fs.read', 'fs.write'],
+    'a PlanAction Provider turn keeps the complete ready tool surface stable'
   );
   const issuedLease = corpusFact(
     'invocationToolIntentAdmitted'
@@ -690,6 +665,10 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     )
   );
   harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, approvedPreview)
+  );
+  harness.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(harness, request, {
       admissionFactId: 'fact-tool-intent-admitted-authority-second',
@@ -697,7 +676,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
       attemptId: 'attempt-authority-second',
     })
   );
-  const secondResult = await harness.loop.runProviderTurn({
+  const secondClassification = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -705,6 +684,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(secondClassification.kind, 'noTool');
+  const secondResult = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(secondResult.kind, 'admitted');
   const secondIntent =
     harness.calls('submitToolIntent').at(-1).intent;
@@ -770,21 +751,25 @@ async function planActionAuthorityComesFromPersistedSessionState() {
       'provider-call-write-after-revoke'
     )
   );
+  harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, approvedPreview)
+  );
   let postRevocationIntent;
   harness.enqueueKernel('submitToolIntent', (request) => {
     postRevocationIntent = request.intent;
     throw new Error('stop_after_post_revocation_intent_capture');
   });
-  await assert.rejects(
-    harness.loop.runProviderTurn({
-      reason: 'planExecution',
-      target: {
-        kind: 'planAction',
-        planActionId: 'plan-action-golden-1',
-      },
-      remainingToolCallBudget: 32,
-    })
-  );
+  const postRevocationClassification = await harness.loop.runProviderTurn({
+    reason: 'planExecution',
+    target: {
+      kind: 'planAction',
+      planActionId: 'plan-action-golden-1',
+    },
+    remainingToolCallBudget: 32,
+  });
+  assert.equal(postRevocationClassification.kind, 'noTool');
+  await assert.rejects(harness.loop.resumePendingProviderToolCalls());
   assert.deepEqual(postRevocationIntent.authority, {
     kind: 'planAction',
     data: {

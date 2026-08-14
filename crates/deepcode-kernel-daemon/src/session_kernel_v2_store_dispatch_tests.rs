@@ -11,6 +11,10 @@ use crate::provider_trace_v1::{
     ProviderTraceResponseBoundaryV1, ProviderTraceStoreV1, ProviderTraceTerminalKindV1,
     ProviderTraceTerminalV1,
 };
+use crate::{
+    ProviderCacheTelemetryStoreV1, SessionProviderAdmissionSidecarV2,
+    SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2,
+};
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Response, StatusCode};
 use axum::routing::post;
@@ -30,6 +34,64 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[test]
+fn user_intervention_persistence_requires_one_exact_card_wait_or_decision_identity() {
+    let candidate_set_digest = format!("sha256:{}", "b".repeat(64));
+    let intervention = json!({
+        "schemaVersion": "deepcode.session.user-intervention.v1",
+        "runId": "run-intervention-persistence",
+        "inputId": "input-intervention-persistence",
+        "controlEpoch": 1,
+        "interactionId": "interaction-persistence",
+        "interactionRevision": "interaction-revision-persistence",
+        "candidateSetDigest": candidate_set_digest,
+        "evidenceProgressDigest": format!("sha256:{}", "c".repeat(64)),
+        "problemSummary": "The requested mutation exceeds the confirmed Plan.",
+        "options": [{ "optionId": "option-a" }],
+        "recordedAt": "2026-08-14T00:00:00.000Z"
+    });
+    let open = json!({
+        "state": "open",
+        "wait": {
+            "kind": "userIntervention",
+            "interactionId": "interaction-persistence",
+            "interactionRevision": "interaction-revision-persistence",
+            "candidateSetDigest": candidate_set_digest
+        },
+        "intervention": intervention
+    });
+    validate_private_user_intervention(
+        open.as_object().expect("open intervention object"),
+    )
+    .expect("exact intervention wait identity");
+
+    let accepted = json!({
+        "state": "accepted",
+        "acceptedPlanRevision": "accepted-plan-revision",
+        "decision": {
+            "interactionId": "interaction-persistence",
+            "interactionRevision": "interaction-revision-persistence",
+            "candidateSetDigest": candidate_set_digest,
+            "selectedOptionId": "option-a"
+        },
+        "intervention": open["intervention"].clone()
+    });
+    validate_private_user_intervention(
+        accepted.as_object().expect("accepted intervention object"),
+    )
+    .expect("exact intervention decision identity");
+
+    let mut stale = open;
+    stale["wait"]["interactionRevision"] = json!("stale-revision");
+    assert!(
+        validate_private_user_intervention(
+            stale.as_object().expect("stale intervention object")
+        )
+        .is_err(),
+        "persistence must fail closed when the ActiveWait and intervention card diverge"
+    );
+}
 
 // Supporting development contracts only. These tests exercise durable
 // dispatch/fence behavior and owned-resource cleanup; real Provider CLI/GUI/TUI
@@ -363,6 +425,7 @@ fn input_data(input_id: &str, unique: u64, recorded_at: &str) -> Value {
         "opaqueInputRef": format!("opaque-input-{unique}"),
         "text": "dispatch fence contract",
         "attachments": [],
+        "attachmentContexts": [],
         "recordedAt": recorded_at,
     })
 }
@@ -432,6 +495,9 @@ fn checkpoint(
                     "providerProfile": {
                         "providerProfileId": profile_id,
                         "providerProfileRevisionDigest": profile_revision
+                    },
+                    "memory": {
+                        "sourceEventVersion": 0
                     },
                     "trimming": {
                         "sections": [{
@@ -550,6 +616,90 @@ async fn create_test_session_store(
         .expect("bind test Run capability");
     drop(turn);
     SessionKernelV2Store::new(root.path.clone(), active_runs)
+}
+
+fn bootstrap_provider_request_envelope(
+    mut request: Value,
+    session_id: &str,
+    profile_revision: &str,
+    admission: &SessionProviderTurnAdmissionV2,
+) -> Value {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .expect("Provider request messages");
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let response_format = request
+        .get("responseFormat")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let system_messages = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let target_kind = admission
+        .target
+        .get("kind")
+        .and_then(Value::as_str)
+        .expect("Provider admission target kind");
+    let mut authority = serde_json::Map::new();
+    if let Some(plan_revision) = &admission.plan_revision {
+        authority.insert("planRevision".to_string(), json!(plan_revision));
+    }
+    let sidecar = json!({
+        "schemaVersion": SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2,
+        "sessionId": session_id,
+        "runId": admission.run_id,
+        "providerTurnId": admission.provider_turn_id,
+        "userTurnId": admission.current_input_id,
+        "controlEpoch": admission.control_epoch,
+        "purpose": admission.purpose,
+        "targetKind": target_kind,
+        "targetBinding": admission.target,
+        "providerProfileRevisionDigest": profile_revision,
+        "currentInputDigest": admission.current_input_digest,
+        "contextAssemblyDigest": admission.context_assembly_digest,
+        "semanticMessagesDigest": stable_json_sha256(&Value::Array(messages.clone()))
+            .expect("digest Provider semantic messages"),
+        "toolSchemaDigest": stable_json_sha256(&Value::Array(tools.clone()))
+            .expect("digest Provider tool schema"),
+        "responseFormatDigest": stable_json_sha256(&response_format)
+            .expect("digest Provider response format"),
+        "toolContextRef": admission.tool_context_ref,
+        "authority": authority,
+        "cacheLane": {
+            "laneId": format!("cache-lane-{}", admission.run_id),
+            "laneRevision": 1,
+            "mode": "bootstrap",
+            "relationKind": "bootstrap",
+            "stablePrefixDigest": stable_json_sha256(&json!({
+                "systemMessages": system_messages,
+                "tools": tools,
+                "responseFormat": response_format,
+            }))
+            .expect("digest Provider stable prefix"),
+        },
+    });
+    request["providerOptions"] = json!({
+        "deepcode": {
+            "sessionKernelV2": sidecar,
+        },
+    });
+    let decoded = SessionProviderAdmissionSidecarV2::decode(&request)
+        .expect("decode test Provider admission sidecar");
+    decoded
+        .validate_request_material(&request)
+        .expect("test Provider request matches its admission sidecar");
+    decoded
+        .validate_against_admission(session_id, profile_revision, admission)
+        .expect("test Provider sidecar matches durable admission");
+    request
 }
 
 async fn run_dispatch_scenario(scenario: DispatchScenario) {
@@ -701,13 +851,14 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
         provider_flavor: Some("deepseek".to_string()),
         base_url: Some(provider.base_url.clone()),
         model: "controlled-model".to_string(),
+        context_window_tokens: Some(128_000),
         max_output_tokens: Some(1024),
         temperature: None,
         reasoning_effort: None,
         thinking: Some("enabled".to_string()),
         api_key: Some("test-provider-key-not-secret-0001".to_string()),
     };
-    let request_envelope = json!({
+    let request_envelope = bootstrap_provider_request_envelope(json!({
         "messages": [
             {
                 "role": "user",
@@ -727,13 +878,14 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
             }
         ],
         "tools": []
-    });
+    }), &session_id, &profile_revision, &captured_admission);
     let response = llm_stream_response(
         profile,
         request_envelope,
         provider_turn_id.clone(),
         ProviderStreamTraceContextV1 {
             store: trace_store.clone(),
+            cache_telemetry_store: ProviderCacheTelemetryStoreV1::new(root.path.clone()),
             identity: ProviderTraceIdentityV1 {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
@@ -905,7 +1057,7 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
 
     match scenario {
         DispatchScenario::SameAuthorityCheckpoint => {
-            assert_eq!(provider.request_count(), 1);
+            assert_eq!(provider.request_count(), 1, "{body}");
             assert!(body.contains("provider_terminal"), "{body}");
             assert!(!body.contains("provider_error"), "{body}");
             assert!(trace_path.is_file());
@@ -931,7 +1083,7 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
                 .is_empty());
         }
         DispatchScenario::ServerFailure | DispatchScenario::RateLimited => {
-            assert_eq!(provider.request_count(), 1);
+            assert_eq!(provider.request_count(), 1, "{body}");
             let expected_public_error = match scenario {
                 DispatchScenario::ServerFailure => "provider_retryable_no_mutation",
                 DispatchScenario::RateLimited => "llm_chat_failed",

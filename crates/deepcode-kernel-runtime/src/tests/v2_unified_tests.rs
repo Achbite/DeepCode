@@ -2,15 +2,84 @@ use super::{open_run, plan_intent, preview_plan_action, tool_intent_response, Te
 use crate::executors::{EmptySecretProvider, KernelExecutorConfig};
 use crate::v2::{HostRunResumeDispositionV2, KernelSessionServiceV2, SettingsCeilingV2};
 use deepcode_kernel_abi::v2::{
-    AuthorizationFactV2, ControlFactV2, KernelFactPayloadV2, MutationCommandResultV2,
+    AuthorizationFactV2, CommandRequestId, ControlFactV2, InputId, KernelFactPayloadV2,
+    MutationCommandResultV2, OperationId, ResourceAccessV2, UserDecisionRefV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    CommandHandlingV2, KernelCommandResponseEnvelopeV2, KernelErrorV2, KernelReplyV2,
-    StorageFaultCodeV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
+    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2,
+    CapabilityScopePreviewOriginV3, CapabilityScopePreviewRecordV2,
+    CapabilityScopePreviewReplyV2, CommandHandlingV2, DeadlineRequestV2,
+    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
+    KernelReplyV2, StorageFaultCodeV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
 };
-use deepcode_kernel_abi::WorkspaceBindingRefV2;
+use deepcode_kernel_abi::{
+    InterventionSelectDecisionV3, PlanActionIdV2, PlanRevisionV2, RequestedResourceV2,
+    ScopeIntentV2, ToolIdV2, UserDecisionReplyV2, UserDecisionV2, WorkspaceBindingRefV2,
+};
 use deepcode_kernel_ledger::v2::FactQueryV2;
 use std::sync::Arc;
+
+const INTERVENTION_ID: &str = "intervention-runtime-1";
+const INTERVENTION_REVISION: &str = "intervention-revision-runtime-1";
+const INTERVENTION_CANDIDATE_SET_DIGEST: &str =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn preview_intervention_candidate(
+    harness: &super::V2Harness,
+    request_id: &str,
+    plan_revision: &str,
+    plan_action_id: &str,
+    operation_id: &str,
+    option_id: &str,
+    path: &str,
+) -> CapabilityScopePreviewRecordV2 {
+    let envelope = KernelCommandEnvelopeV2::new(
+        CommandRequestId::new(request_id).expect("valid candidate preview request"),
+        KernelCommandV2::CapabilityScopePreviewBatch(CapabilityScopePreviewBatchV2 {
+            run_id: harness.opened.run_id.clone(),
+            expected_control_epoch: harness.opened.control_epoch,
+            plan_revision: PlanRevisionV2::new(plan_revision).expect("valid candidate revision"),
+            items: vec![CapabilityScopePreviewItemV2 {
+                plan_action_id: PlanActionIdV2::new(plan_action_id)
+                    .expect("valid candidate PlanAction"),
+                operation_id: OperationId::new(operation_id)
+                    .expect("valid candidate operation"),
+                idempotency_key: format!("idempotency-{operation_id}"),
+                tool_id: ToolIdV2::parse("fs.ensure_directory")
+                    .expect("registered mutation ToolId"),
+                scope_intent: Some(ScopeIntentV2::ResourceScope {
+                    requested_resources: vec![RequestedResourceV2::WorkspacePath {
+                        path: path.to_owned(),
+                        access: ResourceAccessV2::Write,
+                    }],
+                }),
+                raw_arguments: None,
+                deadline: DeadlineRequestV2::ContractDefault {},
+                origin: CapabilityScopePreviewOriginV3::InterventionCandidate {
+                    interaction_id: INTERVENTION_ID.to_owned(),
+                    interaction_revision: INTERVENTION_REVISION.to_owned(),
+                    candidate_set_digest: INTERVENTION_CANDIDATE_SET_DIGEST.to_owned(),
+                    option_id: option_id.to_owned(),
+                },
+            }],
+            tool_context_ref: harness.opened.tool_context_ref.clone(),
+        }),
+    );
+    match harness
+        .service
+        .handle_session_command(envelope, &harness.opened.run_capability)
+    {
+        KernelCommandResponseEnvelopeV2::Correlated {
+            handling: CommandHandlingV2::Evaluated,
+            reply: KernelReplyV2::CapabilityScopePreviewBatchResult(result),
+            ..
+        } => match result.results.as_slice() {
+            [CapabilityScopePreviewReplyV2::Previewed { preview }] => preview.clone(),
+            other => panic!("expected one intervention candidate preview, got {other:?}"),
+        },
+        other => panic!("expected evaluated intervention candidate preview, got {other:?}"),
+    }
+}
 
 #[test]
 fn sqlite_reopen_rotates_transport_and_replays_pending_intent_without_effect() {
@@ -318,4 +387,165 @@ fn invalid_workspace_path_is_durably_rejected_replayed_and_never_admitted() {
             .expect("query resolver error facts")
             .is_empty());
     }
+}
+
+#[test]
+fn intervention_candidates_settle_atomically_without_executing_an_effect() {
+    let harness = super::V2Harness::new("intervention-settlement");
+    let selected = preview_intervention_candidate(
+        &harness,
+        "request-preview-intervention-selected",
+        "candidate-plan-revision-selected",
+        "candidate-plan-action-selected",
+        "candidate-operation-selected",
+        "option-selected",
+        "selected-target",
+    );
+    let superseded = preview_intervention_candidate(
+        &harness,
+        "request-preview-intervention-superseded",
+        "candidate-plan-revision-superseded",
+        "candidate-plan-action-superseded",
+        "candidate-operation-superseded",
+        "option-superseded",
+        "superseded-target",
+    );
+    assert!(selected.origin.is_preview_only());
+    assert!(superseded.origin.is_preview_only());
+
+    let facts_before = harness
+        .service
+        .fact_reader()
+        .query(&FactQueryV2 {
+            run_id: Some(harness.opened.run_id.to_string()),
+            ..FactQueryV2::default()
+        })
+        .expect("query candidate-only facts");
+    assert!(!facts_before.iter().any(|fact| {
+        matches!(
+            &fact.payload,
+            KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityIssued { .. })
+                | KernelFactPayloadV2::Invocation(_)
+                | KernelFactPayloadV2::Effect(_)
+        )
+    }));
+
+    let decision_ref =
+        UserDecisionRefV2::new("decision-ref-intervention-settlement")
+            .expect("valid intervention decision ref");
+    let selected_binding = harness
+        .service
+        .resolve_pending_capability_decision_host(
+            selected.preview_id.clone(),
+            decision_ref.clone(),
+        )
+        .expect("resolve selected candidate")
+        .expect("selected candidate remains current")
+        .binding;
+    let decision = UserDecisionV2::InterventionSelect(InterventionSelectDecisionV3 {
+        input_id: InputId::new("input-intervention-settlement")
+            .expect("valid current input id"),
+        decision_ref,
+        interaction_id: INTERVENTION_ID.to_owned(),
+        interaction_revision: INTERVENTION_REVISION.to_owned(),
+        candidate_set_digest: INTERVENTION_CANDIDATE_SET_DIGEST.to_owned(),
+        selected_option_id: "option-selected".to_owned(),
+        selected_bindings: vec![selected_binding],
+        superseded_preview_ids: vec![superseded.preview_id.clone()],
+    });
+    let request_id = CommandRequestId::new("request-select-intervention")
+        .expect("valid intervention selection request");
+    let (reply, handling) = harness
+        .service
+        .apply_host_user_decision(
+            request_id.clone(),
+            harness.opened.run_id.clone(),
+            harness.opened.control_epoch,
+            decision.clone(),
+        )
+        .expect("atomically settle intervention candidates");
+    assert_eq!(handling, CommandHandlingV2::Evaluated);
+    let (leases, selected_fact_ids, superseded_fact_ids) = match &reply {
+        UserDecisionReplyV2::InterventionSelected {
+            leases,
+            selected_fact_ids,
+            superseded_fact_ids,
+            ..
+        } => (leases, selected_fact_ids, superseded_fact_ids),
+        other => panic!("expected InterventionSelected, got {other:?}"),
+    };
+    assert_eq!(leases.len(), 1);
+    assert_eq!(selected_fact_ids.len(), 1);
+    assert_eq!(superseded_fact_ids.len(), 1);
+
+    let (replayed, replay_handling) = harness
+        .service
+        .apply_host_user_decision(
+            request_id.clone(),
+            harness.opened.run_id.clone(),
+            harness.opened.control_epoch,
+            decision.clone(),
+        )
+        .expect("replay exact intervention selection");
+    assert_eq!(replay_handling, CommandHandlingV2::Replayed);
+    assert_eq!(replayed, reply);
+
+    let mut conflicting = decision;
+    let UserDecisionV2::InterventionSelect(conflicting_selection) = &mut conflicting else {
+        unreachable!("test decision is interventionSelect");
+    };
+    conflicting_selection.selected_option_id = "option-conflict".to_owned();
+    assert!(matches!(
+        harness.service.apply_host_user_decision(
+            request_id,
+            harness.opened.run_id.clone(),
+            harness.opened.control_epoch,
+            conflicting,
+        ),
+        Err(KernelErrorV2::DuplicateCommandDigestMismatch { .. })
+    ));
+
+    let facts = harness
+        .service
+        .fact_reader()
+        .query(&FactQueryV2 {
+            run_id: Some(harness.opened.run_id.to_string()),
+            ..FactQueryV2::default()
+        })
+        .expect("query settled intervention facts");
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| matches!(
+                &fact.payload,
+                KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::CapabilityIssued { identity, .. }
+                ) if identity.preview_id == selected.preview_id
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| matches!(
+                &fact.payload,
+                KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::InterventionCandidateSuperseded {
+                        preview_id,
+                        selected_option_id,
+                        ..
+                    }
+                ) if preview_id == &superseded.preview_id
+                    && selected_option_id == "option-selected"
+            ))
+            .count(),
+        1
+    );
+    assert!(!facts.iter().any(|fact| matches!(
+        &fact.payload,
+        KernelFactPayloadV2::Invocation(_) | KernelFactPayloadV2::Effect(_)
+    )));
+    assert!(!harness.temp.workspace().join("selected-target").exists());
+    assert!(!harness.temp.workspace().join("superseded-target").exists());
 }

@@ -14,8 +14,8 @@ import {
   providerToolIntents,
 } from './harness.mjs';
 import {
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
   StrictSessionKernelProviderAdapterV2,
   canonicalJson,
   sha256Hash,
@@ -793,6 +793,7 @@ async function planAcceptanceRequiresEveryCanonicalScopePreview() {
       toolId: action.manifest.toolId,
       scopeIntent: action.manifest.scopeIntent,
       deadline: action.deadline,
+      origin: { kind: 'plan', data: {} },
     })),
     'the complete Plan must cross the Kernel boundary as one exact batch'
   );
@@ -1090,7 +1091,7 @@ async function prepareConfirmablePlan(harness, draft, commentary) {
 
 async function runSealedPlanningTurn(harness, draft, commentary) {
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
     plan: draft,
   };
   const proposalCallId = 'provider-plan-proposal-contract';
@@ -1102,9 +1103,9 @@ async function runSealedPlanningTurn(harness, draft, commentary) {
     kind: 'plan',
     plan: draft,
     planProposal: {
-      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
       callId: proposalCallId,
-      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
       argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
     },
     items: [{ kind: 'text', phase: 'commentary', text: commentary }],
@@ -1135,7 +1136,7 @@ async function runSealedPlanningTurn(harness, draft, commentary) {
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,
       callId: proposalCallId,
-      name: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
       arguments: canonicalJson(proposalArguments),
     });
     terminal.ref.recordDigest = sha256Hash(canonicalJson(terminal.data));
@@ -1159,6 +1160,13 @@ function oneActionPlanDraft() {
     title: 'Write reviewed output',
     objective: 'Write one file inside the workspace.',
     narrative: 'Use the approved PlanAction and report canonical facts.',
+    evidence: {
+      kernelFactRefs: [],
+      readResources: [],
+      blockingUnknowns: [],
+      nonBlockingUnknowns: [],
+      coverage: 'The requested workspace mutation has a complete explicit scope.',
+    },
     actions: [{
       toolId: 'fs.write',
       scopeIntent: {
