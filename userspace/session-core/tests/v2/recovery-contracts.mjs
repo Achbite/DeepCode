@@ -49,6 +49,10 @@ export const contractCases = [
     run: activeV4CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs,
   },
   {
+    id: 'replayed_committed_projection_is_idempotent_but_changed_content_fails_closed',
+    run: replayedCommittedProjectionIsIdempotentButChangedContentFailsClosed,
+  },
+  {
     id: 'completed_and_noncompleted_provider_terminal_recovery_never_reissues_unresolved_request',
     run: completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnresolvedRequest,
   },
@@ -266,6 +270,114 @@ async function activeV4CompactCheckpointAndPublicSettlementRestoreOnlyCommittedR
     ),
     undefined,
     'orphan settlement checkpoint refs must not become committed state'
+  );
+}
+
+async function replayedCommittedProjectionIsIdempotentButChangedContentFailsClosed() {
+  const durable = createDurablePersistenceHarness({
+    sessionId: 'session-projection-replay-contract',
+  });
+  const { initial, persistence, store } = durable;
+  await persistence.persistInput(initial.initialInput);
+  const state = createSessionKernelLoopStateV2(initial);
+  const request = (sequence) => ({
+    requestId: `request-projection-replay-${sequence}`,
+    lane: 'query',
+    intent: {
+      kind: 'toolContextGet',
+      payload: { knownContext: toolContextRef(initial.toolContext) },
+    },
+    startedAt: NOW,
+    attemptCount: 1,
+  });
+  const authorization = {
+    projectionId: 'projection-authorization-fact-1',
+    runId: initial.runId,
+    recordedAt: NOW,
+    kind: 'authorization.decided',
+    data: {
+      factId: 'fact-authorization-1',
+      factKind: 'capabilityIssued',
+      controlEpoch: initial.controlEpoch,
+      planActionIds: ['plan-action-projection-replay-1'],
+      operationId: 'operation-projection-replay-1',
+      resourceIds: [],
+      details: { source: 'canonical-kernel-fact' },
+    },
+  };
+
+  const first = request(1);
+  await persistence.persistPublicRequest(first);
+  state.checkpointRevision = 1;
+  await persistence.settlePublicRequest(
+    first,
+    sha256Hash(canonicalJson({ sequence: 1 })),
+    checkpointFromStateV3(state),
+    [authorization]
+  );
+
+  const second = request(2);
+  const currentRequestProjection = {
+    projectionId: 'projection-current-request-2',
+    runId: initial.runId,
+    recordedAt: NOW,
+    kind: 'input.persisted',
+    data: {
+      inputId: initial.initialInput.inputId,
+      opaqueInputRef: initial.initialInput.opaqueInputRef,
+      text: initial.initialInput.text,
+      attachments: initial.initialInput.attachments,
+      recordedAt: initial.initialInput.recordedAt,
+      controlEpoch: initial.controlEpoch,
+    },
+  };
+  await persistence.persistPublicRequest(second);
+  state.checkpointRevision = 2;
+  await persistence.settlePublicRequest(
+    second,
+    sha256Hash(canonicalJson({ sequence: 2 })),
+    checkpointFromStateV3(state),
+    [currentRequestProjection, clone(authorization)]
+  );
+
+  const secondMarker = store.records.find(
+    (record) => record.recordKind === 'publicRequestSettled'
+      && record.data.requestId === second.requestId
+  );
+  assert(secondMarker);
+  assert.equal(secondMarker.data.projectionRefs.length, 1);
+  assert.equal(
+    secondMarker.data.projectionRefs[0].recordId.endsWith(
+      `projection:${currentRequestProjection.projectionId}`
+    ),
+    true
+  );
+  assert.equal(
+    store.records.filter((record) =>
+      record.recordKind === 'projection'
+      && record.data.event.projectionId === authorization.projectionId
+    ).length,
+    1,
+    'exact replay must reuse the one committed projection identity'
+  );
+
+  const third = request(3);
+  await persistence.persistPublicRequest(third);
+  state.checkpointRevision = 3;
+  const changedAuthorization = clone(authorization);
+  changedAuthorization.data.details = {
+    source: 'changed-noncanonical-content',
+  };
+  await assert.rejects(
+    persistence.settlePublicRequest(
+      third,
+      sha256Hash(canonicalJson({ sequence: 3 })),
+      checkpointFromStateV3(state),
+      [changedAuthorization]
+    ),
+    (error) =>
+      error?.code
+        === 'session_kernel_public_request_projection_replay_conflict'
   );
 }
 

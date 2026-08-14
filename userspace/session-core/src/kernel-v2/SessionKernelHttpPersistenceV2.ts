@@ -796,6 +796,20 @@ implements SessionKernelPersistencePortV2 {
     checkpoint: SessionKernelCheckpointV2,
     projections: SessionKernelProjectionEventV2[]
   ): Promise<void> {
+    const projectionDigests = new Map<string, string>();
+    for (const projection of projections) {
+      const digest = projectionDigest(projection);
+      const previous = projectionDigests.get(projection.projectionId);
+      if (previous) {
+        throw new SessionKernelPersistenceError(
+          previous === digest
+            ? 'session_kernel_public_request_projection_duplicate'
+            : 'session_kernel_public_request_projection_identity_conflict',
+          `Kernel request ${request.requestId} produced duplicate projection identity ${projection.projectionId}.`
+        );
+      }
+      projectionDigests.set(projection.projectionId, digest);
+    }
     const exactOutcomeDigest = requiredDigest(
       outcomeDigest,
       'outcomeDigest'
@@ -1219,6 +1233,24 @@ implements SessionKernelPersistencePortV2 {
     const committedProjectionIds = new Set(
       committed.projections.map((record) => record.recordId)
     );
+    const committedProjectionsById = new Map(
+      committed.projections.map((record) => [record.recordId, record])
+    );
+    const settlementProjections = projections.filter((event) => {
+      const recordId =
+        `session-kernel-v3:${this.runId}:projection:${event.projectionId}`;
+      const committedRecord = committedProjectionsById.get(recordId);
+      if (!committedRecord) return true;
+      const committedEvent = (committedRecord.data as
+        SessionKernelProjectionRecordV3).event;
+      if (canonicalJson(committedEvent) !== canonicalJson(event)) {
+        throw new SessionKernelPersistenceError(
+          'session_kernel_public_request_projection_replay_conflict',
+          `Kernel request ${commitScope.requestId} changed committed projection ${event.projectionId}.`
+        );
+      }
+      return false;
+    });
     const orphanCheckpoints = records.filter((record) =>
       record.recordKind === 'checkpoint'
       && !committedCheckpointIds.has(record.recordId)
@@ -1279,7 +1311,7 @@ implements SessionKernelPersistencePortV2 {
           `Settlement ${commitScope.requestId} replay changed orphan checkpoint content.`
         );
       }
-      const expectedProjectionIds = projections.map((event) =>
+      const expectedProjectionIds = settlementProjections.map((event) =>
         `session-kernel-v3:${this.runId}:projection:${event.projectionId}`
       );
       const orphanProjectionsById = new Map(
@@ -1290,8 +1322,9 @@ implements SessionKernelPersistencePortV2 {
         orphanProjections.length
       );
       if (
-        new Set(expectedProjectionIds).size !== projections.length
-        || orphanProjections.length > projections.length
+        new Set(expectedProjectionIds).size
+          !== settlementProjections.length
+        || orphanProjections.length > settlementProjections.length
         || expectedOrphanPrefix.some((recordId) =>
           !orphanProjectionsById.has(recordId)
         )
@@ -1302,7 +1335,7 @@ implements SessionKernelPersistencePortV2 {
         );
       }
       const projectionRecords: SessionKernelPersistenceRecordV3[] = [];
-      for (const [index, event] of projections.entries()) {
+      for (const [index, event] of settlementProjections.entries()) {
         const orphanRecord = orphanProjectionsById.get(
           expectedProjectionIds[index]!
         );
@@ -1349,7 +1382,7 @@ implements SessionKernelPersistencePortV2 {
       commitScope
     );
     const projectionRecords: SessionKernelPersistenceRecordV3[] = [];
-    for (const event of projections) {
+    for (const event of settlementProjections) {
       const projectionRecord = createRecord({
         sessionId: this.sessionId,
         runId: this.runId,
