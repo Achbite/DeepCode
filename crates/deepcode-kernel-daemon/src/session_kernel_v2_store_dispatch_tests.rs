@@ -36,6 +36,82 @@ use tokio::sync::oneshot;
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[test]
+fn rejected_scope_projection_requires_exact_plan_action_binding() {
+    let plan_revision = "plan-rejected-scope";
+    let plan_action_id = "plan-action-rejected-scope";
+    let operation_id = "operation-rejected-scope";
+    let mut event: SessionKernelProjectionEventV2 = serde_json::from_value(json!({
+        "projectionId": "projection-rejected-scope",
+        "runId": "run-rejected-scope",
+        "recordedAt": "2026-08-14T00:00:00.000Z",
+        "kind": "scope.previewed",
+        "data": {
+            "kind": "rejected",
+            "data": {
+                "planActionId": plan_action_id,
+                "operationId": operation_id,
+                "toolId": "fs.create",
+                "reason": "requestedScopeInvalid",
+                "guidance": "Use the canonical resource scope for this tool."
+            },
+            "plan": {
+                "runId": "run-rejected-scope",
+                "inputId": "input-rejected-scope",
+                "planRevision": plan_revision,
+                "title": "Create one file",
+                "objective": "Create one reviewed workspace file.",
+                "narrative": "Keep the mutation inside the confirmed scope.",
+                "evidence": {
+                    "kernelFactRefs": [],
+                    "readResources": [],
+                    "blockingUnknowns": [],
+                    "nonBlockingUnknowns": [],
+                    "coverage": "The mutation target and tool are exact."
+                },
+                "carriedSettlementRefs": [],
+                "actions": [{
+                    "taskId": "task-rejected-scope",
+                    "manifest": {
+                        "planRevision": plan_revision,
+                        "planActionId": plan_action_id,
+                        "operationId": operation_id,
+                        "toolId": "fs.create",
+                        "scopeIntent": {
+                            "kind": "resourceScope",
+                            "data": {
+                                "requestedResources": [{
+                                    "kind": "workspacePath",
+                                    "data": {
+                                        "path": "output.txt",
+                                        "access": "write"
+                                    }
+                                }]
+                            }
+                        }
+                    },
+                    "idempotencyKey": "intent-rejected-scope",
+                    "deadline": { "kind": "contractDefault", "data": {} }
+                }],
+                "recordedAt": "2026-08-14T00:00:00.000Z"
+            },
+            "scopePreviews": [],
+            "planRevision": plan_revision,
+            "planActionId": plan_action_id,
+            "operationId": operation_id
+        }
+    }))
+    .expect("decode rejected scope projection fixture");
+
+    validate_private_projection_event_data(&event)
+        .expect("accept a rejected scope projection with exact nested binding");
+
+    event.data["data"]["operationId"] = json!("operation-stale");
+    let error = validate_private_projection_event_data(&event)
+        .expect_err("reject a stale nested operation binding");
+    assert_eq!(error.code, "session_kernel_projection_data_invalid");
+}
+
+#[test]
 fn user_intervention_persistence_requires_one_exact_card_wait_or_decision_identity() {
     let candidate_set_digest = format!("sha256:{}", "b".repeat(64));
     let intervention = json!({

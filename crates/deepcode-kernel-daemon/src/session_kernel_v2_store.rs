@@ -8349,17 +8349,32 @@ fn validate_private_scope_projection(
                 ));
             }
         }
-        Some("rejected") => validate_private_projection_fields(
-            reply,
-            &["toolId", "reason", "guidance"],
-            &[],
-            &["toolId", "reason"],
-            &["guidance"],
-            &[],
-            &[],
-            &[],
-            &[],
-        )?,
+        Some("rejected") => {
+            validate_private_projection_fields(
+                reply,
+                &[
+                    "planActionId",
+                    "operationId",
+                    "toolId",
+                    "reason",
+                    "guidance",
+                ],
+                &[],
+                &["planActionId", "operationId", "toolId", "reason"],
+                &["guidance"],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            if reply.get("planActionId") != data.get("planActionId")
+                || reply.get("operationId") != data.get("operationId")
+            {
+                return Err(private_projection_data_invalid(
+                    "Rejected scope preview does not match its PlanAction projection binding",
+                ));
+            }
+        }
         _ => {
             return Err(private_projection_data_invalid(
                 "Session private scope reply kind is not current",
