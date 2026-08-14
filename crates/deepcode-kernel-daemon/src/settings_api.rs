@@ -1224,18 +1224,46 @@ pub(crate) async fn provider_cache_predecessor(
                 && head.model == recovery.metadata.model
         });
     let durable_parent_valid = if same_run {
-        match state.host_services.session_kernel_v2.provider_turn_admission(
-            &session_id,
-            &run_id,
-            &capability,
-            &provider_turn_id,
-        ) {
-            Ok(admission) => sidecar.validate_against_admission(
+        match state
+            .host_services
+            .session_kernel_v2
+            .provider_turn_predecessor_evidence(
                 &session_id,
-                &authorized.profile_revision,
-                &admission,
-            )
-            .is_ok(),
+                &run_id,
+                &capability,
+                &provider_turn_id,
+            ) {
+            Ok(evidence) => {
+                let terminal_kind_matches = matches!(
+                    (evidence.terminal_kind, recovery.metadata.terminal_kind),
+                    (
+                        SessionProviderTurnTerminalKindV3::Completed,
+                        ProviderTraceTerminalKindV1::Completed
+                    ) | (
+                        SessionProviderTurnTerminalKindV3::Failed,
+                        ProviderTraceTerminalKindV1::Failed
+                    ) | (
+                        SessionProviderTurnTerminalKindV3::Cancelled,
+                        ProviderTraceTerminalKindV1::Cancelled
+                    ) | (
+                        SessionProviderTurnTerminalKindV3::LimitExceeded,
+                        ProviderTraceTerminalKindV1::LimitExceeded
+                    )
+                );
+                terminal_kind_matches
+                    && evidence.request_digest == recovery.metadata.request_digest
+                    && evidence.terminal_reason_code == recovery.reason_code
+                    && evidence.trace_terminal_digest == recovery.metadata.terminal_digest
+                    && evidence.trace_seal_digest == recovery.metadata.seal_digest
+                    && evidence.trace_record_count == recovery.metadata.record_count
+                    && sidecar
+                        .validate_against_admission(
+                            &session_id,
+                            &authorized.profile_revision,
+                            &evidence.admission,
+                        )
+                        .is_ok()
+            }
             Err(_) => false,
         }
     } else {

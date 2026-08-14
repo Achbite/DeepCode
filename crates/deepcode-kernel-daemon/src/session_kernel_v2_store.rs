@@ -697,6 +697,17 @@ pub(crate) struct SessionProviderTurnAdmissionV2 {
     pub(crate) snapshot_high_water: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SessionProviderTurnPredecessorEvidenceV3 {
+    pub(crate) admission: SessionProviderTurnAdmissionV2,
+    pub(crate) request_digest: String,
+    pub(crate) terminal_kind: SessionProviderTurnTerminalKindV3,
+    pub(crate) terminal_reason_code: Option<String>,
+    pub(crate) trace_terminal_digest: String,
+    pub(crate) trace_seal_digest: String,
+    pub(crate) trace_record_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionProviderDispatchBindingV2 {
     pub(crate) provider_turn_id: String,
@@ -905,6 +916,18 @@ impl SessionKernelV2Store {
         validate_bounded_identity(provider_turn_id, "providerTurnId", 512)?;
         let records = self.list(session_id, run_id, capability)?;
         provider_turn_admission_from_records(&records, run_id, provider_turn_id)
+    }
+
+    pub(crate) fn provider_turn_predecessor_evidence(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        capability: &RunCapabilityV2,
+        provider_turn_id: &str,
+    ) -> Result<SessionProviderTurnPredecessorEvidenceV3, HostV2StorageError> {
+        validate_bounded_identity(provider_turn_id, "providerTurnId", 512)?;
+        let records = self.list(session_id, run_id, capability)?;
+        provider_turn_predecessor_evidence_from_records(&records, run_id, provider_turn_id)
     }
 
     #[cfg(test)]
@@ -1821,12 +1844,26 @@ fn provider_turn_admission_from_records(
     run_id: &str,
     provider_turn_id: &str,
 ) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
-    let latest = committed_checkpoint_chain(records)?
-        .into_iter()
+    let checkpoints = committed_checkpoint_chain(records)?;
+    let latest = checkpoints
         .last()
         .ok_or_else(provider_turn_admission_missing)?;
-    let checkpoint_index = latest.record_index;
-    let checkpoint = latest.checkpoint;
+    provider_turn_admission_from_checkpoint(
+        records,
+        run_id,
+        provider_turn_id,
+        latest.record_index,
+        &latest.checkpoint,
+    )
+}
+
+fn provider_turn_admission_from_checkpoint(
+    records: &[SessionKernelPersistenceRecordV3],
+    run_id: &str,
+    provider_turn_id: &str,
+    checkpoint_index: usize,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
     if !checkpoint
         .active
         .provider_reservation
@@ -2032,7 +2069,7 @@ fn provider_turn_admission_from_records(
             let (review_revision, snapshot_high_water) = final_answer_review_binding(
                 records,
                 checkpoint_index,
-                &checkpoint,
+                checkpoint,
                 provider_turn,
                 work_authority,
                 plan_revision.as_deref(),
@@ -2080,6 +2117,104 @@ fn provider_turn_admission_from_records(
     };
     validate_final_answer_dispatch_budget(records, run_id, &admission)?;
     Ok(admission)
+}
+
+fn provider_turn_predecessor_evidence_from_records(
+    records: &[SessionKernelPersistenceRecordV3],
+    run_id: &str,
+    provider_turn_id: &str,
+) -> Result<SessionProviderTurnPredecessorEvidenceV3, HostV2StorageError> {
+    let dispatch_record_id = provider_turn_dispatch_record_id(run_id, provider_turn_id);
+    let (dispatch_index, dispatch_record) = records
+        .iter()
+        .enumerate()
+        .find(|(_, record)| record.record_id == dispatch_record_id)
+        .ok_or_else(provider_turn_predecessor_dispatch_missing)?;
+    if dispatch_record.record_kind != SessionKernelPersistenceRecordKindV3::ProviderTurnDispatch {
+        return Err(provider_turn_predecessor_invalid());
+    }
+    let dispatch = validate_provider_turn_dispatch_record(dispatch_record, run_id)?;
+    if dispatch.provider_turn_id != provider_turn_id {
+        return Err(provider_turn_predecessor_invalid());
+    }
+
+    let checkpoints = committed_checkpoint_chain(records)?;
+    let admitted_checkpoint = checkpoints
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.record_index < dispatch_index
+                && entry
+                    .checkpoint
+                    .active
+                    .provider_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| {
+                        reservation.provider_turn_id == provider_turn_id
+                            && reservation.status == "active"
+                    })
+        })
+        .ok_or_else(provider_turn_admission_missing)?;
+    let admission = provider_turn_admission_from_checkpoint(
+        records,
+        run_id,
+        provider_turn_id,
+        admitted_checkpoint.record_index,
+        &admitted_checkpoint.checkpoint,
+    )?;
+    if !provider_dispatch_matches_admission(&dispatch, run_id, &admission) {
+        return Err(provider_turn_predecessor_invalid());
+    }
+
+    let terminal_record_id = provider_turn_terminal_record_id(run_id, provider_turn_id);
+    let (terminal_index, terminal_record) = records
+        .iter()
+        .enumerate()
+        .find(|(_, record)| record.record_id == terminal_record_id)
+        .ok_or_else(provider_turn_predecessor_terminal_missing)?;
+    if terminal_index <= dispatch_index
+        || terminal_record.record_kind
+            != SessionKernelPersistenceRecordKindV3::ProviderTurnTerminal
+    {
+        return Err(provider_turn_predecessor_invalid());
+    }
+    let terminal = validate_provider_turn_terminal_record(terminal_record, run_id)?;
+    if terminal.provider_turn_id != provider_turn_id
+        || terminal.dispatch_ref.record_id != dispatch_record.record_id
+        || terminal.dispatch_ref.record_digest != dispatch_record.record_digest
+        || terminal.authority_binding != dispatch.authority_binding
+    {
+        return Err(provider_turn_predecessor_invalid());
+    }
+
+    Ok(SessionProviderTurnPredecessorEvidenceV3 {
+        admission,
+        request_digest: dispatch.request_digest,
+        terminal_kind: terminal.terminal_kind,
+        terminal_reason_code: terminal.reason_code,
+        trace_terminal_digest: terminal.trace_ref.terminal_digest,
+        trace_seal_digest: terminal.trace_ref.seal_digest,
+        trace_record_count: terminal.trace_ref.record_count,
+    })
+}
+
+fn provider_dispatch_matches_admission(
+    dispatch: &SessionProviderTurnDispatchDataV3,
+    run_id: &str,
+    admission: &SessionProviderTurnAdmissionV2,
+) -> bool {
+    let authority = &dispatch.authority_binding;
+    dispatch.provider_turn_id == admission.provider_turn_id
+        && dispatch.purpose == admission.purpose
+        && authority.run_id == run_id
+        && authority.input_id == admission.current_input_id
+        && authority.control_epoch == admission.control_epoch
+        && authority.current_input_digest == admission.current_input_digest
+        && authority.plan_revision == admission.plan_revision
+        && authority.review_revision == admission.review_revision
+        && authority.snapshot_high_water == admission.snapshot_high_water
+        && authority.provider_profile_id == admission.provider_profile_id
+        && authority.provider_profile_revision_digest == admission.provider_profile_revision
 }
 
 struct CommittedCheckpointEntryV3<'a> {
@@ -2834,6 +2969,27 @@ fn provider_turn_admission_invalid() -> HostV2StorageError {
     HostV2StorageError::conflict(
         "provider_turn_admission_invalid",
         "Provider transport durable Session turn admission is invalid",
+    )
+}
+
+fn provider_turn_predecessor_dispatch_missing() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_predecessor_dispatch_missing",
+        "Provider cache predecessor has no exact durable dispatch",
+    )
+}
+
+fn provider_turn_predecessor_terminal_missing() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_predecessor_terminal_missing",
+        "Provider cache predecessor has no exact durable terminal",
+    )
+}
+
+fn provider_turn_predecessor_invalid() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_predecessor_invalid",
+        "Provider cache predecessor durable admission, dispatch, and terminal do not form one exact chain",
     )
 }
 

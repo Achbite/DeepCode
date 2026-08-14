@@ -1653,6 +1653,7 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
             None,
         ),
     );
+    let checkpoint_ref = record_ref(&checkpoint_record);
     append_record(
         &session_store,
         &capability,
@@ -1668,7 +1669,7 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
         run_id: run_id.clone(),
         control_epoch: 1,
         current_input_id: input_id.clone(),
-        current_input_digest: provider_input_digest,
+        current_input_digest: provider_input_digest.clone(),
         purpose: ProviderTracePurposeV1::Primary,
         plan_revision: None,
         work_authority: admission.work_authority.clone(),
@@ -1699,6 +1700,18 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
             request_body,
         )
         .expect("commit exact Provider dispatch before Trace activity");
+    let incomplete_predecessor = session_store
+        .provider_turn_predecessor_evidence(
+            &session_id,
+            &run_id,
+            &capability,
+            &provider_turn_id,
+        )
+        .expect_err("a dispatched turn without a durable terminal is not a predecessor");
+    assert_eq!(
+        incomplete_predecessor.code,
+        "provider_turn_predecessor_terminal_missing"
+    );
     let SessionProviderTurnDispatchCommitV3 { mut trace, receipt } = dispatch;
     trace
         .response_boundary(ProviderTraceResponseBoundaryV1 {
@@ -1843,6 +1856,63 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
         Err(error) => error,
     };
     assert_eq!(dispatch_conflict.code, "provider_dispatch_replay_conflict");
+
+    let next_provider_turn_id = format!("provider-turn-terminal-next-{unique}");
+    append_record(
+        &session_store,
+        &capability,
+        &session_id,
+        &run_id,
+        persistence_record(
+            &session_id,
+            &run_id,
+            format!("session-kernel-v3:{run_id}:checkpoint:2"),
+            SessionKernelPersistenceRecordKindV3::Checkpoint,
+            "2026-08-03T00:00:02Z",
+            checkpoint(
+                2,
+                &run_id,
+                &next_provider_turn_id,
+                1,
+                &input_id,
+                &provider_input_digest,
+                &profile_id,
+                &profile_revision,
+                &workspace_binding_digest,
+                &context_ref,
+                &input_ref,
+                Some(&checkpoint_ref),
+            ),
+        ),
+    );
+    let superseded_admission = session_store
+        .provider_turn_admission(&session_id, &run_id, &capability, &provider_turn_id)
+        .expect_err("completed predecessor is no longer the active reservation");
+    assert_eq!(
+        superseded_admission.code,
+        "provider_turn_admission_missing"
+    );
+    let predecessor = session_store
+        .provider_turn_predecessor_evidence(
+            &session_id,
+            &run_id,
+            &capability,
+            &provider_turn_id,
+        )
+        .expect("reconstruct completed predecessor from immutable durable history");
+    assert_eq!(predecessor.admission, admission);
+    assert_eq!(predecessor.request_digest, sha256_bytes(request_body));
+    assert_eq!(
+        predecessor.terminal_kind,
+        SessionProviderTurnTerminalKindV3::Completed
+    );
+    assert_eq!(predecessor.terminal_reason_code, None);
+    assert_eq!(
+        predecessor.trace_terminal_digest,
+        metadata.terminal_digest
+    );
+    assert_eq!(predecessor.trace_seal_digest, metadata.seal_digest);
+    assert_eq!(predecessor.trace_record_count, metadata.record_count);
 
     let records = session_store
         .list(&session_id, &run_id, &capability)
