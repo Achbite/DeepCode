@@ -1821,21 +1821,22 @@ fn provider_turn_admission_from_records(
     run_id: &str,
     provider_turn_id: &str,
 ) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
-    let (checkpoint_index, checkpoint) = committed_checkpoint_chain(records)?
+    let latest = committed_checkpoint_chain(records)?
         .into_iter()
-        .find_map(|entry| {
-            entry
-                .checkpoint
-                .active
-                .provider_reservation
-                .as_ref()
-                .is_some_and(|reservation| {
-                    reservation.provider_turn_id == provider_turn_id
-                        && reservation.status == "active"
-                })
-                .then_some((entry.record_index, entry.checkpoint))
-        })
+        .last()
         .ok_or_else(provider_turn_admission_missing)?;
+    let checkpoint_index = latest.record_index;
+    let checkpoint = latest.checkpoint;
+    if !checkpoint
+        .active
+        .provider_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.provider_turn_id == provider_turn_id && reservation.status == "active"
+        })
+    {
+        return Err(provider_turn_admission_missing());
+    }
     let authority = &checkpoint.authority;
     if authority.run_id != run_id {
         return Err(provider_turn_admission_invalid());
