@@ -1437,14 +1437,9 @@ async fn wait_for_started_run(
                 reconcile_host_terminal_after_projection(client, result, projection_status).await?;
             break;
         }
-        if let Some(message) = live_projection.bound_action_required(&result.run.run_id) {
-            reconcile_host_wait_after_projection(
-                client,
-                &result,
-                run_timeout,
-                run_deadline,
-            )
-            .await?;
+        if let Some(message) = live_projection.bound_action_required(&result.run.run_id)? {
+            reconcile_host_wait_after_projection(client, &result, run_timeout, run_deadline)
+                .await?;
             live_projection.finish_commentary_line()?;
             return Ok(StartedRunOutcome::ActionRequired(message));
         }
@@ -1713,9 +1708,8 @@ async fn reconcile_host_wait_after_projection(
     run_deadline: Option<Instant>,
 ) -> Result<(), String> {
     loop {
-        let mut request = Box::pin(
-            client.get_agent_run(&current.run.session_id, &current.run.run_id)
-        );
+        let mut request =
+            Box::pin(client.get_agent_run(&current.run.session_id, &current.run.run_id));
         let refreshed = tokio::select! {
             refreshed = &mut request => refreshed.map_err(|error| {
                     format!(
@@ -2170,30 +2164,92 @@ impl LiveProjectionCursor {
         }
     }
 
-    fn bound_action_required(&self, host_run_id: &str) -> Option<String> {
+    fn bound_action_required(&self, host_run_id: &str) -> Result<Option<String>, String> {
         if self.superseded_by_turn_id.is_some() {
-            return None;
+            return Ok(None);
         }
         if self.last_revision <= self.action_required_after_revision {
-            return None;
+            return Ok(None);
         }
-        let run = self.snapshot.as_ref()?.run_projection.as_ref()?;
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Ok(None);
+        };
+        let Some(run) = snapshot.run_projection.as_ref() else {
+            return Ok(None);
+        };
         if self.live_run_id.as_deref() != Some(run.run_id.as_str())
             || !matches!(
                 run.status,
                 AgentTimelineRunStatus::WaitingUser | AgentTimelineRunStatus::Paused
             )
         {
-            return None;
+            return Ok(None);
         }
-        let wait = run.wait.0.as_ref()?;
-        if wait.interaction_id.as_deref() == self.ignored_action_interaction_id.as_deref() {
-            return None;
-        }
-        let reason = wait.reason_code.as_str();
-        Some(format!(
-            "shared session run {host_run_id} requires user action: {reason}"
-        ))
+        let Some(wait) = run.wait.0.as_ref() else {
+            return Ok(None);
+        };
+        let action_kind = match wait.interaction_id.as_deref() {
+            Some(interaction_id)
+                if Some(interaction_id) == self.ignored_action_interaction_id.as_deref() =>
+            {
+                return Ok(None);
+            }
+            Some(interaction_id) => {
+                let pending = snapshot
+                    .interaction_projection
+                    .as_ref()
+                    .and_then(|projection| projection.pending.as_ref())
+                    .ok_or_else(|| {
+                        format!(
+                            "Shared Projection Run {} waits for interaction {interaction_id} without a canonical pending interaction",
+                            run.run_id
+                        )
+                    })?;
+                let (pending_interaction_id, pending_run_id, kind) = match pending {
+                    deepcode_kernel_client::AgentTimelinePendingInteraction::Plan(pending) => (
+                        pending.interaction_id.as_str(),
+                        Some(pending.run_id.as_str()),
+                        "plan",
+                    ),
+                    deepcode_kernel_client::AgentTimelinePendingInteraction::Permission(
+                        pending,
+                    ) => (
+                        pending.interaction_id.as_str(),
+                        pending.request.run_id.as_deref(),
+                        "permission",
+                    ),
+                    deepcode_kernel_client::AgentTimelinePendingInteraction::UserIntervention(
+                        pending,
+                    ) => (
+                        pending.interaction_id.as_str(),
+                        Some(pending.run_id.as_str()),
+                        "userIntervention",
+                    ),
+                };
+                if pending_interaction_id != interaction_id {
+                    return Err(format!(
+                        "Shared Projection Run {} wait interaction {interaction_id} conflicts with canonical pending interaction {pending_interaction_id}",
+                        run.run_id
+                    ));
+                }
+                if pending_run_id.is_some_and(|pending_run_id| pending_run_id != run.run_id) {
+                    return Err(format!(
+                        "Shared Projection pending interaction {interaction_id} belongs to a different Run"
+                    ));
+                }
+                kind
+            }
+            None if run.status == AgentTimelineRunStatus::WaitingUser => {
+                return Err(format!(
+                    "Shared Projection Run {} is waiting for user action without an interaction identity",
+                    run.run_id
+                ));
+            }
+            None => wait.reason_code.as_str(),
+        };
+        Ok(Some(format!(
+            "shared session run {host_run_id} requires user action: {action_kind}"
+        )))
     }
 
     fn superseded_turn_id(&self) -> Option<&str> {
@@ -2950,10 +3006,15 @@ mod tests {
     // Supporting development contracts only. Real CLI behavior remains the
     // user-experience acceptance path through the packaged binary.
 
-    fn waiting_snapshot(revision: u64, interaction_id: &str) -> AgentTimelineSnapshot {
+    fn waiting_snapshot_with_pending(
+        revision: u64,
+        interaction_id: &str,
+        reason_code: &str,
+        pending: Value,
+    ) -> AgentTimelineSnapshot {
         serde_json::from_value(json!({
-            "schemaVersion": "deepcode.shared-conversation-projection.v2",
-            "shapeVersion": "deepcode.shared-conversation.work-segments.v2",
+            "schemaVersion": "deepcode.shared-conversation-projection.v4",
+            "shapeVersion": "deepcode.shared-conversation.work-segments.v4",
             "sessionId": "session-cli-decision-contract",
             "revision": revision,
             "sourceEventVersion": revision,
@@ -2969,6 +3030,9 @@ mod tests {
                 "parts": []
             }],
             "eventCount": revision,
+            "interactionProjection": {
+                "pending": pending
+            },
             "runProjection": {
                 "runId": "kernel-run-cli-decision-contract",
                 "turnId": "turn-cli-decision-contract",
@@ -2979,7 +3043,7 @@ mod tests {
                 "wait": {
                     "kind": "user",
                     "since": "2026-08-05T00:00:00.000Z",
-                    "reasonCode": "planDecisionRequired",
+                    "reasonCode": reason_code,
                     "interactionId": interaction_id
                 },
                 "languageBinding": {
@@ -2989,6 +3053,57 @@ mod tests {
             }
         }))
         .expect("exact typed decision timeline")
+    }
+
+    fn waiting_snapshot(revision: u64, interaction_id: &str) -> AgentTimelineSnapshot {
+        waiting_snapshot_with_pending(
+            revision,
+            interaction_id,
+            "planDecisionRequired",
+            json!({
+                "kind": "plan",
+                "interactionId": interaction_id,
+                "interactionRevision": format!("plan-interaction-revision-{revision}"),
+                "targetId": interaction_id,
+                "runId": "kernel-run-cli-decision-contract",
+                "planId": format!("plan-cli-decision-{revision}")
+            }),
+        )
+    }
+
+    fn intervention_waiting_snapshot(revision: u64, interaction_id: &str) -> AgentTimelineSnapshot {
+        let interaction_revision = format!("intervention-revision-{revision}");
+        let candidate_set_digest = format!("sha256:intervention-candidate-set-{revision}");
+        waiting_snapshot_with_pending(
+            revision,
+            interaction_id,
+            "scopeExpansion",
+            json!({
+                "kind": "userIntervention",
+                "interactionId": interaction_id,
+                "interactionRevision": interaction_revision,
+                "targetId": interaction_id,
+                "runId": "kernel-run-cli-decision-contract",
+                "candidateSetDigest": candidate_set_digest,
+                "intervention": {
+                    "schemaVersion": "deepcode.session.user-intervention.v1",
+                    "interactionId": interaction_id,
+                    "interactionRevision": interaction_revision,
+                    "candidateSetDigest": candidate_set_digest,
+                    "problemSummary": "The proposed mutation exceeds the accepted Plan.",
+                    "relevantFacts": ["kernel-fact-cli-intervention"],
+                    "affectedPlanActionIds": ["plan-action-cli-intervention"],
+                    "options": [{
+                        "id": "option-cli-guidance",
+                        "label": "Keep the accepted boundary",
+                        "kind": "guidanceOnly",
+                        "tradeoffs": [],
+                        "actions": []
+                    }],
+                    "allowsFreeform": true
+                }
+            }),
+        )
     }
 
     fn decision_request() -> StartAgentRunRequest {
@@ -3032,13 +3147,20 @@ mod tests {
     fn decision_cli_ignores_baseline_interaction_until_revision_advances() {
         let baseline = waiting_snapshot(10, "interaction-baseline");
         let mut cursor = bound_cursor(&baseline);
-        assert_eq!(cursor.bound_action_required("host-run-decision"), None);
+        assert_eq!(
+            cursor
+                .bound_action_required("host-run-decision")
+                .expect("baseline wait must remain structurally valid"),
+            None
+        );
 
         cursor
             .observe(&waiting_snapshot(11, "interaction-baseline"))
             .expect("same baseline interaction may advance projection metadata");
         assert_eq!(
-            cursor.bound_action_required("host-run-decision"),
+            cursor
+                .bound_action_required("host-run-decision")
+                .expect("replayed baseline wait must remain structurally valid"),
             None,
             "the interaction being resolved cannot immediately re-trigger exit code 5"
         );
@@ -3051,15 +3173,40 @@ mod tests {
         cursor
             .observe(&waiting_snapshot(21, "interaction-baseline"))
             .expect("baseline interaction replay is valid");
-        assert_eq!(cursor.bound_action_required("host-run-decision"), None);
+        assert_eq!(
+            cursor
+                .bound_action_required("host-run-decision")
+                .expect("replayed baseline wait must remain structurally valid"),
+            None
+        );
 
         cursor
             .observe(&waiting_snapshot(22, "interaction-next"))
             .expect("a later exact interaction revision is valid");
         let message = cursor
             .bound_action_required("host-run-decision")
+            .expect("new pending interaction must remain structurally valid")
             .expect("only a different post-baseline interaction requires user action");
         assert!(message.contains("host-run-decision"));
-        assert!(message.contains("planDecisionRequired"));
+        assert!(message.contains("plan"));
+    }
+
+    #[test]
+    fn decision_cli_reports_canonical_intervention_kind_instead_of_wait_reason() {
+        let baseline = waiting_snapshot(30, "interaction-baseline");
+        let mut cursor = bound_cursor(&baseline);
+        cursor
+            .observe(&intervention_waiting_snapshot(
+                31,
+                "interaction-intervention",
+            ))
+            .expect("canonical intervention projection is valid");
+
+        let message = cursor
+            .bound_action_required("host-run-intervention")
+            .expect("canonical intervention binding must remain valid")
+            .expect("the intervention must require user action");
+        assert!(message.contains("userIntervention"));
+        assert!(!message.contains("scopeExpansion"));
     }
 }
