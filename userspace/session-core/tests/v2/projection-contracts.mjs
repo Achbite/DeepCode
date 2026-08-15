@@ -30,6 +30,10 @@ export const contractCases = [
     run: providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOrProjectionFailure,
   },
   {
+    id: 'structured_provider_recovery_is_shared_state_without_private_failure_payloads',
+    run: structuredProviderRecoveryIsSharedStateWithoutPrivateFailurePayloads,
+  },
+  {
     id: 'preview_rejection_marks_only_target_needs_revision_and_creates_no_work_segment',
     run: previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegment,
   },
@@ -672,6 +676,110 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
     0,
     'projection failure must stop before any Kernel tool admission'
   );
+}
+
+async function structuredProviderRecoveryIsSharedStateWithoutPrivateFailurePayloads() {
+  const sessionId = 'session-structured-recovery-projection';
+  const runId = 'run-structured-recovery-projection';
+  const providerTurnId = 'provider-turn-structured-recovery';
+  const input = publicProjectionEvent(
+    sessionId,
+    runId,
+    1,
+    'input.persisted',
+    {
+      inputId: 'input-structured-recovery-projection',
+      opaqueInputRef: 'opaque-structured-recovery-projection',
+      text: 'Prepare a mutation plan.',
+      attachments: [],
+      recordedAt: timestamp(1),
+      controlEpoch: 1,
+    }
+  );
+  const recovering = publicProjectionEvent(
+    sessionId,
+    runId,
+    2,
+    'diagnostic',
+    {
+      providerTurnId,
+      status: 'recovering',
+      code: 'provider_tool_call_arguments_invalid',
+      stage: 'provider.structuredRepair',
+      currentActivityCode: 'session.validating',
+      sourceTerminalKind: 'failed',
+      failureDigest: digest('f'),
+      providerOutcome: providerOutcome(),
+    }
+  );
+  assert.equal(recovering.kind, 'workflow_stage');
+  assert.equal(recovering.payload.visibility, 'trace');
+  assert.equal(recovering.payload.status, 'recovering');
+  assert.equal(
+    recovering.payload.currentActivityCode,
+    'session.validating'
+  );
+
+  const recoveringProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [input, recovering],
+  });
+  assertSharedConversationProjectionV2(recoveringProjection);
+  assert.equal(recoveringProjection.runProjection.status, 'active');
+  assert.equal(
+    recoveringProjection.runProjection.currentActivity.code,
+    'session.validating'
+  );
+  assert.equal(
+    recoveringProjection.turns[0].blocks.some((block) =>
+      block.provenance.sourceEventRefs.includes(recovering.id)
+    ),
+    false,
+    'replaceable recovery state must not become a permanent conversation card'
+  );
+
+  const failed = publicProjectionEvent(
+    sessionId,
+    runId,
+    3,
+    'diagnostic',
+    {
+      providerTurnId,
+      status: 'failed',
+      terminalScope: 'turn',
+      code: 'session_kernel_provider_structured_repair_no_progress',
+      message: 'Structured Provider repair made no progress.',
+      stage: 'provider.structuredRepairNoProgress',
+      providerOutcome: providerOutcome(),
+    }
+  );
+  const failedProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [input, recovering, failed],
+  });
+  assertSharedConversationProjectionV2(failedProjection);
+  assert.equal(failedProjection.runProjection.status, 'failed');
+  assert.equal(failedProjection.runProjection.phase, 'settled');
+  assert.equal(failedProjection.runProjection.currentActivity, null);
+  const publicBytes = JSON.stringify({
+    recovering,
+    failed,
+    failedProjection,
+  });
+  for (const privateField of [
+    'structuredFailure',
+    'nativeCompletion',
+    'originalArgumentsDigest',
+    'normalizedArgumentsDigest',
+    'appendedSuffix',
+    'rawProvider',
+  ]) {
+    assert.equal(
+      publicBytes.includes(privateField),
+      false,
+      `public recovery projection leaked ${privateField}`
+    );
+  }
 }
 
 async function previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegment() {

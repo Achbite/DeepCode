@@ -285,6 +285,7 @@ struct ControlledProvider {
 #[derive(Clone, Copy)]
 enum ControlledProviderReply {
     Success,
+    StructuredFailure,
     HttpStatus(u16),
 }
 
@@ -308,6 +309,15 @@ impl ControlledProvider {
                                 "data: [DONE]\n\n"
                             )))
                             .expect("build controlled Provider response"),
+                        ControlledProviderReply::StructuredFailure => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(concat!(
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"controlled structured failure\"}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-structured-failure\",\"function\":{\"name\":\"deepcode_session_plan_propose_v5\",\"arguments\":\"{\\\"plan\\\":{]}junk\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_cache_hit_tokens\":75,\"prompt_cache_miss_tokens\":25,\"prompt_tokens\":100,\"completion_tokens\":16,\"total_tokens\":116}}\n\n",
+                                "data: [DONE]\n\n"
+                            )))
+                            .expect("build controlled structured Provider response"),
                         ControlledProviderReply::HttpStatus(status) => Response::builder()
                             .status(StatusCode::from_u16(status).expect("valid test HTTP status"))
                             .header(header::CONTENT_TYPE, "application/json")
@@ -393,6 +403,7 @@ enum DispatchScenario {
     ContextChangingCheckpoint,
     ServerFailure,
     RateLimited,
+    StructuredFailure,
 }
 
 impl DispatchScenario {
@@ -403,6 +414,7 @@ impl DispatchScenario {
             Self::ContextChangingCheckpoint => "context-changing",
             Self::ServerFailure => "server-failure",
             Self::RateLimited => "rate-limited",
+            Self::StructuredFailure => "structured-failure",
         }
     }
 
@@ -410,6 +422,7 @@ impl DispatchScenario {
         match self {
             Self::ServerFailure => ControlledProviderReply::HttpStatus(503),
             Self::RateLimited => ControlledProviderReply::HttpStatus(429),
+            Self::StructuredFailure => ControlledProviderReply::StructuredFailure,
             Self::SameAuthorityCheckpoint
             | Self::AuthorityChangingCheckpoint
             | Self::ContextChangingCheckpoint => ControlledProviderReply::Success,
@@ -634,6 +647,7 @@ fn completed_terminal(
             "provider": provider,
             "model": model,
         })),
+        structured_failure: None,
         ordered_items: vec![json!({
             "kind": "toolCall",
             "index": 0,
@@ -996,7 +1010,8 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
         match scenario {
             DispatchScenario::SameAuthorityCheckpoint
             | DispatchScenario::ServerFailure
-            | DispatchScenario::RateLimited => (
+            | DispatchScenario::RateLimited
+            | DispatchScenario::StructuredFailure => (
                 1,
                 initial_input_id.clone(),
                 initial_input_digest.clone(),
@@ -1113,7 +1128,8 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
     match scenario {
         DispatchScenario::SameAuthorityCheckpoint
         | DispatchScenario::ServerFailure
-        | DispatchScenario::RateLimited => {
+        | DispatchScenario::RateLimited
+        | DispatchScenario::StructuredFailure => {
             assert_eq!(current_admission, captured_admission);
         }
         DispatchScenario::AuthorityChangingCheckpoint
@@ -1158,11 +1174,14 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
                 .expect("list stale Provider Traces")
                 .is_empty());
         }
-        DispatchScenario::ServerFailure | DispatchScenario::RateLimited => {
+        DispatchScenario::ServerFailure
+        | DispatchScenario::RateLimited
+        | DispatchScenario::StructuredFailure => {
             assert_eq!(provider.request_count(), 1, "{body}");
             let expected_public_error = match scenario {
                 DispatchScenario::ServerFailure => "provider_retryable_no_mutation",
                 DispatchScenario::RateLimited => "llm_chat_failed",
+                DispatchScenario::StructuredFailure => "provider_tool_call_arguments_invalid",
                 _ => unreachable!(),
             };
             assert!(body.contains(expected_public_error), "{body}");
@@ -1187,6 +1206,7 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
             let expected_reason = match scenario {
                 DispatchScenario::ServerFailure => "provider_retryable_no_mutation",
                 DispatchScenario::RateLimited => "ProviderHttpStatusFailed",
+                DispatchScenario::StructuredFailure => "provider_tool_call_arguments_invalid",
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -1194,7 +1214,36 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
                 Some(expected_reason)
             );
             assert!(terminal.data.get("completion").is_none());
-            assert!(terminal.data.get("providerResult").is_none());
+            if matches!(scenario, DispatchScenario::StructuredFailure) {
+                let provider_result = terminal
+                    .data
+                    .get("providerResult")
+                    .expect("structured failure preserves bounded Provider usage");
+                assert_eq!(
+                    provider_result
+                        .get("usage")
+                        .and_then(|usage| usage.get("total_tokens"))
+                        .and_then(Value::as_u64),
+                    Some(116)
+                );
+                let structured_failure = terminal
+                    .data
+                    .get("structuredFailure")
+                    .expect("structured failure persists safe repair evidence");
+                assert_eq!(
+                    structured_failure
+                        .get("disposition")
+                        .and_then(Value::as_str),
+                    Some("repairableNoMutation")
+                );
+                assert!(structured_failure.get("rawArguments").is_none());
+                assert!(!serde_json::to_string(structured_failure)
+                    .expect("encode safe structured failure")
+                    .contains("junk"));
+            } else {
+                assert!(terminal.data.get("providerResult").is_none());
+                assert!(terminal.data.get("structuredFailure").is_none());
+            }
             assert!(terminal
                 .data
                 .get("orderedItems")
@@ -1570,6 +1619,7 @@ async fn tool_context_snapshot_is_daemon_only_replay_exact_and_history_conflicts
 async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_replay() {
     run_dispatch_scenario(DispatchScenario::ServerFailure).await;
     run_dispatch_scenario(DispatchScenario::RateLimited).await;
+    run_dispatch_scenario(DispatchScenario::StructuredFailure).await;
 
     let mut root = TestRoot::new("provider-terminal-exact");
     let unique = TEST_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);

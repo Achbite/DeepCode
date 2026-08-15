@@ -14,8 +14,13 @@ import {
 } from '../../dist/index.js';
 import {
   SESSION_PROVIDER_TOOL_SETTLEMENT_EVIDENCE_V1_SCHEMA,
+  planSessionProviderCacheLaneV2,
+  sessionProviderCacheMaterialV2,
   sessionProviderSemanticMessagesV2,
 } from '../../dist/kernel-v2/providerCacheLaneV2.js';
+import {
+  providerWireToolDefinitionsV2,
+} from '../../dist/kernel-v2/providerContext.js';
 
 import {
   admittedReply,
@@ -27,6 +32,7 @@ import {
   createSessionHarness,
   openSessionHarness,
   providerOrderedToolItems,
+  providerStructuredFailure,
 } from './harness.mjs';
 
 export const contractCases = [
@@ -62,7 +68,192 @@ export const contractCases = [
     id: 'planning_control_stays_private_until_native_terminal_and_confirmation_settlement',
     run: planningControlStaysPrivateUntilNativeTerminalAndConfirmationSettlement,
   },
+  {
+    id: 'structured_provider_failure_repairs_with_a_new_exact_append_request',
+    run: structuredProviderFailureRepairsWithANewExactAppendRequest,
+  },
+  {
+    id: 'repeated_structured_provider_failure_fails_closed_without_progress',
+    run: repeatedStructuredProviderFailureFailsClosedWithoutProgress,
+  },
 ];
+
+async function structuredProviderFailureRepairsWithANewExactAppendRequest() {
+  const harness = await openSessionHarness();
+  const draft = planningDraft();
+  const valid = sealedPlanningOutput(
+    draft,
+    'I reconstructed the complete Plan from the same authoritative request.'
+  );
+  const restore = installPlanningTerminalEvidence(
+    harness,
+    valid.plan,
+    valid.planProposal.callId
+  );
+  harness.enqueueProvider(providerStructuredFailure({
+    callId: 'call-invalid-first-attempt',
+  }));
+  harness.enqueueProvider((input) =>
+    strictAdapterReturning(valid).requestTurn(input));
+
+  let result;
+  try {
+    result = await harness.loop.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+    });
+  } finally {
+    restore();
+  }
+
+  assert.equal(result.kind, 'plan');
+  assert.equal(harness.providerInputs.length, 2);
+  const [failed, repaired] = harness.providerInputs;
+  assert.notEqual(failed.providerTurnId, repaired.providerTurnId);
+  assert.equal(repaired.purpose, 'continuation');
+  assert.equal(
+    repaired.structuredRepair.predecessorProviderTurnId,
+    failed.providerTurnId
+  );
+  assert.equal(repaired.structuredRepair.sourceTerminalKind, 'failed');
+  assert.equal(
+    repaired.structuredRepair.failureDigest,
+    harness.store.providerEvidence
+      .get(failed.providerTurnId)
+      .terminal.data.structuredFailure.failureDigest
+  );
+  assert.equal(
+    repaired.structuredRepair.errorCode,
+    'provider_tool_call_arguments_invalid'
+  );
+  const tools = providerWireToolDefinitionsV2(repaired);
+  const material = sessionProviderCacheMaterialV2(
+    repaired.contextAssembly.messages,
+    tools
+  );
+  const predecessor = {
+    schemaVersion: 'deepcode.session.provider-cache-predecessor.v2',
+    status: 'available',
+    sessionId: repaired.sessionMemory.sessionId,
+    runId: repaired.runId,
+    userTurnId: repaired.currentInput.inputId,
+    providerTurnId: failed.providerTurnId,
+    controlEpoch: repaired.controlEpoch,
+    terminalKind: 'failed',
+    replayEligible: false,
+    terminalReasonCode: 'provider_tool_call_arguments_invalid',
+    externalRequestDigest: `sha256:${'d'.repeat(64)}`,
+    externalRequestBytes: 4096,
+    providerProfileRevisionDigest:
+      repaired.providerProfile.providerProfileRevisionDigest,
+    providerProfileId: repaired.providerProfile.providerProfileId,
+    provider: 'contract-provider',
+    model: 'contract-model',
+    targetKind: repaired.target.kind,
+    targetBindingDigest: sha256Hash(canonicalJson(repaired.target)),
+    toolSchemaDigest: material.toolSchemaDigest,
+    responseFormatDigest: material.responseFormatDigest,
+    toolContextRef: clone(repaired.toolContext.contextRef),
+    cacheLane: {
+      laneId: `sha256:${'c'.repeat(64)}`,
+      laneRevision: 1,
+      relationKind: 'bootstrap',
+      stablePrefixDigest: material.stablePrefixDigest,
+    },
+  };
+  const cacheLane = planSessionProviderCacheLaneV2({
+    turn: repaired,
+    fullContextMessages: repaired.contextAssembly.messages,
+    tools,
+    predecessor,
+  });
+  assert.equal(cacheLane.mode, 'append');
+  assert.equal(cacheLane.relationKind, 'sameTurnStructuredRepair');
+  assert.equal(cacheLane.predecessorRequestId, failed.providerTurnId);
+  const semanticMessages = sessionProviderSemanticMessagesV2(
+    repaired,
+    cacheLane,
+    predecessor
+  );
+  assert.deepEqual(
+    semanticMessages.map((message) => message.role),
+    ['user', 'user'],
+    'repair appends only a deterministic repair frame and current authority frame'
+  );
+  const repairFrame = JSON.parse(semanticMessages[0].content);
+  assert.equal(
+    repairFrame.schemaVersion,
+    'deepcode.session.provider-structured-repair-frame.v1'
+  );
+  assert.equal(repairFrame.failureDigest, repaired.structuredRepair.failureDigest);
+  assert.equal(
+    semanticMessages.some((message) =>
+      message.content.includes('{"plan":{]}invalid')
+    ),
+    false,
+    'invalid assistant tool-call bytes must never be replayed into Provider messages'
+  );
+  assert.equal(
+    harness.calls('submitToolIntent').length,
+    0,
+    'structured repair must not admit the invalid proposal as a Kernel effect'
+  );
+  const repairProjection = harness.store.projectionEvents.find(
+    (event) =>
+      event.kind === 'diagnostic'
+      && event.data?.stage === 'provider.structuredRepair'
+  );
+  assert(repairProjection);
+  assert.equal(repairProjection.data.status, 'recovering');
+  assert.equal(repairProjection.data.currentActivityCode, 'session.validating');
+}
+
+async function repeatedStructuredProviderFailureFailsClosedWithoutProgress() {
+  const harness = await openSessionHarness();
+  harness.enqueueProvider(providerStructuredFailure({
+    callId: 'call-invalid-first-attempt',
+  }));
+  harness.enqueueProvider(providerStructuredFailure({
+    callId: 'call-invalid-second-attempt',
+  }));
+
+  await assert.rejects(
+    harness.loop.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+    }),
+    (error) =>
+      error?.code
+        === 'session_kernel_provider_structured_repair_no_progress'
+  );
+
+  assert.equal(harness.providerInputs.length, 2);
+  assert.notEqual(
+    harness.providerInputs[0].providerTurnId,
+    harness.providerInputs[1].providerTurnId
+  );
+  assert.equal(
+    harness.providerInputs[0].structuredRepair,
+    undefined
+  );
+  assert.equal(
+    harness.providerInputs[1].structuredRepair.failureDigest,
+    harness.store.providerEvidence
+      .get(harness.providerInputs[0].providerTurnId)
+      .terminal.data.structuredFailure.failureDigest
+  );
+  assert.equal(
+    harness.loop.snapshot().providerTurn.nextStructuredRepair,
+    undefined
+  );
+  const failedProjection = harness.store.projectionEvents.find(
+    (event) =>
+      event.kind === 'diagnostic'
+      && event.data?.stage === 'provider.structuredRepairNoProgress'
+  );
+  assert(failedProjection);
+  assert.equal(failedProjection.data.status, 'failed');
+}
 
 async function planEvidenceDigestIsDerivedFromExactKernelFacts() {
   const initial = createInitialState();
@@ -613,6 +804,8 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
     );
     harness.enqueueProvider((input) =>
       strictAdapterReturning(output).requestTurn(input));
+    harness.enqueueProvider((input) =>
+      strictAdapterReturning(output).requestTurn(input));
     try {
       await assert.rejects(
         harness.loop.runProviderTurn({
@@ -644,6 +837,8 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
   );
   duplicateControl.enqueueProvider((input) =>
     strictAdapterReturning(valid).requestTurn(input));
+  duplicateControl.enqueueProvider((input) =>
+    strictAdapterReturning(valid).requestTurn(input));
   try {
     await assert.rejects(
       duplicateControl.loop.runProviderTurn({
@@ -651,7 +846,8 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
         target: { kind: 'planning' },
       }),
       (error) =>
-        error?.code === 'session_kernel_provider_plan_proposal_conflict'
+        error?.code
+          === 'session_kernel_provider_structured_repair_no_progress'
     );
   } finally {
     restoreDuplicateControl();
@@ -927,6 +1123,9 @@ function installPlanningTerminalEvidence(
   };
   map.set = function setPlanningEvidence(providerTurnId, evidence) {
     const terminal = evidence.terminal;
+    if (terminal.data.terminalKind !== 'completed') {
+      return originalSet.call(this, providerTurnId, evidence);
+    }
     terminal.data.orderedItems.push({
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,

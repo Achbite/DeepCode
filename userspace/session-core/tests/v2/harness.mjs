@@ -10,6 +10,7 @@ import {
   SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
   SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
   SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
@@ -19,6 +20,7 @@ import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
+  SessionKernelProviderTransportError,
   adaptSessionKernelProviderBackendOutputV2,
   buildSessionPlanConfirmationAuthorityV2,
   canonicalJson,
@@ -953,9 +955,30 @@ export function createSessionHarness(options = {}) {
       if (!providerOutputs.length) throw new Error('provider output queue is empty');
       const output = providerOutputs.shift();
       if (output instanceof Error) throw output;
-      const resolved = clone(
-        typeof output === 'function' ? await output(input) : output
-      );
+      const value = typeof output === 'function'
+        ? await output(input)
+        : output;
+      if (value?.harnessProviderFailure) {
+        const failure = value.harnessProviderFailure;
+        store.providerEvidence.set(
+          input.providerTurnId,
+          createFailedProviderEvidence(input, failure.errorCode, {
+            recordedAt: new Date(
+              Date.parse(NOW) + store.clockSequence++
+            ).toISOString(),
+            structuredFailure: failure.structuredFailure,
+            providerResult: failure.providerResult,
+          })
+        );
+        throw new SessionKernelProviderTransportError(
+          failure.errorCode,
+          failure.message,
+          undefined,
+          clone(failure.structuredFailure),
+          clone(failure.providerResult.usage)
+        );
+      }
+      const resolved = clone(value);
       store.providerEvidence.set(
         input.providerTurnId,
         createProviderEvidence(input, resolved, {
@@ -1176,6 +1199,61 @@ export function providerAnswer(text = 'Session answer') {
       model: 'contract-model',
     },
   };
+}
+
+export function providerStructuredFailure(overrides = {}) {
+  const errorCode = 'provider_tool_call_arguments_invalid';
+  const toolName = overrides.toolName
+    ?? SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME;
+  const originalArguments = overrides.originalArguments
+    ?? '{"plan":{]}invalid';
+  const call = {
+    index: 0,
+    callId: overrides.callId ?? 'call-structured-failure',
+    toolName,
+    originalArgumentsDigest: sha256Hash(originalArguments),
+  };
+  const failureDigest = sha256Hash(canonicalJson({
+    errorCode,
+    calls: [{
+      index: call.index,
+      toolName: call.toolName,
+      originalArgumentsDigest: call.originalArgumentsDigest,
+    }],
+  }));
+  const structuredFailure = {
+    schemaVersion: 'deepcode.provider.structured-output-failure.v1',
+    disposition: 'repairableNoMutation',
+    errorCode,
+    failureDigest,
+    nativeCompletion: {
+      providerKind: 'openaiCompatible',
+      terminalSignal: '[DONE]',
+      finishReason: 'tool_calls',
+    },
+    calls: [call],
+  };
+  const usage = clone(overrides.usage ?? {
+    promptCacheHitTokens: 75,
+    promptCacheMissTokens: 25,
+    inputTokens: 100,
+    outputTokens: 16,
+    totalTokens: 116,
+  });
+  return (input) => ({
+    harnessProviderFailure: {
+      errorCode,
+      message:
+        'Provider returned invalid structured output after a complete native response.',
+      structuredFailure,
+      providerResult: {
+        providerProfileId: input.providerProfile.providerProfileId,
+        provider: 'contract-provider',
+        model: 'contract-model',
+        usage,
+      },
+    },
+  });
 }
 
 export function providerPlanActionComplete(
@@ -1455,6 +1533,12 @@ export function createFailedProviderEvidence(
     reasonCode,
     traceRef,
     orderedItems: [],
+    ...(options.structuredFailure
+      ? { structuredFailure: clone(options.structuredFailure) }
+      : {}),
+    ...(options.providerResult
+      ? { providerResult: clone(options.providerResult) }
+      : {}),
   };
   const terminalRef = {
     recordId:

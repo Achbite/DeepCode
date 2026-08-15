@@ -47,6 +47,39 @@ fn provider_public_error_event_uses_bounded_message_and_ignores_raw_detail() {
 }
 
 #[test]
+fn provider_public_structured_error_event_exposes_only_safe_failure_metadata() {
+    let structured_failure = json!({
+        "schemaVersion": PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1,
+        "disposition": "repairableNoMutation",
+        "errorCode": "provider_tool_call_arguments_invalid",
+        "failureDigest": format!("sha256:{}", "a".repeat(64)),
+        "nativeCompletion": {
+            "providerKind": "openaiCompatible",
+            "terminalSignal": "[DONE]",
+            "finishReason": "tool_calls",
+        },
+        "calls": [{
+            "index": 0,
+            "callId": "call-safe-identity",
+            "toolName": "deepcode_session_plan_propose_v5",
+            "originalArgumentsDigest": format!("sha256:{}", "b".repeat(64)),
+        }],
+    });
+    let event = provider_public_structured_error_event(
+        "request-structured-error-contract",
+        "provider_tool_call_arguments_invalid",
+        structured_failure,
+    );
+
+    assert!(event.contains("provider_error"));
+    assert!(event.contains("request-structured-error-contract"));
+    assert!(event.contains("repairableNoMutation"));
+    assert!(event.contains("originalArgumentsDigest"));
+    assert!(!event.contains("rawArguments"));
+    assert!(!event.contains("secret-value"));
+}
+
+#[test]
 fn openai_request_body_preserves_current_profile_max_output_tokens() {
     let mut profile = test_profile();
     profile.max_output_tokens = Some(384_000);
@@ -386,6 +419,176 @@ fn provider_native_stream_completion_and_reasoning_gate() {
         let error = accumulator.finalize().unwrap_err();
         assert_eq!(error.code, "provider_reasoning_missing");
     }
+}
+
+#[test]
+fn proposal_control_eof_json_is_normalized_after_native_completion() {
+    let original_arguments =
+        r#"{"schemaVersion":"deepcode.session.plan-proposal.v5","plan":{"title":"Inspect""#;
+    let mut accumulator =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::OpenAiCompatible);
+    let payload = serde_json::to_vec(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "reasoning_content": "The proposal is complete apart from its EOF delimiters.",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-proposal-eof",
+                    "function": {
+                        "name": "deepcode_session_plan_propose_v5",
+                        "arguments": original_arguments,
+                    },
+                }],
+            },
+        }],
+    }))
+    .unwrap();
+    accumulator.ingest_payload(&payload).unwrap();
+    let terminal = serde_json::to_vec(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+        },
+    }))
+    .unwrap();
+    accumulator.ingest_payload(&terminal).unwrap();
+    accumulator.ingest_payload(b"[DONE]").unwrap();
+
+    let result = accumulator.finalize().unwrap();
+    let recovery = result
+        .structured_output_recovery
+        .expect("proposal EOF normalization must produce a safe recovery receipt");
+    assert_eq!(recovery.disposition, "normalizedProposalControl");
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(recovery.calls[0].appended_suffix.as_deref(), Some("}}"));
+    assert_eq!(
+        result.output.tool_calls[0].arguments["plan"]["title"].as_str(),
+        Some("Inspect")
+    );
+    assert_eq!(
+        result.output.usage.unwrap()["total_tokens"].as_u64(),
+        Some(120)
+    );
+    assert_eq!(
+        result.normalized_tool_arguments.get(&0).map(String::as_str),
+        Some(concat!(
+            r#"{"schemaVersion":"deepcode.session.plan-proposal.v5","plan":{"title":"Inspect""#,
+            "}}"
+        ))
+    );
+}
+
+#[test]
+fn invalid_kernel_tool_arguments_fail_with_usage_and_stable_semantic_digest() {
+    fn invalid_tool_failure(call_id: &str) -> ProviderNativeStreamErrorV1 {
+        let mut accumulator =
+            ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::OpenAiCompatible);
+        let payload = serde_json::to_vec(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning_content": "The native response reached a complete tool terminal.",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "function": {
+                            "name": "fs__read",
+                            "arguments": "{\"path\":\"README.md\"",
+                        },
+                    }],
+                },
+            }],
+        }))
+        .unwrap();
+        accumulator.ingest_payload(&payload).unwrap();
+        let terminal = serde_json::to_vec(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_cache_hit_tokens": 75,
+                "prompt_cache_miss_tokens": 25,
+                "prompt_tokens": 100,
+                "completion_tokens": 16,
+                "total_tokens": 116,
+            },
+        }))
+        .unwrap();
+        accumulator.ingest_payload(&terminal).unwrap();
+        accumulator.ingest_payload(b"[DONE]").unwrap();
+        accumulator.finalize().unwrap_err()
+    }
+
+    let first = invalid_tool_failure("call-kernel-invalid-1");
+    let second = invalid_tool_failure("call-kernel-invalid-2");
+    assert_eq!(first.code, "provider_tool_call_arguments_invalid");
+    assert_eq!(
+        first.usage.as_ref().unwrap()["total_tokens"].as_u64(),
+        Some(116)
+    );
+    let first_failure = first.structured_failure.unwrap();
+    let second_failure = second.structured_failure.unwrap();
+    assert_eq!(first_failure.disposition, "repairableNoMutation");
+    assert_eq!(first_failure.calls[0].normalized_arguments_digest, None);
+    assert_eq!(first_failure.calls[0].appended_suffix, None);
+    assert_eq!(
+        first_failure.failure_digest, second_failure.failure_digest,
+        "Provider call identities must not defeat semantic no-progress detection"
+    );
+    assert_ne!(
+        first_failure.calls[0].call_id,
+        second_failure.calls[0].call_id
+    );
+}
+
+#[test]
+fn proposal_control_non_eof_json_is_not_locally_rewritten() {
+    let mut accumulator =
+        ProviderNativeStreamAccumulatorV1::new(ProviderNativeStreamKindV1::OpenAiCompatible);
+    let payload = serde_json::to_vec(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "reasoning_content": "The response contains non-EOF structural corruption.",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-proposal-invalid",
+                    "function": {
+                        "name": "deepcode_session_plan_propose_v5",
+                        "arguments": "{\"plan\":{]}junk",
+                    },
+                }],
+            },
+        }],
+    }))
+    .unwrap();
+    accumulator.ingest_payload(&payload).unwrap();
+    let terminal = serde_json::to_vec(&json!({
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls",
+        }],
+    }))
+    .unwrap();
+    accumulator.ingest_payload(&terminal).unwrap();
+    accumulator.ingest_payload(b"[DONE]").unwrap();
+
+    let error = accumulator.finalize().unwrap_err();
+    assert_eq!(error.code, "provider_tool_call_arguments_invalid");
+    let failure = error.structured_failure.unwrap();
+    assert_eq!(failure.disposition, "repairableNoMutation");
+    assert_eq!(failure.calls[0].normalized_arguments_digest, None);
+    assert_eq!(failure.calls[0].appended_suffix, None);
 }
 
 #[test]

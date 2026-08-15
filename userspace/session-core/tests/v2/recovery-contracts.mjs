@@ -31,6 +31,7 @@ import {
   providerIntervention,
   providerEvidenceRecordsV3,
   providerPlanActionComplete,
+  providerStructuredFailure,
   providerToolIntent,
   providerToolIntents,
   toolContextRef,
@@ -55,6 +56,10 @@ export const contractCases = [
   {
     id: 'completed_and_noncompleted_provider_terminal_recovery_never_reissues_unresolved_request',
     run: completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnresolvedRequest,
+  },
+  {
+    id: 'failed_structured_terminal_recovers_into_a_new_bound_request',
+    run: failedStructuredTerminalRecoversIntoANewBoundRequest,
   },
   {
     id: 'historical_tool_context_snapshot_recovers_outcomes_across_refresh',
@@ -466,6 +471,71 @@ async function completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnre
   );
   assert.equal(restartedUnresolved.store.providerRequestCount, 0);
   assert.equal(restartedUnresolved.calls('submitToolIntent').length, 0);
+}
+
+async function failedStructuredTerminalRecoversIntoANewBoundRequest() {
+  const initial = createInitialState();
+  const failure = providerStructuredFailure({
+    callId: 'call-structured-restart-source',
+  })({ providerProfile: initial.providerProfile }).harnessProviderFailure;
+  const durable = await createNoncompletedProviderHistory({
+    terminalKind: 'failed',
+    reasonCode: failure.errorCode,
+    expectedStatus: 'active',
+    structuredFailure: failure.structuredFailure,
+    providerResult: failure.providerResult,
+  });
+  const restarted = createSessionHarness({ initial: durable.initial });
+  restarted.ports.persistence = durable.persistence;
+  // The production ID factory carries a fresh process nonce after restart.
+  // Keep the deterministic harness identity distinct from the sealed source
+  // request so the contract still proves one ID per physical request.
+  restarted.store.providerSequence = 1;
+  await restarted.open();
+
+  assert.equal(restarted.store.providerRequestCount, 0);
+  const sourceTurn = restarted.loop.snapshot().providerTurn;
+  assert.equal(sourceTurn.status, 'failed');
+  assert.equal(
+    sourceTurn.nextStructuredRepair.predecessorProviderTurnId,
+    sourceTurn.providerTurnId
+  );
+  assert.equal(
+    sourceTurn.nextStructuredRepair.failureDigest,
+    failure.structuredFailure.failureDigest
+  );
+
+  const recoveredAnswer = providerAnswer('Recovered after restart.');
+  restarted.enqueueProvider((input) => {
+    const evidence = providerEvidenceRecordsV3(
+      durable.sessionId,
+      durable.initial.runId,
+      input,
+      recoveredAnswer
+    );
+    durable.store.seedDaemonRecord(evidence.dispatch);
+    durable.store.seedDaemonRecord(evidence.terminal);
+    return recoveredAnswer;
+  });
+  const result = await restarted.loop.runProviderTurn({
+    reason: 'recovery',
+    target: { kind: 'planning' },
+  });
+  assert.equal(result.kind, 'answer');
+  assert.equal(restarted.providerInputs.length, 1);
+  assert.notEqual(
+    restarted.providerInputs[0].providerTurnId,
+    sourceTurn.providerTurnId
+  );
+  assert.equal(restarted.providerInputs[0].purpose, 'continuation');
+  assert.equal(
+    restarted.providerInputs[0].structuredRepair.predecessorProviderTurnId,
+    sourceTurn.providerTurnId
+  );
+  assert.equal(
+    restarted.providerInputs[0].structuredRepair.failureDigest,
+    failure.structuredFailure.failureDigest
+  );
 }
 
 async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
@@ -2195,6 +2265,12 @@ async function createNoncompletedProviderHistory(options) {
         recordCount: 2,
       },
       orderedItems: [],
+      ...(options.structuredFailure
+        ? { structuredFailure: clone(options.structuredFailure) }
+        : {}),
+      ...(options.providerResult
+        ? { providerResult: clone(options.providerResult) }
+        : {}),
     },
   });
   records.push(failedTerminal);
