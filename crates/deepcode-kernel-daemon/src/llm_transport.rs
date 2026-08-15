@@ -747,6 +747,13 @@ impl ProviderCacheTelemetryRecorderV1 {
         self.provider_terminal_observed();
     }
 
+    fn failed_with_usage(&mut self, code: &str, usage: Option<&Value>, trace_ref: &str) {
+        self.failed(code);
+        self.trace_ref = Some(trace_ref.to_string());
+        self.usage = provider_cache_usage_telemetry(usage, self.relation);
+        self.persist();
+    }
+
     fn cancelled(&mut self, code: &str) {
         self.terminal_status = ProviderCacheTerminalStatusV1::Cancelled;
         self.continuation.error_code = Some(code.to_string());
@@ -954,6 +961,13 @@ struct ProviderCompletedTerminalInputV3 {
     response_digest: String,
     provider_result: Value,
     ordered_items: Vec<Value>,
+    structured_output_recovery: Option<Value>,
+}
+
+struct ProviderStructuredFailureTerminalInputV3 {
+    reason_code: &'static str,
+    structured_failure: Value,
+    provider_result: Value,
 }
 
 struct DurableProviderTurnTraceV3 {
@@ -1020,6 +1034,7 @@ impl DurableProviderTurnTraceV3 {
                 response_digest: None,
                 completion: None,
                 provider_result: None,
+                structured_failure: None,
                 ordered_items: Vec::new(),
             },
         )?;
@@ -1030,6 +1045,43 @@ impl DurableProviderTurnTraceV3 {
         }
         self.cache_telemetry.trace_ref = Some(metadata.seal_digest.clone());
         self.cache_telemetry.persist();
+        self.terminal_committed = true;
+        Ok(metadata)
+    }
+
+    fn finish_structured_failure(
+        &mut self,
+        input: ProviderStructuredFailureTerminalInputV3,
+    ) -> Result<ProviderTraceMetadataV1, ProviderTraceErrorV1> {
+        self.cache_provider_terminal_observed();
+        self.trace.append_normalized_event(json!({
+            "type": "structuredOutputFailure",
+            "failure": input.structured_failure,
+            "providerResult": input.provider_result,
+        }))?;
+        let cache_usage = input.provider_result.get("usage").cloned();
+        let metadata = self.trace.finish(ProviderTraceTerminalV1 {
+            kind: ProviderTraceTerminalKindV1::Failed,
+            reason_code: Some(input.reason_code.to_string()),
+        })?;
+        self.store.commit_provider_terminal(
+            &self.dispatch,
+            &metadata,
+            SessionProviderTurnTerminalCommitV3 {
+                terminal_kind: SessionProviderTurnTerminalKindV3::Failed,
+                reason_code: Some(input.reason_code.to_string()),
+                response_digest: None,
+                completion: None,
+                provider_result: Some(input.provider_result),
+                structured_failure: Some(input.structured_failure),
+                ordered_items: Vec::new(),
+            },
+        )?;
+        self.cache_telemetry.failed_with_usage(
+            input.reason_code,
+            cache_usage.as_ref(),
+            &metadata.seal_digest,
+        );
         self.terminal_committed = true;
         Ok(metadata)
     }
@@ -1058,6 +1110,10 @@ impl DurableProviderTurnTraceV3 {
                 "recordCount": metadata.record_count,
             }
         });
+        let mut completion = completion;
+        if let Some(recovery) = input.structured_output_recovery {
+            completion["structuredOutputRecovery"] = recovery;
+        }
         self.store.commit_provider_terminal(
             &self.dispatch,
             &metadata,
@@ -1067,6 +1123,7 @@ impl DurableProviderTurnTraceV3 {
                 response_digest: Some(input.response_digest),
                 completion: Some(completion.clone()),
                 provider_result: Some(input.provider_result),
+                structured_failure: None,
                 ordered_items: input.ordered_items,
             },
         )?;
@@ -1123,6 +1180,19 @@ struct ProviderSealedToolV3 {
 }
 
 impl ProviderSealedItemsBuilderV3 {
+    fn apply_normalized_tool_arguments(
+        &mut self,
+        normalized: &std::collections::BTreeMap<i64, String>,
+    ) -> Result<(), ProviderNativeStreamTransportErrorV1> {
+        for (native_index, arguments) in normalized {
+            let tool = self.tools.get_mut(native_index).ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_ordered_items_invalid")
+            })?;
+            tool.arguments = arguments.clone();
+        }
+        Ok(())
+    }
+
     fn ingest_public_event(
         &mut self,
         event: &str,
@@ -1587,7 +1657,8 @@ fn inject_provider_native_continuation(
     if parent_request_id == current_identity.provider_turn_id
         || match current_sidecar.cache_lane.relation_kind {
             SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
-            | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation => {
+            | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
+            | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair => {
                 current_identity.purpose != ProviderTracePurposeV1::Continuation
             }
             SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
@@ -1702,6 +1773,59 @@ fn inject_provider_native_continuation(
                 SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
             ));
         }
+        return Ok(ProviderCachePredecessorMaterialV1 {
+            exact_request_body: Some(recovery.exact_request_body),
+        });
+    }
+    if current_sidecar.cache_lane.relation_kind
+        == SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
+    {
+        let repair = current_sidecar.structured_repair.as_ref().ok_or_else(|| {
+            provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            )
+        })?;
+        let terminal_matches = match repair.source_terminal_kind.as_str() {
+            "failed" => {
+                recovery.metadata.terminal_kind == ProviderTraceTerminalKindV1::Failed
+                    && recovery.reason_code.as_deref() == Some(repair.error_code.as_str())
+                    && recovery
+                        .structured_failure
+                        .as_ref()
+                        .and_then(|value| value.get("failureDigest"))
+                        .and_then(Value::as_str)
+                        == Some(repair.failure_digest.as_str())
+            }
+            "completed" => recovery.completed.as_ref().is_some_and(|completed| {
+                repair.source_response_digest.as_deref() == Some(completed.response_digest.as_str())
+            }),
+            _ => false,
+        };
+        if !terminal_matches {
+            return Err(provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            ));
+        }
+        let parent_request = serde_json::from_slice::<Value>(&recovery.exact_request_body)
+            .map_err(|_| {
+                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+            })?;
+        let mut exact_messages = parent_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+            })?;
+        let semantic_delta = request_envelope
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+            })?;
+        exact_messages.extend(semantic_delta);
+        request_envelope["messages"] = Value::Array(exact_messages);
         return Ok(ProviderCachePredecessorMaterialV1 {
             exact_request_body: Some(recovery.exact_request_body),
         });
@@ -1841,6 +1965,7 @@ fn inject_provider_native_continuation(
             vec![provider_terminal_answer_message(provider_kind, &answer)]
         }
         SessionProviderCacheLaneRelationKindV2::Bootstrap
+        | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
         | SessionProviderCacheLaneRelationKindV2::ExactReplay
         | SessionProviderCacheLaneRelationKindV2::Reset => {
             return Err(provider_cache_lane_reset_required(
@@ -1974,6 +2099,7 @@ fn validate_provider_cache_lane_predecessor(
     match current.cache_lane.relation_kind {
         SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
         | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
+        | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
         | SessionProviderCacheLaneRelationKindV2::ExactReplay => {
             if current.run_id != parent.run_id
                 || current.user_turn_id != parent.user_turn_id
@@ -4289,12 +4415,57 @@ pub(crate) fn llm_stream_response(
                         return;
                     }
                 }
-                let _ = finish_provider_trace_failure(&mut trace, error.code);
-                yield Ok(Bytes::from(provider_public_error_event(
-                    &request_id,
-                    error.code,
-                    error.message,
-                )));
+                if let Some(structured_failure) = error.structured_failure {
+                    let structured_failure = match serde_json::to_value(&structured_failure) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            let _ = finish_provider_trace_failure(
+                                &mut trace,
+                                "provider_structured_output_failure_encode_failed",
+                            );
+                            yield Ok(Bytes::from(provider_public_error_event(
+                                &request_id,
+                                "provider_structured_output_failure_encode_failed",
+                                "Provider structured-output evidence could not be encoded.",
+                            )));
+                            return;
+                        }
+                    };
+                    let mut provider_result = json!({
+                        "providerProfileId": profile.id,
+                        "provider": required_resolved_provider_flavor(&profile),
+                        "model": profile.model,
+                    });
+                    if let Some(usage) = error.usage.filter(Value::is_object) {
+                        provider_result["usage"] = usage;
+                    }
+                    if trace.finish_structured_failure(
+                        ProviderStructuredFailureTerminalInputV3 {
+                            reason_code: error.code,
+                            structured_failure: structured_failure.clone(),
+                            provider_result,
+                        },
+                    ).is_err() {
+                        yield Ok(Bytes::from(provider_public_error_event(
+                            &request_id,
+                            "provider_structured_output_terminal_commit_failed",
+                            "Provider structured-output failure could not be committed durably.",
+                        )));
+                        return;
+                    }
+                    yield Ok(Bytes::from(provider_public_structured_error_event(
+                        &request_id,
+                        error.code,
+                        structured_failure,
+                    )));
+                } else {
+                    let _ = finish_provider_trace_failure(&mut trace, error.code);
+                    yield Ok(Bytes::from(provider_public_error_event(
+                        &request_id,
+                        error.code,
+                        error.message,
+                    )));
+                }
                 return;
             }
         };
@@ -4311,6 +4482,17 @@ pub(crate) fn llm_stream_response(
                 &request_id,
                 "provider_final_answer_tool_call_forbidden",
                 "A finalAnswer Provider turn cannot return tool calls",
+            )));
+            return;
+        }
+        if let Err(error) = sealed_items.apply_normalized_tool_arguments(
+            &result.normalized_tool_arguments,
+        ) {
+            let _ = finish_provider_trace_failure(&mut trace, error.code);
+            yield Ok(Bytes::from(provider_public_error_event(
+                &request_id,
+                error.code,
+                error.safe_message(),
             )));
             return;
         }
@@ -4375,6 +4557,26 @@ pub(crate) fn llm_stream_response(
             }
             provider_result["usage"] = usage;
         }
+        let structured_output_recovery = match result
+            .structured_output_recovery
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = finish_provider_trace_failure(
+                    &mut trace,
+                    "provider_structured_output_recovery_encode_failed",
+                );
+                yield Ok(Bytes::from(provider_public_error_event(
+                    &request_id,
+                    "provider_structured_output_recovery_encode_failed",
+                    "Provider structured-output recovery evidence could not be encoded.",
+                )));
+                return;
+            }
+        };
         if let Err(error) = trace.append_normalized_event(json!({
             "type": "validatedTerminal",
             "nativeCompletion": native_completion,
@@ -4384,6 +4586,7 @@ pub(crate) fn llm_stream_response(
             "responseDigest": response_digest,
             "providerResult": provider_result.clone(),
             "orderedItems": ordered_items.clone(),
+            "structuredOutputRecovery": structured_output_recovery,
         })) {
             let _ = finish_provider_trace_failure(
                 &mut trace,
@@ -4403,6 +4606,7 @@ pub(crate) fn llm_stream_response(
             response_digest: response_digest.clone(),
             provider_result,
             ordered_items,
+            structured_output_recovery,
         }) {
             Ok(completed) => completed,
             Err(error) => {
@@ -4498,6 +4702,23 @@ pub(crate) fn provider_public_error_event(
             "requestId": request_id,
             "error": code,
             "message": message,
+        }),
+    )
+}
+
+fn provider_public_structured_error_event(
+    request_id: &str,
+    code: &str,
+    structured_failure: Value,
+) -> String {
+    sse_json_event(
+        "provider_error",
+        json!({
+            "type": "provider_error",
+            "requestId": request_id,
+            "error": code,
+            "message": "Provider returned invalid structured output after a complete native response.",
+            "structuredFailure": structured_failure,
         }),
     )
 }

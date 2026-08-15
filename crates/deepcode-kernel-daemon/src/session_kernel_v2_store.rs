@@ -8,7 +8,8 @@ use crate::host_v2_storage::{
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
 use crate::provider_cache_admission_v2::{
-    SessionProviderConversationHeadV1, SessionProviderToolContextRefSidecarV1,
+    SessionProviderConversationHeadV1, SessionProviderStructuredRepairSidecarV1,
+    SessionProviderToolContextRefSidecarV1,
 };
 use crate::provider_trace_v1::{
     ProviderTraceErrorV1, ProviderTraceIdentityV1, ProviderTraceMetadataV1, ProviderTracePurposeV1,
@@ -18,6 +19,9 @@ use crate::provider_trace_v1::{
 use crate::session_bootstrap_v2::HostSessionPriorEventsV2;
 use crate::user_attachment_v1::{validate_user_attachment_contexts_v1, UserAttachmentContextV1};
 use crate::AppState;
+use crate::{
+    PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1, PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1,
+};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -354,6 +358,8 @@ struct SessionProviderCompletionReceiptV1 {
     reasoning_digest: String,
     response_digest: String,
     trace: SessionProviderCompletionTraceV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_output_recovery: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +416,8 @@ struct SessionProviderTurnTerminalDataV3 {
     completion: Option<SessionProviderCompletionReceiptV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_result: Option<SessionProviderResultV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_failure: Option<Value>,
     trace_ref: SessionProviderTraceRefV3,
     ordered_items: Vec<SessionProviderOrderedItemV3>,
 }
@@ -440,6 +448,10 @@ struct SessionKernelCompactProviderReservationV3 {
     plan_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     correction: Option<SessionKernelToolCorrectionV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_repair: Option<SessionProviderStructuredRepairSidecarV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_structured_repair: Option<SessionProviderStructuredRepairSidecarV1>,
     control_epoch: u64,
     context_ref: ToolContextRefV2,
     fact_projection: Value,
@@ -744,6 +756,7 @@ pub(crate) struct SessionProviderTurnTerminalCommitV3 {
     pub(crate) response_digest: Option<String>,
     pub(crate) completion: Option<Value>,
     pub(crate) provider_result: Option<Value>,
+    pub(crate) structured_failure: Option<Value>,
     pub(crate) ordered_items: Vec<Value>,
 }
 
@@ -1705,6 +1718,7 @@ fn provider_turn_terminal_data(
         response_digest: terminal.response_digest,
         completion,
         provider_result,
+        structured_failure: terminal.structured_failure,
         trace_ref: SessionProviderTraceRefV3 {
             terminal_digest: trace.terminal_digest.clone(),
             seal_digest: trace.seal_digest.clone(),
@@ -1744,7 +1758,8 @@ fn provider_terminal_commit_from_recovery(
             reason_code: recovery.reason_code.clone(),
             response_digest: None,
             completion: None,
-            provider_result: None,
+            provider_result: recovery.structured_failure_provider_result.clone(),
+            structured_failure: recovery.structured_failure.clone(),
             ordered_items: Vec::new(),
         });
     }
@@ -1771,8 +1786,10 @@ fn provider_terminal_commit_from_recovery(
                 "terminalDigest": recovery.metadata.terminal_digest.clone(),
                 "recordCount": recovery.metadata.record_count,
             },
+            "structuredOutputRecovery": completed.structured_output_recovery.clone(),
         })),
         provider_result: Some(completed.provider_result.clone()),
+        structured_failure: None,
         ordered_items: completed.ordered_items.clone(),
     })
 }
@@ -4501,6 +4518,48 @@ fn validate_provider_reservation(
             return Err(provider_turn_admission_invalid());
         }
     }
+    for repair in [
+        reservation.structured_repair.as_ref(),
+        reservation.next_structured_repair.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if repair.schema_version != "deepcode.session.provider-structured-repair.v1"
+            || !matches!(repair.source_terminal_kind.as_str(), "failed" | "completed")
+            || (repair.source_terminal_kind == "completed")
+                != repair.source_response_digest.is_some()
+        {
+            return Err(provider_turn_admission_invalid());
+        }
+        validate_bounded_identity(
+            &repair.predecessor_provider_turn_id,
+            "structuredRepair.predecessorProviderTurnId",
+            512,
+        )?;
+        validate_bounded_identity(&repair.error_code, "structuredRepair.errorCode", 256)?;
+        validate_sha256_digest(&repair.failure_digest, "structuredRepair.failureDigest")?;
+        if let Some(response_digest) = &repair.source_response_digest {
+            validate_sha256_digest(response_digest, "structuredRepair.sourceResponseDigest")?;
+        }
+    }
+    if reservation
+        .structured_repair
+        .as_ref()
+        .is_some_and(|repair| {
+            reservation.purpose != ProviderTracePurposeV1::Continuation
+                || repair.predecessor_provider_turn_id == reservation.provider_turn_id
+        })
+        || reservation
+            .next_structured_repair
+            .as_ref()
+            .is_some_and(|repair| {
+                reservation.status != "failed"
+                    || repair.predecessor_provider_turn_id != reservation.provider_turn_id
+            })
+    {
+        return Err(provider_turn_admission_invalid());
+    }
     if let Some(dispatch_ref) = &reservation.dispatch_ref {
         validate_record_ref(dispatch_ref, "dispatchRef")?;
     }
@@ -4837,9 +4896,35 @@ fn validate_provider_turn_terminal_data(
             {
                 return Err(provider_completed_terminal_invalid());
             }
+            if data.structured_failure.is_some() {
+                return Err(provider_completed_terminal_invalid());
+            }
         }
-        SessionProviderTurnTerminalKindV3::Failed
-        | SessionProviderTurnTerminalKindV3::Cancelled
+        SessionProviderTurnTerminalKindV3::Failed => {
+            let reason_code = data
+                .reason_code
+                .as_deref()
+                .ok_or_else(provider_noncompleted_terminal_invalid)?;
+            validate_bounded_identity(reason_code, "reasonCode", 256)?;
+            if data.response_digest.is_some()
+                || data.completion.is_some()
+                || !data.ordered_items.is_empty()
+            {
+                return Err(provider_noncompleted_terminal_invalid());
+            }
+            match (&data.structured_failure, &data.provider_result) {
+                (Some(failure), Some(result)) => {
+                    validate_provider_structured_failure(failure)?;
+                    validate_provider_result(result, &data.authority_binding)?;
+                    if failure.get("errorCode").and_then(Value::as_str) != Some(reason_code) {
+                        return Err(provider_noncompleted_terminal_invalid());
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(provider_noncompleted_terminal_invalid()),
+            }
+        }
+        SessionProviderTurnTerminalKindV3::Cancelled
         | SessionProviderTurnTerminalKindV3::LimitExceeded => {
             let reason_code = data
                 .reason_code
@@ -4849,6 +4934,7 @@ fn validate_provider_turn_terminal_data(
             if data.response_digest.is_some()
                 || data.completion.is_some()
                 || data.provider_result.is_some()
+                || data.structured_failure.is_some()
                 || !data.ordered_items.is_empty()
             {
                 return Err(provider_noncompleted_terminal_invalid());
@@ -4868,6 +4954,9 @@ fn validate_provider_completion(
     }
     validate_sha256_digest(&completion.reasoning_digest, "reasoningDigest")?;
     validate_sha256_digest(&completion.response_digest, "completion.responseDigest")?;
+    if let Some(recovery) = &completion.structured_output_recovery {
+        validate_provider_structured_recovery(recovery)?;
+    }
     validate_sha256_digest(&completion.trace.seal_digest, "completion.trace.sealDigest")?;
     validate_sha256_digest(
         &completion.trace.terminal_digest,
@@ -4888,6 +4977,162 @@ fn validate_provider_completion(
     };
     if completion.reasoning_transport != expected_transport {
         return Err(provider_completed_terminal_invalid());
+    }
+    Ok(())
+}
+
+fn validate_provider_structured_recovery(value: &Value) -> Result<(), HostV2StorageError> {
+    let object = value
+        .as_object()
+        .ok_or_else(provider_completed_terminal_invalid)?;
+    require_exact_object_keys(
+        object,
+        &[
+            "schemaVersion",
+            "disposition",
+            "errorCode",
+            "failureDigest",
+            "calls",
+        ],
+        "provider_structured_output_recovery_invalid",
+    )?;
+    if object.get("schemaVersion").and_then(Value::as_str)
+        != Some(PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1)
+        || object.get("disposition").and_then(Value::as_str) != Some("normalizedProposalControl")
+        || object.get("errorCode").and_then(Value::as_str)
+            != Some("provider_tool_call_arguments_invalid")
+    {
+        return Err(provider_completed_terminal_invalid());
+    }
+    validate_provider_structured_calls(object, true)?;
+    Ok(())
+}
+
+fn validate_provider_structured_failure(value: &Value) -> Result<(), HostV2StorageError> {
+    let object = value
+        .as_object()
+        .ok_or_else(provider_noncompleted_terminal_invalid)?;
+    require_exact_object_keys(
+        object,
+        &[
+            "schemaVersion",
+            "disposition",
+            "errorCode",
+            "failureDigest",
+            "nativeCompletion",
+            "calls",
+        ],
+        "provider_structured_output_failure_invalid",
+    )?;
+    if object.get("schemaVersion").and_then(Value::as_str)
+        != Some(PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1)
+        || object.get("disposition").and_then(Value::as_str) != Some("repairableNoMutation")
+        || object.get("errorCode").and_then(Value::as_str)
+            != Some("provider_tool_call_arguments_invalid")
+    {
+        return Err(provider_noncompleted_terminal_invalid());
+    }
+    validate_provider_native_completion(
+        object
+            .get("nativeCompletion")
+            .ok_or_else(provider_noncompleted_terminal_invalid)?,
+    )?;
+    validate_provider_structured_calls(object, false)?;
+    Ok(())
+}
+
+fn validate_provider_structured_calls(
+    object: &serde_json::Map<String, Value>,
+    normalized: bool,
+) -> Result<(), HostV2StorageError> {
+    let calls = object
+        .get("calls")
+        .and_then(Value::as_array)
+        .filter(|calls| !calls.is_empty() && calls.len() <= 32)
+        .ok_or_else(provider_noncompleted_terminal_invalid)?;
+    let mut digest_calls = Vec::with_capacity(calls.len());
+    for call in calls {
+        let call = call
+            .as_object()
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let expected_keys = if normalized {
+            [
+                "index",
+                "callId",
+                "toolName",
+                "originalArgumentsDigest",
+                "normalizedArgumentsDigest",
+                "appendedSuffix",
+            ]
+            .as_slice()
+        } else {
+            ["index", "callId", "toolName", "originalArgumentsDigest"].as_slice()
+        };
+        require_exact_object_keys(
+            call,
+            expected_keys,
+            "provider_structured_output_call_invalid",
+        )?;
+        let index = call
+            .get("index")
+            .and_then(Value::as_i64)
+            .filter(|index| *index >= 0 && *index < 32)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let call_id = call
+            .get("callId")
+            .and_then(Value::as_str)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let tool_name = call
+            .get("toolName")
+            .and_then(Value::as_str)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let original_digest = call
+            .get("originalArgumentsDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        validate_bounded_identity(call_id, "structuredOutput.callId", 1024)?;
+        validate_bounded_identity(tool_name, "structuredOutput.toolName", 1024)?;
+        validate_sha256_digest(original_digest, "structuredOutput.originalArgumentsDigest")?;
+        if normalized {
+            if !matches!(
+                tool_name,
+                "deepcode_session_plan_propose_v5" | "deepcode_session_intervention_propose_v1"
+            ) {
+                return Err(provider_completed_terminal_invalid());
+            }
+            let normalized_digest = call
+                .get("normalizedArgumentsDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(provider_completed_terminal_invalid)?;
+            validate_sha256_digest(
+                normalized_digest,
+                "structuredOutput.normalizedArgumentsDigest",
+            )?;
+            let suffix = call
+                .get("appendedSuffix")
+                .and_then(Value::as_str)
+                .filter(|suffix| {
+                    !suffix.is_empty()
+                        && suffix.len() <= 32
+                        && suffix
+                            .chars()
+                            .all(|character| matches!(character, '}' | ']'))
+                })
+                .ok_or_else(provider_completed_terminal_invalid)?;
+            let _ = suffix;
+        }
+        digest_calls.push(json!({
+            "index": index,
+            "toolName": tool_name,
+            "originalArgumentsDigest": original_digest,
+        }));
+    }
+    let expected_digest = stable_json_sha256(&json!({
+        "errorCode": "provider_tool_call_arguments_invalid",
+        "calls": digest_calls,
+    }))?;
+    if object.get("failureDigest").and_then(Value::as_str) != Some(expected_digest.as_str()) {
+        return Err(provider_noncompleted_terminal_invalid());
     }
     Ok(())
 }

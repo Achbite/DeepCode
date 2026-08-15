@@ -26,9 +26,22 @@ pub(crate) enum SessionProviderCacheLaneRelationKindV2 {
     Bootstrap,
     SameTurnToolContinuation,
     SameTurnSessionControlContinuation,
+    SameTurnStructuredRepair,
     NextUserTurn,
     ExactReplay,
     Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderStructuredRepairSidecarV1 {
+    pub(crate) schema_version: String,
+    pub(crate) predecessor_provider_turn_id: String,
+    pub(crate) source_terminal_kind: String,
+    pub(crate) error_code: String,
+    pub(crate) failure_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_response_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +304,8 @@ pub(crate) struct SessionProviderAdmissionSidecarV2 {
     pub(crate) continuation_operation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) continuation_outcomes: Vec<SessionProviderContinuationOutcomeV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) structured_repair: Option<SessionProviderStructuredRepairSidecarV1>,
     pub(crate) cache_lane: SessionProviderCacheLaneSidecarV2,
 }
 
@@ -559,6 +574,7 @@ impl SessionProviderAdmissionSidecarV2 {
                     self.cache_lane.relation_kind,
                     SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
                         | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
+                        | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
                         | SessionProviderCacheLaneRelationKindV2::NextUserTurn
                 ) {
                     return Err(invalid_cache_relation_kind());
@@ -585,6 +601,8 @@ impl SessionProviderAdmissionSidecarV2 {
             == SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation;
         let next_user_append =
             self.cache_lane.relation_kind == SessionProviderCacheLaneRelationKindV2::NextUserTurn;
+        let structured_repair_append = self.cache_lane.relation_kind
+            == SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair;
         if next_user_append
             != (self.purpose == ProviderTracePurposeV1::Primary
                 && self.provider_conversation_head.is_some())
@@ -626,6 +644,42 @@ impl SessionProviderAdmissionSidecarV2 {
                 "provider_control_continuation_invalid",
                 "Session control continuation must remain in the current Provider turn authority",
             ));
+        }
+        if structured_repair_append != self.structured_repair.is_some()
+            || structured_repair_append && self.purpose != ProviderTracePurposeV1::Continuation
+        {
+            return Err(HostV2StorageError::invalid(
+                "provider_structured_repair_relation_invalid",
+                "Structured Provider repair conflicts with its append relation",
+            ));
+        }
+        if let Some(repair) = &self.structured_repair {
+            if repair.schema_version != "deepcode.session.provider-structured-repair.v1"
+                || repair.predecessor_provider_turn_id
+                    != self
+                        .cache_lane
+                        .predecessor_request_id
+                        .clone()
+                        .unwrap_or_default()
+                || !matches!(repair.source_terminal_kind.as_str(), "failed" | "completed")
+                || (repair.source_terminal_kind == "completed")
+                    != repair.source_response_digest.is_some()
+            {
+                return Err(HostV2StorageError::invalid(
+                    "provider_structured_repair_relation_invalid",
+                    "Structured Provider repair has an invalid predecessor binding",
+                ));
+            }
+            validate_bounded_identity(
+                &repair.predecessor_provider_turn_id,
+                "structuredRepair.predecessorProviderTurnId",
+                512,
+            )?;
+            validate_bounded_identity(&repair.error_code, "structuredRepair.errorCode", 256)?;
+            validate_sha256_digest(&repair.failure_digest, "structuredRepair.failureDigest")?;
+            if let Some(digest) = &repair.source_response_digest {
+                validate_sha256_digest(digest, "structuredRepair.sourceResponseDigest")?;
+            }
         }
         let mut unique_continuation_operations =
             HashSet::with_capacity(self.continuation_operation_ids.len());

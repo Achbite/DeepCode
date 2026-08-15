@@ -225,6 +225,7 @@ pub(crate) struct ProviderTraceCompletedTerminalRecoveryV1 {
     pub(crate) response_digest: String,
     pub(crate) provider_result: Value,
     pub(crate) ordered_items: Vec<Value>,
+    pub(crate) structured_output_recovery: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +237,8 @@ pub(crate) struct ProviderTraceTerminalRecoveryV1 {
     pub(crate) reasoning: String,
     pub(crate) exact_request_body: Vec<u8>,
     pub(crate) admission_sidecar: Option<Value>,
+    pub(crate) structured_failure: Option<Value>,
+    pub(crate) structured_failure_provider_result: Option<Value>,
     pub(crate) completed: Option<ProviderTraceCompletedTerminalRecoveryV1>,
 }
 
@@ -1858,6 +1861,9 @@ fn recover_verified_provider_trace_terminal(
     let mut terminal: Option<ProviderTraceTerminalV1> = None;
     let mut completed: Option<ProviderTraceCompletedTerminalRecoveryV1> = None;
     let mut completed_sequence: Option<u64> = None;
+    let mut structured_failure: Option<Value> = None;
+    let mut structured_failure_provider_result: Option<Value> = None;
+    let mut structured_failure_sequence: Option<u64> = None;
     let mut request_seen = false;
     let mut started_at_unix_ms: Option<String> = None;
     let mut completed_at_unix_ms: Option<String> = None;
@@ -1929,6 +1935,32 @@ fn recover_verified_provider_trace_terminal(
                                 continue;
                             }
                             if event.get("type").and_then(Value::as_str)
+                                == Some("structuredOutputFailure")
+                            {
+                                if structured_failure.is_some() || completed.is_some() {
+                                    return Err(ProviderTraceErrorV1::invalid(
+                                        "provider_trace_recovery_invalid",
+                                        "Provider trace contains conflicting structured terminal evidence",
+                                    ));
+                                }
+                                structured_failure = Some(
+                                    event
+                                        .get("failure")
+                                        .filter(|value| value.is_object())
+                                        .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                        .clone(),
+                                );
+                                structured_failure_provider_result = Some(
+                                    event
+                                        .get("providerResult")
+                                        .filter(|value| value.is_object())
+                                        .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                        .clone(),
+                                );
+                                structured_failure_sequence = Some(sequence);
+                                continue;
+                            }
+                            if event.get("type").and_then(Value::as_str)
                                 != Some("validatedTerminal")
                             {
                                 continue;
@@ -1980,6 +2012,10 @@ fn recover_verified_provider_trace_terminal(
                                 .and_then(Value::as_array)
                                 .ok_or_else(provider_trace_completed_recovery_invalid)?
                                 .clone();
+                            let structured_output_recovery = event
+                                .get("structuredOutputRecovery")
+                                .filter(|value| !value.is_null())
+                                .cloned();
                             completed = Some(ProviderTraceCompletedTerminalRecoveryV1 {
                                 exact_request_body: Vec::new(),
                                 admission_sidecar: None,
@@ -1992,6 +2028,7 @@ fn recover_verified_provider_trace_terminal(
                                 response_digest,
                                 provider_result,
                                 ordered_items,
+                                structured_output_recovery,
                             });
                             completed_sequence = Some(sequence);
                             completed_item_ordinal = Some(item_ordinal);
@@ -2079,6 +2116,12 @@ fn recover_verified_provider_trace_terminal(
                     "Non-completed Provider trace terminal requires a reasonCode",
                 ));
             }
+            if structured_failure.is_some() != structured_failure_provider_result.is_some()
+                || structured_failure_sequence
+                    .is_some_and(|sequence| sequence.checked_add(2) != Some(metadata.record_count))
+            {
+                return Err(provider_trace_completed_recovery_invalid());
+            }
             completed = None;
         }
     }
@@ -2092,6 +2135,8 @@ fn recover_verified_provider_trace_terminal(
         reasoning,
         exact_request_body: recovered_request_body,
         admission_sidecar,
+        structured_failure,
+        structured_failure_provider_result,
         completed,
     })
 }
