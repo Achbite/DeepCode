@@ -96,6 +96,10 @@ import {
   decodeCompletedProviderTerminalV3,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
+  decodeStructuredOutputFailureV1,
+  decodeStructuredOutputRecoveryV1,
+} from './providerStreamV1.js';
+import {
   adaptSessionKernelProviderBackendOutputV2,
 } from './SessionKernelProviderAdapterV2.js';
 import {
@@ -214,6 +218,12 @@ interface SessionKernelCompactProviderReservationV3 {
   target: SessionProviderTurnTargetV2;
   planRevision?: string;
   correction?: import('./types.js').SessionToolCorrectionV2;
+  structuredRepair?: NonNullable<
+    SessionProviderTurnRecordV2['structuredRepair']
+  >;
+  nextStructuredRepair?: NonNullable<
+    SessionProviderTurnRecordV2['nextStructuredRepair']
+  >;
   controlEpoch: number;
   contextRef: import('@deepcode/protocol').ToolContextRefV2;
   factProjection: SessionProviderTurnRecordV2['factProjection'];
@@ -2318,7 +2328,7 @@ function decodeProviderTurnDispatchDataV3(
 function decodeProviderCompletionReceiptV1(
   value: unknown
 ): import('./types.js').SessionProviderCompletionReceiptV1 {
-  const record = exactObject(
+  const record = exactObjectOptional(
     value,
     [
       'schemaVersion',
@@ -2329,6 +2339,7 @@ function decodeProviderCompletionReceiptV1(
       'responseDigest',
       'trace',
     ],
+    ['structuredOutputRecovery'],
     'session_kernel_provider_completion_invalid'
   );
   const native = objectRecord(record.nativeCompletion);
@@ -2417,6 +2428,12 @@ function decodeProviderCompletionReceiptV1(
       'session_kernel_provider_completion_invalid'
     );
   }
+  const structuredOutputRecovery = record.structuredOutputRecovery
+    === undefined
+    ? undefined
+    : decodeStructuredOutputRecoveryV1(
+        record.structuredOutputRecovery
+      );
   return {
     schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
     nativeCompletion,
@@ -2443,6 +2460,9 @@ function decodeProviderCompletionReceiptV1(
         'trace.recordCount'
       ),
     },
+    ...(structuredOutputRecovery
+      ? { structuredOutputRecovery }
+      : {}),
   };
 }
 
@@ -2517,7 +2537,13 @@ function decodeProviderTurnTerminalDataV3(
       'traceRef',
       'orderedItems',
     ],
-    ['reasonCode', 'responseDigest', 'completion', 'providerResult'],
+    [
+      'reasonCode',
+      'responseDigest',
+      'completion',
+      'providerResult',
+      'structuredFailure',
+    ],
     'session_kernel_provider_terminal_invalid'
   );
   const providerTurnId = requiredIdentity(
@@ -2598,6 +2624,7 @@ function decodeProviderTurnTerminalDataV3(
     );
     if (
       record.reasonCode !== undefined
+      || record.structuredFailure !== undefined
       || responseDigest !== completion.responseDigest
       || providerResultRecord.providerProfileId
         !== authorityBinding.providerProfileId
@@ -2637,11 +2664,50 @@ function decodeProviderTurnTerminalDataV3(
     record.reasonCode === undefined
     || record.responseDigest !== undefined
     || record.completion !== undefined
-    || record.providerResult !== undefined
     || orderedItems.length !== 0
   ) {
     throw new UnsupportedHistorySchemaError(
       'session_kernel_provider_terminal_invalid'
+    );
+  }
+  const structuredFailure = record.structuredFailure === undefined
+    ? undefined
+    : decodeStructuredOutputFailureV1(record.structuredFailure);
+  const providerResultRecord = record.providerResult === undefined
+    ? undefined
+    : exactObjectOptional(
+        record.providerResult,
+        ['providerProfileId', 'provider', 'model'],
+        ['usage'],
+        'session_kernel_provider_terminal_result_invalid'
+      );
+  if (
+    (
+      terminalKind !== 'failed'
+      && (structuredFailure !== undefined || providerResultRecord !== undefined)
+    )
+    || (
+      (structuredFailure === undefined)
+        !== (providerResultRecord === undefined)
+    )
+    || (
+      structuredFailure !== undefined
+      && (
+        record.reasonCode !== structuredFailure.errorCode
+        || providerResultRecord?.providerProfileId
+          !== authorityBinding.providerProfileId
+      )
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_terminal_invalid'
+    );
+  }
+  const usage = providerResultRecord?.usage;
+  const usageRecord = usage === undefined ? undefined : objectRecord(usage);
+  if (usage !== undefined && !usageRecord) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_terminal_result_invalid'
     );
   }
   return {
@@ -2651,6 +2717,23 @@ function decodeProviderTurnTerminalDataV3(
     authorityBinding,
     terminalKind,
     reasonCode: requiredIdentity(record.reasonCode, 'reasonCode'),
+    ...(providerResultRecord
+      ? {
+          providerResult: {
+            providerProfileId: requiredIdentity(
+              providerResultRecord.providerProfileId,
+              'providerProfileId'
+            ),
+            provider: requiredIdentity(
+              providerResultRecord.provider,
+              'provider'
+            ),
+            model: requiredIdentity(providerResultRecord.model, 'model'),
+            ...(usageRecord ? { usage: cloneJson(usageRecord) } : {}),
+          },
+          structuredFailure,
+        }
+      : {}),
     traceRef,
     orderedItems: [],
   };
@@ -3277,6 +3360,8 @@ function decodeCompactProviderReservationV3(
     [
       'planRevision',
       'correction',
+      'structuredRepair',
+      'nextStructuredRepair',
       'cancellationReason',
       'dispatchRef',
       'terminalRef',
@@ -3314,6 +3399,37 @@ function decodeCompactProviderReservationV3(
       'session_kernel_provider_reservation_status_invalid'
     );
   }
+  const providerTurnId = requiredIdentity(
+    record.providerTurnId,
+    'providerTurnId'
+  );
+  const structuredRepair = record.structuredRepair === undefined
+    ? undefined
+    : decodeSessionProviderStructuredRepairV1(
+        record.structuredRepair
+      );
+  const nextStructuredRepair =
+    record.nextStructuredRepair === undefined
+      ? undefined
+      : decodeSessionProviderStructuredRepairV1(
+          record.nextStructuredRepair
+        );
+  if (
+    (structuredRepair !== undefined && record.purpose !== 'continuation')
+    || structuredRepair?.predecessorProviderTurnId === providerTurnId
+    || (
+      nextStructuredRepair !== undefined
+      && (
+        record.status !== 'failed'
+        || nextStructuredRepair.predecessorProviderTurnId
+          !== providerTurnId
+      )
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_structured_repair_invalid'
+    );
+  }
   const cancellationReasons: readonly NonNullable<
     SessionProviderTurnRecordV2['cancellationReason']
   >[] = ['userInput', 'runCancelled', 'superseded', 'shutdown'];
@@ -3330,10 +3446,7 @@ function decodeCompactProviderReservationV3(
     );
   }
   return {
-    providerTurnId: requiredIdentity(
-      record.providerTurnId,
-      'providerTurnId'
-    ),
+    providerTurnId,
     purpose: record.purpose,
     target,
     ...(record.planRevision === undefined
@@ -3351,6 +3464,12 @@ function decodeCompactProviderReservationV3(
             record.correction
           ),
         }),
+    ...(structuredRepair === undefined
+      ? {}
+      : { structuredRepair }),
+    ...(nextStructuredRepair === undefined
+      ? {}
+      : { nextStructuredRepair }),
     controlEpoch: positiveSafeIntegerV3(
       record.controlEpoch,
       'controlEpoch'
@@ -3477,6 +3596,58 @@ function decodeProviderTurnTargetV3(
         'session_kernel_provider_target_invalid'
       );
   }
+}
+
+function decodeSessionProviderStructuredRepairV1(
+  value: unknown
+): NonNullable<SessionProviderTurnRecordV2['structuredRepair']> {
+  const record = exactObjectOptional(
+    value,
+    [
+      'schemaVersion',
+      'predecessorProviderTurnId',
+      'sourceTerminalKind',
+      'errorCode',
+      'failureDigest',
+    ],
+    ['sourceResponseDigest'],
+    'session_kernel_provider_structured_repair_invalid'
+  );
+  if (
+    record.schemaVersion
+      !== 'deepcode.session.provider-structured-repair.v1'
+    || (
+      record.sourceTerminalKind !== 'failed'
+      && record.sourceTerminalKind !== 'completed'
+    )
+    || (record.sourceTerminalKind === 'completed')
+      !== (record.sourceResponseDigest !== undefined)
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_structured_repair_invalid'
+    );
+  }
+  return {
+    schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+    predecessorProviderTurnId: requiredIdentity(
+      record.predecessorProviderTurnId,
+      'predecessorProviderTurnId'
+    ),
+    sourceTerminalKind: record.sourceTerminalKind,
+    errorCode: requiredIdentity(record.errorCode, 'errorCode'),
+    failureDigest: requiredDigest(
+      record.failureDigest,
+      'failureDigest'
+    ),
+    ...(record.sourceResponseDigest === undefined
+      ? {}
+      : {
+          sourceResponseDigest: requiredDigest(
+            record.sourceResponseDigest,
+            'sourceResponseDigest'
+          ),
+        }),
+  };
 }
 
 function decodeSessionToolCorrectionV3(
@@ -4477,6 +4648,14 @@ function compactProviderReservationV3(
     ...(turn.correction === undefined
       ? {}
       : { correction: cloneJson(turn.correction) }),
+    ...(turn.structuredRepair === undefined
+      ? {}
+      : { structuredRepair: cloneJson(turn.structuredRepair) }),
+    ...(turn.nextStructuredRepair === undefined
+      ? {}
+      : {
+          nextStructuredRepair: cloneJson(turn.nextStructuredRepair),
+        }),
     controlEpoch: turn.controlEpoch,
     contextRef: cloneJson(turn.contextRef),
     factProjection: cloneJson(turn.factProjection),
@@ -5782,6 +5961,17 @@ function materializeProviderReservationV3(
       'provider-reservation-plan-revision-mismatch'
     );
   }
+  if (
+    reservation.nextStructuredRepair
+    && !structuredRepairBindsProviderTerminalV1(
+      reservation.nextStructuredRepair,
+      evidence.terminal
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_structured_repair_invalid'
+    );
+  }
   const response = evidence.terminal?.data.terminalKind === 'completed'
     ? materializeCompletedProviderResponseV3(
         reservation,
@@ -5800,6 +5990,16 @@ function materializeProviderReservationV3(
     ...(reservation.correction === undefined
       ? {}
       : { correction: cloneJson(reservation.correction) }),
+    ...(reservation.structuredRepair === undefined
+      ? {}
+      : { structuredRepair: cloneJson(reservation.structuredRepair) }),
+    ...(reservation.nextStructuredRepair === undefined
+      ? {}
+      : {
+          nextStructuredRepair: cloneJson(
+            reservation.nextStructuredRepair
+          ),
+        }),
     controlEpoch: reservation.controlEpoch,
     contextRef: cloneJson(reservation.contextRef),
     factProjection: cloneJson(reservation.factProjection),
@@ -5817,6 +6017,26 @@ function materializeProviderReservationV3(
       : {}),
     ...(response ? { response } : {}),
   };
+}
+
+function structuredRepairBindsProviderTerminalV1(
+  repair: NonNullable<SessionProviderTurnRecordV2['nextStructuredRepair']>,
+  terminal: SessionProviderTurnDurableEvidenceV3['terminal']
+): boolean {
+  if (
+    !terminal
+    || repair.predecessorProviderTurnId !== terminal.data.providerTurnId
+    || repair.sourceTerminalKind !== terminal.data.terminalKind
+  ) {
+    return false;
+  }
+  if (terminal.data.terminalKind === 'failed') {
+    return terminal.data.reasonCode === repair.errorCode
+      && terminal.data.structuredFailure?.failureDigest
+        === repair.failureDigest;
+  }
+  return terminal.data.terminalKind === 'completed'
+    && repair.sourceResponseDigest === terminal.data.responseDigest;
 }
 
 function materializeCompletedProviderResponseV3(

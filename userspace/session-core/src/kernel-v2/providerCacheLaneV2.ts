@@ -8,6 +8,7 @@ import {
 } from '../cache/canonicalizer.js';
 import type {
   SessionProviderTurnInputV2,
+  SessionProviderStructuredRepairV1,
   SessionWorkAuthorityV3,
 } from './types.js';
 import type {
@@ -36,6 +37,7 @@ export type SessionProviderCacheLaneRelationKindV2 =
   | 'bootstrap'
   | 'sameTurnToolContinuation'
   | 'sameTurnSessionControlContinuation'
+  | 'sameTurnStructuredRepair'
   | 'nextUserTurn'
   | 'exactReplay'
   | 'reset';
@@ -123,6 +125,7 @@ export interface SessionProviderAdmissionSidecarV2 {
    * enter this private sidecar.
    */
   continuationOutcomes?: SessionProviderContinuationOutcomeV2[];
+  structuredRepair?: SessionProviderStructuredRepairV1;
   cacheLane: {
     laneId: string;
     laneRevision: number;
@@ -211,6 +214,34 @@ export function planSessionProviderCacheLaneV2(
         : 1,
       supportingResetReasons
     );
+  }
+  if (input.turn.structuredRepair) {
+    const predecessor = input.predecessor;
+    if (
+      predecessor?.status !== 'available'
+      || predecessor.providerTurnId
+        !== input.turn.structuredRepair.predecessorProviderTurnId
+      || predecessor.terminalKind
+        !== input.turn.structuredRepair.sourceTerminalKind
+      || incompatiblePredecessorReasonsV2(
+        input.turn,
+        material,
+        predecessor
+      ).length > 0
+    ) {
+      throw new Error(
+        'Structured Provider repair requires its exact durable predecessor and stable request shape.'
+      );
+    }
+    return {
+      mode: 'append',
+      relationKind: 'sameTurnStructuredRepair',
+      laneId: predecessor.cacheLane.laneId,
+      laneRevision: predecessor.cacheLane.laneRevision,
+      stablePrefixDigest: material.stablePrefixDigest,
+      predecessorRequestId: predecessor.providerTurnId,
+      predecessorExternalDigest: predecessor.externalRequestDigest,
+    };
   }
   if (input.turn.exactReplayPredecessorId) {
     const predecessor = input.predecessor;
@@ -394,6 +425,10 @@ export function buildSessionProviderAdmissionSidecarV2(
           continuationOutcomes: continuation,
         }
       : {}),
+    ...(input.cacheLane.relationKind === 'sameTurnStructuredRepair'
+      && turn.structuredRepair
+      ? { structuredRepair: cloneJson(turn.structuredRepair) }
+      : {}),
     cacheLane: cloneJson(input.cacheLane),
   };
 }
@@ -482,6 +517,9 @@ export function sessionProviderSemanticMessagesV2(
       === 'sameTurnSessionControlContinuation'
   ) {
     return sessionControlTransitionMessagesV1(turn);
+  }
+  if (cacheLane.relationKind === 'sameTurnStructuredRepair') {
+    return sessionStructuredRepairMessagesV1(turn);
   }
   if (cacheLane.relationKind !== 'sameTurnToolContinuation') {
     throw new Error(
@@ -618,6 +656,43 @@ function sessionProviderSameTurnRelationV2(
   throw new Error(
     'Session Provider append predecessor is neither a settled Kernel tool turn nor a settled Session control turn.'
   );
+}
+
+function sessionStructuredRepairMessagesV1(
+  turn: SessionProviderTurnInputV2
+): LlmChatMessage[] {
+  const repair = turn.structuredRepair;
+  const finalMessage = turn.contextAssembly.messages.at(-1);
+  if (
+    turn.purpose !== 'continuation'
+    || !repair
+    || !finalMessage
+    || finalMessage.role !== 'user'
+    || jsonMessageSchemaV1(finalMessage.content)
+      !== 'deepcode.session.provider-turn-frame.v1'
+  ) {
+    throw new Error(
+      'Structured Provider repair requires one exact predecessor and authoritative turn frame.'
+    );
+  }
+  return [
+    {
+      role: 'user',
+      content: canonicalJson({
+        schemaVersion: 'deepcode.session.provider-structured-repair-frame.v1',
+        predecessorProviderTurnId: repair.predecessorProviderTurnId,
+        sourceTerminalKind: repair.sourceTerminalKind,
+        errorCode: repair.errorCode,
+        failureDigest: repair.failureDigest,
+        ...(repair.sourceResponseDigest
+          ? { sourceResponseDigest: repair.sourceResponseDigest }
+          : {}),
+        instruction:
+          'Re-emit the intended response as one complete schema-valid response. Do not repeat commentary, do not claim execution, and do not change the requested task or authority.',
+      }),
+    },
+    cloneJson(finalMessage),
+  ];
 }
 
 function sessionControlTransitionMessagesV1(

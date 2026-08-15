@@ -1,10 +1,13 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import { canonicalJson } from '../cache/canonicalizer.js';
+import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 import type {
   SessionKernelTransportPrivateAuthV2,
 } from './SessionKernelPortV2.js';
 import type {
   SessionProviderCompletionReceiptV1,
+  SessionProviderStructuredOutputCallV1,
+  SessionProviderStructuredOutputFailureV1,
+  SessionProviderStructuredOutputRecoveryV1,
 } from './types.js';
 import type {
   SessionProviderCacheLaneResetReasonV1,
@@ -133,6 +136,7 @@ export type SessionKernelProviderCachePredecessorV2 =
           | 'bootstrap'
           | 'sameTurnToolContinuation'
           | 'sameTurnSessionControlContinuation'
+          | 'sameTurnStructuredRepair'
           | 'nextUserTurn'
           | 'exactReplay'
           | 'reset';
@@ -775,7 +779,7 @@ export async function consumeProviderSseV1(
         exactKeys(
           event.data,
           ['type', 'requestId', 'error'],
-          ['message']
+          ['message', 'structuredFailure']
         );
         const providerErrorCode = identity(
           event.data.error,
@@ -791,7 +795,14 @@ export async function consumeProviderSseV1(
         }
         throw new SessionKernelProviderTransportError(
           providerErrorCode,
-          providerPublicErrorMessage(providerErrorCode)
+          providerPublicErrorMessage(providerErrorCode),
+          undefined,
+          event.data.structuredFailure === undefined
+            ? undefined
+            : decodeStructuredOutputFailureV1(
+                event.data.structuredFailure
+              ),
+          usage
         );
       case 'provider_reasoning_delta':
         throw protocolViolation(
@@ -989,7 +1000,7 @@ function decodeCompletionReceipt(
     'reasoningDigest',
     'responseDigest',
     'trace',
-  ]);
+  ], ['structuredOutputRecovery']);
   if (
     receipt.schemaVersion
       !== SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA
@@ -1098,6 +1109,12 @@ function decodeCompletionReceipt(
       'Provider reasoningTransport conflicts with native completion kind.'
     );
   }
+  const structuredOutputRecovery = receipt.structuredOutputRecovery
+    === undefined
+    ? undefined
+    : decodeStructuredOutputRecoveryV1(
+        receipt.structuredOutputRecovery
+      );
   return {
     schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
     nativeCompletion,
@@ -1120,7 +1137,286 @@ function decodeCompletionReceipt(
       ),
       recordCount: Number(trace.recordCount),
     },
+    ...(structuredOutputRecovery
+      ? { structuredOutputRecovery }
+      : {}),
   };
+}
+
+export function decodeStructuredOutputRecoveryV1(
+  value: unknown
+): SessionProviderStructuredOutputRecoveryV1 {
+  const recordValue = record(value, 'structuredOutputRecovery');
+  exactKeys(recordValue, [
+    'schemaVersion',
+    'disposition',
+    'errorCode',
+    'failureDigest',
+    'calls',
+  ]);
+  if (
+    recordValue.schemaVersion
+      !== 'deepcode.provider.structured-output-recovery.v1'
+    || recordValue.disposition !== 'normalizedProposalControl'
+    || recordValue.errorCode
+      !== 'provider_tool_call_arguments_invalid'
+  ) {
+    throw protocolViolation(
+      'Provider structured-output recovery identity is invalid.'
+    );
+  }
+  const calls = decodeStructuredOutputCallsV1(
+    recordValue.calls,
+    true
+  );
+  const failureDigest = digest(
+    recordValue.failureDigest,
+    'structuredOutputRecovery.failureDigest'
+  );
+  assertStructuredOutputFailureDigestV1(calls, failureDigest);
+  return {
+    schemaVersion: recordValue.schemaVersion,
+    disposition: recordValue.disposition,
+    errorCode: recordValue.errorCode,
+    failureDigest,
+    calls,
+  };
+}
+
+export function decodeStructuredOutputFailureV1(
+  value: unknown
+): SessionProviderStructuredOutputFailureV1 {
+  const recordValue = record(value, 'structuredFailure');
+  exactKeys(recordValue, [
+    'schemaVersion',
+    'disposition',
+    'errorCode',
+    'failureDigest',
+    'nativeCompletion',
+    'calls',
+  ]);
+  if (
+    recordValue.schemaVersion
+      !== 'deepcode.provider.structured-output-failure.v1'
+    || recordValue.disposition !== 'repairableNoMutation'
+    || recordValue.errorCode
+      !== 'provider_tool_call_arguments_invalid'
+  ) {
+    throw protocolViolation(
+      'Provider structured-output failure identity is invalid.'
+    );
+  }
+  const calls = decodeStructuredOutputCallsV1(
+    recordValue.calls,
+    false
+  );
+  const failureDigest = digest(
+    recordValue.failureDigest,
+    'structuredFailure.failureDigest'
+  );
+  assertStructuredOutputFailureDigestV1(calls, failureDigest);
+  return {
+    schemaVersion: recordValue.schemaVersion,
+    disposition: recordValue.disposition,
+    errorCode: recordValue.errorCode,
+    failureDigest,
+    nativeCompletion: decodeStructuredNativeCompletionV1(
+      recordValue.nativeCompletion
+    ),
+    calls,
+  };
+}
+
+function decodeStructuredOutputCallsV1(
+  value: unknown,
+  normalized: boolean
+): SessionProviderStructuredOutputCallV1[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 32) {
+    throw protocolViolation(
+      'Provider structured-output call evidence is invalid.'
+    );
+  }
+  const indexes = new Set<number>();
+  const callIds = new Set<string>();
+  return value.map((candidate, ordinal) => {
+    const call = record(candidate, `structuredOutput.calls[${ordinal}]`);
+    exactKeys(
+      call,
+      ['index', 'callId', 'toolName', 'originalArgumentsDigest'],
+      normalized
+        ? ['normalizedArgumentsDigest', 'appendedSuffix']
+        : []
+    );
+    const index = call.index;
+    if (
+      !Number.isSafeInteger(index)
+      || Number(index) < 0
+      || Number(index) >= 32
+      || indexes.has(Number(index))
+    ) {
+      throw protocolViolation(
+        'Provider structured-output call index is invalid.'
+      );
+    }
+    indexes.add(Number(index));
+    const callId = identity(call.callId, 'structuredOutput.callId', 1024);
+    if (callIds.has(callId)) {
+      throw protocolViolation(
+        'Provider structured-output call identities must be unique.'
+      );
+    }
+    callIds.add(callId);
+    const toolName = identity(
+      call.toolName,
+      'structuredOutput.toolName',
+      1024
+    );
+    const originalArgumentsDigest = digest(
+      call.originalArgumentsDigest,
+      'structuredOutput.originalArgumentsDigest'
+    );
+    if (!normalized) {
+      return {
+        index: Number(index),
+        callId,
+        toolName,
+        originalArgumentsDigest,
+      };
+    }
+    if (
+      toolName !== 'deepcode_session_plan_propose_v5'
+      && toolName !== 'deepcode_session_intervention_propose_v1'
+    ) {
+      throw protocolViolation(
+        'Only Session proposal controls may be deterministically normalized.'
+      );
+    }
+    const appendedSuffix = text(
+      call.appendedSuffix,
+      'structuredOutput.appendedSuffix',
+      32
+    );
+    if (
+      !appendedSuffix
+      || !/^[}\]]+$/u.test(appendedSuffix)
+    ) {
+      throw protocolViolation(
+        'Provider structured-output normalization suffix is invalid.'
+      );
+    }
+    return {
+      index: Number(index),
+      callId,
+      toolName,
+      originalArgumentsDigest,
+      normalizedArgumentsDigest: digest(
+        call.normalizedArgumentsDigest,
+        'structuredOutput.normalizedArgumentsDigest'
+      ),
+      appendedSuffix,
+    };
+  });
+}
+
+function assertStructuredOutputFailureDigestV1(
+  calls: readonly SessionProviderStructuredOutputCallV1[],
+  failureDigest: string
+): void {
+  const expected = sha256Hash(canonicalJson({
+    errorCode: 'provider_tool_call_arguments_invalid',
+    calls: calls.map((call) => ({
+      index: call.index,
+      toolName: call.toolName,
+      originalArgumentsDigest: call.originalArgumentsDigest,
+    })),
+  }));
+  if (expected !== failureDigest) {
+    throw protocolViolation(
+      'Provider structured-output failure digest is invalid.'
+    );
+  }
+}
+
+function decodeStructuredNativeCompletionV1(
+  value: unknown
+): SessionProviderStructuredOutputFailureV1['nativeCompletion'] {
+  const native = record(value, 'structuredFailure.nativeCompletion');
+  switch (native.providerKind) {
+    case 'openaiCompatible':
+      exactKeys(native, [
+        'providerKind',
+        'terminalSignal',
+        'finishReason',
+      ]);
+      if (
+        native.terminalSignal !== '[DONE]'
+        || (
+          native.finishReason !== 'stop'
+          && native.finishReason !== 'tool_calls'
+        )
+      ) throw protocolViolation('Structured failure native completion is invalid.');
+      return {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+        finishReason: native.finishReason,
+      };
+    case 'anthropic':
+      exactKeys(native, ['providerKind', 'terminalSignal']);
+      if (native.terminalSignal !== 'message_stop') {
+        throw protocolViolation('Structured failure native completion is invalid.');
+      }
+      return {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+      };
+    case 'ollama':
+      exactKeys(native, ['providerKind', 'terminalSignal']);
+      if (native.terminalSignal !== 'done:true') {
+        throw protocolViolation('Structured failure native completion is invalid.');
+      }
+      return {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+      };
+    default:
+      throw protocolViolation('Structured failure native completion is invalid.');
+  }
+}
+
+function applyStructuredOutputRecoveryV1(
+  toolItems: Map<number, SessionKernelLlmStreamToolItemV2>,
+  recovery: SessionProviderStructuredOutputRecoveryV1 | undefined
+): void {
+  if (!recovery) return;
+  for (const call of recovery.calls) {
+    const item = toolItems.get(call.index);
+    if (
+      !item
+      || item.callId !== call.callId
+      || item.name !== call.toolName
+      || sha256Hash(item.arguments) !== call.originalArgumentsDigest
+      || !call.appendedSuffix
+      || !call.normalizedArgumentsDigest
+    ) {
+      throw protocolViolation(
+        'Provider structured-output recovery does not bind the streamed call.'
+      );
+    }
+    const normalized = `${item.arguments}${call.appendedSuffix}`;
+    if (sha256Hash(normalized) !== call.normalizedArgumentsDigest) {
+      throw protocolViolation(
+        'Provider structured-output recovery digest is invalid.'
+      );
+    }
+    try {
+      JSON.parse(normalized);
+    } catch {
+      throw protocolViolation(
+        'Provider structured-output recovery did not produce valid JSON.'
+      );
+    }
+    item.arguments = normalized;
+  }
 }
 
 function materializeCompletedItems(
@@ -1128,6 +1424,10 @@ function materializeCompletedItems(
   toolItems: Map<number, SessionKernelLlmStreamToolItemV2>,
   completion: SessionProviderCompletionReceiptV1
 ): SessionKernelLlmStreamResultV2['items'] {
+  applyStructuredOutputRecoveryV1(
+    toolItems,
+    completion.structuredOutputRecovery
+  );
   const callIds = new Set<string>();
   for (const item of toolItems.values()) {
     identity(item.callId, 'toolCall.id', 1024);
@@ -1612,6 +1912,7 @@ function decodeProviderCachePredecessorV2(
     'bootstrap',
     'sameTurnToolContinuation',
     'sameTurnSessionControlContinuation',
+    'sameTurnStructuredRepair',
     'nextUserTurn',
     'exactReplay',
     'reset',
@@ -1703,6 +2004,7 @@ function decodeProviderCachePredecessorV2(
         | 'bootstrap'
         | 'sameTurnToolContinuation'
         | 'sameTurnSessionControlContinuation'
+        | 'sameTurnStructuredRepair'
         | 'nextUserTurn'
         | 'exactReplay'
         | 'reset',
@@ -1917,7 +2219,9 @@ export class SessionKernelProviderTransportError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly httpStatus?: number
+    readonly httpStatus?: number,
+    readonly structuredFailure?: SessionProviderStructuredOutputFailureV1,
+    readonly providerUsage?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'SessionKernelProviderTransportError';

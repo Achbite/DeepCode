@@ -126,6 +126,7 @@ export interface SessionProviderTurnTerminalRecordV3 {
       model: string;
       usage?: Record<string, unknown>;
     };
+    structuredFailure?: SessionProviderStructuredOutputFailureV1;
     traceRef: {
       terminalDigest: string;
       sealDigest: string;
@@ -188,6 +189,42 @@ export interface SessionProviderCompletionReceiptV1 {
     terminalDigest: string;
     recordCount: number;
   };
+  structuredOutputRecovery?: SessionProviderStructuredOutputRecoveryV1;
+}
+
+export interface SessionProviderStructuredOutputCallV1 {
+  index: number;
+  callId: string;
+  toolName: string;
+  originalArgumentsDigest: string;
+  normalizedArgumentsDigest?: string;
+  appendedSuffix?: string;
+}
+
+export interface SessionProviderStructuredOutputRecoveryV1 {
+  schemaVersion: 'deepcode.provider.structured-output-recovery.v1';
+  disposition: 'normalizedProposalControl';
+  errorCode: 'provider_tool_call_arguments_invalid';
+  failureDigest: string;
+  calls: SessionProviderStructuredOutputCallV1[];
+}
+
+export interface SessionProviderStructuredOutputFailureV1 {
+  schemaVersion: 'deepcode.provider.structured-output-failure.v1';
+  disposition: 'repairableNoMutation';
+  errorCode: 'provider_tool_call_arguments_invalid';
+  failureDigest: string;
+  nativeCompletion: SessionProviderNativeCompletionV1;
+  calls: SessionProviderStructuredOutputCallV1[];
+}
+
+export interface SessionProviderStructuredRepairV1 {
+  schemaVersion: 'deepcode.session.provider-structured-repair.v1';
+  predecessorProviderTurnId: string;
+  sourceTerminalKind: 'failed' | 'completed';
+  errorCode: string;
+  failureDigest: string;
+  sourceResponseDigest?: string;
 }
 
 export type SessionProviderOrderedItemV2 =
@@ -510,6 +547,7 @@ export interface SessionProviderTurnInputV2 {
    * never persisted in Session state or included in Provider-visible content.
    */
   exactReplayPredecessorId?: string;
+  structuredRepair?: SessionProviderStructuredRepairV1;
   runId: string;
   controlEpoch: number;
   currentInput: SessionUserInputRecordV2;
@@ -879,6 +917,10 @@ export interface SessionProviderTurnRecordV2 {
    * the relation.
    */
   correction?: SessionToolCorrectionV2;
+  /** Repair frame used to construct this physical Provider request. */
+  structuredRepair?: SessionProviderStructuredRepairV1;
+  /** Durable recovery request to issue after this terminal failure. */
+  nextStructuredRepair?: SessionProviderStructuredRepairV1;
   controlEpoch: number;
   contextRef: ToolContextRefV2;
   factProjection: SessionProviderFactProjectionReceiptV2;

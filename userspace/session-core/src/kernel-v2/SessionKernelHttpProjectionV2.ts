@@ -1386,6 +1386,33 @@ function publicPresentation(
     }
     case 'diagnostic': {
       const stage = textField(data, 'stage');
+      if (stage === 'provider.structuredRepair') {
+        return {
+          kind: 'workflow_stage',
+          channel: 'progress',
+          visibility: 'trace',
+          fields: {
+            status: 'recovering',
+            code: textField(data, 'code'),
+            providerTurnId: textField(data, 'providerTurnId'),
+            currentActivityCode: 'session.validating',
+            sourceTerminalKind: textField(
+              data,
+              'sourceTerminalKind'
+            ),
+            failureDigest: textField(data, 'failureDigest'),
+            ...(data?.providerOutcome === undefined
+              ? {}
+              : {
+                  providerOutcome: publicProviderOutcome(
+                    data.providerOutcome
+                  ),
+                }),
+            summary:
+              'Validating Provider structured output before retry.',
+          },
+        };
+      }
       if (stage === 'provider.toolCallQueue') {
         const orderedItems = publicOrderedProviderItems(
           data?.orderedItems
@@ -2445,6 +2472,45 @@ function currentDiagnosticProjectionData(
       break;
     case 'provider.requestTurn':
     case 'provider.outputValidation':
+      data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          status: 'string',
+          terminalScope: 'string',
+          code: 'identity',
+          message: 'string',
+          stage: 'string',
+        },
+        { providerOutcome: 'object' }
+      );
+      projectionEnum(data, 'status', ['failed']);
+      projectionEnum(data, 'terminalScope', ['turn']);
+      break;
+    case 'provider.structuredRepair':
+      data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          status: 'string',
+          code: 'identity',
+          stage: 'string',
+          currentActivityCode: 'string',
+          sourceTerminalKind: 'string',
+          failureDigest: 'identity',
+        },
+        { providerOutcome: 'object' }
+      );
+      projectionEnum(data, 'status', ['recovering']);
+      projectionEnum(data, 'currentActivityCode', [
+        'session.validating',
+      ]);
+      projectionEnum(data, 'sourceTerminalKind', [
+        'failed',
+        'completed',
+      ]);
+      break;
+    case 'provider.structuredRepairNoProgress':
       data = exactCurrentProjectionRecord(
         event,
         {

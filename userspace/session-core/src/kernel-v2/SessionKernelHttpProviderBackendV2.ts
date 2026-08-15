@@ -90,7 +90,9 @@ implements SessionKernelProviderBackendV2 {
     input: SessionProviderTurnInputV2
   ): Promise<SessionKernelProviderBackendOutputV2> {
     assertProviderToolContextBindingV2(input);
-    const parentCandidateId = input.exactReplayPredecessorId
+    const parentCandidateId = input.structuredRepair
+      ?.predecessorProviderTurnId
+      ?? input.exactReplayPredecessorId
       ?? providerContinuationParentIdV2(input, this.profileId)
       ?? providerConversationHeadParentIdV2(input, this.profileId);
     const tools = providerWireToolDefinitionsV2(input);
@@ -209,6 +211,7 @@ function providerContinuationParentIdV2(
 ): string | undefined {
   if (
     input.purpose !== 'continuation'
+    || input.structuredRepair
     || input.providerProfile.reasoningTransport !== 'openaiPlaintext'
   ) return undefined;
   const previous = input.providerOutcomes.at(-1);

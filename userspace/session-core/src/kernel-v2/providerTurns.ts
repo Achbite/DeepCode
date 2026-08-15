@@ -70,6 +70,7 @@ import {
   decodeProviderInterventionArgumentsV1,
   decodeProviderPlanActionCompleteArgumentsV2,
   decodeProviderPlanProposalArgumentsV2,
+  SessionKernelProviderTransportError,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
@@ -93,6 +94,7 @@ import type {
   SessionProviderTurnDispatchRecordV3,
   SessionProviderTurnInputV2,
   SessionProviderTurnOutputV2,
+  SessionProviderStructuredRepairV1,
 } from './types.js';
 import {
   SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
@@ -163,6 +165,11 @@ type SessionProviderEvidenceBindingInputV3 = Pick<
 type SessionProviderSealedInputV3 =
   SessionProviderEvidenceBindingInputV3
   & Pick<SessionProviderTurnInputV2, 'toolContext' | 'kernelFacts'>;
+
+type SessionProviderTurnExecutionRequestV2 =
+  SessionProviderTurnRequestV2 & {
+    structuredRepair?: SessionProviderStructuredRepairV1;
+  };
 
 /**
  * Provider lifecycle is Session-owned. This coordinator never sees raw
@@ -304,7 +311,27 @@ export class SessionKernelProviderTurnsV2 {
     request: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
     if (request.target.kind !== 'finalAnswer') {
-      return this.runOnce(request);
+      const pendingRepair = this.pendingStructuredRepairForTarget(
+        request.target
+      );
+      let currentRequest: SessionProviderTurnExecutionRequestV2 = {
+        ...request,
+        ...(pendingRepair ? { structuredRepair: pendingRepair } : {}),
+      };
+      for (;;) {
+        try {
+          return await this.runOnce(currentRequest);
+        } catch (error) {
+          if (!(error instanceof SessionProviderStructuredRepairScheduledV1)) {
+            throw error;
+          }
+          currentRequest = {
+            reason: 'recovery',
+            target: cloneJson(request.target),
+            structuredRepair: cloneJson(error.repair),
+          };
+        }
+      }
     }
     let currentRequest: SessionProviderTurnRequestV2 & {
       target: Extract<
@@ -426,8 +453,87 @@ export class SessionKernelProviderTurnsV2 {
     }
   }
 
+  private pendingStructuredRepairForTarget(
+    target: SessionProviderTurnTargetV2
+  ): SessionProviderStructuredRepairV1 | undefined {
+    const state = this.host.readState();
+    const turn = state.providerTurn;
+    if (
+      turn?.status !== 'failed'
+      || !turn.nextStructuredRepair
+      || turn.controlEpoch !== state.controlEpoch
+      || turn.nextStructuredRepair.predecessorProviderTurnId
+        !== turn.providerTurnId
+      || canonicalJson(turn.target) !== canonicalJson(target)
+    ) {
+      return undefined;
+    }
+    return cloneJson(turn.nextStructuredRepair);
+  }
+
+  private async projectStructuredRepairState(
+    providerTurnId: string,
+    repair: SessionProviderStructuredRepairV1,
+    evidence: SessionProviderTurnDurableEvidenceV3
+  ): Promise<void> {
+    try {
+      await this.host.project(
+        `provider:${providerTurnId}:structured-repair`,
+        'diagnostic',
+        {
+          providerTurnId,
+          status: 'recovering',
+          code: repair.errorCode,
+          stage: 'provider.structuredRepair',
+          currentActivityCode: 'session.validating',
+          sourceTerminalKind: repair.sourceTerminalKind,
+          failureDigest: repair.failureDigest,
+          ...(evidence.terminal?.data.providerResult
+            ? {
+                providerOutcome:
+                  evidence.terminal.data.providerResult,
+              }
+            : {}),
+        }
+      );
+    } catch {
+      // Recovery remains durable even when its replaceable presentation
+      // state cannot be published immediately.
+    }
+  }
+
+  private async projectStructuredRepairNoProgress(
+    providerTurnId: string,
+    evidence: SessionProviderTurnDurableEvidenceV3
+  ): Promise<void> {
+    try {
+      await this.host.project(
+        `provider:${providerTurnId}:structured-repair-no-progress`,
+        'diagnostic',
+        {
+          providerTurnId,
+          status: 'failed',
+          terminalScope: 'turn',
+          code: 'session_kernel_provider_structured_repair_no_progress',
+          message:
+            'Structured Provider repair reproduced the same invalid response.',
+          stage: 'provider.structuredRepairNoProgress',
+          ...(evidence.terminal?.data.providerResult
+            ? {
+                providerOutcome:
+                  evidence.terminal.data.providerResult,
+              }
+            : {}),
+        }
+      );
+    } catch {
+      // The failed checkpoint remains canonical when presentation delivery
+      // cannot settle in this process.
+    }
+  }
+
   private async runOnce(
-    request: SessionProviderTurnRequestV2
+    request: SessionProviderTurnExecutionRequestV2
   ): Promise<SessionKernelLoopResultV2> {
     const reservation = this.begin();
     const generation = this.authorityGeneration;
@@ -487,6 +593,9 @@ export class SessionKernelProviderTurnsV2 {
             : 'continuation' as const,
         ...(exactReplayPredecessorId
           ? { exactReplayPredecessorId }
+          : {}),
+        ...(request.structuredRepair
+          ? { structuredRepair: cloneJson(request.structuredRepair) }
           : {}),
         runId: state.runId,
         controlEpoch: state.controlEpoch,
@@ -569,6 +678,9 @@ export class SessionKernelProviderTurnsV2 {
             ? { planRevision: state.plan.planRevision }
             : {}),
           ...(correction ? { correction } : {}),
+          ...(request.structuredRepair
+            ? { structuredRepair: cloneJson(request.structuredRepair) }
+            : {}),
           controlEpoch: state.controlEpoch,
           contextRef: binding.contextRef,
           factProjection: {
@@ -659,6 +771,14 @@ export class SessionKernelProviderTurnsV2 {
         if (recoveredOutput) {
           output = recoveredOutput;
         } else {
+          const structuredRepair = structuredRepairForProviderFailureV1({
+            request,
+            evidence,
+            error: terminalError,
+          });
+          let scheduledRepair:
+            | SessionProviderStructuredRepairV1
+            | undefined;
           const failureCommit = this.beginAdmissionCommit(
             reservation,
             generation
@@ -668,21 +788,50 @@ export class SessionKernelProviderTurnsV2 {
           }
           try {
             if (latest.providerTurn?.providerTurnId === providerTurnId) {
-              latest.providerTurn.status =
-                evidence.terminal?.data.terminalKind === 'completed'
-                  ? 'failed'
-                  : bindFailedProviderEvidenceV3(
-                      latest,
-                      {
-                        ...providerInput,
-                        expectedPlanRevision:
-                          providerInput.plan?.planRevision,
-                        contextAssembly,
-                      },
-                      evidence
-                    );
-              await this.host.saveCheckpoint();
+              const evidenceBinding = {
+                ...providerInput,
+                expectedPlanRevision:
+                  providerInput.plan?.planRevision,
+                contextAssembly,
+              };
               if (evidence.terminal?.data.terminalKind === 'completed') {
+                bindCompletedProviderEvidenceForStructuredRepairV1(
+                  latest,
+                  evidenceBinding,
+                  evidence
+                );
+                latest.providerTurn.status = 'failed';
+              } else {
+                latest.providerTurn.status = bindFailedProviderEvidenceV3(
+                  latest,
+                  evidenceBinding,
+                  evidence
+                );
+              }
+              if (structuredRepair) {
+                if (
+                  request.structuredRepair?.failureDigest
+                    === structuredRepair.failureDigest
+                ) {
+                  delete latest.providerTurn.nextStructuredRepair;
+                  terminalError = new SessionKernelProviderTurnError(
+                    'session_kernel_provider_structured_repair_no_progress',
+                    'Structured Provider repair reproduced the same invalid response and cannot continue automatically.'
+                  );
+                } else {
+                  latest.providerTurn.nextStructuredRepair = cloneJson(
+                    structuredRepair
+                  );
+                  scheduledRepair = structuredRepair;
+                }
+              } else {
+                delete latest.providerTurn.nextStructuredRepair;
+              }
+              await this.host.saveCheckpoint();
+              if (
+                !scheduledRepair
+                && evidence.terminal?.data.terminalKind === 'completed'
+              ) {
                 try {
                   await this.host.project(
                     `provider:${providerTurnId}:answer-rejected`,
@@ -699,7 +848,13 @@ export class SessionKernelProviderTurnsV2 {
                   // even when its presentation settlement cannot publish.
                 }
               }
-              if (request.target.kind !== 'finalAnswer') {
+              if (scheduledRepair) {
+                await this.projectStructuredRepairState(
+                  providerTurnId,
+                  scheduledRepair,
+                  evidence
+                );
+              } else if (request.target.kind !== 'finalAnswer') {
                 try {
                   await this.host.project(
                     `provider:${providerTurnId}:failed`,
@@ -710,8 +865,10 @@ export class SessionKernelProviderTurnsV2 {
                       terminalScope: 'turn',
                       code: safeErrorCode(terminalError),
                       message: safeErrorMessage(terminalError),
-                      stage:
-                        evidence.terminal?.data.terminalKind === 'completed'
+                      stage: safeErrorCode(terminalError)
+                        === 'session_kernel_provider_structured_repair_no_progress'
+                        ? 'provider.structuredRepairNoProgress'
+                        : evidence.terminal?.data.terminalKind === 'completed'
                           ? 'provider.outputValidation'
                           : 'provider.requestTurn',
                       ...(evidence.terminal?.data.terminalKind === 'completed'
@@ -731,6 +888,11 @@ export class SessionKernelProviderTurnsV2 {
             }
           } finally {
             this.endAdmissionCommit(failureCommit);
+          }
+          if (scheduledRepair) {
+            throw new SessionProviderStructuredRepairScheduledV1(
+              scheduledRepair
+            );
           }
           throw terminalError;
         }
@@ -1410,7 +1572,8 @@ export class SessionKernelProviderTurnsV2 {
       runId: state.runId,
       currentInput: currentSessionUserInputV2(state),
       providerProfile: cloneJson(state.providerProfile),
-      ...(state.plan?.planRevision === turn.planRevision
+      ...(state.plan
+        && state.plan.planRevision === turn.planRevision
         ? { plan: cloneJson(state.plan) }
         : {}),
       target: cloneJson(turn.target),
@@ -1443,19 +1606,76 @@ export class SessionKernelProviderTurnsV2 {
         sealedInput,
         evidence
       );
+      const repair = structuredRepairFromDurableFailedTerminalV1(
+        evidence
+      );
+      if (turn.status === 'failed' && repair) {
+        if (turn.structuredRepair?.failureDigest === repair.failureDigest) {
+          delete turn.nextStructuredRepair;
+          await this.host.saveCheckpoint();
+          await this.projectStructuredRepairNoProgress(
+            turn.providerTurnId,
+            evidence
+          );
+          return;
+        }
+        turn.nextStructuredRepair = cloneJson(repair);
+      } else {
+        delete turn.nextStructuredRepair;
+      }
       await this.host.saveCheckpoint();
+      if (turn.nextStructuredRepair) {
+        await this.projectStructuredRepairState(
+          turn.providerTurnId,
+          turn.nextStructuredRepair,
+          evidence
+        );
+      }
       return;
     }
-    if (!turn.response) {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_provider_recovery_state_invalid',
-        'A completed Provider terminal has no deterministically reconstructed response.'
+    let output: SessionProviderTurnOutputV2;
+    try {
+      output = this.decodeCompletedProviderOutput(
+        sealedInput,
+        evidence
       );
+    } catch (error) {
+      const repair = structuredRepairForProviderFailureV1({
+        request: {
+          reason: 'recovery',
+          target: cloneJson(turn.target),
+          ...(turn.structuredRepair
+            ? { structuredRepair: cloneJson(turn.structuredRepair) }
+            : {}),
+        },
+        evidence,
+        error,
+      });
+      if (!repair) throw error;
+      bindCompletedProviderEvidenceForStructuredRepairV1(
+        state,
+        sealedInput,
+        evidence
+      );
+      turn.status = 'failed';
+      if (turn.structuredRepair?.failureDigest === repair.failureDigest) {
+        delete turn.nextStructuredRepair;
+        await this.host.saveCheckpoint();
+        await this.projectStructuredRepairNoProgress(
+          turn.providerTurnId,
+          evidence
+        );
+        return;
+      }
+      turn.nextStructuredRepair = cloneJson(repair);
+      await this.host.saveCheckpoint();
+      await this.projectStructuredRepairState(
+        turn.providerTurnId,
+        repair,
+        evidence
+      );
+      return;
     }
-    const output = this.decodeCompletedProviderOutput(
-      sealedInput,
-      evidence
-    );
     if (
       turn.target.kind === 'finalAnswer'
       && !finalAnswerBindingIsCurrent(
@@ -2863,6 +3083,151 @@ function bindProviderEvidenceV3(
   bindProviderRecordRefsV3(state, evidence);
 }
 
+function bindCompletedProviderEvidenceForStructuredRepairV1(
+  state: SessionKernelLoopStateV2,
+  input: SessionProviderEvidenceBindingInputV3,
+  evidence: SessionProviderTurnDurableEvidenceV3
+): void {
+  const providerTurn = state.providerTurn;
+  const dispatch = evidence.dispatch;
+  const terminal = evidence.terminal;
+  if (
+    providerTurn?.providerTurnId !== input.providerTurnId
+    || !dispatch
+    || !terminal
+    || terminal.data.terminalKind !== 'completed'
+    || terminal.data.providerTurnId !== input.providerTurnId
+    || !terminal.data.responseDigest
+  ) {
+    throw new SessionKernelProviderTurnError(
+      'session_kernel_provider_terminal_evidence_mismatch',
+      'Structured Provider repair requires one exact completed daemon terminal.'
+    );
+  }
+  requireProviderDispatchAuthorityV3(input, dispatch.data);
+  bindProviderRecordRefsV3(state, evidence);
+}
+
+function structuredRepairForProviderFailureV1(input: {
+  request: SessionProviderTurnExecutionRequestV2;
+  evidence: SessionProviderTurnDurableEvidenceV3;
+  error: unknown;
+}): SessionProviderStructuredRepairV1 | undefined {
+  const terminal = input.evidence.terminal?.data;
+  if (
+    terminal?.terminalKind === 'failed'
+    && terminal.structuredFailure
+    && terminal.providerResult
+    && input.error instanceof SessionKernelProviderTransportError
+    && input.error.structuredFailure
+    && input.error.code === terminal.reasonCode
+    && terminal.reasonCode === terminal.structuredFailure.errorCode
+    && canonicalJson(input.error.structuredFailure)
+      === canonicalJson(terminal.structuredFailure)
+    && canonicalJson(input.error.providerUsage ?? null)
+      === canonicalJson(terminal.providerResult.usage ?? null)
+  ) {
+    return {
+      schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+      predecessorProviderTurnId: terminal.providerTurnId,
+      sourceTerminalKind: 'failed',
+      errorCode: terminal.reasonCode,
+      failureDigest: terminal.structuredFailure.failureDigest,
+    };
+  }
+  if (
+    terminal?.terminalKind !== 'completed'
+    || !(input.error instanceof SessionKernelProviderTransportError)
+    || !repairableCompletedSessionControlErrorV1(
+      input.request.target,
+      input.error.code
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+    predecessorProviderTurnId: terminal.providerTurnId,
+    sourceTerminalKind: 'completed',
+    errorCode: input.error.code,
+    failureDigest: completedStructuredFailureDigestV1(
+      input.error.code,
+      terminal.orderedItems
+    ),
+    sourceResponseDigest: terminal.responseDigest,
+  };
+}
+
+function completedStructuredFailureDigestV1(
+  errorCode: string,
+  orderedItems: readonly import('./types.js').SessionProviderTerminalOrderedItemV3[]
+): string {
+  return sha256Hash(canonicalJson({
+    errorCode,
+    orderedItems: orderedItems.map((item) => item.kind === 'text'
+      ? {
+          kind: item.kind,
+          phase: item.phase,
+          textDigest: sha256Hash(item.text),
+        }
+      : {
+          kind: item.kind,
+          index: item.index,
+          name: item.name,
+          argumentsDigest: sha256Hash(item.arguments),
+        }),
+  }));
+}
+
+function structuredRepairFromDurableFailedTerminalV1(
+  evidence: SessionProviderTurnDurableEvidenceV3
+): SessionProviderStructuredRepairV1 | undefined {
+  const terminal = evidence.terminal?.data;
+  if (
+    terminal?.terminalKind !== 'failed'
+    || !terminal.structuredFailure
+    || !terminal.providerResult
+    || terminal.reasonCode !== terminal.structuredFailure.errorCode
+  ) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+    predecessorProviderTurnId: terminal.providerTurnId,
+    sourceTerminalKind: 'failed',
+    errorCode: terminal.reasonCode,
+    failureDigest: terminal.structuredFailure.failureDigest,
+  };
+}
+
+function repairableCompletedSessionControlErrorV1(
+  target: SessionProviderTurnTargetV2,
+  errorCode: string
+): boolean {
+  if (target.kind === 'planning') {
+    return [
+      'session_kernel_provider_plan_proposal_invalid',
+      'session_kernel_provider_plan_proposal_conflict',
+      'session_kernel_provider_plan_proposal_phase_conflict',
+    ].includes(errorCode);
+  }
+  if (target.kind === 'interventionResearch') {
+    return [
+      'session_kernel_provider_intervention_invalid',
+      'session_kernel_provider_intervention_proposal_conflict',
+      'session_kernel_provider_intervention_proposal_phase_conflict',
+    ].includes(errorCode);
+  }
+  if (target.kind === 'planAction') {
+    return [
+      'session_kernel_provider_plan_action_complete_invalid',
+      'session_kernel_provider_plan_action_complete_conflict',
+      'session_kernel_provider_plan_action_complete_phase_conflict',
+    ].includes(errorCode);
+  }
+  return false;
+}
+
 function bindFailedProviderEvidenceV3(
   state: SessionKernelLoopStateV2,
   input: SessionProviderEvidenceBindingInputV3,
@@ -3558,5 +3923,14 @@ export class SessionKernelProviderTurnError extends Error {
   ) {
     super(message);
     this.name = 'SessionKernelProviderTurnError';
+  }
+}
+
+class SessionProviderStructuredRepairScheduledV1 extends Error {
+  constructor(
+    readonly repair: SessionProviderStructuredRepairV1
+  ) {
+    super('Structured Provider repair was durably scheduled.');
+    this.name = 'SessionProviderStructuredRepairScheduledV1';
   }
 }
