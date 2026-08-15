@@ -30,8 +30,8 @@ import {
   SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
   SessionPlanActionCompletionOutcomeV2,
@@ -344,7 +344,7 @@ export function decodeSessionKernelLlmStreamResultV2(
       );
     }
     const planProposalCalls = streamCalls.filter(
-      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
+      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME
     );
     if (planProposalCalls.length > 0) {
       if (
@@ -385,9 +385,9 @@ export function decodeSessionKernelLlmStreamResultV2(
         kind: 'plan',
         plan,
         planProposal: {
-          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
           callId: requiredIdentity(control.callId, 'callId'),
-          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
           argumentsDigest: sha256Hash(canonicalJson(
             decodeProviderNativeArguments(control.arguments)
           )),
@@ -771,7 +771,7 @@ export function decodeProviderPlanProposalArgumentsV2(
   const record = objectRecord(decoded);
   if (!record) throw invalidPlanningResult();
   exactKeys(record, ['schemaVersion', 'plan']);
-  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA) {
+  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA) {
     throw invalidPlanningResult();
   }
   return decodeProviderPlanDraft(record.plan);
@@ -970,7 +970,7 @@ function decodePlanEvidenceV4(
     readResources: record.readResources.map((resource) => {
       const item = objectRecord(resource);
       if (!item) throw invalidPlanningResult();
-      exactKeys(item, ['resourceRef', 'digest', 'summary', 'factRefs']);
+      exactKeys(item, ['resourceRef', 'summary', 'factRefs']);
       if (
         !Array.isArray(item.factRefs)
         || item.factRefs.length < 1
@@ -980,7 +980,6 @@ function decodePlanEvidenceV4(
       }
       return {
         resourceRef: requiredIdentity(item.resourceRef, 'resourceRef'),
-        digest: requiredIdentity(item.digest, 'resourceDigest'),
         summary: requiredText(item.summary, 'resourceSummary'),
         factRefs: item.factRefs.map((factRef) =>
           requiredIdentity(factRef, 'resourceFactRef')
@@ -1214,6 +1213,6 @@ function requiredText(value: unknown, _field: string): string {
 function invalidPlanningResult(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
     'session_kernel_provider_plan_proposal_invalid',
-    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v4 record.'
+    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v5 record.'
   );
 }

@@ -2188,26 +2188,8 @@ fn provider_native_session_control_continuation(
     parent_target: &SessionProviderTargetBindingSidecarV2,
     current_sidecar: &SessionProviderAdmissionSidecarV2,
 ) -> Result<ProviderNativeContinuationV1, ProviderNativeStreamTransportErrorV1> {
-    let (expected_tool_name, allowed_next_targets): (&str, &[&str]) = match parent_target {
-        SessionProviderTargetBindingSidecarV2::Planning => (
-            "deepcode_session_plan_propose_v4",
-            &["planning", "planAction"],
-        ),
-        SessionProviderTargetBindingSidecarV2::PlanAction { .. } => (
-            "deepcode_session_plan_action_complete_v2",
-            &["planAction", "finalAnswer"],
-        ),
-        SessionProviderTargetBindingSidecarV2::InterventionResearch { .. } => (
-            "deepcode_session_intervention_propose_v1",
-            &["interventionResearch", "planning", "planAction"],
-        ),
-        SessionProviderTargetBindingSidecarV2::ContextRead { .. }
-        | SessionProviderTargetBindingSidecarV2::FinalAnswer { .. } => {
-            return Err(ProviderNativeStreamTransportErrorV1::new(
-                "provider_control_continuation_invalid",
-            ));
-        }
-    };
+    let (expected_tool_name, allowed_next_targets) =
+        provider_native_session_control_contract(parent_target)?;
     let next_target = current_sidecar.target_binding.kind_name();
     if !allowed_next_targets.contains(&next_target) {
         return Err(ProviderNativeStreamTransportErrorV1::new(
@@ -2295,6 +2277,32 @@ fn provider_native_session_control_continuation(
         anthropic_signature: None,
         openai_reasoning_field: None,
     })
+}
+
+fn provider_native_session_control_contract(
+    parent_target: &SessionProviderTargetBindingSidecarV2,
+) -> Result<(&'static str, &'static [&'static str]), ProviderNativeStreamTransportErrorV1> {
+    let contract = match parent_target {
+        SessionProviderTargetBindingSidecarV2::Planning => (
+            "deepcode_session_plan_propose_v5",
+            &["planning", "planAction"] as &'static [&'static str],
+        ),
+        SessionProviderTargetBindingSidecarV2::PlanAction { .. } => (
+            "deepcode_session_plan_action_complete_v2",
+            &["planAction", "finalAnswer"] as &'static [&'static str],
+        ),
+        SessionProviderTargetBindingSidecarV2::InterventionResearch { .. } => (
+            "deepcode_session_intervention_propose_v1",
+            &["interventionResearch", "planning", "planAction"] as &'static [&'static str],
+        ),
+        SessionProviderTargetBindingSidecarV2::ContextRead { .. }
+        | SessionProviderTargetBindingSidecarV2::FinalAnswer { .. } => {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_control_continuation_invalid",
+            ));
+        }
+    };
+    Ok(contract)
 }
 
 fn provider_terminal_answer_text(

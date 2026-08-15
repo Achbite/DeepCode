@@ -1,6 +1,7 @@
 import {
   decodeRawToolArgumentsV2,
   type DeadlineRequestV2,
+  type KernelFactProjectionV2,
   type ProviderWireToolDefinition,
   type RawToolArgumentsV2,
   type RequestedResourceV2,
@@ -17,6 +18,7 @@ import type {
 } from './ports.js';
 import type {
   SessionNaturalLanguagePlanV2,
+  SessionPlanEvidenceV4,
   SessionPlanActionCompletionOutcomeV2,
   SessionProviderCompletionReceiptV1,
   SessionProviderOrderedItemV2,
@@ -29,10 +31,10 @@ import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
 } from './types.js';
 
-export const SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA =
-  'deepcode.session.plan-proposal.v4' as const;
-export const SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME =
-  'deepcode_session_plan_propose_v4' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA =
+  'deepcode.session.plan-proposal.v5' as const;
+export const SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME =
+  'deepcode_session_plan_propose_v5' as const;
 export const SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA =
   'deepcode.session.intervention-proposal.v1' as const;
 export const SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME =
@@ -69,7 +71,7 @@ export function sessionPlanActionCompleteToolV2(): ProviderWireToolDefinition {
   };
 }
 
-export function sessionPlanProposalToolV4(
+export function sessionPlanProposalToolV5(
   admittedToolIds: readonly string[]
 ): ProviderWireToolDefinition {
   if (
@@ -86,7 +88,7 @@ export function sessionPlanProposalToolV4(
     );
   }
   return {
-    name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+    name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
     description: [
       'Session-only structured Plan control; it never executes a Kernel tool.',
       'Call it exactly once only when every action is necessary for an explicit immediate requested outcome, honors every preserve constraint, and excludes deferred or conditional work.',
@@ -101,7 +103,7 @@ export function sessionPlanProposalToolV4(
       properties: {
         schemaVersion: {
           type: 'string',
-          const: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+          const: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
         },
         plan: {
           type: 'object',
@@ -179,10 +181,9 @@ function sessionPlanEvidenceSchemaV4(): unknown {
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['resourceRef', 'digest', 'summary', 'factRefs'],
+          required: ['resourceRef', 'summary', 'factRefs'],
           properties: {
             resourceRef: { type: 'string', minLength: 1 },
-            digest: { type: 'string', minLength: 1 },
             summary: { type: 'string', minLength: 1 },
             factRefs: {
               type: 'array',
@@ -211,7 +212,7 @@ function sessionPlanEvidenceSchemaV4(): unknown {
 export function sessionInterventionProposalToolV1(
   admittedToolIds: readonly string[]
 ): ProviderWireToolDefinition {
-  const planDefinition = sessionPlanProposalToolV4(admittedToolIds);
+  const planDefinition = sessionPlanProposalToolV5(admittedToolIds);
   const planSchema = (
     planDefinition.inputSchema as {
       properties: { plan: unknown };
@@ -440,7 +441,6 @@ export interface SessionProviderPlanActionDraftV2 {
 
 export interface SessionProviderPlanEvidenceResourceDraftV4 {
   resourceRef: string;
-  digest: string;
   summary: string;
   factRefs: string[];
 }
@@ -507,9 +507,9 @@ export type SessionKernelProviderBackendOutputV2 = (
       kind: 'plan';
       plan: SessionProviderPlanDraftV2;
       planProposal: {
-        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA;
+        schemaVersion: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA;
         callId: string;
-        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME;
+        toolName: typeof SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME;
         argumentsDigest: string;
       };
     }
@@ -796,9 +796,9 @@ function assertCompletedProviderBackendOutputV2(
   if (output.kind === 'plan') {
     if (
       output.planProposal.schemaVersion
-        !== SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA
       || output.planProposal.toolName
-        !== SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
+        !== SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME
     ) {
       throw providerCompletionInvalid();
     }
@@ -1108,43 +1108,10 @@ export function materializeProviderPlanV2(
   const exactFacts = input.kernelFacts
     ? new Map(input.kernelFacts.facts.map((fact) => [fact.factId, fact]))
     : undefined;
-  const evidenceFactRefs = new Set(normalized.evidence.kernelFactRefs);
-  for (const resource of normalized.evidence.readResources) {
-    resource.factRefs.forEach((factRef) => evidenceFactRefs.add(factRef));
-  }
-  for (const factRef of evidenceFactRefs) {
-    if (exactFacts && !exactFacts.has(factRef)) {
-      throw new SessionKernelProviderAdapterError(
-        'session_kernel_provider_plan_evidence_stale',
-        `Plan evidence references a Kernel fact outside the exact current snapshot: ${factRef}.`
-      );
-    }
-  }
-  for (const resource of normalized.evidence.readResources) {
-    if (!/^sha256:[0-9a-f]{64}$/u.test(resource.digest)) {
-      throw new SessionKernelProviderAdapterError(
-        'session_kernel_provider_plan_resource_digest_invalid',
-        `Plan evidence resource ${resource.resourceRef} lacks a canonical digest.`
-      );
-    }
-    const facts = exactFacts
-      ? resource.factRefs.map((factRef) => exactFacts.get(factRef)!)
-      : [];
-    if (
-      exactFacts
-      && (
-        !facts.some((fact) =>
-          fact.lineage.resourceIds.includes(resource.resourceRef)
-        )
-        || !facts.some((fact) => canonicalJson(fact).includes(resource.digest))
-      )
-    ) {
-      throw new SessionKernelProviderAdapterError(
-        'session_kernel_provider_plan_resource_evidence_mismatch',
-        `Plan evidence resource ${resource.resourceRef} is not bound to its claimed fact and digest.`
-      );
-    }
-  }
+  const evidence = materializeProviderPlanEvidenceV5(
+    normalized.evidence,
+    exactFacts
+  );
   const admittedPlanningTools = new Map(
     input.toolContext.tools
       .map((tool) => [tool.toolId, tool])
@@ -1180,7 +1147,10 @@ export function materializeProviderPlanV2(
   const digest = sha256Hash(canonicalJson({
     providerTurnId: input.providerTurnId,
     runId: input.runId,
-    plan: normalized,
+    plan: {
+      ...normalized,
+      evidence,
+    },
   })).slice('sha256:'.length);
   const planRevision = `plan-${digest}`;
   return {
@@ -1190,7 +1160,7 @@ export function materializeProviderPlanV2(
     title: normalized.title,
     objective: normalized.objective,
     narrative: normalized.narrative,
-    evidence: normalized.evidence,
+    evidence,
     ...(input.plan
       ? {
           predecessorPlanRef: {
@@ -1255,10 +1225,6 @@ function normalizePlanDraft(
           resource.resourceRef,
           'plan.evidence.resourceRef'
         ),
-        digest: requiredDigest(
-          resource.digest,
-          'plan.evidence.resourceDigest'
-        ),
         summary: requiredText(
           resource.summary,
           'plan.evidence.resourceSummary',
@@ -1321,6 +1287,124 @@ function normalizePlanDraft(
       };
     }),
   };
+}
+
+function materializeProviderPlanEvidenceV5(
+  evidence: SessionProviderPlanEvidenceDraftV4,
+  exactFacts: ReadonlyMap<string, KernelFactProjectionV2> | undefined
+): SessionPlanEvidenceV4 {
+  const evidenceFactRefs = new Set(evidence.kernelFactRefs);
+  for (const resource of evidence.readResources) {
+    resource.factRefs.forEach((factRef) => evidenceFactRefs.add(factRef));
+  }
+  for (const factRef of evidenceFactRefs) {
+    if (!exactFacts?.has(factRef)) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_evidence_stale',
+        `Plan evidence references a Kernel fact outside the exact current snapshot: ${factRef}.`
+      );
+    }
+  }
+
+  const canonicalResourceRefs = new Set<string>();
+  const readResources = evidence.readResources.map((resource) => {
+    const referencedFacts = resource.factRefs.map(
+      (factRef) => exactFacts!.get(factRef)!
+    );
+    const operationIds = new Set(
+      referencedFacts.flatMap((fact) =>
+        fact.lineage.operationId ? [fact.lineage.operationId] : []
+      )
+    );
+    const relatedFacts = [...exactFacts!.values()].filter((fact) =>
+      resource.factRefs.includes(fact.factId)
+      || (
+        fact.lineage.operationId !== undefined
+        && operationIds.has(fact.lineage.operationId)
+      )
+    );
+    const candidates = relatedFacts.flatMap(
+      canonicalReadEvidenceCandidatesV5
+    );
+    const exactMatches = candidates.filter(
+      (candidate) => candidate.resourceRef === resource.resourceRef
+    );
+    const selected = exactMatches.length === 1
+      ? exactMatches[0]
+      : candidates.length === 1
+        ? candidates[0]
+        : undefined;
+    if (!selected) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_resource_evidence_mismatch',
+        `Plan evidence resource ${resource.resourceRef} does not resolve to one canonical read observation.`
+      );
+    }
+    if (canonicalResourceRefs.has(selected.resourceRef)) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_plan_evidence_duplicate',
+        `Plan evidence resolves more than once to ${selected.resourceRef}.`
+      );
+    }
+    canonicalResourceRefs.add(selected.resourceRef);
+    return {
+      resourceRef: selected.resourceRef,
+      digest: selected.digest,
+      summary: resource.summary,
+      factRefs: uniqueSortedIdentities(
+        [...resource.factRefs, selected.factRef],
+        'plan.evidence.resourceFactRefs'
+      ),
+    };
+  });
+
+  return {
+    kernelFactRefs: evidence.kernelFactRefs,
+    readResources,
+    blockingUnknowns: evidence.blockingUnknowns,
+    nonBlockingUnknowns: evidence.nonBlockingUnknowns,
+    coverage: evidence.coverage,
+  };
+}
+
+function canonicalReadEvidenceCandidatesV5(
+  fact: KernelFactProjectionV2
+): Array<{ resourceRef: string; digest: string; factRef: string }> {
+  if (fact.domain !== 'effect') return [];
+  const details = providerEvidenceRecordV5(fact.details);
+  const identity = providerEvidenceRecordV5(details?.identity);
+  const authority = providerEvidenceRecordV5(identity?.authority);
+  const digest = details?.evidenceDigest;
+  if (
+    authority?.kind !== 'read'
+    || typeof digest !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(digest)
+  ) {
+    return [];
+  }
+  const affectedResourceIds = details?.affectedResourceIds;
+  const affected = Array.isArray(affectedResourceIds)
+    ? affectedResourceIds.filter(
+        (value): value is string => typeof value === 'string' && value.length > 0
+      )
+    : [];
+  const resourceRefs = [...new Set([
+    ...affected,
+    ...fact.lineage.resourceIds,
+  ])];
+  return resourceRefs.map((resourceRef) => ({
+    resourceRef,
+    digest,
+    factRef: fact.factId,
+  }));
+}
+
+function providerEvidenceRecordV5(
+  value: unknown
+): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function normalizeInterventionDraftV1(

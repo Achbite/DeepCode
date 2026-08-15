@@ -76,7 +76,7 @@ import {
   type SessionProviderInterventionProposalV1,
   SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
 import type { SessionKernelProjectionReceiptV2 } from './ports.js';
@@ -2998,7 +2998,7 @@ function terminalItemsMatchProviderOutputV3(
           import('./types.js').SessionProviderTerminalOrderedItemV3,
           { kind: 'toolCall' }
         > => item.kind === 'toolCall'
-          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
+          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME
       );
       if (
         controlItems.length !== 1
@@ -3140,16 +3140,7 @@ function providerPlanMatchesDraftV3(
   return plan.title === draft.title
     && plan.objective === draft.objective
     && plan.narrative === draft.narrative
-    && canonicalJson(plan.evidence) === canonicalJson({
-      kernelFactRefs: [...draft.evidence.kernelFactRefs].sort(),
-      readResources: draft.evidence.readResources.map((resource) => ({
-        ...resource,
-        factRefs: [...resource.factRefs].sort(),
-      })),
-      blockingUnknowns: draft.evidence.blockingUnknowns,
-      nonBlockingUnknowns: draft.evidence.nonBlockingUnknowns,
-      coverage: draft.evidence.coverage,
-    })
+    && providerPlanEvidenceMatchesDraftV5(plan, draft)
     && plan.actions.length === draft.actions.length
     && draft.actions.every((actionDraft, index) => {
       const action = plan.actions[index];
@@ -3163,6 +3154,40 @@ function providerPlanMatchesDraftV3(
           }
         );
     });
+}
+
+function providerPlanEvidenceMatchesDraftV5(
+  plan: SessionNaturalLanguagePlanV2,
+  draft: ReturnType<typeof decodeProviderPlanProposalArgumentsV2>
+): boolean {
+  const evidence = plan.evidence;
+  if (
+    canonicalJson(evidence.kernelFactRefs)
+      !== canonicalJson([...draft.evidence.kernelFactRefs].sort())
+    || evidence.readResources.length
+      !== draft.evidence.readResources.length
+    || canonicalJson(evidence.blockingUnknowns)
+      !== canonicalJson(draft.evidence.blockingUnknowns)
+    || canonicalJson(evidence.nonBlockingUnknowns)
+      !== canonicalJson(draft.evidence.nonBlockingUnknowns)
+    || evidence.coverage !== draft.evidence.coverage
+  ) {
+    return false;
+  }
+  return draft.evidence.readResources.every((resourceDraft, index) => {
+    const resource = evidence.readResources[index];
+    if (
+      !resource
+      || resource.summary !== resourceDraft.summary
+      || !/^sha256:[0-9a-f]{64}$/u.test(resource.digest)
+    ) {
+      return false;
+    }
+    const materializedFactRefs = new Set(resource.factRefs);
+    return resourceDraft.factRefs.every(
+      (factRef) => materializedFactRefs.has(factRef)
+    );
+  });
 }
 
 function providerInterventionMatchesDraftV1(

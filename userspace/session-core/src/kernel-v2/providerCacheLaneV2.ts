@@ -23,6 +23,8 @@ export const SESSION_PROVIDER_CACHE_LANE_IDENTITY_V2_SCHEMA =
   'deepcode.session.provider-cache-lane-identity.v2' as const;
 export const SESSION_PROVIDER_SEMANTIC_GUIDANCE_V1_SCHEMA =
   'deepcode.session.provider-semantic-guidance.v1' as const;
+export const SESSION_PROVIDER_TOOL_SETTLEMENT_EVIDENCE_V1_SCHEMA =
+  'deepcode.session.provider-tool-settlement-evidence.v1' as const;
 
 export type SessionProviderCacheLaneModeV2 =
   | 'bootstrap'
@@ -491,9 +493,6 @@ export function sessionProviderSemanticMessagesV2(
       'Provider tool continuation requires its exact available predecessor binding.'
     );
   }
-  const targetBindingChanged = predecessor.targetBindingDigest
-    !== sha256Hash(canonicalJson(turn.target));
-  if (!targetBindingChanged && turn.guidance.length === 0) return [];
   const finalMessage = turn.contextAssembly.messages.at(-1);
   if (
     !finalMessage
@@ -502,10 +501,91 @@ export function sessionProviderSemanticMessagesV2(
       !== 'deepcode.session.provider-turn-frame.v1'
   ) {
     throw new Error(
-      'Provider tool continuation target transition requires the authoritative dynamic user frame at the request tail.'
+      'Provider tool continuation requires the authoritative dynamic user frame at the request tail.'
     );
   }
-  return [cloneJson(finalMessage)];
+  return [
+    sessionProviderToolSettlementEvidenceMessageV1(turn),
+    cloneJson(finalMessage),
+  ];
+}
+
+function sessionProviderToolSettlementEvidenceMessageV1(
+  turn: SessionProviderTurnInputV2
+): LlmChatMessage {
+  const predecessor = turn.providerOutcomes.at(-1);
+  if (!predecessor || predecessor.outputKind !== 'toolIntent') {
+    throw new Error(
+      'Provider tool settlement evidence requires one exact settled predecessor.'
+    );
+  }
+  const calls = predecessor.toolCalls.map((call) => {
+    const facts = turn.kernelFacts.facts.filter(
+      (fact) => fact.lineage.operationId === call.operationId
+    );
+    const readResources = facts.flatMap((fact) => {
+      if (fact.domain !== 'effect') return [];
+      const details = providerEvidenceRecordV1(fact.details);
+      const identity = providerEvidenceRecordV1(details?.identity);
+      const authority = providerEvidenceRecordV1(identity?.authority);
+      const evidenceDigest = details?.evidenceDigest;
+      if (
+        authority?.kind !== 'read'
+        || typeof evidenceDigest !== 'string'
+        || !/^sha256:[0-9a-f]{64}$/u.test(evidenceDigest)
+      ) {
+        return [];
+      }
+      const affectedResourceIds = details?.affectedResourceIds;
+      const resourceRefs = [...new Set([
+        ...(Array.isArray(affectedResourceIds)
+          ? affectedResourceIds.filter(
+              (value): value is string =>
+                typeof value === 'string' && value.length > 0
+            )
+          : []),
+        ...fact.lineage.resourceIds,
+      ])];
+      return resourceRefs.map((resourceRef) => ({
+        resourceRef,
+        digest: evidenceDigest,
+        factRef: fact.factId,
+      }));
+    });
+    return {
+      operationId: call.operationId,
+      toolId: call.toolId,
+      status: call.status,
+      factRefs: [...new Set([
+        ...facts.map((fact) => fact.factId),
+        ...(call.terminalFactId ? [call.terminalFactId] : []),
+      ])].sort(),
+      readResources,
+      ...(call.settlementReason
+        ? { settlementReason: call.settlementReason }
+        : {}),
+    };
+  });
+  return {
+    role: 'user',
+    content: canonicalJson({
+      schemaVersion: SESSION_PROVIDER_TOOL_SETTLEMENT_EVIDENCE_V1_SCHEMA,
+      providerTurnId: predecessor.providerTurnId,
+      factProjection: {
+        snapshotHighWater: turn.kernelFacts.snapshotHighWater,
+        omittedCount: turn.kernelFacts.omittedCount,
+      },
+      calls,
+    }),
+  };
+}
+
+function providerEvidenceRecordV1(
+  value: unknown
+): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function sessionProviderSameTurnRelationV2(

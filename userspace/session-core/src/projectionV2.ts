@@ -4401,7 +4401,7 @@ function reviewRequiresStandaloneDisplay(
     return true;
   }
   if (arrayRecords(review.actualEffects).some((item) =>
-    reviewAuthorityKind(item) !== 'contextRead'
+    !reviewAuthorityIsReadOnly(item)
   )) {
     return true;
   }
@@ -4418,6 +4418,11 @@ function reviewRequiresStandaloneDisplay(
     const reason = reviewRejectionReason(item);
     return !reason || !compensatedReadRejections.has(reason);
   });
+}
+
+function reviewAuthorityIsReadOnly(item: Record<string, unknown>): boolean {
+  const kind = reviewAuthorityKind(item);
+  return kind === 'read' || kind === 'contextRead';
 }
 
 function reviewAuthorityKind(item: Record<string, unknown>): string | undefined {
@@ -5445,10 +5450,15 @@ function buildTokenUsageProjection(
       }
       continue;
     }
+    const projectionKind = stringValue(payload?.projectionKind);
     if (
-      payload?.projectionKind !== 'provider.completed'
+      (
+        projectionKind !== 'provider.completed'
+        && projectionKind !== 'diagnostic'
+      )
       || !runId
       || !providerTurnId
+      || payload?.providerOutcome === undefined
     ) {
       continue;
     }
@@ -5506,7 +5516,7 @@ function buildTokenUsageProjection(
         : providers[0]!,
       startedAt: started?.event.ts,
       completedAt: event.ts,
-      stages: ['provider.completed'],
+      stages: [projectionKind],
       providerCallCount: 1,
       providers,
       ...usage,
