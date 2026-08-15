@@ -2,18 +2,25 @@ import {
   HttpSessionKernelProviderBackendV2,
   SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
   StrictSessionKernelProviderAdapterV2,
   buildSessionProviderContextV2,
   canonicalJson,
+  materializeProviderPlanV2,
+  providerToolContextBindingV2,
   providerWireToolNameV2,
   sha256Hash,
 } from '../../dist/index.js';
+import {
+  SESSION_PROVIDER_TOOL_SETTLEMENT_EVIDENCE_V1_SCHEMA,
+  sessionProviderSemanticMessagesV2,
+} from '../../dist/kernel-v2/providerCacheLaneV2.js';
 
 import {
   admittedReply,
   assert,
+  corpusFact,
   createInitialState,
   createProviderCompletionReceipt,
   createPreview,
@@ -36,6 +43,10 @@ export const contractCases = [
     run: toolAdmissionWaitsForNativeDoneValidationAndDurableQueue,
   },
   {
+    id: 'plan_evidence_digest_is_derived_from_exact_kernel_facts',
+    run: planEvidenceDigestIsDerivedFromExactKernelFacts,
+  },
+  {
     id: 'provider_tool_call_queue_accepts_one_to_thirty_two_in_order',
     run: providerToolCallQueueAcceptsOneToThirtyTwoInOrder,
   },
@@ -52,6 +63,119 @@ export const contractCases = [
     run: planningControlStaysPrivateUntilNativeTerminalAndConfirmationSettlement,
   },
 ];
+
+async function planEvidenceDigestIsDerivedFromExactKernelFacts() {
+  const initial = createInitialState();
+  const operationId = 'operation-plan-evidence-read';
+  const effect = corpusFact('effectContextReadObserved', {
+    factId: 'fact-plan-evidence-read-observed',
+    identities: {
+      runId: initial.runId,
+      contextReadOperationId: operationId,
+      contextReadInvocationId: 'invocation-plan-evidence-read',
+      contextReadAttemptId: 'attempt-plan-evidence-read',
+      contextReadEffectId: 'effect-plan-evidence-read',
+    },
+    ledgerSequence: 1,
+    runSequence: 1,
+  });
+  const completed = corpusFact('invocationContextReadCompleted', {
+    factId: 'fact-plan-evidence-read-completed',
+    identities: {
+      runId: initial.runId,
+      contextReadOperationId: operationId,
+      contextReadInvocationId: 'invocation-plan-evidence-read',
+      contextReadAttemptId: 'attempt-plan-evidence-read',
+      contextReadEffectId: 'effect-plan-evidence-read',
+    },
+    ledgerSequence: 2,
+    runSequence: 2,
+  });
+  const draft = planningDraft();
+  draft.evidence.kernelFactRefs = [completed.factId];
+  draft.evidence.readResources = [{
+    resourceRef: 'fs.read://README.md',
+    summary: 'The current README was read before planning.',
+    factRefs: [completed.factId],
+  }];
+
+  const plan = materializeProviderPlanV2({
+    providerTurnId: 'provider-turn-plan-evidence',
+    runId: initial.runId,
+    currentInput: initial.initialInput,
+    toolContext: providerToolContextBindingV2(initial.toolContext),
+    kernelFacts: {
+      snapshotHighWater: 2,
+      omittedCount: 0,
+      facts: [effect, completed],
+    },
+  }, draft, '2026-07-29T00:00:02.000Z');
+  assert.deepEqual(plan.evidence.readResources, [{
+    resourceRef: effect.lineage.resourceIds[0],
+    digest: effect.details.evidenceDigest,
+    summary: draft.evidence.readResources[0].summary,
+    factRefs: [effect.factId, completed.factId].sort(),
+  }]);
+
+  const finalFrame = {
+    role: 'user',
+    content: canonicalJson({
+      schemaVersion: 'deepcode.session.provider-turn-frame.v1',
+      currentInput: { inputId: initial.initialInput.inputId },
+      target: { kind: 'planning' },
+    }),
+  };
+  const semanticMessages = sessionProviderSemanticMessagesV2({
+    providerOutcomes: [{
+      providerTurnId: 'provider-turn-read-evidence',
+      outputKind: 'toolIntent',
+      recordedAt: '2026-07-29T00:00:01.000Z',
+      toolCallReceipt: {
+        schemaVersion: 'deepcode.session.provider-tool-call-receipt.v2',
+        providerTurnId: 'provider-turn-read-evidence',
+        responseDigest: `sha256:${'1'.repeat(64)}`,
+        callCount: 1,
+        calls: [],
+        recordedAt: '2026-07-29T00:00:01.000Z',
+      },
+      toolSettlement: {
+        status: 'completed',
+        settledAt: '2026-07-29T00:00:01.000Z',
+      },
+      toolCalls: [{
+        ordinal: 1,
+        operationId,
+        toolId: 'fs.read',
+        status: 'completed',
+        terminalFactId: completed.factId,
+        terminalFactKind: completed.factKind,
+      }],
+    }],
+    kernelFacts: {
+      snapshotHighWater: 2,
+      omittedCount: 0,
+      facts: [effect, completed],
+    },
+    contextAssembly: { messages: [finalFrame] },
+  }, {
+    mode: 'append',
+    relationKind: 'sameTurnToolContinuation',
+  }, {
+    status: 'available',
+  });
+  assert.equal(semanticMessages.length, 2);
+  const evidenceFrame = JSON.parse(semanticMessages[0].content);
+  assert.equal(
+    evidenceFrame.schemaVersion,
+    SESSION_PROVIDER_TOOL_SETTLEMENT_EVIDENCE_V1_SCHEMA
+  );
+  assert.deepEqual(evidenceFrame.calls[0].readResources, [{
+    resourceRef: effect.lineage.resourceIds[0],
+    digest: effect.details.evidenceDigest,
+    factRef: effect.factId,
+  }]);
+  assert.deepEqual(semanticMessages[1], finalFrame);
+}
 
 async function providerNativeStreamCompletionAndReasoningGate() {
   const calls = providerCalls(1, 'native-gate');
@@ -425,7 +549,7 @@ async function planningContextSeparatesIntentFactsAndExecutionAuthority() {
   );
 
   const planControls = wireRequest.tools.filter(
-    (tool) => tool.name === SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME
+    (tool) => tool.name === SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME
   );
   assert.equal(planControls.length, 1);
   const planDescription = planControls[0].description;
@@ -439,7 +563,7 @@ async function planningContextSeparatesIntentFactsAndExecutionAuthority() {
     wireRequest.tools.map((tool) => tool.name),
     [
       ...toolContext.tools.map((tool) => providerWireToolNameV2(tool.toolId)),
-      SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+      SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
       SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
       SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
     ],
@@ -471,7 +595,7 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
       delete value.plan.actions[0]
         .scopeIntent.data.requestedResources[0].data.access;
       const proposalArguments = {
-        schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+        schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
         plan: value.plan,
       };
       value.planProposal.argumentsDigest = sha256Hash(
@@ -732,7 +856,7 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
 
 function sealedPlanningOutput(draft, commentary) {
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
     plan: draft,
   };
   const responseDigest = sha256Hash(canonicalJson({
@@ -743,9 +867,9 @@ function sealedPlanningOutput(draft, commentary) {
     kind: 'plan',
     plan: clone(draft),
     planProposal: {
-      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
       callId: 'provider-plan-lifecycle-contract',
-      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
       argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
     },
     items: [{ kind: 'text', phase: 'commentary', text: commentary }],
@@ -798,7 +922,7 @@ function installPlanningTerminalEvidence(
   const map = harness.store.providerEvidence;
   const originalSet = map.set;
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
     plan: draft,
   };
   map.set = function setPlanningEvidence(providerTurnId, evidence) {
@@ -807,7 +931,7 @@ function installPlanningTerminalEvidence(
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,
       callId,
-      name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
       arguments: canonicalJson(proposalArguments),
     });
     if (options.duplicateControl) {
@@ -815,7 +939,7 @@ function installPlanningTerminalEvidence(
         kind: 'toolCall',
         index: terminal.data.orderedItems.length,
         callId: `${callId}-duplicate`,
-        name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+        name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
         arguments: canonicalJson(proposalArguments),
       });
     }

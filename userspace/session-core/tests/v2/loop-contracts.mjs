@@ -14,8 +14,8 @@ import {
   providerToolIntents,
 } from './harness.mjs';
 import {
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
   StrictSessionKernelProviderAdapterV2,
   canonicalJson,
   sha256Hash,
@@ -1091,7 +1091,7 @@ async function prepareConfirmablePlan(harness, draft, commentary) {
 
 async function runSealedPlanningTurn(harness, draft, commentary) {
   const proposalArguments = {
-    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+    schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
     plan: draft,
   };
   const proposalCallId = 'provider-plan-proposal-contract';
@@ -1103,9 +1103,9 @@ async function runSealedPlanningTurn(harness, draft, commentary) {
     kind: 'plan',
     plan: draft,
     planProposal: {
-      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V4_SCHEMA,
+      schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
       callId: proposalCallId,
-      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
       argumentsDigest: sha256Hash(canonicalJson(proposalArguments)),
     },
     items: [{ kind: 'text', phase: 'commentary', text: commentary }],
@@ -1136,7 +1136,7 @@ async function runSealedPlanningTurn(harness, draft, commentary) {
       kind: 'toolCall',
       index: terminal.data.orderedItems.length,
       callId: proposalCallId,
-      name: SESSION_PROVIDER_PLAN_PROPOSAL_V4_TOOL_NAME,
+      name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
       arguments: canonicalJson(proposalArguments),
     });
     terminal.ref.recordDigest = sha256Hash(canonicalJson(terminal.data));

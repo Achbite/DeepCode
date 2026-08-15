@@ -20,6 +20,17 @@ fn test_profile() -> ResolvedLlmProfile {
 }
 
 #[test]
+fn planning_control_continuation_uses_current_plan_v5_contract() {
+    let (tool_name, next_targets) =
+        provider_native_session_control_contract(&SessionProviderTargetBindingSidecarV2::Planning)
+            .expect("planning must have a Session control continuation contract");
+
+    assert_eq!(tool_name, "deepcode_session_plan_propose_v5");
+    assert_ne!(tool_name, "deepcode_session_plan_propose_v4");
+    assert_eq!(next_targets, &["planning", "planAction"]);
+}
+
+#[test]
 fn provider_public_error_event_uses_bounded_message_and_ignores_raw_detail() {
     let event = provider_public_error_event(
         "request-public-error-contract",

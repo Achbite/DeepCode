@@ -1120,6 +1120,71 @@ const contractCases = [
     },
   },
   {
+    id: 'selected_session_observer_survives_terminal_run_and_receives_next_run',
+    async run(host) {
+      const sessionId = 'watcher-multi-run';
+      const scenario = new Scenario(this.id, [sessionId]);
+      scenario.setActiveRun(
+        sessionId,
+        'kernel-watcher-multi-run-1',
+        'host-watcher-multi-run-1'
+      );
+      host.register(scenario);
+      const store = await freshStore(this.id);
+      await activate(store, sessionId);
+      scenario.records.length = 0;
+      const heldStreams = holdSseRequests(scenario, 'timelineStream');
+      const release = store.getState().observeSessionProjection(sessionId);
+      await waitFor(
+        () => heldStreams.length === 1,
+        'selected Session observer to open one canonical stream'
+      );
+
+      const terminal = emptyTimeline(sessionId, 2);
+      heldStreams[0].sseEvent('snapshot', {
+        type: 'snapshot',
+        sessionId,
+        revision: terminal.revision,
+        snapshot: terminal,
+      });
+      await waitFor(
+        () => store.getState().timeline?.revision === terminal.revision,
+        'first Run terminal snapshot on the selected Session stream'
+      );
+      assert.equal(
+        heldStreams[0].record.aborted,
+        false,
+        'a Run terminal incorrectly released the selected Session observer'
+      );
+
+      const nextRun = activeTimeline(
+        sessionId,
+        'kernel-watcher-multi-run-2',
+        3
+      );
+      heldStreams[0].sseEvent('snapshot', {
+        type: 'snapshot',
+        sessionId,
+        revision: nextRun.revision,
+        snapshot: nextRun,
+      });
+      await waitFor(
+        () => store.getState().timeline?.runProjection?.runId
+          === 'kernel-watcher-multi-run-2',
+        'second Run snapshot on the unchanged selected Session'
+      );
+      assert.equal(
+        heldStreams.length,
+        1,
+        'the same selected Session created a second stream between Runs'
+      );
+
+      await release();
+      scenario.handlers.delete('timelineStream');
+      await cleanupStore(store);
+    },
+  },
+  {
     id: 'canonical_timeline_revision_gap_refetches_exact_snapshot',
     async run(host) {
       const {
