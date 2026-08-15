@@ -718,10 +718,9 @@ function startCanonicalProgressWatcher(
     if (applyError) throw applyError;
     if (!appliedTimeline) return;
     refreshWorkspaceTreeForTimeline(appliedTimeline);
-    if (isCanonicalTimelineTerminal(appliedTimeline)) {
-      stop();
-      return;
-    }
+    // This observer is scoped to the selected Session, not to one Run. A
+    // terminal Run may be followed by another Run without changing sessionId,
+    // so only the consumer lifecycle may release the stream.
     void validateProjectedRunIdentity(appliedTimeline).then((ready) => {
       if (!ready) markCanonicalTimelineStale(sessionId);
     });
@@ -869,11 +868,6 @@ function refreshWorkspaceTreeForTimeline(timeline: AgentTimelineResult): void {
   useWorkspaceStore.getState().bumpTreeRevision();
 }
 
-
-function isCanonicalTimelineTerminal(timeline: AgentTimelineResult): boolean {
-  const status = timeline.runProjection?.status;
-  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
