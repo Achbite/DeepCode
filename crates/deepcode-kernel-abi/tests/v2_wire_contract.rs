@@ -3,12 +3,11 @@ use std::collections::BTreeMap;
 use deepcode_kernel_abi::v2::*;
 use deepcode_kernel_abi::v2_command::{
     decode_kernel_command_v2, CapabilityApprovalViewV2, CapabilityResourcePresentationKindV2,
-    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2,
-    CapabilityScopePreviewOriginV3, CapabilityScopePreviewRecordV2,
-    CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandV2,
-    KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
-    KernelWireErrorV2, MutationCommandKindV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
-    ToolIntentSubmitV2,
+    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2, CapabilityScopePreviewOriginV3,
+    CapabilityScopePreviewRecordV2, CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2,
+    KernelCommandV2, KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2,
+    KernelReplyV2, KernelWireErrorV2, MutationCommandKindV2, ToolIntentRejectionReasonV2,
+    ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, capability_authorization_digest_v2, capability_scope_digest_v2,
@@ -480,8 +479,14 @@ fn kernel_capability_previews() -> BTreeMap<&'static str, CapabilityScopePreview
         ("corpusNormalDeny", corpus_deny_normal_preview()),
         ("sessionDefault", session_default_preview()),
         ("sessionFirstAction", session_first_action_preview()),
-        ("sessionInterventionCandidateSelected", session_intervention_candidate_selected_preview()),
-        ("sessionInterventionCandidateSuperseded", session_intervention_candidate_superseded_preview()),
+        (
+            "sessionInterventionCandidateSelected",
+            session_intervention_candidate_selected_preview(),
+        ),
+        (
+            "sessionInterventionCandidateSuperseded",
+            session_intervention_candidate_superseded_preview(),
+        ),
         ("sessionPlanDiscovery", session_plan_discovery_preview()),
         ("sessionSecondAction", session_second_action_preview()),
     ])

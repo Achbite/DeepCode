@@ -6,11 +6,11 @@ use deepcode_kernel_abi::v2::{
     MutationCommandResultV2, OperationId, ResourceAccessV2, UserDecisionRefV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2,
-    CapabilityScopePreviewOriginV3, CapabilityScopePreviewRecordV2,
-    CapabilityScopePreviewReplyV2, CommandHandlingV2, DeadlineRequestV2,
-    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
-    KernelReplyV2, StorageFaultCodeV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
+    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2, CapabilityScopePreviewOriginV3,
+    CapabilityScopePreviewRecordV2, CapabilityScopePreviewReplyV2, CommandHandlingV2,
+    DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2,
+    KernelErrorV2, KernelReplyV2, StorageFaultCodeV2, ToolIntentRejectionReasonV2,
+    ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::{
     InterventionSelectDecisionV3, PlanActionIdV2, PlanRevisionV2, RequestedResourceV2,
@@ -42,8 +42,7 @@ fn preview_intervention_candidate(
             items: vec![CapabilityScopePreviewItemV2 {
                 plan_action_id: PlanActionIdV2::new(plan_action_id)
                     .expect("valid candidate PlanAction"),
-                operation_id: OperationId::new(operation_id)
-                    .expect("valid candidate operation"),
+                operation_id: OperationId::new(operation_id).expect("valid candidate operation"),
                 idempotency_key: format!("idempotency-{operation_id}"),
                 tool_id: ToolIdV2::parse("fs.ensure_directory")
                     .expect("registered mutation ToolId"),
@@ -430,21 +429,16 @@ fn intervention_candidates_settle_atomically_without_executing_an_effect() {
         )
     }));
 
-    let decision_ref =
-        UserDecisionRefV2::new("decision-ref-intervention-settlement")
-            .expect("valid intervention decision ref");
+    let decision_ref = UserDecisionRefV2::new("decision-ref-intervention-settlement")
+        .expect("valid intervention decision ref");
     let selected_binding = harness
         .service
-        .resolve_pending_capability_decision_host(
-            selected.preview_id.clone(),
-            decision_ref.clone(),
-        )
+        .resolve_pending_capability_decision_host(selected.preview_id.clone(), decision_ref.clone())
         .expect("resolve selected candidate")
         .expect("selected candidate remains current")
         .binding;
     let decision = UserDecisionV2::InterventionSelect(InterventionSelectDecisionV3 {
-        input_id: InputId::new("input-intervention-settlement")
-            .expect("valid current input id"),
+        input_id: InputId::new("input-intervention-settlement").expect("valid current input id"),
         decision_ref,
         interaction_id: INTERVENTION_ID.to_owned(),
         interaction_revision: INTERVENTION_REVISION.to_owned(),

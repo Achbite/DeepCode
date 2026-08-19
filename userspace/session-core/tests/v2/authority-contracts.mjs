@@ -538,6 +538,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     harness,
     plan
   );
+  const planActionId = plan.actions[0].manifest.planActionId;
   const lineageBeforeFirstSubmit =
     harness.loop.snapshot().lineage;
   harness.enqueueProvider(
@@ -567,7 +568,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     reason: 'planExecution',
     target: {
       kind: 'planAction',
-      planActionId: 'plan-action-golden-1',
+      planActionId,
     },
     remainingToolCallBudget: 32,
   });
@@ -590,8 +591,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
   assert.deepEqual(firstIntent.authority, {
     kind: 'planAction',
     data: {
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
     },
   });
   assert.equal(
@@ -609,9 +610,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     ['fs.read', 'fs.write'],
     'a PlanAction Provider turn keeps the complete ready tool surface stable'
   );
-  const issuedLease = corpusFact(
-    'invocationToolIntentAdmitted'
-  ).lineage.capabilityLease;
+  const issuedLease = firstReply.data.lease;
   assert.deepEqual(
     harness.loop.snapshot().lineage.operations[
       firstResult.operationId
@@ -626,8 +625,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     runSequence: harness.nextRunSequence(),
     identities: {
       runId: harness.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       operationId: firstResult.operationId,
       invocationId: firstResult.invocationId,
       attemptId: 'attempt-authority-first',
@@ -639,8 +638,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     runSequence: harness.nextRunSequence() + 1,
     identities: {
       runId: harness.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       operationId: firstResult.operationId,
       invocationId: firstResult.invocationId,
       attemptId: 'attempt-authority-first',
@@ -652,8 +651,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     waitKind: 'invocation',
     operationId: firstResult.operationId,
     invocationId: firstResult.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
+    planActionId,
+    expectedPlanRevision: plan.planRevision,
   });
   assert.equal(harness.loop.snapshot().activeWait, undefined);
 
@@ -680,7 +679,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     reason: 'planExecution',
     target: {
       kind: 'planAction',
-      planActionId: 'plan-action-golden-1',
+      planActionId,
     },
     remainingToolCallBudget: 32,
   });
@@ -692,8 +691,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
   assert.deepEqual(secondIntent.authority, {
     kind: 'planAction',
     data: {
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       lease: issuedLease,
     },
   });
@@ -704,8 +703,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     runSequence: harness.nextRunSequence(),
     identities: {
       runId: harness.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       operationId: secondResult.operationId,
       invocationId: secondResult.invocationId,
       attemptId: 'attempt-authority-second',
@@ -717,8 +716,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     runSequence: harness.nextRunSequence() + 1,
     identities: {
       runId: harness.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       operationId: secondResult.operationId,
       invocationId: secondResult.invocationId,
       attemptId: 'attempt-authority-second',
@@ -728,14 +727,22 @@ async function planActionAuthorityComesFromPersistedSessionState() {
   const revoked = corpusFact('authorizationLeaseRevoked', {
     ledgerSequence: harness.nextFactSequence() + 2,
     runSequence: harness.nextRunSequence() + 2,
+    identities: {
+      runId: harness.initial.runId,
+      planRevision: plan.planRevision,
+      planActionId,
+      plannedOperationId: plan.actions[0].manifest.operationId,
+      leaseId: issuedLease.leaseId,
+      issuedScopeDigest: issuedLease.scopeDigest,
+    },
   });
   harness.appendFacts(secondObserved, secondCompleted, revoked);
   await harness.loop.notifyKernelWakeHint({
     waitKind: 'invocation',
     operationId: secondResult.operationId,
     invocationId: secondResult.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
+    planActionId,
+    expectedPlanRevision: plan.planRevision,
   });
   assert.deepEqual(
     Object.values(harness.loop.snapshot().lineage.operations)
@@ -764,7 +771,7 @@ async function planActionAuthorityComesFromPersistedSessionState() {
     reason: 'planExecution',
     target: {
       kind: 'planAction',
-      planActionId: 'plan-action-golden-1',
+      planActionId,
     },
     remainingToolCallBudget: 32,
   });
@@ -773,8 +780,8 @@ async function planActionAuthorityComesFromPersistedSessionState() {
   assert.deepEqual(postRevocationIntent.authority, {
     kind: 'planAction',
     data: {
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
     },
   });
 }

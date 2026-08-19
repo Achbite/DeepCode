@@ -31,6 +31,7 @@ import {
   createPreview,
   createSessionHarness,
   openSessionHarness,
+  providerAnswer,
   providerOrderedToolItems,
   providerStructuredFailure,
 } from './harness.mjs';
@@ -258,20 +259,19 @@ async function repeatedStructuredProviderFailureFailsClosedWithoutProgress() {
 async function planEvidenceDigestIsDerivedFromExactKernelFacts() {
   const initial = createInitialState();
   const operationId = 'operation-plan-evidence-read';
-  const effect = corpusFact('effectContextReadObserved', {
-    factId: 'fact-plan-evidence-read-observed',
+  const admitted = corpusFact('invocationContextReadAdmitted', {
+    factId: 'fact-plan-evidence-read-admitted',
     identities: {
       runId: initial.runId,
       contextReadOperationId: operationId,
       contextReadInvocationId: 'invocation-plan-evidence-read',
       contextReadAttemptId: 'attempt-plan-evidence-read',
-      contextReadEffectId: 'effect-plan-evidence-read',
     },
     ledgerSequence: 1,
     runSequence: 1,
   });
-  const completed = corpusFact('invocationContextReadCompleted', {
-    factId: 'fact-plan-evidence-read-completed',
+  const effect = corpusFact('effectContextReadObserved', {
+    factId: 'fact-plan-evidence-read-observed',
     identities: {
       runId: initial.runId,
       contextReadOperationId: operationId,
@@ -282,10 +282,22 @@ async function planEvidenceDigestIsDerivedFromExactKernelFacts() {
     ledgerSequence: 2,
     runSequence: 2,
   });
+  const completed = corpusFact('invocationContextReadCompleted', {
+    factId: 'fact-plan-evidence-read-completed',
+    identities: {
+      runId: initial.runId,
+      contextReadOperationId: operationId,
+      contextReadInvocationId: 'invocation-plan-evidence-read',
+      contextReadAttemptId: 'attempt-plan-evidence-read',
+      contextReadEffectId: 'effect-plan-evidence-read',
+    },
+    ledgerSequence: 3,
+    runSequence: 3,
+  });
   const draft = planningDraft();
   draft.evidence.kernelFactRefs = [completed.factId];
   draft.evidence.readResources = [{
-    resourceRef: 'fs.read://README.md',
+    resourceRef: effect.lineage.resourceIds[0],
     summary: 'The current README was read before planning.',
     factRefs: [completed.factId],
   }];
@@ -293,12 +305,15 @@ async function planEvidenceDigestIsDerivedFromExactKernelFacts() {
   const plan = materializeProviderPlanV2({
     providerTurnId: 'provider-turn-plan-evidence',
     runId: initial.runId,
+    controlEpoch: initial.controlEpoch,
     currentInput: initial.initialInput,
     toolContext: providerToolContextBindingV2(initial.toolContext),
+    sessionMemory: initial.sessionMemory,
+    providerOutcomes: [],
     kernelFacts: {
-      snapshotHighWater: 2,
+      snapshotHighWater: 3,
       omittedCount: 0,
-      facts: [effect, completed],
+      facts: [admitted, effect, completed],
     },
   }, draft, '2026-07-29T00:00:02.000Z');
   assert.deepEqual(plan.evidence.readResources, [{
@@ -343,9 +358,9 @@ async function planEvidenceDigestIsDerivedFromExactKernelFacts() {
       }],
     }],
     kernelFacts: {
-      snapshotHighWater: 2,
+      snapshotHighWater: 3,
       omittedCount: 0,
-      facts: [effect, completed],
+      facts: [admitted, effect, completed],
     },
     contextAssembly: { messages: [finalFrame] },
   }, {
@@ -976,6 +991,35 @@ async function planningControlStaysPrivateUntilNativeTerminalAndConfirmationSett
     rejectedPlan.plan.planRevision
   );
   assert.equal(rejectedReply.results[0].kind, 'rejected');
+  const previewSettlement = rejectedPreview.loop.snapshot()
+    .pendingProviderControlSettlement;
+  assert.equal(previewSettlement?.kind, 'planPreviewRejected');
+  assert.equal(
+    previewSettlement?.predecessorProviderTurnId,
+    rejectedPreview.loop.snapshot().providerOutcomes.at(-1).providerTurnId
+  );
+  assert.deepEqual(previewSettlement?.preview, {
+    planRevision: rejectedPlan.plan.planRevision,
+    rejections: rejectedReply.results.map((result) => result.data),
+  });
+  rejectedPreview.enqueueProvider(
+    providerAnswer('The rejected scope requires a revised Plan.')
+  );
+  const revised = await rejectedPreview.loop.runProviderTurn({
+    reason: 'replan',
+    target: { kind: 'planning' },
+  });
+  assert.equal(revised.kind, 'answer');
+  assert.deepEqual(
+    rejectedPreview.providerInputs.at(-1)
+      .pendingProviderControlSettlement,
+    previewSettlement,
+    'replanning must consume the exact durable Plan preview rejection receipt'
+  );
+  assert.equal(
+    rejectedPreview.loop.snapshot().pendingProviderControlSettlement,
+    undefined
+  );
   await assert.rejects(
     rejectedPreview.loop.publishPlanConfirmationReady(
       rejectedPlan.plan.planRevision

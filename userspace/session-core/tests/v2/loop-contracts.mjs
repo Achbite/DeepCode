@@ -20,6 +20,15 @@ import {
   canonicalJson,
   sha256Hash,
 } from '../../dist/index.js';
+import {
+  buildSessionProviderAdmissionSidecarV2,
+  planSessionProviderCacheLaneV2,
+  sessionProviderCacheMaterialV2,
+  sessionProviderSemanticMessagesV2,
+} from '../../dist/kernel-v2/providerCacheLaneV2.js';
+import {
+  providerWireToolDefinitionsV2,
+} from '../../dist/kernel-v2/providerContext.js';
 
 export const contractCases = [
   {
@@ -46,7 +55,141 @@ export const contractCases = [
     id: 'plan_confirmation_requires_every_current_canonical_preview',
     run: planConfirmationRequiresEveryCurrentCanonicalPreview,
   },
+  {
+    id: 'plan_reject_closes_native_control_and_preserves_exact_append_lane',
+    run: planRejectClosesNativeControlAndPreservesExactAppendLane,
+  },
 ];
+
+async function planRejectClosesNativeControlAndPreservesExactAppendLane() {
+  const harness = await openSessionHarness();
+  const { plan } = await prepareConfirmablePlan(
+    harness,
+    oneActionPlanDraft(),
+    'I will request approval before changing the workspace.'
+  );
+  await harness.loop.decidePlan({
+    planRevision: plan.planRevision,
+    decision: 'reject',
+    guidance: 'Do not modify the workspace.',
+  });
+  const state = harness.loop.snapshot();
+  const settlement = state.pendingProviderControlSettlement;
+  const predecessorTurn = harness.providerInputs.at(-1);
+  const predecessorOutcome = state.providerOutcomes.at(-1);
+  assert(settlement);
+  assert(predecessorTurn);
+  assert(predecessorOutcome);
+  assert.equal(settlement.kind, 'planDecision');
+  assert.equal(settlement.nextTargetKind, 'finalAnswer');
+  assert.equal(settlement.decision.decision, 'reject');
+  assert.equal(
+    settlement.predecessorProviderTurnId,
+    predecessorOutcome.providerTurnId
+  );
+  const { settlementDigest, ...unsignedSettlement } = settlement;
+  assert.equal(
+    settlementDigest,
+    sha256Hash(canonicalJson(unsignedSettlement)),
+    'the pending control close must be a digest-bound Session fact'
+  );
+
+  const finalTurn = JSON.parse(JSON.stringify({
+    ...predecessorTurn,
+    providerTurnId: 'provider-turn-final-after-plan-reject',
+    purpose: 'finalAnswer',
+    target: {
+      kind: 'finalAnswer',
+      inputId: state.currentInputId,
+      controlEpoch: state.controlEpoch,
+      workAuthority: state.workAuthority,
+      reviewRevision: 1,
+      snapshotHighWater: state.lineage.cursor.snapshotHighWater,
+    },
+    planDecision: state.planDecision,
+    providerOutcomes: state.providerOutcomes,
+    pendingProviderControlSettlement: settlement,
+  }));
+  const stableSystemMessages = finalTurn.contextAssembly.messages.filter(
+    (message) => message.role === 'system'
+  );
+  finalTurn.contextAssembly.messages = [
+    ...stableSystemMessages,
+    {
+      role: 'user',
+      content: canonicalJson({
+        schemaVersion: 'deepcode.session.provider-plan-decision.v3',
+        decision: 'reject',
+        planRevision: plan.planRevision,
+      }),
+    },
+    {
+      role: 'user',
+      content: canonicalJson({
+        schemaVersion: 'deepcode.session.provider-turn-frame.v1',
+        targetKind: 'finalAnswer',
+      }),
+    },
+  ];
+  const tools = providerWireToolDefinitionsV2(finalTurn);
+  const material = sessionProviderCacheMaterialV2(
+    finalTurn.contextAssembly.messages,
+    tools
+  );
+  const predecessor = {
+    schemaVersion: 'deepcode.session.provider-cache-predecessor.v2',
+    status: 'available',
+    sessionId: finalTurn.sessionMemory.sessionId,
+    runId: finalTurn.runId,
+    userTurnId: finalTurn.currentInput.inputId,
+    providerTurnId: predecessorOutcome.providerTurnId,
+    controlEpoch: finalTurn.controlEpoch,
+    terminalKind: 'completed',
+    replayEligible: false,
+    externalRequestDigest: `sha256:${'d'.repeat(64)}`,
+    externalRequestBytes: 4096,
+    providerProfileRevisionDigest:
+      finalTurn.providerProfile.providerProfileRevisionDigest,
+    providerProfileId: finalTurn.providerProfile.providerProfileId,
+    provider: predecessorOutcome.providerResult.provider,
+    model: predecessorOutcome.providerResult.model,
+    targetKind: predecessorTurn.target.kind,
+    targetBindingDigest: sha256Hash(canonicalJson(predecessorTurn.target)),
+    toolSchemaDigest: material.toolSchemaDigest,
+    responseFormatDigest: material.responseFormatDigest,
+    toolContextRef: JSON.parse(JSON.stringify(finalTurn.toolContext.contextRef)),
+    cacheLane: {
+      laneId: `sha256:${'c'.repeat(64)}`,
+      laneRevision: 1,
+      relationKind: 'bootstrap',
+      stablePrefixDigest: material.stablePrefixDigest,
+    },
+  };
+  const lane = planSessionProviderCacheLaneV2({
+    turn: finalTurn,
+    fullContextMessages: finalTurn.contextAssembly.messages,
+    tools,
+    predecessor,
+  });
+  assert.equal(lane.mode, 'append');
+  assert.equal(lane.relationKind, 'sameTurnSessionControlContinuation');
+  assert.equal(lane.predecessorRequestId, predecessorOutcome.providerTurnId);
+  assert.equal(lane.resetReason, undefined);
+  const semanticMessages = sessionProviderSemanticMessagesV2(
+    finalTurn,
+    lane,
+    predecessor
+  );
+  const sidecar = buildSessionProviderAdmissionSidecarV2({
+    turn: finalTurn,
+    semanticMessages,
+    fullContextMessages: finalTurn.contextAssembly.messages,
+    tools,
+    cacheLane: lane,
+  });
+  assert.deepEqual(sidecar.controlSettlement, settlement);
+  assert.equal(sidecar.purpose, 'finalAnswer');
+}
 
 async function inputFenceOrdersEpochCancelFactsBeforeNextProvider() {
   const harness = await openSessionHarness();

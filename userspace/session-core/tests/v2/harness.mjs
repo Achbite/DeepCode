@@ -21,13 +21,11 @@ import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
   SessionKernelProviderTransportError,
+  StrictSessionKernelProviderAdapterV2,
   adaptSessionKernelProviderBackendOutputV2,
-  buildSessionPlanConfirmationAuthorityV2,
   canonicalJson,
-  checkpointSessionKernelStateV2,
   prepareSessionKernelFactReplayV3,
   providerWireToolNameV2,
-  recordSessionPlanConfirmationAuthorityV2,
   sha256Hash,
 } from '../../dist/index.js';
 export { assert };
@@ -120,13 +118,16 @@ export function createInput(overrides = {}) {
 }
 function createSessionMemory(sessionId = 'session-v2-contract') {
   const value = {
-    schemaVersion: 'deepcode.session.context-memory.v2',
+    schemaVersion: 'deepcode.session.context-memory.v3',
     sessionId,
     sourceEventVersion: 0,
     sourceEventCount: 0,
     omittedEntryCount: 0,
     truncated: false,
     entries: [],
+    historicalReadCandidateCount: 0,
+    omittedHistoricalReadCandidateCount: 0,
+    historicalReadCandidates: [],
   };
   return {
     ...value,
@@ -184,6 +185,7 @@ export function createPlan(overrides = {}) {
   return {
     runId: overrides.runId ?? RUN_ID,
     inputId: overrides.inputId ?? 'input-initial',
+    controlEpoch: overrides.controlEpoch ?? 1,
     planRevision,
     title: overrides.title ?? 'Write reviewed output',
     objective: overrides.objective ?? 'Write one file inside the workspace.',
@@ -192,6 +194,7 @@ export function createPlan(overrides = {}) {
     evidence: clone(overrides.evidence ?? {
       kernelFactRefs: [],
       readResources: [],
+      historicalRebinds: [],
       blockingUnknowns: [],
       nonBlockingUnknowns: [],
       coverage: 'The requested workspace mutation is fully scoped by the user input.',
@@ -1058,69 +1061,160 @@ export async function persistPreviewAndAcceptPlan(
   harness,
   plan = createPlan()
 ) {
-  await harness.loop.recordPlan(plan);
+  const draft = providerPlanDraftFromMaterializedPlan(plan);
+  const controlArguments = {
+    schemaVersion: 'deepcode.session.plan-proposal.v5',
+    plan: clone(draft),
+  };
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'plan',
+    controlArguments,
+  }));
+  const backendOutput = {
+    kind: 'plan',
+    plan: clone(draft),
+    planProposal: {
+      schemaVersion: 'deepcode.session.plan-proposal.v5',
+      callId: 'call-harness-plan-confirmation',
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
+      argumentsDigest: sha256Hash(canonicalJson(controlArguments)),
+    },
+    items: [{
+      kind: 'text',
+      phase: 'commentary',
+      text: 'The mutation Plan is ready for user confirmation.',
+    }],
+    completion: createProviderCompletionReceipt(responseDigest, {
+      hasToolCalls: true,
+      reasoningTransport:
+        harness.initial.providerProfile.reasoningTransport,
+    }),
+    providerResult: {
+      providerProfileId:
+        harness.initial.providerProfile.providerProfileId,
+      provider: 'contract-provider',
+      model: 'contract-model',
+    },
+    responseDigest,
+  };
+  const adapter = new StrictSessionKernelProviderAdapterV2(
+    { async requestTurn() { return clone(backendOutput); } },
+    {
+      now: () => new Date(
+        Date.parse(NOW) + harness.store.clockSequence
+      ).toISOString(),
+    }
+  );
+  const restoreTerminalEvidence = installPlanningTerminalEvidence(
+    harness,
+    draft,
+    backendOutput.planProposal.callId
+  );
+  harness.enqueueProvider((input) => adapter.requestTurn(input));
+  let proposed;
+  try {
+    proposed = await harness.loop.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+    });
+  } finally {
+    restoreTerminalEvidence();
+  }
+  assert.equal(proposed.kind, 'plan');
+  replaceObjectContents(plan, proposed.plan);
   harness.enqueueKernel(
     'previewCapabilityBatch',
-    (request) => createPreviewBatch(request, harness.initial.runId)
+    (request) => createMaterializedPlanPreviewBatch(
+      request,
+      harness.initial.runId
+    )
   );
   const preview = await harness.loop.previewPlan(plan.planRevision);
   assert.equal(preview.results.length, plan.actions.length);
   assert.equal(preview.results[0].kind, 'previewed');
-  const providerTurnId = 'provider-turn-harness-plan-confirmation';
-  const confirmationEvent = {
-    projectionId: [
-      'run',
-      harness.initial.runId,
-      'plan',
-      plan.planRevision,
-      'confirmation-ready',
-    ].join(':'),
-    runId: harness.initial.runId,
-    recordedAt: NOW,
-    kind: 'plan.confirmationReady',
-    data: {
-      planRevision: plan.planRevision,
-      providerTurnId,
-      plan: clone(plan),
-      scopePreviews: preview.results.map((result) => {
-        assert.equal(result.kind, 'previewed');
-        return clone(result.data.preview);
-      }),
-      recordedAt: NOW,
-    },
-  };
-  const confirmationReceipt = await harness.ports.projection.project(
-    confirmationEvent
-  );
-  let state = harness.loop.snapshot();
-  state = recordSessionPlanConfirmationAuthorityV2(
-    state,
-    buildSessionPlanConfirmationAuthorityV2(state, {
-      providerTurnId,
-      providerResponseDigest: sha256Hash(canonicalJson({
-        kind: 'harness-plan-confirmation',
-        planRevision: plan.planRevision,
-      })),
-      recordedAt: NOW,
-      confirmationProjection: {
-        projectionId: confirmationReceipt.projectionId,
-        projectionDigest: confirmationReceipt.projectionDigest,
-      },
-    })
-  );
-  await harness.ports.persistence.persistCheckpoint(
-    checkpointSessionKernelStateV2(state, NOW)
-  );
-  harness.loop = await SessionKernelLoopV2.open(
-    harness.initial,
-    harness.ports,
-    { factsPageLimit: 32, maxFactsPagesPerWake: 8 }
-  );
+  await harness.loop.publishPlanConfirmationReady(plan.planRevision);
   await harness.loop.decidePlan({
     planRevision: plan.planRevision,
     decision: 'accept',
   });
   return { plan, preview: preview.results[0].data.preview };
+}
+
+function providerPlanDraftFromMaterializedPlan(plan) {
+  return {
+    title: plan.title,
+    objective: plan.objective,
+    narrative: plan.narrative,
+    evidence: {
+      kernelFactRefs: clone(plan.evidence.kernelFactRefs),
+      readResources: clone(plan.evidence.readResources),
+      blockingUnknowns: clone(plan.evidence.blockingUnknowns),
+      nonBlockingUnknowns: clone(plan.evidence.nonBlockingUnknowns),
+      coverage: plan.evidence.coverage,
+    },
+    actions: plan.actions.map((action) => ({
+      toolId: action.manifest.toolId,
+      scopeIntent: clone(action.manifest.scopeIntent),
+      deadline: clone(action.deadline),
+    })),
+  };
+}
+
+function replaceObjectContents(target, source) {
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, clone(source));
+}
+
+function installPlanningTerminalEvidence(harness, draft, callId) {
+  const map = harness.store.providerEvidence;
+  const originalSet = map.set;
+  const proposalArguments = {
+    schemaVersion: 'deepcode.session.plan-proposal.v5',
+    plan: clone(draft),
+  };
+  map.set = function setPlanningEvidence(providerTurnId, evidence) {
+    const terminal = evidence.terminal;
+    if (terminal?.data.terminalKind === 'completed') {
+      terminal.data.orderedItems.push({
+        kind: 'toolCall',
+        index: terminal.data.orderedItems.length,
+        callId,
+        name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
+        arguments: canonicalJson(proposalArguments),
+      });
+      terminal.ref.recordDigest = sha256Hash(canonicalJson(terminal.data));
+    }
+    return originalSet.call(this, providerTurnId, evidence);
+  };
+  return () => {
+    map.set = originalSet;
+  };
+}
+
+function createMaterializedPlanPreviewBatch(request, runId) {
+  const template = {
+    ...clone(KERNEL_CAPABILITY_PREVIEWS.sessionDefault),
+    runId,
+    controlEpoch: request.expectedControlEpoch,
+    contextRef: clone(request.toolContextRef),
+  };
+  return {
+    runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => ({
+      kind: 'previewed',
+      data: {
+        preview: scopedPreviewForItem(
+          request,
+          item,
+          template,
+          `preview-${item.planActionId}`,
+          previewItemPath(item)
+        ),
+      },
+    })),
+  };
 }
 export function providerToolIntent(
   toolId,

@@ -57,6 +57,7 @@ fn rejected_scope_projection_requires_exact_plan_action_binding() {
             "plan": {
                 "runId": "run-rejected-scope",
                 "inputId": "input-rejected-scope",
+                "controlEpoch": 1,
                 "planRevision": plan_revision,
                 "title": "Create one file",
                 "objective": "Create one reviewed workspace file.",
@@ -64,6 +65,7 @@ fn rejected_scope_projection_requires_exact_plan_action_binding() {
                 "evidence": {
                     "kernelFactRefs": [],
                     "readResources": [],
+                    "historicalRebinds": [],
                     "blockingUnknowns": [],
                     "nonBlockingUnknowns": [],
                     "coverage": "The mutation target and tool are exact."
@@ -137,10 +139,8 @@ fn user_intervention_persistence_requires_one_exact_card_wait_or_decision_identi
         },
         "intervention": intervention
     });
-    validate_private_user_intervention(
-        open.as_object().expect("open intervention object"),
-    )
-    .expect("exact intervention wait identity");
+    validate_private_user_intervention(open.as_object().expect("open intervention object"))
+        .expect("exact intervention wait identity");
 
     let accepted = json!({
         "state": "accepted",
@@ -153,18 +153,14 @@ fn user_intervention_persistence_requires_one_exact_card_wait_or_decision_identi
         },
         "intervention": open["intervention"].clone()
     });
-    validate_private_user_intervention(
-        accepted.as_object().expect("accepted intervention object"),
-    )
-    .expect("exact intervention decision identity");
+    validate_private_user_intervention(accepted.as_object().expect("accepted intervention object"))
+        .expect("exact intervention decision identity");
 
     let mut stale = open;
     stale["wait"]["interactionRevision"] = json!("stale-revision");
     assert!(
-        validate_private_user_intervention(
-            stale.as_object().expect("stale intervention object")
-        )
-        .is_err(),
+        validate_private_user_intervention(stale.as_object().expect("stale intervention object"))
+            .is_err(),
         "persistence must fail closed when the ActiveWait and intervention card diverge"
     );
 }
@@ -948,27 +944,32 @@ async fn run_dispatch_scenario(scenario: DispatchScenario) {
         thinking: Some("enabled".to_string()),
         api_key: Some("test-provider-key-not-secret-0001".to_string()),
     };
-    let request_envelope = bootstrap_provider_request_envelope(json!({
-        "messages": [
-            {
-                "role": "user",
-                "content": serde_json::to_string(&initial_input).expect("encode current input")
-            },
-            {
-                "role": "user",
-                "content": serde_json::to_string(&json!({
-                    "schemaVersion": "deepcode.session.provider-plan-decision.v2"
-                })).expect("encode empty plan context")
-            },
-            {
-                "role": "user",
-                "content": serde_json::to_string(&json!({
-                    "schemaVersion": "deepcode.session.provider-review.v2"
-                })).expect("encode empty review context")
-            }
-        ],
-        "tools": []
-    }), &session_id, &profile_revision, &captured_admission);
+    let request_envelope = bootstrap_provider_request_envelope(
+        json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": serde_json::to_string(&initial_input).expect("encode current input")
+                },
+                {
+                    "role": "user",
+                    "content": serde_json::to_string(&json!({
+                        "schemaVersion": "deepcode.session.provider-plan-decision.v2"
+                    })).expect("encode empty plan context")
+                },
+                {
+                    "role": "user",
+                    "content": serde_json::to_string(&json!({
+                        "schemaVersion": "deepcode.session.provider-review.v2"
+                    })).expect("encode empty review context")
+                }
+            ],
+            "tools": []
+        }),
+        &session_id,
+        &profile_revision,
+        &captured_admission,
+    );
     let response = llm_stream_response(
         profile,
         request_envelope,
@@ -1751,12 +1752,7 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
         )
         .expect("commit exact Provider dispatch before Trace activity");
     let incomplete_predecessor = session_store
-        .provider_turn_predecessor_evidence(
-            &session_id,
-            &run_id,
-            &capability,
-            &provider_turn_id,
-        )
+        .provider_turn_predecessor_evidence(&session_id, &run_id, &capability, &provider_turn_id)
         .expect_err("a dispatched turn without a durable terminal is not a predecessor");
     assert_eq!(
         incomplete_predecessor.code,
@@ -1938,17 +1934,9 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
     let superseded_admission = session_store
         .provider_turn_admission(&session_id, &run_id, &capability, &provider_turn_id)
         .expect_err("completed predecessor is no longer the active reservation");
-    assert_eq!(
-        superseded_admission.code,
-        "provider_turn_admission_missing"
-    );
+    assert_eq!(superseded_admission.code, "provider_turn_admission_missing");
     let predecessor = session_store
-        .provider_turn_predecessor_evidence(
-            &session_id,
-            &run_id,
-            &capability,
-            &provider_turn_id,
-        )
+        .provider_turn_predecessor_evidence(&session_id, &run_id, &capability, &provider_turn_id)
         .expect("reconstruct completed predecessor from immutable durable history");
     assert_eq!(predecessor.admission, admission);
     assert_eq!(predecessor.request_digest, sha256_bytes(request_body));
@@ -1957,10 +1945,7 @@ async fn provider_terminal_v3_binds_trace_provider_flavor_retry_reason_and_repla
         SessionProviderTurnTerminalKindV3::Completed
     );
     assert_eq!(predecessor.terminal_reason_code, None);
-    assert_eq!(
-        predecessor.trace_terminal_digest,
-        metadata.terminal_digest
-    );
+    assert_eq!(predecessor.trace_terminal_digest, metadata.terminal_digest);
     assert_eq!(predecessor.trace_seal_digest, metadata.seal_digest);
     assert_eq!(predecessor.trace_record_count, metadata.record_count);
 

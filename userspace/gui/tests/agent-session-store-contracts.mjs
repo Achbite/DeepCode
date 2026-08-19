@@ -1415,7 +1415,7 @@ const contractCases = [
     },
   },
   {
-    id: 'canonical_current_run_routes_require_no_ui_identity_reconciliation',
+    id: 'canonical_exact_run_routes_require_no_ui_identity_reconciliation',
     async run(host) {
       const sessionId = 'identity-a';
       const scenario = new Scenario(this.id, [sessionId]);
@@ -1447,27 +1447,27 @@ const contractCases = [
         ));
         return true;
       });
-      await store.getState().cancelCurrentRun();
+      await store.getState().cancelCurrentRun('host-identity-a');
       assert.equal(
         scenario.recordsOf('cancel').at(-1)?.runId,
-        'current',
-        'the GUI did not use the canonical current-Run cancellation route'
+        'host-identity-a',
+        'the GUI did not preserve the exact Composer-owned Run identity'
       );
       await waitFor(
         () => !store.getState().timeline?.runProjection,
         'terminal canonical timeline'
       );
       const cancelCount = scenario.recordsOf('cancel').length;
-      await store.getState().cancelCurrentRun();
+      await store.getState().cancelCurrentRun('host-identity-a');
       assert.equal(
         scenario.recordsOf('cancel').length,
         cancelCount + 1,
-        'the GUI retained a local terminal identity gate instead of deferring to the canonical current-Run route'
+        'the GUI retained a local terminal gate instead of retrying the same exact Run identity'
       );
       assert.equal(
         scenario.recordsOf('cancel').at(-1)?.runId,
-        'current',
-        'repeat cancellation reconstructed a stale Host Run identity'
+        'host-identity-a',
+        'repeat cancellation changed the caller-provided canonical Run identity'
       );
       scenario.handlers.delete('cancel');
       await cleanupStore(store);
@@ -1715,7 +1715,7 @@ const contractCases = [
         'unrelated Session C loading'
       );
       assert.equal(store.getState().loading, true);
-      await store.getState().cancelCurrentRun();
+      await store.getState().cancelCurrentRun('host-cancel-a');
       const stateAfterCancel = store.getState();
       assert.equal(
         stateAfterCancel.loading,
@@ -1724,7 +1724,7 @@ const contractCases = [
       );
       assert.equal(
         scenario.recordsOf('cancel').at(-1)?.runId,
-        'current'
+        'host-cancel-a'
       );
 
       host.currentSessionId = sessionC;

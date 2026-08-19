@@ -707,9 +707,6 @@ async function structuredProviderRecoveryIsSharedStateWithoutPrivateFailurePaylo
       code: 'provider_tool_call_arguments_invalid',
       stage: 'provider.structuredRepair',
       currentActivityCode: 'session.validating',
-      sourceTerminalKind: 'failed',
-      failureDigest: digest('f'),
-      providerOutcome: providerOutcome(),
     }
   );
   assert.equal(recovering.kind, 'workflow_stage');
@@ -750,7 +747,6 @@ async function structuredProviderRecoveryIsSharedStateWithoutPrivateFailurePaylo
       code: 'session_kernel_provider_structured_repair_no_progress',
       message: 'Structured Provider repair made no progress.',
       stage: 'provider.structuredRepairNoProgress',
-      providerOutcome: providerOutcome(),
     }
   );
   const failedProjection = buildNarrativeTimelineProjection({
@@ -1101,6 +1097,7 @@ function threeActionPlan(runId, identity = 'authority') {
   return {
     runId,
     inputId: `input-${runId}`,
+    controlEpoch: 1,
     planRevision,
     title: `Reviewed ${identity} plan`,
     objective: `Exercise exact ${identity} PlanAction projection.`,
@@ -1108,6 +1105,7 @@ function threeActionPlan(runId, identity = 'authority') {
     evidence: {
       kernelFactRefs: [],
       readResources: [],
+      historicalRebinds: [],
       blockingUnknowns: [],
       nonBlockingUnknowns: [],
       coverage: `All ${identity} mutation targets are explicitly scoped.`,

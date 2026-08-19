@@ -21,13 +21,225 @@ fn test_profile() -> ResolvedLlmProfile {
 
 #[test]
 fn planning_control_continuation_uses_current_plan_v5_contract() {
-    let (tool_name, next_targets) =
+    let tool_name =
         provider_native_session_control_contract(&SessionProviderTargetBindingSidecarV2::Planning)
             .expect("planning must have a Session control continuation contract");
 
     assert_eq!(tool_name, "deepcode_session_plan_propose_v5");
     assert_ne!(tool_name, "deepcode_session_plan_propose_v4");
-    assert_eq!(next_targets, &["planning", "planAction"]);
+}
+
+fn plan_reject_control_settlement_value() -> Value {
+    let mut settlement = json!({
+        "kind": "planDecision",
+        "schemaVersion": "deepcode.session.provider-control-settlement.v2",
+        "runId": "run-control-settlement",
+        "inputId": "input-control-settlement",
+        "controlEpoch": 1,
+        "predecessorProviderTurnId": "provider-turn-plan",
+        "nextTargetKind": "finalAnswer",
+        "control": {
+            "schemaVersion": "deepcode.session.plan-proposal.v5",
+            "callId": "call-plan-proposal",
+            "toolName": "deepcode_session_plan_propose_v5",
+            "argumentsDigest": format!("sha256:{}", "a".repeat(64)),
+        },
+        "decision": {
+            "planRevision": "plan-revision-1",
+            "decision": "reject",
+            "recordedAt": "2026-08-17T00:00:00.000Z",
+        },
+        "recordedAt": "2026-08-17T00:00:00.000Z",
+    });
+    let digest = crate::host_v2_storage::stable_json_sha256(&settlement)
+        .expect("settlement fixture must have a stable digest");
+    settlement
+        .as_object_mut()
+        .expect("settlement fixture must be an object")
+        .insert("settlementDigest".to_string(), Value::String(digest));
+    settlement
+}
+
+fn plan_preview_rejected_control_settlement_value() -> Value {
+    let mut settlement = json!({
+        "kind": "planPreviewRejected",
+        "schemaVersion": "deepcode.session.provider-control-settlement.v2",
+        "runId": "run-control-settlement",
+        "inputId": "input-control-settlement",
+        "controlEpoch": 1,
+        "predecessorProviderTurnId": "provider-turn-plan",
+        "nextTargetKind": "planning",
+        "control": {
+            "schemaVersion": "deepcode.session.plan-proposal.v5",
+            "callId": "call-plan-proposal",
+            "toolName": "deepcode_session_plan_propose_v5",
+            "argumentsDigest": format!("sha256:{}", "a".repeat(64)),
+        },
+        "preview": {
+            "planRevision": "plan-revision-1",
+            "rejections": [{
+                "planActionId": "plan-action-1",
+                "operationId": "operation-1",
+                "toolId": "fs.write",
+                "reason": "requestedScopeInvalid",
+                "guidance": "Use a workspace resource admitted by the current tool contract.",
+            }],
+        },
+        "recordedAt": "2026-08-17T00:00:00.000Z",
+    });
+    let digest = crate::host_v2_storage::stable_json_sha256(&settlement)
+        .expect("settlement fixture must have a stable digest");
+    settlement
+        .as_object_mut()
+        .expect("settlement fixture must be an object")
+        .insert("settlementDigest".to_string(), Value::String(digest));
+    settlement
+}
+
+#[test]
+fn plan_reject_control_settlement_closes_into_final_answer() {
+    let settlement = serde_json::from_value::<SessionProviderControlSettlementSidecarV2>(
+        plan_reject_control_settlement_value(),
+    )
+    .expect("the exact Plan rejection settlement must decode");
+
+    settlement
+        .validate()
+        .expect("the exact Plan rejection settlement must validate");
+    assert_eq!(settlement.next_target_kind(), "finalAnswer");
+    assert_eq!(
+        settlement.expected_parent_tool_name(),
+        "deepcode_session_plan_propose_v5"
+    );
+    assert_eq!(
+        settlement.continuation_output(),
+        json!({
+            "schemaVersion": "deepcode.session.control-continuation-result.v2",
+            "status": "settled",
+            "control": "deepcode_session_plan_propose_v5",
+            "nextTargetKind": "finalAnswer",
+            "decision": "reject",
+            "planRevision": "plan-revision-1",
+        })
+    );
+
+    let mut tampered = plan_reject_control_settlement_value();
+    tampered["decision"]["decision"] = Value::String("accept".to_string());
+    let tampered = serde_json::from_value::<SessionProviderControlSettlementSidecarV2>(tampered)
+        .expect("the tampered settlement still has a decodable wire shape");
+    assert!(
+        tampered.validate().is_err(),
+        "changing the decision without resealing the digest must fail closed"
+    );
+}
+
+#[test]
+fn plan_preview_rejection_closes_into_replanning() {
+    let settlement = serde_json::from_value::<SessionProviderControlSettlementSidecarV2>(
+        plan_preview_rejected_control_settlement_value(),
+    )
+    .expect("the exact Plan preview rejection settlement must decode");
+
+    settlement
+        .validate()
+        .expect("the exact Plan preview rejection settlement must validate");
+    assert_eq!(settlement.next_target_kind(), "planning");
+    assert_eq!(
+        settlement.expected_parent_tool_name(),
+        "deepcode_session_plan_propose_v5"
+    );
+    assert_eq!(
+        settlement.continuation_output(),
+        json!({
+            "schemaVersion": "deepcode.session.control-continuation-result.v2",
+            "status": "rejected",
+            "control": "deepcode_session_plan_propose_v5",
+            "reasonCode": "planPreviewRejected",
+            "nextTargetKind": "planning",
+            "planRevision": "plan-revision-1",
+            "rejections": [{
+                "planActionId": "plan-action-1",
+                "operationId": "operation-1",
+                "toolId": "fs.write",
+                "reason": "requestedScopeInvalid",
+                "guidance": "Use a workspace resource admitted by the current tool contract.",
+            }],
+        })
+    );
+
+    let mut unsorted = plan_preview_rejected_control_settlement_value();
+    unsorted["preview"]["rejections"] = json!([
+        {
+            "planActionId": "plan-action-2",
+            "operationId": "operation-2",
+            "toolId": "fs.write",
+            "reason": "settingsDenied",
+            "guidance": "Use an allowed resource.",
+        },
+        {
+            "planActionId": "plan-action-1",
+            "operationId": "operation-1",
+            "toolId": "fs.write",
+            "reason": "requestedScopeInvalid",
+            "guidance": "Use a valid resource.",
+        }
+    ]);
+    unsorted
+        .as_object_mut()
+        .expect("unsorted settlement must be an object")
+        .remove("settlementDigest");
+    let digest = crate::host_v2_storage::stable_json_sha256(&unsorted)
+        .expect("unsorted settlement fixture must have a stable digest");
+    unsorted["settlementDigest"] = Value::String(digest);
+    let unsorted = serde_json::from_value::<SessionProviderControlSettlementSidecarV2>(unsorted)
+        .expect("the unsorted settlement still has a decodable wire shape");
+    assert!(
+        unsorted.validate().is_err(),
+        "Plan preview rejection items must be canonical, unique, and sorted"
+    );
+}
+
+#[test]
+fn session_control_append_without_durable_settlement_fails_closed() {
+    let digest = format!("sha256:{}", "b".repeat(64));
+    let sidecar = json!({
+        "schemaVersion": SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2,
+        "sessionId": "session-control-settlement",
+        "runId": "run-control-settlement",
+        "providerTurnId": "provider-turn-continuation",
+        "userTurnId": "input-control-settlement",
+        "controlEpoch": 1,
+        "purpose": "continuation",
+        "targetKind": "planning",
+        "targetBinding": { "kind": "planning" },
+        "providerProfileRevisionDigest": digest,
+        "currentInputDigest": digest,
+        "contextAssemblyDigest": digest,
+        "semanticMessagesDigest": digest,
+        "toolSchemaDigest": digest,
+        "responseFormatDigest": digest,
+        "toolContextRef": {
+            "contextVersion": 1,
+            "catalogDigest": digest,
+            "contextDigest": digest,
+        },
+        "authority": {},
+        "continuationOperationIds": [],
+        "continuationOutcomes": [],
+        "cacheLane": {
+            "laneId": "lane-control-settlement",
+            "laneRevision": 1,
+            "mode": "append",
+            "relationKind": "sameTurnSessionControlContinuation",
+            "stablePrefixDigest": digest,
+            "predecessorRequestId": "provider-turn-plan",
+            "predecessorExternalDigest": digest,
+        },
+    });
+
+    let error = SessionProviderAdmissionSidecarV2::decode_private_value(sidecar)
+        .expect_err("a Session control append without its durable settlement must be rejected");
+    assert_eq!(error.0, "provider_control_continuation_invalid");
 }
 
 #[test]

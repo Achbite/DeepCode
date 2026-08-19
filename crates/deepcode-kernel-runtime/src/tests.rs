@@ -5,10 +5,10 @@ use deepcode_kernel_abi::v2::{
     RunId, UserDecisionRefV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2,
-    CapabilityScopePreviewOriginV3, CapabilityScopePreviewReplyV2, CommandHandlingV2,
-    DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2,
-    KernelReplyV2, RunOpenV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
+    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2, CapabilityScopePreviewOriginV3,
+    CapabilityScopePreviewReplyV2, CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2,
+    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelReplyV2, RunOpenV2,
+    ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::{
     CapabilityLeaseRefV2, CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2,

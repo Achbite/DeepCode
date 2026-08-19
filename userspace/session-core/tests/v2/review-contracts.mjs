@@ -430,6 +430,8 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   assert.equal(secondClassification.kind, 'noTool');
   const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
+  const providerTurnCountBeforeQueueReentry =
+    harness.providerInputs.length;
   assert.equal(
     harness.loop.snapshot().providerToolCallQueue.outcomeRecorded,
     false
@@ -533,7 +535,7 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   );
   assert.equal(
     harness.providerInputs.length,
-    1,
+    providerTurnCountBeforeQueueReentry,
     'an active queue must reject a new Provider turn before transport'
   );
 
@@ -584,7 +586,10 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     remainingToolCallBudget: 1,
   });
   assert.deepEqual(continued, { kind: 'noTool' });
-  assert.equal(harness.providerInputs.length, 2);
+  assert.equal(
+    harness.providerInputs.length,
+    providerTurnCountBeforeQueueReentry + 1
+  );
   settled = harness.loop.snapshot();
   const review = buildSessionKernelReviewV2(
     settled,
