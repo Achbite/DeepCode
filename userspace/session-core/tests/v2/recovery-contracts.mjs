@@ -11,24 +11,27 @@ import {
   NOW,
   admittedReply,
   assert,
-  awaitingCapabilityReply,
   checkpointFromStateV3,
   createFactsPage,
   createCorpusToolContext,
   createDurablePersistenceHarness,
   createDurableRecordV3,
-  createExpandedPreview,
+  createInterventionCandidatePreviewBatch,
   createFailedProviderEvidence,
   createInitialState,
+  createOutOfPlanDiscoveryPreviewBatch,
   createPlan,
+  createPlanDiscoveryPreviewBatch,
   createSessionHarness,
   createToolContextSnapshotRecordV3,
   corpusFact,
   openSessionHarness,
   persistPreviewAndAcceptPlan,
   providerAnswer,
+  providerIntervention,
   providerEvidenceRecordsV3,
   providerPlanActionComplete,
+  providerStructuredFailure,
   providerToolIntent,
   providerToolIntents,
   toolContextRef,
@@ -39,16 +42,24 @@ import {
 
 export const contractCases = [
   {
-    id: 'session_schema_accepts_only_current_v3_history',
-    run: sessionSchemaAcceptsOnlyCurrentV3History,
+    id: 'session_schema_accepts_only_current_v4_history',
+    run: sessionSchemaAcceptsOnlyCurrentV4History,
   },
   {
-    id: 'active_v3_compact_checkpoint_and_public_settlement_restore_only_committed_refs',
-    run: activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs,
+    id: 'active_v4_compact_checkpoint_and_public_settlement_restore_only_committed_refs',
+    run: activeV4CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs,
+  },
+  {
+    id: 'replayed_committed_projection_is_idempotent_but_changed_content_fails_closed',
+    run: replayedCommittedProjectionIsIdempotentButChangedContentFailsClosed,
   },
   {
     id: 'completed_and_noncompleted_provider_terminal_recovery_never_reissues_unresolved_request',
     run: completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnresolvedRequest,
+  },
+  {
+    id: 'failed_structured_terminal_recovers_into_a_new_bound_request',
+    run: failedStructuredTerminalRecoversIntoANewBoundRequest,
   },
   {
     id: 'historical_tool_context_snapshot_recovers_outcomes_across_refresh',
@@ -87,12 +98,12 @@ export const contractCases = [
     run: contextInvalidationRefreshesOnceAtTheNextProviderBoundary,
   },
   {
-    id: 'capability_allow_continues_the_same_invocation_with_a_new_lease',
-    run: capabilityAllowContinuesSameInvocationWithNewLease,
+    id: 'out_of_plan_mutation_freezes_effect_and_publishes_one_consolidated_intervention',
+    run: outOfPlanMutationFreezesEffectAndPublishesOneConsolidatedIntervention,
   },
   {
-    id: 'capability_deny_guides_next_turn_without_session_manufactured_effect',
-    run: capabilityDenyGuidesNextTurnWithoutSessionManufacturedEffect,
+    id: 'intervention_revision_preserves_identity_and_rejection_requires_run_cancellation',
+    run: interventionRevisionPreservesIdentityAndRejectionRequiresRunCancellation,
   },
   {
     id: 'fact_reconciliation_follows_multi_page_continuation',
@@ -108,7 +119,7 @@ export const contractCases = [
   },
 ];
 
-async function sessionSchemaAcceptsOnlyCurrentV3History() {
+async function sessionSchemaAcceptsOnlyCurrentV4History() {
   const current = createDurablePersistenceHarness();
   assert.equal(
     await current.persistence.loadCheckpoint(
@@ -118,6 +129,7 @@ async function sessionSchemaAcceptsOnlyCurrentV3History() {
     undefined
   );
   for (const historySchema of [
+    'deepcode.session.kernel-persistence.v3',
     'deepcode.session.kernel-persistence.v2',
     'deepcode.session.kernel-checkpoint.v2',
     'deepcode.session.kernel-persistence.v1',
@@ -150,7 +162,7 @@ async function sessionSchemaAcceptsOnlyCurrentV3History() {
   );
 }
 
-async function activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs() {
+async function activeV4CompactCheckpointAndPublicSettlementRestoreOnlyCommittedRefs() {
   const durable = createDurablePersistenceHarness({
     sessionId: 'session-compact-settlement-contract',
   });
@@ -266,6 +278,114 @@ async function activeV3CompactCheckpointAndPublicSettlementRestoreOnlyCommittedR
   );
 }
 
+async function replayedCommittedProjectionIsIdempotentButChangedContentFailsClosed() {
+  const durable = createDurablePersistenceHarness({
+    sessionId: 'session-projection-replay-contract',
+  });
+  const { initial, persistence, store } = durable;
+  await persistence.persistInput(initial.initialInput);
+  const state = createSessionKernelLoopStateV2(initial);
+  const request = (sequence) => ({
+    requestId: `request-projection-replay-${sequence}`,
+    lane: 'query',
+    intent: {
+      kind: 'toolContextGet',
+      payload: { knownContext: toolContextRef(initial.toolContext) },
+    },
+    startedAt: NOW,
+    attemptCount: 1,
+  });
+  const authorization = {
+    projectionId: 'projection-authorization-fact-1',
+    runId: initial.runId,
+    recordedAt: NOW,
+    kind: 'authorization.decided',
+    data: {
+      factId: 'fact-authorization-1',
+      factKind: 'capabilityIssued',
+      controlEpoch: initial.controlEpoch,
+      planActionIds: ['plan-action-projection-replay-1'],
+      operationId: 'operation-projection-replay-1',
+      resourceIds: [],
+      details: { source: 'canonical-kernel-fact' },
+    },
+  };
+
+  const first = request(1);
+  await persistence.persistPublicRequest(first);
+  state.checkpointRevision = 1;
+  await persistence.settlePublicRequest(
+    first,
+    sha256Hash(canonicalJson({ sequence: 1 })),
+    checkpointFromStateV3(state),
+    [authorization]
+  );
+
+  const second = request(2);
+  const currentRequestProjection = {
+    projectionId: 'projection-current-request-2',
+    runId: initial.runId,
+    recordedAt: NOW,
+    kind: 'input.persisted',
+    data: {
+      inputId: initial.initialInput.inputId,
+      opaqueInputRef: initial.initialInput.opaqueInputRef,
+      text: initial.initialInput.text,
+      attachments: initial.initialInput.attachments,
+      recordedAt: initial.initialInput.recordedAt,
+      controlEpoch: initial.controlEpoch,
+    },
+  };
+  await persistence.persistPublicRequest(second);
+  state.checkpointRevision = 2;
+  await persistence.settlePublicRequest(
+    second,
+    sha256Hash(canonicalJson({ sequence: 2 })),
+    checkpointFromStateV3(state),
+    [currentRequestProjection, clone(authorization)]
+  );
+
+  const secondMarker = store.records.find(
+    (record) => record.recordKind === 'publicRequestSettled'
+      && record.data.requestId === second.requestId
+  );
+  assert(secondMarker);
+  assert.equal(secondMarker.data.projectionRefs.length, 1);
+  assert.equal(
+    secondMarker.data.projectionRefs[0].recordId.endsWith(
+      `projection:${currentRequestProjection.projectionId}`
+    ),
+    true
+  );
+  assert.equal(
+    store.records.filter((record) =>
+      record.recordKind === 'projection'
+      && record.data.event.projectionId === authorization.projectionId
+    ).length,
+    1,
+    'exact replay must reuse the one committed projection identity'
+  );
+
+  const third = request(3);
+  await persistence.persistPublicRequest(third);
+  state.checkpointRevision = 3;
+  const changedAuthorization = clone(authorization);
+  changedAuthorization.data.details = {
+    source: 'changed-noncanonical-content',
+  };
+  await assert.rejects(
+    persistence.settlePublicRequest(
+      third,
+      sha256Hash(canonicalJson({ sequence: 3 })),
+      checkpointFromStateV3(state),
+      [changedAuthorization]
+    ),
+    (error) =>
+      error?.code
+        === 'session_kernel_public_request_projection_replay_conflict'
+  );
+}
+
 async function completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnresolvedRequest() {
   const completed = await createCompletedProviderDurableHistory(
     'session-completed-terminal-recovery'
@@ -296,11 +416,16 @@ async function completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnre
   restartedTool.ports.persistence = completedTool.persistence;
   await restartedTool.open();
   assert.equal(restartedTool.loop.snapshot().plan.planRevision,
-    'plan-revision-1');
+    completedTool.plan.planRevision);
   assert.equal(restartedTool.loop.snapshot().providerToolCallQueue.status,
     'completed');
-  assert.equal(restartedTool.loop.snapshot().providerOutcomes[0].outputKind,
-    'toolIntent');
+  assert.deepEqual(
+    restartedTool.loop.snapshot().providerOutcomes.map(
+      (outcome) => outcome.outputKind
+    ),
+    ['plan', 'toolIntent'],
+    'recovery must retain the native Plan control before its tool continuation'
+  );
   assert.equal(restartedTool.store.providerRequestCount, 0);
   assert.equal(restartedTool.calls('submitToolIntent').length, 0);
 
@@ -353,6 +478,71 @@ async function completedAndNoncompletedProviderTerminalRecoveryNeverReissuesUnre
   assert.equal(restartedUnresolved.calls('submitToolIntent').length, 0);
 }
 
+async function failedStructuredTerminalRecoversIntoANewBoundRequest() {
+  const initial = createInitialState();
+  const failure = providerStructuredFailure({
+    callId: 'call-structured-restart-source',
+  })({ providerProfile: initial.providerProfile }).harnessProviderFailure;
+  const durable = await createNoncompletedProviderHistory({
+    terminalKind: 'failed',
+    reasonCode: failure.errorCode,
+    expectedStatus: 'active',
+    structuredFailure: failure.structuredFailure,
+    providerResult: failure.providerResult,
+  });
+  const restarted = createSessionHarness({ initial: durable.initial });
+  restarted.ports.persistence = durable.persistence;
+  // The production ID factory carries a fresh process nonce after restart.
+  // Keep the deterministic harness identity distinct from the sealed source
+  // request so the contract still proves one ID per physical request.
+  restarted.store.providerSequence = 1;
+  await restarted.open();
+
+  assert.equal(restarted.store.providerRequestCount, 0);
+  const sourceTurn = restarted.loop.snapshot().providerTurn;
+  assert.equal(sourceTurn.status, 'failed');
+  assert.equal(
+    sourceTurn.nextStructuredRepair.predecessorProviderTurnId,
+    sourceTurn.providerTurnId
+  );
+  assert.equal(
+    sourceTurn.nextStructuredRepair.failureDigest,
+    failure.structuredFailure.failureDigest
+  );
+
+  const recoveredAnswer = providerAnswer('Recovered after restart.');
+  restarted.enqueueProvider((input) => {
+    const evidence = providerEvidenceRecordsV3(
+      durable.sessionId,
+      durable.initial.runId,
+      input,
+      recoveredAnswer
+    );
+    durable.store.seedDaemonRecord(evidence.dispatch);
+    durable.store.seedDaemonRecord(evidence.terminal);
+    return recoveredAnswer;
+  });
+  const result = await restarted.loop.runProviderTurn({
+    reason: 'recovery',
+    target: { kind: 'planning' },
+  });
+  assert.equal(result.kind, 'answer');
+  assert.equal(restarted.providerInputs.length, 1);
+  assert.notEqual(
+    restarted.providerInputs[0].providerTurnId,
+    sourceTurn.providerTurnId
+  );
+  assert.equal(restarted.providerInputs[0].purpose, 'continuation');
+  assert.equal(
+    restarted.providerInputs[0].structuredRepair.predecessorProviderTurnId,
+    sourceTurn.providerTurnId
+  );
+  assert.equal(
+    restarted.providerInputs[0].structuredRepair.failureDigest,
+    failure.structuredFailure.failureDigest
+  );
+}
+
 async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
   const durable = await createCompletedToolProviderDurableHistory(
     'session-historical-context-recovery'
@@ -367,7 +557,8 @@ async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
     )
   );
   const state = clone(durable.completedState);
-  state.checkpointRevision = 2;
+  state.checkpointRevision =
+    durable.completedState.checkpointRevision + 1;
   state.toolContext = {
     bundle: refreshed,
     refreshRequired: false,
@@ -387,10 +578,12 @@ async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
     toolContextRef(restored.state.toolContext.bundle),
     toolContextRef(refreshed)
   );
-  assert.equal(restored.state.providerOutcomes.length, 1);
-  assert.equal(restored.state.providerOutcomes[0].outputKind, 'toolIntent');
+  assert.deepEqual(
+    restored.state.providerOutcomes.map((outcome) => outcome.outputKind),
+    ['plan', 'toolIntent']
+  );
   assert.equal(
-    restored.state.providerOutcomes[0].toolCallReceipt.calls[0].toolId,
+    restored.state.providerOutcomes[1].toolCallReceipt.calls[0].toolId,
     'fs.write'
   );
   assert.equal(
@@ -399,7 +592,7 @@ async function historicalToolContextSnapshotRecoversOutcomesAcrossRefresh() {
     'the current refreshed ToolContext intentionally cannot decode old fs.write'
   );
   assert.equal(
-    restored.state.providerOutcomes[0].summary,
+    restored.state.providerOutcomes[1].summary,
     'Completed 1 ordered Provider tool call(s).'
   );
   const originalReservation = durable.store.records
@@ -428,7 +621,8 @@ async function missingOrConflictingToolContextSnapshotFailsClosedWithoutCurrentB
     )
   );
   const state = clone(durable.completedState);
-  state.checkpointRevision = 2;
+  state.checkpointRevision =
+    durable.completedState.checkpointRevision + 1;
   state.toolContext = { bundle: refreshed, refreshRequired: false };
   state.providerTurn = undefined;
   state.providerToolCallQueue = undefined;
@@ -962,12 +1156,6 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
       value.state.providerToolCallQueue.calls[0].requestId = undefined;
     },
     (value) => {
-      value.state.providerToolCallQueue.target = {
-        kind: 'planAction',
-        planActionId: 'plan-action-forged',
-      };
-    },
-    (value) => {
       value.state.providerToolCallQueue.calls[1].intent.operationId =
         value.state.providerToolCallQueue.calls[0].intent.operationId;
     },
@@ -1006,6 +1194,15 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
   }
   const correlationCorruptions = [
     {
+      label: 'Provider queue target differs from its durable Provider turn',
+      corrupt(value) {
+        value.state.providerToolCallQueue.target = {
+          kind: 'planAction',
+          planActionId: 'plan-action-forged',
+        };
+      },
+    },
+    {
       label: 'missing ContextRead work authority',
       corrupt(value) {
         value.state.workAuthority = undefined;
@@ -1015,11 +1212,17 @@ async function corruptedProviderToolQueueCheckpointFailsClosed() {
       label: 'ContextRead work authority missing the queued operation',
       corrupt(value) {
         const operationIds = ['operation-unrelated-context-read'];
+        const { batchSequence, predecessorDigest } =
+          value.state.workAuthority;
         value.state.workAuthority = {
           kind: 'contextRead',
+          batchSequence,
+          predecessorDigest,
           operationIds,
           digest: sha256Hash(canonicalJson({
             kind: 'contextRead',
+            batchSequence,
+            predecessorDigest,
             operationIds,
           })),
         };
@@ -1151,15 +1354,17 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(first, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(first, plan);
+  const planActionId = plan.actions[0].manifest.planActionId;
   const admitted = corpusFact('invocationToolIntentAdmitted', {
     factId: 'fact-admitted-before-restart',
     ledgerSequence: 6,
     runSequence: 1,
     identities: {
       runId: first.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       operationId: 'operation-restart',
       invocationId: 'invocation-restart',
       attemptId: 'attempt-restart',
@@ -1171,8 +1376,8 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
     runSequence: 2,
     identities: {
       runId: first.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       operationId: 'operation-restart',
       invocationId: 'invocation-restart',
       attemptId: 'attempt-restart',
@@ -1206,7 +1411,7 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
   assert.equal(restored.lineage.cursor.snapshotHighWater, 7);
   assert.equal(
     restored.lineage.planActions[
-      'plan-action-golden-1'
+      planActionId
     ].operationIds.includes('operation-restart'),
     true,
     'facts replay must restore the dynamic operation under its PlanAction'
@@ -1230,6 +1435,8 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
     { path: 'output.txt', content: 'contract output' },
     'provider-call-restart-reuse'
   ));
+  restarted.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   restarted.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(restarted, request, {
@@ -1237,14 +1444,17 @@ async function restartRebuildsSessionStateFromCanonicalFacts() {
       attemptId: 'attempt-restart-reuse',
     })
   );
-  await restarted.loop.runProviderTurn({
+  const classified = await restarted.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
-      planActionId: 'plan-action-golden-1',
+      planActionId,
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const readmitted = await restarted.loop.resumePendingProviderToolCalls();
+  assert.equal(readmitted.kind, 'admitted');
   assert.deepEqual(
     restarted.calls('submitToolIntent').at(-1).intent.authority.data.lease,
     replayedLease,
@@ -1262,7 +1472,9 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(harness, plan);
+  const planActionId = plan.actions[0].manifest.planActionId;
   harness.enqueueProvider(
     providerToolIntent(
       'fs.write',
@@ -1270,6 +1482,8 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
       'provider-call-indeterminate'
     )
   );
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   harness.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(harness, request, {
@@ -1277,14 +1491,16 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
       attemptId: 'attempt-indeterminate',
     })
   );
-  const admitted = await harness.loop.runProviderTurn({
+  const classified = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
-      planActionId: 'plan-action-golden-1',
+      planActionId,
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
 
   harness.appendFacts(corpusFact('invocationToolIndeterminate', {
@@ -1293,8 +1509,8 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
     runSequence: harness.nextRunSequence(),
     identities: {
       runId: harness.initial.runId,
-      planRevision: 'plan-revision-golden-1',
-      planActionId: 'plan-action-golden-1',
+      planRevision: plan.planRevision,
+      planActionId,
       indeterminateOperationId: admitted.operationId,
       indeterminateInvocationId: admitted.invocationId,
       indeterminateAttemptId: 'attempt-indeterminate',
@@ -1305,8 +1521,8 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
     waitKind: 'invocation',
     operationId: admitted.operationId,
     invocationId: admitted.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
+    planActionId,
+    expectedPlanRevision: plan.planRevision,
   });
 
   const wait = harness.loop.snapshot().activeWait;
@@ -1324,7 +1540,7 @@ async function indeterminateMutationRequiresManualRecoveryWithoutRetry() {
       reason: 'recovery',
       target: {
         kind: 'planAction',
-        planActionId: 'plan-action-golden-1',
+        planActionId,
       },
       remainingToolCallBudget: 32,
     }),
@@ -1560,7 +1776,124 @@ function withToolContextCatalog(toolContext, catalogDigest) {
   return forged;
 }
 
-async function capabilityAllowContinuesSameInvocationWithNewLease() {
+async function outOfPlanMutationFreezesEffectAndPublishesOneConsolidatedIntervention() {
+  const { harness, plan, intervention } = await prepareOpenIntervention();
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(harness.loop.snapshot().activeWait?.kind, 'userIntervention');
+  assert.equal(intervention.options.length, 2);
+  const durableWait = clone(harness.loop.snapshot());
+  const restoredWait = restoreSessionKernelLoopStateV2(
+    checkpointFromStateV3(durableWait),
+    {
+      runId: durableWait.runId,
+      workspaceBindingDigest: durableWait.workspaceBindingDigest,
+      sessionMemory: durableWait.sessionMemory,
+      providerProfile: durableWait.providerProfile,
+    }
+  );
+  assert.equal(
+    restoredWait.providerOutcomes.find((outcome) =>
+      outcome.providerTurnId === restoredWait.providerTurn.providerTurnId
+    )?.outputKind,
+    'intervention',
+    'a private Session control must remain recoverable before facts reconciliation'
+  );
+  assert.equal(restoredWait.activeWait?.kind, 'userIntervention');
+  assert.deepEqual(
+    intervention.affectedPlanActionIds,
+    [plan.actions[0].manifest.planActionId]
+  );
+  const executable = intervention.options.find(
+    (option) => option.kind === 'executable'
+  );
+  assert.ok(executable);
+  assert.equal(executable.actions.length, 1);
+  assert.equal(
+    executable.actions[0].preview.origin.kind,
+    'interventionCandidate'
+  );
+  assert.equal(
+    executable.actions[0].preview.disposition,
+    'requiresUserDecision'
+  );
+  const guidanceOnly = intervention.options.find(
+    (option) => option.kind === 'guidanceOnly'
+  );
+  const decision = await harness.loop.decideUserIntervention({
+    interactionId: intervention.interactionId,
+    interactionRevision: intervention.interactionRevision,
+    candidateSetDigest: intervention.candidateSetDigest,
+    decision: 'select',
+    optionId: guidanceOnly.optionId,
+    guidance: 'Keep the original mutation boundary.',
+    callerRequestId: 'caller-guidance-only-1',
+  });
+  assert.equal(decision.disposition, 'guidanceReplan');
+  assert.equal(harness.loop.snapshot().activeWait, undefined);
+  assert.equal(harness.loop.snapshot().userIntervention, undefined);
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(
+    harness.kernelState.facts.some((fact) => fact.domain === 'effect'),
+    false
+  );
+}
+
+async function interventionRevisionPreservesIdentityAndRejectionRequiresRunCancellation() {
+  const { harness, intervention, preview } = await prepareOpenIntervention();
+  const revised = await harness.loop.decideUserIntervention({
+    interactionId: intervention.interactionId,
+    interactionRevision: intervention.interactionRevision,
+    candidateSetDigest: intervention.candidateSetDigest,
+    decision: 'revise',
+    guidance: 'Compare one narrower alternative before asking again.',
+    callerRequestId: 'caller-revise-intervention-1',
+  });
+  assert.equal(revised.disposition, 'researchRevision');
+  const research = harness.loop.snapshot().interventionResearch;
+  assert.equal(research.guidanceRevision, 2);
+  assert.equal(harness.loop.snapshot().userIntervention, undefined);
+
+  const draft = interventionDraft(
+    'Revised consolidated intervention',
+    intervention.affectedPlanActionIds[0]
+  );
+  harness.enqueueProvider(providerIntervention(
+    draft,
+    'intervention-proposal-revised'
+  ));
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createInterventionCandidatePreviewBatch(request, preview));
+  const regenerated = await harness.loop.runProviderTurn({
+    reason: 'recovery',
+    target: {
+      kind: 'interventionResearch',
+      researchId: research.researchId,
+    },
+  });
+  assert.equal(regenerated.kind, 'noTool');
+  const next = harness.loop.snapshot().userIntervention;
+  assert.equal(next.interactionId, intervention.interactionId);
+  assert.notEqual(next.interactionRevision, intervention.interactionRevision);
+  assert.notEqual(next.candidateSetDigest, intervention.candidateSetDigest);
+
+  const rejected = await harness.loop.decideUserIntervention({
+    interactionId: next.interactionId,
+    interactionRevision: next.interactionRevision,
+    candidateSetDigest: next.candidateSetDigest,
+    decision: 'reject',
+    guidance: 'Do not expand this Run.',
+    callerRequestId: 'caller-reject-intervention-1',
+  });
+  assert.equal(rejected.disposition, 'runCancellationRequired');
+  assert.equal(harness.loop.snapshot().activeWait, undefined);
+  assert.equal(harness.calls('submitToolIntent').length, 0);
+  assert.equal(
+    harness.kernelState.facts.some((fact) => fact.domain === 'effect'),
+    false
+  );
+}
+
+async function prepareOpenIntervention() {
   const harness = await openSessionHarness({
     initial: { runId: 'run-1' },
   });
@@ -1570,221 +1903,97 @@ async function capabilityAllowContinuesSameInvocationWithNewLease() {
     planActionId: 'plan-action-golden-1',
     operationId: 'planned-operation-golden-output',
   });
-  await persistPreviewAndAcceptPlan(harness, plan);
-  const issued = corpusFact('authorizationCapabilityIssued', {
-    factId: 'fact-capability-issued-before-expansion',
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const expandedLease = corpusFact(
-    'authorizationExpansionAllowed'
-  ).lineage.capabilityLease;
-  harness.appendFacts(issued);
-  await harness.loop.reconcileFacts(0);
-
+  const { preview } = await persistPreviewAndAcceptPlan(harness, plan);
+  const planActionId = plan.actions[0].manifest.planActionId;
   harness.enqueueProvider(providerToolIntent(
     'fs.write',
     { path: 'expanded.txt', content: 'expanded' },
-    'provider-call-expand-allow'
+    'provider-call-out-of-plan'
   ));
-  harness.enqueueKernel('submitToolIntent', (request) =>
-    awaitingCapabilityReply(
-      harness,
-      request,
-      createExpandedPreview(request, 'allow'),
-      { invocationId: 'invocation-golden-expanded-1' }
-    ));
-  const waiting = await harness.loop.runProviderTurn({
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createOutOfPlanDiscoveryPreviewBatch(request, preview));
+  const frozen = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
-      planActionId: 'plan-action-golden-1',
-    },
-    remainingToolCallBudget: 32,
-  });
-  assert.equal(waiting.kind, 'awaitingCapability');
-  assert.deepEqual(harness.loop.snapshot().activeWait, {
-    kind: 'capability',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    previewId: 'preview-golden-expanded-allow-1',
-    sinceHighWater: harness.kernelState.snapshotHighWater,
-  });
-
-  const allowed = corpusFact('authorizationExpansionAllowed', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const continued = corpusFact('invocationExpandedToolIntentAdmitted', {
-    ledgerSequence: harness.nextFactSequence() + 1,
-    runSequence: harness.nextRunSequence() + 1,
-  });
-  harness.appendFacts(allowed, continued);
-  assert.equal(
-    'invocationId' in allowed.lineage,
-    false,
-    'ExpansionAllowed authorizes scope but does not impersonate admission'
-  );
-  assert.equal(
-    continued.lineage.invocationId,
-    waiting.invocationId
-  );
-  assert.equal(
-    continued.lineage.attemptId,
-    'attempt-golden-expanded-2'
-  );
-  assert.deepEqual(
-    continued.lineage.capabilityLease,
-    expandedLease
-  );
-  await harness.loop.observeCapabilityDecision({
-    decision: 'allow',
-    previewId: 'preview-golden-expanded-allow-1',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
-  });
-
-  assert.deepEqual(harness.loop.snapshot().activeWait, {
-    kind: 'invocation',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    sinceHighWater: allowed.ledgerSequence,
-  });
-  assert.deepEqual(
-    harness.loop.snapshot().lineage.operations[
-      waiting.operationId
-    ].leases,
-    [expandedLease]
-  );
-  assert.equal(harness.calls('submitToolIntent').length, 1);
-
-  const observed = corpusFact('effectExpandedToolObserved', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const completed = corpusFact('invocationExpandedToolCompleted', {
-    factId: 'fact-expanded-invocation-completed',
-    ledgerSequence: harness.nextFactSequence() + 1,
-    runSequence: harness.nextRunSequence() + 1,
-    identities: {
-      expandedObservedFactId: observed.factId,
+      planActionId,
     },
   });
-  harness.appendFacts(observed, completed);
-  await harness.loop.notifyKernelWakeHint({
-    waitKind: 'invocation',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    planActionId: 'plan-action-golden-1',
-    expectedPlanRevision: 'plan-revision-golden-1',
-  });
+  assert.equal(frozen.kind, 'noTool');
+  const research = harness.loop.snapshot().interventionResearch;
+  assert.ok(research);
   assert.equal(harness.loop.snapshot().activeWait, undefined);
 
-  const observedBeforeSupersession =
-    harness.loop.snapshot().lineage.cursor.snapshotHighWater;
-  const superseded = corpusFact(
-    'authorizationLeaseSuperseded',
-    {
-      ledgerSequence: harness.nextFactSequence(),
-      runSequence: harness.nextRunSequence(),
-    }
-  );
-  assert.deepEqual(
-    superseded.lineage.capabilityLease,
-    expandedLease
-  );
-  harness.appendFacts(superseded);
-  await harness.loop.reconcileFacts(observedBeforeSupersession);
-  assert.deepEqual(
-    Object.values(harness.loop.snapshot().lineage.operations)
-      .flatMap((operation) => operation.leases),
-    [],
-    'lease supersession must remove every old copy through the superseded version'
-  );
+  harness.enqueueProvider(providerIntervention(
+    interventionDraft(undefined, planActionId)
+  ));
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createInterventionCandidatePreviewBatch(request, preview));
+  const published = await harness.loop.runProviderTurn({
+    reason: 'recovery',
+    target: {
+      kind: 'interventionResearch',
+      researchId: research.researchId,
+    },
+  });
+  assert.equal(published.kind, 'noTool');
+  const intervention = harness.loop.snapshot().userIntervention;
+  assert.ok(intervention);
+  return { harness, plan, intervention, preview };
 }
 
-async function capabilityDenyGuidesNextTurnWithoutSessionManufacturedEffect() {
-  const harness = await openSessionHarness({
-    initial: { runId: 'run-1' },
-  });
-  const plan = createPlan({
-    runId: 'run-1',
-    planRevision: 'plan-revision-golden-deny-1',
-    planActionId: 'plan-action-golden-deny-1',
-    operationId: 'planned-operation-golden-deny-output',
-  });
-  await persistPreviewAndAcceptPlan(harness, plan);
-  const issued = corpusFact('authorizationCapabilityIssuedDeny', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  harness.appendFacts(issued);
-  await harness.loop.reconcileFacts(0);
-  const issuedLease = issued.lineage.capabilityLease;
-  harness.enqueueProvider(providerToolIntent(
-    'fs.write',
-    { path: 'expanded.txt', content: 'expanded' },
-    'provider-call-expand-deny'
-  ));
-  harness.enqueueKernel('submitToolIntent', (request) =>
-    awaitingCapabilityReply(
-      harness,
-      request,
-      createExpandedPreview(request, 'deny'),
-      { invocationId: 'invocation-golden-expanded-deny-1' }
-    ));
-  const waiting = await harness.loop.runProviderTurn({
-    reason: 'planExecution',
-    target: {
-      kind: 'planAction',
-      planActionId: 'plan-action-golden-deny-1',
-    },
-    remainingToolCallBudget: 32,
-  });
-  assert.equal(harness.loop.snapshot().activeWait?.kind, 'capability');
-  assert.deepEqual(
-    harness.calls('submitToolIntent').at(-1).intent.authority.data.lease,
-    issuedLease,
-    'the denied expansion request must still carry the existing v1 lease'
-  );
-  const denied = corpusFact('authorizationExpansionDenied', {
-    ledgerSequence: harness.nextFactSequence(),
-    runSequence: harness.nextRunSequence(),
-  });
-  const guidance = denied.details.guidance;
-  const effectCountBefore =
-    harness.kernelState.facts.filter(
-      (fact) => fact.domain === 'effect'
-    ).length;
-  harness.appendFacts(denied);
-  harness.enqueueProvider(providerAnswer('replanned after denial'));
-  const resumed = await harness.loop.observeCapabilityDecision({
-    decision: 'deny',
-    previewId: 'preview-golden-expanded-deny-1',
-    operationId: waiting.operationId,
-    invocationId: waiting.invocationId,
-    planActionId: 'plan-action-golden-deny-1',
-    expectedPlanRevision: 'plan-revision-golden-deny-1',
-    nextTurn: {
-      reason: 'recovery',
-      target: { kind: 'planning' },
-    },
-  });
-  assert.deepEqual(resumed, {
-    kind: 'answer',
-    text: 'replanned after denial',
-  });
-  assert.deepEqual(harness.providerInputs.at(-1).guidance, [guidance]);
-  assert.equal(harness.calls('submitToolIntent').length, 1);
-  assert.equal(
-    harness.kernelState.facts.filter(
-      (fact) => fact.domain === 'effect'
-    ).length,
-    effectCountBefore,
-    'Session reconciliation must not manufacture an effect'
-  );
+function interventionDraft(
+  problemSummary = 'The requested mutation expands the accepted Plan scope.',
+  affectedPlanActionId = 'plan-action-golden-1'
+) {
+  return {
+    problemSummary,
+    recommendation: 'Choose the reviewed executable revision only if the expanded file is required.',
+    relevantFactRefs: [],
+    affectedPlanActionIds: [affectedPlanActionId],
+    options: [
+      {
+        optionId: 'option-expanded',
+        kind: 'executable',
+        title: 'Expand the Plan once',
+        description: 'Add the newly discovered workspace write to a replacement Plan revision.',
+        tradeoffs: ['Expands the mutation surface but preserves Kernel review.'],
+        recommended: true,
+        candidatePlan: {
+          title: 'Write reviewed expanded output',
+          objective: 'Write the newly discovered file after explicit user selection.',
+          narrative: 'Carry completed work and execute only the reviewed remaining mutation.',
+          evidence: {
+            kernelFactRefs: [],
+            readResources: [],
+            blockingUnknowns: [],
+            nonBlockingUnknowns: [],
+            coverage: 'The expanded target is represented by one candidate-only preview.',
+          },
+          actions: [{
+            toolId: 'fs.write',
+            scopeIntent: {
+              kind: 'resourceScope',
+              data: {
+                requestedResources: [{
+                  kind: 'workspacePath',
+                  data: { path: 'expanded.txt', access: 'write' },
+                }],
+              },
+            },
+          }],
+        },
+      },
+      {
+        optionId: 'option-guidance',
+        kind: 'guidanceOnly',
+        title: 'Keep the original boundary',
+        description: 'Replan without adding the newly discovered mutation.',
+        tradeoffs: ['May leave the optional expanded output unfinished.'],
+        recommended: false,
+      },
+    ],
+  };
 }
 
 async function factReconciliationFollowsMultiPageContinuation() {
@@ -1926,19 +2135,25 @@ async function createCompletedProviderDurableHistory(sessionId) {
     initial: live.initial,
   });
   await durable.persistence.persistInput(durable.initial.initialInput);
-  const evidence = providerEvidenceRecordsV3(
-    sessionId,
-    durable.initial.runId,
-    live.providerInputs[0],
-    {
-      items: providerTurn.response.items,
-      completion: providerTurn.response.completion,
-      providerResult: providerOutcome.providerResult,
-    },
-    providerOutcome.recordedAt
-  );
-  durable.store.seedDaemonRecord(evidence.dispatch);
-  durable.store.seedDaemonRecord(evidence.terminal);
+  const durableProviderEvidence = new Map();
+  for (const outcome of completedState.providerOutcomes) {
+    const source = live.store.providerEvidence.get(outcome.providerTurnId);
+    assert.equal(
+      source?.terminal?.data.terminalKind,
+      'completed',
+      'every durable Provider outcome must retain its matching terminal'
+    );
+    const records = durableProviderEvidenceRecordsV3(
+      sessionId,
+      durable.initial.runId,
+      source
+    );
+    durable.store.seedDaemonRecord(records.dispatch);
+    durable.store.seedDaemonRecord(records.terminal);
+    durableProviderEvidence.set(outcome.providerTurnId, records);
+  }
+  const evidence = durableProviderEvidence.get(providerTurn.providerTurnId);
+  assert.ok(evidence);
   completedState.checkpointRevision = 1;
   delete completedState.providerTurn.dispatchRef;
   delete completedState.providerTurn.terminalRef;
@@ -1953,21 +2168,52 @@ async function createCompletedProviderDurableHistory(sessionId) {
   };
 }
 
+function durableProviderEvidenceRecordsV3(sessionId, runId, evidence) {
+  const dispatch = createDurableRecordV3({
+    sessionId,
+    runId,
+    recordKind: 'providerTurnDispatch',
+    logicalId:
+      `provider-turn:${evidence.dispatch.data.providerTurnId}:dispatch`,
+    recordedAt: evidence.dispatch.recordedAt,
+    data: evidence.dispatch.data,
+  });
+  const terminal = createDurableRecordV3({
+    sessionId,
+    runId,
+    recordKind: 'providerTurnTerminal',
+    logicalId:
+      `provider-turn:${evidence.terminal.data.providerTurnId}:terminal`,
+    recordedAt: evidence.terminal.recordedAt,
+    data: {
+      ...clone(evidence.terminal.data),
+      dispatchRef: {
+        recordId: dispatch.recordId,
+        recordDigest: dispatch.recordDigest,
+      },
+    },
+  });
+  return { dispatch, terminal };
+}
+
 async function createCompletedToolProviderDurableHistory(sessionId) {
   const live = await openSessionHarness();
   const plan = createPlan();
-  await persistPreviewAndAcceptPlan(live, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(live, plan);
   live.enqueueProvider(providerToolIntent(
     'fs.write',
     { path: 'output.txt', content: 'contract output' },
     'provider-call-durable-tool-history'
   ));
+  live.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   live.enqueueKernel('submitToolIntent', (request) =>
     admittedReply(live, request, {
       invocationId: 'invocation-durable-tool-history',
       attemptId: 'attempt-durable-tool-history',
     }));
-  const admitted = await live.loop.runProviderTurn({
+  const classified = await live.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -1975,6 +2221,8 @@ async function createCompletedToolProviderDurableHistory(sessionId) {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const admitted = await live.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
   appendMutationCompletion(
     live,
@@ -2004,26 +2252,49 @@ async function createCompletedToolProviderDurableHistory(sessionId) {
   });
   await durable.persistence.persistInput(durable.initial.initialInput);
   await durable.persistence.persistPlan(plan);
+  const durableProviderEvidence = new Map();
+  for (const outcome of completedState.providerOutcomes) {
+    const source = live.store.providerEvidence.get(outcome.providerTurnId);
+    assert.equal(
+      source?.terminal?.data.terminalKind,
+      'completed',
+      'every durable Provider outcome must retain its matching terminal'
+    );
+    const records = durableProviderEvidenceRecordsV3(
+      sessionId,
+      durable.initial.runId,
+      source
+    );
+    durable.store.seedDaemonRecord(records.dispatch);
+    durable.store.seedDaemonRecord(records.terminal);
+    durableProviderEvidence.set(outcome.providerTurnId, records);
+  }
+  const evidence = durableProviderEvidence.get(providerTurn.providerTurnId);
+  assert.ok(evidence);
+  const planSourceState = clone(
+    live.store.checkpointHistory.find((checkpoint) =>
+      checkpoint.state.providerTurn?.status === 'completed'
+      && checkpoint.state.providerOutcomes.length === 1
+      && checkpoint.state.providerOutcomes[0].outputKind === 'plan'
+    )?.state
+  );
+  assert.ok(
+    planSourceState,
+    'the accepted Plan must retain its completed Provider source checkpoint'
+  );
+  planSourceState.checkpointRevision = 1;
+  delete planSourceState.providerTurn.dispatchRef;
+  delete planSourceState.providerTurn.terminalRef;
+  await durable.persistence.persistCheckpoint(
+    checkpointFromStateV3(planSourceState)
+  );
   await durable.persistence.persistPlanDecision(
     live.store.planDecisions.get(plan.planRevision)
   );
   for (const [requestId, stored] of live.store.operationResults) {
     await durable.persistence.persistOperationResult(requestId, stored.result);
   }
-  const evidence = providerEvidenceRecordsV3(
-    sessionId,
-    durable.initial.runId,
-    live.providerInputs[0],
-    {
-      items: providerTurn.response.items,
-      completion: providerTurn.response.completion,
-      providerResult: providerOutcome.providerResult,
-    },
-    providerOutcome.recordedAt
-  );
-  durable.store.seedDaemonRecord(evidence.dispatch);
-  durable.store.seedDaemonRecord(evidence.terminal);
-  completedState.checkpointRevision = 1;
+  completedState.checkpointRevision = 2;
   delete completedState.providerTurn.dispatchRef;
   delete completedState.providerTurn.terminalRef;
   await durable.persistence.persistCheckpoint(
@@ -2032,6 +2303,7 @@ async function createCompletedToolProviderDurableHistory(sessionId) {
   return {
     ...durable,
     live,
+    plan,
     completedState,
     evidence,
   };
@@ -2054,7 +2326,7 @@ async function createNoncompletedProviderHistory(options) {
       `provider-turn:${source.completedState.providerTurn.providerTurnId}:terminal`,
     recordedAt: '2026-07-29T00:00:30.000Z',
     data: {
-      schemaVersion: 'deepcode.session.provider-turn-terminal.v3',
+      schemaVersion: 'deepcode.session.provider-turn-terminal.v4',
       providerTurnId: source.completedState.providerTurn.providerTurnId,
       dispatchRef: {
         recordId: source.evidence.dispatch.recordId,
@@ -2069,6 +2341,12 @@ async function createNoncompletedProviderHistory(options) {
         recordCount: 2,
       },
       orderedItems: [],
+      ...(options.structuredFailure
+        ? { structuredFailure: clone(options.structuredFailure) }
+        : {}),
+      ...(options.providerResult
+        ? { providerResult: clone(options.providerResult) }
+        : {}),
     },
   });
   records.push(failedTerminal);
@@ -2124,18 +2402,21 @@ async function createUnresolvedProviderHistory() {
 async function prepareFinalAnswerHarness() {
   const harness = await openSessionHarness();
   const plan = createPlan();
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview: approvedPreview } =
+    await persistPreviewAndAcceptPlan(harness, plan);
   harness.enqueueProvider(providerToolIntent(
     'fs.write',
     { path: 'output.txt', content: 'contract output' },
     'provider-call-final-answer-tool'
   ));
+  harness.enqueueKernel('previewCapabilityBatch', (request) =>
+    createPlanDiscoveryPreviewBatch(request, approvedPreview));
   harness.enqueueKernel('submitToolIntent', (request) =>
     admittedReply(harness, request, {
       invocationId: 'invocation-final-answer-tool',
       attemptId: 'attempt-final-answer-tool',
     }));
-  const admitted = await harness.loop.runProviderTurn({
+  const classified = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -2143,6 +2424,8 @@ async function prepareFinalAnswerHarness() {
     },
     remainingToolCallBudget: 32,
   });
+  assert.equal(classified.kind, 'noTool');
+  const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
   appendMutationCompletion(
     harness,

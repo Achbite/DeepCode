@@ -27,25 +27,25 @@ import type {
   SessionProviderProfileBootstrapV2,
   SessionPlanDecisionV2,
   SessionUserInputRecordV2,
+  SessionUserInterventionDecisionResultV4,
   SessionWorkAuthorityV3,
 } from './types.js';
 import {
   sameSessionFinalAnswerAuthorityV3,
 } from './review.js';
 import type {
-  SessionContextMemoryV2,
+  SessionContextMemoryV3,
 } from './sessionMemory.js';
 
 export interface SessionKernelHostRunnerOpenV2 {
   workspaceBindingRef: string;
   initialInput: SessionUserInputRecordV2;
-  sessionMemory: SessionContextMemoryV2;
+  sessionMemory: SessionContextMemoryV3;
   providerProfile: SessionProviderProfileBootstrapV2;
   signal?: AbortSignal;
 }
 
 export interface SessionPlanActionDriveOptionsV2 {
-  providerCallBudget?: number;
   guidance?: string[];
 }
 
@@ -66,14 +66,13 @@ export type SessionPlanActionDriveStepV2 =
       guidance: string[];
     }
   | {
-      kind: 'budgetExhausted';
-      providerCallBudget: number;
-      completedProviderCalls: number;
-    }
-  | {
       kind: 'toolCallsProgressed';
       completedCallCount: number;
       remainingCallCount: number;
+    }
+  | {
+      kind: 'interventionResearchProgressed';
+      researchId: string;
     }
   | {
       kind: 'interrupted';
@@ -82,8 +81,6 @@ export type SessionPlanActionDriveStepV2 =
         { kind: 'staleProviderResult' }
       >;
     };
-
-const DEFAULT_PLAN_ACTION_PROVIDER_CALL_BUDGET = 32;
 
 /**
  * Minimal Host-owned composition for the v2 Session loop. Provider plans are
@@ -249,10 +246,21 @@ export class SessionKernelHostRunnerV2 {
     return this.loop.decidePlan(input);
   }
 
+  decideUserIntervention(input: {
+    interactionId: string;
+    interactionRevision: string;
+    candidateSetDigest: string;
+    decision: 'select' | 'revise' | 'reject';
+    optionId?: string;
+    guidance?: string;
+    callerRequestId: string;
+  }): Promise<SessionUserInterventionDecisionResultV4> {
+    return this.loop.decideUserIntervention(input);
+  }
+
   async runPlanAction(
     planActionId: string,
     expectedPlanRevision: string,
-    remainingToolCallBudget: number,
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2> {
     const state = this.loop.snapshot();
@@ -264,7 +272,6 @@ export class SessionKernelHostRunnerV2 {
       reason: 'planExecution',
       target: { kind: 'planAction', planActionId },
       guidance,
-      remainingToolCallBudget,
     });
   }
 
@@ -366,9 +373,6 @@ export class SessionKernelHostRunnerV2 {
     requireExactPlanRevision(initialState, expectedPlanRevision);
     requirePlanActionUnsettled(initialState, planActionId);
     requireNextPlanAction(initialState, planActionId);
-    const budget = normalizeProviderCallBudget(
-      options.providerCallBudget
-    );
     let state = this.loop.snapshot();
     const unsettledTerminalQueue = state.providerToolCallQueue;
     if (
@@ -388,6 +392,9 @@ export class SessionKernelHostRunnerV2 {
         kind: 'waiting',
         wait: cloneJson(state.activeWait),
       };
+    }
+    if (state.interventionResearch && !state.userIntervention) {
+      return this.driveInterventionResearchStep(planActionId);
     }
     if (state.pendingGuidance.length > 0) {
       return {
@@ -413,6 +420,12 @@ export class SessionKernelHostRunnerV2 {
           wait: cloneJson(state.activeWait),
         };
       }
+      if (state.interventionResearch && !state.userIntervention) {
+        return {
+          kind: 'interventionResearchProgressed',
+          researchId: state.interventionResearch.researchId,
+        };
+      }
       if (state.pendingGuidance.length > 0) {
         return {
           kind: 'replanRequired',
@@ -421,19 +434,9 @@ export class SessionKernelHostRunnerV2 {
       }
     }
     if (!result) {
-      const completedProviderCalls =
-        planActionProviderCallCount(state, planActionId);
-      if (completedProviderCalls >= budget) {
-        return {
-          kind: 'budgetExhausted',
-          providerCallBudget: budget,
-          completedProviderCalls,
-        };
-      }
       result = await this.runPlanAction(
         planActionId,
         expectedPlanRevision,
-        budget - completedProviderCalls,
         options.guidance
       );
     }
@@ -444,6 +447,12 @@ export class SessionKernelHostRunnerV2 {
         wait: cloneJson(state.activeWait),
       };
     }
+    if (state.interventionResearch && !state.userIntervention) {
+      return {
+        kind: 'interventionResearchProgressed',
+        researchId: state.interventionResearch.researchId,
+      };
+    }
     if (result.kind === 'answer' || result.kind === 'noTool') {
       return { kind: 'providerResult', result };
     }
@@ -451,6 +460,12 @@ export class SessionKernelHostRunnerV2 {
       return { kind: 'interrupted', result };
     }
     if (result.kind === 'rejected') {
+      return {
+        kind: 'replanRequired',
+        guidance: [result.guidance],
+      };
+    }
+    if (result.kind === 'sessionControlRejected') {
       return {
         kind: 'replanRequired',
         guidance: [result.guidance],
@@ -488,6 +503,80 @@ export class SessionKernelHostRunnerV2 {
       'session_kernel_drive_result_unsettled',
       'PlanAction drive returned neither an ActiveWait nor a terminal Session result.'
     );
+  }
+
+  private async driveInterventionResearchStep(
+    planActionId: string
+  ): Promise<SessionPlanActionDriveStepV2> {
+    let state = this.loop.snapshot();
+    const research = state.interventionResearch;
+    if (!research || state.userIntervention) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_intervention_research_missing',
+        'Intervention research continuation requires one active research record and no published intervention card.'
+      );
+    }
+    const queued = state.providerToolCallQueue;
+    if (
+      queued
+      && (queued.status === 'active' || !queued.outcomeRecorded)
+    ) {
+      requirePlanActionToolCallQueue(queued.target, planActionId);
+      const resumed = await this.loop.resumePendingProviderToolCalls();
+      state = this.loop.snapshot();
+      if (state.activeWait) {
+        return { kind: 'waiting', wait: cloneJson(state.activeWait) };
+      }
+      if (resumed?.kind === 'staleProviderResult') {
+        return { kind: 'interrupted', result: resumed };
+      }
+      if (
+        state.providerToolCallQueue
+        && (
+          state.providerToolCallQueue.status === 'active'
+          || !state.providerToolCallQueue.outcomeRecorded
+        )
+      ) {
+        return {
+          kind: 'interventionResearchProgressed',
+          researchId: research.researchId,
+        };
+      }
+    }
+    const current = this.loop.snapshot().interventionResearch;
+    if (!current || current.researchId !== research.researchId) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_intervention_research_stale',
+        'Intervention research identity changed before its Provider continuation.'
+      );
+    }
+    const result = await this.runProviderTurn({
+      reason: 'recovery',
+      target: {
+        kind: 'interventionResearch',
+        researchId: current.researchId,
+      },
+    });
+    state = this.loop.snapshot();
+    if (state.activeWait) {
+      return { kind: 'waiting', wait: cloneJson(state.activeWait) };
+    }
+    if (result.kind === 'staleProviderResult') {
+      return { kind: 'interrupted', result };
+    }
+    if (
+      !state.interventionResearch
+      || state.interventionResearch.researchId !== current.researchId
+    ) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_intervention_research_settlement_missing',
+        'Intervention research Provider turn lost its durable research identity without publishing a wait.'
+      );
+    }
+    return {
+      kind: 'interventionResearchProgressed',
+      researchId: current.researchId,
+    };
   }
 
   /**
@@ -719,54 +808,6 @@ export class SessionKernelHostRunnerError extends Error {
   }
 }
 
-function normalizeProviderCallBudget(value: number | undefined): number {
-  const budget = value ?? DEFAULT_PLAN_ACTION_PROVIDER_CALL_BUDGET;
-  if (!Number.isSafeInteger(budget) || budget <= 0 || budget > 256) {
-    throw new SessionKernelHostRunnerError(
-      'session_kernel_drive_budget_invalid',
-      'PlanAction Provider tool-call budget must be an integer between 1 and 256.'
-    );
-  }
-  return budget;
-}
-
-function planActionProviderCallCount(
-  state: SessionKernelLoopStateV2,
-  planActionId: string
-): number {
-  const action = state.plan?.actions.find(
-    (candidate) => candidate.manifest.planActionId === planActionId
-  );
-  if (!action) {
-    throw new SessionKernelHostRunnerError(
-      'session_kernel_drive_plan_action_missing',
-      `PlanAction ${planActionId} is not present in the current Plan.`
-    );
-  }
-  const operationIds = new Set(
-    state.lineage.planActions[planActionId]?.operationIds ?? []
-  );
-  const manifestOperationId = action.manifest.operationId;
-  const manifestOperationWasSubmitted =
-    state.providerToolCallQueue?.calls.some(
-      (call) => call.intent.operationId === manifestOperationId
-    )
-    || state.providerOutcomes.some(
-      (outcome) =>
-        outcome.outputKind === 'toolIntent'
-        && outcome.toolCalls.some(
-          (call) => call.operationId === manifestOperationId
-        )
-    )
-    || (
-      state.lineage.operations[manifestOperationId]?.invocationCount ?? 0
-    ) > 0;
-  if (!manifestOperationWasSubmitted) {
-    operationIds.delete(manifestOperationId);
-  }
-  return operationIds.size;
-}
-
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -845,8 +886,11 @@ function requirePlanActionToolCallQueue(
   planActionId: string
 ): void {
   if (
-    target.kind !== 'planAction'
-    || target.planActionId !== planActionId
+    (
+      target.kind !== 'planAction'
+      || target.planActionId !== planActionId
+    )
+    && target.kind !== 'interventionResearch'
   ) {
     throw new SessionKernelHostRunnerError(
       'session_kernel_plan_action_tool_call_queue_target_invalid',

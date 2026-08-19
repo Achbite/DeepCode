@@ -18,6 +18,7 @@ import type {
   CodeGrepResult,
   CreateAgentProjectRequest,
   CreateAgentSessionRequest,
+  CreateUserAttachmentGrantRequestV1,
   CreateTerminalSessionRequest,
   FileReadResult,
   FileTreeNode,
@@ -52,6 +53,7 @@ import type {
   TerminalWarmupStatus,
   UpdateAgentProjectRequest,
   UpdateAgentSessionRequest,
+  UserAttachmentGrantResultV1,
   WorkspaceState,
 } from '@deepcode/protocol';
 import * as api from './apiClient';
@@ -84,6 +86,34 @@ export interface KernelStartResult {
   started: boolean;
   blocked: boolean;
   message: string;
+  status: HostStartupStatusV1;
+}
+
+export interface HostStartupStatusV1 {
+  schemaVersion: 'deepcode.host-shell.startup-status.v1';
+  revision: number;
+  attemptId: string;
+  mode: 'managed' | 'connectOnly';
+  phase: 'idle' | 'starting' | 'ready' | 'external' | 'blocked' | 'failed' | 'stopped';
+  stage:
+    | 'permissionPreflight'
+    | 'startAdmission'
+    | 'binaryResolution'
+    | 'daemonSpawn'
+    | 'daemonIdentity'
+    | 'daemonRecovery'
+    | 'proxySpawn'
+    | 'proxyIdentity'
+    | 'proxyHealth'
+    | 'ready'
+    | 'connectOnly';
+  code: string;
+  reasonCode?: string;
+  message: string;
+  retryable: boolean;
+  ownsProcesses: boolean;
+  diagnosticRef?: string;
+  updatedAt: string;
 }
 
 export function healthVersion(health?: HealthStatus): string {
@@ -188,6 +218,27 @@ export async function startKernelAfterPermission(): Promise<ApiResponse<KernelSt
   }
 }
 
+export async function getHostStartupStatus(): Promise<ApiResponse<HostStartupStatusV1>> {
+  const invoke = getTauriInvoke();
+  if (!invoke) {
+    return {
+      ok: false,
+      error: 'host_startup_status_unavailable',
+      message: 'Host startup status is only available in the desktop shell.',
+    };
+  }
+  try {
+    const result = await invoke<HostStartupStatusV1>('deepcode_host_startup_status');
+    return { ok: true, data: result };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'host_startup_status_failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | null>> {
   if (document.documentElement.dataset.product !== 'deepcode-gui') {
     return { ok: true, data: null };
@@ -242,6 +293,18 @@ export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
 
 export function browsePath(absolutePath?: string): Promise<ApiResponse<BrowsePathResult>> {
   return api.browsePath(absolutePath);
+}
+
+export function createUserAttachmentGrant(
+  request: CreateUserAttachmentGrantRequestV1
+): Promise<ApiResponse<UserAttachmentGrantResultV1>> {
+  return api.createUserAttachmentGrant(request);
+}
+
+export function revokeUserAttachmentGrant(
+  attachmentId: string
+): Promise<ApiResponse<api.UserAttachmentRevocationResultV1>> {
+  return api.revokeUserAttachmentGrant(attachmentId);
 }
 
 export function scanSkillMount(
@@ -473,6 +536,50 @@ export function startAgentRun(
   return api.startAgentRun(sessionId, request);
 }
 
+export function getAgentComposer(
+  request: { projectId?: string; sessionId?: string } = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<api.AgentComposerProjectionV1>> {
+  return api.getAgentComposer(request, signal);
+}
+
+export function streamAgentComposer(
+  request: { projectId?: string; sessionId?: string },
+  onEvent: Parameters<typeof api.streamAgentComposer>[1],
+  signal?: AbortSignal
+): Promise<void> {
+  return api.streamAgentComposer(request, onEvent, signal);
+}
+
+export function startConversationDraftRun(
+  request: api.StartConversationDraftRunRequest
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.startConversationDraftRun(request);
+}
+
+export function mintPrivateAnalysisLease(
+  sessionId: string,
+  callerRequestId: string
+) {
+  return api.mintPrivateAnalysisLease(sessionId, callerRequestId);
+}
+
+export function getPrivateAnalysis(
+  sessionId: string,
+  capability: string,
+  request: { afterCursor?: string; limit?: number } = {},
+  signal?: AbortSignal
+) {
+  return api.getPrivateAnalysis(sessionId, capability, request, signal);
+}
+
+export function revokePrivateAnalysisLease(
+  sessionId: string,
+  capability: string
+) {
+  return api.revokePrivateAnalysisLease(sessionId, capability);
+}
+
 export function getAgentRun(
   sessionId: string,
   runId: string,
@@ -484,9 +591,27 @@ export function getAgentRun(
 export function cancelAgentRunById(
   sessionId: string,
   runId: string,
-  callerRequestId: string
+  callerRequestId: string,
+  conversationTarget: api.AgentConversationTargetV1
 ): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.cancelAgentRunById(sessionId, runId, callerRequestId);
+  return api.cancelAgentRunById(
+    sessionId,
+    runId,
+    callerRequestId,
+    conversationTarget
+  );
+}
+
+export function cancelCurrentAgentRun(
+  sessionId: string,
+  callerRequestId: string,
+  conversationTarget: api.AgentConversationTargetV1
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.cancelCurrentAgentRun(
+    sessionId,
+    callerRequestId,
+    conversationTarget
+  );
 }
 
 export function submitAgentRunGuidance(
@@ -495,6 +620,13 @@ export function submitAgentRunGuidance(
   request: api.AgentRunGuidanceRequest
 ): Promise<ApiResponse<api.AgentRunResult>> {
   return api.submitAgentRunGuidance(sessionId, runId, request);
+}
+
+export function submitCurrentAgentRunGuidance(
+  sessionId: string,
+  request: api.AgentRunGuidanceRequest
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.submitCurrentAgentRunGuidance(sessionId, request);
 }
 
 export function getHostSkills(): Promise<ApiResponse<KernelHostSkillCatalogResult>> {

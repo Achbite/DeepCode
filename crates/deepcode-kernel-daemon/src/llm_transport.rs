@@ -5,7 +5,7 @@ use bytes::Bytes;
 use deepcode_kernel_abi::v2::{CommandRequestId, RunId};
 use deepcode_kernel_abi::v2_command::{
     KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2,
-    KernelFactDomainProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
+    KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
 };
 use deepcode_kernel_abi::{RunCapabilityV2, ToolIdV2};
 use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
@@ -19,6 +19,7 @@ pub(crate) struct ResolvedLlmProfile {
     pub(crate) provider_flavor: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) model: String,
+    pub(crate) context_window_tokens: Option<u32>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) temperature: Option<f64>,
     pub(crate) reasoning_effort: Option<String>,
@@ -351,6 +352,7 @@ pub(crate) fn resolve_llm_profile(
             .and_then(Value::as_str)
             .expect("current LLM Profile model")
             .to_string(),
+        context_window_tokens: profile.get("contextWindowTokens").and_then(token_limit_u32),
         max_output_tokens: profile.get("maxOutputTokens").and_then(token_limit_u32),
         temperature: profile.get("temperature").and_then(Value::as_f64),
         reasoning_effort: profile
@@ -611,8 +613,342 @@ fn tool_arguments_string(value: Option<&Value>) -> String {
 #[derive(Clone)]
 pub(crate) struct ProviderStreamTraceContextV1 {
     pub(crate) store: ProviderTraceStoreV1,
+    pub(crate) cache_telemetry_store: ProviderCacheTelemetryStoreV1,
     pub(crate) identity: ProviderTraceIdentityV1,
     pub(crate) dispatch_authority: ProviderStreamDispatchAuthorityV1,
+}
+
+struct ProviderCacheTelemetryRecorderV1 {
+    store: ProviderCacheTelemetryStoreV1,
+    identity: ProviderTraceIdentityV1,
+    profile_id: String,
+    provider: String,
+    model: String,
+    sidecar: SessionProviderAdmissionSidecarV2,
+    relation: ProviderCacheRelationV1,
+    predecessor_external_digest: Option<String>,
+    appended_suffix_bytes: Option<u64>,
+    external_request_digest: Option<String>,
+    external_request_bytes: Option<u64>,
+    usage: ProviderCacheUsageTelemetryV1,
+    timing: ProviderCacheTimingTelemetryV1,
+    continuation: ProviderContinuationTelemetryV1,
+    terminal_status: ProviderCacheTerminalStatusV1,
+    trace_ref: Option<String>,
+    dispatch_started: Option<Instant>,
+    recorded: bool,
+}
+
+impl ProviderCacheTelemetryRecorderV1 {
+    fn new(
+        store: ProviderCacheTelemetryStoreV1,
+        identity: ProviderTraceIdentityV1,
+        profile: &ResolvedLlmProfile,
+        sidecar: SessionProviderAdmissionSidecarV2,
+    ) -> Self {
+        let continuation = if matches!(
+            sidecar.cache_lane.relation_kind,
+            SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+                | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
+                | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
+        ) {
+            ProviderContinuationTelemetryV1 {
+                status: ProviderContinuationStatusV1::Accepted,
+                http_status: None,
+                error_code: None,
+            }
+        } else {
+            ProviderContinuationTelemetryV1 {
+                status: ProviderContinuationStatusV1::NotContinuation,
+                http_status: None,
+                error_code: None,
+            }
+        };
+        Self {
+            store,
+            identity,
+            profile_id: profile.id.clone(),
+            provider: required_resolved_provider_flavor(profile).to_string(),
+            model: profile.model.clone(),
+            sidecar,
+            relation: ProviderCacheRelationV1::Unknown,
+            predecessor_external_digest: None,
+            appended_suffix_bytes: None,
+            external_request_digest: None,
+            external_request_bytes: None,
+            usage: ProviderCacheUsageTelemetryV1::default(),
+            timing: ProviderCacheTimingTelemetryV1::default(),
+            continuation,
+            terminal_status: ProviderCacheTerminalStatusV1::PreflightRejected,
+            trace_ref: None,
+            dispatch_started: None,
+            recorded: false,
+        }
+    }
+
+    fn prepared(&mut self, relation: &ProviderCachePreparedRelationV1, exact_request_body: &[u8]) {
+        self.relation = relation.relation;
+        self.predecessor_external_digest = relation.predecessor_external_digest.clone();
+        self.appended_suffix_bytes = relation.appended_suffix_bytes;
+        self.external_request_digest =
+            Some(crate::host_v2_storage::sha256_prefixed(exact_request_body));
+        self.external_request_bytes =
+            Some(u64::try_from(exact_request_body.len()).unwrap_or(u64::MAX));
+    }
+
+    fn local_rejection(&mut self, code: &str) {
+        self.terminal_status = ProviderCacheTerminalStatusV1::PreflightRejected;
+        if !matches!(
+            self.continuation.status,
+            ProviderContinuationStatusV1::NotContinuation
+        ) {
+            self.continuation.status = ProviderContinuationStatusV1::LocalContractRejected;
+        }
+        self.continuation.error_code = Some(code.to_string());
+    }
+
+    fn dispatch_started(&mut self) {
+        self.dispatch_started = Some(Instant::now());
+        self.terminal_status = ProviderCacheTerminalStatusV1::Failed;
+    }
+
+    fn response_headers(&mut self, status: u16) {
+        self.timing.time_to_response_headers_ms = self.elapsed_ms();
+        if !matches!(
+            self.continuation.status,
+            ProviderContinuationStatusV1::NotContinuation
+        ) && !(200..=299).contains(&status)
+        {
+            self.continuation.status = ProviderContinuationStatusV1::ProviderRejected;
+            self.continuation.http_status = Some(status);
+        }
+    }
+
+    fn first_upstream_byte(&mut self) {
+        if self.timing.time_to_first_upstream_byte_ms.is_none() {
+            self.timing.time_to_first_upstream_byte_ms = self.elapsed_ms();
+        }
+    }
+
+    fn first_semantic_delta(&mut self) {
+        if self.timing.time_to_first_semantic_delta_ms.is_none() {
+            self.timing.time_to_first_semantic_delta_ms = self.elapsed_ms();
+        }
+    }
+
+    fn provider_terminal_observed(&mut self) {
+        if self.timing.provider_total_ms.is_none() {
+            self.timing.provider_total_ms = self.elapsed_ms();
+        }
+    }
+
+    fn failed(&mut self, code: &str) {
+        self.terminal_status = if self.dispatch_started.is_some() {
+            ProviderCacheTerminalStatusV1::Failed
+        } else {
+            ProviderCacheTerminalStatusV1::PreflightRejected
+        };
+        self.continuation.error_code = Some(code.to_string());
+        self.provider_terminal_observed();
+    }
+
+    fn failed_with_usage(&mut self, code: &str, usage: Option<&Value>, trace_ref: &str) {
+        self.failed(code);
+        self.trace_ref = Some(trace_ref.to_string());
+        self.usage = provider_cache_usage_telemetry(usage, self.relation);
+        self.persist();
+    }
+
+    fn cancelled(&mut self, code: &str) {
+        self.terminal_status = ProviderCacheTerminalStatusV1::Cancelled;
+        self.continuation.error_code = Some(code.to_string());
+        self.provider_terminal_observed();
+    }
+
+    fn completed(&mut self, usage: Option<&Value>, trace_ref: &str) {
+        self.terminal_status = ProviderCacheTerminalStatusV1::Completed;
+        self.trace_ref = Some(trace_ref.to_string());
+        self.provider_terminal_observed();
+        self.usage = provider_cache_usage_telemetry(usage, self.relation);
+        self.persist();
+    }
+
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.dispatch_started
+            .map(|started| duration_millis_u64(started.elapsed()))
+    }
+
+    fn persist(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        if self.timing.provider_total_ms.is_none() {
+            self.timing.provider_total_ms = self.elapsed_ms();
+        }
+        let reset_reason = self
+            .sidecar
+            .cache_lane
+            .reset_reason
+            .map(SessionProviderCacheLaneResetReasonV1::wire_name)
+            .map(str::to_string);
+        let relation = if self.relation == ProviderCacheRelationV1::Unknown {
+            match self.sidecar.cache_lane.mode {
+                SessionProviderCacheLaneModeV2::Bootstrap => ProviderCacheRelationV1::NoBaseline,
+                SessionProviderCacheLaneModeV2::Reset => ProviderCacheRelationV1::Reset,
+                _ => ProviderCacheRelationV1::Unknown,
+            }
+        } else {
+            self.relation
+        };
+        let record = ProviderCacheTelemetryV1 {
+            schema_version: PROVIDER_CACHE_TELEMETRY_SCHEMA_V1.to_string(),
+            record_id: String::new(),
+            session_id: self.identity.session_id.clone(),
+            run_id: self.identity.run_id.clone(),
+            provider_turn_id: self.identity.provider_turn_id.clone(),
+            request_id: self.identity.provider_turn_id.clone(),
+            parent_request_id: self.sidecar.cache_lane.predecessor_request_id.clone(),
+            provider_profile_id: self.profile_id.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            attempt_kind: match self.identity.purpose {
+                ProviderTracePurposeV1::Primary => "primary",
+                ProviderTracePurposeV1::Continuation => "continuation",
+                ProviderTracePurposeV1::FinalAnswer => "finalAnswer",
+            }
+            .to_string(),
+            cache_lane: ProviderCacheLaneTelemetryV1 {
+                lane_id: self.sidecar.cache_lane.lane_id.clone(),
+                lane_revision: self.sidecar.cache_lane.lane_revision,
+                relation,
+                relation_kind: Some(self.sidecar.cache_lane.relation_kind),
+                reset_reason,
+                supporting_reset_reasons: self
+                    .sidecar
+                    .cache_lane
+                    .supporting_reset_reasons
+                    .iter()
+                    .map(|reason| reason.wire_name().to_string())
+                    .collect(),
+                predecessor_request_id: self.sidecar.cache_lane.predecessor_request_id.clone(),
+                predecessor_external_digest: self.predecessor_external_digest.clone(),
+                stable_prefix_digest: self.sidecar.cache_lane.stable_prefix_digest.clone(),
+                external_request_digest: self.external_request_digest.clone(),
+                external_request_bytes: self.external_request_bytes,
+                appended_suffix_bytes: self.appended_suffix_bytes,
+            },
+            usage: self.usage.clone(),
+            timing: self.timing.clone(),
+            continuation: self.continuation.clone(),
+            terminal_status: self.terminal_status,
+            trace_ref: self.trace_ref.clone(),
+            recorded_at: crate::utils::now_rfc3339_text(),
+        }
+        .seal_record_id();
+        let store = self.store.clone();
+        match record {
+            Ok(record) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let session_id = self.identity.session_id.clone();
+                    handle.spawn(async move {
+                        let io_guard = crate::session_private_io_lock(&session_id)
+                            .read_owned()
+                            .await;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _io_guard = io_guard;
+                            let _ = store.record(&record);
+                        })
+                        .await;
+                    });
+                } else {
+                    let _ = store.record(&record);
+                }
+            }
+            Err(error) => self
+                .store
+                .note_failure(&self.identity.session_id, error.code),
+        }
+    }
+}
+
+impl Drop for ProviderCacheTelemetryRecorderV1 {
+    fn drop(&mut self) {
+        self.persist();
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Mirrors Session's deterministic one-UTF-8-byte-per-token upper bound.
+/// It is deliberately conservative and is only a compaction guard; Provider
+/// usage remains the source of truth for observed input-token telemetry.
+fn conservative_provider_input_token_upper_bound(exact_request_body: &[u8]) -> u64 {
+    u64::try_from(exact_request_body.len()).unwrap_or(u64::MAX)
+}
+
+fn provider_cache_usage_telemetry(
+    usage: Option<&Value>,
+    relation: ProviderCacheRelationV1,
+) -> ProviderCacheUsageTelemetryV1 {
+    let Some(record) = usage.and_then(Value::as_object) else {
+        return ProviderCacheUsageTelemetryV1::default();
+    };
+    let number = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| record.get(*name).and_then(Value::as_u64))
+    };
+    let input_tokens = number(&[
+        "prompt_tokens",
+        "input_tokens",
+        "promptTokens",
+        "inputTokens",
+    ]);
+    let hit_tokens = number(&[
+        "prompt_cache_hit_tokens",
+        "promptCacheHitTokens",
+        "cached_tokens",
+        "cachedTokens",
+    ]);
+    let miss_tokens = number(&["prompt_cache_miss_tokens", "promptCacheMissTokens"]);
+    let completion_tokens = number(&[
+        "completion_tokens",
+        "output_tokens",
+        "completionTokens",
+        "outputTokens",
+    ]);
+    let reported = input_tokens.is_some()
+        || hit_tokens.is_some()
+        || miss_tokens.is_some()
+        || completion_tokens.is_some();
+    let counters_valid = input_tokens.is_none_or(|input| {
+        hit_tokens.is_none_or(|hit| hit <= input)
+            && miss_tokens.is_none_or(|miss| miss <= input)
+            && match (hit_tokens, miss_tokens) {
+                (Some(hit), Some(miss)) => hit.saturating_add(miss) <= input,
+                _ => true,
+            }
+    });
+    ProviderCacheUsageTelemetryV1 {
+        availability: if reported && !counters_valid {
+            ProviderCacheUsageAvailabilityV1::Invalid
+        } else if reported {
+            ProviderCacheUsageAvailabilityV1::Reported
+        } else {
+            ProviderCacheUsageAvailabilityV1::NotReported
+        },
+        prompt_cache_hit_tokens: hit_tokens,
+        provider_reported_miss_tokens: miss_tokens,
+        uncached_suffix_tokens: (counters_valid
+            && relation == ProviderCacheRelationV1::ExactAppend)
+            .then_some(miss_tokens)
+            .flatten(),
+        input_tokens,
+        completion_tokens,
+    }
 }
 
 #[derive(Clone)]
@@ -630,23 +966,56 @@ struct ProviderCompletedTerminalInputV3 {
     response_digest: String,
     provider_result: Value,
     ordered_items: Vec<Value>,
+    structured_output_recovery: Option<Value>,
+}
+
+struct ProviderStructuredFailureTerminalInputV3 {
+    reason_code: &'static str,
+    structured_failure: Value,
+    provider_result: Value,
 }
 
 struct DurableProviderTurnTraceV3 {
     store: SessionKernelV2Store,
     dispatch: SessionProviderTurnDispatchReceiptV3,
     trace: ProviderTraceWriterV1,
+    cache_telemetry: ProviderCacheTelemetryRecorderV1,
     terminal_committed: bool,
 }
 
 impl DurableProviderTurnTraceV3 {
-    fn new(store: SessionKernelV2Store, commit: SessionProviderTurnDispatchCommitV3) -> Self {
+    fn new(
+        store: SessionKernelV2Store,
+        commit: SessionProviderTurnDispatchCommitV3,
+        cache_telemetry: ProviderCacheTelemetryRecorderV1,
+    ) -> Self {
         Self {
             store,
             dispatch: commit.receipt,
             trace: commit.trace,
+            cache_telemetry,
             terminal_committed: false,
         }
+    }
+
+    fn cache_dispatch_started(&mut self) {
+        self.cache_telemetry.dispatch_started();
+    }
+
+    fn cache_response_headers(&mut self, status: u16) {
+        self.cache_telemetry.response_headers(status);
+    }
+
+    fn cache_first_upstream_byte(&mut self) {
+        self.cache_telemetry.first_upstream_byte();
+    }
+
+    fn cache_first_semantic_delta(&mut self) {
+        self.cache_telemetry.first_semantic_delta();
+    }
+
+    fn cache_provider_terminal_observed(&mut self) {
+        self.cache_telemetry.provider_terminal_observed();
     }
 
     fn finish_noncompleted(
@@ -655,6 +1024,8 @@ impl DurableProviderTurnTraceV3 {
         trace_kind: ProviderTraceTerminalKindV1,
         reason_code: &str,
     ) -> Result<ProviderTraceMetadataV1, ProviderTraceErrorV1> {
+        self.cache_provider_terminal_observed();
+        let cancelled = matches!(terminal_kind, SessionProviderTurnTerminalKindV3::Cancelled);
         let metadata = self.trace.finish(ProviderTraceTerminalV1 {
             kind: trace_kind,
             reason_code: Some(reason_code.to_string()),
@@ -668,9 +1039,54 @@ impl DurableProviderTurnTraceV3 {
                 response_digest: None,
                 completion: None,
                 provider_result: None,
+                structured_failure: None,
                 ordered_items: Vec::new(),
             },
         )?;
+        if cancelled {
+            self.cache_telemetry.cancelled(reason_code);
+        } else {
+            self.cache_telemetry.failed(reason_code);
+        }
+        self.cache_telemetry.trace_ref = Some(metadata.seal_digest.clone());
+        self.cache_telemetry.persist();
+        self.terminal_committed = true;
+        Ok(metadata)
+    }
+
+    fn finish_structured_failure(
+        &mut self,
+        input: ProviderStructuredFailureTerminalInputV3,
+    ) -> Result<ProviderTraceMetadataV1, ProviderTraceErrorV1> {
+        self.cache_provider_terminal_observed();
+        self.trace.append_normalized_event(json!({
+            "type": "structuredOutputFailure",
+            "failure": input.structured_failure,
+            "providerResult": input.provider_result,
+        }))?;
+        let cache_usage = input.provider_result.get("usage").cloned();
+        let metadata = self.trace.finish(ProviderTraceTerminalV1 {
+            kind: ProviderTraceTerminalKindV1::Failed,
+            reason_code: Some(input.reason_code.to_string()),
+        })?;
+        self.store.commit_provider_terminal(
+            &self.dispatch,
+            &metadata,
+            SessionProviderTurnTerminalCommitV3 {
+                terminal_kind: SessionProviderTurnTerminalKindV3::Failed,
+                reason_code: Some(input.reason_code.to_string()),
+                response_digest: None,
+                completion: None,
+                provider_result: Some(input.provider_result),
+                structured_failure: Some(input.structured_failure),
+                ordered_items: Vec::new(),
+            },
+        )?;
+        self.cache_telemetry.failed_with_usage(
+            input.reason_code,
+            cache_usage.as_ref(),
+            &metadata.seal_digest,
+        );
         self.terminal_committed = true;
         Ok(metadata)
     }
@@ -679,6 +1095,8 @@ impl DurableProviderTurnTraceV3 {
         &mut self,
         input: ProviderCompletedTerminalInputV3,
     ) -> Result<(ProviderTraceMetadataV1, Value), ProviderTraceErrorV1> {
+        self.cache_provider_terminal_observed();
+        let cache_usage = input.provider_result.get("usage").cloned();
         let metadata = self.trace.finish(ProviderTraceTerminalV1 {
             kind: ProviderTraceTerminalKindV1::Completed,
             reason_code: None,
@@ -697,6 +1115,10 @@ impl DurableProviderTurnTraceV3 {
                 "recordCount": metadata.record_count,
             }
         });
+        let mut completion = completion;
+        if let Some(recovery) = input.structured_output_recovery {
+            completion["structuredOutputRecovery"] = recovery;
+        }
         self.store.commit_provider_terminal(
             &self.dispatch,
             &metadata,
@@ -706,9 +1128,12 @@ impl DurableProviderTurnTraceV3 {
                 response_digest: Some(input.response_digest),
                 completion: Some(completion.clone()),
                 provider_result: Some(input.provider_result),
+                structured_failure: None,
                 ordered_items: input.ordered_items,
             },
         )?;
+        self.cache_telemetry
+            .completed(cache_usage.as_ref(), &metadata.seal_digest);
         self.terminal_committed = true;
         Ok((metadata, completion))
     }
@@ -760,6 +1185,19 @@ struct ProviderSealedToolV3 {
 }
 
 impl ProviderSealedItemsBuilderV3 {
+    fn apply_normalized_tool_arguments(
+        &mut self,
+        normalized: &std::collections::BTreeMap<i64, String>,
+    ) -> Result<(), ProviderNativeStreamTransportErrorV1> {
+        for (native_index, arguments) in normalized {
+            let tool = self.tools.get_mut(native_index).ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_ordered_items_invalid")
+            })?;
+            tool.arguments = arguments.clone();
+        }
+        Ok(())
+    }
+
     fn ingest_public_event(
         &mut self,
         event: &str,
@@ -1015,7 +1453,6 @@ impl ProviderNativeStreamTransportErrorV1 {
 struct PreparedProviderNativeStreamRequestV1 {
     provider_kind: ProviderNativeStreamKindV1,
     exact_request_body: Vec<u8>,
-    tool_count: usize,
 }
 
 impl ProviderEnvelopeFramerV1 {
@@ -1168,6 +1605,13 @@ struct ProviderContinuationToolV1 {
     output: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderContinuationOperationBindingV1 {
+    operation_id: String,
+    tool_id: String,
+    outcome: SessionProviderContinuationOutcomeV2,
+}
+
 #[derive(Debug, Clone)]
 struct ProviderNativeContinuationV1 {
     reasoning: String,
@@ -1177,15 +1621,36 @@ struct ProviderNativeContinuationV1 {
     openai_reasoning_field: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ProviderCachePredecessorMaterialV1 {
+    exact_request_body: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderCachePreparedRelationV1 {
+    relation: ProviderCacheRelationV1,
+    predecessor_external_digest: Option<String>,
+    appended_suffix_bytes: Option<u64>,
+}
+
 fn inject_provider_native_continuation(
     profile: &ResolvedLlmProfile,
     request_envelope: &mut Value,
     trace_store: &ProviderTraceStoreV1,
     current_identity: &ProviderTraceIdentityV1,
     dispatch_authority: &ProviderStreamDispatchAuthorityV1,
-) -> Result<(), ProviderNativeStreamTransportErrorV1> {
+    current_sidecar: &SessionProviderAdmissionSidecarV2,
+) -> Result<ProviderCachePredecessorMaterialV1, ProviderNativeStreamTransportErrorV1> {
     let Some(parent_request_value) = request_envelope.get("parentRequestId") else {
-        return Ok(());
+        if matches!(
+            current_sidecar.cache_lane.mode,
+            SessionProviderCacheLaneModeV2::Append | SessionProviderCacheLaneModeV2::ExactReplay
+        ) {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_cache_lane_predecessor_missing",
+            ));
+        }
+        return Ok(ProviderCachePredecessorMaterialV1::default());
     };
     let parent_request_id = parent_request_value
         .as_str()
@@ -1194,8 +1659,28 @@ fn inject_provider_native_continuation(
         .ok_or_else(|| {
             ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
         })?;
-    if current_identity.purpose != ProviderTracePurposeV1::Continuation
-        || parent_request_id == current_identity.provider_turn_id
+    if parent_request_id == current_identity.provider_turn_id
+        || match current_sidecar.cache_lane.relation_kind {
+            SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+            | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair => {
+                current_identity.purpose != ProviderTracePurposeV1::Continuation
+            }
+            SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation => {
+                let expected_purpose =
+                    if current_sidecar.target_binding.kind_name() == "finalAnswer" {
+                        ProviderTracePurposeV1::FinalAnswer
+                    } else {
+                        ProviderTracePurposeV1::Continuation
+                    };
+                current_identity.purpose != expected_purpose
+            }
+            SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
+                current_identity.purpose != ProviderTracePurposeV1::Primary
+            }
+            SessionProviderCacheLaneRelationKindV2::Bootstrap
+            | SessionProviderCacheLaneRelationKindV2::ExactReplay
+            | SessionProviderCacheLaneRelationKindV2::Reset => false,
+        }
     {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_invalid",
@@ -1204,29 +1689,166 @@ fn inject_provider_native_continuation(
 
     let recovery = trace_store
         .verified_terminal_recovery(&current_identity.session_id, parent_request_id)
-        .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
+        .map_err(|error| {
+            provider_cache_lane_reset_required(if error.code == "provider_trace_not_found" {
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceUnavailable
+            } else {
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid
+            })
+        })?;
     let parent_identity = &recovery.metadata;
-    if parent_identity.session_id != current_identity.session_id
-        || parent_identity.run_id != current_identity.run_id
-        || parent_identity.user_turn_id != current_identity.user_turn_id
-        || parent_identity.provider_turn_id != parent_request_id
-        || parent_identity.provider_kind != current_identity.provider_kind
-        || parent_identity.model != current_identity.model
-        || parent_identity.profile_id != current_identity.profile_id
-        || parent_identity.profile_revision != current_identity.profile_revision
-        || parent_identity.control_epoch != current_identity.control_epoch
-        || parent_identity.purpose == ProviderTracePurposeV1::FinalAnswer
-        || parent_identity.provider_kind != required_resolved_provider_flavor(profile)
-        || parent_identity.model != profile.model
-        || parent_identity.profile_id != profile.id
-    {
-        return Err(ProviderNativeStreamTransportErrorV1::new(
-            "provider_continuation_invalid",
+    if parent_identity.model != current_identity.model || parent_identity.model != profile.model {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::ModelChanged,
         ));
     }
+    if parent_identity.session_id != current_identity.session_id
+        || parent_identity.provider_turn_id != parent_request_id
+        || parent_identity.provider_kind != current_identity.provider_kind
+        || parent_identity.profile_id != current_identity.profile_id
+        || parent_identity.profile_revision != current_identity.profile_revision
+        || parent_identity.provider_kind != required_resolved_provider_flavor(profile)
+        || parent_identity.profile_id != profile.id
+        || match current_sidecar.cache_lane.mode {
+            SessionProviderCacheLaneModeV2::Append => false,
+            SessionProviderCacheLaneModeV2::ExactReplay => {
+                parent_identity.purpose != current_identity.purpose
+            }
+            SessionProviderCacheLaneModeV2::Bootstrap | SessionProviderCacheLaneModeV2::Reset => {
+                true
+            }
+        }
+    {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+        ));
+    }
+    let parent_sidecar = recovery
+        .admission_sidecar
+        .clone()
+        .ok_or_else(|| {
+            provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::LegacySessionColdStart,
+            )
+        })
+        .and_then(|value| {
+            match value.get("schemaVersion").and_then(Value::as_str) {
+                Some(SESSION_PROVIDER_ADMISSION_SIDECAR_SCHEMA_V2) => {}
+                Some("deepcode.session.provider-admission-sidecar.v1") => {
+                    return Err(provider_cache_lane_reset_required(
+                        SessionProviderCacheLaneResetReasonV1::LegacySessionColdStart,
+                    ));
+                }
+                _ => {
+                    return Err(provider_cache_lane_reset_required(
+                        SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                    ));
+                }
+            }
+            SessionProviderAdmissionSidecarV2::decode_private_value(value).map_err(|_| {
+                provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                )
+            })
+        })?;
+    validate_provider_cache_lane_predecessor(
+        current_identity,
+        current_sidecar,
+        &parent_sidecar,
+        &recovery.metadata.request_digest,
+    )?;
+    if current_sidecar.cache_lane.relation_kind
+        == SessionProviderCacheLaneRelationKindV2::NextUserTurn
+    {
+        let head = current_sidecar
+            .provider_conversation_head
+            .as_ref()
+            .ok_or_else(|| {
+                provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                )
+            })?;
+        if head.provider_profile_id != parent_identity.profile_id
+            || head.provider != parent_identity.provider_kind
+            || head.model != parent_identity.model
+        {
+            return Err(provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::ProviderProfileChanged,
+            ));
+        }
+    }
+    if current_sidecar.cache_lane.mode == SessionProviderCacheLaneModeV2::ExactReplay {
+        if recovery.metadata.terminal_kind != ProviderTraceTerminalKindV1::Failed
+            || recovery.reason_code.as_deref() != Some("provider_retryable_no_mutation")
+            || recovery.metadata.raw_source_bytes != 0
+        {
+            return Err(provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            ));
+        }
+        return Ok(ProviderCachePredecessorMaterialV1 {
+            exact_request_body: Some(recovery.exact_request_body),
+        });
+    }
+    if current_sidecar.cache_lane.relation_kind
+        == SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
+    {
+        let repair = current_sidecar.structured_repair.as_ref().ok_or_else(|| {
+            provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            )
+        })?;
+        let terminal_matches = match repair.source_terminal_kind.as_str() {
+            "failed" => {
+                recovery.metadata.terminal_kind == ProviderTraceTerminalKindV1::Failed
+                    && recovery.reason_code.as_deref() == Some(repair.error_code.as_str())
+                    && recovery
+                        .structured_failure
+                        .as_ref()
+                        .and_then(|value| value.get("failureDigest"))
+                        .and_then(Value::as_str)
+                        == Some(repair.failure_digest.as_str())
+            }
+            "completed" => recovery.completed.as_ref().is_some_and(|completed| {
+                repair.source_response_digest.as_deref() == Some(completed.response_digest.as_str())
+            }),
+            _ => false,
+        };
+        if !terminal_matches {
+            return Err(provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            ));
+        }
+        let parent_request = serde_json::from_slice::<Value>(&recovery.exact_request_body)
+            .map_err(|_| {
+                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+            })?;
+        let mut exact_messages = parent_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+            })?;
+        let semantic_delta = request_envelope
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+            })?;
+        exact_messages.extend(semantic_delta);
+        request_envelope["messages"] = Value::Array(exact_messages);
+        return Ok(ProviderCachePredecessorMaterialV1 {
+            exact_request_body: Some(recovery.exact_request_body),
+        });
+    }
     let completed = recovery.completed.ok_or_else(|| {
-        ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
+        provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+        )
     })?;
+    let parent_exact_request_body = recovery.exact_request_body;
     if completed.reasoning_transport != resolved_reasoning_transport(profile)
         || completed
             .native_completion
@@ -1249,23 +1871,11 @@ fn inject_provider_native_continuation(
             .and_then(Value::as_str)
             != Some(required_resolved_provider_flavor(profile))
     {
-        return Err(ProviderNativeStreamTransportErrorV1::new(
-            "provider_continuation_invalid",
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::ProviderProfileChanged,
         ));
     }
 
-    let parent_binding =
-        provider_dispatch_binding_from_exact_request(&completed.exact_request_body)?;
-    if parent_binding.provider_turn_id != parent_request_id
-        || parent_binding.run_id != current_identity.run_id
-        || parent_binding.control_epoch != current_identity.control_epoch
-        || parent_binding.current_input_id != current_identity.user_turn_id
-        || parent_binding.purpose != parent_identity.purpose
-    {
-        return Err(ProviderNativeStreamTransportErrorV1::new(
-            "provider_continuation_invalid",
-        ));
-    }
     let parent_request = serde_json::from_slice::<Value>(&completed.exact_request_body)
         .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
     let parent_messages = parent_request
@@ -1274,70 +1884,349 @@ fn inject_provider_native_continuation(
         .ok_or_else(|| {
             ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
         })?;
-    let parent_input = exact_provider_context_message(
-        parent_messages,
-        "deepcode.session.provider-current-input.v2",
-    )?;
-    let current_messages = request_envelope
+    let semantic_delta = request_envelope
         .get("messages")
         .and_then(Value::as_array)
+        .cloned()
         .ok_or_else(|| {
             ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
         })?;
-    let current_input = exact_provider_context_message(
-        current_messages,
-        "deepcode.session.provider-current-input.v2",
-    )?;
-    validate_provider_continuation_admission(current_identity, &current_input, dispatch_authority)?;
-    let operation_ids = provider_native_continuation_operation_ids(
-        parent_request_id,
-        current_identity,
-        &parent_input,
-        &completed.ordered_items,
-    )?;
-    let tool_outputs = query_canonical_provider_tool_outputs(
-        current_identity,
-        dispatch_authority,
-        &operation_ids,
-    )?;
-    let mut continuation = provider_native_continuation_from_evidence(
-        parent_request_id,
-        current_identity,
-        &parent_input,
-        completed.reasoning,
-        &completed.ordered_items,
-        &operation_ids,
-        &tool_outputs,
-    )?;
-    if profile.kind == "anthropic" {
-        continuation.anthropic_signature = Some(anthropic_thinking_signature(
-            &completed.raw_upstream_envelopes,
-            &continuation.reasoning,
-        )?);
-    } else if profile.kind == "openaiCompatible" {
-        continuation.openai_reasoning_field = Some(openai_reasoning_field(
-            &completed.raw_upstream_envelopes,
-            &continuation.reasoning,
-        )?);
-    }
     let provider_kind = ProviderNativeStreamKindV1::from_profile_kind(&profile.kind)
         .ok_or_else(|| ProviderNativeStreamTransportErrorV1::new("ProviderUnsupportedKind"))?;
-    let native_messages = provider_native_continuation_messages(provider_kind, continuation)?;
-    request_envelope
-        .get_mut("messages")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?
-        .extend(native_messages);
+    let native_messages = match current_sidecar.cache_lane.relation_kind {
+        SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation => {
+            validate_provider_continuation_admission(
+                current_identity,
+                current_sidecar,
+                dispatch_authority,
+                false,
+            )?;
+            let operation_bindings = provider_native_continuation_operation_bindings(
+                &parent_sidecar.target_binding,
+                &completed.ordered_items,
+                &current_sidecar.continuation_operation_ids,
+                &current_sidecar.continuation_outcomes,
+            )?;
+            let tool_outputs = query_canonical_provider_tool_outputs(
+                current_identity,
+                dispatch_authority,
+                &parent_sidecar,
+                &operation_bindings,
+            )?;
+            let mut continuation = provider_native_continuation_from_evidence(
+                completed.reasoning,
+                &completed.ordered_items,
+                &operation_bindings,
+                &tool_outputs,
+            )?;
+            if profile.kind == "anthropic" {
+                continuation.anthropic_signature = Some(anthropic_thinking_signature(
+                    &completed.raw_upstream_envelopes,
+                    &continuation.reasoning,
+                )?);
+            } else if profile.kind == "openaiCompatible" {
+                continuation.openai_reasoning_field = Some(openai_reasoning_field(
+                    &completed.raw_upstream_envelopes,
+                    &continuation.reasoning,
+                )?);
+            }
+            provider_native_continuation_messages(provider_kind, continuation)?
+        }
+        SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation => {
+            validate_provider_continuation_admission(
+                current_identity,
+                current_sidecar,
+                dispatch_authority,
+                true,
+            )?;
+            let mut continuation = provider_native_session_control_continuation(
+                completed.reasoning,
+                &completed.ordered_items,
+                &parent_sidecar.target_binding,
+                current_sidecar,
+            )?;
+            if profile.kind == "anthropic" {
+                continuation.anthropic_signature = Some(anthropic_thinking_signature(
+                    &completed.raw_upstream_envelopes,
+                    &continuation.reasoning,
+                )?);
+            } else if profile.kind == "openaiCompatible" {
+                continuation.openai_reasoning_field = Some(openai_reasoning_field(
+                    &completed.raw_upstream_envelopes,
+                    &continuation.reasoning,
+                )?);
+            }
+            provider_native_continuation_messages(provider_kind, continuation)?
+        }
+        SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
+            let head = current_sidecar
+                .provider_conversation_head
+                .as_ref()
+                .ok_or_else(|| {
+                    provider_cache_lane_reset_required(
+                        SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                    )
+                })?;
+            let answer = provider_terminal_answer_text(&completed.ordered_items).map_err(|_| {
+                provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                )
+            })?;
+            if crate::host_v2_storage::sha256_prefixed(answer.as_bytes()) != head.answer_digest {
+                return Err(provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                ));
+            }
+            vec![provider_terminal_answer_message(provider_kind, &answer)]
+        }
+        SessionProviderCacheLaneRelationKindV2::Bootstrap
+        | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
+        | SessionProviderCacheLaneRelationKindV2::ExactReplay
+        | SessionProviderCacheLaneRelationKindV2::Reset => {
+            return Err(provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            ));
+        }
+    };
+    let mut exact_messages = parent_messages.clone();
+    exact_messages.extend(native_messages);
+    exact_messages.extend(semantic_delta);
+    request_envelope["messages"] = Value::Array(exact_messages);
+    Ok(ProviderCachePredecessorMaterialV1 {
+        exact_request_body: Some(parent_exact_request_body),
+    })
+}
+
+fn validate_prepared_cache_relation(
+    sidecar: &SessionProviderAdmissionSidecarV2,
+    predecessor: &ProviderCachePredecessorMaterialV1,
+    current_exact_request_body: &[u8],
+) -> Result<ProviderCachePreparedRelationV1, ProviderNativeStreamTransportErrorV1> {
+    match sidecar.cache_lane.mode {
+        SessionProviderCacheLaneModeV2::Bootstrap => Ok(ProviderCachePreparedRelationV1 {
+            relation: ProviderCacheRelationV1::NoBaseline,
+            predecessor_external_digest: None,
+            appended_suffix_bytes: None,
+        }),
+        SessionProviderCacheLaneModeV2::Reset => Ok(ProviderCachePreparedRelationV1 {
+            relation: ProviderCacheRelationV1::Reset,
+            predecessor_external_digest: None,
+            appended_suffix_bytes: None,
+        }),
+        SessionProviderCacheLaneModeV2::ExactReplay => {
+            let parent = predecessor.exact_request_body.as_deref().ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_cache_lane_predecessor_missing")
+            })?;
+            if parent != current_exact_request_body {
+                return Err(ProviderNativeStreamTransportErrorV1::new(
+                    "provider_cache_lane_exact_replay_mismatch",
+                ));
+            }
+            Ok(ProviderCachePreparedRelationV1 {
+                relation: ProviderCacheRelationV1::ExactReplay,
+                predecessor_external_digest: Some(crate::host_v2_storage::sha256_prefixed(parent)),
+                appended_suffix_bytes: Some(0),
+            })
+        }
+        SessionProviderCacheLaneModeV2::Append => {
+            let parent = predecessor.exact_request_body.as_deref().ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new("provider_cache_lane_predecessor_missing")
+            })?;
+            let parent_value = serde_json::from_slice::<Value>(parent).map_err(|_| {
+                ProviderNativeStreamTransportErrorV1::new("provider_cache_lane_predecessor_invalid")
+            })?;
+            let current_value = serde_json::from_slice::<Value>(current_exact_request_body)
+                .map_err(|_| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_cache_lane_current_request_invalid",
+                    )
+                })?;
+            let parent_messages = parent_value
+                .get("messages")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_cache_lane_predecessor_invalid",
+                    )
+                })?;
+            let current_messages = current_value
+                .get("messages")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_cache_lane_current_request_invalid",
+                    )
+                })?;
+            if current_messages.len() <= parent_messages.len()
+                || current_messages.get(..parent_messages.len()) != Some(parent_messages.as_slice())
+            {
+                return Err(ProviderNativeStreamTransportErrorV1::new(
+                    "provider_cache_lane_message_prefix_mismatch",
+                ));
+            }
+            let mut parent_shape = parent_value.clone();
+            let mut current_shape = current_value.clone();
+            parent_shape["messages"] = Value::Array(Vec::new());
+            current_shape["messages"] = Value::Array(Vec::new());
+            if parent_shape != current_shape {
+                return Err(ProviderNativeStreamTransportErrorV1::new(
+                    "provider_cache_lane_request_shape_mismatch",
+                ));
+            }
+            let suffix = Value::Array(current_messages[parent_messages.len()..].to_vec());
+            let suffix_bytes = serde_json::to_vec(&suffix)
+                .map_err(|_| {
+                    ProviderNativeStreamTransportErrorV1::new("provider_cache_lane_suffix_invalid")
+                })?
+                .len();
+            Ok(ProviderCachePreparedRelationV1 {
+                relation: ProviderCacheRelationV1::ExactAppend,
+                predecessor_external_digest: Some(crate::host_v2_storage::sha256_prefixed(parent)),
+                appended_suffix_bytes: Some(u64::try_from(suffix_bytes).unwrap_or(u64::MAX)),
+            })
+        }
+    }
+}
+
+fn validate_provider_cache_lane_predecessor(
+    current_identity: &ProviderTraceIdentityV1,
+    current: &SessionProviderAdmissionSidecarV2,
+    parent: &SessionProviderAdmissionSidecarV2,
+    parent_external_digest: &str,
+) -> Result<(), ProviderNativeStreamTransportErrorV1> {
+    if !matches!(
+        current.cache_lane.mode,
+        SessionProviderCacheLaneModeV2::Append | SessionProviderCacheLaneModeV2::ExactReplay
+    ) || current.cache_lane.predecessor_request_id.as_deref()
+        != Some(parent.provider_turn_id.as_str())
+        || current.cache_lane.predecessor_external_digest.as_deref() != Some(parent_external_digest)
+        || current.session_id != parent.session_id
+        || current_identity.provider_turn_id != current.provider_turn_id
+        || current_identity.session_id != current.session_id
+        || current_identity.run_id != current.run_id
+        || current_identity.user_turn_id != current.user_turn_id
+        || current_identity.control_epoch != current.control_epoch
+    {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+        ));
+    }
+    match current.cache_lane.relation_kind {
+        SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+        | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
+        | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
+        | SessionProviderCacheLaneRelationKindV2::ExactReplay => {
+            if current.run_id != parent.run_id
+                || current.user_turn_id != parent.user_turn_id
+                || current.control_epoch != parent.control_epoch
+            {
+                return Err(provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                ));
+            }
+        }
+        SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
+            let Some(head) = current.provider_conversation_head.as_ref() else {
+                return Err(provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                ));
+            };
+            if head.session_id != parent.session_id
+                || head.run_id != parent.run_id
+                || head.user_turn_id != parent.user_turn_id
+                || head.provider_turn_id != parent.provider_turn_id
+                || head.control_epoch != parent.control_epoch
+            {
+                return Err(provider_cache_lane_reset_required(
+                    SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+                ));
+            }
+        }
+        SessionProviderCacheLaneRelationKindV2::Bootstrap
+        | SessionProviderCacheLaneRelationKindV2::Reset => {
+            return Err(provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+            ));
+        }
+    }
+    if current.provider_profile_revision_digest != parent.provider_profile_revision_digest {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::ProviderProfileChanged,
+        ));
+    }
+    if current.tool_schema_digest != parent.tool_schema_digest
+        || current.tool_context_ref.catalog_digest != parent.tool_context_ref.catalog_digest
+    {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::ToolSchemaChanged,
+        ));
+    }
+    if current.response_format_digest != parent.response_format_digest {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::ResponseFormatChanged,
+        ));
+    }
+    if current.cache_lane.stable_prefix_digest != parent.cache_lane.stable_prefix_digest {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::SystemContractChanged,
+        ));
+    }
+    if current.cache_lane.lane_id != parent.cache_lane.lane_id
+        || current.cache_lane.lane_revision != parent.cache_lane.lane_revision
+    {
+        return Err(provider_cache_lane_reset_required(
+            SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid,
+        ));
+    }
     Ok(())
 }
 
+fn provider_cache_lane_reset_required(
+    reason: SessionProviderCacheLaneResetReasonV1,
+) -> ProviderNativeStreamTransportErrorV1 {
+    ProviderNativeStreamTransportErrorV1::new(match reason {
+        SessionProviderCacheLaneResetReasonV1::DaemonTraceUnavailable => {
+            "provider_cache_lane_reset_required_daemon_trace_unavailable"
+        }
+        SessionProviderCacheLaneResetReasonV1::DaemonTraceInvalid => {
+            "provider_cache_lane_reset_required_daemon_trace_invalid"
+        }
+        SessionProviderCacheLaneResetReasonV1::LegacySessionColdStart => {
+            "provider_cache_lane_reset_required_legacy_session_cold_start"
+        }
+        SessionProviderCacheLaneResetReasonV1::SemanticLaneChanged => {
+            "provider_cache_lane_reset_required_semantic_lane_changed"
+        }
+        SessionProviderCacheLaneResetReasonV1::ProviderProfileChanged => {
+            "provider_cache_lane_reset_required_provider_profile_changed"
+        }
+        SessionProviderCacheLaneResetReasonV1::ModelChanged => {
+            "provider_cache_lane_reset_required_model_changed"
+        }
+        SessionProviderCacheLaneResetReasonV1::SystemContractChanged => {
+            "provider_cache_lane_reset_required_system_contract_changed"
+        }
+        SessionProviderCacheLaneResetReasonV1::ToolSchemaChanged => {
+            "provider_cache_lane_reset_required_tool_schema_changed"
+        }
+        SessionProviderCacheLaneResetReasonV1::ResponseFormatChanged => {
+            "provider_cache_lane_reset_required_response_format_changed"
+        }
+        SessionProviderCacheLaneResetReasonV1::ContextCompaction => {
+            "provider_cache_lane_reset_required_context_compaction"
+        }
+        SessionProviderCacheLaneResetReasonV1::ColdStart
+        | SessionProviderCacheLaneResetReasonV1::Rewind
+        | SessionProviderCacheLaneResetReasonV1::ManualReset => {
+            "provider_cache_lane_reset_required_daemon_trace_invalid"
+        }
+    })
+}
+
 fn provider_native_continuation_from_evidence(
-    parent_request_id: &str,
-    current_identity: &ProviderTraceIdentityV1,
-    parent_input: &Value,
     reasoning: String,
     ordered_items: &[Value],
-    operation_ids: &[String],
+    operation_bindings: &[ProviderContinuationOperationBindingV1],
     tool_outputs: &HashMap<String, Value>,
 ) -> Result<ProviderNativeContinuationV1, ProviderNativeStreamTransportErrorV1> {
     let mut assistant_items = Vec::new();
@@ -1382,30 +2271,24 @@ fn provider_native_continuation_from_evidence(
                 })?;
                 let internal_name = internal_tool_name(&wire_name);
                 let tool_id = provider_wire_tool_id_v2(&wire_name)?;
-                let operation_id = operation_ids.get(tools.len()).ok_or_else(|| {
+                let operation_binding = operation_bindings.get(tools.len()).ok_or_else(|| {
                     ProviderNativeStreamTransportErrorV1::new(
                         "provider_continuation_native_history_invalid",
                     )
                 })?;
-                let expected_operation_id = provider_continuation_operation_id(
-                    current_identity,
-                    parent_request_id,
-                    parent_input,
-                    &call_id,
-                    &tool_id,
-                    tools.len(),
-                    operation_ids.len(),
-                )?;
-                if operation_id != &expected_operation_id {
+                if operation_binding.tool_id != tool_id {
                     return Err(ProviderNativeStreamTransportErrorV1::new(
                         "provider_continuation_native_history_invalid",
                     ));
                 }
-                let output = tool_outputs.get(operation_id).cloned().ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new(
-                        "provider_continuation_result_missing",
-                    )
-                })?;
+                let output = tool_outputs
+                    .get(&operation_binding.operation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_missing",
+                        )
+                    })?;
                 let tool_index = tools.len();
                 tools.push(ProviderContinuationToolV1 {
                     call_id,
@@ -1423,8 +2306,8 @@ fn provider_native_continuation_from_evidence(
             }
         }
     }
-    if tools.len() != operation_ids.len()
-        || tool_outputs.len() != operation_ids.len()
+    if tools.len() != operation_bindings.len()
+        || tool_outputs.len() != operation_bindings.len()
         || reasoning.trim().is_empty()
     {
         return Err(ProviderNativeStreamTransportErrorV1::new(
@@ -1438,6 +2321,208 @@ fn provider_native_continuation_from_evidence(
         anthropic_signature: None,
         openai_reasoning_field: None,
     })
+}
+
+fn provider_native_session_control_continuation(
+    reasoning: String,
+    ordered_items: &[Value],
+    parent_target: &SessionProviderTargetBindingSidecarV2,
+    current_sidecar: &SessionProviderAdmissionSidecarV2,
+) -> Result<ProviderNativeContinuationV1, ProviderNativeStreamTransportErrorV1> {
+    let expected_tool_name = provider_native_session_control_contract(parent_target)?;
+    let settlement = current_sidecar.control_settlement.as_ref().ok_or_else(|| {
+        ProviderNativeStreamTransportErrorV1::new("provider_control_settlement_missing")
+    })?;
+    let next_target = current_sidecar.target_binding.kind_name();
+    if settlement.expected_parent_tool_name() != expected_tool_name
+        || settlement.next_target_kind() != next_target
+    {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_control_continuation_invalid",
+        ));
+    }
+
+    let expected_wire_name = if expected_tool_name.starts_with("deepcode_session_") {
+        expected_tool_name.to_string()
+    } else {
+        provider_tool_name(expected_tool_name)
+    };
+
+    let mut assistant_items = Vec::new();
+    let mut control_tool = None;
+    for item in ordered_items {
+        match item.get("kind").and_then(Value::as_str) {
+            Some("text") => {
+                let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_native_history_invalid",
+                    )
+                })?;
+                if !text.is_empty() {
+                    assistant_items
+                        .push(ProviderContinuationAssistantItemV1::Text(text.to_string()));
+                }
+            }
+            Some("toolCall") if control_tool.is_none() => {
+                if item.get("index").and_then(Value::as_u64) != Some(0) {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_native_history_invalid",
+                    ));
+                }
+                let call_id = required_continuation_text(item, "callId")?;
+                let wire_name = required_continuation_text(item, "name")?;
+                if wire_name != expected_wire_name {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_control_continuation_invalid",
+                    ));
+                }
+                let arguments_text = required_continuation_text(item, "arguments")?;
+                let arguments = serde_json::from_str::<Value>(&arguments_text).map_err(|_| {
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_native_history_invalid",
+                    )
+                })?;
+                let control = settlement.control();
+                if call_id != control.call_id
+                    || wire_name != control.tool_name
+                    || crate::host_v2_storage::stable_json_sha256(&arguments).map_err(|_| {
+                        ProviderNativeStreamTransportErrorV1::new(
+                            "provider_control_continuation_invalid",
+                        )
+                    })? != control.arguments_digest
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_control_continuation_invalid",
+                    ));
+                }
+                control_tool = Some(ProviderContinuationToolV1 {
+                    call_id,
+                    wire_name: wire_name.clone(),
+                    internal_name: internal_tool_name(&wire_name),
+                    arguments,
+                    output: settlement.continuation_output(),
+                });
+                assistant_items.push(ProviderContinuationAssistantItemV1::Tool(0));
+            }
+            _ => {
+                return Err(ProviderNativeStreamTransportErrorV1::new(
+                    "provider_continuation_native_history_invalid",
+                ));
+            }
+        }
+    }
+    let tool = control_tool.ok_or_else(|| {
+        ProviderNativeStreamTransportErrorV1::new("provider_control_continuation_invalid")
+    })?;
+    if reasoning.trim().is_empty() {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_continuation_native_history_invalid",
+        ));
+    }
+    Ok(ProviderNativeContinuationV1 {
+        reasoning,
+        assistant_items,
+        tools: vec![tool],
+        anthropic_signature: None,
+        openai_reasoning_field: None,
+    })
+}
+
+fn provider_native_session_control_contract(
+    parent_target: &SessionProviderTargetBindingSidecarV2,
+) -> Result<&'static str, ProviderNativeStreamTransportErrorV1> {
+    let contract = match parent_target {
+        SessionProviderTargetBindingSidecarV2::Planning => "deepcode_session_plan_propose_v5",
+        SessionProviderTargetBindingSidecarV2::PlanAction { .. } => {
+            "deepcode_session_plan_action_complete_v2"
+        }
+        SessionProviderTargetBindingSidecarV2::InterventionResearch { .. } => {
+            "deepcode_session_intervention_propose_v1"
+        }
+        SessionProviderTargetBindingSidecarV2::ContextRead { .. }
+        | SessionProviderTargetBindingSidecarV2::FinalAnswer { .. } => {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_control_continuation_invalid",
+            ));
+        }
+    };
+    Ok(contract)
+}
+
+fn provider_terminal_answer_text(
+    ordered_items: &[Value],
+) -> Result<String, ProviderNativeStreamTransportErrorV1> {
+    if ordered_items.is_empty()
+        || ordered_items
+            .iter()
+            .any(|item| item.get("kind").and_then(Value::as_str) != Some("text"))
+    {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_conversation_head_terminal_invalid",
+        ));
+    }
+    let mut first_final = None;
+    let mut last_commentary = None;
+    let mut items = Vec::with_capacity(ordered_items.len());
+    for (index, item) in ordered_items.iter().enumerate() {
+        let phase = item.get("phase").and_then(Value::as_str).ok_or_else(|| {
+            ProviderNativeStreamTransportErrorV1::new("provider_conversation_head_terminal_invalid")
+        })?;
+        if !matches!(phase, "commentary" | "final_answer" | "unknown") {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_conversation_head_terminal_invalid",
+            ));
+        }
+        let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+            ProviderNativeStreamTransportErrorV1::new("provider_conversation_head_terminal_invalid")
+        })?;
+        if phase == "final_answer" && first_final.is_none() {
+            first_final = Some(index);
+        }
+        if phase == "commentary" {
+            last_commentary = Some(index);
+        }
+        items.push((phase, text));
+    }
+    let start = first_final.unwrap_or_else(|| last_commentary.map_or(0, |index| index + 1));
+    if first_final.is_some()
+        && items[start..]
+            .iter()
+            .any(|(phase, _)| *phase == "commentary")
+    {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_conversation_head_terminal_invalid",
+        ));
+    }
+    let answer = items[start..]
+        .iter()
+        .filter(|(phase, _)| first_final.is_some() || *phase == "unknown")
+        .map(|(_, text)| *text)
+        .collect::<String>();
+    if answer.trim().is_empty() || answer.len() > 1024 * 1024 {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_conversation_head_terminal_invalid",
+        ));
+    }
+    Ok(answer)
+}
+
+fn provider_terminal_answer_message(
+    provider_kind: ProviderNativeStreamKindV1,
+    answer: &str,
+) -> Value {
+    match provider_kind {
+        ProviderNativeStreamKindV1::Anthropic => json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": answer }],
+        }),
+        ProviderNativeStreamKindV1::OpenAiCompatible | ProviderNativeStreamKindV1::Ollama => {
+            json!({
+                "role": "assistant",
+                "content": answer,
+            })
+        }
+    }
 }
 
 fn required_continuation_text(
@@ -1457,110 +2542,31 @@ fn required_continuation_text(
         })
 }
 
-fn provider_continuation_operation_id(
-    current_identity: &ProviderTraceIdentityV1,
-    parent_request_id: &str,
-    parent_input: &Value,
-    call_id: &str,
-    tool_id: &str,
-    zero_based_index: usize,
-    call_count: usize,
-) -> Result<String, ProviderNativeStreamTransportErrorV1> {
-    let target = parent_input
-        .get("target")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-        })?;
-    let kind = target.get("kind").and_then(Value::as_str).ok_or_else(|| {
-        ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-    })?;
-    if kind == "contextRead" && call_count == 1 {
-        return target
-            .get("operationId")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-            });
-    }
-    let authority_key = match kind {
-        "planning" => format!("planning:{tool_id}"),
-        "planAction" => format!(
-            "planAction:{}",
-            target
-                .get("planActionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-                })?
-        ),
-        "contextRead" => format!(
-            "contextRead:{}:{}:{}",
-            target
-                .get("operationId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-                })?,
-            target
-                .get("idempotencyKey")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-                })?,
-            zero_based_index + 1,
-        ),
-        _ => {
-            return Err(ProviderNativeStreamTransportErrorV1::new(
-                "provider_continuation_invalid",
-            ));
-        }
-    };
-    let digest = crate::host_v2_storage::canonical_sha256(&json!({
-        "runId": current_identity.run_id,
-        "controlEpoch": current_identity.control_epoch,
-        "providerTurnId": parent_request_id,
-        "callIdentity": format!("native:{call_id}"),
-        "authorityKey": authority_key,
-    }))
-    .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
-    let suffix = digest.strip_prefix("sha256:").ok_or_else(|| {
-        ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid")
-    })?;
-    Ok(format!("operation-{suffix}"))
-}
-
 fn validate_provider_continuation_admission(
     current_identity: &ProviderTraceIdentityV1,
-    current_input: &Value,
+    current_sidecar: &SessionProviderAdmissionSidecarV2,
     dispatch_authority: &ProviderStreamDispatchAuthorityV1,
+    allow_final_answer_purpose: bool,
 ) -> Result<(), ProviderNativeStreamTransportErrorV1> {
     let admission = &dispatch_authority.admission;
-    let current_input_digest = crate::host_v2_storage::canonical_sha256(current_input)
-        .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
+    let expected_purpose = if allow_final_answer_purpose
+        && current_sidecar.target_binding.kind_name() == "finalAnswer"
+    {
+        ProviderTracePurposeV1::FinalAnswer
+    } else {
+        ProviderTracePurposeV1::Continuation
+    };
     if admission.provider_turn_id != current_identity.provider_turn_id
-        || admission.purpose != ProviderTracePurposeV1::Continuation
+        || admission.purpose != expected_purpose
         || admission.control_epoch != current_identity.control_epoch
         || admission.current_input_id != current_identity.user_turn_id
-        || admission.current_input_digest != current_input_digest
-        || current_input.get("providerTurnId").and_then(Value::as_str)
-            != Some(current_identity.provider_turn_id.as_str())
-        || current_input.get("runId").and_then(Value::as_str)
-            != Some(current_identity.run_id.as_str())
-        || current_input.get("controlEpoch").and_then(Value::as_u64)
-            != Some(current_identity.control_epoch)
-        || current_input
-            .get("currentInput")
-            .and_then(|value| value.get("inputId"))
-            .and_then(Value::as_str)
-            != Some(current_identity.user_turn_id.as_str())
-        || current_input.get("purpose").and_then(Value::as_str) != Some("continuation")
+        || admission.current_input_digest != current_sidecar.current_input_digest
+        || current_sidecar.provider_turn_id != current_identity.provider_turn_id
+        || current_sidecar.run_id != current_identity.run_id
+        || current_sidecar.control_epoch != current_identity.control_epoch
+        || current_sidecar.user_turn_id != current_identity.user_turn_id
+        || current_sidecar.purpose != expected_purpose
+        || current_identity.purpose != expected_purpose
     {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_invalid",
@@ -1569,23 +2575,27 @@ fn validate_provider_continuation_admission(
     Ok(())
 }
 
-fn provider_native_continuation_operation_ids(
-    parent_request_id: &str,
-    current_identity: &ProviderTraceIdentityV1,
-    parent_input: &Value,
+fn provider_native_continuation_operation_bindings(
+    parent_target: &SessionProviderTargetBindingSidecarV2,
     ordered_items: &[Value],
-) -> Result<Vec<String>, ProviderNativeStreamTransportErrorV1> {
+    admitted_operation_ids: &[String],
+    admitted_outcomes: &[SessionProviderContinuationOutcomeV2],
+) -> Result<Vec<ProviderContinuationOperationBindingV1>, ProviderNativeStreamTransportErrorV1> {
     let call_count = ordered_items
         .iter()
         .filter(|item| item.get("kind").and_then(Value::as_str) == Some("toolCall"))
         .count();
-    if call_count == 0 || call_count > 32 {
+    if call_count == 0
+        || call_count > 32
+        || admitted_operation_ids.len() != call_count
+        || admitted_outcomes.len() != call_count
+    {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_native_history_invalid",
         ));
     }
     let mut call_ids = HashSet::with_capacity(call_count);
-    let mut operation_ids = Vec::with_capacity(call_count);
+    let mut operation_bindings = Vec::with_capacity(call_count);
     let mut unique_operation_ids = HashSet::with_capacity(call_count);
     for item in ordered_items {
         if item.get("kind").and_then(Value::as_str) != Some("toolCall") {
@@ -1596,7 +2606,7 @@ fn provider_native_continuation_operation_ids(
                 "provider_continuation_native_history_invalid",
             )
         })?;
-        if index != u64::try_from(operation_ids.len()).unwrap_or(u64::MAX) {
+        if index != u64::try_from(operation_bindings.len()).unwrap_or(u64::MAX) {
             return Err(ProviderNativeStreamTransportErrorV1::new(
                 "provider_continuation_native_history_invalid",
             ));
@@ -1615,40 +2625,73 @@ fn provider_native_continuation_operation_ids(
                 "provider_continuation_native_history_invalid",
             ));
         }
-        let operation_id = provider_continuation_operation_id(
-            current_identity,
-            parent_request_id,
-            parent_input,
-            &call_id,
-            &tool_id,
-            operation_ids.len(),
-            call_count,
-        )?;
+        let operation_id = admitted_operation_ids
+            .get(operation_bindings.len())
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new(
+                    "provider_continuation_native_history_invalid",
+                )
+            })?;
         if !unique_operation_ids.insert(operation_id.clone()) {
             return Err(ProviderNativeStreamTransportErrorV1::new(
                 "provider_continuation_native_history_invalid",
             ));
         }
-        operation_ids.push(operation_id);
+        let outcome = admitted_outcomes
+            .get(operation_bindings.len())
+            .filter(|outcome| outcome.operation_id == operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderNativeStreamTransportErrorV1::new(
+                    "provider_continuation_native_history_invalid",
+                )
+            })?;
+        operation_bindings.push(ProviderContinuationOperationBindingV1 {
+            operation_id,
+            tool_id,
+            outcome,
+        });
     }
-    Ok(operation_ids)
+    if let SessionProviderTargetBindingSidecarV2::ContextRead { operation_id, .. } = parent_target {
+        if call_count == 1 && operation_bindings[0].operation_id != *operation_id {
+            return Err(ProviderNativeStreamTransportErrorV1::new(
+                "provider_continuation_native_history_invalid",
+            ));
+        }
+    }
+    if matches!(
+        parent_target,
+        SessionProviderTargetBindingSidecarV2::FinalAnswer { .. }
+    ) {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_continuation_invalid",
+        ));
+    }
+    Ok(operation_bindings)
 }
 
 fn query_canonical_provider_tool_outputs(
     current_identity: &ProviderTraceIdentityV1,
     dispatch_authority: &ProviderStreamDispatchAuthorityV1,
-    operation_ids: &[String],
+    parent_sidecar: &SessionProviderAdmissionSidecarV2,
+    operation_bindings: &[ProviderContinuationOperationBindingV1],
 ) -> Result<HashMap<String, Value>, ProviderNativeStreamTransportErrorV1> {
     let run_id = RunId::new(current_identity.run_id.clone())
         .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_continuation_invalid"))?;
-    let expected = operation_ids.iter().cloned().collect::<HashSet<_>>();
-    if expected.len() != operation_ids.len() || expected.is_empty() {
+    let expected = operation_bindings
+        .iter()
+        .map(|binding| (binding.operation_id.clone(), binding.tool_id.clone()))
+        .collect::<HashMap<_, _>>();
+    if expected.len() != operation_bindings.len() || expected.is_empty() {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_native_history_invalid",
         ));
     }
 
     let mut outputs = HashMap::with_capacity(expected.len());
+    let mut admitted = HashSet::with_capacity(expected.len());
+    let mut verified_negative_fact_ids = HashSet::new();
     let mut output_bytes = 0_usize;
     let mut after_ledger_sequence = 0_u64;
     let mut continuation = None;
@@ -1692,46 +2735,120 @@ fn query_canonical_provider_tool_outputs(
         snapshot_high_water.get_or_insert(page.snapshot_high_water);
 
         for fact in page.facts {
-            if fact.domain != KernelFactDomainProjectionV2::Invocation
-                || fact.fact_kind != "toolCompleted"
-                || fact.lineage.run_id != run_id
-                || fact
-                    .lineage
-                    .control_epoch
-                    .is_none_or(|epoch| epoch.get() != current_identity.control_epoch)
+            if fact.lineage.run_id != run_id
+                || fact.lineage.control_epoch.map(|epoch| epoch.get())
+                    != Some(current_identity.control_epoch)
             {
                 continue;
             }
-            let Some(operation_id) = fact
+            let fact_id = fact.fact_id.to_string();
+            let operation_id = fact
                 .lineage
                 .operation_id
                 .as_ref()
                 .map(ToString::to_string)
-                .filter(|operation_id| expected.contains(operation_id))
-            else {
+                .filter(|operation_id| expected.contains_key(operation_id))
+                .or_else(|| {
+                    operation_bindings.iter().find_map(|binding| {
+                        binding
+                            .outcome
+                            .rejection
+                            .as_ref()
+                            .filter(|rejection| rejection.rejection_fact_id == fact_id)
+                            .map(|_| binding.operation_id.clone())
+                    })
+                });
+            let Some(operation_id) = operation_id else {
                 continue;
             };
-            let output = fact.details.get("output").cloned().ok_or_else(|| {
-                ProviderNativeStreamTransportErrorV1::new("provider_continuation_result_missing")
-            })?;
-            output_bytes = output_bytes
-                .checked_add(
-                    serde_json::to_vec(&output)
-                        .map_err(|_| {
-                            ProviderNativeStreamTransportErrorV1::new(
-                                "provider_continuation_result_missing",
-                            )
-                        })?
-                        .len(),
-                )
-                .filter(|bytes| *bytes <= PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1)
+            let binding = operation_bindings
+                .iter()
+                .find(|binding| binding.operation_id == operation_id)
                 .ok_or_else(|| {
-                    ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
+                    ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_identity_mismatch",
+                    )
                 })?;
-            if outputs.insert(operation_id, output).is_some() {
+            let is_bound_terminal_fact =
+                binding.outcome.terminal_fact_id.as_deref() == Some(fact_id.as_str());
+            let is_bound_rejection_fact = binding
+                .outcome
+                .rejection
+                .as_ref()
+                .is_some_and(|rejection| rejection.rejection_fact_id == fact_id);
+            let is_continuation_evidence = matches!(
+                fact.fact_kind.as_str(),
+                "toolIntentAdmitted" | "toolCompleted"
+            ) || is_bound_terminal_fact
+                || is_bound_rejection_fact;
+            if !is_continuation_evidence {
+                continue;
+            }
+            if !provider_continuation_fact_matches_parent(&fact, parent_sidecar) {
                 return Err(ProviderNativeStreamTransportErrorV1::new(
-                    "provider_continuation_result_missing",
+                    "provider_continuation_result_identity_mismatch",
                 ));
+            }
+            if is_bound_terminal_fact {
+                if binding.outcome.terminal_fact_kind.as_deref() != Some(fact.fact_kind.as_str()) {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_identity_mismatch",
+                    ));
+                }
+                verified_negative_fact_ids.insert(fact_id.clone());
+            }
+            if is_bound_rejection_fact {
+                verified_negative_fact_ids.insert(fact_id.clone());
+            }
+            match fact.fact_kind.as_str() {
+                "toolIntentAdmitted" => {
+                    let tool_id = fact
+                        .details
+                        .get("toolId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProviderNativeStreamTransportErrorV1::new(
+                                "provider_continuation_result_identity_mismatch",
+                            )
+                        })?;
+                    if expected.get(&operation_id).map(String::as_str) != Some(tool_id)
+                        || !admitted.insert(operation_id)
+                    {
+                        return Err(ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_identity_mismatch",
+                        ));
+                    }
+                }
+                "toolCompleted" => {
+                    let output = fact.details.get("output").cloned().ok_or_else(|| {
+                        ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_missing",
+                        )
+                    })?;
+                    output_bytes = output_bytes
+                        .checked_add(
+                            serde_json::to_vec(&output)
+                                .map_err(|_| {
+                                    ProviderNativeStreamTransportErrorV1::new(
+                                        "provider_continuation_result_missing",
+                                    )
+                                })?
+                                .len(),
+                        )
+                        .filter(|bytes| *bytes <= PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1)
+                        .ok_or_else(|| {
+                            ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
+                        })?;
+                    if binding.outcome.status
+                        != SessionProviderContinuationOutcomeStatusV2::Completed
+                        || outputs.insert(operation_id, output).is_some()
+                    {
+                        return Err(ProviderNativeStreamTransportErrorV1::new(
+                            "provider_continuation_result_missing",
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1758,12 +2875,134 @@ fn query_canonical_provider_tool_outputs(
             ));
         }
     }
+    for binding in operation_bindings {
+        match binding.outcome.status {
+            SessionProviderContinuationOutcomeStatusV2::Completed => {
+                if !admitted.contains(&binding.operation_id)
+                    || !outputs.contains_key(&binding.operation_id)
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_missing",
+                    ));
+                }
+            }
+            SessionProviderContinuationOutcomeStatusV2::Aborted
+            | SessionProviderContinuationOutcomeStatusV2::Unexecuted => {
+                if binding
+                    .outcome
+                    .terminal_fact_id
+                    .as_ref()
+                    .is_some_and(|fact_id| !verified_negative_fact_ids.contains(fact_id))
+                    || binding.outcome.rejection.as_ref().is_some_and(|rejection| {
+                        !verified_negative_fact_ids.contains(&rejection.rejection_fact_id)
+                    })
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_missing",
+                    ));
+                }
+                let output = provider_negative_tool_outcome(&binding.outcome);
+                output_bytes = output_bytes
+                    .checked_add(
+                        serde_json::to_vec(&output)
+                            .map_err(|_| {
+                                ProviderNativeStreamTransportErrorV1::new(
+                                    "provider_continuation_result_missing",
+                                )
+                            })?
+                            .len(),
+                    )
+                    .filter(|bytes| *bytes <= PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1)
+                    .ok_or_else(|| {
+                        ProviderNativeStreamTransportErrorV1::new("provider_request_too_large")
+                    })?;
+                if outputs
+                    .insert(binding.operation_id.clone(), output)
+                    .is_some()
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_continuation_result_missing",
+                    ));
+                }
+            }
+        }
+    }
     if outputs.len() != expected.len() {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_result_missing",
         ));
     }
     Ok(outputs)
+}
+
+fn provider_negative_tool_outcome(outcome: &SessionProviderContinuationOutcomeV2) -> Value {
+    let mut value = json!({
+        "schemaVersion": "deepcode.session.provider-tool-outcome.v1",
+        "status": match outcome.status {
+            SessionProviderContinuationOutcomeStatusV2::Completed => "completed",
+            SessionProviderContinuationOutcomeStatusV2::Aborted => "aborted",
+            SessionProviderContinuationOutcomeStatusV2::Unexecuted => "unexecuted",
+        },
+    });
+    if let Some(reason) = &outcome.settlement_reason {
+        value["reasonCode"] = json!(reason);
+    }
+    if let Some(kind) = &outcome.terminal_fact_kind {
+        value["terminalKind"] = json!(kind);
+    }
+    if let Some(rejection) = &outcome.rejection {
+        value["rejection"] = json!({
+            "reason": rejection.reason,
+            "guidance": rejection.guidance,
+        });
+    }
+    value
+}
+
+fn provider_continuation_fact_matches_parent(
+    fact: &KernelFactProjectionV2,
+    parent_sidecar: &SessionProviderAdmissionSidecarV2,
+) -> bool {
+    let authority = fact
+        .details
+        .get("identity")
+        .and_then(|identity| identity.get("authority"));
+    match authority
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+    {
+        // Reads retain context-read authority even when they supplement an
+        // accepted PlanAction. The canonical Kernel fact proves the effect was
+        // admitted as a read; the Provider target must not rewrite it into the
+        // PlanAction mutation authority.
+        Some("read") => {
+            fact.lineage.plan_action_ids.is_empty()
+                && !matches!(
+                    parent_sidecar.target_binding,
+                    SessionProviderTargetBindingSidecarV2::FinalAnswer { .. }
+                )
+        }
+        Some("planAction") => {
+            let SessionProviderTargetBindingSidecarV2::PlanAction { plan_action_id } =
+                &parent_sidecar.target_binding
+            else {
+                return false;
+            };
+            fact.lineage.plan_action_ids.len() == 1
+                && fact.lineage.plan_action_ids[0].as_str() == plan_action_id
+                && authority
+                    .and_then(|value| value.get("data"))
+                    .and_then(|value| value.get("planActionId"))
+                    .and_then(Value::as_str)
+                    == Some(plan_action_id.as_str())
+                && authority
+                    .and_then(|value| value.get("data"))
+                    .and_then(|value| value.get("planRevision"))
+                    .and_then(Value::as_str)
+                    == parent_sidecar.authority.plan_revision.as_deref()
+        }
+        _ => false,
+    }
 }
 
 fn next_provider_facts_request_id() -> Result<CommandRequestId, ProviderNativeStreamTransportErrorV1>
@@ -2126,10 +3365,51 @@ fn prepare_provider_native_stream_request(
     Ok(PreparedProviderNativeStreamRequestV1 {
         provider_kind,
         exact_request_body,
-        tool_count: tools.len(),
     })
 }
 
+fn validate_provider_external_request_privacy(
+    exact_request_body: &[u8],
+    sidecar: &SessionProviderAdmissionSidecarV2,
+) -> Result<(), ProviderNativeStreamTransportErrorV1> {
+    let body = serde_json::from_slice::<Value>(exact_request_body)
+        .map_err(|_| ProviderNativeStreamTransportErrorV1::new("provider_request_encode_failed"))?;
+    let object = body.as_object().ok_or_else(|| {
+        ProviderNativeStreamTransportErrorV1::new("provider_request_encode_failed")
+    })?;
+    if object.contains_key("providerOptions")
+        || object.contains_key("requestId")
+        || object.contains_key("parentRequestId")
+        || [
+            sidecar.session_id.as_str(),
+            sidecar.run_id.as_str(),
+            sidecar.provider_turn_id.as_str(),
+            sidecar.user_turn_id.as_str(),
+        ]
+        .into_iter()
+        .any(|identity| json_contains_exact_string(&body, identity))
+    {
+        return Err(ProviderNativeStreamTransportErrorV1::new(
+            "provider_request_private_metadata_forbidden",
+        ));
+    }
+    Ok(())
+}
+
+fn json_contains_exact_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_exact_string(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_exact_string(value, expected)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+#[cfg(test)]
 fn provider_dispatch_binding_from_exact_request(
     exact_request_body: &[u8],
 ) -> Result<SessionProviderDispatchBindingV2, ProviderNativeStreamTransportErrorV1> {
@@ -2192,7 +3472,7 @@ fn provider_dispatch_binding_from_exact_request(
     let target_kind = required_text(target.get("kind"))?;
     if !matches!(
         target_kind.as_str(),
-        "planning" | "planAction" | "contextRead" | "finalAnswer"
+        "planning" | "planAction" | "contextRead" | "interventionResearch" | "finalAnswer"
     ) {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_dispatch_request_identity_invalid",
@@ -2315,6 +3595,7 @@ fn provider_dispatch_binding_from_exact_request(
     })
 }
 
+#[cfg(test)]
 fn exact_provider_context_message(
     messages: &[Value],
     schema_version: &str,
@@ -2488,6 +3769,7 @@ async fn probe_llm_profile_native_stream_inner(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn llm_stream_response(
     profile: ResolvedLlmProfile,
     request_envelope: Value,
@@ -2495,35 +3777,71 @@ pub(crate) fn llm_stream_response(
     trace_context: ProviderStreamTraceContextV1,
     session_io_guard: tokio::sync::OwnedRwLockReadGuard<()>,
 ) -> Response {
+    llm_stream_response_with_composer_invalidation(
+        profile,
+        request_envelope,
+        request_id,
+        trace_context,
+        None,
+        session_io_guard,
+    )
+}
+
+pub(crate) fn llm_stream_response_with_composer_invalidation(
+    profile: ResolvedLlmProfile,
+    request_envelope: Value,
+    request_id: String,
+    trace_context: ProviderStreamTraceContextV1,
+    composer_invalidations: Option<crate::host_run_broker_v2::HostActiveRunBrokerV2>,
+    session_io_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Response {
     let response_request_id = request_id.clone();
     let stream = async_stream::stream! {
         let _session_io_guard = session_io_guard;
         let ProviderStreamTraceContextV1 {
             store: trace_store,
+            cache_telemetry_store,
             identity: trace_identity,
             dispatch_authority,
         } = trace_context;
         let mut request_envelope = request_envelope;
-        if let Err(error) = inject_provider_native_continuation(
+        let admission_sidecar = match SessionProviderAdmissionSidecarV2::decode(&request_envelope) {
+            Ok(sidecar) => sidecar,
+            Err((code, message)) => {
+                yield Ok::<Bytes, Infallible>(Bytes::from(provider_public_error_event(
+                    &request_id,
+                    code,
+                    message,
+                )));
+                return;
+            }
+        };
+        let mut cache_telemetry = ProviderCacheTelemetryRecorderV1::new(
+            cache_telemetry_store,
+            trace_identity.clone(),
+            &profile,
+            admission_sidecar.clone(),
+        );
+        if let Err((code, message)) = admission_sidecar.validate_request_material(&request_envelope) {
+            cache_telemetry.local_rejection(code);
+            yield Ok::<Bytes, Infallible>(Bytes::from(provider_public_error_event(
+                &request_id,
+                code,
+                message,
+            )));
+            return;
+        }
+        let predecessor_material = match inject_provider_native_continuation(
             &profile,
             &mut request_envelope,
             &trace_store,
             &trace_identity,
             &dispatch_authority,
+            &admission_sidecar,
         ) {
-            yield Ok::<Bytes, Infallible>(Bytes::from(provider_public_error_event(
-                &request_id,
-                error.code,
-                error.safe_message(),
-            )));
-            return;
-        }
-        let prepared = match prepare_provider_native_stream_request(
-            &profile,
-            &request_envelope,
-        ) {
-            Ok(prepared) => prepared,
+            Ok(material) => material,
             Err(error) => {
+                cache_telemetry.local_rejection(error.code);
                 yield Ok::<Bytes, Infallible>(Bytes::from(provider_public_error_event(
                     &request_id,
                     error.code,
@@ -2532,13 +3850,42 @@ pub(crate) fn llm_stream_response(
                 return;
             }
         };
+        let prepared = match prepare_provider_native_stream_request(
+            &profile,
+            &request_envelope,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cache_telemetry.local_rejection(error.code);
+                yield Ok::<Bytes, Infallible>(Bytes::from(provider_public_error_event(
+                    &request_id,
+                    error.code,
+                    error.safe_message(),
+                )));
+                return;
+            }
+        };
+        if let Err(error) = validate_provider_external_request_privacy(
+            &prepared.exact_request_body,
+            &admission_sidecar,
+        ) {
+            cache_telemetry.local_rejection(error.code);
+            yield Ok(Bytes::from(provider_public_error_event(
+                &request_id,
+                error.code,
+                error.safe_message(),
+            )));
+            return;
+        }
         let provider_kind = prepared.provider_kind;
-        let tool_count = prepared.tool_count;
-        let exact_request_binding = match provider_dispatch_binding_from_exact_request(
+        let prepared_cache_relation = match validate_prepared_cache_relation(
+            &admission_sidecar,
+            &predecessor_material,
             &prepared.exact_request_body,
         ) {
-            Ok(binding) => binding,
+            Ok(relation) => relation,
             Err(error) => {
+                cache_telemetry.local_rejection(error.code);
                 yield Ok(Bytes::from(provider_public_error_event(
                     &request_id,
                     error.code,
@@ -2547,7 +3894,46 @@ pub(crate) fn llm_stream_response(
                 return;
             }
         };
+        cache_telemetry.prepared(
+            &prepared_cache_relation,
+            &prepared.exact_request_body,
+        );
+        if prepared_cache_relation.relation == ProviderCacheRelationV1::ExactAppend
+            && profile.context_window_tokens.is_some_and(|window| {
+                let input_budget = window.saturating_sub(
+                    profile.max_output_tokens.unwrap_or(4_096),
+                );
+                conservative_provider_input_token_upper_bound(
+                    &prepared.exact_request_body,
+                ) > u64::from(input_budget)
+            })
+        {
+            let error = provider_cache_lane_reset_required(
+                SessionProviderCacheLaneResetReasonV1::ContextCompaction,
+            );
+            cache_telemetry.local_rejection(error.code);
+            yield Ok(Bytes::from(provider_public_error_event(
+                &request_id,
+                error.code,
+                error.safe_message(),
+            )));
+            return;
+        }
+        let exact_request_binding = admission_sidecar.dispatch_binding();
+        let private_admission_binding = match admission_sidecar.private_trace_value() {
+            Ok(binding) => binding,
+            Err((code, message)) => {
+                cache_telemetry.local_rejection(code);
+                yield Ok(Bytes::from(provider_public_error_event(
+                    &request_id,
+                    code,
+                    message,
+                )));
+                return;
+            }
+        };
         if let Err(error) = validate_provider_native_reasoning_mode(&profile, provider_kind) {
+            cache_telemetry.local_rejection(error.code);
             yield Ok(Bytes::from(provider_public_error_event(
                 &request_id,
                 error.code,
@@ -2556,14 +3942,6 @@ pub(crate) fn llm_stream_response(
             return;
         }
         let trace_purpose = trace_identity.purpose;
-        if matches!(trace_purpose, ProviderTracePurposeV1::FinalAnswer) && tool_count != 0 {
-            yield Ok(Bytes::from(provider_public_error_event(
-                &request_id,
-                "provider_final_answer_tools_exposed",
-                "A finalAnswer Provider request must not expose tools",
-            )));
-            return;
-        }
         let quarantine_profile_id = trace_identity.profile_id.clone();
         let quarantine_profile_revision = trace_identity.profile_revision.clone();
         let quarantine_store = trace_store.clone();
@@ -2575,6 +3953,7 @@ pub(crate) fn llm_stream_response(
         ) {
             Ok(false) => {}
             Ok(true) => {
+                cache_telemetry.local_rejection("llm_profile_revision_unavailable");
                 drop(availability_transition);
                 yield Ok(Bytes::from(provider_public_error_event(
                     &request_id,
@@ -2584,6 +3963,7 @@ pub(crate) fn llm_stream_response(
                 return;
             }
             Err(error) => {
+                cache_telemetry.local_rejection(error.code);
                 drop(availability_transition);
                 yield Ok(Bytes::from(provider_public_error_event(
                     &request_id,
@@ -2593,16 +3973,18 @@ pub(crate) fn llm_stream_response(
                 return;
             }
         }
-        let dispatch_commit = match dispatch_authority.session_store.commit_provider_dispatch(
+        let dispatch_commit = match dispatch_authority.session_store.commit_provider_dispatch_with_private_binding(
             &dispatch_authority.run_capability,
             &dispatch_authority.admission,
             &exact_request_binding,
             &trace_store,
             trace_identity,
             &prepared.exact_request_body,
+            Some(&private_admission_binding),
         ) {
             Ok(commit) => commit,
             Err(error) => {
+                cache_telemetry.local_rejection(error.code);
                 drop(availability_transition);
                 yield Ok(Bytes::from(provider_public_error_event(
                     &request_id,
@@ -2615,6 +3997,7 @@ pub(crate) fn llm_stream_response(
         let mut trace = DurableProviderTurnTraceV3::new(
             dispatch_authority.session_store.clone(),
             dispatch_commit,
+            cache_telemetry,
         );
         drop(availability_transition);
         let request = match build_provider_native_stream_request(
@@ -2633,6 +4016,7 @@ pub(crate) fn llm_stream_response(
                 return;
             }
         };
+        trace.cache_dispatch_started();
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
@@ -2649,6 +4033,7 @@ pub(crate) fn llm_stream_response(
             }
         };
         let status = response.status();
+        trace.cache_response_headers(status.as_u16());
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -2676,6 +4061,9 @@ pub(crate) fn llm_stream_response(
             loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
+                        if !chunk.is_empty() {
+                            trace.cache_first_upstream_byte();
+                        }
                         if error_body.len().saturating_add(chunk.len())
                             > PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1
                         {
@@ -2804,6 +4192,9 @@ pub(crate) fn llm_stream_response(
             };
             match next {
                 Ok(Some(chunk)) => {
+                    if !chunk.is_empty() {
+                        trace.cache_first_upstream_byte();
+                    }
                     let envelopes = match framer.push(&chunk) {
                         Ok(envelopes) => envelopes,
                         Err(error) => {
@@ -2842,6 +4233,13 @@ pub(crate) fn llm_stream_response(
                             }
                         };
                         for emission in emissions {
+                            let semantic_delta = matches!(
+                                emission.trace_event.get("type").and_then(Value::as_str),
+                                Some("reasoning_delta" | "text_delta" | "tool_call_delta")
+                            );
+                            if semantic_delta {
+                                trace.cache_first_semantic_delta();
+                            }
                             if let Err(error) =
                                 trace.append_normalized_event(emission.trace_event)
                             {
@@ -2952,6 +4350,13 @@ pub(crate) fn llm_stream_response(
                             }
                         };
                         for emission in emissions {
+                            let semantic_delta = matches!(
+                                emission.trace_event.get("type").and_then(Value::as_str),
+                                Some("reasoning_delta" | "text_delta" | "tool_call_delta")
+                            );
+                            if semantic_delta {
+                                trace.cache_first_semantic_delta();
+                            }
                             if let Err(error) =
                                 trace.append_normalized_event(emission.trace_event)
                             {
@@ -3051,13 +4456,64 @@ pub(crate) fn llm_stream_response(
                         )));
                         return;
                     }
+                    drop(_availability_transition);
+                    if let Some(invalidations) = &composer_invalidations {
+                        invalidations.notify_all_composer_projections(
+                            "profileRevisionQuarantined",
+                        );
+                    }
                 }
-                let _ = finish_provider_trace_failure(&mut trace, error.code);
-                yield Ok(Bytes::from(provider_public_error_event(
-                    &request_id,
-                    error.code,
-                    error.message,
-                )));
+                if let Some(structured_failure) = error.structured_failure {
+                    let structured_failure = match serde_json::to_value(&structured_failure) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            let _ = finish_provider_trace_failure(
+                                &mut trace,
+                                "provider_structured_output_failure_encode_failed",
+                            );
+                            yield Ok(Bytes::from(provider_public_error_event(
+                                &request_id,
+                                "provider_structured_output_failure_encode_failed",
+                                "Provider structured-output evidence could not be encoded.",
+                            )));
+                            return;
+                        }
+                    };
+                    let mut provider_result = json!({
+                        "providerProfileId": profile.id,
+                        "provider": required_resolved_provider_flavor(&profile),
+                        "model": profile.model,
+                    });
+                    if let Some(usage) = error.usage.filter(Value::is_object) {
+                        provider_result["usage"] = usage;
+                    }
+                    if trace.finish_structured_failure(
+                        ProviderStructuredFailureTerminalInputV3 {
+                            reason_code: error.code,
+                            structured_failure: structured_failure.clone(),
+                            provider_result,
+                        },
+                    ).is_err() {
+                        yield Ok(Bytes::from(provider_public_error_event(
+                            &request_id,
+                            "provider_structured_output_terminal_commit_failed",
+                            "Provider structured-output failure could not be committed durably.",
+                        )));
+                        return;
+                    }
+                    yield Ok(Bytes::from(provider_public_structured_error_event(
+                        &request_id,
+                        error.code,
+                        structured_failure,
+                    )));
+                } else {
+                    let _ = finish_provider_trace_failure(&mut trace, error.code);
+                    yield Ok(Bytes::from(provider_public_error_event(
+                        &request_id,
+                        error.code,
+                        error.message,
+                    )));
+                }
                 return;
             }
         };
@@ -3074,6 +4530,17 @@ pub(crate) fn llm_stream_response(
                 &request_id,
                 "provider_final_answer_tool_call_forbidden",
                 "A finalAnswer Provider turn cannot return tool calls",
+            )));
+            return;
+        }
+        if let Err(error) = sealed_items.apply_normalized_tool_arguments(
+            &result.normalized_tool_arguments,
+        ) {
+            let _ = finish_provider_trace_failure(&mut trace, error.code);
+            yield Ok(Bytes::from(provider_public_error_event(
+                &request_id,
+                error.code,
+                error.safe_message(),
             )));
             return;
         }
@@ -3138,6 +4605,26 @@ pub(crate) fn llm_stream_response(
             }
             provider_result["usage"] = usage;
         }
+        let structured_output_recovery = match result
+            .structured_output_recovery
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = finish_provider_trace_failure(
+                    &mut trace,
+                    "provider_structured_output_recovery_encode_failed",
+                );
+                yield Ok(Bytes::from(provider_public_error_event(
+                    &request_id,
+                    "provider_structured_output_recovery_encode_failed",
+                    "Provider structured-output recovery evidence could not be encoded.",
+                )));
+                return;
+            }
+        };
         if let Err(error) = trace.append_normalized_event(json!({
             "type": "validatedTerminal",
             "nativeCompletion": native_completion,
@@ -3147,6 +4634,7 @@ pub(crate) fn llm_stream_response(
             "responseDigest": response_digest,
             "providerResult": provider_result.clone(),
             "orderedItems": ordered_items.clone(),
+            "structuredOutputRecovery": structured_output_recovery,
         })) {
             let _ = finish_provider_trace_failure(
                 &mut trace,
@@ -3166,6 +4654,7 @@ pub(crate) fn llm_stream_response(
             response_digest: response_digest.clone(),
             provider_result,
             ordered_items,
+            structured_output_recovery,
         }) {
             Ok(completed) => completed,
             Err(error) => {
@@ -3261,6 +4750,23 @@ pub(crate) fn provider_public_error_event(
             "requestId": request_id,
             "error": code,
             "message": message,
+        }),
+    )
+}
+
+fn provider_public_structured_error_event(
+    request_id: &str,
+    code: &str,
+    structured_failure: Value,
+) -> String {
+    sse_json_event(
+        "provider_error",
+        json!({
+            "type": "provider_error",
+            "requestId": request_id,
+            "error": code,
+            "message": "Provider returned invalid structured output after a complete native response.",
+            "structuredFailure": structured_failure,
         }),
     )
 }

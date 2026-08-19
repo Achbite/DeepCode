@@ -11,6 +11,8 @@ pub(crate) struct AppState {
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) host_services: HostServices,
     pub(crate) provider_trace_v1: ProviderTraceStoreV1,
+    pub(crate) private_analysis_v1: PrivateAnalysisLeaseStoreV1,
+    pub(crate) provider_cache_telemetry_v1: ProviderCacheTelemetryStoreV1,
     pub(crate) provider_trace_export_limiter_v1:
         crate::provider_trace_api::ProviderTraceExportLimiterV1,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
@@ -105,7 +107,7 @@ impl GuiState {
             };
         let current_session_id = sessions
             .iter()
-            .find(|session| session_is_selectable(session))
+            .find(|session| session_is_publicly_selectable(session))
             .and_then(|session| session.get("id").and_then(Value::as_str))
             .map(ToOwned::to_owned);
         let current_session_ids_by_scope =

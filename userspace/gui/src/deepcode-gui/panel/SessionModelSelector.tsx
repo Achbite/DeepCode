@@ -1,112 +1,43 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import type { LlmProviderProfile } from '@deepcode/protocol';
-import { hasCompatibleReasoningTransport } from '@deepcode/protocol';
+import React, { useMemo } from 'react';
+import type { AgentComposerProjectionV1 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { getLlmProfiles } from '../../services/runtimeAdapter';
-import { useAgentSessionStore } from '../../state/agentSessionStore';
-import useAppStatusStore from '../../state/appStatusStore';
 
 interface SessionModelSelectorProps {
   language: UiLanguage;
-  locked: boolean;
-  onAvailabilityChange: (available: boolean) => void;
-}
-
-function profileLabel(profile: LlmProviderProfile): string {
-  return profile.name;
+  composer: AgentComposerProjectionV1 | null;
+  selectedProfileId?: string;
+  busy?: boolean;
+  onProfileChange: (profileId: string) => void | Promise<void>;
 }
 
 const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   language,
-  locked,
-  onAvailabilityChange,
+  composer,
+  selectedProfileId,
+  busy = false,
+  onProfileChange,
 }) => {
-  const session = useAgentSessionStore((state) => state.session);
-  const apiStatus = useAppStatusStore((state) => state.apiStatus);
-  const profileSelectionBusy = useAgentSessionStore((state) => state.profileSelectionBusy);
-  const selectProfile = useAgentSessionStore((state) => state.selectProfile);
-  const refreshSessionProfile = useAgentSessionStore((state) => state.refreshSessionProfile);
-  const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
-  const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
-  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
-
-  const loadProfiles = useCallback(async (): Promise<LlmProviderProfile[]> => {
-    let result;
-    try {
-      result = await getLlmProfiles();
-    } catch {
-      setProfiles([]);
-      setDefaultProfileId(undefined);
-      setLoadState('error');
-      return [];
-    }
-    if (!result.ok || !result.data) {
-      setProfiles([]);
-      setDefaultProfileId(undefined);
-      setLoadState('error');
-      return [];
-    }
-    const enabledProfiles = result.data.profiles.filter(
-      (profile) => (
-        profile.enabled
-        && profile.thinking === 'enabled'
-        && hasCompatibleReasoningTransport(profile)
-      )
-    );
-    setProfiles(enabledProfiles);
-    setDefaultProfileId(
-      enabledProfiles.some((profile) => profile.id === result.data!.defaultProfileId)
-        ? result.data.defaultProfileId
-        : undefined
-    );
-    setLoadState('ready');
-    return enabledProfiles;
-  }, []);
-
-  useEffect(() => {
-    if (apiStatus !== 'connected') {
-      setLoadState(apiStatus === 'checking' ? 'loading' : 'error');
-      return;
-    }
-    setLoadState('loading');
-    void loadProfiles();
-  }, [apiStatus, loadProfiles]);
-
-  useEffect(() => {
-    const onProfilesUpdated = () => {
-      void (async () => {
-        await loadProfiles();
-        await refreshSessionProfile();
-      })();
-    };
-    window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-    return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [loadProfiles, refreshSessionProfile]);
-
-  const selectedProfileId = session
-    ? session.profileId ?? ''
-    : defaultProfileId ?? '';
+  const profiles = composer?.enabledProfiles ?? [];
+  const effectiveProfileId = selectedProfileId
+    ?? composer?.selectedProfileId
+    ?? composer?.defaultProfileId
+    ?? '';
   const selectedProfile = useMemo(
-    () => profiles.find((profile) => profile.id === selectedProfileId),
-    [profiles, selectedProfileId]
+    () => profiles.find((profile) => profile.profileId === effectiveProfileId),
+    [effectiveProfileId, profiles]
   );
-  const sessionProfileAvailable = Boolean(session?.profileId && selectedProfile);
-  useEffect(() => {
-    onAvailabilityChange(loadState === 'ready' && sessionProfileAvailable);
-  }, [loadState, onAvailabilityChange, sessionProfileAvailable]);
-  const unavailable = loadState !== 'ready' || profiles.length === 0;
-  const disabled = locked || profileSelectionBusy || unavailable || !session;
-  const selectorTitle = locked
-    ? t(language, 'agent.profile.locked')
-    : loadState === 'loading'
-      ? t(language, 'agent.profile.loading')
-      : loadState === 'error'
-        ? t(language, 'agent.profile.loadFailed')
-        : profiles.length === 0
-          ? t(language, 'agent.profile.unavailable')
-          : selectedProfile
-            ? profileLabel(selectedProfile)
-            : t(language, 'agent.profile.selectionRequired');
+  const locked = composer ? !composer.selectionMutable : true;
+  const unavailable = !composer || profiles.length === 0;
+  const disabled = busy || locked || unavailable;
+  const selectorTitle = !composer
+    ? t(language, 'agent.profile.loading')
+    : locked
+      ? t(language, 'agent.profile.locked')
+      : profiles.length === 0
+        ? t(language, 'agent.profile.unavailable')
+        : selectedProfile
+          ? selectedProfile.name
+          : t(language, 'agent.profile.selectionRequired');
 
   return (
     <div className="deepcode-session-model">
@@ -121,25 +52,25 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
       <label className="deepcode-session-model__selector" title={selectorTitle}>
         <span className="deepcode-session-model__label">{t(language, 'agent.profile.selector')}</span>
         <select
-          value={selectedProfile ? selectedProfileId : ''}
+          value={selectedProfile ? effectiveProfileId : ''}
           disabled={disabled}
           aria-label={t(language, 'agent.profile.selector')}
-          onChange={(event) => void selectProfile(event.target.value)}
+          onChange={(event) => {
+            if (event.target.value) void onProfileChange(event.target.value);
+          }}
         >
           {!selectedProfile && (
             <option value="">
-              {loadState === 'loading'
+              {!composer
                 ? t(language, 'agent.profile.loading')
-                : loadState === 'error'
-                  ? t(language, 'agent.profile.loadFailed')
-                  : profiles.length === 0
-                    ? t(language, 'agent.profile.unavailable')
-                    : t(language, 'agent.profile.selectionRequired')}
+                : profiles.length === 0
+                  ? t(language, 'agent.profile.unavailable')
+                  : t(language, 'agent.profile.selectionRequired')}
             </option>
           )}
           {profiles.map((profile) => (
-            <option key={profile.id} value={profile.id}>
-              {profileLabel(profile)}
+            <option key={profile.profileId} value={profile.profileId}>
+              {profile.name}
             </option>
           ))}
         </select>

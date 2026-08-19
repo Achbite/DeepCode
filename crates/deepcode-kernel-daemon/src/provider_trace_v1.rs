@@ -1,7 +1,8 @@
 use crate::host_v2_storage::{
-    append_json_line_durable, create_private_directory, sha256_path_component, sha256_prefixed,
-    stable_json_sha256, sync_directory, validate_bounded_identity, validate_safe_session_identity,
-    validate_sha256_digest, with_storage_path_lock, HostV2StorageError,
+    append_json_line_durable, create_private_directory, reject_transport_capabilities,
+    sha256_path_component, sha256_prefixed, stable_json_sha256, sync_directory,
+    validate_bounded_identity, validate_safe_session_identity, validate_sha256_digest,
+    with_storage_path_lock, HostV2StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,6 +19,7 @@ pub(crate) const PROVIDER_TRACE_FLUSH_INTERVAL_V1: Duration = Duration::from_mil
 pub(crate) const PROVIDER_TRACE_FLUSH_BYTES_V1: usize = 16 * 1024;
 pub(crate) const PROVIDER_TRACE_ENVELOPE_HARD_LIMIT_V1: usize = 16 * 1024 * 1024;
 pub(crate) const PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1: usize = 16 * 1024 * 1024;
+const PROVIDER_TRACE_ADMISSION_SIDECAR_LIMIT_V1: usize = 64 * 1024;
 const PROVIDER_TRACE_EXPORT_CAPABILITY_LIMIT_V1: usize = 1024;
 pub(crate) const PROVIDER_TRACE_EXPORT_DEADLINE_EXCEEDED_V1: &str = "export_deadline_exceeded";
 // Verification has no aggregate archive-size threshold. A single record stays
@@ -213,6 +215,7 @@ pub(crate) struct ProviderTraceMetadataV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderTraceCompletedTerminalRecoveryV1 {
     pub(crate) exact_request_body: Vec<u8>,
+    pub(crate) admission_sidecar: Option<Value>,
     pub(crate) reasoning: String,
     pub(crate) raw_upstream_envelopes: Vec<Vec<u8>>,
     pub(crate) native_completion: Value,
@@ -222,12 +225,20 @@ pub(crate) struct ProviderTraceCompletedTerminalRecoveryV1 {
     pub(crate) response_digest: String,
     pub(crate) provider_result: Value,
     pub(crate) ordered_items: Vec<Value>,
+    pub(crate) structured_output_recovery: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderTraceTerminalRecoveryV1 {
     pub(crate) metadata: ProviderTraceMetadataV1,
     pub(crate) reason_code: Option<String>,
+    pub(crate) started_at_unix_ms: String,
+    pub(crate) completed_at_unix_ms: String,
+    pub(crate) reasoning: String,
+    pub(crate) exact_request_body: Vec<u8>,
+    pub(crate) admission_sidecar: Option<Value>,
+    pub(crate) structured_failure: Option<Value>,
+    pub(crate) structured_failure_provider_result: Option<Value>,
     pub(crate) completed: Option<ProviderTraceCompletedTerminalRecoveryV1>,
 }
 
@@ -248,8 +259,19 @@ pub(crate) struct ProviderTraceExportCapabilityV1 {
 #[derive(Debug)]
 pub(crate) struct ProviderTraceVerifiedExportV1 {
     pub(crate) metadata: ProviderTraceMetadataV1,
+    pub(crate) exact_request_body: Vec<u8>,
+    pub(crate) admission_sidecar: Option<Value>,
+    pub(crate) terminal_reason_code: Option<String>,
     pub(crate) file: File,
     pub(crate) byte_length: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderTraceCachePredecessorSummaryV1 {
+    pub(crate) metadata: ProviderTraceMetadataV1,
+    pub(crate) exact_request_body: Vec<u8>,
+    pub(crate) admission_sidecar: Option<Value>,
+    pub(crate) reason_code: Option<String>,
 }
 
 #[derive(Debug)]
@@ -296,10 +318,24 @@ impl ProviderTraceStoreV1 {
     /// archive is accepted only when it is exactly one complete request record
     /// with the same identity and request bytes. It is never truncated,
     /// replaced, or reopened after any response or terminal activity.
+    #[cfg(test)]
     pub(crate) fn begin_or_reopen_exact_request_only_turn(
         &self,
         identity: ProviderTraceIdentityV1,
         exact_request_body: &[u8],
+    ) -> Result<ProviderTraceWriterV1, ProviderTraceErrorV1> {
+        self.begin_or_reopen_exact_request_only_turn_with_private_binding(
+            identity,
+            exact_request_body,
+            None,
+        )
+    }
+
+    pub(crate) fn begin_or_reopen_exact_request_only_turn_with_private_binding(
+        &self,
+        identity: ProviderTraceIdentityV1,
+        exact_request_body: &[u8],
+        admission_sidecar: Option<&Value>,
     ) -> Result<ProviderTraceWriterV1, ProviderTraceErrorV1> {
         identity.validate()?;
         if exact_request_body.is_empty() {
@@ -317,6 +353,25 @@ impl ProviderTraceStoreV1 {
                     PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1
                 ),
             ));
+        }
+        if let Some(sidecar) = admission_sidecar {
+            if !sidecar.is_object()
+                || serde_json::to_vec(sidecar)
+                    .map_err(|error| {
+                        ProviderTraceErrorV1::invalid(
+                            "provider_trace_admission_sidecar_invalid",
+                            format!("Encode Provider admission sidecar: {error}"),
+                        )
+                    })?
+                    .len()
+                    > PROVIDER_TRACE_ADMISSION_SIDECAR_LIMIT_V1
+            {
+                return Err(ProviderTraceErrorV1::invalid(
+                    "provider_trace_admission_sidecar_invalid",
+                    "Provider admission sidecar is invalid or exceeds its private size bound",
+                ));
+            }
+            reject_transport_capabilities(sidecar)?;
         }
 
         let trace_directory = self
@@ -339,7 +394,12 @@ impl ProviderTraceStoreV1 {
         let file = match options.open(&trace_path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return reopen_exact_request_only_trace(&trace_path, identity, exact_request_body);
+                return reopen_exact_request_only_trace(
+                    &trace_path,
+                    identity,
+                    exact_request_body,
+                    admission_sidecar,
+                );
             }
             Err(error) => {
                 return Err(ProviderTraceErrorV1::io(
@@ -370,13 +430,16 @@ impl ProviderTraceStoreV1 {
             sealed: false,
             poisoned: false,
         };
-        let request_payload = json!({
+        let mut request_payload = json!({
             "identity": writer.identity,
             "bodyEncoding": "base64",
             "bodyBase64": encode_base64(exact_request_body),
             "byteLength": exact_request_body.len(),
             "requestDigest": writer.request_digest,
         });
+        if let Some(sidecar) = admission_sidecar {
+            request_payload["admissionSidecar"] = sidecar.clone();
+        }
         writer.append_record("request", request_payload)?;
         writer.flush_durable()?;
         Ok(writer)
@@ -466,6 +529,20 @@ impl ProviderTraceStoreV1 {
         recover_verified_provider_trace_terminal(
             self.verified_export(session_id, provider_turn_id)?,
         )
+    }
+
+    pub(crate) fn verified_cache_predecessor_summary(
+        &self,
+        session_id: &str,
+        provider_turn_id: &str,
+    ) -> Result<ProviderTraceCachePredecessorSummaryV1, ProviderTraceErrorV1> {
+        let export = self.verified_export(session_id, provider_turn_id)?;
+        Ok(ProviderTraceCachePredecessorSummaryV1 {
+            metadata: export.metadata,
+            exact_request_body: export.exact_request_body,
+            admission_sidecar: export.admission_sidecar,
+            reason_code: export.terminal_reason_code,
+        })
     }
 
     fn verified_export_until(
@@ -850,6 +927,7 @@ fn reopen_exact_request_only_trace(
     path: &Path,
     expected_identity: ProviderTraceIdentityV1,
     exact_request_body: &[u8],
+    expected_admission_sidecar: Option<&Value>,
 ) -> Result<ProviderTraceWriterV1, ProviderTraceErrorV1> {
     let path_metadata = fs::symlink_metadata(path).map_err(|error| {
         ProviderTraceErrorV1::io(
@@ -985,7 +1063,7 @@ fn reopen_exact_request_only_trace(
                 "Existing Provider trace request payload is invalid",
             )
         })?;
-    if !object_has_exact_keys(
+    let canonical_payload = object_has_exact_keys(
         payload,
         &[
             "identity",
@@ -994,7 +1072,18 @@ fn reopen_exact_request_only_trace(
             "byteLength",
             "requestDigest",
         ],
-    ) {
+    ) || object_has_exact_keys(
+        payload,
+        &[
+            "identity",
+            "bodyEncoding",
+            "bodyBase64",
+            "byteLength",
+            "requestDigest",
+            "admissionSidecar",
+        ],
+    );
+    if !canonical_payload {
         return Err(ProviderTraceErrorV1::invalid(
             "provider_trace_request_only_invalid",
             "Existing Provider trace request payload is not canonical",
@@ -1010,6 +1099,12 @@ fn reopen_exact_request_only_trace(
         return Err(ProviderTraceErrorV1::invalid(
             "provider_trace_identity_mismatch",
             "Existing Provider trace request identity does not match the exact dispatch identity",
+        ));
+    }
+    if payload.get("admissionSidecar") != expected_admission_sidecar {
+        return Err(ProviderTraceErrorV1::invalid(
+            "provider_trace_request_replay_conflict",
+            "Existing Provider trace admission sidecar differs from the exact dispatch binding",
         ));
     }
     let archived_request_body = decode_trace_bytes(
@@ -1171,6 +1266,8 @@ fn verify_provider_trace_path_until(
     let mut trace_id: Option<String> = None;
     let mut request_identity: Option<ProviderTraceIdentityV1> = None;
     let mut request_digest: Option<String> = None;
+    let mut exact_request_body: Option<Vec<u8>> = None;
+    let mut admission_sidecar: Option<Value> = None;
     let mut verified_raw_source_bytes = 0usize;
     let mut response_boundary_seen = false;
     let mut expected_response_item_ordinal = 1u64;
@@ -1339,7 +1436,7 @@ fn verify_provider_trace_path_until(
                             "Provider trace request payload is invalid",
                         )
                     })?;
-                if !object_has_exact_keys(
+                let canonical_payload = object_has_exact_keys(
                     payload,
                     &[
                         "identity",
@@ -1348,13 +1445,44 @@ fn verify_provider_trace_path_until(
                         "byteLength",
                         "requestDigest",
                     ],
-                ) {
+                ) || object_has_exact_keys(
+                    payload,
+                    &[
+                        "identity",
+                        "bodyEncoding",
+                        "bodyBase64",
+                        "byteLength",
+                        "requestDigest",
+                        "admissionSidecar",
+                    ],
+                );
+                if !canonical_payload {
                     return Err(ProviderTraceErrorV1::invalid(
                         "provider_trace_request_invalid",
                         "Provider trace request payload is not canonical",
                     ));
                 }
-                let exact_request_body = decode_trace_bytes(
+                if let Some(sidecar) = payload.get("admissionSidecar") {
+                    if !sidecar.is_object()
+                        || serde_json::to_vec(sidecar)
+                            .map_err(|_| {
+                                ProviderTraceErrorV1::invalid(
+                                    "provider_trace_request_invalid",
+                                    "Provider trace admission sidecar cannot be encoded",
+                                )
+                            })?
+                            .len()
+                            > PROVIDER_TRACE_ADMISSION_SIDECAR_LIMIT_V1
+                    {
+                        return Err(ProviderTraceErrorV1::invalid(
+                            "provider_trace_request_invalid",
+                            "Provider trace admission sidecar is invalid or too large",
+                        ));
+                    }
+                    reject_transport_capabilities(sidecar)?;
+                    admission_sidecar = Some(sidecar.clone());
+                }
+                let decoded_request_body = decode_trace_bytes(
                     payload,
                     "bodyEncoding",
                     "bodyBase64",
@@ -1363,7 +1491,7 @@ fn verify_provider_trace_path_until(
                     PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1,
                     "provider_trace_request_invalid",
                 )?;
-                if exact_request_body.is_empty() {
+                if decoded_request_body.is_empty() {
                     return Err(ProviderTraceErrorV1::invalid(
                         "provider_trace_request_invalid",
                         "Provider trace request body must not be empty",
@@ -1399,13 +1527,14 @@ fn verify_provider_trace_path_until(
                         )
                     })?
                     .to_string();
-                if sha256_prefixed(&exact_request_body) != digest {
+                if sha256_prefixed(&decoded_request_body) != digest {
                     return Err(ProviderTraceErrorV1::invalid(
                         "provider_trace_request_digest_mismatch",
                         "Provider trace request bytes do not match requestDigest",
                     ));
                 }
                 validate_sha256_digest(&digest, "requestDigest")?;
+                exact_request_body = Some(decoded_request_body);
                 request_identity = Some(identity);
                 request_digest = Some(digest);
             }
@@ -1704,6 +1833,14 @@ fn verify_provider_trace_path_until(
             terminal_digest,
             seal_digest: seal.digest.clone(),
         },
+        exact_request_body: exact_request_body.ok_or_else(|| {
+            ProviderTraceErrorV1::invalid(
+                "provider_trace_request_missing",
+                "Provider trace first record is not the request",
+            )
+        })?,
+        admission_sidecar,
+        terminal_reason_code: terminal_value.reason_code,
         file,
         byte_length: verified_byte_length,
     })
@@ -1714,6 +1851,9 @@ fn recover_verified_provider_trace_terminal(
 ) -> Result<ProviderTraceTerminalRecoveryV1, ProviderTraceErrorV1> {
     let ProviderTraceVerifiedExportV1 {
         metadata,
+        exact_request_body: verified_exact_request_body,
+        admission_sidecar: verified_admission_sidecar,
+        terminal_reason_code: _,
         file,
         byte_length: _,
     } = export;
@@ -1721,7 +1861,14 @@ fn recover_verified_provider_trace_terminal(
     let mut terminal: Option<ProviderTraceTerminalV1> = None;
     let mut completed: Option<ProviderTraceCompletedTerminalRecoveryV1> = None;
     let mut completed_sequence: Option<u64> = None;
-    let mut exact_request_body: Option<Vec<u8>> = None;
+    let mut structured_failure: Option<Value> = None;
+    let mut structured_failure_provider_result: Option<Value> = None;
+    let mut structured_failure_sequence: Option<u64> = None;
+    let mut request_seen = false;
+    let mut started_at_unix_ms: Option<String> = None;
+    let mut completed_at_unix_ms: Option<String> = None;
+    let exact_request_body = Some(verified_exact_request_body);
+    let admission_sidecar = verified_admission_sidecar;
     let mut reasoning = String::new();
     let mut raw_upstream_envelopes = Vec::new();
     let mut recovered_raw_source_bytes = 0usize;
@@ -1740,25 +1887,17 @@ fn recover_verified_provider_trace_terminal(
         })?;
         match record.get("recordKind").and_then(Value::as_str) {
             Some("request") => {
-                if exact_request_body.is_some() {
+                if request_seen {
                     return Err(ProviderTraceErrorV1::invalid(
                         "provider_trace_recovery_invalid",
                         "Provider trace contains more than one request record",
                     ));
                 }
-                let payload = record
-                    .get("payload")
-                    .and_then(Value::as_object)
-                    .ok_or_else(provider_trace_completed_recovery_invalid)?;
-                exact_request_body = Some(decode_trace_bytes(
-                    payload,
-                    "bodyEncoding",
-                    "bodyBase64",
-                    "byteLength",
-                    "requestDigest",
-                    PROVIDER_TRACE_REQUEST_HARD_LIMIT_V1,
-                    "provider_trace_recovery_invalid",
-                )?);
+                request_seen = true;
+                started_at_unix_ms = record
+                    .get("recordedAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             Some("responseChunk") => {
                 let payload = record
@@ -1793,6 +1932,32 @@ fn recover_verified_provider_trace_terminal(
                                     .and_then(Value::as_str)
                                     .ok_or_else(provider_trace_completed_recovery_invalid)?;
                                 reasoning.push_str(content);
+                                continue;
+                            }
+                            if event.get("type").and_then(Value::as_str)
+                                == Some("structuredOutputFailure")
+                            {
+                                if structured_failure.is_some() || completed.is_some() {
+                                    return Err(ProviderTraceErrorV1::invalid(
+                                        "provider_trace_recovery_invalid",
+                                        "Provider trace contains conflicting structured terminal evidence",
+                                    ));
+                                }
+                                structured_failure = Some(
+                                    event
+                                        .get("failure")
+                                        .filter(|value| value.is_object())
+                                        .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                        .clone(),
+                                );
+                                structured_failure_provider_result = Some(
+                                    event
+                                        .get("providerResult")
+                                        .filter(|value| value.is_object())
+                                        .ok_or_else(provider_trace_completed_recovery_invalid)?
+                                        .clone(),
+                                );
+                                structured_failure_sequence = Some(sequence);
                                 continue;
                             }
                             if event.get("type").and_then(Value::as_str)
@@ -1847,8 +2012,13 @@ fn recover_verified_provider_trace_terminal(
                                 .and_then(Value::as_array)
                                 .ok_or_else(provider_trace_completed_recovery_invalid)?
                                 .clone();
+                            let structured_output_recovery = event
+                                .get("structuredOutputRecovery")
+                                .filter(|value| !value.is_null())
+                                .cloned();
                             completed = Some(ProviderTraceCompletedTerminalRecoveryV1 {
                                 exact_request_body: Vec::new(),
+                                admission_sidecar: None,
                                 reasoning: String::new(),
                                 raw_upstream_envelopes: Vec::new(),
                                 native_completion,
@@ -1858,6 +2028,7 @@ fn recover_verified_provider_trace_terminal(
                                 response_digest,
                                 provider_result,
                                 ordered_items,
+                                structured_output_recovery,
                             });
                             completed_sequence = Some(sequence);
                             completed_item_ordinal = Some(item_ordinal);
@@ -1886,6 +2057,10 @@ fn recover_verified_provider_trace_terminal(
                         )
                     })?;
                 decoded.validate()?;
+                completed_at_unix_ms = record
+                    .get("recordedAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 terminal = Some(decoded);
             }
             _ => {}
@@ -1897,17 +2072,22 @@ fn recover_verified_provider_trace_terminal(
             "Provider trace recovery cannot find its verified terminal",
         )
     })?;
+    if !request_seen {
+        return Err(provider_trace_completed_recovery_invalid());
+    }
     if terminal.kind != metadata.terminal_kind {
         return Err(ProviderTraceErrorV1::invalid(
             "provider_trace_recovery_invalid",
             "Provider trace recovery terminal kind conflicts with verified metadata",
         ));
     }
+    let recovered_request_body =
+        exact_request_body.ok_or_else(provider_trace_completed_recovery_invalid)?;
+    if sha256_prefixed(&recovered_request_body) != metadata.request_digest {
+        return Err(provider_trace_completed_recovery_invalid());
+    }
     match terminal.kind {
         ProviderTraceTerminalKindV1::Completed => {
-            let request_body = exact_request_body
-                .take()
-                .ok_or_else(provider_trace_completed_recovery_invalid)?;
             let completed_evidence = completed
                 .as_mut()
                 .ok_or_else(provider_trace_completed_recovery_invalid)?;
@@ -1916,15 +2096,15 @@ fn recover_verified_provider_trace_terminal(
                 || completed_sequence.and_then(|sequence| sequence.checked_add(2))
                     != Some(metadata.record_count)
                 || completed_item_ordinal != Some(last_response_item_ordinal)
-                || sha256_prefixed(&request_body) != metadata.request_digest
                 || recovered_raw_source_bytes != metadata.raw_source_bytes
                 || reasoning.trim().is_empty()
                 || sha256_prefixed(reasoning.as_bytes()) != completed_evidence.reasoning_digest
             {
                 return Err(provider_trace_completed_recovery_invalid());
             }
-            completed_evidence.exact_request_body = request_body;
-            completed_evidence.reasoning = reasoning;
+            completed_evidence.exact_request_body = recovered_request_body.clone();
+            completed_evidence.admission_sidecar = admission_sidecar.clone();
+            completed_evidence.reasoning = reasoning.clone();
             completed_evidence.raw_upstream_envelopes = raw_upstream_envelopes;
         }
         ProviderTraceTerminalKindV1::Failed
@@ -1936,12 +2116,27 @@ fn recover_verified_provider_trace_terminal(
                     "Non-completed Provider trace terminal requires a reasonCode",
                 ));
             }
+            if structured_failure.is_some() != structured_failure_provider_result.is_some()
+                || structured_failure_sequence
+                    .is_some_and(|sequence| sequence.checked_add(2) != Some(metadata.record_count))
+            {
+                return Err(provider_trace_completed_recovery_invalid());
+            }
             completed = None;
         }
     }
     Ok(ProviderTraceTerminalRecoveryV1 {
         metadata,
         reason_code: terminal.reason_code,
+        started_at_unix_ms: started_at_unix_ms
+            .ok_or_else(provider_trace_completed_recovery_invalid)?,
+        completed_at_unix_ms: completed_at_unix_ms
+            .ok_or_else(provider_trace_completed_recovery_invalid)?,
+        reasoning,
+        exact_request_body: recovered_request_body,
+        admission_sidecar,
+        structured_failure,
+        structured_failure_provider_result,
         completed,
     })
 }

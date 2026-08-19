@@ -21,7 +21,10 @@ pub(crate) fn persist_agent_projects(gui: &GuiState) -> Result<(), String> {
 
 pub(crate) async fn agent_projects_list(State(state): State<AppState>) -> Json<ApiResponse> {
     let gui = state.gui.lock().expect("gui state lock");
-    ApiResponse::ok(json!({ "projects": gui.projects }))
+    match public_agent_project_values(gui.projects.clone()) {
+        Ok(projects) => ApiResponse::ok(json!({ "projects": projects })),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) async fn agent_project_get(
@@ -30,7 +33,10 @@ pub(crate) async fn agent_project_get(
 ) -> Json<ApiResponse> {
     let gui = state.gui.lock().expect("gui state lock");
     match project_by_id(&gui, &project_id) {
-        Some(project) => ApiResponse::ok(json!({ "project": project })),
+        Some(project) => match public_agent_project_value(project) {
+            Ok(project) => ApiResponse::ok(json!({ "project": project })),
+            Err(error) => ApiResponse::error(error.code, error.message),
+        },
         None => ApiResponse::error("agent_project_not_found", "agent project not found"),
     }
 }
@@ -83,7 +89,10 @@ pub(crate) async fn agent_project_create(
         );
         return ApiResponse::error("agent_project_persist_failed", message);
     }
-    ApiResponse::ok(json!({ "project": project }))
+    match public_agent_project_value(&project) {
+        Ok(project) => ApiResponse::ok(json!({ "project": project })),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) async fn agent_project_update(
@@ -110,7 +119,10 @@ pub(crate) async fn agent_project_update(
         gui.projects = previous_projects;
         return ApiResponse::error("agent_project_persist_failed", error);
     }
-    ApiResponse::ok(json!({ "project": result }))
+    match public_agent_project_value(&result) {
+        Ok(project) => ApiResponse::ok(json!({ "project": project })),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) async fn agent_project_rebind(
@@ -126,13 +138,43 @@ pub(crate) async fn agent_project_rebind(
     else {
         return ApiResponse::error("project_root_required", "project root path is required");
     };
-    let existing_binding = {
+    let _project_binding_guard = agent_project_binding_transition_lock().lock_owned().await;
+    let (existing_binding, mut bound_session_ids) = {
         let gui = state.gui.lock().expect("gui state lock");
         let Some(project) = project_by_id(&gui, &project_id) else {
             return ApiResponse::error("agent_project_not_found", "agent project not found");
         };
-        project_workspace_binding(project)
+        let session_ids = gui
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.get("projectId").and_then(Value::as_str) == Some(project_id.as_str())
+            })
+            .filter_map(|session| {
+                session
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        (project_workspace_binding(project), session_ids)
     };
+    bound_session_ids.sort();
+    bound_session_ids.dedup();
+    let mut _run_admission_guards = Vec::with_capacity(bound_session_ids.len());
+    for session_id in &bound_session_ids {
+        _run_admission_guards.push(session_run_admission_lock(session_id).lock_owned().await);
+    }
+    for session_id in &bound_session_ids {
+        match session_has_active_run(&state, session_id) {
+            Ok(true) => return ApiResponse::error(
+                "agent_project_binding_locked",
+                "Project workspace binding is locked while one of its Sessions has an active Run",
+            ),
+            Ok(false) => {}
+            Err(error) => return ApiResponse::error(error.code, error.message),
+        }
+    }
     let binding_change = match state
         .host_services
         .workspace
@@ -143,6 +185,9 @@ pub(crate) async fn agent_project_rebind(
     };
     let mut gui = state.gui.lock().expect("gui state lock");
     let previous_projects = gui.projects.clone();
+    let previous_sessions = gui.sessions.clone();
+    let previous_scope_session_ids = gui.current_session_ids_by_scope.clone();
+    let now = now_text();
     let Some(project) = project_mut(&mut gui, &project_id) else {
         let _ = state
             .host_services
@@ -153,27 +198,102 @@ pub(crate) async fn agent_project_rebind(
     project["kind"] = json!("folder");
     project["workspaceBinding"] = binding_change.value.clone();
     project["rootStatus"] = json!("ready");
-    project["updatedAt"] = json!(now_text());
+    project["updatedAt"] = json!(now);
     let result = project.clone();
-    if let Err(error) = persist_agent_projects(&gui) {
+    for session in &mut gui.sessions {
+        if session.get("projectId").and_then(Value::as_str) == Some(project_id.as_str()) {
+            apply_project_binding_to_session(session, &result);
+            session["updatedAt"] = json!(now);
+        }
+    }
+    let affected_session_ids = bound_session_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    gui.current_session_ids_by_scope
+        .retain(|_, current_id| !affected_session_ids.contains(current_id.as_str()));
+    if let Err(error) = persist_agent_projects(&gui)
+        .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
+    {
         gui.projects = previous_projects;
+        gui.sessions = previous_sessions;
+        gui.current_session_ids_by_scope = previous_scope_session_ids;
+        let rollback_error = persist_agent_projects(&gui)
+            .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
+            .err();
+        let persistence_error = rollback_error
+            .map(|rollback| format!("{error}; storage rollback failed: {rollback}"))
+            .unwrap_or(error);
         let message = rollback_project_binding_after_persist_failure(
             &state.host_services.workspace,
             Some(binding_change),
-            error,
+            persistence_error,
         );
         return ApiResponse::error("agent_project_persist_failed", message);
     }
-    ApiResponse::ok(json!({ "project": result }))
+    let public_result = public_agent_project_value(&result);
+    drop(gui);
+    for session_id in &bound_session_ids {
+        state
+            .host_services
+            .active_runs_v2
+            .notify_composer_projection(session_id, "projectRebound");
+    }
+    state
+        .host_services
+        .active_runs_v2
+        .notify_all_composer_projections("projectRebound");
+    match public_result {
+        Ok(project) => ApiResponse::ok(json!({ "project": project })),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) async fn agent_project_delete(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Json<ApiResponse> {
+    let _project_binding_guard = agent_project_binding_transition_lock().lock_owned().await;
+    let mut bound_session_ids = {
+        let gui = state.gui.lock().expect("gui state lock");
+        if project_by_id(&gui, &project_id).is_none() {
+            return ApiResponse::error("agent_project_not_found", "agent project not found");
+        }
+        gui.sessions
+            .iter()
+            .filter(|session| {
+                session.get("projectId").and_then(Value::as_str) == Some(project_id.as_str())
+            })
+            .filter_map(|session| {
+                session
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    };
+    bound_session_ids.sort();
+    bound_session_ids.dedup();
+    let mut _run_admission_guards = Vec::with_capacity(bound_session_ids.len());
+    for session_id in &bound_session_ids {
+        _run_admission_guards.push(session_run_admission_lock(session_id).lock_owned().await);
+    }
+    for session_id in &bound_session_ids {
+        match session_has_active_run(&state, session_id) {
+            Ok(true) => {
+                return ApiResponse::error(
+                    "agent_project_binding_locked",
+                    "Project cannot be deleted while one of its Sessions has an active Run",
+                )
+            }
+            Ok(false) => {}
+            Err(error) => return ApiResponse::error(error.code, error.message),
+        }
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     let previous_projects = gui.projects.clone();
     let previous_sessions = gui.sessions.clone();
+    let previous_scope_session_ids = gui.current_session_ids_by_scope.clone();
     let Some(index) = gui
         .projects
         .iter()
@@ -192,11 +312,24 @@ pub(crate) async fn agent_project_delete(
             session["updatedAt"] = json!(now_text());
         }
     }
+    let affected_session_ids = bound_session_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    gui.current_session_ids_by_scope
+        .retain(|_, current_id| !affected_session_ids.contains(current_id.as_str()));
+    if let Some(current_session_id) = gui.current_session_id.clone() {
+        if affected_session_ids.contains(current_session_id.as_str()) {
+            gui.current_session_ids_by_scope
+                .insert("unbound-workspace".to_string(), current_session_id);
+        }
+    }
     if let Err(error) = persist_agent_projects(&gui)
         .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
     {
         gui.projects = previous_projects;
         gui.sessions = previous_sessions;
+        gui.current_session_ids_by_scope = previous_scope_session_ids;
         let rollback_error = persist_agent_projects(&gui)
             .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
             .err();
@@ -205,7 +338,22 @@ pub(crate) async fn agent_project_delete(
             .unwrap_or(error);
         return ApiResponse::error("agent_project_persist_failed", message);
     }
-    ApiResponse::ok(json!({ "projects": gui.projects }))
+    let public_result = public_agent_project_values(gui.projects.clone());
+    drop(gui);
+    for session_id in &bound_session_ids {
+        state
+            .host_services
+            .active_runs_v2
+            .notify_composer_projection(session_id, "projectDeleted");
+    }
+    state
+        .host_services
+        .active_runs_v2
+        .notify_all_composer_projections("projectDeleted");
+    match public_result {
+        Ok(projects) => ApiResponse::ok(json!({ "projects": projects })),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) fn project_by_id<'a>(gui: &'a GuiState, project_id: &str) -> Option<&'a Value> {

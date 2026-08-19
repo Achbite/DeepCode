@@ -16,6 +16,7 @@ import {
 import type {
   SessionKernelPersistencePortV2,
   SessionKernelProjectionReceiptV2,
+  SessionKernelProjectionDeliveryOptionsV2,
   SessionKernelProjectionPortV2,
   SessionKernelStoredOperationResultV2,
   SessionKernelStoredOperationResultRefV2,
@@ -32,9 +33,12 @@ import {
   type SessionKernelCheckpointV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
+import { projectSessionProviderFactsV2 } from './providerFactProjection.js';
 import type {
   SessionActiveWaitV2,
   SessionFinalAnswerStateV3,
+  SessionInterventionResearchV4,
+  SessionTerminalAnswerCandidateV1,
   SessionKernelFactBarrierV2,
   SessionKernelPersistenceRecordRefV3,
   SessionKernelProjectionEventV2,
@@ -45,16 +49,20 @@ import type {
   SessionPlanActionSettlementV2,
   SessionPlanDecisionV2,
   SessionProviderAuthorityBindingV3,
+  SessionProviderControlSettlementV2,
   SessionProviderOutcomeRecordV2,
   SessionProviderTerminalOrderedItemV3,
   SessionProviderTurnDispatchRecordV3,
   SessionProviderTurnDurableEvidenceV3,
   SessionProviderTurnRecordV2,
+  SessionProviderTurnOutputV2,
   SessionProviderTurnTargetV2,
   SessionProviderTurnTerminalRecordV3,
   SessionToolContextSnapshotRecordV3,
   SessionRunCancellationV2,
   SessionUserInputRecordV2,
+  SessionUserInterventionDecisionV4,
+  SessionUserInterventionV4,
   SessionWorkAuthorityV3,
 } from './types.js';
 import type {
@@ -67,9 +75,12 @@ import {
   SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
   SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
+  SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
 } from './types.js';
+import { utf8Prefix } from './utf8.js';
 import {
-  decodeAgentInputAttachmentsV2,
+  decodeAgentInputAttachmentsV3,
+  decodeUserAttachmentContextsV1,
 } from './inputAttachmentsV2.js';
 import {
   assertProviderSafeToolContextV2,
@@ -81,6 +92,7 @@ import type {
   SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
 import {
+  repairedSessionProviderOutcomeV2,
   settledSessionProviderToolCallsV2,
   validateSessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
@@ -88,16 +100,22 @@ import {
   decodeCompletedProviderTerminalV3,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
+  decodeStructuredOutputFailureV1,
+  decodeStructuredOutputRecoveryV1,
+} from './providerStreamV1.js';
+import {
   adaptSessionKernelProviderBackendOutputV2,
+  rehydratePersistedProviderInterventionOutputV2,
+  rehydratePersistedProviderPlanOutputV2,
 } from './SessionKernelProviderAdapterV2.js';
 import {
   validateCurrentSessionKernelProjectionEventV2,
 } from './SessionKernelHttpProjectionV2.js';
 
 export const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA =
-  'deepcode.session.kernel-persistence.v3' as const;
+  'deepcode.session.kernel-persistence.v4' as const;
 export const SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA =
-  'deepcode.session.kernel-persistence-record.v3' as const;
+  'deepcode.session.kernel-persistence-record.v4' as const;
 export const SESSION_KERNEL_PERSISTENCE_APPEND_REQUEST_V2_SCHEMA =
   'deepcode.session.kernel-persistence-append-request.v2' as const;
 export const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA =
@@ -107,13 +125,13 @@ export const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA =
 export const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA =
   'deepcode.session.kernel-operation-result.v2' as const;
 export const SESSION_KERNEL_REVIEW_RECORD_V3_SCHEMA =
-  'deepcode.session.review-record.v3' as const;
+  'deepcode.session.review-record.v4' as const;
 export const SESSION_KERNEL_PLAN_ACTION_SETTLEMENT_RECORD_V3_SCHEMA =
-  'deepcode.session.plan-action-settlement-record.v3' as const;
+  'deepcode.session.plan-action-settlement-record.v4' as const;
 export const SESSION_KERNEL_PUBLIC_REQUEST_SETTLEMENT_V3_SCHEMA =
-  'deepcode.session.public-request-settlement.v3' as const;
+  'deepcode.session.public-request-settlement.v4' as const;
 export const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA =
-  'deepcode.session.projection-record.v3' as const;
+  'deepcode.session.projection-record.v4' as const;
 
 export type SessionKernelPersistenceRecordKindV3 =
   | 'storeHeader'
@@ -205,8 +223,13 @@ interface SessionKernelCompactProviderReservationV3 {
   purpose: 'primary' | 'continuation' | 'finalAnswer';
   target: SessionProviderTurnTargetV2;
   planRevision?: string;
-  remainingToolCallBudget?: number;
   correction?: import('./types.js').SessionToolCorrectionV2;
+  structuredRepair?: NonNullable<
+    SessionProviderTurnRecordV2['structuredRepair']
+  >;
+  nextStructuredRepair?: NonNullable<
+    SessionProviderTurnRecordV2['nextStructuredRepair']
+  >;
   controlEpoch: number;
   contextRef: import('@deepcode/protocol').ToolContextRefV2;
   factProjection: SessionProviderTurnRecordV2['factProjection'];
@@ -223,6 +246,7 @@ interface SessionKernelCompactProviderQueueV3 {
   terminalRef: SessionKernelPersistenceRecordRefV3;
   target: SessionProviderTurnTargetV2;
   calls: SessionProviderToolCallQueueItemV2[];
+  mutationDisposition: SessionProviderToolCallQueueV2['mutationDisposition'];
   status: SessionProviderToolCallQueueV2['status'];
   outcomeRecorded: boolean;
   settledAt?: string;
@@ -231,7 +255,12 @@ interface SessionKernelCompactProviderQueueV3 {
 
 type SessionKernelCompactFinalAnswerV3 = Omit<
   SessionFinalAnswerStateV3,
-  'physicalRequestCount' | 'finalText' | 'committedAt'
+  'physicalRequestCount' | 'finalText'
+>;
+
+type SessionKernelCompactTerminalAnswerCandidateV1 = Omit<
+  SessionTerminalAnswerCandidateV1,
+  'text'
 >;
 
 interface SessionKernelCompactCheckpointV3 {
@@ -275,6 +304,10 @@ interface SessionKernelCompactCheckpointV3 {
   active: {
     pendingEpochInputRef?: SessionKernelPersistenceRecordRefV3;
     activeWait?: SessionActiveWaitV2;
+    interventionResearch?: SessionInterventionResearchV4;
+    userIntervention?: SessionUserInterventionV4;
+    userInterventionDecision?: SessionUserInterventionDecisionV4;
+    pendingProviderControlSettlement?: SessionProviderControlSettlementV2;
     pendingGuidance: string[];
     providerReservation?: SessionKernelCompactProviderReservationV3;
     providerQueue?: SessionKernelCompactProviderQueueV3;
@@ -294,6 +327,7 @@ interface SessionKernelCompactCheckpointV3 {
     >;
   };
   finalAnswer?: SessionKernelCompactFinalAnswerV3;
+  terminalAnswerCandidate?: SessionKernelCompactTerminalAnswerCandidateV1;
 }
 
 interface SessionKernelProjectionRecordV3 {
@@ -779,6 +813,20 @@ implements SessionKernelPersistencePortV2 {
     checkpoint: SessionKernelCheckpointV2,
     projections: SessionKernelProjectionEventV2[]
   ): Promise<void> {
+    const projectionDigests = new Map<string, string>();
+    for (const projection of projections) {
+      const digest = projectionDigest(projection);
+      const previous = projectionDigests.get(projection.projectionId);
+      if (previous) {
+        throw new SessionKernelPersistenceError(
+          previous === digest
+            ? 'session_kernel_public_request_projection_duplicate'
+            : 'session_kernel_public_request_projection_identity_conflict',
+          `Kernel request ${request.requestId} produced duplicate projection identity ${projection.projectionId}.`
+        );
+      }
+      projectionDigests.set(projection.projectionId, digest);
+    }
     const exactOutcomeDigest = requiredDigest(
       outcomeDigest,
       'outcomeDigest'
@@ -1202,6 +1250,24 @@ implements SessionKernelPersistencePortV2 {
     const committedProjectionIds = new Set(
       committed.projections.map((record) => record.recordId)
     );
+    const committedProjectionsById = new Map(
+      committed.projections.map((record) => [record.recordId, record])
+    );
+    const settlementProjections = projections.filter((event) => {
+      const recordId =
+        `session-kernel-v3:${this.runId}:projection:${event.projectionId}`;
+      const committedRecord = committedProjectionsById.get(recordId);
+      if (!committedRecord) return true;
+      const committedEvent = (committedRecord.data as
+        SessionKernelProjectionRecordV3).event;
+      if (canonicalJson(committedEvent) !== canonicalJson(event)) {
+        throw new SessionKernelPersistenceError(
+          'session_kernel_public_request_projection_replay_conflict',
+          `Kernel request ${commitScope.requestId} changed committed projection ${event.projectionId}.`
+        );
+      }
+      return false;
+    });
     const orphanCheckpoints = records.filter((record) =>
       record.recordKind === 'checkpoint'
       && !committedCheckpointIds.has(record.recordId)
@@ -1262,7 +1328,7 @@ implements SessionKernelPersistencePortV2 {
           `Settlement ${commitScope.requestId} replay changed orphan checkpoint content.`
         );
       }
-      const expectedProjectionIds = projections.map((event) =>
+      const expectedProjectionIds = settlementProjections.map((event) =>
         `session-kernel-v3:${this.runId}:projection:${event.projectionId}`
       );
       const orphanProjectionsById = new Map(
@@ -1273,8 +1339,9 @@ implements SessionKernelPersistencePortV2 {
         orphanProjections.length
       );
       if (
-        new Set(expectedProjectionIds).size !== projections.length
-        || orphanProjections.length > projections.length
+        new Set(expectedProjectionIds).size
+          !== settlementProjections.length
+        || orphanProjections.length > settlementProjections.length
         || expectedOrphanPrefix.some((recordId) =>
           !orphanProjectionsById.has(recordId)
         )
@@ -1285,7 +1352,7 @@ implements SessionKernelPersistencePortV2 {
         );
       }
       const projectionRecords: SessionKernelPersistenceRecordV3[] = [];
-      for (const [index, event] of projections.entries()) {
+      for (const [index, event] of settlementProjections.entries()) {
         const orphanRecord = orphanProjectionsById.get(
           expectedProjectionIds[index]!
         );
@@ -1332,7 +1399,7 @@ implements SessionKernelPersistencePortV2 {
       commitScope
     );
     const projectionRecords: SessionKernelPersistenceRecordV3[] = [];
-    for (const event of projections) {
+    for (const event of settlementProjections) {
       const projectionRecord = createRecord({
         sessionId: this.sessionId,
         runId: this.runId,
@@ -1559,7 +1626,8 @@ implements SessionKernelPersistencePortV2 {
 export interface SessionKernelHostProjectionSinkV2 {
   publish(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2>;
 }
 
@@ -1572,7 +1640,8 @@ implements SessionKernelProjectionPortV2 {
   ) {}
 
   async project(
-    event: SessionKernelProjectionEventV2
+    event: SessionKernelProjectionEventV2,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
     await this.persistence.persistProjection(event);
     if (this.sink) {
@@ -1580,7 +1649,8 @@ implements SessionKernelProjectionPortV2 {
       try {
         receipt = await this.sink.publish(
           cloneJson(event),
-          () => this.projectionHistoryThrough(event.projectionId)
+          () => this.projectionHistoryThrough(event.projectionId),
+          options
         );
       } catch (error) {
         throw new SessionKernelProjectionDeliveryErrorV2(
@@ -1607,7 +1677,10 @@ implements SessionKernelProjectionPortV2 {
     };
   }
 
-  async flushPending(runId: string): Promise<void> {
+  async flushPending(
+    runId: string,
+    options?: SessionKernelProjectionDeliveryOptionsV2
+  ): Promise<void> {
     if (!this.sink) return;
     const pending = await this.persistence
       .loadUndeliveredProjections(runId);
@@ -1615,7 +1688,8 @@ implements SessionKernelProjectionPortV2 {
       try {
         await this.sink.publish(
           cloneJson(event),
-          () => this.projectionHistoryThrough(event.projectionId)
+          () => this.projectionHistoryThrough(event.projectionId),
+          options
         );
       } catch (error) {
         throw new SessionKernelProjectionDeliveryErrorV2(
@@ -1667,6 +1741,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'provider.started',
   'provider.composing',
   'provider.completed',
+  'provider.answerState',
   'provider.stale',
   'toolIntent.submitted',
   'capability.awaiting',
@@ -1674,6 +1749,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'authorization.decided',
   'review.revised',
   'planAction.completed',
+  'userIntervention.changed',
   'run.cancelled',
   'wait.changed',
   'diagnostic',
@@ -2266,7 +2342,7 @@ function decodeProviderTurnDispatchDataV3(
 function decodeProviderCompletionReceiptV1(
   value: unknown
 ): import('./types.js').SessionProviderCompletionReceiptV1 {
-  const record = exactObject(
+  const record = exactObjectOptional(
     value,
     [
       'schemaVersion',
@@ -2277,6 +2353,7 @@ function decodeProviderCompletionReceiptV1(
       'responseDigest',
       'trace',
     ],
+    ['structuredOutputRecovery'],
     'session_kernel_provider_completion_invalid'
   );
   const native = objectRecord(record.nativeCompletion);
@@ -2365,6 +2442,12 @@ function decodeProviderCompletionReceiptV1(
       'session_kernel_provider_completion_invalid'
     );
   }
+  const structuredOutputRecovery = record.structuredOutputRecovery
+    === undefined
+    ? undefined
+    : decodeStructuredOutputRecoveryV1(
+        record.structuredOutputRecovery
+      );
   return {
     schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
     nativeCompletion,
@@ -2391,6 +2474,9 @@ function decodeProviderCompletionReceiptV1(
         'trace.recordCount'
       ),
     },
+    ...(structuredOutputRecovery
+      ? { structuredOutputRecovery }
+      : {}),
   };
 }
 
@@ -2465,7 +2551,13 @@ function decodeProviderTurnTerminalDataV3(
       'traceRef',
       'orderedItems',
     ],
-    ['reasonCode', 'responseDigest', 'completion', 'providerResult'],
+    [
+      'reasonCode',
+      'responseDigest',
+      'completion',
+      'providerResult',
+      'structuredFailure',
+    ],
     'session_kernel_provider_terminal_invalid'
   );
   const providerTurnId = requiredIdentity(
@@ -2546,6 +2638,7 @@ function decodeProviderTurnTerminalDataV3(
     );
     if (
       record.reasonCode !== undefined
+      || record.structuredFailure !== undefined
       || responseDigest !== completion.responseDigest
       || providerResultRecord.providerProfileId
         !== authorityBinding.providerProfileId
@@ -2585,11 +2678,50 @@ function decodeProviderTurnTerminalDataV3(
     record.reasonCode === undefined
     || record.responseDigest !== undefined
     || record.completion !== undefined
-    || record.providerResult !== undefined
     || orderedItems.length !== 0
   ) {
     throw new UnsupportedHistorySchemaError(
       'session_kernel_provider_terminal_invalid'
+    );
+  }
+  const structuredFailure = record.structuredFailure === undefined
+    ? undefined
+    : decodeStructuredOutputFailureV1(record.structuredFailure);
+  const providerResultRecord = record.providerResult === undefined
+    ? undefined
+    : exactObjectOptional(
+        record.providerResult,
+        ['providerProfileId', 'provider', 'model'],
+        ['usage'],
+        'session_kernel_provider_terminal_result_invalid'
+      );
+  if (
+    (
+      terminalKind !== 'failed'
+      && (structuredFailure !== undefined || providerResultRecord !== undefined)
+    )
+    || (
+      (structuredFailure === undefined)
+        !== (providerResultRecord === undefined)
+    )
+    || (
+      structuredFailure !== undefined
+      && (
+        record.reasonCode !== structuredFailure.errorCode
+        || providerResultRecord?.providerProfileId
+          !== authorityBinding.providerProfileId
+      )
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_terminal_invalid'
+    );
+  }
+  const usage = providerResultRecord?.usage;
+  const usageRecord = usage === undefined ? undefined : objectRecord(usage);
+  if (usage !== undefined && !usageRecord) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_terminal_result_invalid'
     );
   }
   return {
@@ -2599,6 +2731,23 @@ function decodeProviderTurnTerminalDataV3(
     authorityBinding,
     terminalKind,
     reasonCode: requiredIdentity(record.reasonCode, 'reasonCode'),
+    ...(providerResultRecord
+      ? {
+          providerResult: {
+            providerProfileId: requiredIdentity(
+              providerResultRecord.providerProfileId,
+              'providerProfileId'
+            ),
+            provider: requiredIdentity(
+              providerResultRecord.provider,
+              'provider'
+            ),
+            model: requiredIdentity(providerResultRecord.model, 'model'),
+            ...(usageRecord ? { usage: cloneJson(usageRecord) } : {}),
+          },
+          structuredFailure,
+        }
+      : {}),
     traceRef,
     orderedItems: [],
   };
@@ -2705,7 +2854,7 @@ function decodeCompactCheckpointV3(
       'active',
       'refs',
     ],
-    ['finalAnswer'],
+    ['finalAnswer', 'terminalAnswerCandidate'],
     'session_kernel_checkpoint_invalid'
   );
   const revision = positiveSafeIntegerV3(
@@ -2797,6 +2946,10 @@ function decodeCompactCheckpointV3(
     [
       'pendingEpochInputRef',
       'activeWait',
+      'interventionResearch',
+      'userIntervention',
+      'userInterventionDecision',
+      'pendingProviderControlSettlement',
       'providerReservation',
       'providerQueue',
       'runCancellation',
@@ -2854,6 +3007,12 @@ function decodeCompactCheckpointV3(
   const finalAnswer = record.finalAnswer === undefined
     ? undefined
     : decodeCompactFinalAnswerV3(record.finalAnswer);
+  const terminalAnswerCandidate =
+    record.terminalAnswerCandidate === undefined
+      ? undefined
+      : decodeCompactTerminalAnswerCandidateV1(
+          record.terminalAnswerCandidate
+        );
   const reviewFactsAfterLedgerSequence = nonnegativeSafeIntegerV3(
     cursor.reviewFactsAfterLedgerSequence,
     'reviewFactsAfterLedgerSequence'
@@ -2965,6 +3124,34 @@ function decodeCompactCheckpointV3(
       ...(active.activeWait === undefined
         ? {}
         : { activeWait: cloneJson(active.activeWait) as SessionActiveWaitV2 }),
+      ...(active.interventionResearch === undefined
+        ? {}
+        : {
+            interventionResearch: cloneJson(
+              active.interventionResearch
+            ) as SessionInterventionResearchV4,
+          }),
+      ...(active.userIntervention === undefined
+        ? {}
+        : {
+            userIntervention: cloneJson(
+              active.userIntervention
+            ) as SessionUserInterventionV4,
+          }),
+      ...(active.userInterventionDecision === undefined
+        ? {}
+        : {
+            userInterventionDecision: cloneJson(
+              active.userInterventionDecision
+            ) as SessionUserInterventionDecisionV4,
+          }),
+      ...(active.pendingProviderControlSettlement === undefined
+        ? {}
+        : {
+            pendingProviderControlSettlement: cloneJson(
+              active.pendingProviderControlSettlement
+            ) as SessionProviderControlSettlementV2,
+          }),
       pendingGuidance: active.pendingGuidance.map((guidance) =>
         requiredText(guidance, 'pendingGuidance')
       ),
@@ -3004,6 +3191,81 @@ function decodeCompactCheckpointV3(
       ),
     },
     ...(finalAnswer === undefined ? {} : { finalAnswer }),
+    ...(terminalAnswerCandidate === undefined
+      ? {}
+      : { terminalAnswerCandidate }),
+  };
+}
+
+function decodeCompactTerminalAnswerCandidateV1(
+  value: unknown
+): SessionKernelCompactTerminalAnswerCandidateV1 {
+  const record = exactObject(
+    value,
+    [
+      'schemaVersion',
+      'providerTurnId',
+      'inputId',
+      'controlEpoch',
+      'languageRevision',
+      'snapshotHighWater',
+      'workAuthority',
+      'textDigest',
+      'sourceEventRefs',
+      'recordedAt',
+    ],
+    'session_kernel_terminal_answer_candidate_invalid'
+  );
+  const controlEpoch = positiveSafeIntegerV3(
+    record.controlEpoch,
+    'terminalAnswerCandidate.controlEpoch'
+  );
+  const languageRevision = positiveSafeIntegerV3(
+    record.languageRevision,
+    'terminalAnswerCandidate.languageRevision'
+  );
+  const sourceEventRefs = Array.isArray(record.sourceEventRefs)
+    ? record.sourceEventRefs.map((ref) =>
+        requiredIdentity(ref, 'terminalAnswerCandidate.sourceEventRef')
+      )
+    : [];
+  if (
+    record.schemaVersion
+      !== SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA
+    || languageRevision !== controlEpoch
+    || sourceEventRefs.length === 0
+    || new Set(sourceEventRefs).size !== sourceEventRefs.length
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_terminal_answer_candidate_invalid'
+    );
+  }
+  return {
+    schemaVersion: SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
+    providerTurnId: requiredIdentity(
+      record.providerTurnId,
+      'terminalAnswerCandidate.providerTurnId'
+    ),
+    inputId: requiredIdentity(
+      record.inputId,
+      'terminalAnswerCandidate.inputId'
+    ),
+    controlEpoch,
+    languageRevision,
+    snapshotHighWater: nonnegativeSafeIntegerV3(
+      record.snapshotHighWater,
+      'terminalAnswerCandidate.snapshotHighWater'
+    ),
+    workAuthority: decodeSessionWorkAuthorityV3(record.workAuthority),
+    textDigest: requiredDigest(
+      record.textDigest,
+      'terminalAnswerCandidate.textDigest'
+    ),
+    sourceEventRefs,
+    recordedAt: requiredText(
+      record.recordedAt,
+      'terminalAnswerCandidate.recordedAt'
+    ),
   };
 }
 
@@ -3118,9 +3380,10 @@ function decodeCompactProviderReservationV3(
       'status',
     ],
     [
-      'remainingToolCallBudget',
       'planRevision',
       'correction',
+      'structuredRepair',
+      'nextStructuredRepair',
       'cancellationReason',
       'dispatchRef',
       'terminalRef',
@@ -3142,22 +3405,6 @@ function decodeCompactProviderReservationV3(
       'session_kernel_provider_reservation_invalid'
     );
   }
-  const remainingToolCallBudget =
-    record.remainingToolCallBudget === undefined
-      ? undefined
-      : positiveSafeIntegerV3(
-          record.remainingToolCallBudget,
-          'remainingToolCallBudget'
-        );
-  if (
-    (target.kind === 'planAction')
-      !== (remainingToolCallBudget !== undefined)
-    || (remainingToolCallBudget ?? 0) > 256
-  ) {
-    throw new UnsupportedHistorySchemaError(
-      'session_kernel_provider_reservation_budget_invalid'
-    );
-  }
   const allowedStatuses: readonly SessionProviderTurnRecordV2['status'][] = [
     'active',
     'awaitingTools',
@@ -3172,6 +3419,37 @@ function decodeCompactProviderReservationV3(
   )) {
     throw new UnsupportedHistorySchemaError(
       'session_kernel_provider_reservation_status_invalid'
+    );
+  }
+  const providerTurnId = requiredIdentity(
+    record.providerTurnId,
+    'providerTurnId'
+  );
+  const structuredRepair = record.structuredRepair === undefined
+    ? undefined
+    : decodeSessionProviderStructuredRepairV1(
+        record.structuredRepair
+      );
+  const nextStructuredRepair =
+    record.nextStructuredRepair === undefined
+      ? undefined
+      : decodeSessionProviderStructuredRepairV1(
+          record.nextStructuredRepair
+        );
+  if (
+    (structuredRepair !== undefined && record.purpose !== 'continuation')
+    || structuredRepair?.predecessorProviderTurnId === providerTurnId
+    || (
+      nextStructuredRepair !== undefined
+      && (
+        record.status !== 'failed'
+        || nextStructuredRepair.predecessorProviderTurnId
+          !== providerTurnId
+      )
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_structured_repair_invalid'
     );
   }
   const cancellationReasons: readonly NonNullable<
@@ -3190,10 +3468,7 @@ function decodeCompactProviderReservationV3(
     );
   }
   return {
-    providerTurnId: requiredIdentity(
-      record.providerTurnId,
-      'providerTurnId'
-    ),
+    providerTurnId,
     purpose: record.purpose,
     target,
     ...(record.planRevision === undefined
@@ -3204,9 +3479,6 @@ function decodeCompactProviderReservationV3(
             'planRevision'
           ),
         }),
-    ...(remainingToolCallBudget === undefined
-      ? {}
-      : { remainingToolCallBudget }),
     ...(record.correction === undefined
       ? {}
       : {
@@ -3214,6 +3486,12 @@ function decodeCompactProviderReservationV3(
             record.correction
           ),
         }),
+    ...(structuredRepair === undefined
+      ? {}
+      : { structuredRepair }),
+    ...(nextStructuredRepair === undefined
+      ? {}
+      : { nextStructuredRepair }),
     controlEpoch: positiveSafeIntegerV3(
       record.controlEpoch,
       'controlEpoch'
@@ -3266,6 +3544,19 @@ function decodeProviderTurnTargetV3(
         planActionId: requiredIdentity(
           tagged.planActionId,
           'target.planActionId'
+        ),
+      };
+    case 'interventionResearch':
+      exactObject(
+        tagged,
+        ['kind', 'researchId'],
+        'session_kernel_provider_target_invalid'
+      );
+      return {
+        kind: 'interventionResearch',
+        researchId: requiredIdentity(
+          tagged.researchId,
+          'target.researchId'
         ),
       };
     case 'contextRead':
@@ -3327,6 +3618,58 @@ function decodeProviderTurnTargetV3(
         'session_kernel_provider_target_invalid'
       );
   }
+}
+
+function decodeSessionProviderStructuredRepairV1(
+  value: unknown
+): NonNullable<SessionProviderTurnRecordV2['structuredRepair']> {
+  const record = exactObjectOptional(
+    value,
+    [
+      'schemaVersion',
+      'predecessorProviderTurnId',
+      'sourceTerminalKind',
+      'errorCode',
+      'failureDigest',
+    ],
+    ['sourceResponseDigest'],
+    'session_kernel_provider_structured_repair_invalid'
+  );
+  if (
+    record.schemaVersion
+      !== 'deepcode.session.provider-structured-repair.v1'
+    || (
+      record.sourceTerminalKind !== 'failed'
+      && record.sourceTerminalKind !== 'completed'
+    )
+    || (record.sourceTerminalKind === 'completed')
+      !== (record.sourceResponseDigest !== undefined)
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_structured_repair_invalid'
+    );
+  }
+  return {
+    schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+    predecessorProviderTurnId: requiredIdentity(
+      record.predecessorProviderTurnId,
+      'predecessorProviderTurnId'
+    ),
+    sourceTerminalKind: record.sourceTerminalKind,
+    errorCode: requiredIdentity(record.errorCode, 'errorCode'),
+    failureDigest: requiredDigest(
+      record.failureDigest,
+      'failureDigest'
+    ),
+    ...(record.sourceResponseDigest === undefined
+      ? {}
+      : {
+          sourceResponseDigest: requiredDigest(
+            record.sourceResponseDigest,
+            'sourceResponseDigest'
+          ),
+        }),
+  };
 }
 
 function decodeSessionToolCorrectionV3(
@@ -3401,6 +3744,7 @@ function decodeCompactProviderQueueV3(
       'terminalRef',
       'target',
       'calls',
+      'mutationDisposition',
       'status',
       'outcomeRecorded',
     ],
@@ -3408,7 +3752,15 @@ function decodeCompactProviderQueueV3(
     'session_kernel_provider_queue_invalid'
   );
   if (!Array.isArray(record.calls)
-    || typeof record.outcomeRecorded !== 'boolean') {
+    || typeof record.outcomeRecorded !== 'boolean'
+    || ![
+      'notRequired',
+      'classifying',
+      'planned',
+      'initialPlanDiscovery',
+      'userIntervention',
+    ].includes(String(record.mutationDisposition))
+    || !['active', 'completed', 'aborted'].includes(String(record.status))) {
     throw new UnsupportedHistorySchemaError(
       'session_kernel_provider_queue_invalid'
     );
@@ -3421,6 +3773,8 @@ function decodeCompactProviderQueueV3(
     terminalRef: decodeRecordRefV3(record.terminalRef),
     target: cloneJson(record.target) as SessionProviderTurnTargetV2,
     calls: cloneJson(record.calls) as SessionProviderToolCallQueueItemV2[],
+    mutationDisposition: record.mutationDisposition as
+      SessionProviderToolCallQueueV2['mutationDisposition'],
     status: record.status as SessionProviderToolCallQueueV2['status'],
     outcomeRecorded: record.outcomeRecorded,
     ...(record.settledAt === undefined
@@ -3447,8 +3801,10 @@ function decodeCompactFinalAnswerV3(
       'providerTurnId',
       'startedAt',
       'staleAt',
+      'committedAt',
       'failedAt',
       'lastErrorCode',
+      'commitKind',
     ],
     'session_kernel_final_answer_checkpoint_invalid'
   );
@@ -3497,6 +3853,14 @@ function decodeCompactFinalAnswerV3(
     ...(record.staleAt === undefined
       ? {}
       : { staleAt: requiredText(record.staleAt, 'staleAt') }),
+    ...(record.committedAt === undefined
+      ? {}
+      : {
+          committedAt: requiredText(
+            record.committedAt,
+            'committedAt'
+          ),
+        }),
     ...(record.failedAt === undefined
       ? {}
       : { failedAt: requiredText(record.failedAt, 'failedAt') }),
@@ -3508,6 +3872,16 @@ function decodeCompactFinalAnswerV3(
             'lastErrorCode'
           ),
         }),
+    ...(record.commitKind === undefined
+      ? {}
+      : record.commitKind === 'candidatePromotion'
+          || record.commitKind === 'finalSynthesis'
+        ? { commitKind: record.commitKind }
+        : (() => {
+            throw new UnsupportedHistorySchemaError(
+              'session_kernel_final_answer_checkpoint_invalid'
+            );
+          })()),
   }) as SessionKernelCompactFinalAnswerV3;
 }
 
@@ -3537,7 +3911,13 @@ function decodeSessionWorkAuthorityV3(
   } else if (tagged.kind === 'contextRead') {
     const record = exactObject(
       value,
-      ['kind', 'operationIds', 'digest'],
+      [
+        'kind',
+        'batchSequence',
+        'predecessorDigest',
+        'operationIds',
+        'digest',
+      ],
       'session_kernel_work_authority_invalid'
     );
     if (!Array.isArray(record.operationIds)) {
@@ -3547,6 +3927,16 @@ function decodeSessionWorkAuthorityV3(
     }
     authority = {
       kind: 'contextRead',
+      batchSequence: positiveSafeIntegerV3(
+        record.batchSequence,
+        'workAuthority.batchSequence'
+      ),
+      predecessorDigest: record.predecessorDigest === null
+        ? null
+        : requiredDigest(
+            record.predecessorDigest,
+            'workAuthority.predecessorDigest'
+          ),
       operationIds: record.operationIds.map((operationId) =>
         requiredIdentity(operationId, 'workAuthority.operationId')
       ),
@@ -4127,6 +4517,11 @@ function compactCheckpointFromStateV3(input: {
   const finalAnswer = state.finalAnswer
     ? compactFinalAnswerV3(state.finalAnswer)
     : undefined;
+  const terminalAnswerCandidate = state.terminalAnswerCandidate
+    ? compactTerminalAnswerCandidateV1(
+        state.terminalAnswerCandidate
+      )
+    : undefined;
   return {
     schemaVersion: SESSION_KERNEL_CHECKPOINT_V3_SCHEMA,
     checkpointRevision: checkpoint.checkpointRevision,
@@ -4182,6 +4577,26 @@ function compactCheckpointFromStateV3(input: {
       ...(state.activeWait
         ? { activeWait: cloneJson(state.activeWait) }
         : {}),
+      ...(state.interventionResearch
+        ? { interventionResearch: cloneJson(state.interventionResearch) }
+        : {}),
+      ...(state.userIntervention
+        ? { userIntervention: cloneJson(state.userIntervention) }
+        : {}),
+      ...(state.userInterventionDecision
+        ? {
+            userInterventionDecision: cloneJson(
+              state.userInterventionDecision
+            ),
+          }
+        : {}),
+      ...(state.pendingProviderControlSettlement
+        ? {
+            pendingProviderControlSettlement: cloneJson(
+              state.pendingProviderControlSettlement
+            ),
+          }
+        : {}),
       pendingGuidance: cloneJson(state.pendingGuidance),
       ...(providerReservation ? { providerReservation } : {}),
       ...(providerQueue ? { providerQueue } : {}),
@@ -4197,6 +4612,9 @@ function compactCheckpointFromStateV3(input: {
       planActionSettlements: settlementRefs,
     },
     ...(finalAnswer ? { finalAnswer } : {}),
+    ...(terminalAnswerCandidate
+      ? { terminalAnswerCandidate }
+      : {}),
   };
 }
 
@@ -4256,14 +4674,17 @@ function compactProviderReservationV3(
     ...(turn.planRevision === undefined
       ? {}
       : { planRevision: turn.planRevision }),
-    ...(turn.remainingToolCallBudget === undefined
-      ? {}
-      : {
-          remainingToolCallBudget: turn.remainingToolCallBudget,
-        }),
     ...(turn.correction === undefined
       ? {}
       : { correction: cloneJson(turn.correction) }),
+    ...(turn.structuredRepair === undefined
+      ? {}
+      : { structuredRepair: cloneJson(turn.structuredRepair) }),
+    ...(turn.nextStructuredRepair === undefined
+      ? {}
+      : {
+          nextStructuredRepair: cloneJson(turn.nextStructuredRepair),
+        }),
     controlEpoch: turn.controlEpoch,
     contextRef: cloneJson(turn.contextRef),
     factProjection: cloneJson(turn.factProjection),
@@ -4297,6 +4718,7 @@ function compactProviderQueueV3(
     terminalRef: cloneJson(terminal.ref),
     target: cloneJson(queue.target),
     calls: cloneJson(queue.calls),
+    mutationDisposition: queue.mutationDisposition,
     status: queue.status,
     outcomeRecorded: queue.outcomeRecorded,
     ...(queue.settledAt ? { settledAt: queue.settledAt } : {}),
@@ -4310,9 +4732,15 @@ function compactFinalAnswerV3(
   const {
     physicalRequestCount: _derived,
     finalText: _terminalText,
-    committedAt: _terminalRecordedAt,
     ...wire
   } = finalAnswer;
+  return cloneJson(wire);
+}
+
+function compactTerminalAnswerCandidateV1(
+  candidate: SessionTerminalAnswerCandidateV1
+): SessionKernelCompactTerminalAnswerCandidateV1 {
+  const { text: _terminalText, ...wire } = candidate;
   return cloneJson(wire);
 }
 
@@ -4479,6 +4907,18 @@ function materializeCompactCheckpointV3(input: {
       ).data) as SessionUserInputRecordV2
     : undefined;
   state.activeWait = cloneJson(checkpoint.active.activeWait);
+  state.interventionResearch = cloneJson(
+    checkpoint.active.interventionResearch
+  );
+  state.userIntervention = cloneJson(
+    checkpoint.active.userIntervention
+  );
+  state.userInterventionDecision = cloneJson(
+    checkpoint.active.userInterventionDecision
+  );
+  state.pendingProviderControlSettlement = cloneJson(
+    checkpoint.active.pendingProviderControlSettlement
+  );
   state.pendingGuidance = cloneJson(checkpoint.active.pendingGuidance);
   state.factBarriers = cloneJson(checkpoint.active.factBarriers);
   state.publicRequests = Object.fromEntries(
@@ -4510,6 +4950,15 @@ function materializeCompactCheckpointV3(input: {
     committedCheckpoints,
     recovery
   );
+  if (checkpoint.terminalAnswerCandidate) {
+    state.terminalAnswerCandidate =
+      materializeTerminalAnswerCandidateV1({
+        candidate: checkpoint.terminalAnswerCandidate,
+        state,
+        records,
+        committedProjections,
+      });
+  }
   const currentInputHasDurableToolResponse =
     checkpoint.cursor.providerTerminalRefs.some((ref) => {
       const terminal = resolveRecordRefV3(
@@ -4529,7 +4978,7 @@ function materializeCompactCheckpointV3(input: {
     && (
       currentInputHasDurableToolResponse
       || checkpoint.active.providerQueue?.calls.some((call) =>
-        call.intent.authority.kind === 'contextRead'
+        call.intent?.authority.kind === 'read'
       )
     )
   ) {
@@ -4561,17 +5010,24 @@ function materializeCompactCheckpointV3(input: {
     );
   }
   if (checkpoint.finalAnswer) {
-    const physicalRequestCount = countMatchingFinalAnswerDispatchesV3(
-      records,
-      state.runId,
-      checkpoint.finalAnswer,
-      recovery.providerProfile
-    );
+    const physicalRequestCount =
+      checkpoint.finalAnswer.commitKind === 'candidatePromotion'
+        ? 0
+        : countMatchingFinalAnswerDispatchesV3(
+            records,
+            state.runId,
+            checkpoint.finalAnswer,
+            recovery.providerProfile
+          );
     state.finalAnswer = {
       ...cloneJson(checkpoint.finalAnswer),
       physicalRequestCount,
     } as SessionFinalAnswerStateV3;
-    recoverFinalAnswerFromTerminalV3(state, activeEvidence);
+    if (checkpoint.finalAnswer.commitKind === 'candidatePromotion') {
+      recoverPromotedCandidateFinalAnswerV1(state);
+    } else {
+      recoverFinalAnswerFromTerminalV3(state, activeEvidence);
+    }
   }
   restoreProjectionHeadsV3(state, committedProjections);
   return {
@@ -4579,6 +5035,63 @@ function materializeCompactCheckpointV3(input: {
     checkpointRevision: checkpoint.checkpointRevision,
     savedAt: checkpoint.savedAt,
     state,
+  };
+}
+
+function recoverPromotedCandidateFinalAnswerV1(
+  state: SessionKernelLoopStateV2
+): void {
+  const finalAnswer = state.finalAnswer;
+  const candidate = state.terminalAnswerCandidate;
+  const providerTurn = state.providerTurn;
+  if (
+    finalAnswer?.status !== 'committed'
+    || finalAnswer.commitKind !== 'candidatePromotion'
+    || finalAnswer.physicalRequestCount !== 0
+    || !finalAnswer.providerTurnId
+    || !finalAnswer.committedAt
+    || !candidate
+    || candidate.providerTurnId !== finalAnswer.providerTurnId
+    || candidate.inputId !== finalAnswer.binding.inputId
+    || candidate.controlEpoch !== finalAnswer.binding.controlEpoch
+    || candidate.languageRevision !== finalAnswer.binding.controlEpoch
+    || candidate.snapshotHighWater
+      !== finalAnswer.binding.snapshotHighWater
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      finalAnswer.binding.workAuthority
+    )
+    || !providerTurn
+    || providerTurn.providerTurnId !== candidate.providerTurnId
+    || providerTurn.status !== 'completed'
+    || !providerTurn.response
+    || providerTurn.purpose === 'finalAnswer'
+    || providerTurn.target.kind === 'finalAnswer'
+    || state.currentInputId !== finalAnswer.binding.inputId
+    || state.controlEpoch !== finalAnswer.binding.controlEpoch
+    || state.review?.status !== 'final'
+    || state.review.revision !== finalAnswer.binding.reviewRevision
+    || state.review.snapshotHighWater
+      !== finalAnswer.binding.snapshotHighWater
+    || !state.review.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      state.review.workAuthority,
+      finalAnswer.binding.workAuthority
+    )
+    || !state.providerOutcomes.some((outcome) =>
+      outcome.providerTurnId === candidate.providerTurnId
+      && outcome.outputKind === 'answer'
+      && outcome.recordedAt === candidate.recordedAt
+      && outcome.summary === utf8Prefix(candidate.text, 8_192)
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_promoted_terminal_answer_invalid'
+    );
+  }
+  state.finalAnswer = {
+    ...cloneJson(finalAnswer),
+    finalText: candidate.text,
   };
 }
 
@@ -4759,6 +5272,7 @@ function recoverFinalAnswerFromTerminalV3(
     providerTurnId: terminal.data.providerTurnId,
     committedAt: terminal.recordedAt,
     finalText: text,
+    commitKind: 'finalSynthesis',
   };
   if (state.providerTurn) state.providerTurn.status = 'completed';
   const outcome = state.providerOutcomes.find((candidate) =>
@@ -4768,7 +5282,7 @@ function recoverFinalAnswerFromTerminalV3(
     !outcome
     || outcome.outputKind !== 'answer'
     || outcome.recordedAt !== terminal.recordedAt
-    || outcome.summary !== text.slice(0, 8_192)
+    || outcome.summary !== utf8Prefix(text, 8_192)
     || canonicalJson(outcome.providerResult)
       !== canonicalJson(terminal.data.providerResult)
   ) {
@@ -4818,7 +5332,8 @@ function materializeProviderOutcomesV3(
   recovery: SessionKernelCheckpointRecoveryInputV3
 ): SessionProviderOutcomeRecordV2[] {
   const seen = new Set<string>();
-  return refs.map((ref) => {
+  const outcomes: SessionProviderOutcomeRecordV2[] = [];
+  for (const ref of refs) {
     if (seen.has(ref.recordId)) {
       throw new UnsupportedHistorySchemaError(
         'provider-terminal-history-duplicate'
@@ -4856,7 +5371,7 @@ function materializeProviderOutcomesV3(
       terminal.providerTurnId,
       committedCheckpoints
     );
-    return materializeProviderOutcomeV3({
+    outcomes.push(materializeProviderOutcomeV3({
       terminalRef: ref,
       evidence: {
         dispatch: evidence.dispatch,
@@ -4865,8 +5380,10 @@ function materializeProviderOutcomesV3(
       source,
       byId,
       recovery,
-    });
-  });
+      priorOutcomes: outcomes,
+    }));
+  }
+  return outcomes;
 }
 
 function providerOutcomeSourceCheckpointV3(
@@ -4906,8 +5423,16 @@ function materializeProviderOutcomeV3(input: {
   source: SessionKernelCompactCheckpointV3;
   byId: ReadonlyMap<string, SessionKernelPersistenceRecordV3>;
   recovery: SessionKernelCheckpointRecoveryInputV3;
+  priorOutcomes: readonly SessionProviderOutcomeRecordV2[];
 }): SessionProviderOutcomeRecordV2 {
-  const { terminalRef, evidence, source, byId, recovery } = input;
+  const {
+    terminalRef,
+    evidence,
+    source,
+    byId,
+    recovery,
+    priorOutcomes,
+  } = input;
   const reservation = source.active.providerReservation!;
   const dispatch = evidence.dispatch;
   const terminal = evidence.terminal;
@@ -5030,7 +5555,10 @@ function materializeProviderOutcomeV3(input: {
     providerTurnId: reservation.providerTurnId,
     purpose: reservation.purpose,
     runId: source.authority.runId,
+    controlEpoch: source.authority.controlEpoch,
     currentInput,
+    providerOutcomes: cloneJson(priorOutcomes),
+    sessionMemory: cloneJson(recovery.sessionMemory),
     providerProfile: cloneJson(recovery.providerProfile),
     ...(plan ? { plan: cloneJson(plan) } : {}),
     target: cloneJson(target),
@@ -5041,11 +5569,44 @@ function materializeProviderOutcomeV3(input: {
     terminal,
     recovery.providerProfile.providerProfileId
   );
-  const output = adaptSessionKernelProviderBackendOutputV2(
-    semanticInput,
-    backendOutput,
-    terminal.recordedAt
-  );
+  let output: SessionProviderTurnOutputV2;
+  if (backendOutput.kind === 'plan') {
+    const planRef = source.authority.planRef;
+    if (!planRef) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-outcome-plan-ref-missing'
+      );
+    }
+    output = rehydratePersistedProviderPlanOutputV2(
+      semanticInput,
+      backendOutput,
+      cloneJson(resolveRecordRefV3(
+        byId,
+        planRef,
+        'plan'
+      ).data) as SessionNaturalLanguagePlanV2,
+      terminal.recordedAt
+    );
+  } else if (backendOutput.kind === 'intervention') {
+    const persistedIntervention = source.active.userIntervention;
+    if (!persistedIntervention) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-outcome-intervention-record-missing'
+      );
+    }
+    output = rehydratePersistedProviderInterventionOutputV2(
+      semanticInput,
+      backendOutput,
+      cloneJson(persistedIntervention),
+      terminal.recordedAt
+    );
+  } else {
+    output = adaptSessionKernelProviderBackendOutputV2(
+      semanticInput,
+      backendOutput,
+      terminal.recordedAt
+    );
+  }
   if (output.kind !== 'toolIntent' && reservation.status !== 'completed') {
     throw new UnsupportedHistorySchemaError(
       'provider-outcome-reservation-status-mismatch'
@@ -5111,13 +5672,56 @@ function materializeProviderOutcomeV3(input: {
       'provider-outcome-unexpected-tool-settlement'
     );
   }
-  const summary = providerOutputSummaryV3(output);
-  return {
+  if (output.kind === 'noTool' && output.repair) {
+    return repairedSessionProviderOutcomeV2(
+      reservation.providerTurnId,
+      output,
+      terminal.recordedAt
+    );
+  }
+  if (output.kind === 'planEvidenceRefresh') {
+    return {
+      providerTurnId: reservation.providerTurnId,
+      outputKind: output.kind,
+      recordedAt: terminal.recordedAt,
+      summary: utf8Prefix(output.guidance, 8_192),
+      control: cloneJson(output.control),
+      refresh: cloneJson(output.refresh),
+      providerResult: cloneJson(output.providerResult),
+    };
+  }
+  const base = {
     providerTurnId: reservation.providerTurnId,
-    outputKind: output.kind,
     recordedAt: terminal.recordedAt,
-    ...(summary === undefined ? {} : { summary }),
+    ...(providerOutputSummaryV3(output) === undefined
+      ? {}
+      : { summary: providerOutputSummaryV3(output) }),
     providerResult: cloneJson(output.providerResult),
+  };
+  if (output.kind === 'plan') {
+    return {
+      ...base,
+      outputKind: output.kind,
+      control: cloneJson(output.control),
+    };
+  }
+  if (output.kind === 'planActionComplete') {
+    return {
+      ...base,
+      outputKind: output.kind,
+      control: cloneJson(output.control),
+    };
+  }
+  if (output.kind === 'intervention') {
+    return {
+      ...base,
+      outputKind: output.kind,
+      control: cloneJson(output.control),
+    };
+  }
+  return {
+    ...base,
+    outputKind: output.kind,
   };
 }
 
@@ -5332,12 +5936,22 @@ function providerOutputSummaryV3(
     { kind: 'toolIntent' }
   >
 ): string | undefined {
-  if (output.kind === 'answer') return output.text.slice(0, 8_192);
-  if (output.kind === 'noTool') return output.guidance?.slice(0, 8_192);
+  if (output.kind === 'answer') return utf8Prefix(output.text, 8_192);
+  if (output.kind === 'noTool') {
+    return output.guidance === undefined
+      ? undefined
+      : utf8Prefix(output.guidance, 8_192);
+  }
+  if (output.kind === 'planEvidenceRefresh') {
+    return utf8Prefix(output.guidance, 8_192);
+  }
   if (output.kind === 'planActionComplete') {
     return `PlanAction outcome: ${output.outcome}`;
   }
-  return `${output.plan.title}\n${output.plan.objective}`.slice(0, 8_192);
+  if (output.kind === 'intervention') {
+    return utf8Prefix(output.proposal.problemSummary, 8_192);
+  }
+  return utf8Prefix(`${output.plan.title}\n${output.plan.objective}`, 8_192);
 }
 
 function terminalFinalTextV3(
@@ -5353,6 +5967,77 @@ function terminalFinalTextV3(
         .filter((item) => item.phase === 'unknown'))
     .map((item) => item.text)
     .join('');
+}
+
+function materializeTerminalAnswerCandidateV1(input: {
+  candidate: SessionKernelCompactTerminalAnswerCandidateV1;
+  state: SessionKernelLoopStateV2;
+  records: readonly SessionKernelPersistenceRecordV3[];
+  committedProjections: readonly SessionKernelPersistenceRecordV3[];
+}): SessionTerminalAnswerCandidateV1 {
+  const { candidate, state, records, committedProjections } = input;
+  const evidence = providerTurnEvidenceV3(
+    records,
+    state.runId,
+    candidate.providerTurnId
+  );
+  const terminal = evidence.terminal;
+  if (
+    !evidence.dispatch
+    || !terminal
+    || terminal.data.terminalKind !== 'completed'
+    || terminal.data.authorityBinding.inputId !== candidate.inputId
+    || terminal.data.authorityBinding.controlEpoch
+      !== candidate.controlEpoch
+    || terminal.recordedAt !== candidate.recordedAt
+    || candidate.inputId !== state.currentInputId
+    || candidate.controlEpoch !== state.controlEpoch
+    || candidate.snapshotHighWater
+      > state.lineage.cursor.snapshotHighWater
+    || !state.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      state.workAuthority
+    )
+    || !state.providerOutcomes.some((outcome) =>
+      outcome.providerTurnId === candidate.providerTurnId
+      && outcome.outputKind === 'answer'
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_terminal_answer_candidate_invalid'
+    );
+  }
+  const text = terminalFinalTextV3(
+    terminal.data.orderedItems.filter(
+      (item): item is Extract<
+        SessionProviderTerminalOrderedItemV3,
+        { kind: 'text' }
+      > => item.kind === 'text'
+    )
+  );
+  if (
+    !text.trim()
+    || sha256Hash(text) !== candidate.textDigest
+    || candidate.sourceEventRefs.some((sourceRef) =>
+      !committedProjections.some((record) => {
+        const event = (record.data as SessionKernelProjectionRecordV3).event;
+        const data = objectRecord(event.data);
+        return event.projectionId === sourceRef
+          && event.kind === 'provider.completed'
+          && data?.providerTurnId === candidate.providerTurnId
+          && data?.outputKind === 'answer';
+      })
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_terminal_answer_candidate_source_invalid'
+    );
+  }
+  return {
+    ...cloneJson(candidate),
+    text,
+  };
 }
 
 function materializeProviderReservationV3(
@@ -5398,6 +6083,17 @@ function materializeProviderReservationV3(
       'provider-reservation-plan-revision-mismatch'
     );
   }
+  if (
+    reservation.nextStructuredRepair
+    && !structuredRepairBindsProviderTerminalV1(
+      reservation.nextStructuredRepair,
+      evidence.terminal
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_provider_structured_repair_invalid'
+    );
+  }
   const response = evidence.terminal?.data.terminalKind === 'completed'
     ? materializeCompletedProviderResponseV3(
         reservation,
@@ -5413,15 +6109,19 @@ function materializeProviderReservationV3(
     ...(reservation.planRevision === undefined
       ? {}
       : { planRevision: reservation.planRevision }),
-    ...(reservation.remainingToolCallBudget === undefined
-      ? {}
-      : {
-          remainingToolCallBudget:
-            reservation.remainingToolCallBudget,
-        }),
     ...(reservation.correction === undefined
       ? {}
       : { correction: cloneJson(reservation.correction) }),
+    ...(reservation.structuredRepair === undefined
+      ? {}
+      : { structuredRepair: cloneJson(reservation.structuredRepair) }),
+    ...(reservation.nextStructuredRepair === undefined
+      ? {}
+      : {
+          nextStructuredRepair: cloneJson(
+            reservation.nextStructuredRepair
+          ),
+        }),
     controlEpoch: reservation.controlEpoch,
     contextRef: cloneJson(reservation.contextRef),
     factProjection: cloneJson(reservation.factProjection),
@@ -5439,6 +6139,26 @@ function materializeProviderReservationV3(
       : {}),
     ...(response ? { response } : {}),
   };
+}
+
+function structuredRepairBindsProviderTerminalV1(
+  repair: NonNullable<SessionProviderTurnRecordV2['nextStructuredRepair']>,
+  terminal: SessionProviderTurnDurableEvidenceV3['terminal']
+): boolean {
+  if (
+    !terminal
+    || repair.predecessorProviderTurnId !== terminal.data.providerTurnId
+    || repair.sourceTerminalKind !== terminal.data.terminalKind
+  ) {
+    return false;
+  }
+  if (terminal.data.terminalKind === 'failed') {
+    return terminal.data.reasonCode === repair.errorCode
+      && terminal.data.structuredFailure?.failureDigest
+        === repair.failureDigest;
+  }
+  return terminal.data.terminalKind === 'completed'
+    && repair.sourceResponseDigest === terminal.data.responseDigest;
 }
 
 function materializeCompletedProviderResponseV3(
@@ -5463,13 +6183,20 @@ function materializeCompletedProviderResponseV3(
     providerTurnId: reservation.providerTurnId,
     purpose: reservation.purpose,
     runId: state.runId,
+    controlEpoch: state.controlEpoch,
     currentInput: currentSessionUserInputV2(state),
+    providerOutcomes: cloneJson(state.providerOutcomes),
+    sessionMemory: cloneJson(state.sessionMemory),
     providerProfile: cloneJson(state.providerProfile),
     ...(state.plan?.planRevision === reservation.planRevision
       ? { plan: cloneJson(state.plan) }
       : {}),
     target: cloneJson(reservation.target),
     toolContext,
+    kernelFacts: projectSessionProviderFactsV2(
+      state,
+      reservation.target
+    ),
   };
   if (reservation.target.kind === 'planAction' && !input.plan) {
     throw new UnsupportedHistorySchemaError(
@@ -5481,11 +6208,38 @@ function materializeCompletedProviderResponseV3(
     terminal,
     state.providerProfile.providerProfileId
   );
-  const output = adaptSessionKernelProviderBackendOutputV2(
-    input,
-    backendOutput,
-    terminal.recordedAt
-  );
+  let output: SessionProviderTurnOutputV2;
+  if (backendOutput.kind === 'plan') {
+    if (!state.plan) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-terminal-recovery-plan-missing'
+      );
+    }
+    output = rehydratePersistedProviderPlanOutputV2(
+      input,
+      backendOutput,
+      cloneJson(state.plan),
+      terminal.recordedAt
+    );
+  } else if (backendOutput.kind === 'intervention') {
+    if (!state.userIntervention) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-terminal-recovery-intervention-missing'
+      );
+    }
+    output = rehydratePersistedProviderInterventionOutputV2(
+      input,
+      backendOutput,
+      cloneJson(state.userIntervention),
+      terminal.recordedAt
+    );
+  } else {
+    output = adaptSessionKernelProviderBackendOutputV2(
+      input,
+      backendOutput,
+      terminal.recordedAt
+    );
+  }
   return {
     items: cloneJson(output.items),
     completion: cloneJson(output.completion),
@@ -5545,6 +6299,7 @@ function materializeProviderQueueV3(
     orderedItems,
     completion: cloneJson(terminal.data.completion),
     calls: cloneJson(compact.calls),
+    mutationDisposition: compact.mutationDisposition,
     status: compact.status,
     outcomeRecorded: compact.outcomeRecorded,
     ...(compact.settledAt ? { settledAt: compact.settledAt } : {}),
@@ -5585,8 +6340,15 @@ function materializeTerminalOrderedItemsV3(
         'provider-native-tool-arguments-invalid'
       );
     }
-    if (canonicalJson(argumentsValue)
-      !== canonicalJson(call.intent.rawArguments)) {
+    const callArguments = call.intent?.rawArguments
+      ?? call.candidatePreview?.rawArguments;
+    const callToolId = call.intent?.toolId
+      ?? call.candidatePreview?.toolId;
+    if (
+      !callArguments
+      || !callToolId
+      || canonicalJson(argumentsValue) !== canonicalJson(callArguments)
+    ) {
       throw new UnsupportedHistorySchemaError(
         'provider-native-tool-queue-mismatch'
       );
@@ -5597,8 +6359,8 @@ function materializeTerminalOrderedItemsV3(
       ordinal: callIndex,
       callId: raw.callId,
       toolName: raw.name,
-      toolId: call.intent.toolId,
-      arguments: cloneJson(call.intent.rawArguments),
+      toolId: callToolId,
+      arguments: cloneJson(callArguments),
     };
   });
 }
@@ -5675,6 +6437,7 @@ function decodePersistedSessionInputV2(
       'opaqueInputRef',
       'text',
       'attachments',
+      'attachmentContexts',
       'recordedAt',
     ],
     'session_kernel_persisted_input_invalid'
@@ -5702,11 +6465,16 @@ function decodePersistedSessionInputV2(
       'session_kernel_persisted_input_time_invalid'
     );
   }
+  const attachments = decodeAgentInputAttachmentsV3(record.attachments);
   return {
     inputId: requiredIdentity(record.inputId, 'inputId'),
     opaqueInputRef,
     text,
-    attachments: decodeAgentInputAttachmentsV2(record.attachments),
+    attachments,
+    attachmentContexts: decodeUserAttachmentContextsV1(
+      record.attachmentContexts,
+      attachments
+    ),
     recordedAt,
   };
 }

@@ -2,13 +2,14 @@ use deepcode_kernel_client::{
     terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
     AgentTimelineDurability, AgentTimelineEntryRole, AgentTimelineRunStatus, AgentTimelineSnapshot,
     AgentTimelineStatus, AgentTimelineTurnPart, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
-    TerminalWorkspaceScope,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PrivateAnalysisBoundaryV1,
+    PrivateAnalysisItemV1, PrivateAnalysisLeaseRequestV1, PrivateAnalysisStatusV1,
+    StartAgentRunRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
@@ -17,8 +18,7 @@ const EXIT_ACTION_REQUIRED: i32 = 5;
 const EXIT_INTERRUPTED: i32 = 130;
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_RUN_TIMEOUT_ENV: &str = "DEEPCODE_CLI_RUN_TIMEOUT_MS";
-const CLI_INTERRUPT_CLEANUP_WINDOW: Duration = Duration::from_secs(5);
-static CLI_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CLI_INTERRUPT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum CliCommandOutcome {
@@ -37,20 +37,23 @@ async fn main() {
         }
     };
 
-    CLI_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    CLI_INTERRUPT_COUNT.store(0, Ordering::SeqCst);
     let interrupt_task = tokio::spawn(async {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            CLI_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            CLI_INTERRUPT_COUNT.fetch_add(1, Ordering::SeqCst);
         }
     });
     let mut running = Box::pin(run(command));
     let outcome = tokio::select! {
         outcome = &mut running => outcome,
         _ = wait_for_cli_interrupt() => {
-            match tokio::time::timeout(CLI_INTERRUPT_CLEANUP_WINDOW, &mut running).await {
-                Ok(outcome) => outcome,
-                Err(_) => Err(
-                    "CLI interrupt cleanup timed out; the owned Kernel guard was reclaimed, but an externally owned Run may still require cancellation"
+            tokio::select! {
+                outcome = &mut running => outcome,
+                _ = wait_for_additional_cli_interrupt(1) => Err(
+                    "a second CLI interrupt stopped the local cancellation wait; inspect the canonical Run projection before assuming settlement"
                         .to_string(),
                 ),
             }
@@ -59,7 +62,7 @@ async fn main() {
     drop(running);
     interrupt_task.abort();
 
-    if CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+    if CLI_INTERRUPT_COUNT.load(Ordering::SeqCst) > 0 {
         if let Err(error) = outcome {
             eprintln!("{error}");
         } else {
@@ -82,7 +85,11 @@ async fn main() {
 }
 
 async fn wait_for_cli_interrupt() {
-    while !CLI_INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+    wait_for_additional_cli_interrupt(0).await;
+}
+
+async fn wait_for_additional_cli_interrupt(observed_count: usize) {
+    while CLI_INTERRUPT_COUNT.load(Ordering::SeqCst) <= observed_count {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -197,6 +204,18 @@ pub(crate) async fn run(command: Command) -> Result<CliCommandOutcome, String> {
                 .await
                 .map(|_| CliCommandOutcome::Completed)
         }
+        Command::Analysis {
+            api,
+            no_auto_start_kernel,
+            session_id,
+            follow,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_private_analysis(bootstrap.client(), session_id, &host, follow)
+                .await
+                .map(|_| CliCommandOutcome::Completed)
+        }
         Command::Permission {
             api,
             no_auto_start_kernel,
@@ -224,6 +243,26 @@ pub(crate) async fn run(command: Command) -> Result<CliCommandOutcome, String> {
                 decision,
                 run_id,
                 target_id,
+                guidance,
+                host,
+            )
+            .await
+        }
+        Command::InterventionDecision {
+            api,
+            no_auto_start_kernel,
+            interaction_id,
+            decision,
+            option_id,
+            guidance,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            resolve_user_intervention_decision(
+                bootstrap.client(),
+                interaction_id,
+                decision,
+                option_id,
                 guidance,
                 host,
             )
@@ -298,6 +337,13 @@ enum Command {
         session_id: Option<String>,
         host: SessionHostOptions,
     },
+    Analysis {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        session_id: Option<String>,
+        follow: bool,
+        host: SessionHostOptions,
+    },
     Permission {
         api: Option<String>,
         no_auto_start_kernel: bool,
@@ -312,6 +358,15 @@ enum Command {
         decision: String,
         run_id: Option<String>,
         target_id: Option<String>,
+        guidance: Option<String>,
+        host: SessionHostOptions,
+    },
+    InterventionDecision {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        interaction_id: String,
+        decision: String,
+        option_id: Option<String>,
         guidance: Option<String>,
         host: SessionHostOptions,
     },
@@ -468,6 +523,28 @@ impl Command {
                 session_id: Some(session_id.to_string()),
                 host,
             }),
+            [analysis, action]
+                if analysis == "analysis" && matches!(action.as_str(), "show" | "follow") =>
+            {
+                Ok(Command::Analysis {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: None,
+                    follow: action == "follow",
+                    host,
+                })
+            }
+            [analysis, action, session_id]
+                if analysis == "analysis" && matches!(action.as_str(), "show" | "follow") =>
+            {
+                Ok(Command::Analysis {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: Some(session_id.to_string()),
+                    follow: action == "follow",
+                    host,
+                })
+            }
             [permission, allow, permission_id]
                 if permission == "permission" && allow == "allow" =>
             {
@@ -485,6 +562,20 @@ impl Command {
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
                     decision: "reject".to_string(),
+                    host,
+                })
+            }
+            [decision_cmd, intervention, interaction_id, decision, tail @ ..]
+                if decision_cmd == "decision" && intervention == "intervention" =>
+            {
+                let (option_id, guidance) = parse_intervention_decision_options(decision, tail)?;
+                Ok(Command::InterventionDecision {
+                    api,
+                    no_auto_start_kernel,
+                    interaction_id: interaction_id.to_string(),
+                    decision: decision.to_string(),
+                    option_id,
+                    guidance,
                     host,
                 })
             }
@@ -550,6 +641,71 @@ impl Command {
     }
 }
 
+pub(crate) fn parse_intervention_decision_options(
+    decision: &str,
+    tail: &[String],
+) -> Result<(Option<String>, Option<String>), String> {
+    if !matches!(decision, "select" | "revise" | "reject") {
+        return Err("intervention decision must be select, revise, or reject".to_string());
+    }
+    let mut option_id = None;
+    let mut guidance = None;
+    let mut index = 0;
+    while index < tail.len() {
+        match tail[index].as_str() {
+            "--option" => {
+                if option_id.is_some() {
+                    return Err("--option may be supplied only once".to_string());
+                }
+                let value = tail
+                    .get(index + 1)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| "--option requires a non-empty option id".to_string())?;
+                option_id = Some(value.to_string());
+                index += 2;
+            }
+            "--guidance" => {
+                if guidance.is_some() {
+                    return Err("--guidance may be supplied only once".to_string());
+                }
+                let values = &tail[index + 1..];
+                if values.is_empty() || values.iter().any(|value| value.starts_with("--")) {
+                    return Err(
+                        "--guidance must be the final option and include non-empty text"
+                            .to_string(),
+                    );
+                }
+                let value = values.join(" ");
+                if value.trim().is_empty() {
+                    return Err("--guidance requires non-empty text".to_string());
+                }
+                guidance = Some(value);
+                index = tail.len();
+            }
+            option => {
+                return Err(format!(
+                    "unsupported intervention decision option {option}; use --option or --guidance"
+                ));
+            }
+        }
+    }
+    match decision {
+        "select" if option_id.is_none() => {
+            Err("intervention select requires --option <id>".to_string())
+        }
+        "revise" if guidance.is_none() => {
+            Err("intervention revise requires --guidance <text>".to_string())
+        }
+        "revise" if option_id.is_some() => {
+            Err("intervention revise cannot carry --option".to_string())
+        }
+        "reject" if option_id.is_some() => {
+            Err("intervention reject cannot carry --option".to_string())
+        }
+        _ => Ok((option_id, guidance)),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionHostOptions {
     pub(crate) workspace: Option<String>,
@@ -559,6 +715,15 @@ pub(crate) struct SessionHostOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSessionDecision {
+    pub(crate) run_id: String,
+    pub(crate) target_id: String,
+}
+
+pub(crate) struct PendingUserInterventionDecision {
+    pub(crate) interaction_id: String,
+    pub(crate) interaction_revision: String,
+    pub(crate) candidate_set_digest: String,
+    pub(crate) projection_cursor: u64,
     pub(crate) run_id: String,
     pub(crate) target_id: String,
 }

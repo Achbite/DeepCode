@@ -113,7 +113,14 @@ function factMatcherForTarget(
   state: SessionKernelLoopStateV2,
   target: SessionProviderTurnTargetV2
 ): (fact: KernelFactProjectionV2) => boolean {
-  if (target.kind === 'planning') return () => false;
+  if (
+    target.kind === 'planning'
+    || target.kind === 'interventionResearch'
+  ) {
+    return (fact) =>
+      fact.lineage.runId === state.runId
+      && fact.lineage.controlEpoch === state.controlEpoch;
+  }
   if (target.kind === 'finalAnswer') return () => true;
   if (target.kind === 'contextRead') {
     return (fact) => fact.lineage.operationId === target.operationId;
@@ -135,6 +142,7 @@ function factMatcherForActiveWait(
 ): (fact: KernelFactProjectionV2) => boolean {
   const wait = state.activeWait;
   if (!wait) return () => false;
+  if (wait.kind === 'userIntervention') return () => false;
   return (fact) =>
     fact.lineage.operationId === wait.operationId
     || (

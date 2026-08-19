@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{broadcast, Mutex as AsyncMutex, OwnedMutexGuard};
 
 const ACTIVE_RUN_SCHEMA_V2: &str = "deepcode.host.kernel-run-lifecycle.v3";
 const MAX_ACTIVE_RUN_RECORDS: usize = 16_384;
@@ -172,6 +172,12 @@ pub(crate) struct HostKernelRunRetirementProofV2 {
     pub(crate) ledger_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostComposerProjectionInvalidationV1 {
+    pub(crate) session_id: Option<String>,
+    pub(crate) reason: &'static str,
+}
+
 #[derive(Clone)]
 pub(crate) struct HostActiveRunBrokerV2 {
     sessions_dir: Arc<PathBuf>,
@@ -182,6 +188,7 @@ pub(crate) struct HostActiveRunBrokerV2 {
     _bridge_finalizer: Arc<HostBridgeFinalizerV2>,
     run_transport_capabilities:
         Arc<Mutex<HashMap<HostRunTransportBindingV2, HostRunTransportCapabilityV2>>>,
+    composer_invalidations: broadcast::Sender<HostComposerProjectionInvalidationV1>,
 }
 
 impl HostActiveRunBrokerV2 {
@@ -194,6 +201,7 @@ impl HostActiveRunBrokerV2 {
             owner_instance_id: Arc::clone(&owner_instance_id),
             bridge_slots: Arc::clone(&bridge_slots),
         });
+        let (composer_invalidations, _) = broadcast::channel(256);
         Ok(Self {
             sessions_dir,
             owner_instance_id,
@@ -202,7 +210,32 @@ impl HostActiveRunBrokerV2 {
             bridge_slots,
             _bridge_finalizer: bridge_finalizer,
             run_transport_capabilities: Arc::new(Mutex::new(HashMap::new())),
+            composer_invalidations,
         })
+    }
+
+    pub(crate) fn subscribe_composer_invalidations(
+        &self,
+    ) -> broadcast::Receiver<HostComposerProjectionInvalidationV1> {
+        self.composer_invalidations.subscribe()
+    }
+
+    pub(crate) fn notify_composer_projection(&self, session_id: &str, reason: &'static str) {
+        let _ = self
+            .composer_invalidations
+            .send(HostComposerProjectionInvalidationV1 {
+                session_id: Some(session_id.to_string()),
+                reason,
+            });
+    }
+
+    pub(crate) fn notify_all_composer_projections(&self, reason: &'static str) {
+        let _ = self
+            .composer_invalidations
+            .send(HostComposerProjectionInvalidationV1 {
+                session_id: None,
+                reason,
+            });
     }
 
     pub(crate) fn owner_instance_id(&self) -> String {
@@ -869,7 +902,13 @@ impl HostActiveRunBrokerV2 {
                 "Host active-run registration does not match its Session lifecycle guard",
             ));
         }
-        if let Some(existing) = self.resolve_session_active_run(&input.session_id)? {
+        if let Some(existing) = self.resolve_session_run_slot(&input.session_id)? {
+            if existing.lifecycle == HostRunLifecycleV2::Retiring {
+                return Err(HostV2StorageError::conflict(
+                    "host_active_run_retiring",
+                    "Session Run slot remains occupied while its Host Run is retiring",
+                ));
+            }
             if existing.host_run_id != input.host_run_id {
                 return Err(HostV2StorageError::conflict(
                     "host_session_multiple_active_runs",
@@ -879,7 +918,7 @@ impl HostActiveRunBrokerV2 {
         }
         let record = active_run_record(input, workspace_canonical_root)?;
         let path = self.active_run_path(&record.session_id, &record.host_run_id)?;
-        with_storage_path_lock(&path, || {
+        let receipt = with_storage_path_lock(&path, || {
             let retired_path = self.retired_run_path(&record.session_id, &record.host_run_id)?;
             if read_json(&retired_path)?.is_some() {
                 return Err(HostV2StorageError::conflict(
@@ -916,7 +955,11 @@ impl HostActiveRunBrokerV2 {
                 record,
                 replayed: false,
             })
-        })
+        })?;
+        if !receipt.replayed {
+            self.notify_composer_projection(&receipt.record.session_id, "runRegistered");
+        }
+        Ok(receipt)
     }
 
     pub(crate) fn resolve(
@@ -953,6 +996,20 @@ impl HostActiveRunBrokerV2 {
         &self,
         session_id: &str,
     ) -> Result<Option<HostActiveRunRecordV2>, HostV2StorageError> {
+        match self.resolve_session_run_slot(session_id)? {
+            Some(record) if record.lifecycle == HostRunLifecycleV2::Active => Ok(Some(record)),
+            Some(_) => Err(HostV2StorageError::conflict(
+                "host_active_run_retiring",
+                "Host Run is retiring and cannot accept new Host operations",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn resolve_session_run_slot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<HostActiveRunRecordV2>, HostV2StorageError> {
         validate_safe_session_identity(session_id)?;
         let active_dir = self
             .sessions_dir
@@ -969,7 +1026,7 @@ impl HostActiveRunBrokerV2 {
                 ))
             }
         };
-        let mut active = None;
+        let mut slot = None;
         for entry in entries {
             let entry = entry.map_err(|error| {
                 HostV2StorageError::io(
@@ -987,20 +1044,25 @@ impl HostActiveRunBrokerV2 {
                 )
             })?;
             let record = decode_active_run_record(value)?;
-            if record.session_id != session_id || record.lifecycle != HostRunLifecycleV2::Active {
+            if record.session_id != session_id
+                || !matches!(
+                    record.lifecycle,
+                    HostRunLifecycleV2::Active | HostRunLifecycleV2::Retiring
+                )
+            {
                 return Err(HostV2StorageError::conflict(
                     "host_active_run_identity_conflict",
                     "Session active-run record does not match its durable location",
                 ));
             }
-            if active.replace(record).is_some() {
+            if slot.replace(record).is_some() {
                 return Err(HostV2StorageError::conflict(
                     "host_session_multiple_active_runs",
                     "Session has more than one durable active Kernel Run",
                 ));
             }
         }
-        Ok(active)
+        Ok(slot)
     }
 
     pub(crate) fn verify_session_has_no_run_residue(
@@ -1233,7 +1295,7 @@ impl HostActiveRunBrokerV2 {
         validate_bounded_identity(host_run_id, "hostRunId", 512)?;
         validate_bounded_identity(run_id, "runId", 512)?;
         let path = self.active_run_path(session_id, host_run_id)?;
-        with_storage_path_lock(&path, || {
+        let record = with_storage_path_lock(&path, || {
             if let Some(value) = read_json(&path)? {
                 let mut record = decode_active_run_record(value)?;
                 require_run_identity(&record, session_id, host_run_id, run_id)?;
@@ -1289,7 +1351,11 @@ impl HostActiveRunBrokerV2 {
                 require_retirement_reason(&record, reason_code, reason)?;
                 Ok(record)
             }
-        })
+        })?;
+        if record.lifecycle == HostRunLifecycleV2::Retiring {
+            self.notify_composer_projection(session_id, "runRetiring");
+        }
+        Ok(record)
     }
 
     fn resume_retirement(
@@ -1590,7 +1656,7 @@ impl HostActiveRunBrokerV2 {
         expected: &HostActiveRunRecordV2,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
         let path = self.active_run_path(&expected.session_id, &expected.host_run_id)?;
-        with_storage_path_lock(&path, || {
+        let receipt = with_storage_path_lock(&path, || {
             let retired_path =
                 self.retired_run_path(&expected.session_id, &expected.host_run_id)?;
             let Some(value) = read_json(&path)? else {
@@ -1669,7 +1735,9 @@ impl HostActiveRunBrokerV2 {
                 sync_directory(parent)?;
             }
             Ok(HostRunRetirementReceiptV2)
-        })
+        })?;
+        self.notify_composer_projection(&expected.session_id, "runRetired");
+        Ok(receipt)
     }
 
     fn remove_exact_empty_workspace(

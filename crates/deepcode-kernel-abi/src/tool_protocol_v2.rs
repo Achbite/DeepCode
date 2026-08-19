@@ -275,6 +275,13 @@ impl RawToolArgumentsV2 {
         &self.0
     }
 
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        if !self.0.is_object() {
+            return Err(invalid_value("rawArguments", "must be a JSON object"));
+        }
+        validate_json_value("rawArguments", &self.0, 0, MAX_RAW_TOOL_ARGUMENT_BYTES_V2)
+    }
+
     pub fn into_value(self) -> Value {
         self.0
     }
@@ -709,7 +716,7 @@ pub enum ToolIntentAuthorityV2 {
         plan_action_id: PlanActionIdV2,
         lease: Option<CapabilityLeaseRefV2>,
     },
-    ContextRead {
+    Read {
         purpose: String,
     },
 }
@@ -718,9 +725,7 @@ impl ToolIntentAuthorityV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         match self {
             Self::PlanAction { .. } => Ok(()),
-            Self::ContextRead { purpose } => {
-                validate_bounded_text("contextRead.purpose", purpose, 1024)
-            }
+            Self::Read { purpose } => validate_bounded_text("read.purpose", purpose, 1024),
         }
     }
 }

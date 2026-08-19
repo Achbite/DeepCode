@@ -16,6 +16,7 @@ target/
 .build-cache/
 .pnpm-store/
 .deepcode/build-baselines/
+.deepcode-recovery.*/
 
 # ---- 本地可执行打包产物 ----
 # bin/ 用于输出统一分发目录；二进制产物不入库

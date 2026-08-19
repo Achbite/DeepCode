@@ -13,6 +13,7 @@ import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
   getHealth,
+  getHostStartupStatus,
   getRuntimeStatus,
   healthVersion,
   startKernelAfterPermission,
@@ -49,6 +50,18 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
+
+function startupStatusMessage(status: {
+  message: string;
+  code: string;
+  reasonCode?: string;
+  diagnosticRef?: string;
+}): string {
+  const details = [status.code, status.reasonCode, status.diagnosticRef].filter(Boolean);
+  return details.length > 0
+    ? `${status.message} (${details.join(' · ')})`
+    : status.message;
+}
 
 const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> }> = ({ language }) => (
   <div className="deepcode-gui-boot-shell">
@@ -104,10 +117,14 @@ const DeepCodeGuiApp: React.FC = () => {
       setKernelStartBusy(false);
       return;
     }
-    if (start.data?.blocked) {
+    const startupStatus = start.data?.status;
+    if (start.data?.blocked || startupStatus?.phase === 'failed') {
       setApiStatus('error');
-      setErrorMessage(start.data.message);
-      setKernelStartMessage(start.data.message);
+      const message = startupStatus
+        ? startupStatusMessage(startupStatus)
+        : start.data?.message || t(language, 'deepcodeGui.kernelStart.failed');
+      setErrorMessage(message);
+      setKernelStartMessage(message);
       setKernelStartBusy(false);
       return;
     }
@@ -124,7 +141,9 @@ const DeepCodeGuiApp: React.FC = () => {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
 
-    const message = start.data?.message || t(language, 'deepcodeGui.kernelStart.waitingHealth');
+    const message = startupStatus
+      ? startupStatusMessage(startupStatus)
+      : start.data?.message || t(language, 'deepcodeGui.kernelStart.waitingHealth');
     setApiStatus('error');
     setErrorMessage(message);
     setKernelStartMessage(message);
@@ -177,7 +196,7 @@ const DeepCodeGuiApp: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
-    let interval: ReturnType<typeof setInterval> | null = null;
+    let timeout: number | null = null;
     const check = async () => {
       await getRuntimeStatus();
       if (cancelled) return;
@@ -186,21 +205,38 @@ const DeepCodeGuiApp: React.FC = () => {
       if (result.ok && result.data) {
         setApiStatus('connected');
         setServerVersion(healthVersion(result.data));
+        setKernelStartMessage(null);
+        timeout = window.setTimeout(() => void check(), 30000);
       } else {
-        setApiStatus('error');
-        setErrorMessage(result.message || t(language, 'app.apiUnavailable'));
+        const startup = await getHostStartupStatus();
+        if (cancelled) return;
+        if (startup.ok && startup.data) {
+          const message = startupStatusMessage(startup.data);
+          setKernelStartMessage(message);
+          if (startup.data.phase === 'starting' || startup.data.phase === 'idle') {
+            setApiStatus('checking');
+            timeout = window.setTimeout(() => void check(), 500);
+          } else {
+            setApiStatus('error');
+            setErrorMessage(message);
+            timeout = window.setTimeout(() => void check(), 5000);
+          }
+        } else {
+          setApiStatus('error');
+          setErrorMessage(result.message || t(language, 'app.apiUnavailable'));
+          timeout = window.setTimeout(() => void check(), 5000);
+        }
       }
     };
     const cancelFirstPaint = afterFirstPaint(() => {
       void check();
-      interval = setInterval(() => void check(), 30000);
     });
     return () => {
       cancelled = true;
       cancelFirstPaint();
-      if (interval) clearInterval(interval);
+      if (timeout) window.clearTimeout(timeout);
     };
-  }, [language, setApiStatus, setErrorMessage, setServerVersion]);
+  }, [language, setApiStatus, setErrorMessage, setKernelStartMessage, setServerVersion]);
 
   useEffect(() => {
     let disconnect: (() => void) | null = null;

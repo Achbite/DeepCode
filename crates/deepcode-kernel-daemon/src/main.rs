@@ -6,6 +6,7 @@ mod agent_session_state;
 mod agent_timeline;
 mod api_response;
 mod browser_api;
+mod composer_projection_v1;
 mod decision_capability_v2;
 mod host_admission_v2;
 mod host_inspection;
@@ -24,7 +25,10 @@ mod llm_provider_transport;
 mod llm_stream_parser;
 mod llm_transport;
 mod prelude;
+mod private_analysis_v1;
 mod project_store;
+mod provider_cache_admission_v2;
+mod provider_cache_telemetry_v1;
 mod provider_trace_api;
 mod provider_trace_v1;
 mod routes;
@@ -38,6 +42,8 @@ mod startup_readiness_v2;
 mod state;
 mod terminal_api;
 mod terminal_runtime;
+mod user_attachment_api_v1;
+mod user_attachment_v1;
 mod utils;
 mod workspace_api;
 
@@ -51,6 +57,7 @@ pub(crate) use agent_session_state::*;
 pub(crate) use agent_timeline::*;
 pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
+pub(crate) use composer_projection_v1::*;
 pub(crate) use host_admission_v2::*;
 pub(crate) use host_services::*;
 pub(crate) use host_shutdown_v2::*;
@@ -58,7 +65,10 @@ pub(crate) use kernel_api::*;
 pub(crate) use llm_provider_transport::*;
 pub(crate) use llm_stream_parser::*;
 pub(crate) use llm_transport::*;
+pub(crate) use private_analysis_v1::*;
 pub(crate) use project_store::*;
+pub(crate) use provider_cache_admission_v2::*;
+pub(crate) use provider_cache_telemetry_v1::*;
 pub(crate) use provider_trace_api::*;
 pub(crate) use provider_trace_v1::*;
 pub(crate) use session_kernel_v2_store::*;
@@ -66,6 +76,8 @@ pub(crate) use settings_api::*;
 pub(crate) use skill_api::*;
 pub(crate) use state::*;
 pub(crate) use terminal_api::*;
+pub(crate) use user_attachment_api_v1::*;
+pub(crate) use user_attachment_v1::*;
 pub(crate) use utils::*;
 pub(crate) use workspace_api::*;
 
@@ -253,6 +265,10 @@ async fn main() {
     )
     .expect("open canonical Kernel v2 service");
     let provider_trace_v1 = ProviderTraceStoreV1::new(gui_state.paths.sessions_dir.clone());
+    let private_analysis_v1 =
+        PrivateAnalysisLeaseStoreV1::new(gui_state.paths.sessions_dir.clone());
+    let provider_cache_telemetry_v1 =
+        ProviderCacheTelemetryStoreV1::new(gui_state.paths.sessions_dir.clone());
     let host_services = HostServices::from_projects(
         &gui_state.projects,
         gui_state.paths.sessions_dir.clone(),
@@ -315,6 +331,8 @@ async fn main() {
         gui,
         host_services,
         provider_trace_v1,
+        private_analysis_v1,
+        provider_cache_telemetry_v1,
         provider_trace_export_limiter_v1:
             crate::provider_trace_api::ProviderTraceExportLimiterV1::default(),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),

@@ -10,6 +10,11 @@ import type {
   AgentTimelineWorkSegment,
 } from '@deepcode/protocol';
 import ActivityIndicator from './ActivityIndicator';
+import {
+  AnswerSettlementStatus,
+  isAnswerBusy,
+  isAnswerCommitted,
+} from './AnswerSettlementStatus';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import {
@@ -23,6 +28,7 @@ interface MessageListProps {
   timeline: AgentTimelineResult;
   loading?: boolean;
   language: UiLanguage;
+  suppressedBlockIds?: ReadonlySet<string>;
 }
 
 function blockText(block: AgentTimelineBlock, language: UiLanguage): string {
@@ -41,18 +47,18 @@ function AttachmentChips({
   if (attachments.length === 0) return null;
   return (
     <div className="agent-message-attachments" aria-label={t(language, 'agent.message.attachments')}>
-      {attachments.map((attachment, index) => (
+      {attachments.map((attachment) => (
         <span
-          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          key={`${attachment.scope}:${attachment.attachmentId}`}
           className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
-          title={attachment.path}
+          title={attachment.displayName}
         >
           <span className="agent-message-attachment__kind">
             {attachment.kind === 'directory'
               ? t(language, 'agent.composer.dir')
               : t(language, 'agent.composer.file')}
           </span>
-          <span className="agent-message-attachment__path">{attachment.path || '.'}</span>
+          <span className="agent-message-attachment__path">{attachment.displayName}</span>
         </span>
       ))}
     </div>
@@ -71,14 +77,24 @@ function UserBlock({ block, language }: { block: AgentTimelineBlock; language: U
 function AssistantBlock({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   const assistantText = block.bodyMarkdown || block.summary;
   return (
-    <article className="agent-message agent-message--assistant_msg">
+    <article
+      className={`agent-message agent-message--assistant_msg${block.answerState ? ` agent-message--answer-${block.answerState}` : ''}`}
+      data-answer-state={block.answerState}
+      aria-busy={isAnswerBusy(block.answerState)}
+    >
       <div className="agent-message__body agent-message__body--markdown">
         <MarkdownContent content={assistantText} />
       </div>
-      <FinalFactReceipt
-        projection={block.structuredProjection}
+      <AnswerSettlementStatus
+        answerState={block.answerState}
         language={language}
       />
+      {isAnswerCommitted(block.answerState) && (
+        <FinalFactReceipt
+          projection={block.structuredProjection}
+          language={language}
+        />
+      )}
     </article>
   );
 }
@@ -138,6 +154,7 @@ function ProjectedBlock({ block, language }: { block: AgentTimelineBlock; langua
     case 'review':
       return <StructuredBlock block={block} language={language} />;
     case 'permission':
+    case 'userIntervention':
     case 'error':
       return <StatusBlock block={block} language={language} />;
   }
@@ -259,7 +276,7 @@ function CurrentActivity({
     <div className="agent-projection-current-activity" role="status" aria-live="polite">
       <ActivityIndicator
         activityKey={activity
-          ? `${activity.code}:${activity.workSegmentId ?? ''}:${activity.operationId ?? ''}`
+          ? `${activity.activityId}:${activity.revision}`
           : 'transport-pending'}
         label={currentActivityLabel(activity, language)}
         variant={activity?.code === 'retry.backoff' ? 'retry' : 'default'}
@@ -273,6 +290,7 @@ function currentActivityLabel(
   language: UiLanguage
 ): string {
   if (!activity) return language === 'zh-CN' ? '正在处理' : 'Working';
+  if (activity.message?.text) return activity.message.text;
   const labels: Record<string, readonly [string, string]> = {
     'session.admitting': ['正在接收请求', 'Admitting request'],
     'provider.awaitingFirstByte': ['正在等待模型响应', 'Waiting for model response'],
@@ -380,8 +398,15 @@ function workOperationStatusLabel(
   return language === 'zh-CN' ? label[0] : label[1];
 }
 
-const MessageList: React.FC<MessageListProps> = ({ timeline, loading = false, language }) => {
-  const hasParts = timeline.turns.some((turn) => turn.parts.length > 0);
+const MessageList: React.FC<MessageListProps> = ({
+  timeline,
+  loading = false,
+  language,
+  suppressedBlockIds,
+}) => {
+  const hasParts = timeline.turns.some((turn) => turn.parts.some((part) =>
+    part.kind !== 'block' || !suppressedBlockIds?.has(part.blockId)
+  ));
   const currentActivity = timeline.runProjection?.currentActivity ?? null;
   const waitingForUser = timeline.runProjection?.status === 'waitingUser'
     || timeline.runProjection?.wait?.kind === 'user';
@@ -403,6 +428,7 @@ const MessageList: React.FC<MessageListProps> = ({ timeline, loading = false, la
           <React.Fragment key={turn.id}>
             {turn.parts.map((part) => {
               if (part.kind === 'block') {
+                if (suppressedBlockIds?.has(part.blockId)) return null;
                 const block = blocksById.get(part.blockId);
                 return block
                   ? <ProjectedBlock key={`block:${block.id}`} block={block} language={language} />

@@ -44,7 +44,7 @@ assert.deepEqual(
 );
 assert.equal(
   golden.schemaVersion,
-  'deepcode.kernel-session.wire-golden.v2',
+  'deepcode.kernel-session.wire-golden.v3',
   'the shared golden schema must be explicitly versioned'
 );
 
@@ -291,6 +291,9 @@ assert.deepEqual(
     'corpusNormalDeny',
     'sessionDefault',
     'sessionFirstAction',
+    'sessionInterventionCandidateSelected',
+    'sessionInterventionCandidateSuperseded',
+    'sessionPlanDiscovery',
     'sessionSecondAction',
   ].sort(),
   'the shared preview vectors must be a sorted-key-independent Rust set'
@@ -314,6 +317,35 @@ for (const preview of Object.values(golden.kernelCapabilityPreviews)) {
     'safe resource presentation must preserve canonical target identity'
   );
 }
+const planDiscoveryPreview =
+  golden.kernelCapabilityPreviews.sessionPlanDiscovery;
+const selectedCandidatePreview =
+  golden.kernelCapabilityPreviews.sessionInterventionCandidateSelected;
+const supersededCandidatePreview =
+  golden.kernelCapabilityPreviews.sessionInterventionCandidateSuperseded;
+assert.deepEqual(planDiscoveryPreview.origin, {
+  kind: 'planDiscovery',
+  data: { discoveryId: 'discovery-wire-golden-1' },
+});
+assert.equal(selectedCandidatePreview.origin.kind, 'interventionCandidate');
+assert.equal(
+  selectedCandidatePreview.origin.data.candidateSetDigest,
+  supersededCandidatePreview.origin.data.candidateSetDigest
+);
+assert.equal(
+  selectedCandidatePreview.origin.data.interactionId,
+  supersededCandidatePreview.origin.data.interactionId
+);
+assert.notEqual(
+  selectedCandidatePreview.origin.data.optionId,
+  supersededCandidatePreview.origin.data.optionId,
+  'one intervention candidate set must retain distinct option identities'
+);
+assert.equal(
+  selectedCandidatePreview.disposition,
+  'requiresUserDecision',
+  'candidate-only previews must never become auto-issuable authority'
+);
 assert.equal(denyAwaiting.details.scopeDigest, denyPreview.scopeDigest);
 assert.equal(
   denyAwaiting.details.canonicalArgumentsDigest,

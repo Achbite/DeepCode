@@ -3,6 +3,15 @@ use crate::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const PROVIDER_STREAM_TERMINAL_SCHEMA_V1: &str = "deepcode.provider-stream-terminal.v1";
+pub(crate) const PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1: &str =
+    "deepcode.provider.structured-output-recovery.v1";
+pub(crate) const PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1: &str =
+    "deepcode.provider.structured-output-failure.v1";
+
+const SESSION_PROPOSAL_CONTROL_NAMES_V1: [&str; 2] = [
+    "deepcode_session_plan_propose_v5",
+    "deepcode_session_intervention_propose_v1",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderNativeStreamKindV1 {
@@ -42,6 +51,8 @@ impl ProviderNativeStreamKindV1 {
 pub(crate) struct ProviderNativeStreamErrorV1 {
     pub(crate) code: &'static str,
     pub(crate) message: String,
+    pub(crate) structured_failure: Option<ProviderStructuredOutputFailureV1>,
+    pub(crate) usage: Option<Value>,
 }
 
 impl ProviderNativeStreamErrorV1 {
@@ -49,8 +60,57 @@ impl ProviderNativeStreamErrorV1 {
         Self {
             code,
             message: message.into(),
+            structured_failure: None,
+            usage: None,
         }
     }
+
+    fn structured(
+        message: impl Into<String>,
+        structured_failure: ProviderStructuredOutputFailureV1,
+        usage: Option<Value>,
+    ) -> Self {
+        Self {
+            code: "provider_tool_call_arguments_invalid",
+            message: message.into(),
+            structured_failure: Some(structured_failure),
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProviderStructuredOutputCallV1 {
+    pub(crate) index: i64,
+    pub(crate) call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) original_arguments_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) normalized_arguments_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) appended_suffix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProviderStructuredOutputRecoveryV1 {
+    pub(crate) schema_version: String,
+    pub(crate) disposition: String,
+    pub(crate) error_code: String,
+    pub(crate) failure_digest: String,
+    pub(crate) calls: Vec<ProviderStructuredOutputCallV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProviderStructuredOutputFailureV1 {
+    pub(crate) schema_version: String,
+    pub(crate) disposition: String,
+    pub(crate) error_code: String,
+    pub(crate) failure_digest: String,
+    pub(crate) native_completion: Value,
+    pub(crate) calls: Vec<ProviderStructuredOutputCallV1>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +135,8 @@ pub(crate) struct ProviderNativeCompletionV1 {
 pub(crate) struct ProviderNativeStreamResultV1 {
     pub(crate) output: LlmChatOutput,
     pub(crate) completion: ProviderNativeCompletionV1,
+    pub(crate) structured_output_recovery: Option<ProviderStructuredOutputRecoveryV1>,
+    pub(crate) normalized_tool_arguments: BTreeMap<i64, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -203,7 +265,18 @@ impl ProviderNativeStreamAccumulatorV1 {
                 }
             }
         }
+        let native_completion =
+            Self::provider_native_completion_value(self.kind, self.finish_reason.as_deref());
+        let proposal_only = !self.tool_calls.is_empty()
+            && self.tool_calls.values().all(|buffer| {
+                buffer
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| SESSION_PROPOSAL_CONTROL_NAMES_V1.contains(&name))
+            });
         let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
+        let mut structured_calls = Vec::new();
+        let mut normalized_tool_arguments = BTreeMap::new();
         for (index, buffer) in self.tool_calls {
             let name = buffer.name.ok_or_else(|| {
                 ProviderNativeStreamErrorV1::invalid(
@@ -211,25 +284,83 @@ impl ProviderNativeStreamAccumulatorV1 {
                     format!("Provider tool call {index} has no function name"),
                 )
             })?;
+            let call_id = buffer.id.ok_or_else(|| {
+                ProviderNativeStreamErrorV1::invalid(
+                    "provider_tool_call_identity_missing",
+                    format!("Provider tool call {index} has no identity"),
+                )
+            })?;
             let arguments = if let Some(arguments) = buffer.arguments_complete {
                 arguments
             } else if buffer.arguments.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&buffer.arguments).map_err(|error| {
-                    ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_arguments_invalid",
-                        format!("Provider tool call {index} arguments are invalid JSON: {error}"),
-                    )
-                })?
+                match serde_json::from_str(&buffer.arguments) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        let original_arguments_digest =
+                            crate::host_v2_storage::sha256_prefixed(buffer.arguments.as_bytes());
+                        if proposal_only {
+                            if let Some((normalized, suffix, parsed)) =
+                                Self::deterministic_json_eof_completion(&buffer.arguments, &error)
+                            {
+                                let normalized_arguments_digest =
+                                    crate::host_v2_storage::sha256_prefixed(normalized.as_bytes());
+                                structured_calls.push(ProviderStructuredOutputCallV1 {
+                                    index,
+                                    call_id: call_id.clone(),
+                                    tool_name: name.clone(),
+                                    original_arguments_digest,
+                                    normalized_arguments_digest: Some(normalized_arguments_digest),
+                                    appended_suffix: Some(suffix),
+                                });
+                                normalized_tool_arguments.insert(index, normalized);
+                                parsed
+                            } else {
+                                let failure = Self::structured_output_failure(
+                                    native_completion.clone(),
+                                    vec![ProviderStructuredOutputCallV1 {
+                                        index,
+                                        call_id,
+                                        tool_name: name,
+                                        original_arguments_digest,
+                                        normalized_arguments_digest: None,
+                                        appended_suffix: None,
+                                    }],
+                                )?;
+                                return Err(ProviderNativeStreamErrorV1::structured(
+                                    format!(
+                                        "Provider tool call {index} arguments are invalid JSON: {error}"
+                                    ),
+                                    failure,
+                                    self.usage,
+                                ));
+                            }
+                        } else {
+                            let failure = Self::structured_output_failure(
+                                native_completion.clone(),
+                                vec![ProviderStructuredOutputCallV1 {
+                                    index,
+                                    call_id,
+                                    tool_name: name,
+                                    original_arguments_digest,
+                                    normalized_arguments_digest: None,
+                                    appended_suffix: None,
+                                }],
+                            )?;
+                            return Err(ProviderNativeStreamErrorV1::structured(
+                                format!(
+                                    "Provider tool call {index} arguments are invalid JSON: {error}"
+                                ),
+                                failure,
+                                self.usage,
+                            ));
+                        }
+                    }
+                }
             };
             tool_calls.push(LlmToolCall {
-                id: buffer.id.ok_or_else(|| {
-                    ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_identity_missing",
-                        format!("Provider tool call {index} has no identity"),
-                    )
-                })?,
+                id: call_id,
                 name: internal_tool_name(&name),
                 arguments,
             });
@@ -246,6 +377,18 @@ impl ProviderNativeStreamAccumulatorV1 {
                 "OpenAI-compatible finish_reason stop conflicted with tool calls",
             ));
         }
+        let structured_output_recovery = if structured_calls.is_empty() {
+            None
+        } else {
+            let failure_digest = Self::structured_output_digest(&structured_calls)?;
+            Some(ProviderStructuredOutputRecoveryV1 {
+                schema_version: PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1.to_string(),
+                disposition: "normalizedProposalControl".to_string(),
+                error_code: "provider_tool_call_arguments_invalid".to_string(),
+                failure_digest,
+                calls: structured_calls,
+            })
+        };
         Ok(ProviderNativeStreamResultV1 {
             output: LlmChatOutput {
                 content: self.content,
@@ -257,7 +400,100 @@ impl ProviderNativeStreamAccumulatorV1 {
                 provider_kind: self.kind,
                 finish_reason: self.finish_reason,
             },
+            structured_output_recovery,
+            normalized_tool_arguments,
         })
+    }
+
+    fn provider_native_completion_value(
+        kind: ProviderNativeStreamKindV1,
+        finish_reason: Option<&str>,
+    ) -> Value {
+        let mut value = json!({
+            "providerKind": kind.wire_name(),
+            "terminalSignal": kind.terminal_signal(),
+        });
+        if let Some(finish_reason) = finish_reason {
+            value["finishReason"] = json!(finish_reason);
+        }
+        value
+    }
+
+    fn structured_output_failure(
+        native_completion: Value,
+        calls: Vec<ProviderStructuredOutputCallV1>,
+    ) -> Result<ProviderStructuredOutputFailureV1, ProviderNativeStreamErrorV1> {
+        Ok(ProviderStructuredOutputFailureV1 {
+            schema_version: PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1.to_string(),
+            disposition: "repairableNoMutation".to_string(),
+            error_code: "provider_tool_call_arguments_invalid".to_string(),
+            failure_digest: Self::structured_output_digest(&calls)?,
+            native_completion,
+            calls,
+        })
+    }
+
+    fn structured_output_digest(
+        calls: &[ProviderStructuredOutputCallV1],
+    ) -> Result<String, ProviderNativeStreamErrorV1> {
+        let identities = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "index": call.index,
+                    "toolName": call.tool_name,
+                    "originalArgumentsDigest": call.original_arguments_digest,
+                })
+            })
+            .collect::<Vec<_>>();
+        crate::host_v2_storage::stable_json_sha256(&json!({
+            "errorCode": "provider_tool_call_arguments_invalid",
+            "calls": identities,
+        }))
+        .map_err(|error| {
+            ProviderNativeStreamErrorV1::invalid(
+                "provider_structured_output_digest_failed",
+                error.message,
+            )
+        })
+    }
+
+    fn deterministic_json_eof_completion(
+        arguments: &str,
+        error: &serde_json::Error,
+    ) -> Option<(String, String, Value)> {
+        if !error.is_eof() || arguments.trim().is_empty() {
+            return None;
+        }
+        let mut expected_closers = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        for character in arguments.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '{' => expected_closers.push('}'),
+                '[' => expected_closers.push(']'),
+                '}' | ']' if expected_closers.pop() != Some(character) => return None,
+                _ => {}
+            }
+        }
+        if in_string || escaped || expected_closers.is_empty() || expected_closers.len() > 32 {
+            return None;
+        }
+        let suffix = expected_closers.into_iter().rev().collect::<String>();
+        let normalized = format!("{arguments}{suffix}");
+        let parsed = serde_json::from_str::<Value>(&normalized).ok()?;
+        Some((normalized, suffix, parsed))
     }
 
     fn ingest_openai_payload(

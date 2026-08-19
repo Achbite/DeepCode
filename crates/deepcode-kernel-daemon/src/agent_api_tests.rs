@@ -78,6 +78,73 @@ fn run_request_preserves_separate_ask_and_decision_fields() {
 }
 
 #[test]
+fn intervention_decision_request_preserves_exact_candidate_identity() {
+    let request: AgentSessionRunRequest = serde_json::from_value(json!({
+        "op": "resolveDecision",
+        "decisionKind": "userIntervention",
+        "decision": "select",
+        "guidance": "Prefer the smaller implementation surface.",
+        "runId": "run-intervention-v4",
+        "targetId": "interaction-v4",
+        "optionId": "option-a",
+        "interactionId": "interaction-v4",
+        "interactionRevision": "interaction-revision-v4",
+        "candidateSetDigest": format!("sha256:{}", "a".repeat(64)),
+        "expectedProjectionCursor": 41,
+        "conversationTarget": {
+            "schemaVersion": "deepcode.host.conversation-target.v1",
+            "targetId": "session-v4",
+            "sessionId": "session-v4",
+            "targetRevision": "target-revision-v4",
+            "workspaceScopeKey": "no-workspace"
+        },
+        "callerRequestId": "request-intervention-v4"
+    }))
+    .expect("strict user-intervention request");
+
+    assert_eq!(request.decision_kind.as_deref(), Some("userIntervention"));
+    assert_eq!(request.decision.as_deref(), Some("select"));
+    assert_eq!(request.target_id.as_deref(), Some("interaction-v4"));
+    assert_eq!(request.option_id.as_deref(), Some("option-a"));
+    assert_eq!(request.interaction_id.as_deref(), Some("interaction-v4"));
+    assert_eq!(
+        request.interaction_revision.as_deref(),
+        Some("interaction-revision-v4")
+    );
+    assert_eq!(request.expected_projection_cursor, Some(41));
+    assert!(request
+        .candidate_set_digest
+        .as_deref()
+        .is_some_and(|digest| digest == format!("sha256:{}", "a".repeat(64))));
+
+    assert!(
+        serde_json::from_value::<AgentSessionRunRequest>(json!({
+            "op": "resolveDecision",
+            "decisionKind": "userIntervention",
+            "decision": "select",
+            "runId": "run-intervention-v4",
+            "targetId": "interaction-v4",
+            "optionId": "option-a",
+            "interactionId": "interaction-v4",
+            "interactionRevision": "interaction-revision-v4",
+            "candidateSetDigest": format!("sha256:{}", "a".repeat(64)),
+            "expectedProjectionCursor": 41,
+            "conversationTarget": {
+                "schemaVersion": "deepcode.host.conversation-target.v1",
+                "targetId": "session-v4",
+                "sessionId": "session-v4",
+                "targetRevision": "target-revision-v4",
+                "workspaceScopeKey": "no-workspace"
+            },
+            "callerRequestId": "request-intervention-v4",
+            "selectedPreviewIds": ["preview-forged"]
+        }))
+        .is_err(),
+        "the public request cannot manufacture Kernel preview selection material"
+    );
+}
+
+#[test]
 fn authority_revoke_request_is_strict_and_typed() {
     let valid: AgentAuthorityRevokeRequestV2 = serde_json::from_value(json!({
         "callerRequestId": "request-revoke-v2",

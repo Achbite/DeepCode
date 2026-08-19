@@ -52,6 +52,9 @@ pub(crate) fn route_uses_specialized_transport(method: &Method, path: &str) -> b
     ) {
         return true;
     }
+    if path.starts_with("/api/llm/cache/predecessors/") {
+        return true;
+    }
     if path.starts_with("/api/session-store/") && path.contains("/session-runs/") {
         return true;
     }

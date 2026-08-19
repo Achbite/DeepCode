@@ -111,31 +111,55 @@ pub(crate) fn env_truthy(name: &str) -> bool {
 }
 
 pub(crate) fn user_config_root() -> PathBuf {
-    if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
-        return PathBuf::from(path);
-    }
-    if env_truthy("DEEPCODE_PORTABLE") {
-        return distribution_root()
+    let requested = if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
+        PathBuf::from(path)
+    } else if env_truthy("DEEPCODE_PORTABLE") {
+        distribution_root()
             .join("config")
             .join("user")
-            .join("local");
-    }
-    if cfg!(windows) {
+            .join("local")
+    } else if cfg!(windows) {
         if let Some(path) = std::env::var_os("APPDATA") {
-            return PathBuf::from(path).join("DeepCode");
+            PathBuf::from(path).join("DeepCode")
+        } else {
+            home_dir()
+                .map(|path| path.join("AppData").join("Roaming").join("DeepCode"))
+                .unwrap_or_else(|| distribution_root().join(".deepcode-user"))
         }
     } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(path).join("deepcode");
+        PathBuf::from(path).join("deepcode")
+    } else {
+        home_dir()
+            .map(|path| path.join(".config").join("deepcode"))
+            .unwrap_or_else(|| distribution_root().join(".deepcode-user"))
+    };
+
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| distribution_root())
+            .join(requested)
+    };
+    std::fs::create_dir_all(&absolute).unwrap_or_else(|error| {
+        panic!(
+            "create DeepCode config root {}: {error}",
+            absolute.display()
+        )
+    });
+    let canonical = std::fs::canonicalize(&absolute).unwrap_or_else(|error| {
+        panic!(
+            "canonicalize DeepCode config root {}: {error}",
+            absolute.display()
+        )
+    });
+    if !canonical.is_dir() {
+        panic!(
+            "DeepCode config root is not a directory: {}",
+            canonical.display()
+        );
     }
-    home_dir()
-        .map(|path| {
-            if cfg!(windows) {
-                path.join("AppData").join("Roaming").join("DeepCode")
-            } else {
-                path.join(".config").join("deepcode")
-            }
-        })
-        .unwrap_or_else(|| distribution_root().join(".deepcode-user"))
+    canonical
 }
 
 pub(crate) struct DriveLocation {

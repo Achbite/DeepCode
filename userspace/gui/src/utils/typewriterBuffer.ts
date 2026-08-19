@@ -8,9 +8,9 @@ interface BufferedTypewriterProfile {
 }
 
 const TYPEWRITER_PROFILES: Record<BufferedTypewriterSpeed, BufferedTypewriterProfile> = {
-  slow: { baseStep: 1, maxStep: 6, backlogDivisor: 24, intervalMs: 32 },
-  normal: { baseStep: 1, maxStep: 10, backlogDivisor: 16, intervalMs: 24 },
-  fast: { baseStep: 2, maxStep: 16, backlogDivisor: 10, intervalMs: 16 },
+  slow: { baseStep: 2, maxStep: 32, backlogDivisor: 20, intervalMs: 48 },
+  normal: { baseStep: 4, maxStep: 96, backlogDivisor: 12, intervalMs: 32 },
+  fast: { baseStep: 8, maxStep: 192, backlogDivisor: 8, intervalMs: 16 },
 };
 
 const graphemeSegmenter = typeof Intl.Segmenter === 'function'

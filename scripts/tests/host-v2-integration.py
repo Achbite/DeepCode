@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,7 +42,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 TARGET_DIR = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
 DAEMON = TARGET_DIR / "debug" / "deepcode-kernel-daemon"
 CLI = TARGET_DIR / "debug" / "deepcode-cli"
-ABI_VERSION = "deepcode.kernel.abi.v2"
+ABI_VERSION = "deepcode.kernel.abi.v3"
 FACT_STORE_SCHEMA_VERSION = "6"
 CURRENT_FACT_STORE_SCHEMA_CONTRACT = "deepcode.kernel.fact-store.v2.sqlite.6"
 PREDECESSOR_FACT_STORE_SCHEMA_CONTRACT = "deepcode.kernel.fact-store.v2.sqlite.5"
@@ -84,15 +85,26 @@ DELETE_PLAN_REASONING = (
 DELETE_PLAN_CALL_ID = "call-host-v2-delete-plan"
 DELETE_TOOL_ID = "fs.delete"
 DELETE_PROVIDER_TOOL_NAME = "dcv2_66732e64656c657465"
-SESSION_PLAN_PROPOSAL_TOOL_NAME = "deepcode_session_plan_propose_v3"
+SESSION_PLAN_PROPOSAL_TOOL_NAME = "deepcode_session_plan_propose_v5"
 DELETE_PLAN_ARGUMENTS = {
-    "schemaVersion": "deepcode.session.plan-proposal.v3",
+    "schemaVersion": "deepcode.session.plan-proposal.v5",
     "plan": {
         "title": "Delete the test-owned file",
         "objective": "Delete exactly one test-owned workspace file after approval.",
         "narrative": (
             "Preview the exact file deletion scope and wait for the user's decision."
         ),
+        "evidence": {
+            "kernelFactRefs": [],
+            "readResources": [],
+            "blockingUnknowns": [],
+            "nonBlockingUnknowns": [],
+            "coverage": (
+                "The user named one exact test-owned file and requested only a "
+                "previewed deletion; no current-state claim is required to define "
+                "that mutation scope."
+            ),
+        },
         "actions": [
             {
                 "toolId": DELETE_TOOL_ID,
@@ -368,8 +380,15 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
         if current_input == CLI_TOOL_PROMPT:
             if provider_current_input_target_kind(request) == "finalAnswer":
                 require(
-                    not request.get("tools"),
-                    "fixed finalAnswer request exposed Provider tools",
+                    provider_request_exposes_tool(
+                        request,
+                        FIXED_PROVIDER_TOOL_NAME,
+                    )
+                    and provider_request_exposes_tool(
+                        request,
+                        SESSION_PLAN_PROPOSAL_TOOL_NAME,
+                    ),
+                    "fixed finalAnswer request changed the stable ready tool catalog",
                 )
                 chunks = provider_final_chunks(
                     CLI_TOOL_FINAL_TEXT,
@@ -377,7 +396,7 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
                 )
             elif provider_request_has_tool_result(request, FIXED_TOOL_CALL_ID):
                 chunks = provider_final_chunks(
-                    "README.md evidence is sufficient; no additional tool is needed.",
+                    CLI_TOOL_FINAL_TEXT,
                     reasoning=FIXED_TOOL_REASONING,
                 )
             else:
@@ -395,8 +414,15 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
             target_kind = provider_current_input_target_kind(request)
             if target_kind == "finalAnswer":
                 require(
-                    not request.get("tools"),
-                    "delete Plan finalAnswer request exposed Provider tools",
+                    provider_request_exposes_tool(
+                        request,
+                        DELETE_PROVIDER_TOOL_NAME,
+                    )
+                    and provider_request_exposes_tool(
+                        request,
+                        SESSION_PLAN_PROPOSAL_TOOL_NAME,
+                    ),
+                    "delete Plan finalAnswer request changed the stable ready tool catalog",
                 )
                 chunks = provider_final_chunks(
                     CLI_DELETE_FINAL_TEXT,
@@ -409,11 +435,11 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
                         request,
                         SESSION_PLAN_PROPOSAL_TOOL_NAME,
                     )
-                    and not provider_request_exposes_tool(
+                    and provider_request_exposes_tool(
                         request,
                         DELETE_PROVIDER_TOOL_NAME,
                     ),
-                    "delete Plan request did not expose only the Session Plan control boundary",
+                    "delete Plan request did not expose the stable ready catalog and Session Plan control",
                 )
                 chunks = provider_plan_proposal_chunks()
         else:
@@ -623,37 +649,36 @@ def provider_usage_chunk(
     }
 
 
-def provider_current_input_payloads(
+def provider_active_turn_frame(
     request: dict[str, Any],
-) -> list[dict[str, Any]]:
+) -> dict[str, Any] | None:
     messages = request.get("messages")
-    if not isinstance(messages, list):
-        return []
-    current_inputs: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
-            continue
-        if (
-            isinstance(payload, dict)
-            and payload.get("schemaVersion")
-            == "deepcode.session.provider-current-input.v2"
-        ):
-            current_inputs.append(payload)
-    return current_inputs
+    if not isinstance(messages, list) or not messages:
+        return None
+    message = messages[-1]
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schemaVersion")
+        != "deepcode.session.provider-turn-frame.v1"
+    ):
+        return None
+    return payload
 
 
 def provider_current_input_text(request: dict[str, Any]) -> str | None:
-    current_inputs = provider_current_input_payloads(request)
-    if len(current_inputs) != 1:
+    active_frame = provider_active_turn_frame(request)
+    if active_frame is None:
         return None
-    current_input = current_inputs[0].get("currentInput")
+    current_input = active_frame.get("currentInput")
     text = current_input.get("text") if isinstance(current_input, dict) else None
     return text if isinstance(text, str) else None
 
@@ -661,10 +686,10 @@ def provider_current_input_text(request: dict[str, Any]) -> str | None:
 def provider_current_input_target_kind(
     request: dict[str, Any],
 ) -> str | None:
-    current_inputs = provider_current_input_payloads(request)
-    if len(current_inputs) != 1:
+    active_frame = provider_active_turn_frame(request)
+    if active_frame is None:
         return None
-    target = current_inputs[0].get("target")
+    target = active_frame.get("target")
     kind = target.get("kind") if isinstance(target, dict) else None
     return kind if isinstance(kind, str) else None
 
@@ -672,10 +697,10 @@ def provider_current_input_target_kind(
 def provider_current_input_guidance(
     request: dict[str, Any],
 ) -> list[str]:
-    current_inputs = provider_current_input_payloads(request)
-    if len(current_inputs) != 1:
+    active_frame = provider_active_turn_frame(request)
+    if active_frame is None:
         return []
-    guidance = current_inputs[0].get("guidance")
+    guidance = active_frame.get("guidance")
     if not isinstance(guidance, list):
         return []
     return [
@@ -705,7 +730,7 @@ def provider_plan_decision_payloads(
         if (
             isinstance(payload, dict)
             and payload.get("schemaVersion")
-            == "deepcode.session.provider-plan-decision.v2"
+            == "deepcode.session.provider-plan-decision.v3"
         ):
             payloads.append(payload)
     return payloads
@@ -731,7 +756,33 @@ def provider_tool_observation_payloads(
         if (
             isinstance(payload, dict)
             and payload.get("schemaVersion")
-            == "deepcode.session.provider-tool-observations.v1"
+            == "deepcode.session.provider-tool-observations.v2"
+        ):
+            payloads.append(payload)
+    return payloads
+
+
+def provider_tool_settlement_evidence_payloads(
+    request: dict[str, Any],
+) -> list[dict[str, Any]]:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    payloads: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schemaVersion")
+            == "deepcode.session.provider-tool-settlement-evidence.v1"
         ):
             payloads.append(payload)
     return payloads
@@ -813,12 +864,12 @@ def assert_provider_received_current_input(
     request: dict[str, Any],
     expected_text: str,
 ) -> None:
-    current_inputs = provider_current_input_payloads(request)
+    active_frame = provider_active_turn_frame(request)
     require(
-        len(current_inputs) == 1,
-        "Provider request did not contain one exact current-input envelope",
+        active_frame is not None,
+        "Provider request did not end with one exact active turn frame",
     )
-    current_input = current_inputs[0].get("currentInput")
+    current_input = active_frame.get("currentInput")
     require(
         isinstance(current_input, dict)
         and current_input.get("text") == expected_text,
@@ -829,16 +880,13 @@ def assert_provider_received_current_input(
 def assert_fixed_tool_provider_sequence(
     initial: dict[str, Any],
     continuation: dict[str, Any],
-    final_answer: dict[str, Any],
 ) -> None:
     assert_provider_received_current_input(initial, CLI_TOOL_PROMPT)
     assert_provider_received_current_input(continuation, CLI_TOOL_PROMPT)
-    assert_provider_received_current_input(final_answer, CLI_TOOL_PROMPT)
     require(
         provider_current_input_target_kind(initial) == "planning"
-        and provider_current_input_target_kind(continuation) == "planning"
-        and provider_current_input_target_kind(final_answer) == "finalAnswer",
-        "fixed dispatch did not preserve planning continuation before bound finalAnswer",
+        and provider_current_input_target_kind(continuation) == "planning",
+        "fixed dispatch did not preserve the planning tool continuation",
     )
     require(
         provider_request_exposes_tool(initial, FIXED_PROVIDER_TOOL_NAME)
@@ -856,41 +904,42 @@ def assert_fixed_tool_provider_sequence(
         provider_request_has_tool_result(continuation, FIXED_TOOL_CALL_ID),
         "fixed planning continuation omitted the native tool result",
     )
+    observation_payloads = provider_tool_observation_payloads(continuation)
     require(
-        not final_answer.get("tools")
-        and not provider_request_has_tool_result(
-            final_answer,
-            FIXED_TOOL_CALL_ID,
-        ),
-        "bound finalAnswer request exposed tools or raw native tool history",
+        len(observation_payloads) == 1,
+        "planning continuation omitted the safe Provider tool-observation envelope",
     )
-    for label, request in (
-        ("planning continuation", continuation),
-        ("bound finalAnswer", final_answer),
-    ):
-        observation_payloads = provider_tool_observation_payloads(request)
-        require(
-            len(observation_payloads) == 1,
-            f"{label} omitted the safe Provider tool-observation envelope",
-        )
-        observations = observation_payloads[0].get("observations")
-        require(
-            isinstance(observations, list),
-            f"{label} Provider tool-observation envelope omitted observations",
-        )
-        completed = [
-            observation
-            for observation in observations
-            if isinstance(observation, dict)
-            and observation.get("kind") == "tool"
-            and observation.get("canonicalAction") == FIXED_TOOL_ID
-            and observation.get("outcome") == "completed"
-        ]
-        require(
-            len(completed) == 1,
-            f"{label} did not receive one safe completed fs.read observation; "
-            f"safeSummary={json.dumps(fixed_tool_provider_request_summary(request), separators=(',', ':'))}",
-        )
+    observations = observation_payloads[0].get("observations")
+    require(
+        isinstance(observations, list),
+        "planning continuation Provider tool-observation envelope omitted observations",
+    )
+    settlement_payloads = provider_tool_settlement_evidence_payloads(
+        continuation
+    )
+    require(
+        len(settlement_payloads) == 1,
+        "planning continuation did not append one canonical tool-settlement evidence frame; "
+        f"safeSummary={json.dumps(fixed_tool_provider_request_summary(continuation), separators=(',', ':'))}",
+    )
+    settlement_calls = settlement_payloads[0].get("calls")
+    require(
+        isinstance(settlement_calls, list) and len(settlement_calls) == 1,
+        "planning continuation tool-settlement evidence did not bind one exact call",
+    )
+    settled_call = settlement_calls[0]
+    require(
+        isinstance(settled_call, dict)
+        and settled_call.get("toolId") == FIXED_TOOL_ID
+        and settled_call.get("status") == "completed"
+        and isinstance(settled_call.get("operationId"), str)
+        and bool(settled_call["operationId"])
+        and isinstance(settled_call.get("factRefs"), list)
+        and bool(settled_call["factRefs"])
+        and isinstance(settled_call.get("readResources"), list)
+        and bool(settled_call["readResources"]),
+        "planning continuation tool-settlement evidence did not prove the completed fs.read effect",
+    )
 
 
 def fixed_tool_provider_request_summary(request: dict[str, Any]) -> dict[str, Any]:
@@ -921,6 +970,9 @@ def fixed_tool_provider_request_summary(request: dict[str, Any]) -> dict[str, An
         "hasNativeToolResult": provider_request_has_tool_result(
             request,
             FIXED_TOOL_CALL_ID,
+        ),
+        "toolSettlementEvidenceCount": len(
+            provider_tool_settlement_evidence_payloads(request)
         ),
         "toolObservationOutcomes": observation_outcomes,
     }
@@ -2572,18 +2624,26 @@ def require_cli_final_answer_and_safe_review(
     cleanup: int = 0,
     indeterminate: int = 0,
     expected_effect: str | None = None,
+    review_counts_required: bool = True,
 ) -> None:
     rendered = completed.stdout.strip()
     expected_counts = (
         f"{planned} planned; {effects} effects; {unexecuted} unexecuted; "
         f"{rejected} rejected; {cleanup} cleanup; {indeterminate} indeterminate."
     )
-    require(
-        rendered.startswith(f"{expected_final_text}\n\n")
-        and expected_counts in rendered,
-        "CLI output omitted its exact final answer prefix or safe Review counts: "
-        f"stdout={safe_diagnostic(rendered)!r}",
-    )
+    if review_counts_required:
+        require(
+            rendered.startswith(f"{expected_final_text}\n\n")
+            and expected_counts in rendered,
+            "CLI output omitted its exact final answer prefix or safe Review counts: "
+            f"stdout={safe_diagnostic(rendered)!r}",
+        )
+    else:
+        require(
+            rendered == expected_final_text,
+            "CLI output changed the exact final answer for a projection-settled decision: "
+            f"stdout={safe_diagnostic(rendered)!r}",
+        )
     if expected_effect is not None:
         require(
             "## Actual effects" in rendered and expected_effect in rendered,
@@ -2730,6 +2790,37 @@ def create_session(daemon: OwnedDaemon) -> str:
     return session_id
 
 
+def read_session_conversation_target(
+    daemon: OwnedDaemon,
+    session_id: str,
+) -> dict[str, Any]:
+    status, body = request_json(
+        daemon.base_url,
+        "GET",
+        f"/api/agent/sessions/{urllib.parse.quote(session_id, safe='')}",
+        host_capability=daemon.host_capability,
+    )
+    data = require_api_ok(status, body, "Session conversation target")
+    require(isinstance(data, dict), "Session conversation target returned invalid data")
+    session = data.get("session")
+    if not isinstance(session, dict):
+        session = data
+    target = session.get("conversationTarget") if isinstance(session, dict) else None
+    require(
+        isinstance(target, dict)
+        and target.get("schemaVersion") == "deepcode.host.conversation-target.v1"
+        and target.get("sessionId") == session_id
+        and isinstance(target.get("targetId"), str)
+        and bool(target["targetId"])
+        and isinstance(target.get("targetRevision"), str)
+        and bool(target["targetRevision"])
+        and isinstance(target.get("workspaceScopeKey"), str)
+        and bool(target["workspaceScopeKey"]),
+        "Session response omitted its exact canonical conversationTarget",
+    )
+    return target
+
+
 def delete_session_and_require_private_storage_released(
     daemon: OwnedDaemon,
     config_root: pathlib.Path,
@@ -2763,10 +2854,10 @@ def read_agent_timeline(
     require(
         isinstance(timeline, dict)
         and timeline.get("schemaVersion")
-        == "deepcode.shared-conversation-projection.v2"
+        == "deepcode.shared-conversation-projection.v4"
         and timeline.get("shapeVersion")
-        == "deepcode.shared-conversation.work-segments.v2",
-        "Session timeline did not use the exact Shared Projection v2 shape",
+        == "deepcode.shared-conversation.work-segments.v4",
+        "Session timeline did not use the exact live Shared Projection v4 shape",
     )
     return timeline
 
@@ -2973,10 +3064,12 @@ def fact_store_sidecars(database: pathlib.Path) -> tuple[pathlib.Path, ...]:
 def fact_store_schema_meta(database: pathlib.Path) -> dict[str, str]:
     require(database.is_file(), f"fact store is missing: {database.name}")
     try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
+        with closing(
+            sqlite3.connect(
+                f"file:{database}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
         ) as connection:
             rows = connection.execute(
                 "SELECT key, value FROM schema_meta ORDER BY key"
@@ -3009,7 +3102,7 @@ def seed_incompatible_predecessor_fact_store(
         "fact-store cutover fixture requires an unused config root",
     )
     try:
-        with sqlite3.connect(predecessor, timeout=5.0) as connection:
+        with closing(sqlite3.connect(predecessor, timeout=5.0)) as connection:
             connection.execute(
                 "CREATE TABLE schema_meta ("
                 "key TEXT PRIMARY KEY NOT NULL,"
@@ -3024,6 +3117,7 @@ def seed_incompatible_predecessor_fact_store(
                     ("abi_version", ABI_VERSION),
                 ),
             )
+            connection.commit()
     except sqlite3.Error as error:
         raise IntegrationFailure(
             f"incompatible predecessor fact-store fixture could not be created: "
@@ -3144,10 +3238,12 @@ def require_no_execution_fact_domains(
     database = kernel_fact_store(config_root)
     require(database.is_file(), f"{context} canonical fact store is missing")
     try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
+        with closing(
+            sqlite3.connect(
+                f"file:{database}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
         ) as connection:
             rows = connection.execute(
                 "SELECT ledger_sequence, envelope_json FROM kernel_facts "
@@ -3211,10 +3307,12 @@ def query_host_operation_snapshot(
             time.sleep(0.05)
             continue
         try:
-            with sqlite3.connect(
-                f"file:{database}?mode=ro&immutable=1",
-                uri=True,
-                timeout=1.0,
+            with closing(
+                sqlite3.connect(
+                    f"file:{database}?mode=ro&immutable=1",
+                    uri=True,
+                    timeout=1.0,
+                )
             ) as connection:
                 rows = connection.execute(query, parameters).fetchall()
         except sqlite3.Error as error:
@@ -3309,10 +3407,12 @@ def canonical_run_snapshot(
         f"exact {CURRENT_FACT_STORE_FILE_NAME} fact store is missing",
     )
     try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
+        with closing(
+            sqlite3.connect(
+                f"file:{database}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
         ) as connection:
             high_water_row = connection.execute(
                 "SELECT COALESCE(MAX(ledger_sequence), 0) FROM kernel_facts"
@@ -3396,10 +3496,12 @@ def require_fixed_read_canonical_facts(
 ) -> None:
     database = kernel_fact_store(config_root)
     try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
+        with closing(
+            sqlite3.connect(
+                f"file:{database}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
         ) as connection:
             rows = connection.execute(
                 "SELECT ledger_sequence, envelope_json FROM kernel_facts "
@@ -3562,7 +3664,9 @@ def validate_fs_delete_plan_preview_rejection_without_effect(
     )
     require(
         plan_cli.returncode == 5,
-        "delete Plan CLI did not use the dedicated action-required exit code",
+        "delete Plan CLI did not use the dedicated action-required exit code; "
+        f"returncode={plan_cli.returncode}; "
+        f"stderr={safe_diagnostic(plan_cli.stderr, daemon.host_capability)}",
     )
     require(
         not plan_cli.stdout.strip(),
@@ -3585,11 +3689,11 @@ def validate_fs_delete_plan_preview_rejection_without_effect(
             initial_request,
             SESSION_PLAN_PROPOSAL_TOOL_NAME,
         )
-        and not provider_request_exposes_tool(
+        and provider_request_exposes_tool(
             initial_request,
             DELETE_PROVIDER_TOOL_NAME,
         ),
-        "initial delete Plan request crossed the Session Plan-control boundary",
+        "initial delete Plan request changed the stable ready catalog or omitted the Session Plan control",
     )
 
     waiting_timeline = read_agent_timeline(daemon, session_id)
@@ -3685,6 +3789,7 @@ def validate_fs_delete_plan_preview_rejection_without_effect(
         planned=1,
         effects=0,
         unexecuted=1,
+        review_counts_required=False,
     )
     provider_count_rejected = provider.request_count()
     require(
@@ -3705,18 +3810,31 @@ def validate_fs_delete_plan_preview_rejection_without_effect(
             CLI_DELETE_PLAN_PROMPT,
         )
     plan_decisions = provider_plan_decision_payloads(final_request)
+    initial_decision_view = (
+        plan_decisions[0]
+        if len(plan_decisions) == 2
+        else None
+    )
     bound_decision = (
-        plan_decisions[0].get("planDecision")
-        if len(plan_decisions) == 1
+        plan_decisions[-1].get("planDecision")
+        if len(plan_decisions) == 2
         else None
     )
     require(
         provider_current_input_target_kind(final_request) == "finalAnswer"
-        and not final_request.get("tools")
+        and provider_request_exposes_tool(
+            final_request,
+            DELETE_PROVIDER_TOOL_NAME,
+        )
+        and provider_request_exposes_tool(
+            final_request,
+            SESSION_PLAN_PROPOSAL_TOOL_NAME,
+        )
+        and isinstance(initial_decision_view, dict)
+        and initial_decision_view.get("planDecision") is None
         and isinstance(bound_decision, dict)
-        and bound_decision.get("planRevision") == plan_revision
         and bound_decision.get("decision") == "reject",
-        "delete Plan rejection did not preserve the decision-bound no-tools finalAnswer boundary",
+        "delete Plan rejection did not append its safe decision view after the immutable planning prefix",
     )
 
     host_run_id = read_cli_ask_host_run_identity(config_root, session_id)
@@ -3861,7 +3979,7 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
     )
     for record in records:
         require(
-            record.get("schemaVersion") == "deepcode.session.kernel-persistence-record.v3"
+            record.get("schemaVersion") == "deepcode.session.kernel-persistence-record.v4"
             and record.get("sessionId") == session_id
             and record.get("runId") == canonical_snapshot.run_id
             and isinstance(record.get("recordId"), str)
@@ -3882,7 +4000,7 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
         and records[0]["recordId"]
         == f"session-kernel-v3:{canonical_snapshot.run_id}:store"
         and records[0]["data"]
-        == {"schemaVersion": "deepcode.session.kernel-persistence.v3"}
+        == {"schemaVersion": "deepcode.session.kernel-persistence.v4"}
         and records[1]["recordKind"] == "toolContextSnapshot",
         "RunOpen did not durably write storeHeader and initial ToolContext snapshot first",
     )
@@ -3901,10 +4019,10 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
         require(
             isinstance(snapshot_data, dict)
             and snapshot_data.get("schemaVersion")
-            == "deepcode.session.tool-context-snapshot.v3"
+            == "deepcode.session.tool-context-snapshot.v4"
             and snapshot_data.get("runId") == canonical_snapshot.run_id
             and isinstance(snapshot_data.get("toolContext"), dict),
-            "ToolContext snapshot did not use the exact strict v3 envelope",
+            "ToolContext snapshot did not use the exact strict v4 envelope",
         )
         context_ref = snapshot_data.get("contextRef")
         context_identity = exact_tool_context_ref(context_ref)
@@ -3973,7 +4091,7 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
     terminal = terminal_record.get("data")
     require(
         isinstance(dispatch, dict)
-        and dispatch.get("schemaVersion") == "deepcode.session.provider-turn-dispatch.v3"
+        and dispatch.get("schemaVersion") == "deepcode.session.provider-turn-dispatch.v4"
         and isinstance(dispatch.get("providerTurnId"), str)
         and dispatch["providerTurnId"]
         and isinstance(dispatch.get("authorityBinding"), dict)
@@ -3990,7 +4108,7 @@ def host_run_open_restart_and_replay_preserve_exact_snapshot_dispatch_terminal_a
             f"{provider_turn_id}:dispatch"
         )
         and isinstance(terminal, dict)
-        and terminal.get("schemaVersion") == "deepcode.session.provider-turn-terminal.v3"
+        and terminal.get("schemaVersion") == "deepcode.session.provider-turn-terminal.v4"
         and terminal.get("providerTurnId") == provider_turn_id
         and terminal.get("authorityBinding") == dispatch["authorityBinding"]
         and terminal.get("dispatchRef")
@@ -4701,6 +4819,10 @@ def create_real_provider_trace_for_capacity(
             "workspacePath": str(workspace),
             "noWorkspace": False,
             "attachments": [],
+            "conversationTarget": read_session_conversation_target(
+                daemon,
+                session_id,
+            ),
             "decisionKind": None,
             "decision": None,
             "guidance": None,
@@ -5334,10 +5456,12 @@ def canonical_failure_diagnostics(config_root: pathlib.Path) -> str:
     if not database.is_file():
         return "canonicalStore=missing"
     try:
-        with sqlite3.connect(
-            f"file:{database}?mode=ro",
-            uri=True,
-            timeout=5.0,
+        with closing(
+            sqlite3.connect(
+                f"file:{database}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
         ) as connection:
             facts = connection.execute(
                 "SELECT ledger_sequence, envelope_json "
@@ -5451,9 +5575,9 @@ def open_host_run(
     require(
         isinstance(timeline, dict)
         and timeline.get("schemaVersion")
-        == "deepcode.shared-conversation-projection.v2"
+        == "deepcode.shared-conversation-projection.v4"
         and timeline.get("shapeVersion")
-        == "deepcode.shared-conversation.work-segments.v2"
+        == "deepcode.shared-conversation.work-segments.v4"
         and isinstance(timeline.get("runProjection"), dict)
         and timeline["runProjection"].get("runId") == kernel_run_id
         and timeline["runProjection"].get("status") == "succeeded",
@@ -5644,18 +5768,34 @@ def require_no_open_path_references(root: pathlib.Path) -> None:
                             continue
             except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
                 continue
-            require(
-                not any(
+            matching_links = [
+                value
+                for value in links
+                if (
                     (candidate := _normalized_absolute_path_reference(value))
                     is not None
                     and (
                         candidate == normalized_root
                         or candidate.is_relative_to(normalized_root)
                     )
-                    for value in links
-                ),
-                f"owner root retained an open file reference from pid {entry.name}",
-            )
+                )
+            ]
+            if matching_links:
+                try:
+                    executable = os.readlink(entry / "exe")
+                except (FileNotFoundError, PermissionError, OSError):
+                    executable = "unavailable"
+                try:
+                    command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ")
+                    command_text = command.decode("utf-8", errors="replace").strip()
+                except (FileNotFoundError, PermissionError, OSError):
+                    command_text = "unavailable"
+                raise IntegrationFailure(
+                    "owner root retained an open file reference from pid "
+                    f"{entry.name}: executable={safe_diagnostic(executable)}; "
+                    f"command={safe_diagnostic(command_text)}; "
+                    f"references={safe_diagnostic(json.dumps(matching_links))}"
+                )
         return
 
     lsof = pathlib.Path("/usr/sbin/lsof")
@@ -5898,20 +6038,19 @@ def run() -> None:
         )
         provider_count_after_fixed_tool = provider.request_count()
         require(
-            provider_count_after_fixed_tool == provider_count_before_fixed_tool + 3,
-            "fixed tool CLI turn did not use planning tool-call, planning continuation, and no-tools finalAnswer turns",
+            provider_count_after_fixed_tool == provider_count_before_fixed_tool + 2,
+            "fixed tool CLI turn did not use one planning tool-call and one promotable continuation",
         )
         fixed_tool_requests = provider.request_snapshot()[
             provider_count_before_fixed_tool:provider_count_after_fixed_tool
         ]
         require(
-            len(fixed_tool_requests) == 3,
+            len(fixed_tool_requests) == 2,
             "fixed tool Provider request snapshot changed during validation",
         )
         assert_fixed_tool_provider_sequence(
             fixed_tool_requests[0],
             fixed_tool_requests[1],
-            fixed_tool_requests[2],
         )
         fixed_tool_host_run_id = read_cli_ask_host_run_identity(
             config_root,
@@ -5939,7 +6078,7 @@ def run() -> None:
         provider.require_healthy()
         passed(
             "Supporting evidence: fixed CLI instruction reached Session, Kernel fs.read, "
-            "canonical facts, planning continuation, and bound finalAnswer; not final acceptance"
+            "canonical facts, append-only continuation, and promoted finalAnswer; not final acceptance"
         )
 
         validate_fs_delete_plan_preview_rejection_without_effect(
@@ -5967,6 +6106,10 @@ def run() -> None:
             "workspacePath": str(workspace),
             "noWorkspace": False,
             "attachments": [],
+            "conversationTarget": read_session_conversation_target(
+                owned,
+                session_id,
+            ),
             "decisionKind": None,
             "decision": None,
             "guidance": None,
@@ -6062,6 +6205,10 @@ def run() -> None:
                 "workspacePath": str(workspace),
                 "noWorkspace": False,
                 "attachments": [],
+                "conversationTarget": read_session_conversation_target(
+                    owned,
+                    resource_session_id,
+                ),
                 "decisionKind": None,
                 "decision": None,
                 "guidance": None,

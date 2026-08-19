@@ -1,4 +1,8 @@
-export const KERNEL_ABI_V2_VERSION = 'deepcode.kernel.abi.v2' as const;
+/**
+ * Live Kernel wire version. Internal V2 file/type names remain temporarily so
+ * the coordinated cut can land without introducing a second live adapter.
+ */
+export const KERNEL_ABI_V2_VERSION = 'deepcode.kernel.abi.v3' as const;
 export const KERNEL_TOOL_REGISTRY_VERSION_V2 = 'deepcode.kernel.tools.v2' as const;
 export const KERNEL_TOOL_INVENTORY_V2_FORMAT =
   'deepcode.kernel.tool-inventory.v2' as const;
@@ -137,7 +141,7 @@ export interface CapabilityLeaseRefV2 {
   scopeDigest: CapabilityScopeDigestV2;
 }
 
-export type ToolIntentAuthorityV2 =
+export type ToolIntentAuthorityV3 =
   | {
       kind: 'planAction';
       data: {
@@ -147,9 +151,33 @@ export type ToolIntentAuthorityV2 =
       };
     }
   | {
-      kind: 'contextRead';
+      kind: 'read';
       data: {
         purpose: string;
+      };
+    };
+
+/** @deprecated Internal compatibility name; the live wire is ABI v3 only. */
+export type ToolIntentAuthorityV2 = ToolIntentAuthorityV3;
+
+export type CapabilityScopePreviewOriginV3 =
+  | {
+      kind: 'plan';
+      data: Record<string, never>;
+    }
+  | {
+      kind: 'planDiscovery';
+      data: {
+        discoveryId: string;
+      };
+    }
+  | {
+      kind: 'interventionCandidate';
+      data: {
+        interactionId: string;
+        interactionRevision: string;
+        candidateSetDigest: string;
+        optionId: string;
       };
     };
 
@@ -198,14 +226,32 @@ export interface ScopeManifestV2 {
   scopeIntent: ScopeIntentV2;
 }
 
-export interface CapabilityScopePreviewItemV2 {
+export type CapabilityScopePreviewItemV2 = {
   planActionId: PlanActionIdV2;
   operationId: OperationIdV2;
   idempotencyKey: string;
   toolId: ToolIdV2;
-  scopeIntent: ScopeIntentV2;
   deadline: DeadlineRequestV2;
-}
+} & (
+  | {
+      scopeIntent: ScopeIntentV2;
+      rawArguments?: never;
+      origin:
+        | Extract<CapabilityScopePreviewOriginV3, { kind: 'plan' }>
+        | Extract<
+            CapabilityScopePreviewOriginV3,
+            { kind: 'interventionCandidate' }
+          >;
+    }
+  | {
+      scopeIntent?: never;
+      rawArguments: RawToolArgumentsV2;
+      origin: Extract<
+        CapabilityScopePreviewOriginV3,
+        { kind: 'planDiscovery' }
+      >;
+    }
+);
 
 export interface CapabilityScopePreviewBatchV2 {
   runId: RunIdV2;
@@ -258,6 +304,7 @@ export interface CapabilityScopePreviewRecordV2 {
   planActionId: PlanActionIdV2;
   operationId: OperationIdV2;
   toolId: ToolIdV2;
+  origin: CapabilityScopePreviewOriginV3;
   authorizationBinding: CapabilityAuthorizationBindingV2;
   canonicalScope: JsonObjectV2;
   scopeDigest: CapabilityScopeDigestV2;
@@ -812,17 +859,42 @@ function decodeCapabilityScopePreviewBatch(
         'idempotencyKey',
         'toolId',
         'scopeIntent',
+        'rawArguments',
         'deadline',
+        'origin',
       ],
-      'CapabilityScopePreviewBatch item'
+      'CapabilityScopePreviewBatch item',
+      ['scopeIntent', 'rawArguments']
     );
-    return {
+    const origin = decodeCapabilityScopePreviewOriginV3(item.origin);
+    const common = {
       planActionId: identity(item.planActionId, 'planActionId'),
       operationId: identity(item.operationId, 'operationId'),
       idempotencyKey: wireText(item.idempotencyKey, 'idempotencyKey'),
       toolId: toolId(item.toolId),
-      scopeIntent: decodeScopeIntent(item.scopeIntent),
       deadline: decodeDeadlineRequest(item.deadline),
+    };
+    if (origin.kind === 'planDiscovery') {
+      if (item.scopeIntent !== undefined || item.rawArguments === undefined) {
+        throw new KernelV2WireError(
+          'Plan-discovery preview requires rawArguments only.'
+        );
+      }
+      return {
+        ...common,
+        rawArguments: decodeRawToolArgumentsV2(item.rawArguments),
+        origin,
+      };
+    }
+    if (item.scopeIntent === undefined || item.rawArguments !== undefined) {
+      throw new KernelV2WireError(
+        'Plan and intervention previews require scopeIntent only.'
+      );
+    }
+    return {
+      ...common,
+      scopeIntent: decodeScopeIntent(item.scopeIntent),
+      origin,
     };
   });
   if (items.length === 0 || items.length > 256) {
@@ -1066,21 +1138,72 @@ function decodeToolIntentAuthority(value: unknown): ToolIntentAuthorityV2 {
       },
     };
   }
-  if (authority.kind === 'contextRead') {
+  if (authority.kind === 'read') {
     const data = exactRecord(
       authority.data,
       ['purpose'],
-      'context-read authority'
+      'read authority'
     );
     return {
       kind: authority.kind,
       data: {
-        purpose: boundedText(data.purpose, 'contextRead.purpose', 1024),
+        purpose: boundedText(data.purpose, 'read.purpose', 1024),
       },
     };
   }
   throw new KernelV2WireError(
     `Unsupported ToolIntent authority kind ${authority.kind}.`
+  );
+}
+
+function decodeCapabilityScopePreviewOriginV3(
+  value: unknown
+): CapabilityScopePreviewOriginV3 {
+  const origin = tagged(value, 'CapabilityScopePreview origin');
+  if (origin.kind === 'plan') {
+    exactRecord(origin.data, [], 'plan preview origin');
+    return { kind: origin.kind, data: {} };
+  }
+  if (origin.kind === 'planDiscovery') {
+    const data = exactRecord(
+      origin.data,
+      ['discoveryId'],
+      'plan-discovery preview origin'
+    );
+    return {
+      kind: origin.kind,
+      data: { discoveryId: identity(data.discoveryId, 'discoveryId') },
+    };
+  }
+  if (origin.kind === 'interventionCandidate') {
+    const data = exactRecord(
+      origin.data,
+      [
+        'interactionId',
+        'interactionRevision',
+        'candidateSetDigest',
+        'optionId',
+      ],
+      'intervention-candidate preview origin'
+    );
+    return {
+      kind: origin.kind,
+      data: {
+        interactionId: identity(data.interactionId, 'interactionId'),
+        interactionRevision: identity(
+          data.interactionRevision,
+          'interactionRevision'
+        ),
+        candidateSetDigest: digest(
+          data.candidateSetDigest,
+          'candidateSetDigest'
+        ),
+        optionId: identity(data.optionId, 'optionId'),
+      },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported CapabilityScopePreview origin ${origin.kind}.`
   );
 }
 
@@ -1486,6 +1609,7 @@ function decodeScopePreviewRecord(value: unknown): CapabilityScopePreviewRecordV
       'planActionId',
       'operationId',
       'toolId',
+      'origin',
       'authorizationBinding',
       'canonicalScope',
       'scopeDigest',
@@ -1509,6 +1633,7 @@ function decodeScopePreviewRecord(value: unknown): CapabilityScopePreviewRecordV
     planActionId: identity(data.planActionId, 'planActionId'),
     operationId: identity(data.operationId, 'operationId'),
     toolId: toolId(data.toolId),
+    origin: decodeCapabilityScopePreviewOriginV3(data.origin),
     authorizationBinding: decodeAuthorizationBinding(
       data.authorizationBinding
     ),

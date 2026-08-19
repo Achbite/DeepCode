@@ -17,8 +17,11 @@ import {
 import {
   currentSessionUserInputV2,
   currentSessionWorkAuthorityV3,
+  consumeSessionProviderControlSettlementV2,
   recordSessionContextReadWorkAuthorityV3,
+  recordSessionProviderControlSettlementV2,
   recordSessionProviderOutcomeV2,
+  recordSessionTerminalAnswerCandidateV1,
   sameSessionWorkAuthorityV3,
   sessionPlanActionV2,
   type SessionKernelLoopStateV2,
@@ -49,11 +52,16 @@ import {
   abortSessionProviderToolCallQueueV2,
   activeSessionProviderToolCallQueueV2,
   createSessionProviderToolCallQueueV2,
+  finalizeSessionProviderMutationClassificationV4,
+  nextSessionProviderToolCallQueueWorkV4,
+  prepareSessionProviderMutationPreviewV4,
   prepareSessionProviderToolCallSubmissionV2,
   publicSessionProviderOrderedItemsV2,
   publicSessionProviderToolCallQueueItemsV2,
+  repairedSessionProviderOutcomeV2,
   sessionToolCorrectionForNextTurnV2,
   type SessionProviderToolCallQueueV2,
+  type SessionProviderQueuedCallInputV4,
 } from './providerToolCallQueue.js';
 import {
   normalizeProviderKernelToolIntentV2,
@@ -61,15 +69,27 @@ import {
 } from './toolIntent.js';
 import {
   decodeCompletedProviderTerminalV3,
+  decodeProviderInterventionArgumentsV1,
   decodeProviderPlanActionCompleteArgumentsV2,
   decodeProviderPlanProposalArgumentsV2,
+  SessionKernelProviderTransportError,
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
+  SessionKernelProviderAdapterError,
+  type SessionProviderInterventionProposalV1,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
+import {
+  SessionKernelProjectionDeliveryErrorV2,
+} from './ports.js';
+import type {
+  SessionKernelProjectionDeliveryOptionsV2,
+  SessionKernelProjectionReceiptV2,
+} from './ports.js';
 import type {
   SessionKernelLoopResultV2,
   SessionNaturalLanguagePlanV2,
@@ -82,8 +102,17 @@ import type {
   SessionProviderTurnDurableEvidenceV3,
   SessionProviderTurnDispatchRecordV3,
   SessionProviderTurnInputV2,
+  SessionProviderOutcomeRecordV2,
   SessionProviderTurnOutputV2,
+  SessionProviderStructuredRepairV1,
 } from './types.js';
+import {
+  SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
+} from './types.js';
+import {
+  sealSessionProviderControlSettlementV2,
+} from './providerControlSettlementV2.js';
+import { utf8Prefix } from './utf8.js';
 
 export interface SessionKernelProviderTurnHostV2 {
   readState(): SessionKernelLoopStateV2;
@@ -94,8 +123,9 @@ export interface SessionKernelProviderTurnHostV2 {
     projectionId: string,
     kind: SessionKernelProjectionEventV2['kind'],
     data: unknown,
-    recordedAt?: string
-  ): Promise<void>;
+    recordedAt?: string,
+    options?: SessionKernelProjectionDeliveryOptionsV2
+  ): Promise<SessionKernelProjectionReceiptV2>;
 
   reconcileFacts(): Promise<void>;
 
@@ -104,6 +134,12 @@ export interface SessionKernelProviderTurnHostV2 {
   recordProviderPlan(
     plan: SessionNaturalLanguagePlanV2
   ): Promise<void>;
+
+  recordProviderIntervention(
+    proposal: SessionProviderInterventionProposalV1,
+    providerTurnId: string,
+    recordedAt: string
+  ): Promise<{ published: boolean; guidance?: string }>;
 
   settlePlanActionComplete(
     planActionId: string,
@@ -143,7 +179,15 @@ type SessionProviderEvidenceBindingInputV3 = Pick<
 
 type SessionProviderSealedInputV3 =
   SessionProviderEvidenceBindingInputV3
-  & Pick<SessionProviderTurnInputV2, 'toolContext'>;
+  & Pick<
+    SessionProviderTurnInputV2,
+    'toolContext' | 'kernelFacts' | 'sessionMemory' | 'providerOutcomes'
+  >;
+
+type SessionProviderTurnExecutionRequestV2 =
+  SessionProviderTurnRequestV2 & {
+    structuredRepair?: SessionProviderStructuredRepairV1;
+  };
 
 /**
  * Provider lifecycle is Session-owned. This coordinator never sees raw
@@ -285,7 +329,27 @@ export class SessionKernelProviderTurnsV2 {
     request: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
     if (request.target.kind !== 'finalAnswer') {
-      return this.runOnce(request);
+      const pendingRepair = this.pendingStructuredRepairForTarget(
+        request.target
+      );
+      let currentRequest: SessionProviderTurnExecutionRequestV2 = {
+        ...request,
+        ...(pendingRepair ? { structuredRepair: pendingRepair } : {}),
+      };
+      for (;;) {
+        try {
+          return await this.runOnce(currentRequest);
+        } catch (error) {
+          if (!(error instanceof SessionProviderStructuredRepairScheduledV1)) {
+            throw error;
+          }
+          currentRequest = {
+            reason: 'recovery',
+            target: cloneJson(request.target),
+            structuredRepair: cloneJson(error.repair),
+          };
+        }
+      }
     }
     let currentRequest: SessionProviderTurnRequestV2 & {
       target: Extract<
@@ -310,6 +374,12 @@ export class SessionKernelProviderTurnsV2 {
           'session_kernel_final_answer_binding_stale',
           'Final-answer request belongs to a superseded authority identity.'
         );
+      }
+      if (finalAnswer?.status === 'pending') {
+        const promoted = await this.promoteTerminalAnswerCandidate(
+          currentRequest.target
+        );
+        if (promoted) return promoted;
       }
       if (finalAnswer?.status === 'committed') {
         await this.ensureCommittedFinalAnswerProjected(state);
@@ -401,8 +471,79 @@ export class SessionKernelProviderTurnsV2 {
     }
   }
 
+  private pendingStructuredRepairForTarget(
+    target: SessionProviderTurnTargetV2
+  ): SessionProviderStructuredRepairV1 | undefined {
+    const state = this.host.readState();
+    const turn = state.providerTurn;
+    if (
+      turn?.status !== 'failed'
+      || !turn.nextStructuredRepair
+      || turn.controlEpoch !== state.controlEpoch
+      || turn.nextStructuredRepair.predecessorProviderTurnId
+        !== turn.providerTurnId
+      || canonicalJson(turn.target) !== canonicalJson(target)
+    ) {
+      return undefined;
+    }
+    return cloneJson(turn.nextStructuredRepair);
+  }
+
+  private async projectStructuredRepairState(
+    providerTurnId: string,
+    repair: SessionProviderStructuredRepairV1,
+    signal?: AbortSignal
+  ): Promise<void> {
+    try {
+      await this.host.project(
+        `provider:${providerTurnId}:structured-repair`,
+        'diagnostic',
+        {
+          providerTurnId,
+          status: 'recovering',
+          code: repair.errorCode,
+          stage: 'provider.structuredRepair',
+          currentActivityCode: 'session.validating',
+        },
+        undefined,
+        signal ? { signal } : undefined
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (!stagedProjectionDeliveryCanDefer(error)) throw error;
+      // The repair request is already durable. A presentation delivery
+      // failure must not replace the scheduled Session continuation with an
+      // unrelated transport error; the pending projection remains in the
+      // durable outbox for later delivery.
+    }
+  }
+
+  private async projectStructuredRepairNoProgress(
+    providerTurnId: string
+  ): Promise<void> {
+    try {
+      await this.host.project(
+        `provider:${providerTurnId}:structured-repair-no-progress`,
+        'diagnostic',
+        {
+          providerTurnId,
+          status: 'failed',
+          terminalScope: 'turn',
+          code: 'session_kernel_provider_structured_repair_no_progress',
+          message:
+            'Structured Provider repair reproduced the same invalid response.',
+          stage: 'provider.structuredRepairNoProgress',
+        }
+      );
+    } catch (error) {
+      if (!stagedProjectionDeliveryCanDefer(error)) throw error;
+      // The failed repair boundary and its no-effect proof are already
+      // durable. Presentation delivery remains retryable through the outbox.
+    }
+  }
+
   private async runOnce(
-    request: SessionProviderTurnRequestV2
+    request: SessionProviderTurnExecutionRequestV2
   ): Promise<SessionKernelLoopResultV2> {
     const reservation = this.begin();
     const generation = this.authorityGeneration;
@@ -451,6 +592,8 @@ export class SessionKernelProviderTurnsV2 {
         controlEpoch: state.controlEpoch,
         nextTarget: request.target,
       });
+      const exactReplayPredecessorId =
+        finalAnswerExactReplayPredecessorIdV1(state, request);
       const providerInput = {
         providerTurnId,
         purpose: request.target.kind === 'finalAnswer'
@@ -458,6 +601,12 @@ export class SessionKernelProviderTurnsV2 {
           : request.reason === 'userInput'
             ? 'primary' as const
             : 'continuation' as const,
+        ...(exactReplayPredecessorId
+          ? { exactReplayPredecessorId }
+          : {}),
+        ...(request.structuredRepair
+          ? { structuredRepair: cloneJson(request.structuredRepair) }
+          : {}),
         runId: state.runId,
         controlEpoch: state.controlEpoch,
         currentInput: currentSessionUserInputV2(state),
@@ -467,6 +616,13 @@ export class SessionKernelProviderTurnsV2 {
         providerOutcomes: state.providerOutcomes,
         providerOutcomeOmittedCount:
           state.providerOutcomeHistoryOmittedCount,
+        ...(state.pendingProviderControlSettlement
+          ? {
+              pendingProviderControlSettlement: cloneJson(
+                state.pendingProviderControlSettlement
+              ),
+            }
+          : {}),
         sessionMemory: state.sessionMemory,
         providerProfile: state.providerProfile,
         ...(state.plan ? { plan: state.plan } : {}),
@@ -538,13 +694,10 @@ export class SessionKernelProviderTurnsV2 {
           ...(state.plan
             ? { planRevision: state.plan.planRevision }
             : {}),
-          ...(request.target.kind === 'planAction'
-            ? {
-                remainingToolCallBudget:
-                  request.remainingToolCallBudget,
-              }
-            : {}),
           ...(correction ? { correction } : {}),
+          ...(request.structuredRepair
+            ? { structuredRepair: cloneJson(request.structuredRepair) }
+            : {}),
           controlEpoch: state.controlEpoch,
           contextRef: binding.contextRef,
           factProjection: {
@@ -558,17 +711,32 @@ export class SessionKernelProviderTurnsV2 {
         };
         this.providerAbort = { reservation, controller };
         await this.host.saveCheckpoint();
-        await this.host.project(
-          `provider:${providerTurnId}:started`,
-          'provider.started',
-          {
-            providerTurnId,
-            controlEpoch: state.controlEpoch,
-            contextRef: binding.contextRef,
-            factProjection: state.providerTurn.factProjection,
-            contextAssembly: state.providerTurn.contextAssembly,
+        try {
+          await this.host.project(
+            `provider:${providerTurnId}:started`,
+            'provider.started',
+            {
+              providerTurnId,
+              controlEpoch: state.controlEpoch,
+              contextRef: binding.contextRef,
+              factProjection: state.providerTurn.factProjection,
+              contextAssembly: state.providerTurn.contextAssembly,
+            },
+            undefined,
+            { signal: controller.signal }
+          );
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          if (stagedProjectionDeliveryCanDefer(error)) {
+            // The admission event is already durable. A transient delivery
+            // failure must not create an active-no-dispatch reservation; the
+            // ordered outbox will publish it before later presentation facts.
+          } else {
+            state.providerTurn.status = 'failed';
+            await this.host.saveCheckpoint();
+            throw error;
           }
-        );
+        }
       } finally {
         this.endAdmissionCommit(startCommit);
       }
@@ -586,13 +754,15 @@ export class SessionKernelProviderTurnsV2 {
             reservation,
             generation,
             providerTurnId,
-            state.controlEpoch
+            state.controlEpoch,
+            controller.signal
           ),
           publicActivityObserver: this.publicActivityObserverForTurn(
             reservation,
             generation,
             providerTurnId,
-            state.controlEpoch
+            state.controlEpoch,
+            controller.signal
           ),
           signal: controller.signal,
         });
@@ -635,6 +805,14 @@ export class SessionKernelProviderTurnsV2 {
         if (recoveredOutput) {
           output = recoveredOutput;
         } else {
+          const structuredRepair = structuredRepairForProviderFailureV1({
+            request,
+            evidence,
+            error: terminalError,
+          });
+          let scheduledRepair:
+            | SessionProviderStructuredRepairV1
+            | undefined;
           const failureCommit = this.beginAdmissionCommit(
             reservation,
             generation
@@ -644,21 +822,73 @@ export class SessionKernelProviderTurnsV2 {
           }
           try {
             if (latest.providerTurn?.providerTurnId === providerTurnId) {
-              latest.providerTurn.status =
-                evidence.terminal?.data.terminalKind === 'completed'
-                  ? 'failed'
-                  : bindFailedProviderEvidenceV3(
-                      latest,
-                      {
-                        ...providerInput,
-                        expectedPlanRevision:
-                          providerInput.plan?.planRevision,
-                        contextAssembly,
-                      },
-                      evidence
-                    );
+              const evidenceBinding = {
+                ...providerInput,
+                expectedPlanRevision:
+                  providerInput.plan?.planRevision,
+                contextAssembly,
+              };
+              if (evidence.terminal?.data.terminalKind === 'completed') {
+                bindCompletedProviderEvidenceForStructuredRepairV1(
+                  latest,
+                  evidenceBinding,
+                  evidence
+                );
+                latest.providerTurn.status = 'failed';
+              } else {
+                latest.providerTurn.status = bindFailedProviderEvidenceV3(
+                  latest,
+                  evidenceBinding,
+                  evidence
+                );
+              }
+              if (structuredRepair) {
+                if (
+                  request.structuredRepair?.failureDigest
+                    === structuredRepair.failureDigest
+                ) {
+                  delete latest.providerTurn.nextStructuredRepair;
+                  terminalError = new SessionKernelProviderTurnError(
+                    'session_kernel_provider_structured_repair_no_progress',
+                    'Structured Provider repair reproduced the same invalid response and cannot continue automatically.'
+                  );
+                } else {
+                  latest.providerTurn.nextStructuredRepair = cloneJson(
+                    structuredRepair
+                  );
+                  scheduledRepair = structuredRepair;
+                }
+              } else {
+                delete latest.providerTurn.nextStructuredRepair;
+              }
               await this.host.saveCheckpoint();
-              if (request.target.kind !== 'finalAnswer') {
+              if (
+                !scheduledRepair
+                && evidence.terminal?.data.terminalKind === 'completed'
+              ) {
+                try {
+                  await this.host.project(
+                    `provider:${providerTurnId}:answer-rejected`,
+                    'provider.answerState',
+                    {
+                      providerTurnId,
+                      controlEpoch: latest.controlEpoch,
+                      answerState: 'rejected',
+                      reasonCode: safeErrorCode(terminalError),
+                    }
+                  );
+                } catch {
+                  // The durable failed Provider boundary remains canonical
+                  // even when its presentation settlement cannot publish.
+                }
+              }
+              if (scheduledRepair) {
+                await this.projectStructuredRepairState(
+                  providerTurnId,
+                  scheduledRepair,
+                  controller.signal
+                );
+              } else if (request.target.kind !== 'finalAnswer') {
                 try {
                   await this.host.project(
                     `provider:${providerTurnId}:failed`,
@@ -669,11 +899,15 @@ export class SessionKernelProviderTurnsV2 {
                       terminalScope: 'turn',
                       code: safeErrorCode(terminalError),
                       message: safeErrorMessage(terminalError),
-                      stage:
-                        evidence.terminal?.data.terminalKind === 'completed'
+                      stage: safeErrorCode(terminalError)
+                        === 'session_kernel_provider_structured_repair_no_progress'
+                        ? 'provider.structuredRepairNoProgress'
+                        : evidence.terminal?.data.terminalKind === 'completed'
                           ? 'provider.outputValidation'
                           : 'provider.requestTurn',
                       ...(evidence.terminal?.data.terminalKind === 'completed'
+                        && safeErrorCode(terminalError)
+                          !== 'session_kernel_provider_structured_repair_no_progress'
                         ? {
                             providerOutcome:
                               evidence.terminal.data.providerResult,
@@ -691,11 +925,12 @@ export class SessionKernelProviderTurnsV2 {
           } finally {
             this.endAdmissionCommit(failureCommit);
           }
+          if (scheduledRepair) {
+            throw new SessionProviderStructuredRepairScheduledV1(
+              scheduledRepair
+            );
+          }
           throw terminalError;
-        }
-      } finally {
-        if (this.providerAbort?.reservation === reservation) {
-          this.providerAbort = undefined;
         }
       }
 
@@ -714,11 +949,18 @@ export class SessionKernelProviderTurnsV2 {
       }
       try {
         try {
+          if (!completedTerminalRecordedAt) {
+            throw new SessionKernelProviderTurnError(
+              'session_kernel_provider_terminal_evidence_mismatch',
+              'Provider output admission requires one durable terminal timestamp.'
+            );
+          }
           const admission = await this.admitProviderOutput(
             request,
             output,
             providerTurnId,
-            pendingGuidanceAtDispatch
+            pendingGuidanceAtDispatch,
+            completedTerminalRecordedAt
           );
           result = admission.result;
           queuedToolIntents = admission.queuedToolIntents;
@@ -861,6 +1103,9 @@ export class SessionKernelProviderTurnsV2 {
       }
       return result;
     } finally {
+      if (this.providerAbort?.reservation === reservation) {
+        this.providerAbort = undefined;
+      }
       if (this.reservation === reservation) {
         this.reservation = undefined;
       }
@@ -871,7 +1116,8 @@ export class SessionKernelProviderTurnsV2 {
     request: SessionProviderTurnRequestV2,
     output: SessionProviderTurnOutputV2,
     providerTurnId: string,
-    pendingGuidanceAtDispatch: readonly string[]
+    pendingGuidanceAtDispatch: readonly string[],
+    completedTerminalRecordedAt: string
   ): Promise<{
     result: SessionKernelLoopResultV2;
     queuedToolIntents: boolean;
@@ -908,6 +1154,11 @@ export class SessionKernelProviderTurnsV2 {
         (guidance) => !acknowledgedGuidance.has(guidance)
       );
     acceptingState.providerTurn.response = response;
+    consumeSessionProviderControlSettlementV2(
+      acceptingState,
+      providerTurnId,
+      request.target.kind
+    );
     await this.host.saveCheckpoint();
 
     if (
@@ -932,9 +1183,47 @@ export class SessionKernelProviderTurnsV2 {
         queuedToolIntents: false,
       };
     }
+    if (output.kind === 'planEvidenceRefresh') {
+      if (!output.guidance.trim()) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_plan_evidence_guidance_missing',
+          'Recoverable Plan evidence rejection requires deterministic revalidation guidance.'
+        );
+      }
+      if (!acceptingState.pendingGuidance.includes(output.guidance)) {
+        acceptingState.pendingGuidance.push(output.guidance);
+      }
+      await this.host.saveCheckpoint();
+      return {
+        result: {
+          kind: 'sessionControlRejected',
+          providerTurnId,
+          controlKind: 'planEvidenceRefresh',
+          evidenceDebtDigest: output.refresh.evidenceDebtDigest,
+          guidance: output.guidance,
+        },
+        queuedToolIntents: false,
+      };
+    }
     if (output.kind === 'planActionComplete') {
       return {
         result: { kind: 'noTool' },
+        queuedToolIntents: false,
+      };
+    }
+    if (output.kind === 'intervention') {
+      const settlement = await this.host.recordProviderIntervention(
+        output.proposal,
+        providerTurnId,
+        completedTerminalRecordedAt
+      );
+      return {
+        result: {
+          kind: 'noTool',
+          ...(settlement.guidance
+            ? { guidance: settlement.guidance }
+            : {}),
+        },
         queuedToolIntents: false,
       };
     }
@@ -976,20 +1265,7 @@ export class SessionKernelProviderTurnsV2 {
         queuedToolIntents: false,
       };
     }
-    if (
-      request.target.kind === 'planAction'
-      && output.sources.length > request.remainingToolCallBudget!
-    ) {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_provider_tool_call_budget_exceeded',
-        [
-          'Provider output exceeds the remaining PlanAction tool-call',
-          `budget (${output.sources.length} requested,`,
-          `${request.remainingToolCallBudget} remaining).`,
-        ].join(' ')
-      );
-    }
-    const intents = output.sources.map((source, index) =>
+    const calls = output.sources.map((source, index) =>
       this.normalizeOutput(
         source,
         request,
@@ -998,8 +1274,11 @@ export class SessionKernelProviderTurnsV2 {
       )
     );
     const latest = this.host.readState();
-    if (intents[0]?.authority.kind === 'contextRead') {
-      recordSessionContextReadWorkAuthorityV3(latest, intents);
+    const readIntents = calls.flatMap((call) =>
+      call.dispatchKind === 'read' ? [call.intent] : []
+    );
+    if (readIntents.length > 0) {
+      recordSessionContextReadWorkAuthorityV3(latest, readIntents);
     }
     latest.providerToolCallQueue =
       createSessionProviderToolCallQueueV2({
@@ -1010,7 +1289,7 @@ export class SessionKernelProviderTurnsV2 {
         providerResult: output.providerResult,
         orderedItems: output.items,
         completion: output.completion,
-        intents,
+        calls,
         ...(latest.providerTurn?.correction
           ? { correction: latest.providerTurn.correction }
           : {}),
@@ -1071,16 +1350,63 @@ export class SessionKernelProviderTurnsV2 {
         providerTurnId,
         committedAt: recordedAt,
         finalText: result.text,
+        commitKind: 'finalSynthesis',
       };
     }
     current.providerTurn.status = 'completed';
-    const outcome = {
-      providerTurnId,
-      outputKind: output.kind,
-      recordedAt,
-      ...providerOutcomeSummary(output),
-      providerResult: output.providerResult,
-    };
+    let outcome: SessionProviderOutcomeRecordV2;
+    if (output.kind === 'noTool' && output.repair) {
+      outcome = repairedSessionProviderOutcomeV2(
+        providerTurnId,
+        output,
+        recordedAt
+      );
+    } else if (output.kind === 'planEvidenceRefresh') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        summary: utf8Prefix(output.guidance, 8_192),
+        control: cloneJson(output.control),
+        refresh: cloneJson(output.refresh),
+        providerResult: output.providerResult,
+      };
+    } else if (output.kind === 'plan') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        control: cloneJson(output.control),
+        providerResult: output.providerResult,
+      };
+    } else if (output.kind === 'planActionComplete') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        control: cloneJson(output.control),
+        providerResult: output.providerResult,
+      };
+    } else if (output.kind === 'intervention') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        control: cloneJson(output.control),
+        providerResult: output.providerResult,
+      };
+    } else {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        providerResult: output.providerResult,
+      };
+    }
     const existingOutcome = current.providerOutcomes.find(
       (candidate) => candidate.providerTurnId === providerTurnId
     );
@@ -1096,23 +1422,76 @@ export class SessionKernelProviderTurnsV2 {
     if (!existingOutcome) {
       recordSessionProviderOutcomeV2(current, outcome);
     }
+    if (output.kind === 'planEvidenceRefresh') {
+      recordSessionProviderControlSettlementV2(
+        current,
+        sealSessionProviderControlSettlementV2({
+          kind: 'planEvidenceRefresh',
+          runId: current.runId,
+          inputId: current.currentInputId,
+          controlEpoch: current.controlEpoch,
+          predecessorProviderTurnId: providerTurnId,
+          nextTargetKind: 'planning',
+          control: cloneJson(output.control),
+          refresh: cloneJson(output.refresh),
+          recordedAt,
+        })
+      );
+    } else if (output.kind === 'planActionComplete') {
+      if (!planActionSettlement) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_action_settlement_missing',
+          'PlanActionComplete lost its exact durable settlement.'
+        );
+      }
+      const hasRemainingAction = current.plan?.actions.some((action) =>
+        !current.planActionSettlements[action.manifest.planActionId]
+      ) ?? false;
+      recordSessionProviderControlSettlementV2(
+        current,
+        sealSessionProviderControlSettlementV2({
+          kind: 'planActionComplete',
+          runId: current.runId,
+          inputId: current.currentInputId,
+          controlEpoch: current.controlEpoch,
+          predecessorProviderTurnId: providerTurnId,
+          nextTargetKind: hasRemainingAction
+            ? 'planAction'
+            : 'finalAnswer',
+          control: cloneJson(output.control),
+          settlement: cloneJson(planActionSettlement),
+          recordedAt,
+        })
+      );
+    }
     await this.host.saveCheckpoint();
-    await this.host.project(
-      `provider:${providerTurnId}:completed`,
+    const workAuthority = currentSessionWorkAuthorityV3(current);
+    const terminalScope =
+      output.kind === 'answer'
+      && (
+        request.target.kind === 'finalAnswer'
+        || workAuthority === undefined
+      )
+        ? 'turn' as const
+        : 'providerTurn' as const;
+    const answerState = output.kind === 'answer'
+      ? terminalScope === 'turn'
+        ? 'committed' as const
+        : workAuthority?.kind === 'contextRead'
+          ? 'provisional' as const
+          : undefined
+      : undefined;
+    const completedProjectionId = `provider:${providerTurnId}:completed`;
+    const completedProjection = await this.host.project(
+      completedProjectionId,
       'provider.completed',
       {
         providerTurnId,
         controlEpoch: current.providerTurn.controlEpoch,
         outputKind: output.kind,
         result,
-        terminalScope:
-          output.kind === 'answer'
-          && (
-            request.target.kind === 'finalAnswer'
-            || currentSessionWorkAuthorityV3(current) === undefined
-          )
-            ? 'turn'
-            : 'providerTurn',
+        terminalScope,
+        ...(answerState ? { answerState } : {}),
         orderedItems: publicSessionProviderOrderedItemsV2(output.items),
         providerOutcome: output.providerResult,
         ...(request.target.kind === 'finalAnswer'
@@ -1124,6 +1503,46 @@ export class SessionKernelProviderTurnsV2 {
       },
       recordedAt
     );
+    if (
+      output.kind === 'answer'
+      && result.kind === 'answer'
+      && request.target.kind !== 'finalAnswer'
+    ) {
+      // Projection delivery may synchronously advance or replace the host's
+      // canonical state. Bind the candidate to the post-delivery state rather
+      // than retaining the pre-delivery object captured above.
+      const latest = this.host.readState();
+      if (
+        latest.providerTurn?.providerTurnId !== providerTurnId
+        || latest.providerTurn.status !== 'completed'
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_terminal_answer_candidate_source_stale',
+          'Terminal answer candidate lost its completed Provider turn after projection delivery.'
+        );
+      }
+      const workAuthority = currentSessionWorkAuthorityV3(latest);
+      if (workAuthority?.kind === 'contextRead') {
+        recordSessionTerminalAnswerCandidateV1(latest, {
+          schemaVersion: SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
+          providerTurnId,
+          inputId: latest.currentInputId,
+          controlEpoch: latest.controlEpoch,
+          // Every authoritative input advances the control epoch in the
+          // current Loop; this is the exact language-policy revision until
+          // the language value is restored as an independent v3 fact.
+          languageRevision: latest.controlEpoch,
+          snapshotHighWater:
+            latest.lineage.cursor.snapshotHighWater,
+          workAuthority: cloneJson(workAuthority),
+          text: result.text,
+          textDigest: sha256Hash(result.text),
+          sourceEventRefs: [completedProjection.projectionId],
+          recordedAt,
+        });
+        await this.host.saveCheckpoint();
+      }
+    }
     if (output.kind === 'plan') {
       const commentaryItems = publicSessionProviderOrderedItemsV2(
         output.items
@@ -1296,12 +1715,23 @@ export class SessionKernelProviderTurnsV2 {
       purpose: turn.purpose,
       runId: state.runId,
       currentInput: currentSessionUserInputV2(state),
+      providerOutcomes: cloneJson(state.providerOutcomes),
+      ...(state.pendingProviderControlSettlement
+        ? {
+            pendingProviderControlSettlement: cloneJson(
+              state.pendingProviderControlSettlement
+            ),
+          }
+        : {}),
+      sessionMemory: cloneJson(state.sessionMemory),
       providerProfile: cloneJson(state.providerProfile),
-      ...(state.plan?.planRevision === turn.planRevision
+      ...(state.plan
+        && state.plan.planRevision === turn.planRevision
         ? { plan: cloneJson(state.plan) }
         : {}),
       target: cloneJson(turn.target),
       toolContext,
+      kernelFacts: projectSessionProviderFactsV2(state, turn.target),
     };
     if (turn.target.kind === 'planAction' && !semanticInput.plan) {
       throw new SessionKernelProviderTurnError(
@@ -1329,19 +1759,72 @@ export class SessionKernelProviderTurnsV2 {
         sealedInput,
         evidence
       );
+      const repair = structuredRepairFromDurableFailedTerminalV1(
+        evidence
+      );
+      if (turn.status === 'failed' && repair) {
+        if (turn.structuredRepair?.failureDigest === repair.failureDigest) {
+          delete turn.nextStructuredRepair;
+          await this.host.saveCheckpoint();
+          await this.projectStructuredRepairNoProgress(
+            turn.providerTurnId
+          );
+          return;
+        }
+        turn.nextStructuredRepair = cloneJson(repair);
+      } else {
+        delete turn.nextStructuredRepair;
+      }
       await this.host.saveCheckpoint();
+      if (turn.nextStructuredRepair) {
+        await this.projectStructuredRepairState(
+          turn.providerTurnId,
+          turn.nextStructuredRepair
+        );
+      }
       return;
     }
-    if (!turn.response) {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_provider_recovery_state_invalid',
-        'A completed Provider terminal has no deterministically reconstructed response.'
+    let output: SessionProviderTurnOutputV2;
+    try {
+      output = this.decodeCompletedProviderOutput(
+        sealedInput,
+        evidence
       );
+    } catch (error) {
+      const repair = structuredRepairForProviderFailureV1({
+        request: {
+          reason: 'recovery',
+          target: cloneJson(turn.target),
+          ...(turn.structuredRepair
+            ? { structuredRepair: cloneJson(turn.structuredRepair) }
+            : {}),
+        },
+        evidence,
+        error,
+      });
+      if (!repair) throw error;
+      bindCompletedProviderEvidenceForStructuredRepairV1(
+        state,
+        sealedInput,
+        evidence
+      );
+      turn.status = 'failed';
+      if (turn.structuredRepair?.failureDigest === repair.failureDigest) {
+        delete turn.nextStructuredRepair;
+        await this.host.saveCheckpoint();
+        await this.projectStructuredRepairNoProgress(
+          turn.providerTurnId
+        );
+        return;
+      }
+      turn.nextStructuredRepair = cloneJson(repair);
+      await this.host.saveCheckpoint();
+      await this.projectStructuredRepairState(
+        turn.providerTurnId,
+        repair
+      );
+      return;
     }
-    const output = this.decodeCompletedProviderOutput(
-      sealedInput,
-      evidence
-    );
     if (
       turn.target.kind === 'finalAnswer'
       && !finalAnswerBindingIsCurrent(
@@ -1375,18 +1858,13 @@ export class SessionKernelProviderTurnsV2 {
     const request: SessionProviderTurnRequestV2 = {
       reason: 'recovery',
       target: cloneJson(turn.target),
-      ...(turn.remainingToolCallBudget === undefined
-        ? {}
-        : {
-            remainingToolCallBudget:
-              turn.remainingToolCallBudget,
-          }),
     };
     const admission = await this.admitProviderOutput(
       request,
       output,
       turn.providerTurnId,
-      this.host.readState().pendingGuidance
+      this.host.readState().pendingGuidance,
+      evidence.terminal.recordedAt
     );
     if (admission.queuedToolIntents) return;
     if (output.kind === 'toolIntent') {
@@ -1429,9 +1907,15 @@ export class SessionKernelProviderTurnsV2 {
     try {
       const submitting = queued.calls.find(
         (candidate) => candidate.status === 'submitting'
+          || candidate.status === 'previewing'
       );
       if (submitting) {
-        this.assertMayReplayQueuedSubmission(submitting.requestId!);
+        this.assertMayReplayQueuedRequest(
+          submitting.requestId!,
+          submitting.status === 'previewing'
+            ? 'capabilityPreviewBatch'
+            : 'toolIntentSubmit'
+        );
         const result = await this.submitNextQueuedIntent();
         if (this.resultIsStale(
           reservation,
@@ -1521,8 +2005,15 @@ export class SessionKernelProviderTurnsV2 {
         'Committed final answer is missing its durable Provider outcome.'
       );
     }
+    const projectionId = finalAnswer.commitKind === 'candidatePromotion'
+      ? [
+          `provider:${finalAnswer.providerTurnId}:candidate-promoted`,
+          finalAnswer.binding.reviewRevision,
+          finalAnswer.binding.snapshotHighWater,
+        ].join(':')
+      : `provider:${finalAnswer.providerTurnId}:completed`;
     await this.host.project(
-      `provider:${finalAnswer.providerTurnId}:completed`,
+      projectionId,
       'provider.completed',
       {
         providerTurnId: finalAnswer.providerTurnId,
@@ -1530,15 +2021,74 @@ export class SessionKernelProviderTurnsV2 {
         outputKind: 'answer',
         result: { kind: 'answer', text: finalAnswer.finalText },
         terminalScope: 'turn',
+        answerState: 'committed',
         orderedItems: publicSessionProviderOrderedItemsV2(
           providerTurn.response.items
         ),
         providerOutcome: outcome.providerResult,
         reviewRevision: finalAnswer.binding.reviewRevision,
         snapshotHighWater: finalAnswer.binding.snapshotHighWater,
+        ...(finalAnswer.commitKind === 'candidatePromotion'
+          ? {
+              candidateSourceEventRefs: cloneJson(
+                state.terminalAnswerCandidate?.sourceEventRefs ?? []
+              ),
+            }
+          : {}),
       },
       finalAnswer.committedAt
     );
+  }
+
+  private async promoteTerminalAnswerCandidate(
+    target: Extract<
+      SessionProviderTurnTargetV2,
+      { kind: 'finalAnswer' }
+    >
+  ): Promise<Extract<
+    SessionKernelLoopResultV2,
+    { kind: 'answer' }
+  > | undefined> {
+    const state = this.host.readState();
+    const finalAnswer = state.finalAnswer;
+    const candidate = state.terminalAnswerCandidate;
+    if (
+      finalAnswer?.status !== 'pending'
+      || finalAnswer.physicalRequestCount !== 0
+      || !sameSessionFinalAnswerBindingV3(finalAnswer.binding, target)
+      || !candidateCanPromoteToFinalAnswerV1(state, target)
+      || !candidate
+    ) {
+      if (candidate && finalAnswer?.status === 'pending') {
+        await this.host.project(
+          [
+            `provider:${candidate.providerTurnId}:answer-stale`,
+            target.reviewRevision,
+            target.snapshotHighWater,
+          ].join(':'),
+          'provider.answerState',
+          {
+            providerTurnId: candidate.providerTurnId,
+            controlEpoch: candidate.controlEpoch,
+            answerState: 'stale',
+            reasonCode: 'terminalAnswerCandidateNotPromotable',
+          }
+        );
+      }
+      return undefined;
+    }
+    state.finalAnswer = {
+      status: 'committed',
+      binding: cloneJson(finalAnswer.binding),
+      physicalRequestCount: finalAnswer.physicalRequestCount,
+      providerTurnId: candidate.providerTurnId,
+      committedAt: this.ports.clock.now(),
+      finalText: candidate.text,
+      commitKind: 'candidatePromotion',
+    };
+    await this.host.saveCheckpoint();
+    await this.ensureCommittedFinalAnswerProjected(state);
+    return { kind: 'answer', text: candidate.text };
   }
 
   private async projectFinalAnswerFailure(
@@ -1689,7 +2239,10 @@ export class SessionKernelProviderTurnsV2 {
     this.host.requireNoPendingRequests();
   }
 
-  private assertMayReplayQueuedSubmission(requestId: string): void {
+  private assertMayReplayQueuedRequest(
+    requestId: string,
+    kind: 'capabilityPreviewBatch' | 'toolIntentSubmit'
+  ): void {
     if (this.userInputFenceGeneration !== undefined) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_user_input_admission_fenced',
@@ -1703,11 +2256,12 @@ export class SessionKernelProviderTurnsV2 {
       );
     }
     const pending = this.requests.pendingRecords();
+    const lane = kind === 'toolIntentSubmit' ? 'effect' : 'query';
     if (
       pending.some((record) =>
-        record.lane !== 'effect'
+        record.lane !== lane
         || record.requestId !== requestId
-        || record.intent.kind !== 'toolIntentSubmit'
+        || record.intent.kind !== kind
       )
     ) {
       throw new SessionKernelProviderTurnError(
@@ -1731,7 +2285,7 @@ export class SessionKernelProviderTurnsV2 {
     request: SessionProviderTurnRequestV2,
     index: number,
     callCount: number
-  ): ToolIntentV2 {
+  ): SessionProviderQueuedCallInputV4 {
     const state = this.host.readState();
     const toolId = providerSourceToolId(source);
     const descriptor = state.toolContext.bundle.tools.find(
@@ -1743,102 +2297,133 @@ export class SessionKernelProviderTurnsV2 {
         `Provider requested a tool outside the current ready ToolContext: ${toolId}.`
       );
     }
-    if (request.target.kind === 'planning') {
-      if (descriptor.effectClass !== 'read') {
-        throw new SessionKernelProviderTurnError(
-          'session_kernel_planning_mutation_forbidden',
-          'A planning turn cannot invoke a mutation without a confirmed PlanAction.'
-        );
-      }
-      const identity = providerCallIdentity(
-        state,
-        source,
-        `planning:${toolId}`
-      );
-      return normalizeProviderKernelToolIntentV2(source, {
-        runId: state.runId,
-        controlEpoch: state.controlEpoch,
-        operationId: identity.operationId,
-        authority: contextReadAuthorityV2(
-          `Session planning context read using ${toolId}.`
-        ),
-        idempotencyKey: identity.idempotencyKey,
-        toolContext: state.toolContext.bundle,
-      });
-    }
     if (request.target.kind === 'finalAnswer') {
       throw new SessionKernelProviderTurnError(
         'session_kernel_final_answer_tool_forbidden',
         'A no-tools final-answer turn cannot admit a Provider tool call.'
       );
-    } else if (request.target.kind === 'planAction') {
-      const action = sessionPlanActionV2(
-        state,
-        request.target.planActionId
-      );
-      if (toolId !== action.manifest.toolId) {
-        throw new SessionKernelProviderTurnError(
-          'session_kernel_plan_action_tool_mismatch',
-          'Provider tool does not match the persisted PlanAction tool.'
-        );
-      }
-      const lease = latestPlanActionLease(
-        state,
-        action.manifest.planActionId
-      );
-      const identity = planActionProviderCallIdentity(
-        state,
-        action,
-        source,
-        index,
-        lease
-      );
-      return normalizeProviderKernelToolIntentV2(source, {
-        runId: state.runId,
-        controlEpoch: state.controlEpoch,
-        operationId: identity.operationId,
-        authority: planActionAuthorityV2({
-          planRevision: action.manifest.planRevision,
-          planActionId: action.manifest.planActionId,
-          ...(lease ? { lease } : {}),
+    }
+    if (descriptor.effectClass === 'read') {
+      const purpose = request.target.kind === 'planning'
+        ? `Session planning context read using ${toolId}.`
+        : request.target.kind === 'planAction'
+          ? `Session PlanAction supplemental read using ${toolId}.`
+          : request.target.kind === 'interventionResearch'
+            ? `Session intervention research read using ${toolId}.`
+            : request.target.purpose;
+      const contextReadIdentity = request.target.kind === 'contextRead'
+        && callCount === 1
+        ? {
+            operationId: request.target.operationId,
+            idempotencyKey: request.target.idempotencyKey,
+          }
+        : providerCallIdentity(
+            state,
+            source,
+            `${request.target.kind}:read:${toolId}:${index + 1}`
+          );
+      return {
+        dispatchKind: 'read',
+        intent: normalizeProviderKernelToolIntentV2(source, {
+          runId: state.runId,
+          controlEpoch: state.controlEpoch,
+          operationId: contextReadIdentity.operationId,
+          authority: contextReadAuthorityV2(purpose),
+          idempotencyKey: contextReadIdentity.idempotencyKey,
+          toolContext: state.toolContext.bundle,
+          ...(request.target.kind === 'contextRead' && request.target.deadline
+            ? { deadline: request.target.deadline }
+            : {}),
         }),
-        idempotencyKey: identity.idempotencyKey,
-        toolContext: state.toolContext.bundle,
-        deadline: action.deadline,
-      });
+      };
     }
-    if (descriptor.effectClass !== 'read') {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_context_read_mutation_forbidden',
-        'A contextRead turn cannot invoke a mutation tool.'
-      );
-    }
-    const contextReadIdentity = callCount === 1
-      ? {
-          operationId: request.target.operationId,
-          idempotencyKey: request.target.idempotencyKey,
-        }
+
+    const currentAction = request.target.kind === 'planAction'
+      ? sessionPlanActionV2(state, request.target.planActionId)
+      : undefined;
+    const matchesCurrentAction = currentAction?.manifest.toolId === toolId;
+    const lease = currentAction && matchesCurrentAction
+      ? latestPlanActionLease(state, currentAction.manifest.planActionId)
+      : undefined;
+    const identity = currentAction && matchesCurrentAction
+      ? planActionProviderCallIdentity(
+          state,
+          currentAction,
+          source,
+          index
+        )
       : providerCallIdentity(
           state,
           source,
-          [
-            'contextRead',
-            request.target.operationId,
-            request.target.idempotencyKey,
-            String(index + 1),
-          ].join(':')
+          `${request.target.kind}:planDiscovery:${toolId}:${index + 1}`
         );
-    return normalizeProviderKernelToolIntentV2(source, {
+    const parsed = normalizeProviderKernelToolIntentV2(source, {
       runId: state.runId,
       controlEpoch: state.controlEpoch,
-      operationId: contextReadIdentity.operationId,
-      authority: contextReadAuthorityV2(request.target.purpose),
-      idempotencyKey: contextReadIdentity.idempotencyKey,
+      operationId: identity.operationId,
+      authority: contextReadAuthorityV2(
+        `Preview-only mutation discovery for ${toolId}.`
+      ),
+      idempotencyKey: identity.idempotencyKey,
       toolContext: state.toolContext.bundle,
-      ...(request.target.deadline
-        ? { deadline: request.target.deadline }
+      ...(currentAction && matchesCurrentAction
+        ? { deadline: currentAction.deadline }
         : {}),
     });
+    const providerTurnId = state.providerTurn?.providerTurnId;
+    if (!providerTurnId) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_turn_missing',
+        'Mutation discovery requires the exact active Provider turn identity.'
+      );
+    }
+    const discoveryDigest = sha256Hash(canonicalJson({
+      schemaVersion: 'deepcode.session.plan-discovery-identity.v1',
+      providerTurnId,
+      callId: source.callId,
+      ordinal: index + 1,
+      operationId: identity.operationId,
+      toolId,
+      argumentsDigest: sha256Hash(canonicalJson(parsed.rawArguments)),
+    })).slice('sha256:'.length);
+    const candidatePlanRevision = currentAction && matchesCurrentAction
+      ? currentAction.manifest.planRevision
+      : `discovery-plan-${discoveryDigest}`;
+    const candidatePlanActionId = currentAction && matchesCurrentAction
+      ? currentAction.manifest.planActionId
+      : `discovery-action-${discoveryDigest}`;
+    const executableIntent = currentAction && matchesCurrentAction
+      ? normalizeProviderKernelToolIntentV2(source, {
+          runId: state.runId,
+          controlEpoch: state.controlEpoch,
+          operationId: identity.operationId,
+          authority: planActionAuthorityV2({
+            planRevision: currentAction.manifest.planRevision,
+            planActionId: currentAction.manifest.planActionId,
+            ...(lease ? { lease } : {}),
+          }),
+          idempotencyKey: identity.idempotencyKey,
+          toolContext: state.toolContext.bundle,
+          deadline: currentAction.deadline,
+        })
+      : undefined;
+    return {
+      dispatchKind: 'mutation',
+      ...(executableIntent ? { intent: executableIntent } : {}),
+      candidatePreview: {
+        runId: state.runId,
+        controlEpoch: state.controlEpoch,
+        discoveryId: `discovery-${discoveryDigest}`,
+        planRevision: candidatePlanRevision,
+        planActionId: candidatePlanActionId,
+        operationId: identity.operationId,
+        idempotencyKey: identity.idempotencyKey,
+        toolId,
+        rawArguments: parsed.rawArguments,
+        deadline: parsed.deadline,
+        toolContextRef: parsed.toolContextRef,
+      },
+    };
   }
 
   private async submitNextQueuedIntent():
@@ -1853,31 +2438,112 @@ export class SessionKernelProviderTurnsV2 {
     }
     const state = this.host.readState();
     const queue = activeSessionProviderToolCallQueueV2(state);
-    const item = queue?.calls.find((candidate) =>
-      candidate.status !== 'completed'
-    );
-    if (
-      !queue
-      || !item
-      || (
-        item.status !== 'pending'
-        && item.status !== 'submitting'
-      )
-    ) {
+    const work = nextSessionProviderToolCallQueueWorkV4(state);
+    if (!queue || !work) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_provider_tool_call_queue_missing',
         'No resumable Provider tool call is available to submit.'
       );
     }
+    if (work.kind === 'preview') {
+      const { item, candidate } = work;
+      let request: SessionKernelPublicRequestRecordV2;
+      const payload = {
+        expectedControlEpoch: candidate.controlEpoch,
+        planRevision: candidate.planRevision,
+        items: [{
+          planActionId: candidate.planActionId,
+          operationId: candidate.operationId,
+          idempotencyKey: candidate.idempotencyKey,
+          toolId: candidate.toolId,
+          rawArguments: candidate.rawArguments,
+          deadline: candidate.deadline,
+          origin: {
+            kind: 'planDiscovery' as const,
+            data: { discoveryId: candidate.discoveryId },
+          },
+        }],
+        toolContextRef: candidate.toolContextRef,
+      };
+      if (item.status === 'pending') {
+        request = this.requests.newRecord({
+          kind: 'capabilityPreviewBatch',
+          payload,
+        });
+        prepareSessionProviderMutationPreviewV4(state, {
+          operationId: candidate.operationId,
+          requestId: request.requestId,
+          requestStartedAt: request.startedAt,
+        });
+        await this.host.saveCheckpoint();
+      } else if (item.status === 'previewing') {
+        const pending = state.publicRequests.query;
+        if (pending) {
+          if (
+            pending.requestId !== item.requestId
+            || pending.intent.kind !== 'capabilityPreviewBatch'
+            || canonicalJson(pending.intent.payload) !== canonicalJson(payload)
+          ) {
+            throw new SessionKernelProviderTurnError(
+              'session_kernel_plan_discovery_request_conflict',
+              'The pending Kernel query does not match the durable mutation discovery preview.'
+            );
+          }
+          request = pending;
+        } else {
+          request = {
+            requestId: item.requestId!,
+            lane: 'query',
+            intent: { kind: 'capabilityPreviewBatch', payload },
+            startedAt: item.requestStartedAt!,
+            attemptCount: 1,
+          };
+        }
+      } else {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_discovery_queue_state_invalid',
+          'Mutation discovery preview is not in a resumable state.'
+        );
+      }
+      const current = nextSessionProviderToolCallQueueWorkV4(
+        this.host.readState()
+      );
+      if (
+        !this.boundaryIsCurrent(reservation, generation)
+        || current?.kind !== 'preview'
+        || current.item.requestId !== request.requestId
+        || current.candidate.operationId !== candidate.operationId
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_discovery_submission_superseded',
+          'Mutation discovery preview was superseded before Kernel dispatch.'
+        );
+      }
+      const outcome = await this.requests.execute(request);
+      expectSessionKernelPublicRequestOutcomeV2(
+        outcome,
+        'capabilityPreviewBatch'
+      );
+      const latest = this.host.readState();
+      if (finalizeSessionProviderMutationClassificationV4(
+        latest,
+        this.ports.clock.now()
+      )) {
+        await this.host.saveCheckpoint();
+      }
+      return { kind: 'noTool' };
+    }
+
+    const { item, intent } = work;
     let request: SessionKernelPublicRequestRecordV2;
     if (item.status === 'pending') {
-      this.refreshPendingPlanActionLease(queue.target, item.intent);
+      this.refreshPendingPlanActionLease(queue.target, intent);
       request = this.requests.newRecord({
         kind: 'toolIntentSubmit',
-        payload: { intent: item.intent },
+        payload: { intent },
       });
       prepareSessionProviderToolCallSubmissionV2(state, {
-        operationId: item.intent.operationId,
+        operationId: intent.operationId,
         requestId: request.requestId,
         requestStartedAt: request.startedAt,
       });
@@ -1889,7 +2555,7 @@ export class SessionKernelProviderTurnsV2 {
           pending.requestId !== item.requestId
           || pending.intent.kind !== 'toolIntentSubmit'
           || canonicalJson(pending.intent.payload.intent)
-            !== canonicalJson(item.intent)
+            !== canonicalJson(intent)
         ) {
           throw new SessionKernelProviderTurnError(
             'session_kernel_provider_tool_call_request_conflict',
@@ -1903,7 +2569,7 @@ export class SessionKernelProviderTurnsV2 {
           lane: 'effect',
           intent: {
             kind: 'toolIntentSubmit',
-            payload: { intent: item.intent },
+            payload: { intent },
           },
           startedAt: item.requestStartedAt!,
           attemptCount: 1,
@@ -1919,7 +2585,7 @@ export class SessionKernelProviderTurnsV2 {
       if (
         !this.boundaryIsCurrent(reservation, generation)
         || current?.requestId !== request.requestId
-        || current.intent.operationId !== item.intent.operationId
+        || current.intent?.operationId !== intent.operationId
       ) {
         throw new SessionKernelProviderTurnError(
           'session_kernel_provider_tool_call_submission_superseded',
@@ -1990,6 +2656,11 @@ export class SessionKernelProviderTurnsV2 {
     intent: ToolIntentV2
   ): void {
     if (target.kind !== 'planAction') return;
+    // PlanAction authority belongs only to mutation effects. Supplemental
+    // reads keep their independent context-read authority and are admitted by
+    // Kernel Settings, ToolContext, and canonical scope without consuming or
+    // inheriting the mutation lease.
+    if (intent.authority.kind === 'read') return;
     if (
       intent.authority.kind !== 'planAction'
       || intent.authority.data.planActionId !== target.planActionId
@@ -2057,16 +2728,6 @@ export class SessionKernelProviderTurnsV2 {
       );
     }
     if (request.target.kind === 'planAction') {
-      if (
-        !Number.isSafeInteger(request.remainingToolCallBudget)
-        || request.remainingToolCallBudget! <= 0
-        || request.remainingToolCallBudget! > 256
-      ) {
-        throw new SessionKernelProviderTurnError(
-          'session_kernel_provider_tool_call_budget_invalid',
-          'A PlanAction Provider turn requires a remaining tool-call budget between 1 and 256.'
-        );
-      }
       this.host.requirePlanProjected();
       this.host.requirePlanAccepted();
       sessionPlanActionV2(state, request.target.planActionId);
@@ -2076,11 +2737,29 @@ export class SessionKernelProviderTurnsV2 {
           `PlanAction ${request.target.planActionId} is already settled.`
         );
       }
-    } else if (request.remainingToolCallBudget !== undefined) {
-      throw new SessionKernelProviderTurnError(
-        'session_kernel_provider_tool_call_budget_unexpected',
-        'Only a PlanAction Provider turn may carry a tool-call budget.'
-      );
+    } else if (request.target.kind === 'interventionResearch') {
+      this.host.requirePlanProjected();
+      this.host.requirePlanAccepted();
+      const research = state.interventionResearch;
+      const input = currentSessionUserInputV2(state);
+      if (
+        !research
+        || state.userIntervention
+        || research.researchId !== request.target.researchId
+        || research.runId !== state.runId
+        || research.inputId !== input.inputId
+        || research.controlEpoch !== state.controlEpoch
+        || !state.plan
+        || research.predecessorPlanRef.planRevision
+          !== state.plan.planRevision
+        || research.predecessorPlanRef.planDigest
+          !== sha256Hash(canonicalJson(state.plan))
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_intervention_research_authority_mismatch',
+          'An intervention research turn must bind the exact active Run, input, control epoch, and accepted predecessor Plan.'
+        );
+      }
     }
   }
 
@@ -2194,7 +2873,8 @@ export class SessionKernelProviderTurnsV2 {
     reservation: symbol,
     generation: number,
     providerTurnId: string,
-    controlEpoch: number
+    controlEpoch: number,
+    signal: AbortSignal
   ): NonNullable<SessionProviderTurnInputV2['publicTextObserver']> {
     return async (delta) => {
       if (
@@ -2250,7 +2930,9 @@ export class SessionKernelProviderTurnsV2 {
               ? { providerPhase: delta.providerPhase }
               : {}),
             textDelta: delta.textDelta,
-          }
+          },
+          undefined,
+          { signal }
         );
         if (this.resultIsStale(
           reservation,
@@ -2272,7 +2954,8 @@ export class SessionKernelProviderTurnsV2 {
     reservation: symbol,
     generation: number,
     providerTurnId: string,
-    controlEpoch: number
+    controlEpoch: number,
+    signal: AbortSignal
   ): NonNullable<SessionProviderTurnInputV2['publicActivityObserver']> {
     return async (activity) => {
       if (
@@ -2319,7 +3002,9 @@ export class SessionKernelProviderTurnsV2 {
             controlEpoch,
             activitySequence: activity.activitySequence,
             currentActivityCode: activity.code,
-          }
+          },
+          undefined,
+          { signal }
         );
         if (this.resultIsStale(
           reservation,
@@ -2366,21 +3051,163 @@ function providerOutcomeSummary(
   output: import('./types.js').SessionProviderTurnOutputV2
 ): { summary?: string } {
   if (output.kind === 'answer') {
-    return { summary: output.text.slice(0, 8_192) };
+    return { summary: utf8Prefix(output.text, 8_192) };
   }
   if (output.kind === 'noTool' && output.guidance) {
-    return { summary: output.guidance.slice(0, 8_192) };
+    return { summary: utf8Prefix(output.guidance, 8_192) };
   }
   if (output.kind === 'plan') {
     return {
-      summary: `${output.plan.title}\n${output.plan.objective}`
-        .slice(0, 8_192),
+      summary: utf8Prefix(
+        `${output.plan.title}\n${output.plan.objective}`,
+        8_192
+      ),
     };
+  }
+  if (output.kind === 'planEvidenceRefresh') {
+    return { summary: utf8Prefix(output.guidance, 8_192) };
   }
   if (output.kind === 'planActionComplete') {
     return { summary: `PlanAction outcome: ${output.outcome}` };
   }
+  if (output.kind === 'intervention') {
+    return {
+      summary: utf8Prefix(
+        `${output.proposal.problemSummary}\n${
+          output.proposal.options.map((option) => option.title).join('\n')
+        }`,
+        8_192
+      ),
+    };
+  }
   return {};
+}
+
+function stagedProjectionDeliveryCanDefer(error: unknown): boolean {
+  if (!(error instanceof SessionKernelProjectionDeliveryErrorV2)) {
+    return false;
+  }
+  if (error.deliveryStage === 'deliveryReceipt') {
+    return true;
+  }
+  const cause = error.deliveryError;
+  if (cause instanceof TypeError) {
+    return true;
+  }
+  return cause !== null
+    && typeof cause === 'object'
+    && (cause as { retryable?: unknown }).retryable === true;
+}
+
+function candidateCanPromoteToFinalAnswerV1(
+  state: SessionKernelLoopStateV2,
+  target: Extract<
+    SessionProviderTurnTargetV2,
+    { kind: 'finalAnswer' }
+  >
+): boolean {
+  const candidate = state.terminalAnswerCandidate;
+  const review = state.review;
+  const turn = state.providerTurn;
+  if (
+    !candidate
+    || !review
+    || review.status !== 'final'
+    || candidate.inputId !== target.inputId
+    || candidate.controlEpoch !== target.controlEpoch
+    || candidate.languageRevision !== target.controlEpoch
+    || candidate.snapshotHighWater !== target.snapshotHighWater
+    || candidate.snapshotHighWater
+      !== state.lineage.cursor.snapshotHighWater
+    || candidate.workAuthority.kind !== 'contextRead'
+    || !sameSessionWorkAuthorityV3(
+      candidate.workAuthority,
+      target.workAuthority
+    )
+    || !review.workAuthority
+    || !sameSessionWorkAuthorityV3(
+      review.workAuthority,
+      target.workAuthority
+    )
+    || turn?.providerTurnId !== candidate.providerTurnId
+    || turn.status !== 'completed'
+    || !turn.response
+    || state.activeWait !== undefined
+    || Object.keys(state.publicRequests).length > 0
+    || sessionKernelFactBarriersPendingV2(state)
+    || state.pendingGuidance.length > 0
+    || state.providerToolCallQueue?.status === 'active'
+    || (
+      state.providerToolCallQueue !== undefined
+      && !state.providerToolCallQueue.outcomeRecorded
+    )
+    || state.runCancellation !== undefined
+    || review.scopeExpansions.length > 0
+    || review.denied.length > 0
+    || review.unexecuted.length > 0
+    || review.cleanup.length > 0
+    || review.indeterminate.length > 0
+    || review.priorEpochLateFacts.length > 0
+    || review.pendingCleanupCount !== 0
+    || Object.values(review.factCoverage).some(
+      (coverage) => coverage.omittedCount !== 0
+    )
+    || review.actualEffects.some(
+      (fact) => reviewFactAuthorityKindV1(fact.details) !== 'read'
+    )
+    || review.rejections.some(
+      (fact) =>
+        fact.factKind !== 'commandRecorded'
+        && ![
+          'invalidArguments',
+          'toolNotRegistered',
+          'toolUnavailable',
+          'staleToolContext',
+          'staleControlEpoch',
+          'commandRecorded',
+        ].includes(reviewRejectionReasonV1(fact.details) ?? '')
+    )
+  ) {
+    return false;
+  }
+  return state.providerOutcomes.some((outcome) =>
+    outcome.providerTurnId === candidate.providerTurnId
+    && outcome.outputKind === 'answer'
+  );
+}
+
+function reviewFactAuthorityKindV1(
+  details: unknown
+): string | undefined {
+  return nestedStringV1(details, ['identity', 'authority', 'kind']);
+}
+
+function reviewRejectionReasonV1(
+  details: unknown
+): string | undefined {
+  return nestedStringV1(details, [
+    'result',
+    'data',
+    'reply',
+    'data',
+    'reason',
+  ]);
+}
+
+function nestedStringV1(
+  value: unknown,
+  path: readonly string[]
+): string | undefined {
+  let current: unknown = value;
+  for (const key of path) {
+    if (
+      !current
+      || typeof current !== 'object'
+      || Array.isArray(current)
+    ) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'string' ? current : undefined;
 }
 
 function providerRepairOperationIdV2(
@@ -2432,6 +3259,162 @@ function bindProviderEvidenceV3(
   }
   requireProviderDispatchAuthorityV3(input, dispatch.data);
   bindProviderRecordRefsV3(state, evidence);
+}
+
+function bindCompletedProviderEvidenceForStructuredRepairV1(
+  state: SessionKernelLoopStateV2,
+  input: SessionProviderEvidenceBindingInputV3,
+  evidence: SessionProviderTurnDurableEvidenceV3
+): void {
+  const providerTurn = state.providerTurn;
+  const dispatch = evidence.dispatch;
+  const terminal = evidence.terminal;
+  if (
+    providerTurn?.providerTurnId !== input.providerTurnId
+    || !dispatch
+    || !terminal
+    || terminal.data.terminalKind !== 'completed'
+    || terminal.data.providerTurnId !== input.providerTurnId
+    || !terminal.data.responseDigest
+  ) {
+    throw new SessionKernelProviderTurnError(
+      'session_kernel_provider_terminal_evidence_mismatch',
+      'Structured Provider repair requires one exact completed daemon terminal.'
+    );
+  }
+  requireProviderDispatchAuthorityV3(input, dispatch.data);
+  bindProviderRecordRefsV3(state, evidence);
+}
+
+function structuredRepairForProviderFailureV1(input: {
+  request: SessionProviderTurnExecutionRequestV2;
+  evidence: SessionProviderTurnDurableEvidenceV3;
+  error: unknown;
+}): SessionProviderStructuredRepairV1 | undefined {
+  const terminal = input.evidence.terminal?.data;
+  if (
+    terminal?.terminalKind === 'failed'
+    && terminal.structuredFailure
+    && terminal.providerResult
+    && input.error instanceof SessionKernelProviderTransportError
+    && input.error.structuredFailure
+    && input.error.code === terminal.reasonCode
+    && terminal.reasonCode === terminal.structuredFailure.errorCode
+    && canonicalJson(input.error.structuredFailure)
+      === canonicalJson(terminal.structuredFailure)
+    && canonicalJson(input.error.providerUsage ?? null)
+      === canonicalJson(terminal.providerResult.usage ?? null)
+  ) {
+    return {
+      schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+      predecessorProviderTurnId: terminal.providerTurnId,
+      sourceTerminalKind: 'failed',
+      errorCode: terminal.reasonCode,
+      failureDigest: terminal.structuredFailure.failureDigest,
+    };
+  }
+  if (
+    terminal?.terminalKind !== 'completed'
+    || !(
+      input.error instanceof SessionKernelProviderTransportError
+      || input.error instanceof SessionKernelProviderAdapterError
+    )
+    || !repairableCompletedSessionControlErrorV1(
+      input.request.target,
+      input.error.code
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+    predecessorProviderTurnId: terminal.providerTurnId,
+    sourceTerminalKind: 'completed',
+    errorCode: input.error.code,
+    failureDigest: completedStructuredFailureDigestV1(
+      input.error.code,
+      terminal.orderedItems
+    ),
+    sourceResponseDigest: terminal.responseDigest,
+  };
+}
+
+function completedStructuredFailureDigestV1(
+  errorCode: string,
+  orderedItems: readonly import('./types.js').SessionProviderTerminalOrderedItemV3[]
+): string {
+  return sha256Hash(canonicalJson({
+    errorCode,
+    orderedItems: orderedItems.map((item) => item.kind === 'text'
+      ? {
+          kind: item.kind,
+          phase: item.phase,
+          textDigest: sha256Hash(item.text),
+        }
+      : {
+          kind: item.kind,
+          index: item.index,
+          name: item.name,
+          argumentsDigest: sha256Hash(item.arguments),
+        }),
+  }));
+}
+
+function structuredRepairFromDurableFailedTerminalV1(
+  evidence: SessionProviderTurnDurableEvidenceV3
+): SessionProviderStructuredRepairV1 | undefined {
+  const terminal = evidence.terminal?.data;
+  if (
+    terminal?.terminalKind !== 'failed'
+    || !terminal.structuredFailure
+    || !terminal.providerResult
+    || terminal.reasonCode !== terminal.structuredFailure.errorCode
+  ) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 'deepcode.session.provider-structured-repair.v1',
+    predecessorProviderTurnId: terminal.providerTurnId,
+    sourceTerminalKind: 'failed',
+    errorCode: terminal.reasonCode,
+    failureDigest: terminal.structuredFailure.failureDigest,
+  };
+}
+
+function repairableCompletedSessionControlErrorV1(
+  target: SessionProviderTurnTargetV2,
+  errorCode: string
+): boolean {
+  if (target.kind === 'planning') {
+    return [
+      'session_kernel_provider_plan_proposal_invalid',
+      'session_kernel_provider_plan_proposal_conflict',
+      'session_kernel_provider_plan_proposal_phase_conflict',
+      'session_kernel_provider_plan_tool_unavailable',
+      'session_kernel_provider_plan_read_action_invalid',
+      'session_kernel_provider_plan_scope_shape_invalid',
+      'session_kernel_provider_plan_arguments_invalid',
+    ].includes(errorCode);
+  }
+  if (target.kind === 'interventionResearch') {
+    return [
+      'session_kernel_provider_intervention_invalid',
+      'session_kernel_provider_intervention_proposal_conflict',
+      'session_kernel_provider_intervention_proposal_phase_conflict',
+      'session_kernel_provider_plan_tool_unavailable',
+      'session_kernel_provider_plan_read_action_invalid',
+      'session_kernel_provider_plan_scope_shape_invalid',
+      'session_kernel_provider_plan_arguments_invalid',
+    ].includes(errorCode);
+  }
+  if (target.kind === 'planAction') {
+    return [
+      'session_kernel_provider_plan_action_complete_invalid',
+      'session_kernel_provider_plan_action_complete_conflict',
+      'session_kernel_provider_plan_action_complete_phase_conflict',
+    ].includes(errorCode);
+  }
+  return false;
 }
 
 function bindFailedProviderEvidenceV3(
@@ -2561,7 +3544,10 @@ function terminalItemsMatchProviderOutputV3(
   );
   if (
     targetKind === 'planning'
-    && output.kind === 'plan'
+    && (
+      output.kind === 'plan'
+      || output.kind === 'planEvidenceRefresh'
+    )
   ) {
     try {
       const controlItems = terminalItems.filter(
@@ -2569,7 +3555,7 @@ function terminalItemsMatchProviderOutputV3(
           import('./types.js').SessionProviderTerminalOrderedItemV3,
           { kind: 'toolCall' }
         > => item.kind === 'toolCall'
-          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+          && item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME
       );
       if (
         controlItems.length !== 1
@@ -2589,8 +3575,24 @@ function terminalItemsMatchProviderOutputV3(
         phase: 'commentary' as const,
         text: item.text,
       }));
-      return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
-        && providerPlanMatchesDraftV3(output.plan, draft);
+      if (canonicalJson(outputItems) !== canonicalJson(normalizedTextItems)) {
+        return false;
+      }
+      if (output.kind === 'plan') {
+        const decodedArguments = JSON.parse(
+          controlItems[0]!.arguments
+        ) as unknown;
+        return providerPlanMatchesDraftV3(output.plan, draft)
+          && controlItems[0]!.callId === output.control.callId
+          && sha256Hash(canonicalJson(decodedArguments))
+            === output.control.argumentsDigest;
+      }
+      const decodedArguments = JSON.parse(
+        controlItems[0]!.arguments
+      ) as unknown;
+      return controlItems[0]!.callId === output.control.callId
+        && sha256Hash(canonicalJson(decodedArguments))
+          === output.control.argumentsDigest;
     } catch {
       return false;
     }
@@ -2638,6 +3640,49 @@ function terminalItemsMatchProviderOutputV3(
       return false;
     }
   }
+  if (
+    targetKind === 'interventionResearch'
+    && output.kind === 'intervention'
+  ) {
+    try {
+      const controlItems = terminalItems.filter(
+        (item): item is Extract<
+          import('./types.js').SessionProviderTerminalOrderedItemV3,
+          { kind: 'toolCall' }
+        > => item.kind === 'toolCall'
+          && item.name
+            === SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME
+      );
+      if (
+        controlItems.length !== 1
+        || terminalTextItems.length + 1 !== terminalItems.length
+        || terminalItems.at(-1) !== controlItems[0]
+        || terminalTextItems.some(
+          (item) => item.phase === 'final_answer'
+        )
+      ) {
+        return false;
+      }
+      const decodedArguments = JSON.parse(
+        controlItems[0]!.arguments
+      ) as unknown;
+      const draft = decodeProviderInterventionArgumentsV1(
+        decodedArguments
+      );
+      const normalizedTextItems = terminalTextItems.map((item) => ({
+        kind: 'text' as const,
+        phase: 'commentary' as const,
+        text: item.text,
+      }));
+      return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
+        && providerInterventionMatchesDraftV1(output.proposal, draft)
+        && controlItems[0]!.callId === output.control.callId
+        && sha256Hash(canonicalJson(decodedArguments))
+          === output.control.argumentsDigest;
+    } catch {
+      return false;
+    }
+  }
   if (terminalItems.length !== outputItems.length) return false;
   return terminalItems.every((terminal, index) => {
     const output = outputItems[index];
@@ -2668,6 +3713,7 @@ function providerPlanMatchesDraftV3(
   return plan.title === draft.title
     && plan.objective === draft.objective
     && plan.narrative === draft.narrative
+    && providerPlanEvidenceMatchesDraftV5(plan, draft)
     && plan.actions.length === draft.actions.length
     && draft.actions.every((actionDraft, index) => {
       const action = plan.actions[index];
@@ -2683,6 +3729,76 @@ function providerPlanMatchesDraftV3(
     });
 }
 
+function providerPlanEvidenceMatchesDraftV5(
+  plan: SessionNaturalLanguagePlanV2,
+  draft: ReturnType<typeof decodeProviderPlanProposalArgumentsV2>
+): boolean {
+  const evidence = plan.evidence;
+  if (
+    canonicalJson(evidence.kernelFactRefs)
+      !== canonicalJson([...draft.evidence.kernelFactRefs].sort())
+    || evidence.readResources.length
+      !== draft.evidence.readResources.length
+    || canonicalJson(evidence.blockingUnknowns)
+      !== canonicalJson(draft.evidence.blockingUnknowns)
+    || canonicalJson(evidence.nonBlockingUnknowns)
+      !== canonicalJson(draft.evidence.nonBlockingUnknowns)
+    || evidence.coverage !== draft.evidence.coverage
+  ) {
+    return false;
+  }
+  return draft.evidence.readResources.every((resourceDraft, index) => {
+    const resource = evidence.readResources[index];
+    if (
+      !resource
+      || resource.summary !== resourceDraft.summary
+      || !/^sha256:[0-9a-f]{64}$/u.test(resource.digest)
+    ) {
+      return false;
+    }
+    const materializedFactRefs = new Set(resource.factRefs);
+    return resourceDraft.factRefs.every(
+      (factRef) => materializedFactRefs.has(factRef)
+    );
+  });
+}
+
+function providerInterventionMatchesDraftV1(
+  proposal: SessionProviderInterventionProposalV1,
+  draft: ReturnType<typeof decodeProviderInterventionArgumentsV1>
+): boolean {
+  return proposal.problemSummary === draft.problemSummary
+    && proposal.recommendation === draft.recommendation
+    && canonicalJson(proposal.relevantFactRefs)
+      === canonicalJson([...draft.relevantFactRefs].sort())
+    && canonicalJson(proposal.affectedPlanActionIds)
+      === canonicalJson([...draft.affectedPlanActionIds].sort())
+    && proposal.options.length === draft.options.length
+    && draft.options.every((optionDraft, index) => {
+      const option = proposal.options[index];
+      if (
+        !option
+        || option.optionId !== optionDraft.optionId
+        || option.kind !== optionDraft.kind
+        || option.title !== optionDraft.title
+        || option.description !== optionDraft.description
+        || canonicalJson(option.tradeoffs)
+          !== canonicalJson(optionDraft.tradeoffs)
+        || option.recommended !== optionDraft.recommended
+      ) {
+        return false;
+      }
+      if (!optionDraft.candidatePlan) {
+        return option.candidatePlan === undefined;
+      }
+      return option.candidatePlan !== undefined
+        && providerPlanMatchesDraftV3(
+          option.candidatePlan,
+          optionDraft.candidatePlan
+        );
+    });
+}
+
 function sameProviderOutputIgnoringAdapterTimestampV3(
   left: SessionProviderTurnOutputV2,
   right: SessionProviderTurnOutputV2
@@ -2691,6 +3807,14 @@ function sameProviderOutputIgnoringAdapterTimestampV3(
     const output = cloneJson(value);
     if (output.kind === 'plan') {
       output.plan.recordedAt = '<durable-terminal-recorded-at>';
+    }
+    if (output.kind === 'intervention') {
+      output.proposal.options.forEach((option) => {
+        if (option.candidatePlan) {
+          option.candidatePlan.recordedAt =
+            '<durable-terminal-recorded-at>';
+        }
+      });
     }
     if (output.kind === 'toolIntent') {
       output.receipt.recordedAt = '<durable-terminal-recorded-at>';
@@ -2742,15 +3866,15 @@ function planActionProviderCallIdentity(
   state: SessionKernelLoopStateV2,
   action: SessionPlanActionV2,
   source: ProviderKernelToolSourceV2,
-  callIndex: number,
-  lease: CapabilityLeaseRefV2 | undefined
+  callIndex: number
 ): {
   operationId: string;
   idempotencyKey: string;
 } {
+  // A preview lease proves approval; it is not an effect submission. The
+  // first physical call must still consume the manifest operation identity.
   if (
-    !lease
-    && callIndex === 0
+    callIndex === 0
     && !planManifestOperationWasPreviouslySubmitted(
       state,
       action.manifest.operationId
@@ -2774,7 +3898,7 @@ function planManifestOperationWasPreviouslySubmitted(
 ): boolean {
   if (
     state.providerToolCallQueue?.calls.some(
-      (call) => call.intent.operationId === operationId
+      (call) => call.intent?.operationId === operationId
     )
   ) {
     return true;
@@ -2918,6 +4042,35 @@ function finalAnswerFailureIsRetryable(error: unknown): boolean {
     && Number(candidate!.httpStatus) <= 599;
 }
 
+function finalAnswerExactReplayPredecessorIdV1(
+  state: SessionKernelLoopStateV2,
+  request: SessionProviderTurnRequestV2
+): string | undefined {
+  const turn = state.providerTurn;
+  const finalAnswer = state.finalAnswer;
+  if (
+    request.target.kind !== 'finalAnswer'
+    || finalAnswer?.status !== 'pending'
+    || finalAnswer.lastErrorCode === undefined
+    || ![
+      'provider_retryable_no_mutation',
+      'session_kernel_provider_transport_failed',
+      'session_kernel_provider_stream_read_failed',
+      'session_kernel_provider_http_failed',
+    ].includes(finalAnswer.lastErrorCode)
+    || turn?.status !== 'failed'
+    || turn.purpose !== 'finalAnswer'
+    || turn.target.kind !== 'finalAnswer'
+    || !turn.dispatchRef
+    || !turn.terminalRef
+    || !sameSessionFinalAnswerBindingV3(
+      turn.target,
+      request.target
+    )
+  ) return undefined;
+  return turn.providerTurnId;
+}
+
 function finalAnswerFailedResult(
   state: SessionKernelLoopStateV2
 ): Extract<
@@ -2978,5 +4131,14 @@ export class SessionKernelProviderTurnError extends Error {
   ) {
     super(message);
     this.name = 'SessionKernelProviderTurnError';
+  }
+}
+
+class SessionProviderStructuredRepairScheduledV1 extends Error {
+  constructor(
+    readonly repair: SessionProviderStructuredRepairV1
+  ) {
+    super('Structured Provider repair was durably scheduled.');
+    this.name = 'SessionProviderStructuredRepairScheduledV1';
   }
 }

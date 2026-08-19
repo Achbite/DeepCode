@@ -9,7 +9,10 @@ import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
-import { findPendingComposerDecisionFromProjection } from './pendingDecision';
+import {
+  findCanonicalPendingInteractionBlockId,
+  findPendingComposerDecisionFromProjection,
+} from './pendingDecision';
 import { timelineOrEmpty } from '../../utils/uiTimelineProjection';
 import './agentPanel.css';
 
@@ -20,8 +23,6 @@ const AgentPanel: React.FC = () => {
   const loading = useAgentSessionStore((s) => s.loading);
   const selectionReady = useAgentSessionStore((s) => s.selectionReady);
   const localWorkspaceScopeKey = useAgentSessionStore((s) => s.localWorkspaceScopeKey);
-  const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
-  const activeRunSessionIds = useAgentSessionStore((s) => s.activeRunSessionIds);
   const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const activeSubmissionSessionIds = useAgentSessionStore((s) => s.activeSubmissionSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
@@ -29,50 +30,66 @@ const AgentPanel: React.FC = () => {
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
-  const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
+  const resolvingIntervention = useAgentSessionStore((s) => s.resolvingIntervention);
+  const loadCurrentSelection = useAgentSessionStore((s) => s.loadCurrentSelection);
+  const observeSessionProjection = useAgentSessionStore((s) => s.observeSessionProjection);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
-  const pendingSubmissionSessionIds = useAgentSessionStore((s) => s.pendingSubmissionSessionIds);
-  const pendingSubmissionRetryView = useAgentSessionStore((s) => s.pendingSubmissionRetryView);
-  const retryPendingSubmission = useAgentSessionStore((s) => s.retryPendingSubmission);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
-  const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
+  const resolveUserIntervention = useAgentSessionStore((s) => s.resolveUserIntervention);
   const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
-  const activeFolderId = useWorkspaceStore((s) => (
-    s.activeFolderId ?? s.getActiveFolder()?.id ?? null
-  ));
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const activeSessionRunning = Boolean(
+  const timelineProjection = timelineOrEmpty(timeline, session?.id);
+  const projectedRunActive = Boolean(
+    timelineProjection.runProjection
+    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      timelineProjection.runProjection.status
+    )
+  );
+  const activeSessionMutation = Boolean(
     session?.id
     && (
-      runningSessionIds.includes(session.id)
-      || activeRunSessionIds.includes(session.id)
+      activeSubmissionSessionIds.includes(session.id)
       || cancellingSessionIds.includes(session.id)
     )
   );
-  const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
     resolvingPlan,
     resolvingPermission,
+    resolvingIntervention,
   });
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
-  const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
+  const composerPendingDecision = pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
-  const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
+  const pendingInteractionBlockId = pendingDecision?.kind === 'userIntervention'
+    ? findCanonicalPendingInteractionBlockId(timelineProjection)
+    : null;
+  const suppressedBlockIds = pendingInteractionBlockId
+    ? new Set([pendingInteractionBlockId])
+    : undefined;
+  const agentBusy = loading
+    || projectedRunActive
+    || activeSessionMutation
+    || pendingDecisionResolving;
   const waitingForUser = timelineProjection.runProjection?.status === 'waitingUser'
     || timelineProjection.runProjection?.wait?.kind === 'user';
+  const cancellableRun = Boolean(
+    timelineProjection.runProjection
+    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      timelineProjection.runProjection.status
+    )
+  );
   const agentReady = Boolean(
     !loading
     && selectionReady
@@ -80,37 +97,13 @@ const AgentPanel: React.FC = () => {
     && localWorkspaceScopeKey === workspaceScopeKey
     && timeline?.sessionId === session.id
   );
-  const pendingSubmissionRetry = session?.id
-    && pendingSubmissionSessionIds.includes(session.id)
-    && !activeSubmissionSessionIds.includes(session.id)
-    ? pendingSubmissionRetryView(session.id)
-    : null;
-  const attachmentWorkspaceBinding = session?.workspaceBinding;
-  const allowGlobalAttachmentWorkspaceFallback = !session?.projectId;
-
   useEffect(() => {
-    if (session?.projectId) return;
-    void loadOrCreate();
-    void refreshSessions();
-  }, [loadOrCreate, refreshSessions, session?.projectId, workspaceScopeKey]);
-
-  useEffect(() => {
-    if (
-      attachmentWorkspaceBinding
-      && !attachmentWorkspaceBinding.activeFolderId
-    ) {
-      return;
-    }
-    synchronizeAttachmentRoot(
-      attachmentWorkspaceBinding?.activeFolderId
-        ?? (allowGlobalAttachmentWorkspaceFallback ? activeFolderId : null)
-    );
-  }, [
-    activeFolderId,
-    allowGlobalAttachmentWorkspaceFallback,
-    attachmentWorkspaceBinding,
-    synchronizeAttachmentRoot,
-  ]);
+    if (!session?.id) return;
+    const release = observeSessionProjection(session.id);
+    return () => {
+      void release();
+    };
+  }, [observeSessionProjection, session?.id]);
 
   return (
     <div className="agent-panel-shell">
@@ -135,6 +128,7 @@ const AgentPanel: React.FC = () => {
         timeline={timelineProjection}
         loading={agentBusy && !waitingForUser}
         language={language}
+        suppressedBlockIds={suppressedBlockIds}
       />
 
       {pendingPermissionRequest && (
@@ -156,7 +150,7 @@ const AgentPanel: React.FC = () => {
         <div className="agent-panel-error">
           <span>{errorMessage}</span>
           {!agentReady && (
-            <button type="button" onClick={() => void loadOrCreate()}>
+            <button type="button" onClick={() => void loadCurrentSelection()}>
               {t(language, 'deepcodeGui.statusAction.retry')}
             </button>
           )}
@@ -166,20 +160,19 @@ const AgentPanel: React.FC = () => {
       <AgentComposer
         messageAttachments={messageAttachments}
         sessionAttachments={sessionAttachments}
-        attachmentWorkspaceBinding={attachmentWorkspaceBinding}
-        allowGlobalAttachmentWorkspaceFallback={allowGlobalAttachmentWorkspaceFallback}
         language={language}
         loading={agentBusy}
         sendBlocked={!agentReady}
         sendBlockedTitle={!agentReady ? t(language, 'agent.readiness.pending') : undefined}
         onSend={sendMessage}
-        pendingSubmissionRetry={pendingSubmissionRetry}
-        onRetryPendingSubmission={retryPendingSubmission}
         submissionScopeId={session?.id ?? null}
         canCancelCurrentRun={Boolean(
-          session?.id && activeRunSessionIds.includes(session.id)
+          session?.id && cancellableRun
         )}
-        onStop={() => void cancelCurrentRun()}
+        cancellationPending={Boolean(
+          session?.id && cancellingSessionIds.includes(session.id)
+        )}
+        onStop={() => void cancelCurrentRun(timeline?.runProjection?.runId)}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
         pendingDecision={composerPendingDecision}
@@ -195,10 +188,47 @@ const AgentPanel: React.FC = () => {
             );
           }
         }}
+        onInterventionSelect={(optionId, guidance) => {
+          if (composerPendingDecision?.kind !== 'userIntervention') return;
+          void resolveUserIntervention({
+            runId: composerPendingDecision.runId,
+            targetId: composerPendingDecision.targetId,
+            interactionId: composerPendingDecision.interactionId,
+            interactionRevision: composerPendingDecision.interactionRevision,
+            candidateSetDigest: composerPendingDecision.candidateSetDigest,
+            expectedProjectionCursor: composerPendingDecision.projectionCursor,
+            decision: 'select',
+            optionId,
+            guidance,
+          });
+        }}
+        onInterventionRevise={(guidance) => {
+          if (composerPendingDecision?.kind !== 'userIntervention') return;
+          void resolveUserIntervention({
+            runId: composerPendingDecision.runId,
+            targetId: composerPendingDecision.targetId,
+            interactionId: composerPendingDecision.interactionId,
+            interactionRevision: composerPendingDecision.interactionRevision,
+            candidateSetDigest: composerPendingDecision.candidateSetDigest,
+            expectedProjectionCursor: composerPendingDecision.projectionCursor,
+            decision: 'revise',
+            guidance,
+          });
+        }}
         onDecisionReject={() => {
           if (!composerPendingDecision) return;
           if (composerPendingDecision.kind === 'plan') {
             void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
+          } else if (composerPendingDecision.kind === 'userIntervention') {
+            void resolveUserIntervention({
+              runId: composerPendingDecision.runId,
+              targetId: composerPendingDecision.targetId,
+              interactionId: composerPendingDecision.interactionId,
+              interactionRevision: composerPendingDecision.interactionRevision,
+              candidateSetDigest: composerPendingDecision.candidateSetDigest,
+              expectedProjectionCursor: composerPendingDecision.projectionCursor,
+              decision: 'reject',
+            });
           }
         }}
       />

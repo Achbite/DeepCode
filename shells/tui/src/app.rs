@@ -1,10 +1,11 @@
 use crate::model::{CardModel, CurrentWorkModel};
 use crate::renderer::Renderer;
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
-    AgentTimelinePendingInteraction, AgentTimelineRunStatus, AgentTimelineSnapshot,
-    AgentTimelineStreamEvent, AgentTimelineStreamReduction, CreateAgentSessionRequest,
-    HttpKernelClient, ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentConversationTargetV1, AgentRunCallerRequest,
+    AgentRunGuidanceRequest, AgentTimelinePendingInteraction, AgentTimelineRunStatus,
+    AgentTimelineSnapshot, AgentTimelineStreamEvent, AgentTimelineStreamReduction,
+    CreateAgentSessionRequest, HttpKernelClient, ListAgentSessionsRequest, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::{
@@ -13,7 +14,6 @@ use std::{
 };
 
 const TIMELINE_STREAM_CHANNEL_CAPACITY: usize = 16;
-const HOST_TERMINAL_RECONCILE_WINDOW: Duration = Duration::from_secs(4);
 const TIMELINE_SNAPSHOT_REQUEST_WINDOW: Duration = Duration::from_secs(2);
 const TIMELINE_INITIAL_SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TIMELINE_STREAM_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -28,10 +28,8 @@ enum RunOperation {
 struct PendingRun {
     operation: RunOperation,
     session_id: String,
-    run_id: String,
-    kernel_run_id: String,
+    baseline_revision: u64,
     timeline_stream: Option<PendingTimelineStream>,
-    projection_terminal_since: Option<Instant>,
     last_projection_activity_at: Instant,
     last_watchdog_snapshot_at: Instant,
     stream_reconnect_not_before: Instant,
@@ -55,7 +53,7 @@ impl PendingTimelineStream {
         let (sender, receiver) = tokio::sync::mpsc::channel(TIMELINE_STREAM_CHANNEL_CAPACITY);
         let task = tokio::spawn(async move {
             let mut stream = match client
-                .agent_timeline_stream_v2(&session_id, after_revision)
+                .agent_timeline_stream_v3(&session_id, after_revision)
                 .await
             {
                 Ok(stream) => stream,
@@ -139,6 +137,19 @@ impl TuiApp {
         }
     }
 
+    async fn canonical_conversation_target(
+        &self,
+        session_id: &str,
+    ) -> Result<AgentConversationTargetV1, String> {
+        let result = self
+            .client
+            .get_agent_session(session_id)
+            .await
+            .map_err(|error| format!("读取规范会话目标失败：{error}"))?;
+        AgentConversationTargetV1::from_session(&result.session)
+            .map_err(|error| format!("解析规范会话目标失败：{error}"))
+    }
+
     pub async fn bootstrap(&mut self) {
         self.update_daemon_status(false).await;
         self.refresh_current_session().await;
@@ -210,139 +221,65 @@ impl TuiApp {
     pub async fn poll_pending_run(&mut self) {
         self.consume_pending_timeline_stream().await;
         self.settle_pending_action_required();
-        let Some((session_id, run_id)) = self
+        let Some(session_id) = self
             .pending_run
             .as_ref()
-            .map(|pending| (pending.session_id.clone(), pending.run_id.clone()))
+            .map(|pending| pending.session_id.clone())
         else {
             return;
         };
-        if self.pending_projection_terminal_status().is_none() {
-            let projection_bound = self.pending_projection_is_bound();
-            let watchdog_due = self.pending_run.as_ref().is_some_and(|pending| {
-                if projection_bound {
-                    pending.last_projection_activity_at.elapsed()
-                        >= TIMELINE_STREAM_WATCHDOG_INTERVAL
-                        && pending.last_watchdog_snapshot_at.elapsed()
-                            >= TIMELINE_STREAM_WATCHDOG_INTERVAL
-                } else {
-                    pending.last_watchdog_snapshot_at.elapsed()
-                        >= TIMELINE_INITIAL_SNAPSHOT_RETRY_INTERVAL
-                }
-            });
-            if watchdog_due {
-                if let Some(pending) = self.pending_run.as_mut() {
-                    pending.last_watchdog_snapshot_at = Instant::now();
-                }
-                self.refresh_running_timeline(&session_id).await;
-                self.settle_pending_action_required();
-                if self.pending_run.is_none() {
-                    return;
-                }
-                self.schedule_pending_timeline_stream_reconnect();
-            }
-        }
-        let Some(projection_status) = self.pending_projection_terminal_status() else {
-            self.ensure_pending_timeline_stream();
-            if self
-                .pending_run
-                .as_ref()
-                .is_some_and(|pending| pending.cancel_requested)
-            {
-                self.status = format!(
-                    "API {} · cancel accepted · waiting for canonical terminal",
-                    self.client.base_url()
-                );
-            }
-            return;
-        };
-        let terminal_since = self
-            .pending_run
-            .as_ref()
-            .and_then(|pending| pending.projection_terminal_since)
-            .unwrap_or_else(Instant::now);
-        let remaining = HOST_TERMINAL_RECONCILE_WINDOW.saturating_sub(terminal_since.elapsed());
-        if remaining.is_zero() {
+        if let Some(projection_status) = self.pending_projection_terminal_status() {
             self.pending_run = None;
             self.running_preview_active = false;
-            self.status = format!(
-                "API {} · terminal reconciliation failed",
-                self.client.base_url()
-            );
-            self.cards.push(CardModel::error(format!(
-                "Shared Projection 已到达 {projection_status:?}，但 Host Run {run_id} 未在 {} ms 内完成对账。已停止 watcher。",
-                HOST_TERMINAL_RECONCILE_WINDOW.as_millis()
-            )));
+            self.status = match projection_status {
+                AgentTimelineRunStatus::Succeeded => {
+                    format!("API {} · 回合完成", self.client.base_url())
+                }
+                AgentTimelineRunStatus::Cancelled => {
+                    format!("API {} · stopped", self.client.base_url())
+                }
+                AgentTimelineRunStatus::Failed => {
+                    format!("API {} · run failed", self.client.base_url())
+                }
+                _ => format!("API {} · settled", self.client.base_url()),
+            };
             return;
         }
-        match tokio::time::timeout(remaining, self.client.get_agent_run(&session_id, &run_id)).await
+        let projection_bound = self.pending_projection_is_bound();
+        let watchdog_due = self.pending_run.as_ref().is_some_and(|pending| {
+            if projection_bound {
+                pending.last_projection_activity_at.elapsed() >= TIMELINE_STREAM_WATCHDOG_INTERVAL
+                    && pending.last_watchdog_snapshot_at.elapsed()
+                        >= TIMELINE_STREAM_WATCHDOG_INTERVAL
+            } else {
+                pending.last_watchdog_snapshot_at.elapsed()
+                    >= TIMELINE_INITIAL_SNAPSHOT_RETRY_INTERVAL
+            }
+        });
+        if watchdog_due {
+            if let Some(pending) = self.pending_run.as_mut() {
+                pending.last_watchdog_snapshot_at = Instant::now();
+            }
+            self.refresh_running_timeline(&session_id).await;
+            self.settle_pending_action_required();
+            if self.pending_run.is_none() {
+                return;
+            }
+            if self.pending_projection_terminal_status().is_some() {
+                return;
+            }
+            self.schedule_pending_timeline_stream_reconnect();
+        }
+        self.ensure_pending_timeline_stream();
+        if self
+            .pending_run
+            .as_ref()
+            .is_some_and(|pending| pending.cancel_requested)
         {
-            Ok(Ok(result)) => {
-                self.apply_run_snapshot(&result).await;
-                if host_status_matches_projection(&result, projection_status) {
-                    self.pending_run = None;
-                    self.apply_run_result(result);
-                    return;
-                }
-                let expired = self.pending_run.as_ref().is_some_and(|pending| {
-                    pending
-                        .projection_terminal_since
-                        .is_some_and(|since| since.elapsed() >= HOST_TERMINAL_RECONCILE_WINDOW)
-                });
-                if expired {
-                    let host_status = result.run.status.clone();
-                    self.pending_run = None;
-                    self.running_preview_active = false;
-                    self.status = format!(
-                        "API {} · terminal reconciliation failed",
-                        self.client.base_url()
-                    );
-                    self.cards.push(CardModel::error(format!(
-                        "Shared Projection 已到达 {projection_status:?}，但 Host Run {run_id} 在 {} ms 内仍为 {host_status}。已停止 watcher，未使用 Host 状态改写投影事实。",
-                        HOST_TERMINAL_RECONCILE_WINDOW.as_millis()
-                    )));
-                } else {
-                    self.status = format!(
-                        "API {} · canonical terminal · reconciling Host",
-                        self.client.base_url()
-                    );
-                }
-            }
-            Ok(Err(error)) => {
-                let expired = self.pending_run.as_ref().is_some_and(|pending| {
-                    pending
-                        .projection_terminal_since
-                        .is_some_and(|since| since.elapsed() >= HOST_TERMINAL_RECONCILE_WINDOW)
-                });
-                if expired {
-                    self.pending_run = None;
-                    self.running_preview_active = false;
-                    self.status = format!(
-                        "API {} · terminal reconciliation failed",
-                        self.client.base_url()
-                    );
-                    self.cards.push(CardModel::error(format!(
-                        "terminal 对账在 {} ms 内未能读取 Host Run；已停止 watcher：{error}",
-                        HOST_TERMINAL_RECONCILE_WINDOW.as_millis()
-                    )));
-                } else {
-                    self.record_pending_refresh_error(format!(
-                        "读取 session run 状态失败：{error}"
-                    ));
-                }
-            }
-            Err(_) => {
-                self.pending_run = None;
-                self.running_preview_active = false;
-                self.status = format!(
-                    "API {} · terminal reconciliation failed",
-                    self.client.base_url()
-                );
-                self.cards.push(CardModel::error(format!(
-                    "terminal 对账未在剩余 {} ms 内完成；已停止 watcher。",
-                    remaining.as_millis()
-                )));
-            }
+            self.status = format!(
+                "API {} · cancel accepted · waiting for canonical terminal",
+                self.client.base_url()
+            );
         }
     }
 
@@ -371,7 +308,6 @@ impl TuiApp {
                         Ok(AgentTimelineStreamReduction::Unchanged) => {}
                         Ok(AgentTimelineStreamReduction::Replace(timeline)) => {
                             self.apply_timeline_snapshot(timeline, false);
-                            self.mark_pending_projection_terminal();
                             self.settle_pending_action_required();
                         }
                         Ok(AgentTimelineStreamReduction::ReconcileRequired { .. }) => {
@@ -414,7 +350,6 @@ impl TuiApp {
         if self.pending_run.is_none() {
             return;
         }
-        self.mark_pending_projection_terminal();
         if self.pending_projection_terminal_status().is_some() {
             return;
         }
@@ -430,9 +365,6 @@ impl TuiApp {
     }
 
     fn ensure_pending_timeline_stream(&mut self) {
-        if !self.pending_projection_is_bound() {
-            return;
-        }
         let Some((session_id, should_reconnect)) = self.pending_run.as_ref().map(|pending| {
             (
                 pending.session_id.clone(),
@@ -445,7 +377,12 @@ impl TuiApp {
         if !should_reconnect || self.pending_projection_terminal_status().is_some() {
             return;
         }
-        let after_revision = self.timeline.as_ref().map(|timeline| timeline.revision);
+        let after_revision = self.pending_run.as_ref().map(|pending| {
+            self.timeline
+                .as_ref()
+                .filter(|timeline| timeline.session_id == pending.session_id)
+                .map_or(pending.baseline_revision, |timeline| timeline.revision)
+        });
         if let Some(pending) = self.pending_run.as_mut() {
             pending.timeline_stream = Some(PendingTimelineStream::spawn(
                 self.client.clone(),
@@ -467,7 +404,7 @@ impl TuiApp {
         }
         match tokio::time::timeout(
             TIMELINE_SNAPSHOT_REQUEST_WINDOW,
-            self.client.agent_timeline_v2_optional(target_session_id),
+            self.client.agent_timeline_v3_optional(target_session_id),
         )
         .await
         {
@@ -517,7 +454,6 @@ impl TuiApp {
                     .unwrap_or_else(|| {
                         format!("API {} · projection r{revision}", self.client.base_url())
                     });
-                self.mark_pending_projection_terminal();
                 self.settle_pending_action_required();
             }
             Ok(Ok(None)) => {
@@ -550,9 +486,11 @@ impl TuiApp {
     }
 
     fn pending_projection_terminal_status(&self) -> Option<AgentTimelineRunStatus> {
-        let pending = self.pending_run.as_ref()?;
+        if !self.pending_projection_is_bound() {
+            return None;
+        }
         let run = self.timeline.as_ref()?.run_projection.as_ref()?;
-        (run.run_id == pending.kernel_run_id && run.status.is_terminal()).then_some(run.status)
+        run.status.is_terminal().then_some(run.status)
     }
 
     fn pending_projection_is_bound(&self) -> bool {
@@ -563,28 +501,14 @@ impl TuiApp {
             return false;
         };
         timeline.session_id == pending.session_id
-            && timeline
-                .run_projection
-                .as_ref()
-                .is_some_and(|run| run.run_id == pending.kernel_run_id)
-    }
-
-    fn mark_pending_projection_terminal(&mut self) {
-        if self.pending_projection_terminal_status().is_none() {
-            return;
-        }
-        if let Some(pending) = self.pending_run.as_mut() {
-            pending.timeline_stream = None;
-            pending
-                .projection_terminal_since
-                .get_or_insert_with(Instant::now);
-        }
+            && timeline.revision > pending.baseline_revision
+            && timeline.run_projection.is_some()
     }
 
     fn settle_pending_action_required(&mut self) {
-        let Some(pending) = self.pending_run.as_ref() else {
+        if self.pending_run.is_none() {
             return;
-        };
+        }
         let Some(run) = self
             .timeline
             .as_ref()
@@ -592,7 +516,7 @@ impl TuiApp {
         else {
             return;
         };
-        if run.run_id != pending.kernel_run_id {
+        if !self.pending_projection_is_bound() {
             return;
         }
         if !matches!(
@@ -605,12 +529,11 @@ impl TuiApp {
             .wait
             .0
             .as_ref()
-            .and_then(|wait| wait.reason.as_deref())
-            .filter(|reason| !reason.trim().is_empty())
+            .map(|wait| wait.reason_code.as_str())
             .unwrap_or("Session requires an explicit user action");
         let message = format!(
             "shared session run {} requires user action: {reason}",
-            pending.run_id
+            run.run_id
         );
         self.status = format!("API {} · action required", self.client.base_url());
         self.action_required = Some(message);
@@ -810,7 +733,16 @@ impl TuiApp {
                 return;
             }
         };
-        let mut request = StartAgentRunRequest::ask(prompt.to_string(), caller_request_id);
+        let conversation_target = match self.canonical_conversation_target(&session_id).await {
+            Ok(target) => target,
+            Err(error) => {
+                self.running_preview_active = false;
+                self.cards.push(CardModel::error(error));
+                return;
+            }
+        };
+        let mut request =
+            StartAgentRunRequest::ask(prompt.to_string(), caller_request_id, conversation_target);
         request.workspace_path = self.workspace_path();
         request.no_workspace = Some(self.host.no_workspace);
         self.start_run_request(RunOperation::Ask, session_id.clone(), request)
@@ -822,12 +754,11 @@ impl TuiApp {
             return;
         };
         let session_id = pending.session_id.clone();
-        let run_id = pending.run_id.clone();
-        self.submit_user_input_to_run(&session_id, &run_id, guidance)
+        self.submit_user_input_to_current_run(&session_id, guidance)
             .await;
     }
 
-    async fn submit_user_input_to_run(&mut self, session_id: &str, run_id: &str, input: &str) {
+    async fn submit_user_input_to_current_run(&mut self, session_id: &str, input: &str) {
         let caller_request_id = match new_tui_request_id("input") {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -836,16 +767,26 @@ impl TuiApp {
                 return;
             }
         };
-        let mut request = AgentRunGuidanceRequest::new(input, caller_request_id);
+        let conversation_target = match self.canonical_conversation_target(&session_id).await {
+            Ok(target) => target,
+            Err(error) => {
+                self.cards.push(CardModel::error(error));
+                return;
+            }
+        };
+        let mut request =
+            AgentRunGuidanceRequest::new(input, caller_request_id, conversation_target);
         request.workspace_path = self.workspace_path();
         request.no_workspace = Some(self.host.no_workspace);
         match self
             .client
-            .submit_agent_run_guidance(session_id, run_id, request)
+            .submit_current_agent_run_guidance(session_id, request)
             .await
         {
-            Ok(result) => {
-                self.apply_run_snapshot(&result).await;
+            Ok(_) => {
+                if let Some(pending) = self.pending_run.as_mut() {
+                    pending.last_refresh_error = None;
+                }
                 self.status = format!("API {} · guidance accepted", self.client.base_url());
             }
             Err(error) => {
@@ -867,10 +808,65 @@ impl TuiApp {
             .collect::<Vec<_>>();
         let Some(kind) = parts.first().cloned() else {
             self.cards.push(CardModel::error(
-                "用法：/decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
+                "用法：/decision <plan|permission> ... 或 /decision intervention <interaction-id> <select|revise|reject> [--option <id>] [--guidance <text>]",
             ));
             return;
         };
+        if kind == "intervention" {
+            let Some(interaction_id) = parts.get(1).cloned() else {
+                self.cards
+                    .push(CardModel::error("介入决定缺少 interaction id。"));
+                return;
+            };
+            let Some(decision) = parts.get(2).cloned() else {
+                self.cards.push(CardModel::error(
+                    "介入决定必须是 select、revise 或 reject。",
+                ));
+                return;
+            };
+            let mut option_id = None;
+            let mut guidance = None;
+            let mut index = 3;
+            while index < parts.len() {
+                match parts[index].as_str() {
+                    "--option" => {
+                        option_id = parts.get(index + 1).cloned();
+                        if option_id.is_none() {
+                            self.cards
+                                .push(CardModel::error("--option 缺少 option id。"));
+                            return;
+                        }
+                        index += 2;
+                    }
+                    "--guidance" => {
+                        let value = parts[index + 1..].join(" ");
+                        if value.trim().is_empty() {
+                            self.cards
+                                .push(CardModel::error("--guidance 缺少点评文本。"));
+                            return;
+                        }
+                        guidance = Some(value);
+                        index = parts.len();
+                    }
+                    other => {
+                        self.cards.push(CardModel::error(format!(
+                            "未知介入参数 {other}；只能使用 --option 或 --guidance。"
+                        )));
+                        return;
+                    }
+                }
+            }
+            self.start_decision_request(
+                "userIntervention".to_string(),
+                decision,
+                None,
+                Some(interaction_id),
+                guidance,
+                option_id,
+            )
+            .await;
+            return;
+        }
         let Some(decision) = parts.get(1).cloned() else {
             self.cards.push(CardModel::error(
                 "用法：/decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
@@ -907,6 +903,7 @@ impl TuiApp {
             } else {
                 None
             },
+            None,
         )
         .await;
     }
@@ -921,7 +918,7 @@ impl TuiApp {
                             .push(CardModel::error("当前没有激活会话，无法提交新的用户输入。"));
                         return;
                     };
-                    self.submit_user_input_to_run(&session_id, &pending.run_id, line)
+                    self.submit_user_input_to_current_run(&session_id, line)
                         .await;
                     return;
                 }
@@ -932,6 +929,63 @@ impl TuiApp {
                 Some(pending.run_id),
                 Some(pending.target_id),
                 None,
+                None,
+            )
+            .await;
+            return;
+        }
+        if pending.kind == "userIntervention" {
+            let trimmed = line.trim();
+            let mut parts = trimmed.split_whitespace();
+            let action = parts.next().unwrap_or_default();
+            let (decision, option_id, guidance) = match action {
+                "reject" | "拒绝" => (
+                    "reject".to_string(),
+                    None,
+                    parts.next().map(|first| {
+                        std::iter::once(first)
+                            .chain(parts)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }),
+                ),
+                "revise" | "修订" => {
+                    let guidance = parts.collect::<Vec<_>>().join(" ");
+                    if guidance.trim().is_empty() {
+                        self.cards
+                            .push(CardModel::error("介入修订必须提供 guidance：revise <text>"));
+                        return;
+                    }
+                    ("revise".to_string(), None, Some(guidance))
+                }
+                "select" | "选择" => {
+                    let Some(option_id) = parts.next().map(ToOwned::to_owned) else {
+                        self.cards.push(CardModel::error(
+                            "介入选择必须提供 option id：select <option-id> [comment]",
+                        ));
+                        return;
+                    };
+                    let guidance = parts.collect::<Vec<_>>().join(" ");
+                    (
+                        "select".to_string(),
+                        Some(option_id),
+                        (!guidance.trim().is_empty()).then_some(guidance),
+                    )
+                }
+                _ => {
+                    self.cards.push(CardModel::error(
+                        "介入输入必须使用 select <option-id> [comment]、revise <guidance> 或 reject [comment]。",
+                    ));
+                    return;
+                }
+            };
+            self.start_decision_request(
+                pending.kind,
+                decision,
+                Some(pending.run_id),
+                Some(pending.target_id),
+                guidance,
+                option_id,
             )
             .await;
             return;
@@ -943,6 +997,7 @@ impl TuiApp {
             Some(pending.run_id),
             Some(pending.target_id),
             parsed.guidance,
+            None,
         )
         .await;
     }
@@ -954,11 +1009,18 @@ impl TuiApp {
         run_id: Option<String>,
         target_id: Option<String>,
         guidance: Option<String>,
+        option_id: Option<String>,
     ) {
         if !matches!(
             (kind.as_str(), decision.as_str()),
-            ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
+            ("plan", "accept" | "reject" | "revise")
+                | ("permission", "accept" | "reject")
+                | ("userIntervention", "select" | "revise" | "reject")
         ) || (kind == "permission" && guidance.is_some())
+            || (kind == "userIntervention"
+                && ((decision == "select" && option_id.is_none())
+                    || (decision == "revise" && guidance.as_deref().is_none_or(str::is_empty))
+                    || (decision != "select" && option_id.is_some())))
         {
             self.cards.push(CardModel::error(
                 "decision kind、decision 或 guidance 不符合 canonical Session decision contract。",
@@ -971,7 +1033,7 @@ impl TuiApp {
             ));
             return;
         };
-        let timeline = match self.client.agent_timeline_v2(&session_id).await {
+        let timeline = match self.client.agent_timeline_v3(&session_id).await {
             Ok(timeline) => timeline,
             Err(error) => {
                 self.cards.push(CardModel::error(format!(
@@ -1000,6 +1062,17 @@ impl TuiApp {
             self.timeline = Some(timeline);
             return;
         }
+        if kind == "userIntervention"
+            && option_id
+                .as_deref()
+                .is_some_and(|selected| !pending.option_ids.iter().any(|id| id == selected))
+        {
+            self.cards.push(CardModel::error(
+                "所选介入方案已失效，请刷新 timeline 后重新选择。",
+            ));
+            self.timeline = Some(timeline);
+            return;
+        }
         let caller_request_id = match new_tui_request_id("decision") {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -1007,10 +1080,30 @@ impl TuiApp {
                 return;
             }
         };
-        let mut request = StartAgentRunRequest::resolve_decision(kind, decision, caller_request_id);
+        let conversation_target = match self.canonical_conversation_target(&session_id).await {
+            Ok(target) => target,
+            Err(error) => {
+                self.cards.push(CardModel::error(error));
+                return;
+            }
+        };
+        let intervention_decision = kind == "userIntervention";
+        let mut request = StartAgentRunRequest::resolve_decision(
+            kind,
+            decision,
+            caller_request_id,
+            conversation_target,
+        );
         request.run_id = Some(pending.run_id);
-        request.target_id = Some(pending.target_id);
+        request.target_id = Some(pending.target_id.clone());
         request.guidance = guidance;
+        if intervention_decision {
+            request.option_id = option_id;
+            request.interaction_id = Some(pending.target_id.clone());
+            request.interaction_revision = pending.interaction_revision;
+            request.candidate_set_digest = pending.candidate_set_digest;
+            request.expected_projection_cursor = pending.projection_cursor;
+        }
         self.status = format!("API {} · running", self.client.base_url());
         self.running_preview_active = true;
         self.start_run_request(RunOperation::Decision, session_id, request)
@@ -1116,55 +1209,47 @@ impl TuiApp {
     async fn start_run_request(
         &mut self,
         operation: RunOperation,
-        session_id: String,
+        target_session_id: String,
         request: StartAgentRunRequest,
     ) {
-        match self.client.start_agent_run(&session_id, request).await {
+        let baseline_revision = self
+            .timeline
+            .as_ref()
+            .filter(|timeline| timeline.session_id == target_session_id)
+            .map_or(0, |timeline| timeline.revision);
+        match self
+            .client
+            .start_agent_run(&target_session_id, request)
+            .await
+        {
             Ok(result) => {
-                let Some(kernel_run_id) = result.run.kernel_run_id.clone() else {
-                    self.running_preview_active = false;
-                    self.cards.push(CardModel::error(format!(
-                        "Host Run {} 缺少精确 Kernel Run identity，TUI 拒绝推断投影绑定。",
-                        result.run.run_id
-                    )));
-                    return;
-                };
                 self.action_required = None;
+                if let Some(id) = session_id(&result.session) {
+                    self.current_session_id = Some(id.to_string());
+                    self.current_session_resume_hint = false;
+                }
                 if self
                     .timeline
                     .as_ref()
-                    .is_some_and(|timeline| timeline.session_id != session_id)
+                    .is_some_and(|timeline| timeline.session_id != target_session_id)
                 {
                     self.timeline = None;
                     self.current_work = None;
                 }
                 self.pending_run = Some(PendingRun {
                     operation,
-                    session_id: session_id.clone(),
-                    run_id: result.run.run_id.clone(),
-                    kernel_run_id,
+                    session_id: target_session_id.clone(),
+                    baseline_revision,
                     timeline_stream: None,
-                    projection_terminal_since: None,
                     last_projection_activity_at: Instant::now(),
                     last_watchdog_snapshot_at: Instant::now(),
                     stream_reconnect_not_before: Instant::now(),
                     cancel_requested: false,
                     last_refresh_error: None,
                 });
-                let terminal = result.run.is_terminal();
-                self.apply_run_snapshot(&result).await;
-                self.refresh_running_timeline(&session_id).await;
+                self.status = format!("API {} · accepted", self.client.base_url());
+                self.refresh_running_timeline(&target_session_id).await;
                 self.ensure_pending_timeline_stream();
-                if terminal {
-                    self.mark_pending_projection_terminal();
-                    if self
-                        .pending_projection_terminal_status()
-                        .is_some_and(|status| host_status_matches_projection(&result, status))
-                    {
-                        self.pending_run = None;
-                        self.apply_run_result(result);
-                    }
-                }
             }
             Err(error) => {
                 self.running_preview_active = false;
@@ -1190,7 +1275,6 @@ impl TuiApp {
         };
         let operation = pending.operation;
         let session_id = pending.session_id.clone();
-        let run_id = pending.run_id.clone();
         let caller_request_id = match new_tui_request_id("cancel") {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -1206,18 +1290,25 @@ impl TuiApp {
         };
         match self
             .client
-            .cancel_agent_run_by_id(
+            .cancel_current_agent_run(
                 &session_id,
-                &run_id,
-                AgentRunCallerRequest::new(caller_request_id),
+                AgentRunCallerRequest::new(
+                    caller_request_id,
+                    match self.canonical_conversation_target(&session_id).await {
+                        Ok(target) => target,
+                        Err(error) => {
+                            self.cards.push(CardModel::error(error));
+                            return;
+                        }
+                    },
+                ),
             )
             .await
         {
-            Ok(result) => {
+            Ok(_) => {
                 if let Some(pending) = self.pending_run.as_mut() {
                     pending.cancel_requested = true;
                 }
-                self.apply_run_snapshot(&result).await;
                 self.status = format!(
                     "API {} · cancel accepted · waiting for canonical terminal",
                     self.client.base_url()
@@ -1233,10 +1324,7 @@ impl TuiApp {
                         }
                     },
                 ));
-                if result.run.is_terminal() {
-                    self.refresh_running_timeline(&session_id).await;
-                    self.mark_pending_projection_terminal();
-                }
+                self.refresh_running_timeline(&session_id).await;
             }
             Err(error) => {
                 self.status = format!(
@@ -1246,39 +1334,6 @@ impl TuiApp {
                 self.cards.push(CardModel::error(format!(
                     "daemon 未接纳 cancel 请求；当前回合与 watcher 保持有效：{error}"
                 )));
-            }
-        }
-    }
-
-    async fn apply_run_snapshot(&mut self, result: &AgentRunResult) {
-        if let Some(id) = session_id(&result.session) {
-            self.current_session_id = Some(id.to_string());
-            self.current_session_resume_hint = false;
-        }
-        if let Some(pending) = self
-            .pending_run
-            .as_mut()
-            .filter(|pending| pending.session_id == result.run.session_id)
-        {
-            pending.last_refresh_error = None;
-        }
-        self.status = format!("API {} · {}", self.client.base_url(), result.run.status);
-    }
-
-    fn apply_run_result(&mut self, result: AgentRunResult) {
-        self.running_preview_active = false;
-        self.current_session_id = Some(result.run.session_id.clone());
-        self.current_session_resume_hint = false;
-        self.status = match result.run.status.as_str() {
-            "completed" => format!("API {} · 回合完成", self.client.base_url()),
-            "waiting" => format!("API {} · 等待用户决策", self.client.base_url()),
-            "cancelled" => format!("API {} · stopped", self.client.base_url()),
-            "failed" => format!("API {} · run failed", self.client.base_url()),
-            other => format!("API {} · {other}", self.client.base_url()),
-        };
-        if result.run.status == "failed" {
-            if let Some(message) = result.run.message {
-                self.cards.push(CardModel::error(message));
             }
         }
     }
@@ -1456,7 +1511,7 @@ impl TuiApp {
                 .push(CardModel::error("用法：/timeline <session-id>"));
             return;
         }
-        match self.client.agent_timeline_v2(session_id).await {
+        match self.client.agent_timeline_v3(session_id).await {
             Ok(timeline) => {
                 let next_cards = CardModel::from_timeline(&timeline);
                 self.apply_timeline_snapshot(timeline, true);
@@ -1612,6 +1667,7 @@ impl TuiApp {
             None,
             Some(permission_id.to_string()),
             None,
+            None,
         )
         .await;
     }
@@ -1639,23 +1695,15 @@ struct PendingDecision {
     kind: String,
     run_id: String,
     target_id: String,
+    interaction_revision: Option<String>,
+    candidate_set_digest: Option<String>,
+    projection_cursor: Option<u64>,
+    option_ids: Vec<String>,
 }
 
 struct ParsedDecisionInput {
     decision: String,
     guidance: Option<String>,
-}
-
-fn host_status_matches_projection(
-    result: &AgentRunResult,
-    projection_status: AgentTimelineRunStatus,
-) -> bool {
-    matches!(
-        (projection_status, result.run.status.as_str()),
-        (AgentTimelineRunStatus::Succeeded, "completed")
-            | (AgentTimelineRunStatus::Failed, "failed")
-            | (AgentTimelineRunStatus::Cancelled, "cancelled")
-    )
 }
 
 fn session_id(session: &Value) -> Option<&str> {
@@ -1710,6 +1758,10 @@ fn latest_pending_decision(timeline: Option<&AgentTimelineSnapshot>) -> Option<P
             kind: "plan".to_string(),
             run_id: plan.run_id.clone(),
             target_id: plan.target_id.clone(),
+            interaction_revision: None,
+            candidate_set_digest: None,
+            projection_cursor: None,
+            option_ids: Vec::new(),
         }),
         AgentTimelinePendingInteraction::Permission(permission) => {
             if permission.request.id != permission.request_id
@@ -1721,8 +1773,26 @@ fn latest_pending_decision(timeline: Option<&AgentTimelineSnapshot>) -> Option<P
                 kind: "permission".to_string(),
                 run_id: permission.request.run_id.clone()?,
                 target_id: permission.target_id.clone(),
+                interaction_revision: None,
+                candidate_set_digest: None,
+                projection_cursor: None,
+                option_ids: Vec::new(),
             })
         }
+        AgentTimelinePendingInteraction::UserIntervention(intervention) => Some(PendingDecision {
+            kind: "userIntervention".to_string(),
+            run_id: intervention.run_id.clone(),
+            target_id: intervention.target_id.clone(),
+            interaction_revision: Some(intervention.interaction_revision.clone()),
+            candidate_set_digest: Some(intervention.candidate_set_digest.clone()),
+            projection_cursor: Some(timeline?.revision),
+            option_ids: intervention
+                .intervention
+                .options
+                .iter()
+                .map(|option| option.id.clone())
+                .collect(),
+        }),
     }
 }
 
@@ -1829,6 +1899,10 @@ mod tests {
             kind: "plan".to_string(),
             run_id: "run-generic".to_string(),
             target_id: "target-generic".to_string(),
+            interaction_revision: None,
+            candidate_set_digest: None,
+            projection_cursor: None,
+            option_ids: Vec::new(),
         }
     }
 
@@ -1857,17 +1931,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_session_waits_for_matching_initial_snapshot_before_opening_stream() {
+    async fn new_session_stream_uses_pending_identity_without_binding_stale_snapshot() {
         let mut app = test_tui_app();
         app.current_session_id = Some("session-old".to_string());
         app.timeline = Some(timeline_snapshot("session-old", "kernel-run-old"));
         app.pending_run = Some(PendingRun {
             operation: RunOperation::Ask,
             session_id: "session-new".to_string(),
-            run_id: "host-run-new".to_string(),
-            kernel_run_id: "kernel-run-new".to_string(),
+            baseline_revision: 0,
             timeline_stream: None,
-            projection_terminal_since: None,
             last_projection_activity_at: Instant::now(),
             last_watchdog_snapshot_at: Instant::now(),
             stream_reconnect_not_before: Instant::now(),
@@ -1880,8 +1952,8 @@ mod tests {
         assert!(
             app.pending_run
                 .as_ref()
-                .is_some_and(|pending| pending.timeline_stream.is_none()),
-            "stale prior-Session projection opened a timeline stream"
+                .is_some_and(|pending| pending.timeline_stream.is_some()),
+            "pending Session identity did not open the typed timeline stream"
         );
 
         app.timeline = Some(timeline_snapshot("session-new", "kernel-run-new"));
@@ -1891,7 +1963,7 @@ mod tests {
             app.pending_run
                 .as_ref()
                 .is_some_and(|pending| pending.timeline_stream.is_some()),
-            "matching initial snapshot did not open the typed timeline stream"
+            "matching projection unexpectedly replaced or closed the typed timeline stream"
         );
 
         app.pending_run = None;

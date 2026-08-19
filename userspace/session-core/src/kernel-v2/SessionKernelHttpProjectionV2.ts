@@ -19,12 +19,13 @@ import {
   normalizeAgentTimelineSnapshot,
 } from '../timelineDelta.js';
 import {
-  appendProviderComposingProjectionV2,
+  appendProviderComposingProjectionV3,
 } from '../projectionV2.js';
 import type {
   SessionKernelHostProjectionSinkV2,
 } from './SessionKernelHttpPersistenceV2.js';
 import type {
+  SessionKernelProjectionDeliveryOptionsV2,
   SessionKernelProjectionReceiptV2,
 } from './ports.js';
 import type {
@@ -56,6 +57,7 @@ const MAX_PRIOR_EVENTS_PAGE_COUNT = 128;
 const MAX_PRIOR_EVENTS_PAGE_UTF8_BYTES = 1024 * 1024;
 const MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_UTF8_BYTES =
   8 * 1024 * 1024;
+const DEFAULT_PROJECTION_DELIVERY_DEADLINE_MS = 15_000;
 
 export interface SessionKernelPublicProjectionPayloadV2 {
   schemaVersion: typeof SESSION_KERNEL_PUBLIC_PROJECTION_V2_SCHEMA;
@@ -195,10 +197,11 @@ implements SessionKernelHostProjectionSinkV2 {
 
   async publish(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
     const publication = this.publicationTail.then(() =>
-      this.publishSerial(event, projectionHistory)
+      this.publishSerial(event, projectionHistory, options)
     );
     this.publicationTail = publication.then(
       () => undefined,
@@ -209,36 +212,53 @@ implements SessionKernelHostProjectionSinkV2 {
 
   private async publishSerial(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
-    const projectionId = requiredIdentity(event.projectionId, 'projectionId');
-    const eventDigest = sha256Hash(canonicalJson(event));
-    const replay = this.lastPublished?.projectionId === projectionId
-      ? this.lastPublished
-      : undefined;
-    if (replay) {
-      if (replay.eventDigest !== eventDigest) {
-        throw new SessionKernelProjectionTransportError(
-          'session_kernel_projection_identity_conflict',
-          'Session projection identity was reused with different content.'
+    const delivery = projectionDeliveryAbortScope(options);
+    try {
+      const projectionId = requiredIdentity(
+        event.projectionId,
+        'projectionId'
+      );
+      const eventDigest = sha256Hash(canonicalJson(event));
+      const replay = this.lastPublished?.projectionId === projectionId
+        ? this.lastPublished
+        : undefined;
+      if (replay) {
+        if (replay.eventDigest !== eventDigest) {
+          throw new SessionKernelProjectionTransportError(
+            'session_kernel_projection_identity_conflict',
+            'Session projection identity was reused with different content.'
+          );
+        }
+        const receipt = await this.sendProjectionRequest(
+          replay.request,
+          delivery.signal
         );
+        this.currentTimeline = cloneJson(replay.timeline);
+        return receipt;
       }
-      const receipt = await this.sendProjectionRequest(replay.request);
-      this.currentTimeline = cloneJson(replay.timeline);
+      const prepared = await this.prepareProjectionRequest(
+        event,
+        projectionHistory,
+        delivery.signal
+      );
+      const receipt = await this.sendProjectionRequest(
+        prepared.request,
+        delivery.signal
+      );
+      this.commitPreparedProjection(prepared);
       return receipt;
+    } finally {
+      delivery.dispose();
     }
-    const prepared = await this.prepareProjectionRequest(
-      event,
-      projectionHistory
-    );
-    const receipt = await this.sendProjectionRequest(prepared.request);
-    this.commitPreparedProjection(prepared);
-    return receipt;
   }
 
   private async prepareProjectionRequest(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    signal: AbortSignal
   ): Promise<PreparedHostProjectionV2> {
     assertNoTransportCapabilities(event);
     const projectionId = requiredIdentity(
@@ -254,7 +274,7 @@ implements SessionKernelHostProjectionSinkV2 {
     let timelineUpdate:
       SessionKernelHostProjectionRequestV2['timelineUpdate'];
     if (event.kind === 'provider.composing' && this.currentTimeline) {
-      timeline = appendProviderComposingProjectionV2(
+      timeline = appendProviderComposingProjectionV3(
         this.currentTimeline,
         agentEvent
       );
@@ -272,8 +292,8 @@ implements SessionKernelHostProjectionSinkV2 {
           sessionKernelAgentEventV2(this.sessionId, projection)
       );
       const [priorEvents, priorTimeline] = await Promise.all([
-        this.priorEventsForProjection(),
-        this.priorTimelineForProjection(),
+        this.priorEventsForProjection(signal),
+        this.priorTimelineForProjection(signal),
       ]);
       const agentEvents = [
         ...priorEvents,
@@ -359,7 +379,8 @@ implements SessionKernelHostProjectionSinkV2 {
   }
 
   private async sendProjectionRequest(
-    request: SessionKernelHostProjectionRequestV2
+    request: SessionKernelHostProjectionRequestV2,
+    signal: AbortSignal
   ): Promise<SessionKernelProjectionReceiptV2> {
     const { projectionId, projectionDigest } = request;
     const encodedRequest = JSON.stringify(request);
@@ -379,6 +400,7 @@ implements SessionKernelHostProjectionSinkV2 {
         'x-deepcode-run-capability': this.#runCapability,
       },
       body: encodedRequest,
+      signal,
     });
     if (!response.ok) {
       const failure = await projectionHttpFailure(
@@ -387,7 +409,8 @@ implements SessionKernelHostProjectionSinkV2 {
       );
       throw new SessionKernelProjectionTransportError(
         failure.code,
-        failure.message
+        failure.message,
+        failure.retryable
       );
     }
     const rawReply: unknown = await response.json();
@@ -454,14 +477,14 @@ implements SessionKernelHostProjectionSinkV2 {
     };
   }
 
-  private priorEventsForProjection(): Promise<AgentEvent[]> {
+  private priorEventsForProjection(signal: AbortSignal): Promise<AgentEvent[]> {
     if (this.priorSessionEvents.omittedEventCount === 0) {
       return Promise.resolve(
         cloneJson(this.priorSessionEvents.events)
       );
     }
     if (!this.fullPriorSessionEvents) {
-      const loading = this.fetchFrozenPriorEvents();
+      const loading = this.fetchFrozenPriorEvents(signal);
       const recoverable = loading.catch((error: unknown) => {
         if (this.fullPriorSessionEvents === recoverable) {
           this.fullPriorSessionEvents = undefined;
@@ -473,13 +496,13 @@ implements SessionKernelHostProjectionSinkV2 {
     return this.fullPriorSessionEvents.then(cloneJson);
   }
 
-  private priorTimelineForProjection():
+  private priorTimelineForProjection(signal: AbortSignal):
   Promise<AgentTimelineResult | undefined> {
     if (this.priorSessionEvents.sourceEventVersion === 0) {
       return Promise.resolve(undefined);
     }
     if (!this.frozenPriorTimeline) {
-      const loading = this.fetchFrozenPriorTimeline();
+      const loading = this.fetchFrozenPriorTimeline(signal);
       const recoverable = loading.catch((error: unknown) => {
         if (this.frozenPriorTimeline === recoverable) {
           this.frozenPriorTimeline = undefined;
@@ -491,7 +514,7 @@ implements SessionKernelHostProjectionSinkV2 {
     return this.frozenPriorTimeline.then(cloneJson);
   }
 
-  private async fetchFrozenPriorTimeline():
+  private async fetchFrozenPriorTimeline(signal: AbortSignal):
   Promise<AgentTimelineResult> {
     const response = await this.fetchImpl(this.priorTimelineEndpoint, {
       method: 'GET',
@@ -499,6 +522,7 @@ implements SessionKernelHostProjectionSinkV2 {
         'x-deepcode-run-id': this.runId,
         'x-deepcode-run-capability': this.#runCapability,
       },
+      signal,
     });
     if (!response.ok) {
       throw new SessionKernelProjectionTransportError(
@@ -566,7 +590,9 @@ implements SessionKernelHostProjectionSinkV2 {
     return timeline;
   }
 
-  private async fetchFrozenPriorEvents(): Promise<AgentEvent[]> {
+  private async fetchFrozenPriorEvents(
+    signal: AbortSignal
+  ): Promise<AgentEvent[]> {
     const events: AgentEvent[] = [];
     let continuation: string | null = null;
     do {
@@ -580,6 +606,7 @@ implements SessionKernelHostProjectionSinkV2 {
         headers: {
           'x-deepcode-run-capability': this.#runCapability,
         },
+        signal,
       });
       if (!response.ok) {
         const failure = await priorEventsHttpFailure(response);
@@ -776,7 +803,11 @@ function mergeTimelineTokenUsage(
 async function projectionHttpFailure(
   response: Response,
   projectionId: string
-): Promise<{ code: string; message: string }> {
+): Promise<{ code: string; message: string; retryable: boolean }> {
+  const retryable = response.status === 408
+    || response.status === 425
+    || response.status === 429
+    || response.status >= 500;
   try {
     const envelope = objectRecord(await response.json());
     const nestedError = objectRecord(envelope?.error);
@@ -793,7 +824,7 @@ async function projectionHttpFailure(
       && message.length > 0
       && new TextEncoder().encode(message).byteLength <= 8_192
     ) {
-      return { code, message };
+      return { code, message, retryable };
     }
   } catch {
     // Preserve a typed local transport failure for non-v2 Host responses.
@@ -802,11 +833,13 @@ async function projectionHttpFailure(
     ? {
         code: 'session_kernel_projection_identity_conflict',
         message: `Projection ${projectionId} conflicts with Host content.`,
+        retryable: false,
       }
     : {
         code: 'session_kernel_projection_http_failed',
         message:
           `Session v2 projection failed with HTTP ${response.status}.`,
+        retryable,
       };
 }
 
@@ -1171,6 +1204,8 @@ function publicPresentation(
           review: cloneJson(event.data),
         },
       };
+    case 'userIntervention.changed':
+      return userInterventionPresentation(data);
     case 'planAction.completed':
       return {
         kind: 'workflow_stage',
@@ -1204,6 +1239,7 @@ function publicPresentation(
         data?.orderedItems
       );
       const orderedItems = outputKind === 'plan'
+        || outputKind === 'planEvidenceRefresh'
         ? []
         : decodedOrderedItems;
       const terminalScope = publicTerminalScope(data);
@@ -1230,6 +1266,7 @@ function publicPresentation(
       }
       const terminalAnswer = result?.kind === 'answer'
         && terminalScope === 'turn';
+      const answerState = textField(data, 'answerState');
       const terminalAnswerText = terminalAnswer
         ? exactTerminalAnswerText(result, decodedOrderedItems)
         : undefined;
@@ -1249,6 +1286,7 @@ function publicPresentation(
           ...(orderedItems.length > 0 ? { orderedItems } : {}),
           ...(terminalScope ? { terminalScope } : {}),
           outputKind,
+          ...(answerState ? { answerState } : {}),
           providerTurnId,
           controlEpoch,
           providerOutcome: publicProviderOutcome(data?.providerOutcome),
@@ -1261,6 +1299,19 @@ function publicPresentation(
         },
       };
     }
+    case 'provider.answerState':
+      return {
+        kind: 'workflow_stage',
+        channel: 'progress',
+        visibility: 'conversation',
+        fields: {
+          status: 'completed',
+          providerTurnId: textField(data, 'providerTurnId'),
+          controlEpoch: data?.controlEpoch,
+          answerState: textField(data, 'answerState'),
+          reasonCode: textField(data, 'reasonCode'),
+        },
+      };
     case 'provider.started': {
       const currentActivityCode = textField(
         data,
@@ -1369,6 +1420,21 @@ function publicPresentation(
     }
     case 'diagnostic': {
       const stage = textField(data, 'stage');
+      if (stage === 'provider.structuredRepair') {
+        return {
+          kind: 'workflow_stage',
+          channel: 'progress',
+          visibility: 'trace',
+          fields: {
+            status: 'recovering',
+            code: textField(data, 'code'),
+            providerTurnId: textField(data, 'providerTurnId'),
+            currentActivityCode: 'session.validating',
+            summary:
+              'Validating Provider structured output before retry.',
+          },
+        };
+      }
       if (stage === 'provider.toolCallQueue') {
         const orderedItems = publicOrderedProviderItems(
           data?.orderedItems
@@ -1414,6 +1480,254 @@ function publicPresentation(
   }
 }
 
+function userInterventionPresentation(
+  data: Record<string, unknown> | undefined
+): ReturnType<typeof publicPresentation> {
+  const state = textField(data, 'state');
+  const intervention = objectRecord(data?.intervention);
+  if (!intervention) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_user_intervention_projection_invalid',
+      'User intervention projection is missing its canonical card.'
+    );
+  }
+  const interactionId = requiredIdentity(
+    intervention.interactionId,
+    'intervention.interactionId'
+  );
+  const interactionRevision = requiredIdentity(
+    intervention.interactionRevision,
+    'intervention.interactionRevision'
+  );
+  const candidateSetDigest = requiredIdentity(
+    intervention.candidateSetDigest,
+    'intervention.candidateSetDigest'
+  );
+  const runId = requiredIdentity(intervention.runId, 'intervention.runId');
+  const problemSummary = boundedPublicText(
+    intervention.problemSummary,
+    'intervention.problemSummary'
+  );
+  const decision = objectRecord(data?.decision);
+  const publicState = state === 'open'
+    ? 'awaitingUserDecision'
+    : state === 'accepted'
+      ? 'accepted'
+      : state === 'rejected'
+        ? 'rejected'
+        : 'needsRevision';
+  return {
+    kind: 'user_intervention',
+    channel: 'task',
+    visibility: 'both',
+    fields: {
+      status: publicState,
+      decisionKind: 'userIntervention',
+      interactionId,
+      interactionRevision,
+      candidateSetDigest,
+      targetId: interactionId,
+      blockId: `user-intervention:${runId}:${interactionId}`,
+      title: 'User intervention required',
+      summary: problemSummary,
+      intervention: publicUserInterventionView(intervention),
+      ...(decision
+        ? {
+            decision: textField(decision, 'decision'),
+            selectedOptionId: textField(decision, 'optionId'),
+            guidance: textField(decision, 'guidance'),
+          }
+        : {}),
+      ...(textField(data, 'acceptedPlanRevision')
+        ? { acceptedPlanRevision: textField(data, 'acceptedPlanRevision') }
+        : {}),
+    },
+  };
+}
+
+function publicUserInterventionView(
+  intervention: Record<string, unknown>
+): Record<string, unknown> {
+  const options = Array.isArray(intervention.options)
+    ? intervention.options.map((value, index) => {
+        const option = objectRecord(value);
+        if (!option) {
+          throw invalidPublicIntervention(`options[${index}]`);
+        }
+        const optionId = requiredIdentity(
+          option.optionId,
+          `intervention.options[${index}].optionId`
+        );
+        const kind = textField(option, 'kind');
+        if (kind !== 'executable' && kind !== 'guidanceOnly') {
+          throw invalidPublicIntervention(`options[${index}].kind`);
+        }
+        const candidatePlan = objectRecord(option.candidatePlan);
+        const actions = Array.isArray(option.actions)
+          ? option.actions.map((actionValue, actionIndex) => {
+              const action = objectRecord(actionValue);
+              const preview = objectRecord(action?.preview);
+              const approval = objectRecord(preview?.approvalView);
+              if (!action || !preview || !approval) {
+                throw invalidPublicIntervention(
+                  `options[${index}].actions[${actionIndex}]`
+                );
+              }
+              return {
+                planActionId: requiredIdentity(
+                  action.planActionId,
+                  'intervention.action.planActionId'
+                ),
+                operationId: requiredIdentity(
+                  action.operationId,
+                  'intervention.action.operationId'
+                ),
+                toolId: requiredIdentity(
+                  action.toolId,
+                  'intervention.action.toolId'
+                ),
+                summary: boundedPublicText(
+                  action.summary,
+                  'intervention.action.summary'
+                ),
+                riskLevel: interventionRisk(preview.risk),
+                canonicalTargets: boundedPublicTextArray(
+                  approval.canonicalTargets,
+                  'intervention.action.canonicalTargets'
+                ),
+                scopeDelta: boundedPublicTextArray(
+                  approval.scopeDelta,
+                  'intervention.action.scopeDelta'
+                ),
+                previewId: requiredIdentity(
+                  preview.previewId,
+                  'intervention.action.previewId'
+                ),
+                previewDigest: sha256Hash(canonicalJson(preview)),
+              };
+            })
+          : [];
+        if (
+          (kind === 'executable' && (!candidatePlan || actions.length === 0))
+          || (kind === 'guidanceOnly' && (candidatePlan || actions.length > 0))
+        ) {
+          throw invalidPublicIntervention(`options[${index}].authority`);
+        }
+        return {
+          id: optionId,
+          label: boundedPublicText(
+            option.title,
+            `intervention.options[${index}].title`
+          ),
+          description: boundedPublicText(
+            option.description,
+            `intervention.options[${index}].description`
+          ),
+          recommended: option.recommended === true,
+          kind,
+          tradeoffs: boundedPublicTextArray(
+            option.tradeoffs,
+            `intervention.options[${index}].tradeoffs`
+          ),
+          ...(candidatePlan
+            ? {
+                candidatePlanRevision: requiredIdentity(
+                  candidatePlan.planRevision,
+                  'intervention.candidatePlan.planRevision'
+                ),
+                candidatePlanDigest: sha256Hash(canonicalJson(candidatePlan)),
+              }
+            : {}),
+          actions,
+        };
+      })
+    : [];
+  if (options.length === 0) {
+    throw invalidPublicIntervention('options');
+  }
+  return {
+    schemaVersion: 'deepcode.session.user-intervention.v1',
+    interactionId: requiredIdentity(
+      intervention.interactionId,
+      'intervention.interactionId'
+    ),
+    interactionRevision: requiredIdentity(
+      intervention.interactionRevision,
+      'intervention.interactionRevision'
+    ),
+    candidateSetDigest: requiredIdentity(
+      intervention.candidateSetDigest,
+      'intervention.candidateSetDigest'
+    ),
+    problemSummary: boundedPublicText(
+      intervention.problemSummary,
+      'intervention.problemSummary'
+    ),
+    ...(intervention.recommendation === undefined
+      ? {}
+      : {
+          recommendation: boundedPublicText(
+            intervention.recommendation,
+            'intervention.recommendation'
+          ),
+        }),
+    relevantFacts: boundedPublicTextArray(
+      intervention.relevantFactRefs,
+      'intervention.relevantFactRefs'
+    ),
+    affectedPlanActionIds: boundedPublicTextArray(
+      intervention.affectedPlanActionIds,
+      'intervention.affectedPlanActionIds'
+    ),
+    options,
+    allowsFreeform: true,
+  };
+}
+
+function interventionRisk(
+  value: unknown
+): 'low' | 'medium' | 'high' | 'critical' {
+  if (
+    value !== 'low'
+    && value !== 'medium'
+    && value !== 'high'
+    && value !== 'critical'
+  ) {
+    throw invalidPublicIntervention('risk');
+  }
+  return value;
+}
+
+function boundedPublicText(value: unknown, field: string): string {
+  if (
+    typeof value !== 'string'
+    || !value.trim()
+    || value.trim() !== value
+    || new TextEncoder().encode(value).byteLength > 64 * 1024
+  ) {
+    throw invalidPublicIntervention(field);
+  }
+  return value;
+}
+
+function boundedPublicTextArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > 256) {
+    throw invalidPublicIntervention(field);
+  }
+  return value.map((item, index) =>
+    boundedPublicText(item, `${field}[${index}]`)
+  );
+}
+
+function invalidPublicIntervention(
+  field: string
+): SessionKernelProjectionTransportError {
+  return new SessionKernelProjectionTransportError(
+    'session_kernel_user_intervention_projection_invalid',
+    `User intervention public field ${field} is invalid.`
+  );
+}
+
 type CurrentProjectionFieldKind =
   | 'identity'
   | 'string'
@@ -1430,12 +1744,19 @@ type CurrentProjectionFieldSchema = Readonly<
 const CURRENT_PLAN_FIELDS = {
   runId: 'identity',
   inputId: 'identity',
+  controlEpoch: 'positiveInteger',
   planRevision: 'identity',
   title: 'string',
   objective: 'string',
   narrative: 'string',
+  evidence: 'object',
+  carriedSettlementRefs: 'array',
   actions: 'array',
   recordedAt: 'identity',
+} as const satisfies CurrentProjectionFieldSchema;
+
+const CURRENT_PLAN_OPTIONAL_FIELDS = {
+  predecessorPlanRef: 'object',
 } as const satisfies CurrentProjectionFieldSchema;
 
 const CURRENT_SCOPE_PREVIEW_FIELDS = {
@@ -1446,6 +1767,7 @@ const CURRENT_SCOPE_PREVIEW_FIELDS = {
   planActionId: 'identity',
   operationId: 'identity',
   toolId: 'identity',
+  origin: 'object',
   authorizationBinding: 'object',
   canonicalScope: 'object',
   scopeDigest: 'identity',
@@ -1482,7 +1804,8 @@ function currentProjectionData(
     case 'plan.persisted': {
       const data = exactCurrentProjectionRecord(
         event,
-        CURRENT_PLAN_FIELDS
+        CURRENT_PLAN_FIELDS,
+        CURRENT_PLAN_OPTIONAL_FIELDS
       );
       validateCurrentPlan(data);
       return data;
@@ -1583,6 +1906,19 @@ function currentProjectionData(
     }
     case 'provider.completed':
       return currentProviderCompletedProjectionData(event);
+    case 'provider.answerState': {
+      const data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          controlEpoch: 'positiveInteger',
+          answerState: 'string',
+          reasonCode: 'identity',
+        }
+      );
+      projectionEnum(data, 'answerState', ['stale', 'rejected']);
+      return data;
+    }
     case 'provider.stale':
       return exactCurrentProjectionRecord(
         event,
@@ -1698,6 +2034,8 @@ function currentProjectionData(
       ]);
       return data;
     }
+    case 'userIntervention.changed':
+      return currentUserInterventionProjectionData(event);
     case 'run.cancelled':
       return exactCurrentProjectionRecord(event, {
         callerRequestId: 'identity',
@@ -1714,6 +2052,93 @@ function currentProjectionData(
     default:
       throw unsupportedProjectionKind(event);
   }
+}
+
+function currentUserInterventionProjectionData(
+  event: SessionKernelProjectionEventV2
+): Record<string, unknown> {
+  const tagged = objectRecord(event.data);
+  const state = textField(tagged, 'state');
+  const data = state === 'open'
+    ? exactCurrentProjectionRecord(event, {
+        state: 'string',
+        wait: 'object',
+        intervention: 'object',
+      })
+    : state === 'accepted'
+      ? exactCurrentProjectionRecord(event, {
+          state: 'string',
+          intervention: 'object',
+          decision: 'object',
+          acceptedPlanRevision: 'identity',
+        })
+      : exactCurrentProjectionRecord(event, {
+          state: 'string',
+          intervention: 'object',
+          decision: 'object',
+        });
+  projectionEnum(data, 'state', [
+    'open',
+    'accepted',
+    'needsRevision',
+    'guidanceReplan',
+    'rejected',
+  ]);
+  const intervention = projectionObject(data, 'intervention');
+  for (const field of [
+    'runId',
+    'inputId',
+    'interactionId',
+    'interactionRevision',
+    'candidateSetDigest',
+    'evidenceProgressDigest',
+    'recordedAt',
+  ]) {
+    requiredIdentity(intervention[field], `intervention.${field}`);
+  }
+  if (
+    intervention.schemaVersion !== 'deepcode.session.user-intervention.v1'
+    || typeof intervention.problemSummary !== 'string'
+    || !intervention.problemSummary.trim()
+    || !Number.isSafeInteger(intervention.controlEpoch)
+    || Number(intervention.controlEpoch) <= 0
+    || !Array.isArray(intervention.relevantFactRefs)
+    || !Array.isArray(intervention.affectedPlanActionIds)
+    || !Array.isArray(intervention.options)
+    || intervention.options.length === 0
+  ) {
+    throw invalidCurrentProjectionData(
+      event.kind,
+      'user intervention payload is incomplete'
+    );
+  }
+  if (state === 'open') {
+    const wait = projectionObject(data, 'wait');
+    if (
+      wait.kind !== 'userIntervention'
+      || wait.interactionId !== intervention.interactionId
+      || wait.interactionRevision !== intervention.interactionRevision
+      || wait.candidateSetDigest !== intervention.candidateSetDigest
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'user intervention wait does not match the card identity'
+      );
+    }
+  } else {
+    const decision = projectionObject(data, 'decision');
+    if (
+      decision.interactionId !== intervention.interactionId
+      || decision.interactionRevision !== intervention.interactionRevision
+      || decision.candidateSetDigest !== intervention.candidateSetDigest
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'user intervention decision does not match the card identity'
+      );
+    }
+  }
+  return data;
 }
 
 function currentScopePreviewProjectionData(
@@ -1825,6 +2250,8 @@ function currentProviderCompletedProjectionData(
       toolCallReceipt: 'object',
       reviewRevision: 'positiveInteger',
       snapshotHighWater: 'nonNegativeInteger',
+      candidateSourceEventRefs: 'array',
+      answerState: 'string',
     }
   );
   projectionEnum(data, 'outputKind', [
@@ -1832,9 +2259,27 @@ function currentProviderCompletedProjectionData(
     'answer',
     'noTool',
     'toolIntent',
+    'planEvidenceRefresh',
     'planActionComplete',
+    'intervention',
   ]);
   projectionEnum(data, 'terminalScope', ['turn', 'providerTurn']);
+  if (data.answerState !== undefined) {
+    projectionEnum(data, 'answerState', ['provisional', 'committed']);
+    if (
+      data.outputKind !== 'answer'
+      || (
+        data.answerState === 'provisional'
+          ? data.terminalScope !== 'providerTurn'
+          : data.terminalScope !== 'turn'
+      )
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'answer state does not match Provider answer settlement'
+      );
+    }
+  }
   if (data.status !== undefined) {
     projectionEnum(data, 'status', ['responseAccepted']);
   }
@@ -1866,6 +2311,25 @@ function currentProviderCompletedProjectionData(
       'final Review binding does not match a terminal Provider answer'
     );
   }
+  if (data.candidateSourceEventRefs !== undefined) {
+    const sourceRefs = (data.candidateSourceEventRefs as unknown[])
+      .map((sourceRef) => requiredIdentity(
+        sourceRef,
+        'candidateSourceEventRef'
+      ));
+    if (
+      sourceRefs.length === 0
+      || new Set(sourceRefs).size !== sourceRefs.length
+      || data.outputKind !== 'answer'
+      || data.terminalScope !== 'turn'
+      || !hasReviewRevision
+    ) {
+      throw invalidCurrentProjectionData(
+        event.kind,
+        'candidate source refs do not bind a terminal reviewed answer'
+      );
+    }
+  }
   return data;
 }
 
@@ -1891,7 +2355,7 @@ function currentToolIntentProjectionData(
   );
   const authorityKind = projectionEnum(data, 'authorityKind', [
     'planAction',
-    'contextRead',
+    'read',
   ]);
   const replyKind = projectionEnum(data, 'replyKind', [
     'admitted',
@@ -2047,6 +2511,37 @@ function currentDiagnosticProjectionData(
       projectionEnum(data, 'status', ['failed']);
       projectionEnum(data, 'terminalScope', ['turn']);
       break;
+    case 'provider.structuredRepair':
+      data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          status: 'string',
+          code: 'identity',
+          stage: 'string',
+          currentActivityCode: 'string',
+        }
+      );
+      projectionEnum(data, 'status', ['recovering']);
+      projectionEnum(data, 'currentActivityCode', [
+        'session.validating',
+      ]);
+      break;
+    case 'provider.structuredRepairNoProgress':
+      data = exactCurrentProjectionRecord(
+        event,
+        {
+          providerTurnId: 'identity',
+          status: 'string',
+          terminalScope: 'string',
+          code: 'identity',
+          message: 'string',
+          stage: 'string',
+        }
+      );
+      projectionEnum(data, 'status', ['failed']);
+      projectionEnum(data, 'terminalScope', ['turn']);
+      break;
     case 'provider.outputAdmission':
       data = exactCurrentProjectionRecord(event, {
         providerTurnId: 'identity',
@@ -2070,7 +2565,8 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
   const plan = exactCurrentProjectionValue(
     data,
     'plan',
-    CURRENT_PLAN_FIELDS
+    CURRENT_PLAN_FIELDS,
+    CURRENT_PLAN_OPTIONAL_FIELDS
   );
   for (const field of ['title', 'objective', 'narrative'] as const) {
     if (!(plan[field] as string).trim()) {
@@ -2080,7 +2576,65 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
       );
     }
   }
-  projectionArray(plan, 'actions').forEach((value, index) => {
+  validateCurrentPlanEvidence(
+    projectionObject(plan, 'evidence'),
+    plan.runId as string,
+    plan.controlEpoch as number
+  );
+  if (plan.predecessorPlanRef !== undefined) {
+    const predecessor = exactCurrentProjectionValue(
+      plan.predecessorPlanRef,
+      'plan.predecessorPlanRef',
+      {
+        planRevision: 'identity',
+        planDigest: 'identity',
+      }
+    );
+    currentProjectionDigest(
+      predecessor.planDigest,
+      'plan.predecessorPlanRef.planDigest'
+    );
+  }
+  const carriedActionIds = new Set<string>();
+  projectionArray(plan, 'carriedSettlementRefs').forEach(
+    (value, index) => {
+      const settlement = exactCurrentProjectionValue(
+        value,
+        `plan.carriedSettlementRefs[${String(index)}]`,
+        {
+          planRevision: 'identity',
+          planActionId: 'identity',
+          settlementDigest: 'identity',
+          kernelFactRefs: 'array',
+        }
+      );
+      currentProjectionDigest(
+        settlement.settlementDigest,
+        `plan.carriedSettlementRefs[${String(index)}].settlementDigest`
+      );
+      const planActionId = settlement.planActionId as string;
+      if (carriedActionIds.has(planActionId)) {
+        throw invalidCurrentProjectionData(
+          'plan.carriedSettlementRefs',
+          'PlanAction identities must be unique'
+        );
+      }
+      carriedActionIds.add(planActionId);
+      validateCurrentIdentityArray(
+        projectionArray(settlement, 'kernelFactRefs'),
+        `plan.carriedSettlementRefs[${String(index)}].kernelFactRefs`,
+        false
+      );
+    }
+  );
+  const actions = projectionArray(plan, 'actions');
+  if (actions.length === 0 || actions.length > 128) {
+    throw invalidCurrentProjectionData(
+      'plan.actions',
+      'Plan must contain 1..=128 current mutation actions'
+    );
+  }
+  actions.forEach((value, index) => {
     const action = exactCurrentProjectionValue(
       value,
       `plan.actions[${String(index)}]`,
@@ -2128,12 +2682,275 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
   });
 }
 
+function validateCurrentPlanEvidence(
+  evidence: Record<string, unknown>,
+  runId: string,
+  controlEpoch: number
+): void {
+  const current = exactCurrentProjectionValue(
+    evidence,
+    'plan.evidence',
+    {
+      kernelFactRefs: 'array',
+      readResources: 'array',
+      historicalRebinds: 'array',
+      blockingUnknowns: 'array',
+      nonBlockingUnknowns: 'array',
+      coverage: 'string',
+    }
+  );
+  if (!(current.coverage as string).trim()) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.coverage',
+      'coverage must be non-empty'
+    );
+  }
+  const kernelFactRefs = projectionArray(current, 'kernelFactRefs');
+  if (kernelFactRefs.length > 512) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.kernelFactRefs',
+      'Kernel fact ref list exceeds the current object bound'
+    );
+  }
+  validateCurrentIdentityArray(
+    kernelFactRefs,
+    'plan.evidence.kernelFactRefs',
+    false
+  );
+
+  const readResources = projectionArray(current, 'readResources');
+  if (readResources.length > 512) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.readResources',
+      'read evidence exceeds the current object bound'
+    );
+  }
+  const resourceRefs = new Set<string>();
+  const resourceEvidence = new Map<string, {
+    digest: string;
+    factRefs: string[];
+  }>();
+  readResources.forEach((value, index) => {
+    const resource = exactCurrentProjectionValue(
+      value,
+      `plan.evidence.readResources[${String(index)}]`,
+      {
+        resourceRef: 'identity',
+        digest: 'identity',
+        summary: 'string',
+        factRefs: 'array',
+      }
+    );
+    const resourceRef = resource.resourceRef as string;
+    if (
+      resourceRefs.has(resourceRef)
+      || !(resource.summary as string).trim()
+    ) {
+      throw invalidCurrentProjectionData(
+        'plan.evidence.readResources',
+        'resource refs must be unique and summaries must be non-empty'
+      );
+    }
+    resourceRefs.add(resourceRef);
+    currentProjectionDigest(
+      resource.digest,
+      `plan.evidence.readResources[${String(index)}].digest`
+    );
+    validateCurrentIdentityArray(
+      projectionArray(resource, 'factRefs'),
+      `plan.evidence.readResources[${String(index)}].factRefs`,
+      true
+    );
+    resourceEvidence.set(resourceRef, {
+      digest: resource.digest as string,
+      factRefs: projectionArray(resource, 'factRefs') as string[],
+    });
+  });
+
+  const historicalRebinds = projectionArray(
+    current,
+    'historicalRebinds'
+  );
+  if (historicalRebinds.length > 512) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.historicalRebinds',
+      'historical evidence rebinds exceed the current object bound'
+    );
+  }
+  const rebindIds = new Set<string>();
+  historicalRebinds.forEach((value, index) => {
+    const rebind = exactCurrentProjectionValue(
+      value,
+      `plan.evidence.historicalRebinds[${String(index)}]`,
+      {
+        rebindId: 'identity',
+        sourceEventId: 'identity',
+        sourceEventDigest: 'identity',
+        sourceEventVersion: 'positiveInteger',
+        sourceRunId: 'identity',
+        sourceFactId: 'identity',
+        sourceControlEpoch: 'positiveInteger',
+        sourceOperationId: 'identity',
+        sourceToolId: 'identity',
+        subjectDigest: 'identity',
+        sourceEvidenceDigest: 'identity',
+        sourceCandidateDigest: 'identity',
+        currentRunId: 'identity',
+        currentControlEpoch: 'positiveInteger',
+        currentFactRef: 'identity',
+        currentEvidenceDigest: 'identity',
+        resourceRef: 'identity',
+        contentRelation: 'string',
+      }
+    );
+    for (const digestField of [
+      'sourceEventDigest',
+      'subjectDigest',
+      'sourceEvidenceDigest',
+      'sourceCandidateDigest',
+      'currentEvidenceDigest',
+    ] as const) {
+      currentProjectionDigest(
+        rebind[digestField],
+        `plan.evidence.historicalRebinds[${String(index)}].${digestField}`
+      );
+    }
+    const resource = resourceEvidence.get(rebind.resourceRef as string);
+    if (
+      !rebindIds.add(rebind.rebindId as string)
+      || rebind.sourceRunId === runId
+      || rebind.currentRunId !== runId
+      || rebind.currentControlEpoch !== controlEpoch
+      || (
+        rebind.contentRelation !== 'sameDigest'
+        && rebind.contentRelation !== 'changedDigest'
+      )
+      || !resource
+      || resource.digest !== rebind.currentEvidenceDigest
+      || !resource.factRefs.includes(rebind.currentFactRef as string)
+    ) {
+      throw invalidCurrentProjectionData(
+        'plan.evidence.historicalRebinds',
+        'historical rebind must reference exact current read evidence'
+      );
+    }
+  });
+
+  const blocking = projectionArray(current, 'blockingUnknowns');
+  const nonBlocking = projectionArray(current, 'nonBlockingUnknowns');
+  if (blocking.length > 128 || nonBlocking.length > 128) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.unknowns',
+      'unknown list exceeds the current object bound'
+    );
+  }
+  const unknownIds = new Set<string>();
+  [...blocking, ...nonBlocking].forEach((value, index) => {
+    const unknown = exactCurrentProjectionValue(
+      value,
+      `plan.evidence.unknowns[${String(index)}]`,
+      {
+        unknownId: 'identity',
+        question: 'string',
+        impact: 'string',
+      }
+    );
+    const unknownId = unknown.unknownId as string;
+    if (
+      unknownIds.has(unknownId)
+      || !(unknown.question as string).trim()
+      || !(unknown.impact as string).trim()
+    ) {
+      throw invalidCurrentProjectionData(
+        'plan.evidence.unknowns',
+        'unknown identities must be unique and text must be non-empty'
+      );
+    }
+    unknownIds.add(unknownId);
+  });
+}
+
+function validateCurrentIdentityArray(
+  values: unknown[],
+  field: string,
+  requireNonEmpty: boolean
+): void {
+  if (requireNonEmpty && values.length === 0) {
+    throw invalidCurrentProjectionData(
+      field,
+      'identity list must be non-empty'
+    );
+  }
+  const identities = new Set<string>();
+  values.forEach((value) => {
+    if (!currentProjectionIdentity(value) || identities.has(value as string)) {
+      throw invalidCurrentProjectionData(
+        field,
+        'identities must be current and unique'
+      );
+    }
+    identities.add(value as string);
+  });
+}
+
+function currentProjectionDigest(value: unknown, field: string): string {
+  if (
+    typeof value !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(value)
+  ) {
+    throw invalidCurrentProjectionData(field, 'digest is invalid');
+  }
+  return value;
+}
+
 function validateCurrentScopePreview(value: unknown, field: string): void {
   const preview = exactCurrentProjectionValue(
     value,
     field,
     CURRENT_SCOPE_PREVIEW_FIELDS
   );
+  const origin = exactCurrentProjectionValue(
+    preview.origin,
+    `${field}.origin`,
+    { kind: 'string', data: 'object' }
+  );
+  switch (projectionEnum(origin, 'kind', [
+    'plan',
+    'planDiscovery',
+    'interventionCandidate',
+  ])) {
+    case 'plan':
+      exactCurrentProjectionValue(
+        origin.data,
+        `${field}.origin.data`,
+        {}
+      );
+      break;
+    case 'planDiscovery':
+      exactCurrentProjectionValue(
+        origin.data,
+        `${field}.origin.data`,
+        { discoveryId: 'identity' }
+      );
+      break;
+    case 'interventionCandidate': {
+      const data = exactCurrentProjectionValue(
+        origin.data,
+        `${field}.origin.data`,
+        {
+          interactionId: 'identity',
+          interactionRevision: 'identity',
+          candidateSetDigest: 'identity',
+          optionId: 'identity',
+        }
+      );
+      currentProjectionDigest(
+        data.candidateSetDigest,
+        `${field}.origin.data.candidateSetDigest`
+      );
+      break;
+    }
+  }
   projectionEnum(preview, 'effectClass', ['read', 'mutation']);
   projectionEnum(preview, 'effectScope', [
     'workspaceRead',
@@ -2310,7 +3127,7 @@ function invalidCurrentProjectionData(
   return new SessionKernelProjectionTransportError(
     'session_kernel_projection_data_invalid',
     'Session ' + kind
-      + ' projection is not exact current v2 data: ' + reason + '.'
+      + ' projection is not exact current v4 data: ' + reason + '.'
   );
 }
 
@@ -2320,7 +3137,7 @@ function unsupportedProjectionKind(
   return new SessionKernelProjectionTransportError(
     'UnsupportedHistorySchema',
     'Session projection kind ' + String(event.kind)
-      + ' is not current v2.'
+      + ' is not current v4.'
   );
 }
 function providerComposingPresentation(
@@ -2838,6 +3655,7 @@ function publicOrderedProviderItems(
       'toolName',
       'toolId',
       'operationId',
+      'previewId',
       'status',
       'invocationId',
       'terminalFactId',
@@ -2878,6 +3696,14 @@ function publicOrderedProviderItems(
       toolName: requiredIdentity(item.toolName, 'toolName'),
       toolId: requiredIdentity(item.toolId, 'toolId'),
       ...(operationId ? { operationId } : {}),
+      ...(item.previewId === undefined
+        ? {}
+        : {
+            previewId: requiredIdentity(
+              item.previewId,
+              'previewId'
+            ),
+          }),
       ...(retry ? { retry } : {}),
       ...(status ? { status } : {}),
       ...(item.invocationId === undefined
@@ -3295,10 +4121,59 @@ function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function projectionDeliveryAbortScope(
+  options: SessionKernelProjectionDeliveryOptionsV2 | undefined
+): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const external = options?.signal;
+  const deadlineMs = options?.deadlineMs
+    ?? DEFAULT_PROJECTION_DELIVERY_DEADLINE_MS;
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_deadline_invalid',
+      'Session projection delivery deadline must be a positive integer.'
+    );
+  }
+  const abortFromExternal = (): void => {
+    controller.abort(
+      external?.reason
+      ?? new SessionKernelProjectionTransportError(
+        'session_kernel_projection_delivery_cancelled',
+        'Session projection delivery was cancelled.'
+      )
+    );
+  };
+  if (external?.aborted) {
+    abortFromExternal();
+  } else {
+    external?.addEventListener('abort', abortFromExternal, { once: true });
+  }
+  const timer = setTimeout(() => {
+    controller.abort(
+      new SessionKernelProjectionTransportError(
+        'session_kernel_projection_delivery_timeout',
+        `Session projection delivery exceeded ${deadlineMs}ms.`,
+        true
+      )
+    );
+  }, deadlineMs);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', abortFromExternal);
+    },
+  };
+}
+
 export class SessionKernelProjectionTransportError extends Error {
   constructor(
     readonly code: string,
-    message: string
+    message: string,
+    readonly retryable = false
   ) {
     super(message);
     this.name = 'SessionKernelProjectionTransportError';

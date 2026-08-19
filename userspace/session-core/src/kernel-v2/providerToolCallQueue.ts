@@ -1,5 +1,11 @@
 import type {
+  CapabilityScopePreviewBatchReplyV2,
+  CapabilityScopePreviewRecordV2,
+  CapabilityScopeRejectionReasonV2,
+  DeadlineRequestV2,
   KernelFactProjectionV2,
+  RawToolArgumentsV2,
+  ToolContextRefV2,
   ToolIntentRejectionReasonV2,
   ToolIntentSubmitReplyV2,
   ToolIntentV2,
@@ -13,6 +19,7 @@ import {
   SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2,
 } from './factKinds.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
+import { utf8Prefix } from './utf8.js';
 import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   type SessionProviderCompletionReceiptV1,
@@ -22,6 +29,7 @@ import {
   type SessionProviderSettledToolCallV2,
   type SessionProviderToolRejectionV2,
   type SessionProviderToolCallReceiptV2,
+  type SessionProviderTurnOutputV2,
   type SessionToolCorrectionV2,
   type SessionProviderTurnTargetV2,
 } from './types.js';
@@ -46,6 +54,7 @@ export function isExactSessionProviderOutcomeRecordV2(
 
 export type SessionProviderToolCallQueueItemStatusV2 =
   | 'pending'
+  | 'previewing'
   | 'submitting'
   | 'awaitingCapability'
   | 'awaitingInvocation'
@@ -53,9 +62,31 @@ export type SessionProviderToolCallQueueItemStatusV2 =
   | 'aborted'
   | 'unexecuted';
 
+export interface SessionProviderMutationCandidatePreviewV4 {
+  runId: string;
+  controlEpoch: number;
+  discoveryId: string;
+  planRevision: string;
+  planActionId: string;
+  operationId: string;
+  idempotencyKey: string;
+  toolId: string;
+  rawArguments: RawToolArgumentsV2;
+  deadline: DeadlineRequestV2;
+  toolContextRef: ToolContextRefV2;
+  preview?: CapabilityScopePreviewRecordV2;
+  rejection?: {
+    reason: CapabilityScopeRejectionReasonV2;
+    guidance: string;
+  };
+  classification?: 'planned' | 'outOfPlan';
+}
+
 export interface SessionProviderToolCallQueueItemV2 {
   ordinal: number;
-  intent: ToolIntentV2;
+  dispatchKind: 'read' | 'mutation';
+  intent?: ToolIntentV2;
+  candidatePreview?: SessionProviderMutationCandidatePreviewV4;
   status: SessionProviderToolCallQueueItemStatusV2;
   requestId?: string;
   requestStartedAt?: string;
@@ -76,6 +107,12 @@ export interface SessionProviderToolCallQueueV2 {
   orderedItems: SessionProviderOrderedItemV2[];
   completion: SessionProviderCompletionReceiptV1;
   calls: SessionProviderToolCallQueueItemV2[];
+  mutationDisposition:
+    | 'notRequired'
+    | 'classifying'
+    | 'planned'
+    | 'initialPlanDiscovery'
+    | 'userIntervention';
   status: 'active' | 'completed' | 'aborted';
   outcomeRecorded: boolean;
   settledAt?: string;
@@ -86,6 +123,18 @@ export interface SessionProviderToolCallQueueReconcileResultV2 {
   changed: boolean;
   settlement?: 'completed' | 'aborted';
 }
+
+export type SessionProviderToolCallQueueWorkV4 =
+  | {
+      kind: 'preview';
+      item: SessionProviderToolCallQueueItemV2;
+      candidate: SessionProviderMutationCandidatePreviewV4;
+    }
+  | {
+      kind: 'intent';
+      item: SessionProviderToolCallQueueItemV2;
+      intent: ToolIntentV2;
+    };
 
 /**
  * Produces the public, execution-free view of the Provider response. Raw tool
@@ -122,7 +171,7 @@ export function publicSessionProviderToolCallQueueItemsV2(
   mode: 'response' | 'settlement' = 'settlement'
 ): Array<Record<string, unknown>> {
   validateSessionProviderToolCallQueueV2(queue, {
-    runId: queue.calls[0]?.intent.runId,
+    runId: queueRunId(queue),
     controlEpoch: queue.controlEpoch,
   });
   return queue.orderedItems.map((item) => {
@@ -140,7 +189,7 @@ export function publicSessionProviderToolCallQueueItemsV2(
       || !receipt
       || receipt.callId !== item.callId
       || receipt.toolId !== item.toolId
-      || call.intent.toolId !== item.toolId
+      || queueItemToolId(call) !== item.toolId
     ) {
       throw invalidQueue();
     }
@@ -150,7 +199,7 @@ export function publicSessionProviderToolCallQueueItemsV2(
       callId: item.callId,
       toolName: item.toolName,
       toolId: item.toolId,
-      operationId: call.intent.operationId,
+      operationId: queueItemOperationId(call),
       ...(call.correction
         ? { retry: cloneJson(call.correction) }
         : {}),
@@ -167,9 +216,24 @@ export function publicSessionProviderToolCallQueueItemsV2(
       ...(mode === 'settlement' && call.settlementReason
         ? { settlementReason: call.settlementReason }
         : {}),
+      ...(mode === 'settlement' && call.candidatePreview?.preview
+        ? { previewId: call.candidatePreview.preview.previewId }
+        : {}),
     };
   });
 }
+
+export type SessionProviderQueuedCallInputV4 =
+  | {
+      dispatchKind: 'read';
+      intent: ToolIntentV2;
+      candidatePreview?: never;
+    }
+  | {
+      dispatchKind: 'mutation';
+      intent?: ToolIntentV2;
+      candidatePreview: SessionProviderMutationCandidatePreviewV4;
+    };
 
 export function createSessionProviderToolCallQueueV2(input: {
   providerTurnId: string;
@@ -179,7 +243,7 @@ export function createSessionProviderToolCallQueueV2(input: {
   providerResult: SessionProviderResultMetadataV2;
   orderedItems: SessionProviderOrderedItemV2[];
   completion: SessionProviderCompletionReceiptV1;
-  intents: ToolIntentV2[];
+  calls: SessionProviderQueuedCallInputV4[];
   correction?: SessionToolCorrectionV2;
 }): SessionProviderToolCallQueueV2 {
   const queue: SessionProviderToolCallQueueV2 = {
@@ -190,19 +254,26 @@ export function createSessionProviderToolCallQueueV2(input: {
     providerResult: cloneJson(input.providerResult),
     orderedItems: cloneJson(input.orderedItems),
     completion: cloneJson(input.completion),
-    calls: input.intents.map((intent, index) => ({
+    calls: input.calls.map((call, index) => ({
       ordinal: index + 1,
-      intent: cloneJson(intent),
+      dispatchKind: call.dispatchKind,
+      ...(call.intent ? { intent: cloneJson(call.intent) } : {}),
+      ...(call.candidatePreview
+        ? { candidatePreview: cloneJson(call.candidatePreview) }
+        : {}),
       status: 'pending',
       ...(index === 0 && input.correction
         ? { correction: cloneJson(input.correction) }
         : {}),
     })),
+    mutationDisposition: input.calls.some(
+      (call) => call.dispatchKind === 'mutation'
+    ) ? 'classifying' : 'notRequired',
     status: 'active',
     outcomeRecorded: false,
   };
   validateSessionProviderToolCallQueueV2(queue, {
-    runId: input.intents[0]?.runId,
+    runId: queueRunId(queue),
     controlEpoch: input.controlEpoch,
   });
   return queue;
@@ -259,6 +330,8 @@ export function validateSessionProviderToolCallQueueV2(
     ) {
       throw invalidQueue();
     }
+  } else if (queue.target.kind === 'interventionResearch') {
+    requiredIdentity(queue.target.researchId, 'target.researchId');
   } else if (queue.target.kind !== 'planning') {
     throw invalidQueue();
   }
@@ -266,28 +339,33 @@ export function validateSessionProviderToolCallQueueV2(
   const operationIds = new Set<string>();
   const requestIds = new Set<string>();
   let correctionCount = 0;
-  let firstUnsettled = -1;
   let planRevision: string | undefined;
   for (let index = 0; index < queue.calls.length; index += 1) {
     const item = queue.calls[index]!;
     const receipt = queue.receipt.calls[index]!;
-    const authority = item.intent.authority;
-    const targetAuthorityInvalid =
-      queue.target.kind === 'planAction'
-        ? authority.kind !== 'planAction'
+    const intent = item.intent;
+    const candidate = item.candidatePreview;
+    const operationId = queueItemOperationId(item);
+    const toolId = queueItemToolId(item);
+    const rawArguments = queueItemRawArguments(item);
+    const authority = intent?.authority;
+    const targetAuthorityInvalid = intent
+      ? authority?.kind === 'planAction'
+        ? queue.target.kind !== 'planAction'
           || authority.data.planActionId !== queue.target.planActionId
           || (
             planRevision !== undefined
             && authority.data.planRevision !== planRevision
           )
-        : authority.kind !== 'contextRead'
+        : authority?.kind !== 'read'
           || (
             queue.target.kind === 'contextRead'
             && authority.data.purpose !== queue.target.purpose
-          );
+          )
+      : false;
     if (
       queue.target.kind === 'planAction'
-      && authority.kind === 'planAction'
+      && authority?.kind === 'planAction'
       && planRevision === undefined
     ) {
       planRevision = authority.data.planRevision;
@@ -304,14 +382,44 @@ export function validateSessionProviderToolCallQueueV2(
     if (
       item.ordinal !== index + 1
       || receipt.ordinal !== item.ordinal
-      || receipt.toolId !== item.intent.toolId
+      || receipt.toolId !== toolId
       || receipt.argumentsDigest
-        !== sha256Hash(canonicalJson(item.intent.rawArguments))
-      || item.intent.expectedControlEpoch !== queue.controlEpoch
-      || (expected.runId !== undefined && item.intent.runId !== expected.runId)
+        !== sha256Hash(canonicalJson(rawArguments))
+      || (intent && intent.expectedControlEpoch !== queue.controlEpoch)
+      || (candidate && candidate.controlEpoch !== queue.controlEpoch)
+      || (
+        expected.runId !== undefined
+        && queueItemRunId(item) !== expected.runId
+      )
       || targetAuthorityInvalid
+      || (
+        item.dispatchKind === 'read'
+        && (!intent || candidate || authority?.kind !== 'read')
+      )
+      || (
+        item.dispatchKind === 'mutation'
+        && !candidate
+      )
+      || (
+        candidate
+        && (
+          candidate.operationId !== operationId
+          || candidate.toolId !== toolId
+          || candidate.runId !== queueItemRunId(item)
+          || canonicalJson(candidate.toolContextRef)
+            !== canonicalJson(intent?.toolContextRef ?? candidate.toolContextRef)
+          || (intent && (
+            intent.operationId !== candidate.operationId
+            || intent.toolId !== candidate.toolId
+            || canonicalJson(intent.rawArguments)
+              !== canonicalJson(candidate.rawArguments)
+            || intent.idempotencyKey !== candidate.idempotencyKey
+          ))
+        )
+      )
       || ![
         'pending',
+        'previewing',
         'submitting',
         'awaitingCapability',
         'awaitingInvocation',
@@ -326,9 +434,10 @@ export function validateSessionProviderToolCallQueueV2(
     requiredIdentity(receipt.toolName, 'receipt.toolName');
     requiredIdentity(receipt.toolId, 'receipt.toolId');
     requiredDigest(receipt.argumentsDigest, 'receipt.argumentsDigest');
-    requiredIdentity(item.intent.operationId, 'intent.operationId');
-    if (operationIds.has(item.intent.operationId)) throw invalidQueue();
-    operationIds.add(item.intent.operationId);
+    requiredIdentity(operationId, 'operationId');
+    if (operationIds.has(operationId)) throw invalidQueue();
+    operationIds.add(operationId);
+    if (candidate) validateMutationCandidatePreviewV4(candidate);
     if ((item.requestId === undefined) !== (item.requestStartedAt === undefined)) {
       throw invalidQueue();
     }
@@ -366,7 +475,7 @@ export function validateSessionProviderToolCallQueueV2(
         !Number.isSafeInteger(item.correction.retryOrdinal)
         || item.correction.retryOrdinal < 2
         || item.correction.predecessorOperationId
-          === item.intent.operationId
+          === operationId
       ) {
         throw invalidQueue();
       }
@@ -388,7 +497,8 @@ export function validateSessionProviderToolCallQueueV2(
     }
     if (
       (
-        item.status === 'submitting'
+        item.status === 'previewing'
+        || item.status === 'submitting'
         || item.status === 'awaitingCapability'
         || item.status === 'awaitingInvocation'
         || item.status === 'completed'
@@ -410,7 +520,8 @@ export function validateSessionProviderToolCallQueueV2(
     }
     if (
       (
-        item.status === 'submitting'
+        item.status === 'previewing'
+        || item.status === 'submitting'
         || item.status === 'unexecuted'
       )
       && item.invocationId !== undefined
@@ -467,42 +578,68 @@ export function validateSessionProviderToolCallQueueV2(
     ) {
       throw invalidQueue();
     }
-    if (callIds.has(receipt.callId)) throw invalidQueue();
-    callIds.add(receipt.callId);
-    if (item.status !== 'completed' && firstUnsettled < 0) {
-      firstUnsettled = index;
-    }
     if (
-      item.status === 'completed'
-      && firstUnsettled >= 0
+      item.status === 'previewing'
+      && (!candidate || candidate.preview || candidate.rejection)
     ) {
       throw invalidQueue();
     }
+    if (
+      item.status !== 'previewing'
+      && candidate
+      && Boolean(candidate.preview) === Boolean(candidate.rejection)
+      && candidate.classification !== undefined
+    ) {
+      throw invalidQueue();
+    }
+    if (callIds.has(receipt.callId)) throw invalidQueue();
+    callIds.add(receipt.callId);
   }
+  const activeCallCount = queue.calls.filter((item) =>
+    item.status === 'previewing'
+    || item.status === 'submitting'
+    || item.status === 'awaitingCapability'
+    || item.status === 'awaitingInvocation'
+  ).length;
+  const terminal = (item: SessionProviderToolCallQueueItemV2) =>
+    item.status === 'completed'
+    || item.status === 'aborted'
+    || item.status === 'unexecuted';
+  const mutationCalls = queue.calls.filter(
+    (item) => item.dispatchKind === 'mutation'
+  );
+  const dispositionInvalid =
+    (mutationCalls.length === 0
+      && queue.mutationDisposition !== 'notRequired')
+    || (mutationCalls.length > 0
+      && queue.mutationDisposition === 'notRequired')
+    || (queue.mutationDisposition === 'classifying'
+      && mutationCalls.every((item) =>
+        item.candidatePreview?.classification !== undefined
+      ))
+    || (queue.mutationDisposition === 'planned'
+      && mutationCalls.some((item) =>
+        item.candidatePreview?.classification !== 'planned'
+        || !item.intent
+      ))
+    || (
+      (
+        queue.mutationDisposition === 'initialPlanDiscovery'
+        || queue.mutationDisposition === 'userIntervention'
+      )
+      && mutationCalls.some((item) =>
+        item.candidatePreview?.classification === undefined
+        || item.status !== 'unexecuted'
+      )
+    );
   if (
     (queue.status === 'completed'
       && queue.calls.some((item) => item.status !== 'completed'))
     || (
       queue.status === 'active'
       && (
-        firstUnsettled < 0
-        || ![
-          'pending',
-          'submitting',
-          'awaitingCapability',
-          'awaitingInvocation',
-        ].includes(queue.calls[firstUnsettled]!.status)
-        || queue.calls.some(
-          (item, index) =>
-            index > firstUnsettled
-            && item.status !== 'pending'
-        )
-        || queue.calls.filter(
-          (item) =>
-            item.status === 'submitting'
-            || item.status === 'awaitingCapability'
-            || item.status === 'awaitingInvocation'
-        ).length > 1
+        queue.calls.every(terminal)
+        || activeCallCount > 1
       )
     )
     || (
@@ -511,6 +648,7 @@ export function validateSessionProviderToolCallQueueV2(
         queue.calls.every((item) => item.status === 'completed')
         || queue.calls.some((item) =>
           item.status === 'pending'
+          || item.status === 'previewing'
           || item.status === 'submitting'
           || item.status === 'awaitingCapability'
           || item.status === 'awaitingInvocation'
@@ -531,6 +669,7 @@ export function validateSessionProviderToolCallQueueV2(
       && (queue.settledAt === undefined || queue.abortReason === undefined)
     )
     || correctionCount > 1
+    || dispositionInvalid
     || queue.calls.some((item) =>
       item.correction !== undefined
       && operationIds.has(item.correction.predecessorOperationId)
@@ -551,6 +690,237 @@ export function activeSessionProviderToolCallQueueV2(
     : undefined;
 }
 
+export function nextSessionProviderToolCallQueueWorkV4(
+  state: SessionKernelLoopStateV2
+): SessionProviderToolCallQueueWorkV4 | undefined {
+  const queue = activeSessionProviderToolCallQueueV2(state);
+  if (!queue) return undefined;
+  const inFlight = queue.calls.find((item) =>
+    item.status === 'previewing'
+    || item.status === 'submitting'
+    || item.status === 'awaitingCapability'
+    || item.status === 'awaitingInvocation'
+  );
+  if (inFlight) {
+    if (inFlight.status === 'previewing') {
+      const candidate = inFlight.candidatePreview;
+      if (!candidate) throw invalidQueue();
+      return { kind: 'preview', item: inFlight, candidate };
+    }
+    if (inFlight.status === 'submitting') {
+      return {
+        kind: 'intent',
+        item: inFlight,
+        intent: executableQueueItemIntent(inFlight),
+      };
+    }
+    return undefined;
+  }
+  if (queue.mutationDisposition === 'classifying') {
+    const candidateItem = queue.calls.find((item) =>
+      item.dispatchKind === 'mutation'
+      && item.status === 'pending'
+      && item.candidatePreview?.preview === undefined
+      && item.candidatePreview?.rejection === undefined
+    );
+    if (candidateItem) {
+      const candidate = candidateItem.candidatePreview;
+      if (!candidate) throw invalidQueue();
+      return { kind: 'preview', item: candidateItem, candidate };
+    }
+    return undefined;
+  }
+  const intentItem = queue.calls.find((item) =>
+    item.status === 'pending'
+    && item.intent !== undefined
+    && (
+      item.dispatchKind === 'read'
+      || queue.mutationDisposition === 'planned'
+    )
+  );
+  return intentItem
+    ? {
+        kind: 'intent',
+        item: intentItem,
+        intent: executableQueueItemIntent(intentItem),
+      }
+    : undefined;
+}
+
+export function prepareSessionProviderMutationPreviewV4(
+  state: SessionKernelLoopStateV2,
+  input: {
+    operationId: string;
+    requestId: string;
+    requestStartedAt: string;
+  }
+): void {
+  const queue = activeSessionProviderToolCallQueueV2(state);
+  const work = nextSessionProviderToolCallQueueWorkV4(state);
+  if (
+    !queue
+    || !work
+    || work.kind !== 'preview'
+    || work.item.status !== 'pending'
+    || work.candidate.operationId !== input.operationId
+  ) {
+    throw invalidQueue();
+  }
+  requiredIdentity(input.requestId, 'requestId');
+  requiredInstant(input.requestStartedAt, 'requestStartedAt');
+  if (queue.calls.some((candidate) =>
+    candidate.requestId === input.requestId
+  )) {
+    throw invalidQueue();
+  }
+  work.item.status = 'previewing';
+  work.item.requestId = input.requestId;
+  work.item.requestStartedAt = input.requestStartedAt;
+  try {
+    validateSessionProviderToolCallQueueV2(queue, {
+      runId: work.candidate.runId,
+      controlEpoch: state.controlEpoch,
+    });
+  } catch (error) {
+    work.item.status = 'pending';
+    delete work.item.requestId;
+    delete work.item.requestStartedAt;
+    throw error;
+  }
+}
+
+export function markSessionProviderMutationPreviewedV4(
+  state: SessionKernelLoopStateV2,
+  input: {
+    requestId: string;
+    reply: CapabilityScopePreviewBatchReplyV2;
+  }
+): boolean {
+  const queue = activeSessionProviderToolCallQueueV2(state);
+  const item = queue?.calls.find((candidate) =>
+    candidate.status === 'previewing'
+  );
+  if (!queue || !item || item.requestId !== input.requestId) {
+    return false;
+  }
+  const candidate = item.candidatePreview;
+  if (
+    !candidate
+    || input.reply.runId !== candidate.runId
+    || input.reply.acceptedControlEpoch !== candidate.controlEpoch
+    || input.reply.planRevision !== candidate.planRevision
+    || input.reply.results.length !== 1
+  ) {
+    throw invalidQueue();
+  }
+  const result = input.reply.results[0]!;
+  const resultIdentity = result.kind === 'previewed'
+    ? result.data.preview
+    : result.data;
+  if (
+    resultIdentity.operationId !== candidate.operationId
+    || resultIdentity.planActionId !== candidate.planActionId
+    || resultIdentity.toolId !== candidate.toolId
+  ) {
+    throw invalidQueue();
+  }
+  if (result.kind === 'previewed') {
+    candidate.preview = cloneJson(result.data.preview);
+  } else if (result.kind === 'rejected') {
+    candidate.rejection = {
+      reason: result.data.reason,
+      guidance: result.data.guidance,
+    };
+  } else {
+    throw invalidQueue();
+  }
+  item.status = 'pending';
+  delete item.requestId;
+  delete item.requestStartedAt;
+  validateSessionProviderToolCallQueueV2(queue, {
+    runId: candidate.runId,
+    controlEpoch: state.controlEpoch,
+  });
+  return true;
+}
+
+export function finalizeSessionProviderMutationClassificationV4(
+  state: SessionKernelLoopStateV2,
+  recordedAt: string
+): boolean {
+  const queue = activeSessionProviderToolCallQueueV2(state);
+  if (!queue || queue.mutationDisposition !== 'classifying') return false;
+  const mutationItems = queue.calls.filter(
+    (item) => item.dispatchKind === 'mutation'
+  );
+  if (
+    mutationItems.length === 0
+    || mutationItems.some((item) => {
+      const candidate = item.candidatePreview;
+      return !candidate
+        || (candidate.preview === undefined && candidate.rejection === undefined);
+    })
+  ) {
+    return false;
+  }
+
+  const currentPlan = state.plan;
+  const targetPlanActionId = queue.target.kind === 'planAction'
+    ? queue.target.planActionId
+    : undefined;
+  const currentAction = targetPlanActionId
+    ? currentPlan?.actions.find(
+        (action) => action.manifest.planActionId === targetPlanActionId
+      )
+    : undefined;
+  for (const item of mutationItems) {
+    const candidate = item.candidatePreview!;
+    const currentPreview = currentAction
+      ? state.previews[currentAction.manifest.operationId]
+      : undefined;
+    candidate.classification = item.intent
+      && currentPlan
+      && currentAction
+      && currentPreview
+      && item.intent.authority.kind === 'planAction'
+      && item.intent.authority.data.planRevision === currentPlan.planRevision
+      && item.intent.authority.data.planActionId
+        === currentAction.manifest.planActionId
+      && candidate.preview
+      && previewMatchesApprovedPlanAction(
+        candidate.preview,
+        currentPreview,
+        candidate
+      )
+      ? 'planned'
+      : 'outOfPlan';
+  }
+
+  const allPlanned = mutationItems.every(
+    (item) => item.candidatePreview?.classification === 'planned'
+      && item.intent !== undefined
+  );
+  if (allPlanned) {
+    queue.mutationDisposition = 'planned';
+  } else {
+    queue.mutationDisposition = currentPlan
+      ? 'userIntervention'
+      : 'initialPlanDiscovery';
+    for (const item of mutationItems) {
+      item.status = 'unexecuted';
+      item.settlementReason = item.candidatePreview?.classification === 'planned'
+        ? 'deferredForIntervention'
+        : 'candidatePreviewed';
+    }
+  }
+  settleQueueFromTerminals(state, queue, recordedAt);
+  validateSessionProviderToolCallQueueV2(queue, {
+    runId: state.runId,
+    controlEpoch: state.controlEpoch,
+  });
+  return true;
+}
+
 export function markSessionProviderToolCallSubmittedV2(
   state: SessionKernelLoopStateV2,
   input: {
@@ -565,7 +935,8 @@ export function markSessionProviderToolCallSubmittedV2(
     (candidate) => candidate.status === 'submitting'
   );
   if (!item || item.requestId !== input.requestId) throw invalidQueue();
-  if (input.reply.data.operationId !== item.intent.operationId) {
+  const intent = executableQueueItemIntent(item);
+  if (input.reply.data.operationId !== intent.operationId) {
     throw invalidQueue();
   }
   switch (input.reply.kind) {
@@ -598,7 +969,7 @@ export function markSessionProviderToolCallSubmittedV2(
             ? 'indeterminate'
             : 'kernelRejected',
         recordedAt,
-        item.intent.operationId
+        intent.operationId
       );
       return true;
     default:
@@ -634,10 +1005,10 @@ export function sessionToolCorrectionForNextTurnV2(input: {
         schemaVersion: 'deepcode.session.tool-retry-group.v1',
         runId: input.runId,
         controlEpoch: input.controlEpoch,
-        initialOperationId: predecessor.intent.operationId,
+        initialOperationId: queueItemOperationId(predecessor),
       })
     ).replace(/^sha256:/u, '')}`,
-    predecessorOperationId: predecessor.intent.operationId,
+    predecessorOperationId: queueItemOperationId(predecessor),
     retryOrdinal: (existing?.retryOrdinal ?? 1) + 1,
   };
 }
@@ -649,13 +1020,13 @@ export function settledSessionProviderToolCallsV2(
     throw invalidQueue();
   }
   validateSessionProviderToolCallQueueV2(queue, {
-    runId: queue.calls[0]?.intent.runId,
+    runId: queueRunId(queue),
     controlEpoch: queue.controlEpoch,
   });
   return queue.calls.map((call) => ({
     ordinal: call.ordinal,
-    operationId: call.intent.operationId,
-    toolId: call.intent.toolId,
+    operationId: queueItemOperationId(call),
+    toolId: queueItemToolId(call),
     status: call.status as SessionProviderSettledToolCallV2['status'],
     ...(call.invocationId ? { invocationId: call.invocationId } : {}),
     ...(call.terminalFactId
@@ -676,6 +1047,77 @@ export function settledSessionProviderToolCallsV2(
   }));
 }
 
+/**
+ * Closes every Provider-native tool call when Session rejects the complete
+ * batch before Kernel admission (for example schema repair or PlanAction
+ * ownership repair). The synthetic operation identities are Session-only and
+ * never grant capability; they exist solely to preserve the native
+ * assistant(tool_calls) -> tool(result) continuation topology.
+ */
+export function repairedSessionProviderOutcomeV2(
+  providerTurnId: string,
+  output: Extract<
+    SessionProviderTurnOutputV2,
+    { kind: 'noTool' }
+  >,
+  recordedAt: string
+): SessionProviderOutcomeRecordV2 {
+  const calls = output.items.filter(
+    (item): item is Extract<
+      SessionProviderOrderedItemV2,
+      { kind: 'toolCall' }
+    > => item.kind === 'toolCall'
+  );
+  if (calls.length === 0 || calls.length > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
+    throw invalidQueue();
+  }
+  if (!output.repair) throw invalidQueue();
+  const settlementReason = output.repair.kind === 'toolArguments'
+    ? 'sessionToolArgumentsInvalid'
+    : 'sessionPlanActionOwnershipMismatch';
+  const receipt: SessionProviderToolCallReceiptV2 = {
+    schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+    providerTurnId,
+    responseDigest: output.completion.responseDigest,
+    callCount: calls.length,
+    calls: calls.map((call, index) => ({
+      ordinal: index + 1,
+      callId: call.callId,
+      toolName: call.toolName,
+      toolId: call.toolId,
+      argumentsDigest: sha256Hash(canonicalJson(call.arguments)),
+    })),
+    recordedAt,
+  };
+  return {
+    providerTurnId,
+    outputKind: 'toolIntent',
+    recordedAt,
+    ...(output.guidance
+      ? { summary: utf8Prefix(output.guidance, 8_192) }
+      : {}),
+    toolCallReceipt: receipt,
+    toolSettlement: {
+      status: 'aborted',
+      settledAt: recordedAt,
+    },
+    toolCalls: calls.map((call, index) => ({
+      ordinal: index + 1,
+      operationId: `provider-repair-${sha256Hash(canonicalJson({
+        schemaVersion: 'deepcode.session.provider-repair-operation.v1',
+        providerTurnId,
+        callId: call.callId,
+        ordinal: index + 1,
+        toolId: call.toolId,
+      })).slice('sha256:'.length)}`,
+      toolId: call.toolId,
+      status: 'unexecuted',
+      settlementReason,
+    })),
+    providerResult: cloneJson(output.providerResult),
+  };
+}
+
 export function prepareSessionProviderToolCallSubmissionV2(
   state: SessionKernelLoopStateV2,
   input: {
@@ -685,14 +1127,13 @@ export function prepareSessionProviderToolCallSubmissionV2(
   }
 ): void {
   const queue = activeSessionProviderToolCallQueueV2(state);
-  const item = queue?.calls.find((candidate) =>
-    candidate.status !== 'completed'
-  );
+  const work = nextSessionProviderToolCallQueueWorkV4(state);
+  const item = work?.kind === 'intent' ? work.item : undefined;
   if (
     !queue
     || !item
     || item.status !== 'pending'
-    || item.intent.operationId !== input.operationId
+    || executableQueueItemIntent(item).operationId !== input.operationId
   ) {
     throw invalidQueue();
   }
@@ -708,7 +1149,7 @@ export function prepareSessionProviderToolCallSubmissionV2(
   item.requestStartedAt = input.requestStartedAt;
   try {
     validateSessionProviderToolCallQueueV2(queue, {
-      runId: item.intent.runId,
+      runId: executableQueueItemIntent(item).runId,
       controlEpoch: state.controlEpoch,
     });
   } catch (error) {
@@ -735,31 +1176,32 @@ export function reconcileSessionProviderToolCallQueueV2(
     return { changed: true, settlement: 'aborted' };
   }
   const item = queue.calls.find((candidate) =>
-    candidate.status !== 'completed'
+    candidate.status === 'submitting'
+    || candidate.status === 'awaitingCapability'
+    || candidate.status === 'awaitingInvocation'
   );
   if (!item) {
-    completeQueue(state, queue, recordedAt);
-    return { changed: true, settlement: 'completed' };
+    const settlement = settleQueueFromTerminals(state, queue, recordedAt);
+    return settlement
+      ? { changed: true, settlement }
+      : { changed: false };
   }
   const wait = state.activeWait;
   if (
-    wait?.operationId === item.intent.operationId
-    && wait.kind === 'manualRecovery'
+    wait?.kind === 'manualRecovery'
+    && wait.operationId === queueItemOperationId(item)
   ) {
     abortSessionProviderToolCallQueueV2(
       state,
       'indeterminate',
       recordedAt,
-      item.intent.operationId
+      queueItemOperationId(item)
     );
     return { changed: true, settlement: 'aborted' };
   }
   if (
-    wait?.operationId === item.intent.operationId
-    && (
-      wait.kind === 'capability'
-      || wait.kind === 'invocation'
-    )
+    (wait?.kind === 'capability' || wait?.kind === 'invocation')
+    && wait.operationId === queueItemOperationId(item)
   ) {
     const nextStatus = wait.kind === 'capability'
       ? 'awaitingCapability'
@@ -771,7 +1213,7 @@ export function reconcileSessionProviderToolCallQueueV2(
     return { changed };
   }
   const related = mergedOrderedFacts(state, observedFacts).filter((fact) =>
-    fact.lineage.operationId === item.intent.operationId
+    fact.lineage.operationId === queueItemOperationId(item)
     || (
       item.invocationId !== undefined
       && fact.lineage.invocationId === item.invocationId
@@ -786,7 +1228,7 @@ export function reconcileSessionProviderToolCallQueueV2(
   if (terminal) {
     const terminalInvocationId = terminal.lineage.invocationId;
     if (
-      terminal.lineage.operationId !== item.intent.operationId
+      terminal.lineage.operationId !== queueItemOperationId(item)
       || !terminalInvocationId
       || (
         item.invocationId !== undefined
@@ -803,18 +1245,17 @@ export function reconcileSessionProviderToolCallQueueV2(
         === SESSION_KERNEL_FACT_KINDS_V2.invocation.completed
     ) {
       item.status = 'completed';
-      if (queue.calls.every((candidate) => candidate.status === 'completed')) {
-        completeQueue(state, queue, recordedAt);
-        return { changed: true, settlement: 'completed' };
-      }
-      return { changed: true };
+      const settlement = settleQueueFromTerminals(state, queue, recordedAt);
+      return settlement
+        ? { changed: true, settlement }
+        : { changed: true };
     }
     const reason = terminalReason(terminal);
     abortSessionProviderToolCallQueueV2(
       state,
       reason,
       recordedAt,
-      item.intent.operationId,
+      queueItemOperationId(item),
       terminal
     );
     return { changed: true, settlement: 'aborted' };
@@ -833,7 +1274,7 @@ export function reconcileSessionProviderToolCallQueueV2(
       state,
       'capabilityDenied',
       recordedAt,
-      item.intent.operationId
+      queueItemOperationId(item)
     );
     return { changed: true, settlement: 'aborted' };
   }
@@ -851,17 +1292,18 @@ export function abortSessionProviderToolCallQueueV2(
   if (!queue) return false;
   requiredIdentity(reason, 'abortReason');
   requiredInstant(recordedAt, 'recordedAt');
-  const inferredCurrentOperationId = currentOperationId
-    ?? queue.calls.find((item) =>
+  const currentItem = queue.calls.find((item) =>
       item.status === 'submitting'
       || item.status === 'awaitingCapability'
       || item.status === 'awaitingInvocation'
-    )?.intent.operationId;
+    );
+  const inferredCurrentOperationId = currentOperationId
+    ?? (currentItem ? queueItemOperationId(currentItem) : undefined);
   if (
     currentOperationId
     && !queue.calls.some((item) =>
       item.status !== 'completed'
-      && item.intent.operationId === currentOperationId
+      && queueItemOperationId(item) === currentOperationId
     )
   ) {
     throw invalidQueue();
@@ -870,7 +1312,7 @@ export function abortSessionProviderToolCallQueueV2(
     if (item.status === 'completed') continue;
     if (
       inferredCurrentOperationId
-      && item.intent.operationId === inferredCurrentOperationId
+      && queueItemOperationId(item) === inferredCurrentOperationId
     ) {
       item.status = 'aborted';
       item.settlementReason = reason;
@@ -918,6 +1360,184 @@ function completeQueue(
   if (turn?.providerTurnId === queue.providerTurnId) {
     turn.status = 'completed';
   }
+}
+
+function settleQueueFromTerminals(
+  state: SessionKernelLoopStateV2,
+  queue: SessionProviderToolCallQueueV2,
+  recordedAt: string
+): 'completed' | 'aborted' | undefined {
+  if (queue.status !== 'active') return undefined;
+  const terminal = (item: SessionProviderToolCallQueueItemV2) =>
+    item.status === 'completed'
+    || item.status === 'aborted'
+    || item.status === 'unexecuted';
+  if (!queue.calls.every(terminal)) return undefined;
+  if (queue.calls.every((item) => item.status === 'completed')) {
+    completeQueue(state, queue, recordedAt);
+    return 'completed';
+  }
+  queue.status = 'aborted';
+  queue.abortReason = queue.mutationDisposition === 'initialPlanDiscovery'
+    ? 'planDiscovery'
+    : queue.mutationDisposition === 'userIntervention'
+      ? 'userIntervention'
+      : queue.calls.find((item) => item.settlementReason)?.settlementReason
+        ?? 'toolTerminalFailure';
+  queue.settledAt = recordedAt;
+  const turn = state.providerTurn;
+  if (turn?.providerTurnId === queue.providerTurnId) {
+    turn.status = 'aborted';
+  }
+  return 'aborted';
+}
+
+function queueItemOperationId(
+  item: SessionProviderToolCallQueueItemV2
+): string {
+  const value = item.intent?.operationId
+    ?? item.candidatePreview?.operationId;
+  return requiredIdentity(value, 'operationId');
+}
+
+function queueItemToolId(
+  item: SessionProviderToolCallQueueItemV2
+): string {
+  const value = item.intent?.toolId ?? item.candidatePreview?.toolId;
+  return requiredIdentity(value, 'toolId');
+}
+
+function queueItemRunId(
+  item: SessionProviderToolCallQueueItemV2
+): string {
+  const value = item.intent?.runId ?? item.candidatePreview?.runId;
+  return requiredIdentity(value, 'runId');
+}
+
+function queueItemRawArguments(
+  item: SessionProviderToolCallQueueItemV2
+): RawToolArgumentsV2 {
+  const value = item.intent?.rawArguments
+    ?? item.candidatePreview?.rawArguments;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw invalidQueue();
+  }
+  return value;
+}
+
+function queueRunId(queue: SessionProviderToolCallQueueV2): string {
+  const runIds = new Set(queue.calls.map(queueItemRunId));
+  if (runIds.size !== 1) throw invalidQueue();
+  return runIds.values().next().value!;
+}
+
+function executableQueueItemIntent(
+  item: SessionProviderToolCallQueueItemV2
+): ToolIntentV2 {
+  if (!item.intent) throw invalidQueue();
+  return item.intent;
+}
+
+function validateMutationCandidatePreviewV4(
+  candidate: SessionProviderMutationCandidatePreviewV4
+): void {
+  requiredIdentity(candidate.runId, 'candidate.runId');
+  if (!Number.isSafeInteger(candidate.controlEpoch) || candidate.controlEpoch <= 0) {
+    throw invalidQueue();
+  }
+  requiredIdentity(candidate.discoveryId, 'candidate.discoveryId');
+  requiredIdentity(candidate.planRevision, 'candidate.planRevision');
+  requiredIdentity(candidate.planActionId, 'candidate.planActionId');
+  requiredIdentity(candidate.operationId, 'candidate.operationId');
+  requiredIdentity(candidate.idempotencyKey, 'candidate.idempotencyKey');
+  requiredIdentity(candidate.toolId, 'candidate.toolId');
+  if (
+    !candidate.rawArguments
+    || typeof candidate.rawArguments !== 'object'
+    || Array.isArray(candidate.rawArguments)
+    || !candidate.deadline
+    || typeof candidate.deadline !== 'object'
+    || Array.isArray(candidate.deadline)
+    || !candidate.toolContextRef
+    || typeof candidate.toolContextRef !== 'object'
+    || Array.isArray(candidate.toolContextRef)
+    || (candidate.preview !== undefined && candidate.rejection !== undefined)
+    || (
+      candidate.classification !== undefined
+      && candidate.preview === undefined
+      && candidate.rejection === undefined
+    )
+    || (
+      candidate.classification !== undefined
+      && candidate.classification !== 'planned'
+      && candidate.classification !== 'outOfPlan'
+    )
+  ) {
+    throw invalidQueue();
+  }
+  if (candidate.rejection) {
+    requiredIdentity(candidate.rejection.reason, 'candidate.rejection.reason');
+    if (!candidate.rejection.guidance.trim()) throw invalidQueue();
+  }
+  const preview = candidate.preview;
+  if (!preview) return;
+  if (
+    preview.runId !== candidate.runId
+    || preview.controlEpoch !== candidate.controlEpoch
+    || preview.planRevision !== candidate.planRevision
+    || preview.planActionId !== candidate.planActionId
+    || preview.operationId !== candidate.operationId
+    || preview.toolId !== candidate.toolId
+    || preview.origin.kind !== 'planDiscovery'
+    || preview.origin.data.discoveryId !== candidate.discoveryId
+    || canonicalJson(preview.contextRef)
+      !== canonicalJson(candidate.toolContextRef)
+  ) {
+    throw invalidQueue();
+  }
+  requiredIdentity(preview.previewId, 'candidate.preview.previewId');
+  requiredDigest(preview.scopeDigest, 'candidate.preview.scopeDigest');
+  requiredDigest(
+    preview.authorizationDigest,
+    'candidate.preview.authorizationDigest'
+  );
+  requiredDigest(
+    preview.toolContractDigest,
+    'candidate.preview.toolContractDigest'
+  );
+}
+
+function previewMatchesApprovedPlanAction(
+  discovery: CapabilityScopePreviewRecordV2,
+  approved: CapabilityScopePreviewRecordV2,
+  candidate: SessionProviderMutationCandidatePreviewV4
+): boolean {
+  // Kernel digests bind a preview to its origin and preview identity. A
+  // planDiscovery preview therefore cannot share those digests with the
+  // approved Plan preview even when the invocation and canonical scope are
+  // exact. Kernel re-canonicalizes the subsequent ToolIntent, so Session
+  // compares the shared authority identities and semantic scope here.
+  return discovery.runId === approved.runId
+    && candidate.runId === approved.runId
+    && discovery.controlEpoch === approved.controlEpoch
+    && candidate.controlEpoch === approved.controlEpoch
+    && discovery.planRevision === approved.planRevision
+    && candidate.planRevision === approved.planRevision
+    && discovery.planActionId === approved.planActionId
+    && candidate.planActionId === approved.planActionId
+    && discovery.toolId === approved.toolId
+    && candidate.toolId === approved.toolId
+    && canonicalJson(discovery.contextRef) === canonicalJson(approved.contextRef)
+    && canonicalJson(discovery.authorizationBinding)
+      === canonicalJson(approved.authorizationBinding)
+    && canonicalJson(discovery.canonicalScope)
+      === canonicalJson(approved.canonicalScope)
+    && discovery.toolContractDigest === approved.toolContractDigest
+    && discovery.effectClass === approved.effectClass
+    && discovery.effectScope === approved.effectScope
+    && discovery.risk === approved.risk
+    && discovery.effectiveDeadlineMs === approved.effectiveDeadlineMs
+    && discovery.disposition === approved.disposition;
 }
 
 function terminalReason(fact: KernelFactProjectionV2): string {
@@ -1075,7 +1695,14 @@ function validateExactSessionProviderOutcomeRecordV2(
       'recordedAt',
       'providerResult',
     ],
-    ['summary', 'toolCallReceipt', 'toolSettlement', 'toolCalls']
+    [
+      'summary',
+      'toolCallReceipt',
+      'toolSettlement',
+      'toolCalls',
+      'control',
+      'refresh',
+    ]
   );
   const providerTurnId = requiredIdentity(
     record.providerTurnId,
@@ -1122,6 +1749,9 @@ function validateExactSessionProviderOutcomeRecordV2(
   }
 
   if (record.outputKind === 'toolIntent') {
+    if (record.control !== undefined || record.refresh !== undefined) {
+      throw invalidQueue();
+    }
     const receipt = exactOutcomeObject(
       record.toolCallReceipt,
       [
@@ -1280,11 +1910,121 @@ function validateExactSessionProviderOutcomeRecordV2(
     return;
   }
 
+  if (record.outputKind === 'planEvidenceRefresh') {
+    if (
+      Object.prototype.hasOwnProperty.call(record, 'toolCallReceipt')
+      || Object.prototype.hasOwnProperty.call(record, 'toolSettlement')
+      || Object.prototype.hasOwnProperty.call(record, 'toolCalls')
+    ) {
+      throw invalidQueue();
+    }
+    const control = exactOutcomeObject(
+      record.control,
+      ['schemaVersion', 'callId', 'toolName', 'argumentsDigest']
+    );
+    if (
+      control.schemaVersion !== 'deepcode.session.plan-proposal.v5'
+      || control.toolName !== 'deepcode_session_plan_propose_v5'
+    ) {
+      throw invalidQueue();
+    }
+    requiredIdentity(control.callId, 'providerOutcome.control.callId');
+    requiredDigest(
+      control.argumentsDigest,
+      'providerOutcome.control.argumentsDigest'
+    );
+    const refresh = exactOutcomeObject(
+      record.refresh,
+      [
+        'errorCode',
+        'staleFactRefs',
+        'resourceRefs',
+        'readSubjectDigests',
+        'blockingUnknownIds',
+        'candidateScopeDigest',
+        'requiresCurrentRead',
+        'snapshotHighWater',
+        'factSetDigest',
+        'evidenceDebtDigest',
+      ]
+    );
+    if (![
+      'session_kernel_provider_plan_evidence_stale',
+      'session_kernel_provider_plan_resource_evidence_mismatch',
+      'session_kernel_provider_plan_blocking_unknowns',
+      'session_kernel_provider_plan_evidence_debt_unresolved',
+    ].includes(String(refresh.errorCode))) {
+      throw invalidQueue();
+    }
+    for (const [field, value] of [
+      ['staleFactRefs', refresh.staleFactRefs],
+      ['resourceRefs', refresh.resourceRefs],
+      ['blockingUnknownIds', refresh.blockingUnknownIds],
+    ] as const) {
+      if (
+        !Array.isArray(value)
+        || value.length > 512
+        || new Set(value).size !== value.length
+        || value.some((item) => {
+          try {
+            requiredIdentity(item, `providerOutcome.refresh.${field}`);
+            return false;
+          } catch {
+            return true;
+          }
+        })
+      ) {
+        throw invalidQueue();
+      }
+    }
+    const readSubjectDigests = refresh.readSubjectDigests;
+    if (
+      !Array.isArray(readSubjectDigests)
+      || readSubjectDigests.length > 512
+      || new Set(readSubjectDigests).size !== readSubjectDigests.length
+      || readSubjectDigests.some((digest, index) => {
+        try {
+          requiredDigest(
+            digest,
+            'providerOutcome.refresh.readSubjectDigest'
+          );
+          return index > 0
+            && readSubjectDigests[index - 1] >= digest;
+        } catch {
+          return true;
+        }
+      })
+    ) {
+      throw invalidQueue();
+    }
+    if (
+      !Number.isSafeInteger(refresh.snapshotHighWater)
+      || Number(refresh.snapshotHighWater) < 0
+      || typeof refresh.requiresCurrentRead !== 'boolean'
+    ) {
+      throw invalidQueue();
+    }
+    requiredDigest(
+      refresh.candidateScopeDigest,
+      'providerOutcome.refresh.candidateScopeDigest'
+    );
+    requiredDigest(
+      refresh.factSetDigest,
+      'providerOutcome.refresh.factSetDigest'
+    );
+    requiredDigest(
+      refresh.evidenceDebtDigest,
+      'providerOutcome.refresh.evidenceDebtDigest'
+    );
+    return;
+  }
+
   if (
     record.outputKind !== 'plan'
     && record.outputKind !== 'answer'
     && record.outputKind !== 'noTool'
     && record.outputKind !== 'planActionComplete'
+    && record.outputKind !== 'intervention'
   ) {
     throw invalidQueue();
   }
@@ -1292,9 +2032,57 @@ function validateExactSessionProviderOutcomeRecordV2(
     Object.prototype.hasOwnProperty.call(record, 'toolCallReceipt')
     || Object.prototype.hasOwnProperty.call(record, 'toolSettlement')
     || Object.prototype.hasOwnProperty.call(record, 'toolCalls')
+    || Object.prototype.hasOwnProperty.call(record, 'refresh')
   ) {
     throw invalidQueue();
   }
+  if (
+    record.outputKind === 'plan'
+    || record.outputKind === 'planActionComplete'
+    || record.outputKind === 'intervention'
+  ) {
+    validateProviderControlReceiptV2(
+      record.control,
+      record.outputKind
+    );
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(record, 'control')) {
+    throw invalidQueue();
+  }
+}
+
+function validateProviderControlReceiptV2(
+  value: unknown,
+  outputKind: 'plan' | 'planActionComplete' | 'intervention'
+): void {
+  const control = exactOutcomeObject(
+    value,
+    ['schemaVersion', 'callId', 'toolName', 'argumentsDigest']
+  );
+  const expected = outputKind === 'plan'
+    ? {
+        schemaVersion: 'deepcode.session.plan-proposal.v5',
+        toolName: 'deepcode_session_plan_propose_v5',
+      }
+    : outputKind === 'planActionComplete'
+      ? {
+          schemaVersion: 'deepcode.session.plan-action-complete.v2',
+          toolName: 'deepcode_session_plan_action_complete_v2',
+        }
+      : {
+          schemaVersion: 'deepcode.session.intervention-proposal.v1',
+          toolName: 'deepcode_session_intervention_propose_v1',
+        };
+  if (
+    control.schemaVersion !== expected.schemaVersion
+    || control.toolName !== expected.toolName
+  ) throw invalidQueue();
+  requiredIdentity(control.callId, 'providerOutcome.control.callId');
+  requiredDigest(
+    control.argumentsDigest,
+    'providerOutcome.control.argumentsDigest'
+  );
 }
 
 function validateProviderToolRejectionV2(
@@ -1362,6 +2150,14 @@ function correctionTargetsMatch(
     return previous.kind === 'planAction'
       && next.kind === 'planAction'
       && previous.planActionId === next.planActionId;
+  }
+  if (
+    previous.kind === 'interventionResearch'
+    || next.kind === 'interventionResearch'
+  ) {
+    return previous.kind === 'interventionResearch'
+      && next.kind === 'interventionResearch'
+      && previous.researchId === next.researchId;
   }
   return true;
 }

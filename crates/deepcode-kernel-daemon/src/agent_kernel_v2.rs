@@ -3,12 +3,13 @@ use crate::host_kernel_operation_store_v2::{
     HostCallerRequestDriveStateV2, HostCallerRequestRecoveryEvidenceV2, HostKernelFailureCommitV2,
     HostKernelFailureDispositionV2, HostKernelFailureEffectV2, HostKernelLiveRunForDeletionV2,
     HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
-    HostKernelStoredRunLifecycleV2, HostRunCallerDriveRecoveryV2,
+    HostKernelPendingRequestLaneV2, HostKernelStoredRunLifecycleV2, HostRunCallerDriveRecoveryV2,
 };
 use crate::host_kernel_run_v2::{
     HostKernelBridgeOperationV2, HostKernelCapabilityDecisionV2, HostKernelInitialInputV2,
-    HostKernelPlanDecisionV2, HostKernelRunAdmittedV2, HostKernelRunSpawnInputV2,
-    HostKernelRunWorkspaceV2, HostKernelStartupContinuationRunV2, HostKernelWaitKindV2,
+    HostKernelInterventionDecisionV4, HostKernelPlanDecisionV2, HostKernelRunAdmittedV2,
+    HostKernelRunSpawnInputV2, HostKernelRunWorkspaceV2, HostKernelStartupContinuationRunV2,
+    HostKernelWaitKindV2,
 };
 use crate::host_kernel_wake_v2::{
     HostKernelWakeCancelOutcomeV2, HostKernelWakeKeyV2, HostKernelWakeLaneV2,
@@ -19,11 +20,13 @@ use crate::host_run_broker_v2::{
     HostActiveRunRecordV2, HostRunSettingsCeilingV2, HostRunWorkspaceKindV2,
 };
 use crate::host_services::{HostPreparedBoundWorkspaceV2, HostPreparedEmptyWorkspaceV2};
-use crate::host_v2_storage::{canonical_sha256, stable_json_sha256, HostV2StorageError};
+use crate::host_v2_storage::{
+    canonical_sha256, stable_json_sha256, validate_bounded_identity, HostV2StorageError,
+};
 use crate::kernel_v2_transport::{
     HostAuthorityRevokeResolveRequestV2, HostCapabilityDecisionApplyErrorV2,
-    HostCapabilityDecisionKindV2, HostCapabilityDecisionRequestV2, HostResolvedAuthorityRevokeV2,
-    HostTrustGrantRequestV2,
+    HostCapabilityDecisionKindV2, HostCapabilityDecisionRequestV2,
+    HostInterventionSelectionRequestV3, HostResolvedAuthorityRevokeV2, HostTrustGrantRequestV2,
 };
 use crate::prelude::*;
 use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPriorEventsV2};
@@ -41,8 +44,6 @@ use deepcode_kernel_abi::{
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-const MAX_AUTOMATIC_SESSION_STEPS_V2: usize = 128;
-const PLAN_ACTION_PROVIDER_CALL_BUDGET_V2: u16 = 32;
 const KERNEL_FACT_WAKE_POLL_INTERVAL_V2: Duration = Duration::from_millis(50);
 const HOST_CALLER_SETTLEMENT_RETRY_INTERVAL_V2: Duration = Duration::from_millis(100);
 const HOST_INPUT_PROJECTION_SETTLEMENT_GRACE_CHECKS_V2: u8 = 40;
@@ -139,18 +140,6 @@ impl PreparedAgentWorkspaceV2 {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty { .. })
-    }
-
-    fn active_folder_id(&self) -> Option<&str> {
-        match self {
-            Self::Bound { workspace, .. } | Self::Empty { workspace, .. } => {
-                workspace.active_folder_id.as_deref()
-            }
-        }
-    }
-
     fn discard(self, state: &AppState) -> Result<(), AgentKernelV2Error> {
         match self {
             Self::Bound { prepared, .. } => state
@@ -205,6 +194,18 @@ enum PreparedAgentDecisionV2 {
         guidance: String,
         operation_request_id: String,
     },
+    UserIntervention {
+        interaction_id: String,
+        interaction_revision: String,
+        candidate_set_digest: String,
+        expected_projection_cursor: u64,
+        decision: HostKernelInterventionDecisionV4,
+        option_id: Option<String>,
+        guidance: Option<String>,
+        selected_preview_ids: Vec<String>,
+        superseded_preview_ids: Vec<String>,
+        operation_request_id: String,
+    },
 }
 
 enum RecoveredCallerDriveActionV2 {
@@ -223,7 +224,7 @@ enum PlanPreviewAuthorizationModeV2 {
 
 struct PreparedOpenCallerRequestV2 {
     prompt: String,
-    attachments: Vec<AgentInputAttachmentV2>,
+    attachments: Vec<AgentInputAttachmentV3>,
     caller_request_id: String,
     request_digest: String,
     host_run_id: String,
@@ -444,29 +445,25 @@ pub(crate) async fn open_agent_kernel_run_v2(
                 return Err(error);
             }
         };
-    if prepared_workspace.is_empty() && !prepared.attachments.is_empty() {
-        let error = AgentKernelV2Error::invalid(
-            "agent_input_attachment_workspace_required",
-            "Attachments require a bound workspace.",
-        );
-        settle_caller_error_outcome_v2(state, &binding, &error, false)?;
-        let _ = prepared_workspace.discard(state);
-        return Err(error);
-    }
-    if let Err(folder_error) = validate_agent_attachment_folder_binding_v2(
+    let attachment_admission = match state.host_services.user_attachments_v1.admit_input(
+        session_id,
+        &binding.caller_request_id,
         &prepared.attachments,
-        prepared_workspace.active_folder_id(),
     ) {
-        let error = AgentKernelV2Error::invalid(folder_error.code, folder_error.message);
-        settle_caller_error_outcome_v2(state, &binding, &error, false)?;
-        let _ = prepared_workspace.discard(state);
-        return Err(error);
-    }
+        Ok(admission) => admission,
+        Err(attachment_error) => {
+            let error = AgentKernelV2Error::from_storage(attachment_error);
+            settle_caller_error_outcome_v2(state, &binding, &error, false)?;
+            let _ = prepared_workspace.discard(state);
+            return Err(error);
+        }
+    };
     let initial_input = HostKernelInitialInputV2 {
         input_id: input_id.clone(),
         opaque_input_ref,
         text: prepared.prompt,
-        attachments: prepared.attachments,
+        attachments: attachment_admission.attachments,
+        attachment_contexts: attachment_admission.contexts,
         recorded_at: binding.recorded_at.clone(),
     };
     let operation = HostKernelBridgeOperationV2::InitialTurn {
@@ -728,6 +725,17 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
     body: &AgentSessionRunRequest,
 ) -> Result<String, AgentKernelV2Error> {
     let caller_request_id = required_caller_request_id_v2(Some(&body.caller_request_id))?;
+    let conversation_target_revision = body
+        .conversation_target
+        .as_ref()
+        .map(|target| target.target_revision.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "agent_conversation_target_required",
+                "Decision admission requires the exact daemon-issued conversationTarget",
+            )
+        })?;
     let route_run_id = body
         .run_id
         .as_deref()
@@ -750,10 +758,22 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
                 "A supported Kernel–Session v2 decision kind is required.",
             )
         })?;
-    if !matches!(decision_kind, "plan" | "permission") {
+    if !matches!(decision_kind, "plan" | "permission" | "userIntervention") {
         return Err(AgentKernelV2Error::invalid(
             "session_interaction_v2_unsupported",
             "The requested decision kind is not part of the Kernel–Session v2 contract.",
+        ));
+    }
+    if decision_kind != "userIntervention"
+        && (body.option_id.is_some()
+            || body.interaction_id.is_some()
+            || body.interaction_revision.is_some()
+            || body.candidate_set_digest.is_some()
+            || body.expected_projection_cursor.is_some())
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "session_operation_v2_invalid",
+            "Plan and permission decisions cannot carry user-intervention identity.",
         ));
     }
     let normalized_guidance = body
@@ -761,17 +781,38 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let request_material = json!({
-        "schemaVersion": "deepcode.host.caller-request-payload.v2",
-        "kind": HOST_DECISION_REQUEST_KIND_V2,
-        "sessionId": session_id,
-        "routeRunId": route_run_id,
-        "callerRequestId": caller_request_id,
-        "decisionKind": decision_kind,
-        "decision": body.decision,
-        "guidance": normalized_guidance,
-        "targetId": body.target_id,
-    });
+    let request_material = if decision_kind == "userIntervention" {
+        json!({
+            "schemaVersion": "deepcode.host.caller-request-payload.v2",
+            "kind": HOST_DECISION_REQUEST_KIND_V2,
+            "sessionId": session_id,
+            "routeRunId": route_run_id,
+            "callerRequestId": caller_request_id,
+            "conversationTargetRevision": conversation_target_revision,
+            "decisionKind": decision_kind,
+            "decision": body.decision,
+            "guidance": normalized_guidance,
+            "targetId": body.target_id,
+            "optionId": body.option_id,
+            "interactionId": body.interaction_id,
+            "interactionRevision": body.interaction_revision,
+            "candidateSetDigest": body.candidate_set_digest,
+            "expectedProjectionCursor": body.expected_projection_cursor,
+        })
+    } else {
+        json!({
+            "schemaVersion": "deepcode.host.caller-request-payload.v2",
+            "kind": HOST_DECISION_REQUEST_KIND_V2,
+            "sessionId": session_id,
+            "routeRunId": route_run_id,
+            "callerRequestId": caller_request_id,
+            "conversationTargetRevision": conversation_target_revision,
+            "decisionKind": decision_kind,
+            "decision": body.decision,
+            "guidance": normalized_guidance,
+            "targetId": body.target_id,
+        })
+    };
     let request_digest =
         canonical_sha256(&request_material).map_err(AgentKernelV2Error::from_storage)?;
     let existing = state
@@ -803,8 +844,14 @@ pub(crate) async fn resolve_agent_kernel_decision_v2(
         Some(binding) => binding,
         None => {
             let current = latest_settlement_v2(state, &active)?;
-            let prepared =
-                prepare_agent_decision_v2(&active, body, &current, decision_kind, &request_digest)?;
+            let prepared = prepare_agent_decision_v2(
+                state,
+                &active,
+                body,
+                &current,
+                decision_kind,
+                &request_digest,
+            )?;
             state
                 .host_services
                 .kernel_operations_v2
@@ -1837,50 +1884,17 @@ pub(crate) fn revoke_agent_kernel_authority_v2(
     Ok(result)
 }
 
-fn validate_active_run_attachment_binding_v2(
+fn validate_active_run_attachments_v3(
     state: &AppState,
     active: &HostActiveRunRecordV2,
-    attachments: &[AgentInputAttachmentV2],
+    caller_request_id: &str,
+    attachments: &[AgentInputAttachmentV3],
 ) -> Result<(), AgentKernelV2Error> {
-    if attachments.is_empty() {
-        return Ok(());
-    }
-    if active.workspace_kind != HostRunWorkspaceKindV2::Bound {
-        return Err(AgentKernelV2Error::invalid(
-            "agent_input_attachment_workspace_required",
-            "Attachments require a bound workspace.",
-        ));
-    }
-    let workspace_binding_ref = WorkspaceBindingRefV2::new(active.workspace_binding_ref.clone())
-        .map_err(|_| {
-            AgentKernelV2Error::invalid(
-                "agent_input_attachment_workspace_unverifiable",
-                "The active Run workspace binding reference is invalid.",
-            )
-        })?;
-    let current_binding = state
+    state
         .host_services
-        .workspace
-        .resolve_exact_run_binding(&workspace_binding_ref, &active.workspace_binding_identity)
-        .map_err(|error| {
-            AgentKernelV2Error::invalid(
-                "agent_input_attachment_workspace_unverifiable",
-                format!(
-                    "The active Run workspace root cannot be proven unchanged: {}",
-                    error.message
-                ),
-            )
-        })?;
-    if let Some(authoritative_folder_id) = active.active_folder_id.as_deref() {
-        if current_binding.active_folder_id.as_deref() != Some(authoritative_folder_id) {
-            return Err(AgentKernelV2Error::invalid(
-                "agent_input_attachment_folder_binding_stale",
-                "The durable Run folder identity no longer matches its exact workspace root.",
-            ));
-        }
-    }
-    validate_agent_attachment_folder_binding_v2(attachments, active.active_folder_id.as_deref())
-        .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))
+        .user_attachments_v1
+        .validate_bound_handles(&active.session_id, caller_request_id, attachments)
+        .map_err(AgentKernelV2Error::from_storage)
 }
 
 pub(crate) async fn submit_agent_kernel_user_input_v2(
@@ -1890,15 +1904,16 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
     guidance: &str,
     workspace_path: Option<&str>,
     no_workspace: bool,
-    attachments: Option<&[AgentInputAttachmentV2]>,
+    attachments: Option<&[AgentInputAttachmentV3]>,
     caller_request_id: &str,
+    conversation_target_revision: &str,
 ) -> Result<AgentKernelUserInputAdmissionV2, AgentKernelV2Error> {
     let text = Some(guidance)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AgentKernelV2Error::invalid("empty_guidance", "guidance must not be empty"))?
         .to_string();
-    let attachments = validate_agent_input_attachments_v2(attachments)
+    let attachments = validate_agent_input_attachments_v3(attachments)
         .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
     let caller_request_id = required_caller_request_id_v2(Some(caller_request_id))?;
     let request_material = json!({
@@ -1907,6 +1922,7 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
         "sessionId": session_id,
         "routeRunId": route_run_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
         "text": text,
         "workspacePath": workspace_path,
         "noWorkspace": no_workspace,
@@ -1952,12 +1968,16 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
     }
     let active = require_active_agent_kernel_run_v2(state, session_id, Some(route_run_id))?;
     validate_active_run_workspace_request_v2(state, &active, workspace_path, no_workspace)?;
-    validate_active_run_attachment_binding_v2(state, &active, &attachments)?;
     ensure_agent_run_cache_v2(state, &active)?;
     let binding = match existing {
         Some(binding) => binding,
         None => {
             let recorded_at = crate::utils::now_rfc3339_text();
+            let attachment_admission = state
+                .host_services
+                .user_attachments_v1
+                .admit_input(session_id, caller_request_id, &attachments)
+                .map_err(AgentKernelV2Error::from_storage)?;
             let material = json!({
                 "schemaVersion": "deepcode.host.agent-input.v2",
                 "sessionId": session_id,
@@ -1966,7 +1986,7 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
                 "callerRequestId": caller_request_id,
                 "requestDigest": request_digest,
                 "text": text,
-                "attachments": attachments,
+                "attachments": attachment_admission.attachments,
             });
             let input_id = typed_input_id("user", &material)?;
             let opaque_input_ref = stable_identity_v2("input-ref", &material)?;
@@ -1974,7 +1994,8 @@ pub(crate) async fn submit_agent_kernel_user_input_v2(
                 input_id: input_id.clone(),
                 opaque_input_ref: opaque_input_ref.clone(),
                 text: text.clone(),
-                attachments: attachments.clone(),
+                attachments: attachment_admission.attachments,
+                attachment_contexts: attachment_admission.contexts,
                 recorded_at: recorded_at.clone(),
             };
             let identity_operation = HostKernelBridgeOperationV2::UserInput {
@@ -2256,8 +2277,10 @@ fn durable_user_input_from_binding_v2(
             "Durable Host caller request semantic user input is invalid.",
         )
     })?;
-    validate_agent_input_attachment_slice_v2(&input.attachments)
+    validate_agent_input_attachment_slice_v3(&input.attachments)
         .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
+    validate_user_attachment_contexts_v1(&input.attachments, &input.attachment_contexts)
+        .map_err(AgentKernelV2Error::from_storage)?;
     if input.text.is_empty() || input.text.trim() != input.text {
         return Err(AgentKernelV2Error::invalid(
             "host_caller_request_semantic_input_invalid",
@@ -2281,6 +2304,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
     session_id: &str,
     route_run_id: &str,
     caller_request_id: &str,
+    conversation_target_revision: &str,
 ) -> Result<Option<String>, AgentKernelV2Error> {
     let caller_request_id = required_caller_request_id_v2(Some(caller_request_id))?;
     let request_material = json!({
@@ -2289,6 +2313,7 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
         "sessionId": session_id,
         "routeRunId": route_run_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
     });
     let request_digest =
         canonical_sha256(&request_material).map_err(AgentKernelV2Error::from_storage)?;
@@ -2547,10 +2572,21 @@ fn prepare_open_caller_request_v2(
             )
         })?
         .to_string();
-    let attachments = validate_agent_input_attachments_v2(body.attachments.as_deref())
+    let attachments = validate_agent_input_attachments_v3(body.attachments.as_deref())
         .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
     let caller_request_id =
         required_caller_request_id_v2(Some(&body.caller_request_id))?.to_string();
+    let conversation_target_revision = body
+        .conversation_target
+        .as_ref()
+        .map(|target| target.target_revision.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "agent_conversation_target_required",
+                "Run admission requires the exact daemon-issued conversationTarget",
+            )
+        })?;
     let no_workspace = body.no_workspace.unwrap_or(false);
     let workspace_path = (!no_workspace)
         .then(|| {
@@ -2565,6 +2601,7 @@ fn prepare_open_caller_request_v2(
         "kind": HOST_RUN_OPEN_REQUEST_KIND_V2,
         "sessionId": session_id,
         "callerRequestId": caller_request_id,
+        "conversationTargetRevision": conversation_target_revision,
         "prompt": prompt,
         "attachments": attachments,
         "workspacePath": workspace_path,
@@ -2703,11 +2740,10 @@ fn prepare_agent_workspace_v2(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    deepcode_kernel_abi::validate_optional_agent_attachment_id_v2(
-        active_folder_id.as_deref(),
-        "activeFolderId",
-    )
-    .map_err(|error| AgentKernelV2Error::invalid(error.code, error.message))?;
+    if let Some(active_folder_id) = active_folder_id.as_deref() {
+        validate_bounded_identity(active_folder_id, "activeFolderId", 512)
+            .map_err(AgentKernelV2Error::from_storage)?;
+    }
     let settings = state
         .kernel_v2
         .settings_resolver()
@@ -2739,6 +2775,7 @@ fn prepare_agent_workspace_v2(
 }
 
 fn prepare_agent_decision_v2(
+    state: &AppState,
     active: &HostActiveRunRecordV2,
     body: &AgentSessionRunRequest,
     current: &HostKernelOperationSettlementReceiptV2,
@@ -2871,11 +2908,313 @@ fn prepare_agent_decision_v2(
                 operation_request_id,
             })
         }
+        "userIntervention" => {
+            prepare_user_intervention_decision_v4(state, active, body, current, request_digest)
+        }
         _ => Err(AgentKernelV2Error::invalid(
             "session_interaction_kind_invalid",
             "A supported Kernel–Session v2 decision kind is required.",
         )),
     }
+}
+
+fn prepare_user_intervention_decision_v4(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    body: &AgentSessionRunRequest,
+    current: &HostKernelOperationSettlementReceiptV2,
+    request_digest: &str,
+) -> Result<PreparedAgentDecisionV2, AgentKernelV2Error> {
+    if continuation_kind_v2(current) != Some("awaitingUserIntervention") {
+        return Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_decision_stale",
+            "The durable Run is not awaiting a user intervention decision.",
+        ));
+    }
+    let interaction_id = body
+        .interaction_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_identity_required",
+                "User intervention decision requires the exact interaction identity.",
+            )
+        })?
+        .to_string();
+    let interaction_revision = body
+        .interaction_revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_identity_required",
+                "User intervention decision requires the exact interaction revision.",
+            )
+        })?
+        .to_string();
+    let candidate_set_digest = body
+        .candidate_set_digest
+        .as_deref()
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_identity_required",
+                "User intervention decision requires the exact candidate-set digest.",
+            )
+        })?
+        .to_string();
+    validate_bounded_identity(&interaction_id, "interactionId", 512)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    validate_bounded_identity(&interaction_revision, "interactionRevision", 512)
+        .map_err(AgentKernelV2Error::from_storage)?;
+    crate::host_v2_storage::validate_sha256_digest(&candidate_set_digest, "candidateSetDigest")
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let target_id = body
+        .target_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_identity_required",
+                "User intervention decision requires the exact interaction target.",
+            )
+        })?;
+    if target_id != interaction_id
+        || continuation_field_v2(current, "interactionId") != Some(interaction_id.as_str())
+        || continuation_field_v2(current, "interactionRevision")
+            != Some(interaction_revision.as_str())
+        || continuation_field_v2(current, "candidateSetDigest")
+            != Some(candidate_set_digest.as_str())
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_decision_stale",
+            "User intervention decision does not match the exact durable wait.",
+        ));
+    }
+
+    let expected_projection_cursor = body.expected_projection_cursor.ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_projection_cursor_required",
+            "User intervention decision requires the exact public projection cursor.",
+        )
+    })?;
+    let projection = state
+        .host_services
+        .projection_v2
+        .latest_timeline(&active.session_id)
+        .map_err(AgentKernelV2Error::from_storage)?
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_projection_unavailable",
+                "User intervention decision has no canonical public projection.",
+            )
+        })?;
+    let projection_cursor = projection
+        .get("revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_projection_invalid",
+                "Canonical public projection has no safe revision cursor.",
+            )
+        })?;
+    if projection_cursor != expected_projection_cursor {
+        return Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_projection_stale",
+            "User intervention decision was made against a stale public projection cursor.",
+        ));
+    }
+
+    let response = success_response_v2(current)?;
+    let intervention = response
+        .pointer("/state/userIntervention")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_state_missing",
+                "Durable Session state does not expose the active intervention candidate set.",
+            )
+        })?;
+    for (field, expected) in [
+        ("interactionId", interaction_id.as_str()),
+        ("interactionRevision", interaction_revision.as_str()),
+        ("candidateSetDigest", candidate_set_digest.as_str()),
+    ] {
+        if intervention.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(AgentKernelV2Error::invalid(
+                "session_user_intervention_state_stale",
+                format!("Durable user intervention state does not match {field}."),
+            ));
+        }
+    }
+    let options = intervention
+        .get("options")
+        .and_then(Value::as_array)
+        .filter(|options| !options.is_empty())
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_options_missing",
+                "Durable user intervention has no candidate options.",
+            )
+        })?;
+    let decision = match body.decision.as_deref() {
+        Some("select") => HostKernelInterventionDecisionV4::Select,
+        Some("revise") => HostKernelInterventionDecisionV4::Revise,
+        Some("reject") => HostKernelInterventionDecisionV4::Reject,
+        _ => {
+            return Err(AgentKernelV2Error::invalid(
+                "session_user_intervention_decision_invalid",
+                "User intervention decision must be select, revise, or reject.",
+            ))
+        }
+    };
+    let guidance = body
+        .guidance
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let option_id = body
+        .option_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if matches!(decision, HostKernelInterventionDecisionV4::Select) != option_id.is_some()
+        || (matches!(decision, HostKernelInterventionDecisionV4::Revise) && guidance.is_none())
+        || (!matches!(decision, HostKernelInterventionDecisionV4::Select) && option_id.is_some())
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_decision_invalid",
+            "User intervention decision does not contain its exact closed payload.",
+        ));
+    }
+
+    let mut all_preview_ids = HashSet::new();
+    let mut selected_preview_ids = Vec::new();
+    let mut superseded_preview_ids = Vec::new();
+    let mut selected_kind = None;
+    for option in options {
+        let option_object = option.as_object().ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_user_intervention_option_invalid",
+                "User intervention option must be a structured object.",
+            )
+        })?;
+        let current_option_id = option_object
+            .get("optionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "session_user_intervention_option_invalid",
+                    "User intervention option has no identity.",
+                )
+            })?;
+        let kind = option_object
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "executable" | "guidanceOnly"))
+            .ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "session_user_intervention_option_invalid",
+                    "User intervention option has an unsupported kind.",
+                )
+            })?;
+        let actions = option_object
+            .get("actions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "session_user_intervention_option_invalid",
+                    "User intervention option has no canonical action previews.",
+                )
+            })?;
+        if kind == "executable"
+            && (actions.is_empty() || option_object.get("candidatePlan").is_none())
+        {
+            return Err(AgentKernelV2Error::invalid(
+                "session_user_intervention_option_invalid",
+                "Executable intervention option requires a final candidate Plan and previews.",
+            ));
+        }
+        if kind == "guidanceOnly"
+            && (!actions.is_empty() || option_object.get("candidatePlan").is_some())
+        {
+            return Err(AgentKernelV2Error::invalid(
+                "session_user_intervention_option_invalid",
+                "Guidance-only intervention option cannot carry executable authority.",
+            ));
+        }
+        let mut option_preview_ids = Vec::new();
+        for action in actions {
+            let preview_id = action
+                .pointer("/preview/previewId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AgentKernelV2Error::invalid(
+                        "session_user_intervention_preview_invalid",
+                        "Executable intervention action has no canonical preview identity.",
+                    )
+                })?;
+            if !all_preview_ids.insert(preview_id.to_string()) {
+                return Err(AgentKernelV2Error::invalid(
+                    "session_user_intervention_preview_conflict",
+                    "Intervention candidate previews must be unique across options.",
+                ));
+            }
+            option_preview_ids.push(preview_id.to_string());
+        }
+        if option_id.as_deref() == Some(current_option_id) {
+            selected_kind = Some(kind);
+            selected_preview_ids = option_preview_ids;
+        } else if kind == "executable" {
+            superseded_preview_ids.extend(option_preview_ids);
+        }
+    }
+    if matches!(decision, HostKernelInterventionDecisionV4::Select) && selected_kind.is_none() {
+        return Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_option_stale",
+            "Selected intervention option is not part of the active candidate set.",
+        ));
+    }
+    if selected_kind == Some("guidanceOnly") {
+        selected_preview_ids.clear();
+        superseded_preview_ids.clear();
+    }
+    let operation_request_id = stable_identity_v2(
+        "decision-operation",
+        &json!({
+            "requestDigest": request_digest,
+            "runId": active.run_id,
+            "decisionKind": "userIntervention",
+            "interactionId": interaction_id,
+            "interactionRevision": interaction_revision,
+            "candidateSetDigest": candidate_set_digest,
+            "expectedProjectionCursor": expected_projection_cursor,
+            "decision": intervention_decision_name_v4(decision),
+            "optionId": option_id,
+            "guidance": guidance,
+            "selectedPreviewIds": selected_preview_ids,
+            "supersededPreviewIds": superseded_preview_ids,
+        }),
+    )?;
+    Ok(PreparedAgentDecisionV2::UserIntervention {
+        interaction_id,
+        interaction_revision,
+        candidate_set_digest,
+        expected_projection_cursor,
+        decision,
+        option_id,
+        guidance,
+        selected_preview_ids,
+        superseded_preview_ids,
+        operation_request_id,
+    })
 }
 
 fn prepared_agent_decision_identity_v2(
@@ -2918,6 +3257,35 @@ fn prepared_agent_decision_identity_v2(
             "decision": capability_decision_name_v2(*host_decision),
             "guidance": guidance,
             "operationRequestId": operation_request_id,
+        }),
+        PreparedAgentDecisionV2::UserIntervention {
+            interaction_id,
+            interaction_revision,
+            candidate_set_digest,
+            expected_projection_cursor,
+            decision,
+            option_id,
+            guidance,
+            selected_preview_ids,
+            superseded_preview_ids,
+            operation_request_id,
+        } => json!({
+            "hostRunId": active.host_run_id,
+            "runId": active.run_id,
+            "predecessorSettlementDigest": current.settlement_digest,
+            "decisionKind": "userIntervention",
+            "interactionId": interaction_id,
+            "interactionRevision": interaction_revision,
+            "candidateSetDigest": candidate_set_digest,
+            "expectedProjectionCursor": expected_projection_cursor,
+            "decision": intervention_decision_name_v4(*decision),
+            "optionId": option_id,
+            "guidance": guidance,
+            "selectedPreviewIds": selected_preview_ids,
+            "supersededPreviewIds": superseded_preview_ids,
+            "operationRequestId": operation_request_id,
+            "cancelOperationId": matches!(*decision, HostKernelInterventionDecisionV4::Reject)
+                .then_some(operation_request_id),
         }),
     }
 }
@@ -3003,6 +3371,68 @@ fn decode_prepared_agent_decision_v2(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                operation_request_id,
+            })
+        }
+        Some("userIntervention") => {
+            let decision = match binding
+                .response_identity
+                .get("decision")
+                .and_then(Value::as_str)
+            {
+                Some("select") => HostKernelInterventionDecisionV4::Select,
+                Some("revise") => HostKernelInterventionDecisionV4::Revise,
+                Some("reject") => HostKernelInterventionDecisionV4::Reject,
+                _ => {
+                    return Err(AgentKernelV2Error::invalid(
+                        "host_caller_request_identity_invalid",
+                        "Durable Host intervention decision has an invalid decision.",
+                    ))
+                }
+            };
+            let expected_projection_cursor = binding
+                .response_identity
+                .get("expectedProjectionCursor")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    AgentKernelV2Error::invalid(
+                        "host_caller_request_identity_invalid",
+                        "Durable Host intervention decision has no projection cursor.",
+                    )
+                })?;
+            if matches!(decision, HostKernelInterventionDecisionV4::Reject)
+                && binding
+                    .response_identity
+                    .get("cancelOperationId")
+                    .and_then(Value::as_str)
+                    != Some(operation_request_id.as_str())
+            {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_caller_request_identity_invalid",
+                    "Durable Host intervention rejection has no exact cancellation identity.",
+                ));
+            }
+            Ok(PreparedAgentDecisionV2::UserIntervention {
+                interaction_id: caller_binding_string_v2(binding, "interactionId")?,
+                interaction_revision: caller_binding_string_v2(binding, "interactionRevision")?,
+                candidate_set_digest: caller_binding_string_v2(binding, "candidateSetDigest")?,
+                expected_projection_cursor,
+                decision,
+                option_id: binding
+                    .response_identity
+                    .get("optionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                guidance: binding
+                    .response_identity
+                    .get("guidance")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                selected_preview_ids: caller_binding_string_vec_v4(binding, "selectedPreviewIds")?,
+                superseded_preview_ids: caller_binding_string_vec_v4(
+                    binding,
+                    "supersededPreviewIds",
+                )?,
                 operation_request_id,
             })
         }
@@ -3171,7 +3601,256 @@ async fn execute_prepared_agent_decision_v2(
             )
             .await
         }
+        PreparedAgentDecisionV2::UserIntervention {
+            interaction_id,
+            interaction_revision,
+            candidate_set_digest,
+            expected_projection_cursor: _,
+            decision,
+            option_id,
+            guidance,
+            selected_preview_ids,
+            superseded_preview_ids,
+            operation_request_id,
+        } => {
+            if matches!(decision, HostKernelInterventionDecisionV4::Select)
+                && !selected_preview_ids.is_empty()
+            {
+                let selected_option_id = option_id.as_deref().ok_or_else(|| {
+                    AgentKernelV2Error::invalid(
+                        "session_user_intervention_option_missing",
+                        "Executable intervention selection has no exact option identity.",
+                    )
+                })?;
+                let decision_material = json!({
+                    "schemaVersion": "deepcode.host.intervention-selection.v3",
+                    "callerRequestDigest": binding.request_digest,
+                    "runId": active.run_id,
+                    "interactionId": interaction_id,
+                    "interactionRevision": interaction_revision,
+                    "candidateSetDigest": candidate_set_digest,
+                    "selectedOptionId": selected_option_id,
+                    "selectedPreviewIds": selected_preview_ids,
+                    "supersededPreviewIds": superseded_preview_ids,
+                });
+                apply_host_intervention_selection_v4(
+                    &state.kernel_v2,
+                    &interaction_id,
+                    &interaction_revision,
+                    &candidate_set_digest,
+                    selected_option_id,
+                    &selected_preview_ids,
+                    &superseded_preview_ids,
+                    &decision_material,
+                )?;
+            }
+            let operation = HostKernelBridgeOperationV2::DecideUserIntervention {
+                interaction_id,
+                interaction_revision,
+                candidate_set_digest,
+                decision,
+                option_id,
+                guidance,
+                caller_request_id: binding.caller_request_id.clone(),
+                caller_request_digest: binding.request_digest.clone(),
+                cancel_operation_id: matches!(decision, HostKernelInterventionDecisionV4::Reject)
+                    .then_some(operation_request_id.clone()),
+            };
+            let settled = state
+                .kernel_session_v2
+                .submit_operation(
+                    &active.session_id,
+                    &active.host_run_id,
+                    &operation_request_id,
+                    operation,
+                )
+                .await
+                .map_err(AgentKernelV2Error::from_storage)?;
+            let settlement = if matches!(decision, HostKernelInterventionDecisionV4::Select)
+                && !selected_preview_ids.is_empty()
+            {
+                let observed_high_water = success_response_v2(&settled)?
+                    .pointer("/state/factsSnapshotHighWater")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        AgentKernelV2Error::invalid(
+                            "session_kernel_facts_high_water_missing",
+                            "Executable intervention settlement has no exact facts high-water.",
+                        )
+                    })?;
+                let reconcile = HostKernelBridgeOperationV2::ReconcileFacts {
+                    observed_high_water,
+                };
+                let request_id = next_operation_request_id_v2(&settled, &reconcile)?;
+                state
+                    .kernel_session_v2
+                    .submit_operation(
+                        &active.session_id,
+                        &active.host_run_id,
+                        &request_id,
+                        reconcile,
+                    )
+                    .await
+                    .map_err(AgentKernelV2Error::from_storage)?
+            } else {
+                settled
+            };
+            drive_agent_kernel_until_boundary_v2(
+                &AgentKernelDriveContextV2::from_state(state),
+                active,
+                settlement,
+            )
+            .await
+        }
     }
+}
+
+/// Completes the missing Session half of an executable intervention selection
+/// whose Kernel authority facts were durably written before an older Session
+/// checkpoint rejected the still-open intervention wait. This recovery never
+/// drives the selected Plan action: it stops at `readyToDrivePlanAction` and
+/// preserves the original caller's immutable indeterminate outcome.
+async fn recover_indeterminate_intervention_selection_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<bool, AgentKernelV2Error> {
+    let prepared = decode_prepared_agent_decision_v2(binding)?;
+    let PreparedAgentDecisionV2::UserIntervention {
+        interaction_id,
+        interaction_revision,
+        candidate_set_digest,
+        expected_projection_cursor: _,
+        decision: HostKernelInterventionDecisionV4::Select,
+        option_id: Some(option_id),
+        guidance,
+        selected_preview_ids,
+        superseded_preview_ids: _,
+        operation_request_id: _,
+    } = prepared
+    else {
+        return Ok(false);
+    };
+    if selected_preview_ids.is_empty() {
+        return Ok(false);
+    }
+    let evidence = state
+        .host_services
+        .kernel_operations_v2
+        .caller_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let Some(first_settlement) = evidence.first_settlement.as_ref() else {
+        return Ok(false);
+    };
+    let HostKernelOperationSettlementV2::FailedRecoverable { boundary, .. } =
+        &first_settlement.settlement
+    else {
+        return Ok(false);
+    };
+    if boundary.disposition != HostKernelFailureDispositionV2::QueryFacts
+        || boundary.commit != HostKernelFailureCommitV2::Unknown
+        || boundary.effect != HostKernelFailureEffectV2::Possible
+        || boundary.pending_request_lanes != vec![HostKernelPendingRequestLaneV2::Query]
+    {
+        return Ok(false);
+    }
+    let reclaimed = state
+        .host_services
+        .kernel_operations_v2
+        .reclaim_indeterminate_intervention_caller_request_drive(
+            binding,
+            &state.host_services.active_runs_v2.owner_instance_id(),
+            &crate::utils::now_rfc3339_text(),
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    ensure_agent_run_cache_v2(state, active)?;
+    // The original caller-correlated Session operation is created only after
+    // `apply_host_intervention_selection_v4` returned a committed Kernel
+    // receipt. Its exact FailedRecoverable QueryFacts settlement therefore
+    // proves that selection facts and leases already exist. Reissuing the
+    // selection after restart would incorrectly require consumed previews to
+    // become pending again. Recovery instead reconciles the existing Kernel
+    // facts into Session and fails closed if those facts cannot be proven.
+    let decision_operation = HostKernelBridgeOperationV2::DecideUserIntervention {
+        interaction_id,
+        interaction_revision,
+        candidate_set_digest,
+        decision: HostKernelInterventionDecisionV4::Select,
+        option_id: Some(option_id),
+        guidance,
+        caller_request_id: reclaimed.caller_request_id.clone(),
+        caller_request_digest: reclaimed.request_digest.clone(),
+        cancel_operation_id: None,
+    };
+    let decision_request_id = stable_operation_request_id_v2(
+        "recover-intervention-decision",
+        &first_settlement.settlement_digest,
+        &decision_operation,
+    )?;
+    let decided = state
+        .kernel_session_v2
+        .submit_operation(
+            &active.session_id,
+            &active.host_run_id,
+            &decision_request_id,
+            decision_operation,
+        )
+        .await
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let observed_high_water = success_response_v2(&decided)?
+        .pointer("/state/factsSnapshotHighWater")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_kernel_facts_high_water_missing",
+                "Recovered intervention settlement has no exact facts high-water.",
+            )
+        })?;
+    let reconcile_operation = HostKernelBridgeOperationV2::ReconcileFacts {
+        observed_high_water,
+    };
+    let reconcile_request_id = next_operation_request_id_v2(&decided, &reconcile_operation)?;
+    let reconciled = state
+        .kernel_session_v2
+        .submit_operation(
+            &active.session_id,
+            &active.host_run_id,
+            &reconcile_request_id,
+            reconcile_operation,
+        )
+        .await
+        .map_err(AgentKernelV2Error::from_storage)?;
+    if continuation_kind_v2(&reconciled) != Some("readyToDrivePlanAction") {
+        return Err(AgentKernelV2Error::invalid(
+            "session_intervention_recovery_boundary_invalid",
+            "Recovered intervention settlement did not stop before its first unexecuted Plan action.",
+        ));
+    }
+    state
+        .host_services
+        .kernel_operations_v2
+        .release_recovered_indeterminate_intervention_drive(
+            &reclaimed,
+            &state.host_services.active_runs_v2.owner_instance_id(),
+            &decided,
+            &reconciled,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    mark_agent_run_v2(
+        state,
+        &active.host_run_id,
+        "waiting",
+        Some(
+            "Recovered the selected intervention to its next unexecuted Plan action; no workspace mutation was replayed."
+                .to_string(),
+        ),
+    );
+    Ok(true)
 }
 
 fn normalized_permission_decision_v2(
@@ -3216,6 +3895,14 @@ fn plan_decision_name_v2(decision: HostKernelPlanDecisionV2) -> &'static str {
         HostKernelPlanDecisionV2::Accept => "accept",
         HostKernelPlanDecisionV2::Reject => "reject",
         HostKernelPlanDecisionV2::Revise => "revise",
+    }
+}
+
+fn intervention_decision_name_v4(decision: HostKernelInterventionDecisionV4) -> &'static str {
+    match decision {
+        HostKernelInterventionDecisionV4::Select => "select",
+        HostKernelInterventionDecisionV4::Revise => "revise",
+        HostKernelInterventionDecisionV4::Reject => "reject",
     }
 }
 
@@ -3556,6 +4243,89 @@ fn apply_host_scope_decision_v2(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_host_intervention_selection_v4(
+    kernel_v2: &crate::kernel_v2_transport::KernelV2TransportState,
+    interaction_id: &str,
+    interaction_revision: &str,
+    candidate_set_digest: &str,
+    selected_option_id: &str,
+    selected_preview_ids: &[String],
+    superseded_preview_ids: &[String],
+    identity_material: &Value,
+) -> Result<(), AgentKernelV2Error> {
+    let request_id = CommandRequestId::new(stable_identity_v2(
+        "user-decision-request",
+        identity_material,
+    )?)
+    .map_err(|_| {
+        AgentKernelV2Error::invalid(
+            "host_kernel_decision_request_id_invalid",
+            "Trusted intervention request identity is invalid.",
+        )
+    })?;
+    let decision_ref =
+        UserDecisionRefV2::new(stable_identity_v2("user-decision-ref", identity_material)?)
+            .map_err(|_| {
+                AgentKernelV2Error::invalid(
+                    "host_kernel_decision_ref_invalid",
+                    "Trusted intervention decision reference is invalid.",
+                )
+            })?;
+    let decode_preview_ids = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| {
+                CapabilityScopePreviewIdV2::new(value.clone()).map_err(|_| {
+                    AgentKernelV2Error::invalid(
+                        "session_user_intervention_preview_invalid",
+                        "Intervention preview identity is not strict Kernel v3.",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let response = kernel_v2
+        .apply_host_intervention_selection(HostInterventionSelectionRequestV3 {
+            request_id,
+            decision_ref,
+            interaction_id: interaction_id.to_string(),
+            interaction_revision: interaction_revision.to_string(),
+            candidate_set_digest: candidate_set_digest.to_string(),
+            selected_option_id: selected_option_id.to_string(),
+            selected_preview_ids: decode_preview_ids(selected_preview_ids)?,
+            superseded_preview_ids: decode_preview_ids(superseded_preview_ids)?,
+        })
+        .map_err(host_decision_error_v2)?;
+    match response {
+        UserDecisionResponseEnvelopeV2::Correlated {
+            reply: UserDecisionReplyV2::InterventionSelected { .. },
+            ..
+        } => Ok(()),
+        UserDecisionResponseEnvelopeV2::Correlated {
+            reply: UserDecisionReplyV2::Stale { .. },
+            ..
+        } => Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_decision_stale",
+            "Kernel rejected a stale intervention candidate selection.",
+        )),
+        UserDecisionResponseEnvelopeV2::Correlated {
+            reply: UserDecisionReplyV2::Error(error),
+            ..
+        } => Err(kernel_user_decision_error_v2(error)),
+        UserDecisionResponseEnvelopeV2::Correlated { .. } => Err(AgentKernelV2Error::invalid(
+            "host_kernel_intervention_reply_mismatch",
+            "Kernel intervention reply does not match the trusted selection.",
+        )),
+        UserDecisionResponseEnvelopeV2::UncorrelatedWireFailure { .. } => {
+            Err(AgentKernelV2Error::invalid(
+                "host_kernel_intervention_uncorrelated",
+                "Kernel returned an uncorrelated intervention decision failure.",
+            ))
+        }
+    }
+}
+
 fn apply_host_plan_trust_v2(
     kernel_v2: &crate::kernel_v2_transport::KernelV2TransportState,
     preview_id: &str,
@@ -3736,15 +4506,18 @@ enum OwnedDriveErrorDispositionV2 {
 
 fn classify_owned_drive_error_v2(error: &AgentKernelV2Error) -> OwnedDriveErrorDispositionV2 {
     match error.code.as_str() {
-        "session_permission_decision_stale" | "host_kernel_operation_unexpected_stale" => {
-            OwnedDriveErrorDispositionV2::StaleStop
-        }
+        "session_permission_decision_stale"
+        | "session_user_intervention_decision_stale"
+        | "session_user_intervention_projection_stale"
+        | "session_user_intervention_state_stale"
+        | "session_user_intervention_option_stale"
+        | "host_kernel_operation_unexpected_stale" => OwnedDriveErrorDispositionV2::StaleStop,
         "host_kernel_wake_supervisor_unavailable"
         | "host_kernel_retry_recovery_waiting"
         | "host_kernel_live_bridge_recovery_waiting"
         | "host_kernel_facts_high_water_unavailable"
         | "host_kernel_run_settings_unavailable"
-        | "session_kernel_automatic_step_budget_exhausted"
+        | "session_kernel_intervention_no_progress"
         | "session_kernel_production_operation_receipts_busy" => {
             OwnedDriveErrorDispositionV2::RecoveryWaiting
         }
@@ -3833,7 +4606,7 @@ async fn drive_agent_kernel_until_boundary_v2(
     mut settlement: HostKernelOperationSettlementReceiptV2,
 ) -> Result<AgentKernelDriveBoundaryV2, AgentKernelV2Error> {
     let mut last_facts_wait = None;
-    for _ in 0..MAX_AUTOMATIC_SESSION_STEPS_V2 {
+    loop {
         match &settlement.settlement {
             HostKernelOperationSettlementV2::FailedRecoverable {
                 error_code,
@@ -3924,7 +4697,6 @@ async fn drive_agent_kernel_until_boundary_v2(
                     "expectedPlanRevision",
                 )?
                 .to_string(),
-                provider_call_budget: PLAN_ACTION_PROVIDER_CALL_BUDGET_V2,
                 guidance: Vec::new(),
             },
             "readyToFinalizeReview" => HostKernelBridgeOperationV2::FinalizeReview {
@@ -4049,6 +4821,24 @@ async fn drive_agent_kernel_until_boundary_v2(
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
+            "terminalRunCancelled" => {
+                validate_intervention_cancellation_settlement_v4(&settlement)?;
+                context
+                    .kernel_session_v2
+                    .retire_run(&active.session_id, &active.host_run_id, &active.run_id)
+                    .await
+                    .map_err(AgentKernelV2Error::from_storage)?;
+                mark_agent_drive_v2(
+                    context,
+                    &active.host_run_id,
+                    "cancelled",
+                    Some(
+                        "User rejected the canonical intervention and the Run was cancelled."
+                            .to_string(),
+                    ),
+                );
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
+            }
             "awaitingUserPlanConfirmation" => {
                 let plan_revision =
                     required_continuation_field_v2(&settlement, "planRevision")?.to_string();
@@ -4169,6 +4959,15 @@ async fn drive_agent_kernel_until_boundary_v2(
                 );
                 return Ok(AgentKernelDriveBoundaryV2::Complete);
             }
+            "awaitingUserIntervention" => {
+                mark_agent_drive_v2(
+                    context,
+                    &active.host_run_id,
+                    "waiting",
+                    Some("Waiting for a canonical user intervention decision.".to_string()),
+                );
+                return Ok(AgentKernelDriveBoundaryV2::Complete);
+            }
             "awaitingKernelWake" => {
                 mark_agent_drive_v2(
                     context,
@@ -4194,7 +4993,7 @@ async fn drive_agent_kernel_until_boundary_v2(
                     },
                 ));
             }
-            "manualRecoveryRequired" | "recoveryRequired" | "providerBudgetExhausted" => {
+            "manualRecoveryRequired" | "recoveryRequired" => {
                 mark_agent_drive_v2(
                     context,
                     &active.host_run_id,
@@ -4240,17 +5039,8 @@ async fn drive_agent_kernel_until_boundary_v2(
             )
             .await
             .map_err(AgentKernelV2Error::from_storage)?;
+        tokio::task::yield_now().await;
     }
-    mark_agent_drive_v2(
-        context,
-        &active.host_run_id,
-        "waiting",
-        Some("Automatic Session continuation budget exhausted.".to_string()),
-    );
-    Err(AgentKernelV2Error::invalid(
-        "session_kernel_automatic_step_budget_exhausted",
-        "Automatic Kernel–Session v2 continuation exceeded its bounded Host budget.",
-    ))
 }
 
 async fn register_owned_agent_kernel_wait_v2(
@@ -4801,6 +5591,10 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                     require_user_input_admission_projection_v2(state, &binding)?;
                 }
                 ensure_agent_run_cache_v2(state, &active)?;
+                if recover_indeterminate_intervention_selection_v2(state, &active, &binding).await?
+                {
+                    continue;
+                }
                 mark_agent_run_v2(
                     state,
                     &active.host_run_id,
@@ -4859,7 +5653,12 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
             }
         };
         if let RecoveredCallerDriveActionV2::UserInput { input, .. } = &action {
-            validate_active_run_attachment_binding_v2(state, &active, &input.attachments)?;
+            validate_active_run_attachments_v3(
+                state,
+                &active,
+                &binding.caller_request_id,
+                &input.attachments,
+            )?;
         }
         let reclaimed = state
             .host_services
@@ -5329,6 +6128,69 @@ fn validate_final_answer_continuation_binding_v2(
     Ok(())
 }
 
+fn validate_intervention_cancellation_settlement_v4(
+    settlement: &HostKernelOperationSettlementReceiptV2,
+) -> Result<(), AgentKernelV2Error> {
+    let response = success_response_v2(settlement)?;
+    let outcome = response.get("outcome").ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention cancellation settlement has no outcome.",
+        )
+    })?;
+    let result = outcome.get("result").ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention cancellation settlement has no decision result.",
+        )
+    })?;
+    let decision = result.get("decision").ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention cancellation settlement has no durable decision.",
+        )
+    })?;
+    let cancellation = outcome.get("cancellation").ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention rejection did not settle canonical Run cancellation.",
+        )
+    })?;
+    let facts = cancellation.get("facts").ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention cancellation has no reconciled fact boundary.",
+        )
+    })?;
+    let projection = cancellation.get("projection").ok_or_else(|| {
+        AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention cancellation has no terminal projection receipt.",
+        )
+    })?;
+    let cancel_operation_id = required_text_field_v2(cancellation, "cancelOperationId")?;
+    if response.get("operationKind").and_then(Value::as_str) != Some("decideUserIntervention")
+        || outcome.get("kind").and_then(Value::as_str) != Some("userInterventionDecisionRecorded")
+        || result.get("disposition").and_then(Value::as_str) != Some("runCancellationRequired")
+        || decision.get("decision").and_then(Value::as_str) != Some("reject")
+        || cancel_operation_id != settlement.operation_request_id
+        || facts.get("caughtUp").and_then(Value::as_bool) != Some(true)
+        || facts.get("pendingFactBarrierCount").and_then(Value::as_u64) != Some(0)
+        || continuation_kind_v2(settlement) != Some("terminalRunCancelled")
+        || continuation_field_v2(settlement, "cancelOperationId") != Some(cancel_operation_id)
+        || continuation_field_v2(settlement, "projectionId")
+            != projection.get("projectionId").and_then(Value::as_str)
+        || continuation_field_v2(settlement, "projectionDigest")
+            != projection.get("projectionDigest").and_then(Value::as_str)
+    {
+        return Err(AgentKernelV2Error::invalid(
+            "session_user_intervention_cancellation_invalid",
+            "Intervention rejection did not produce one exact terminal cancellation settlement.",
+        ));
+    }
+    Ok(())
+}
+
 fn continuation_string_array_v2(
     settlement: &HostKernelOperationSettlementReceiptV2,
     field: &str,
@@ -5557,6 +6419,43 @@ fn caller_binding_string_v2(
                 format!("Durable Host caller request is missing exact {field}."),
             )
         })
+}
+
+fn caller_binding_string_vec_v4(
+    binding: &HostCallerRequestBindingReceiptV2,
+    field: &'static str,
+) -> Result<Vec<String>, AgentKernelV2Error> {
+    let values = binding
+        .response_identity
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "host_caller_request_identity_invalid",
+                format!("Durable Host caller request is missing exact {field}."),
+            )
+        })?;
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let value = value.as_str().ok_or_else(|| {
+                AgentKernelV2Error::invalid(
+                    "host_caller_request_identity_invalid",
+                    format!("Durable Host caller request contains an invalid {field}."),
+                )
+            })?;
+            validate_bounded_identity(value, field, 512)
+                .map_err(AgentKernelV2Error::from_storage)?;
+            if !seen.insert(value.to_string()) {
+                return Err(AgentKernelV2Error::invalid(
+                    "host_caller_request_identity_invalid",
+                    format!("Durable Host caller request repeats {field}."),
+                ));
+            }
+            Ok(value.to_string())
+        })
+        .collect()
 }
 
 fn user_input_admission_receipt_v2(
@@ -5869,7 +6768,12 @@ async fn resume_admitted_user_input_drive_v2(
         return Err(error);
     }
     let input = durable_user_input_from_binding_v2(&binding)?;
-    validate_active_run_attachment_binding_v2(state, &active, &input.attachments)?;
+    validate_active_run_attachments_v3(
+        state,
+        &active,
+        &binding.caller_request_id,
+        &input.attachments,
+    )?;
     let operation_request_id = caller_binding_string_v2(&binding, "operationRequestId")?;
     let owner = host_kernel_caller_drive_owner_v2(&active, &binding)?;
     let owner_for_drive = owner.clone();
@@ -6309,10 +7213,10 @@ fn recovered_run_snapshot_v2(
             Some(
                 "awaitingUserPlanConfirmation"
                 | "awaitingUserScopeDecision"
+                | "awaitingUserIntervention"
                 | "awaitingKernelWake"
                 | "manualRecoveryRequired"
                 | "recoveryRequired"
-                | "providerBudgetExhausted"
                 | "providerTurnSuperseded"
                 | "userInputSuperseded",
             ),
@@ -6352,6 +7256,19 @@ fn recovered_run_snapshot_v2(
             "failed",
             "Recovered terminal final-answer failure from durable settlement and retirement.",
         ))),
+        (
+            Some(HostKernelStoredRunLifecycleV2::Retired),
+            HostKernelOperationSettlementV2::Succeeded { .. },
+            Some("terminalRunCancelled"),
+        ) => {
+            validate_intervention_cancellation_settlement_v4(latest)?;
+            Ok(Some(recovered_agent_run_state_v2(
+                evidence,
+                host_run_id,
+                "cancelled",
+                "Recovered canonical intervention rejection and Run cancellation.",
+            )))
+        }
         _ => Ok(None),
     }
 }

@@ -42,6 +42,8 @@ import {
   currentSessionPlanScopePreviewsV2,
   currentSessionPlanConfirmationAuthorityV2,
   currentSessionWorkAuthorityV3,
+  recordSessionProviderControlSettlementV2,
+  recordSelectedInterventionCandidatePreviewsV4,
   recordSessionPlanConfirmationAuthorityV2,
   recordSessionProviderOutcomeV2,
   recordSessionPlanDecisionV2,
@@ -49,10 +51,15 @@ import {
   recordSessionUserInputV2,
   restoreSessionKernelLoopStateV2,
   sameSessionWorkAuthorityV3,
+  sessionInterventionEvidenceProgressDigestV4,
+  sessionUserInterventionCandidateSetDigestV4,
   sessionPlanActionV2,
   type SessionKernelInitialStateV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
+import {
+  sealSessionProviderControlSettlementV2,
+} from './providerControlSettlementV2.js';
 import {
   markSessionProviderToolCallQueueOutcomeRecordedV2,
   publicSessionProviderOrderedItemsV2,
@@ -68,6 +75,7 @@ import type {
   SessionKernelProjectionEventV2,
   SessionKernelPublicRequestRecordV2,
   SessionKernelReviewV2,
+  SessionInterventionResearchV4,
   SessionRunCancellationV2,
   SessionNaturalLanguagePlanV2,
   SessionPlanConfirmationAuthorityV2,
@@ -75,8 +83,17 @@ import type {
   SessionPlanDecisionV2,
   SessionProviderTurnRequestV2,
   SessionUserInputRecordV2,
+  SessionUserInterventionDecisionResultV4,
+  SessionUserInterventionDecisionV4,
   SessionWorkAuthorityV3,
 } from './types.js';
+import type {
+  SessionProviderInterventionProposalV1,
+} from './SessionKernelProviderAdapterV2.js';
+import {
+  canonicalJson,
+  sha256Hash,
+} from '../cache/canonicalizer.js';
 
 export interface SessionKernelRunCancelInputV2 {
   callerRequestId: string;
@@ -174,14 +191,32 @@ export class SessionKernelLoopV2 {
       {
         readState: () => this.state,
         saveCheckpoint: () => this.saveCheckpoint(),
-        project: async (projectionId, kind, data, recordedAt) => {
-          await this.project(projectionId, kind, data, recordedAt);
+        project: async (
+          projectionId,
+          kind,
+          data,
+          recordedAt,
+          options
+        ) => {
+          return this.project(
+            projectionId,
+            kind,
+            data,
+            recordedAt,
+            options
+          );
         },
         reconcileFacts: () => this.reconcileFactsInternal(),
         settleProviderToolCallQueue: () =>
           this.settleProviderToolCallQueue(),
         recordProviderPlan: (plan) =>
           this.persistPlan(plan),
+        recordProviderIntervention: (proposal, providerTurnId, recordedAt) =>
+          this.persistProviderIntervention(
+            proposal,
+            providerTurnId,
+            recordedAt
+          ),
         settlePlanActionComplete: (
           planActionId,
           outcome,
@@ -404,7 +439,18 @@ export class SessionKernelLoopV2 {
             this.state,
             existing
           );
+          recordPlanDecisionControlSettlementV2(
+            this.state,
+            existing
+          );
           this.pendingPlanDecision = undefined;
+          await this.saveCheckpoint();
+        }
+        if (!this.state.pendingProviderControlSettlement) {
+          recordPlanDecisionControlSettlementV2(
+            this.state,
+            existing
+          );
           await this.saveCheckpoint();
         }
         await this.ensurePlanDecisionProjected();
@@ -462,6 +508,7 @@ export class SessionKernelLoopV2 {
       this.pendingPlanDecision = decision;
       await this.ports.persistence.persistPlanDecision(decision);
       this.state = next;
+      recordPlanDecisionControlSettlementV2(this.state, decision);
       this.pendingPlanDecision = undefined;
       await this.saveCheckpoint();
       await this.ensurePlanDecisionProjected();
@@ -525,6 +572,7 @@ export class SessionKernelLoopV2 {
                       toolId: action.manifest.toolId,
                       scopeIntent: cloneJson(action.manifest.scopeIntent),
                       deadline: cloneJson(action.deadline),
+                      origin: { kind: 'plan', data: {} },
                     })),
                     toolContextRef: toolContextRefV2(
                       this.state.toolContext.bundle
@@ -566,10 +614,444 @@ export class SessionKernelLoopV2 {
           projectionData
         );
       }
+      if (reply.results.some((result) => result.kind === 'rejected')) {
+        recordPlanPreviewRejectedControlSettlementV2(
+          this.state,
+          plan,
+          reply,
+          this.ports.clock.now()
+        );
+        await this.saveCheckpoint();
+      }
       return reply;
     } finally {
       this.endMaintenance();
     }
+  }
+
+  async decideUserIntervention(input: {
+    interactionId: string;
+    interactionRevision: string;
+    candidateSetDigest: string;
+    decision: 'select' | 'revise' | 'reject';
+    optionId?: string;
+    guidance?: string;
+    callerRequestId: string;
+  }): Promise<SessionUserInterventionDecisionResultV4> {
+    this.beginMaintenance('decideUserIntervention');
+    try {
+      this.requireNoPendingRequests();
+      const intervention = this.state.userIntervention;
+      const wait = this.state.activeWait;
+      const decisionSettlementInProgress = Boolean(
+        this.state.userInterventionDecision
+      ) && wait === undefined;
+      if (
+        !intervention
+        || intervention.interactionId !== input.interactionId
+        || intervention.interactionRevision !== input.interactionRevision
+        || intervention.candidateSetDigest !== input.candidateSetDigest
+        || (!decisionSettlementInProgress && (
+          !wait
+          || wait.kind !== 'userIntervention'
+          || wait.interactionId !== input.interactionId
+          || wait.interactionRevision !== input.interactionRevision
+          || wait.candidateSetDigest !== input.candidateSetDigest
+        ))
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_user_intervention_stale',
+          'User intervention decision does not bind the exact active card, wait, or durable settlement.'
+        );
+      }
+      const guidance = input.guidance?.trim();
+      if (
+        !input.callerRequestId.trim()
+        || (input.decision === 'select') !== Boolean(input.optionId)
+        || (input.decision === 'revise' && !guidance)
+        || (input.decision !== 'select' && input.optionId !== undefined)
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_user_intervention_decision_invalid',
+          'User intervention select, revise, and reject require their exact closed decision fields.'
+        );
+      }
+      const selectedOption = input.optionId
+        ? intervention.options.find(
+            (option) => option.optionId === input.optionId
+          )
+        : undefined;
+      if (input.decision === 'select' && !selectedOption) {
+        throw new SessionKernelLoopError(
+          'session_kernel_user_intervention_option_stale',
+          'Selected intervention option is not part of the exact active candidate set.'
+        );
+      }
+      const requestedDecision = {
+        interactionId: input.interactionId,
+        interactionRevision: input.interactionRevision,
+        candidateSetDigest: input.candidateSetDigest,
+        decision: input.decision,
+        ...(input.optionId ? { optionId: input.optionId } : {}),
+        ...(guidance ? { guidance } : {}),
+        callerRequestId: input.callerRequestId,
+      };
+      let decision = this.state.userInterventionDecision;
+      if (decision) {
+        const { recordedAt: _recordedAt, ...durableRequest } = decision;
+        if (canonicalJson(durableRequest) !== canonicalJson(requestedDecision)) {
+          throw new SessionKernelLoopError(
+            'session_kernel_user_intervention_decision_conflict',
+            'The intervention interaction already has a different durable user decision.'
+          );
+        }
+      } else {
+        decision = {
+          ...requestedDecision,
+          recordedAt: this.ports.clock.now(),
+        };
+        this.state.userInterventionDecision = cloneJson(decision);
+      }
+
+      const interventionDisposition = input.decision === 'reject'
+        ? 'runCancellationRequired' as const
+        : input.decision === 'revise'
+          ? 'researchRevision' as const
+          : selectedOption?.kind === 'executable'
+            ? 'planAccepted' as const
+            : 'guidanceReplan' as const;
+      // Once the exact decision is durable, the interaction is no longer
+      // accepting a competing decision.  Persist this closed-wait settlement
+      // before facts reconciliation so a crash can retry the same caller
+      // request without ever checkpointing the invalid decision+wait pair.
+      this.state.activeWait = undefined;
+      if (input.decision === 'select' && selectedOption?.kind === 'executable') {
+        const candidatePlan = selectedOption.candidatePlan;
+        if (!candidatePlan) {
+          throw new SessionKernelLoopError(
+            'session_kernel_user_intervention_candidate_plan_missing',
+            'Executable intervention selection lost its final candidate Plan.'
+          );
+        }
+        // Kernel selection and Session Plan activation are separate durable
+        // phases.  This checkpoint closes the interaction without claiming
+        // that the candidate Plan is active.  The following ReconcileFacts
+        // operation verifies the exact Kernel selection facts and activates
+        // the Plan idempotently.
+        await this.saveCheckpoint();
+        return {
+          decision: cloneJson(decision),
+          disposition: 'planAccepted',
+          planRevision: candidatePlan.planRevision,
+        };
+      }
+
+      recordUserInterventionControlSettlementV2(
+        this.state,
+        intervention,
+        decision,
+        interventionDisposition,
+        undefined
+      );
+      await this.saveCheckpoint();
+
+      if (input.decision === 'revise') {
+        const research = this.state.interventionResearch;
+        if (!research) {
+          throw new SessionKernelLoopError(
+            'session_kernel_intervention_research_missing',
+            'Intervention revision requires its durable research record.'
+          );
+        }
+        research.guidanceRevision += 1;
+        research.updatedAt = decision.recordedAt;
+        this.state.userIntervention = undefined;
+        this.state.pendingGuidance = unique([
+          ...this.state.pendingGuidance,
+          guidance!,
+        ]);
+      } else if (
+        input.decision === 'select'
+        && selectedOption?.kind === 'guidanceOnly'
+      ) {
+        this.state.userIntervention = undefined;
+        this.state.pendingGuidance = unique([
+          ...this.state.pendingGuidance,
+          [
+            `The user selected guidance-only intervention option ${selectedOption.optionId}: ${selectedOption.description}`,
+            guidance,
+          ].filter(Boolean).join(' '),
+        ]);
+        this.state.interventionResearch = undefined;
+        this.state.userInterventionDecision = undefined;
+      }
+      await this.saveCheckpoint();
+      await this.project(
+        `user-intervention:${input.interactionId}:${input.interactionRevision}:${input.decision}`,
+        'userIntervention.changed',
+        {
+          state: input.decision === 'reject'
+            ? 'rejected'
+            : input.decision === 'revise'
+              ? 'needsRevision'
+              : 'guidanceReplan',
+          intervention: cloneJson(intervention),
+          decision: cloneJson(decision),
+        },
+        decision.recordedAt
+      );
+      return {
+        decision: cloneJson(decision),
+        disposition: input.decision === 'reject'
+          ? 'runCancellationRequired'
+          : input.decision === 'revise'
+            ? 'researchRevision'
+            : 'guidanceReplan',
+      };
+    } finally {
+      this.endMaintenance();
+    }
+  }
+
+  private async persistProviderIntervention(
+    proposal: SessionProviderInterventionProposalV1,
+    providerTurnId: string,
+    recordedAt: string
+  ): Promise<{ published: boolean; guidance?: string }> {
+    const research = this.state.interventionResearch;
+    if (
+      !research
+      || this.state.providerTurn?.providerTurnId !== providerTurnId
+      || this.state.providerTurn.target.kind !== 'interventionResearch'
+      || this.state.providerTurn.target.researchId !== research.researchId
+      || research.runId !== this.state.runId
+      || research.inputId !== this.state.currentInputId
+      || research.controlEpoch !== this.state.controlEpoch
+      || this.state.activeWait
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_research_binding_invalid',
+        'Provider intervention proposal is not bound to the active intervention research state.'
+      );
+    }
+    const canonicalProposal: SessionProviderInterventionProposalV1 = {
+      ...cloneJson(proposal),
+      options: proposal.options.map((option) => ({
+        ...cloneJson(option),
+        ...(option.candidatePlan
+          ? {
+              candidatePlan: carrySettledPlanActionsV4(
+                this.state,
+                option.candidatePlan
+              ),
+            }
+          : {}),
+      })),
+    };
+    const exactFactIds = new Set(Object.keys(this.state.factsById));
+    if (canonicalProposal.relevantFactRefs.some(
+      (factId) => !exactFactIds.has(factId)
+    )) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_fact_ref_stale',
+        'Provider intervention references a fact outside the exact current Session snapshot.'
+      );
+    }
+    const unsettledPlanActionIds = new Set(
+      (this.state.plan?.actions ?? [])
+        .filter((action) =>
+          !this.state.planActionSettlements[action.manifest.planActionId]
+        )
+        .map((action) => action.manifest.planActionId)
+    );
+    if (
+      canonicalProposal.affectedPlanActionIds.some(
+        (planActionId) => !unsettledPlanActionIds.has(planActionId)
+      )
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_affected_action_stale',
+        'Provider intervention references a settled or non-current PlanAction.'
+      );
+    }
+    const candidateSetDigest =
+      sessionUserInterventionCandidateSetDigestV4({
+        researchId: research.researchId,
+        evidenceProgressDigest: research.evidenceProgressDigest,
+        guidanceRevision: research.guidanceRevision,
+        problemSummary: canonicalProposal.problemSummary,
+        ...(canonicalProposal.recommendation
+          ? { recommendation: canonicalProposal.recommendation }
+          : {}),
+        relevantFactRefs: canonicalProposal.relevantFactRefs,
+        affectedPlanActionIds:
+          canonicalProposal.affectedPlanActionIds,
+        options: canonicalProposal.options,
+      });
+    const identityDigest = candidateSetDigest.slice('sha256:'.length);
+    const interactionId = `user-intervention-${research.researchId}`;
+    const interactionRevision = `intervention-revision-${identityDigest}`;
+    if (this.state.userIntervention) {
+      if (
+        this.state.userIntervention.interactionId === interactionId
+        && this.state.userIntervention.candidateSetDigest === candidateSetDigest
+      ) {
+        return { published: false };
+      }
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_duplicate_without_guidance',
+        'A different intervention card is already active for this research identity.'
+      );
+    }
+    if (research.lastCandidateSetDigest === candidateSetDigest) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_no_progress',
+        'Intervention research repeated the same canonical candidate set without new facts or user guidance; it must request clarification or report a blocked state instead of reopening the same choice.'
+      );
+    }
+    const contextRef = toolContextRefV2(this.state.toolContext.bundle);
+    const options = [];
+    for (const option of canonicalProposal.options) {
+      if (option.kind === 'guidanceOnly') {
+        options.push({
+          ...option,
+          actions: [],
+        });
+        continue;
+      }
+      const plan = option.candidatePlan;
+      if (!plan || plan.actions.length === 0) {
+        throw new SessionKernelLoopError(
+          'session_kernel_intervention_candidate_plan_missing',
+          'Executable intervention option lacks one non-empty candidate Plan.'
+        );
+      }
+      const outcome = expectSessionKernelPublicRequestOutcomeV2(
+        await this.requests.execute(this.requests.newRecord({
+          kind: 'capabilityPreviewBatch',
+          payload: {
+            expectedControlEpoch: this.state.controlEpoch,
+            planRevision: plan.planRevision,
+            items: plan.actions.map((action) => ({
+              planActionId: action.manifest.planActionId,
+              operationId: action.manifest.operationId,
+              idempotencyKey: action.idempotencyKey,
+              toolId: action.manifest.toolId,
+              scopeIntent: cloneJson(action.manifest.scopeIntent),
+              deadline: cloneJson(action.deadline),
+              origin: {
+                kind: 'interventionCandidate' as const,
+                data: {
+                  interactionId,
+                  interactionRevision,
+                  candidateSetDigest,
+                  optionId: option.optionId,
+                },
+              },
+            })),
+            toolContextRef: contextRef,
+          },
+        })),
+        'capabilityPreviewBatch'
+      );
+      const rejection = outcome.reply.results.find(
+        (result) => result.kind === 'rejected'
+      );
+      if (rejection?.kind === 'rejected') {
+        const guidance = [
+          `Intervention option ${option.optionId} cannot be offered as executable.`,
+          rejection.data.guidance,
+          'Continue evidence research and replace the consolidated intervention proposal.',
+        ].join(' ');
+        if (!this.state.pendingGuidance.includes(guidance)) {
+          this.state.pendingGuidance.push(guidance);
+        }
+        const currentResearch = this.currentInterventionResearchAfterRequest(
+          research
+        );
+        currentResearch.lastCandidateSetDigest = candidateSetDigest;
+        currentResearch.updatedAt = recordedAt;
+        await this.saveCheckpoint();
+        return { published: false, guidance };
+      }
+      const actions = outcome.reply.results.map((result) => {
+        if (result.kind !== 'previewed') {
+          throw new SessionKernelLoopError(
+            'session_kernel_intervention_candidate_preview_incomplete',
+            'Executable intervention option did not receive a complete Kernel preview batch.'
+          );
+        }
+        return {
+          planActionId: result.data.preview.planActionId,
+          operationId: result.data.preview.operationId,
+          toolId: result.data.preview.toolId,
+          summary: result.data.preview.approvalView.summary,
+          preview: cloneJson(result.data.preview),
+        };
+      });
+      options.push({
+        ...option,
+        candidatePlan: cloneJson(plan),
+        actions,
+      });
+    }
+    const currentResearch = this.currentInterventionResearchAfterRequest(
+      research
+    );
+    const userIntervention = {
+      schemaVersion: 'deepcode.session.user-intervention.v1' as const,
+      runId: this.state.runId,
+      inputId: this.state.currentInputId,
+      controlEpoch: this.state.controlEpoch,
+      interactionId,
+      interactionRevision,
+      candidateSetDigest,
+      problemSummary: canonicalProposal.problemSummary,
+      ...(canonicalProposal.recommendation
+        ? { recommendation: canonicalProposal.recommendation }
+        : {}),
+      relevantFactRefs: [...canonicalProposal.relevantFactRefs],
+      affectedPlanActionIds: [...canonicalProposal.affectedPlanActionIds],
+      options,
+      evidenceProgressDigest: research.evidenceProgressDigest,
+      recordedAt,
+    };
+    this.state.userIntervention = userIntervention;
+    this.state.userInterventionDecision = undefined;
+    this.state.activeWait = {
+      kind: 'userIntervention',
+      interactionId,
+      interactionRevision,
+      candidateSetDigest,
+      sinceHighWater: this.state.lineage.cursor.snapshotHighWater,
+    };
+    currentResearch.lastCandidateSetDigest = candidateSetDigest;
+    currentResearch.updatedAt = recordedAt;
+    await this.saveCheckpoint();
+    await this.project(
+      `user-intervention:${interactionId}:${interactionRevision}`,
+      'userIntervention.changed',
+      {
+        state: 'open',
+        wait: cloneJson(this.state.activeWait),
+        intervention: cloneJson(userIntervention),
+      },
+      recordedAt
+    );
+    return { published: true };
+  }
+
+  private currentInterventionResearchAfterRequest(
+    expected: NonNullable<SessionKernelLoopStateV2['interventionResearch']>
+  ): NonNullable<SessionKernelLoopStateV2['interventionResearch']> {
+    const current = this.state.interventionResearch;
+    if (!current || canonicalJson(current) !== canonicalJson(expected)) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_research_changed',
+        'Intervention research authority changed while Kernel candidate previews were settling.'
+      );
+    }
+    return current;
   }
 
   async publishPlanConfirmationReady(
@@ -747,6 +1229,10 @@ export class SessionKernelLoopV2 {
       requireExactRunCancellation(prior, input);
       if (prior.status === 'projected') {
         await this.ports.projection.flushPending(this.state.runId);
+        // A prior response may have observed projection delivery while the
+        // final checkpoint write failed. Reassert the terminal checkpoint
+        // before returning the canonical acknowledgement.
+        await this.saveCheckpoint();
         return completedRunCancellation(prior, this.state.controlEpoch);
       }
     }
@@ -766,6 +1252,10 @@ export class SessionKernelLoopV2 {
       }
       await this.settleProviderToolCallQueue();
       let cancellation = currentRunCancellation(this.state, input);
+
+      if (cancellation.status === 'factsReconciled') {
+        return await this.finalizeRunCancellationProjection(input);
+      }
 
       await this.requests.replay('control');
       cancellation = currentRunCancellation(this.state, input);
@@ -836,40 +1326,7 @@ export class SessionKernelLoopV2 {
         cancellation.status = 'factsReconciled';
         await this.saveCheckpoint();
       }
-      const event = this.event(
-        `cancel:${cancellation.cancelOperationId}:settled`,
-        'run.cancelled',
-        {
-          callerRequestId: cancellation.callerRequestId,
-          callerRequestDigest: cancellation.callerRequestDigest,
-          cancelOperationId: cancellation.cancelOperationId,
-          controlEpoch: this.state.controlEpoch,
-          cancellation: cancellation.cancellation,
-          facts: cancellation.facts,
-        },
-        cancellation.cancelledAt
-      );
-      const projection = await this.ports.projection.project(event);
-      if (
-        !projection.delivered
-        || projection.projectionId !== event.projectionId
-      ) {
-        throw new SessionKernelLoopError(
-          'session_kernel_run_cancellation_projection_unconfirmed',
-          'Session Run cancellation projection was not durably acknowledged by Host.'
-        );
-      }
-      cancellation = currentRunCancellation(this.state, input);
-      cancellation.projection = {
-        projectionId: projection.projectionId,
-        projectionDigest: projection.projectionDigest,
-      };
-      cancellation.status = 'projected';
-      await this.saveCheckpoint();
-      return completedRunCancellation(
-        cancellation,
-        this.state.controlEpoch
-      );
+      return await this.finalizeRunCancellationProjection(input);
     } finally {
       this.providers.releaseUserInputFence(fence.generation);
       if (this.runCancellationFence === fence) {
@@ -879,6 +1336,57 @@ export class SessionKernelLoopV2 {
         this.authorityTransitionActive = false;
       }
     }
+  }
+
+  private async finalizeRunCancellationProjection(
+    input: SessionKernelRunCancelInputV2
+  ): Promise<SessionKernelRunCancelResultV2> {
+    let cancellation = currentRunCancellation(this.state, input);
+    if (
+      cancellation.status !== 'factsReconciled'
+      || !cancellation.cancellation
+      || !cancellation.facts
+      || !cancellation.cancelledAt
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_projection_not_ready',
+        'Session Run cancellation cannot project before canonical facts are reconciled.'
+      );
+    }
+    const event = this.event(
+      `cancel:${cancellation.cancelOperationId}:settled`,
+      'run.cancelled',
+      {
+        callerRequestId: cancellation.callerRequestId,
+        callerRequestDigest: cancellation.callerRequestDigest,
+        cancelOperationId: cancellation.cancelOperationId,
+        controlEpoch: this.state.controlEpoch,
+        cancellation: cancellation.cancellation,
+        facts: cancellation.facts,
+      },
+      cancellation.cancelledAt
+    );
+    const projection = await this.ports.projection.project(event);
+    if (
+      !projection.delivered
+      || projection.projectionId !== event.projectionId
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_projection_unconfirmed',
+        'Session Run cancellation projection was not durably acknowledged by Host.'
+      );
+    }
+    cancellation = currentRunCancellation(this.state, input);
+    cancellation.projection = {
+      projectionId: projection.projectionId,
+      projectionDigest: projection.projectionDigest,
+    };
+    cancellation.status = 'projected';
+    await this.saveCheckpoint();
+    return completedRunCancellation(
+      cancellation,
+      this.state.controlEpoch
+    );
   }
 
   private fenceForRunCancellation(): {
@@ -1244,9 +1752,74 @@ export class SessionKernelLoopV2 {
     this.beginMaintenance('reconcileFacts');
     try {
       await this.reconcileFactsInternal();
+      await this.settlePendingUserInterventionSelection();
     } finally {
       this.endMaintenance();
     }
+  }
+
+  private async settlePendingUserInterventionSelection(): Promise<void> {
+    const intervention = this.state.userIntervention;
+    const decision = this.state.userInterventionDecision;
+    if (!intervention || decision?.decision !== 'select') return;
+    const selectedOption = intervention.options.find(
+      (option) => option.optionId === decision.optionId
+    );
+    if (selectedOption?.kind !== 'executable') return;
+    const candidatePlan = selectedOption.candidatePlan;
+    if (!candidatePlan) {
+      throw new SessionKernelLoopError(
+        'session_kernel_user_intervention_candidate_plan_missing',
+        'Executable intervention selection lost its final candidate Plan.'
+      );
+    }
+    requireInterventionSelectionFactsV4(
+      this.state,
+      intervention,
+      selectedOption.optionId
+    );
+    const planDecision: SessionPlanDecisionV2 = {
+      planRevision: candidatePlan.planRevision,
+      decision: 'accept',
+      recordedAt: decision.recordedAt,
+    };
+    const alreadyActivated =
+      this.state.plan?.planRevision === candidatePlan.planRevision
+      && this.state.planDecision?.planRevision === candidatePlan.planRevision
+      && this.state.planDecision.decision === 'accept';
+    if (!alreadyActivated) {
+      await this.ports.persistence.persistPlan(candidatePlan);
+      await this.ports.persistence.persistPlanDecision(planDecision);
+      this.state = recordSessionPlanV2(this.state, candidatePlan);
+      this.state.userInterventionDecision = cloneJson(decision);
+      this.state.planDecision = planDecision;
+      this.state.projectedPlanRevision = undefined;
+      this.state.projectedPlanDecisionKey = undefined;
+    }
+    this.state = recordSelectedInterventionCandidatePreviewsV4(this.state);
+    if (!this.state.pendingProviderControlSettlement) {
+      recordUserInterventionControlSettlementV2(
+        this.state,
+        intervention,
+        decision,
+        'planAccepted',
+        candidatePlan.planRevision
+      );
+    }
+    await this.saveCheckpoint();
+    await this.ensurePlanProjected();
+    await this.ensurePlanDecisionProjected();
+    await this.project(
+      `user-intervention:${decision.interactionId}:${decision.interactionRevision}:selected`,
+      'userIntervention.changed',
+      {
+        state: 'accepted',
+        intervention: cloneJson(intervention),
+        decision: cloneJson(decision),
+        acceptedPlanRevision: candidatePlan.planRevision,
+      },
+      decision.recordedAt
+    );
   }
 
   async finalizeReview(
@@ -1418,6 +1991,9 @@ export class SessionKernelLoopV2 {
   }
 
   private async reconcileFactsInternal(): Promise<void> {
+    await this.requests.settleFactsQueryCursorMismatchForRecovery(
+      this.state.lineage.cursor.afterLedgerSequence
+    );
     const replayed = await this.requests.replay('query');
     if (replayed?.kind === 'factsQuery') {
       await this.settleProviderToolCallQueue(replayed.reply.facts);
@@ -1462,7 +2038,12 @@ export class SessionKernelLoopV2 {
     );
     const queue = this.state.providerToolCallQueue;
     if (!queue) return;
-    if (reconciliation.changed) {
+    const researchProgressChanged =
+      queue.status !== 'active'
+      && queue.target.kind === 'interventionResearch'
+      && queue.abortReason !== 'userIntervention'
+      && this.refreshInterventionResearchProgressV4(queue.settledAt);
+    if (reconciliation.changed || researchProgressChanged) {
       await this.saveCheckpoint();
     }
     if (queue.status === 'active' || queue.outcomeRecorded) return;
@@ -1478,6 +2059,8 @@ export class SessionKernelLoopV2 {
       && queue.abortReason !== 'userInput'
       && queue.abortReason !== 'runCancelled'
       && queue.abortReason !== 'capabilityDenied'
+      && queue.abortReason !== 'planDiscovery'
+      && queue.abortReason !== 'userIntervention'
     ) {
       const guidance = [
         'The ordered Provider tool-call sequence stopped after',
@@ -1489,6 +2072,21 @@ export class SessionKernelLoopV2 {
       if (!this.state.pendingGuidance.includes(guidance)) {
         this.state.pendingGuidance.push(guidance);
       }
+    }
+    if (queue.status === 'aborted' && queue.abortReason === 'planDiscovery') {
+      const guidance = [
+        'The mutation candidates were previewed but not executed because no accepted mutation Plan exists.',
+        'Continue safe evidence reads as needed, then propose one mutation-only Plan with no blocking unknowns.',
+      ].join(' ');
+      if (!this.state.pendingGuidance.includes(guidance)) {
+        this.state.pendingGuidance.push(guidance);
+      }
+    }
+    if (
+      queue.status === 'aborted'
+      && queue.abortReason === 'userIntervention'
+    ) {
+      this.recordInterventionResearchFromQueue(queue, queue.settledAt);
     }
     const outcome = {
       providerTurnId: queue.providerTurnId,
@@ -1514,7 +2112,11 @@ export class SessionKernelLoopV2 {
     let projectionDeliveryError:
       SessionKernelProjectionDeliveryErrorV2 | undefined;
     try {
-      if (queue.status === 'completed') {
+      if (
+        queue.status === 'completed'
+        || queue.abortReason === 'planDiscovery'
+        || queue.abortReason === 'userIntervention'
+      ) {
         await this.project(
           `provider:${queue.providerTurnId}:completed`,
           'provider.completed',
@@ -1524,8 +2126,19 @@ export class SessionKernelLoopV2 {
             outputKind: 'toolIntent',
             terminalScope: 'providerTurn',
             result: {
-              kind: 'orderedToolCallsCompleted',
+              kind: queue.status === 'completed'
+                ? 'orderedToolCallsCompleted'
+                : queue.abortReason === 'planDiscovery'
+                  ? 'mutationPlanDiscoveryRequired'
+                  : 'userInterventionResearchRequired',
               callCount: queue.calls.length,
+              ...(queue.status === 'aborted'
+                ? {
+                    unexecutedOrdinals: queue.calls
+                      .filter((call) => call.status === 'unexecuted')
+                      .map((call) => call.ordinal),
+                  }
+                : {}),
             },
             orderedItems:
               publicSessionProviderToolCallQueueItemsV2(queue),
@@ -1575,6 +2188,168 @@ export class SessionKernelLoopV2 {
       throw error;
     }
     if (projectionDeliveryError) throw projectionDeliveryError;
+  }
+
+  private recordInterventionResearchFromQueue(
+    queue: NonNullable<SessionKernelLoopStateV2['providerToolCallQueue']>,
+    recordedAt: string
+  ): void {
+    const plan = this.state.plan;
+    if (
+      !plan
+      || queue.controlEpoch !== this.state.controlEpoch
+      || queue.mutationDisposition !== 'userIntervention'
+      || queue.calls.every((call) => call.dispatchKind !== 'mutation')
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_research_source_invalid',
+        'User intervention research requires one current Plan and canonical out-of-plan mutation candidates.'
+      );
+    }
+    const triggerCandidates = queue.calls.flatMap((call) => {
+      const candidate = call.candidatePreview;
+      if (call.dispatchKind !== 'mutation' || !candidate) return [];
+      return [{
+        discoveryId: candidate.discoveryId,
+        operationId: candidate.operationId,
+        toolId: candidate.toolId,
+        argumentsDigest: sha256Hash(canonicalJson(candidate.rawArguments)),
+        classification: candidate.classification ?? 'outOfPlan',
+        ...(candidate.preview
+          ? { preview: cloneJson(candidate.preview) }
+          : {}),
+        ...(candidate.rejection
+          ? { rejection: cloneJson(candidate.rejection) }
+          : {}),
+      }];
+    });
+    if (triggerCandidates.length === 0) {
+      throw new SessionKernelLoopError(
+        'session_kernel_intervention_research_candidates_missing',
+        'User intervention research lost every canonical mutation candidate.'
+      );
+    }
+    const triggerCandidateSetDigest = sha256Hash(canonicalJson(
+      triggerCandidates.map((candidate) => ({
+        discoveryId: candidate.discoveryId,
+        operationId: candidate.operationId,
+        toolId: candidate.toolId,
+        argumentsDigest: candidate.argumentsDigest,
+        classification: candidate.classification,
+        previewId: candidate.preview?.previewId,
+        scopeDigest: candidate.preview?.scopeDigest,
+        rejection: candidate.rejection,
+      }))
+    ));
+    const unsettledPlanActionIds = plan.actions
+      .filter((action) =>
+        !this.state.planActionSettlements[action.manifest.planActionId]
+      )
+      .map((action) => action.manifest.planActionId);
+    const evidenceProgressDigest = sessionInterventionEvidenceProgressDigestV4(
+      this.state,
+      triggerCandidateSetDigest
+    );
+    const predecessorPlanRef = {
+      planRevision: plan.planRevision,
+      planDigest: sha256Hash(canonicalJson(plan)),
+    };
+    const existing = this.state.interventionResearch;
+    const researchId = existing?.runId === this.state.runId
+      && existing.inputId === this.state.currentInputId
+      && existing.controlEpoch === this.state.controlEpoch
+      && existing.predecessorPlanRef.planRevision === plan.planRevision
+        ? existing.researchId
+        : `intervention-research-${sha256Hash(canonicalJson({
+            runId: this.state.runId,
+            inputId: this.state.currentInputId,
+            controlEpoch: this.state.controlEpoch,
+            predecessorPlanRef,
+          })).slice('sha256:'.length)}`;
+    const research: SessionInterventionResearchV4 = {
+      schemaVersion: 'deepcode.session.intervention-research.v1',
+      runId: this.state.runId,
+      inputId: this.state.currentInputId,
+      controlEpoch: this.state.controlEpoch,
+      researchId,
+      triggerProviderTurnId: queue.providerTurnId,
+      predecessorPlanRef,
+      triggerCandidates,
+      triggerCandidateSetDigest,
+      evidenceProgressDigest,
+      ...(existing
+        ? {
+            previousEvidenceProgressDigest: existing.evidenceProgressDigest,
+            ...(existing.lastCandidateSetDigest
+              ? { lastCandidateSetDigest: existing.lastCandidateSetDigest }
+              : {}),
+          }
+        : {}),
+      guidanceRevision: existing
+        ? existing.guidanceRevision + (
+            existing.evidenceProgressDigest === evidenceProgressDigest
+            && existing.triggerCandidateSetDigest === triggerCandidateSetDigest
+              ? 0
+              : 1
+          )
+        : 1,
+      startedAt: existing?.startedAt ?? recordedAt,
+      updatedAt: recordedAt,
+    };
+    this.state.interventionResearch = research;
+    this.state.userIntervention = undefined;
+    this.state.userInterventionDecision = undefined;
+    const guidance = canonicalJson({
+      schemaVersion: 'deepcode.session.intervention-research-guidance.v1',
+      researchId: research.researchId,
+      guidanceRevision: research.guidanceRevision,
+      predecessorPlanRef: research.predecessorPlanRef,
+      triggerCandidateSetDigest,
+      evidenceProgressDigest,
+      affectedUnsettledPlanActionIds: unsettledPlanActionIds,
+      triggerCandidates: triggerCandidates.map((candidate) => ({
+        operationId: candidate.operationId,
+        toolId: candidate.toolId,
+        classification: candidate.classification,
+        preview: candidate.preview
+          ? {
+              previewId: candidate.preview.previewId,
+              summary: candidate.preview.approvalView.summary,
+              risk: candidate.preview.risk,
+              effectClass: candidate.preview.effectClass,
+              canonicalTargets:
+                candidate.preview.approvalView.canonicalTargets,
+            }
+          : undefined,
+        rejection: candidate.rejection,
+      })),
+      instruction: 'Continue directly related safe reads until material options and blocking unknowns converge, then emit exactly one consolidated intervention proposal. Do not execute or claim any mutation.',
+    });
+    if (!this.state.pendingGuidance.includes(guidance)) {
+      this.state.pendingGuidance.push(guidance);
+    }
+  }
+
+  private refreshInterventionResearchProgressV4(
+    recordedAt: string | undefined
+  ): boolean {
+    const research = this.state.interventionResearch;
+    if (!research || !recordedAt || this.state.userIntervention) {
+      return false;
+    }
+    const evidenceProgressDigest = sessionInterventionEvidenceProgressDigestV4(
+      this.state,
+      research.triggerCandidateSetDigest
+    );
+    if (evidenceProgressDigest === research.evidenceProgressDigest) {
+      return false;
+    }
+    research.previousEvidenceProgressDigest =
+      research.evidenceProgressDigest;
+    research.evidenceProgressDigest = evidenceProgressDigest;
+    research.guidanceRevision += 1;
+    research.updatedAt = recordedAt;
+    return true;
   }
 
   private async ensurePlanProjected(): Promise<void> {
@@ -1630,11 +2405,12 @@ export class SessionKernelLoopV2 {
         'Plan cannot change while capability, invocation, or recovery work is active.'
       );
     }
+    const canonicalPlan = carrySettledPlanActionsV4(this.state, plan);
     const previousRevision = this.state.plan?.planRevision;
-    const next = recordSessionPlanV2(this.state, plan);
-    await this.ports.persistence.persistPlan(plan);
+    const next = recordSessionPlanV2(this.state, canonicalPlan);
+    await this.ports.persistence.persistPlan(canonicalPlan);
     this.state = next;
-    if (previousRevision !== plan.planRevision) {
+    if (previousRevision !== canonicalPlan.planRevision) {
       this.state.projectedPlanRevision = undefined;
     }
     await this.saveCheckpoint();
@@ -1795,7 +2571,11 @@ export class SessionKernelLoopV2 {
       `input:${input.inputId}`,
       'input.persisted',
       {
-        ...input,
+        inputId: input.inputId,
+        opaqueInputRef: input.opaqueInputRef,
+        text: input.text,
+        attachments: cloneJson(input.attachments),
+        recordedAt: input.recordedAt,
         controlEpoch: this.state.controlEpoch,
       },
       input.recordedAt
@@ -1988,7 +2768,6 @@ export class SessionKernelLoopV2 {
     );
     this.state.checkpointRevision = checkpoint.checkpointRevision;
     const write = this.checkpointWrites
-      .catch(() => undefined)
       .then(() => this.ports.persistence.persistCheckpoint(checkpoint));
     this.checkpointWrites = write;
     await write;
@@ -1998,10 +2777,12 @@ export class SessionKernelLoopV2 {
     projectionId: string,
     kind: SessionKernelProjectionEventV2['kind'],
     data: unknown,
-    recordedAt?: string
+    recordedAt?: string,
+    options?: import('./ports.js').SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
     return this.ports.projection.project(
-      this.event(projectionId, kind, data, recordedAt)
+      this.event(projectionId, kind, data, recordedAt),
+      options
     );
   }
 
@@ -2183,12 +2964,247 @@ function activeInvocationId(
       : undefined;
 }
 
+function recordPlanDecisionControlSettlementV2(
+  state: SessionKernelLoopStateV2,
+  decision: SessionPlanDecisionV2
+): void {
+  const confirmation = currentSessionPlanConfirmationAuthorityV2(state);
+  const outcome = confirmation
+    ? state.providerOutcomes.find((candidate) =>
+        candidate.providerTurnId === confirmation.providerTurnId
+      )
+    : undefined;
+  if (!confirmation || outcome?.outputKind !== 'plan') {
+    throw new SessionKernelLoopError(
+      'session_kernel_provider_control_settlement_source_missing',
+      'Plan decision has no exact durable Provider control outcome.'
+    );
+  }
+  recordSessionProviderControlSettlementV2(
+    state,
+    sealSessionProviderControlSettlementV2({
+      kind: 'planDecision',
+      runId: state.runId,
+      inputId: state.currentInputId,
+      controlEpoch: state.controlEpoch,
+      predecessorProviderTurnId: outcome.providerTurnId,
+      nextTargetKind: decision.decision === 'accept'
+        ? 'planAction'
+        : decision.decision === 'revise'
+          ? 'planning'
+          : 'finalAnswer',
+      control: cloneJson(outcome.control),
+      decision: cloneJson(decision),
+      recordedAt: decision.recordedAt,
+    })
+  );
+}
+
+function recordPlanPreviewRejectedControlSettlementV2(
+  state: SessionKernelLoopStateV2,
+  plan: SessionNaturalLanguagePlanV2,
+  reply: CapabilityScopePreviewBatchReplyV2,
+  recordedAt: string
+): void {
+  const outcome = state.providerOutcomes.at(-1);
+  if (
+    outcome?.outputKind !== 'plan'
+    || plan.planRevision !== reply.planRevision
+    || plan.runId !== reply.runId
+    || plan.controlEpoch !== reply.acceptedControlEpoch
+    || state.plan?.planRevision !== plan.planRevision
+  ) {
+    throw new SessionKernelLoopError(
+      'session_kernel_provider_control_settlement_source_missing',
+      'Rejected Plan preview has no exact durable Provider control outcome.'
+    );
+  }
+  const rejections = reply.results.flatMap((result) =>
+    result.kind === 'rejected'
+      ? [{ ...cloneJson(result.data) }]
+      : []
+  ).sort((left, right) => {
+    const leftKey = [
+      left.planActionId,
+      left.operationId,
+      left.toolId,
+    ].join('\u0000');
+    const rightKey = [
+      right.planActionId,
+      right.operationId,
+      right.toolId,
+    ].join('\u0000');
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  if (rejections.length === 0) {
+    throw new SessionKernelLoopError(
+      'session_kernel_provider_control_settlement_preview_invalid',
+      'Rejected Plan preview settlement requires at least one canonical rejection.'
+    );
+  }
+  const preview = {
+    planRevision: plan.planRevision,
+    rejections,
+  };
+  const pending = state.pendingProviderControlSettlement;
+  if (pending) {
+    if (
+      pending.kind !== 'planPreviewRejected'
+      || pending.predecessorProviderTurnId !== outcome.providerTurnId
+      || canonicalJson(pending.preview) !== canonicalJson(preview)
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_provider_control_settlement_conflict',
+        'A different Provider control settlement is already pending.'
+      );
+    }
+    return;
+  }
+  recordSessionProviderControlSettlementV2(
+    state,
+    sealSessionProviderControlSettlementV2({
+      kind: 'planPreviewRejected',
+      runId: state.runId,
+      inputId: state.currentInputId,
+      controlEpoch: state.controlEpoch,
+      predecessorProviderTurnId: outcome.providerTurnId,
+      nextTargetKind: 'planning',
+      control: cloneJson(outcome.control),
+      preview,
+      recordedAt,
+    })
+  );
+}
+
+function recordUserInterventionControlSettlementV2(
+  state: SessionKernelLoopStateV2,
+  intervention: import('./types.js').SessionUserInterventionV4,
+  decision: SessionUserInterventionDecisionV4,
+  disposition: SessionUserInterventionDecisionResultV4['disposition'],
+  acceptedPlanRevision: string | undefined
+): void {
+  const outcome = [...state.providerOutcomes].reverse().find((candidate) =>
+    candidate.outputKind === 'intervention'
+    && candidate.recordedAt === intervention.recordedAt
+  );
+  if (outcome?.outputKind !== 'intervention') {
+    throw new SessionKernelLoopError(
+      'session_kernel_provider_control_settlement_source_missing',
+      'User intervention decision has no exact durable Provider control outcome.'
+    );
+  }
+  if ((disposition === 'planAccepted') !== Boolean(acceptedPlanRevision)) {
+    throw new SessionKernelLoopError(
+      'session_kernel_provider_control_settlement_plan_binding_invalid',
+      'Executable intervention settlement requires one accepted candidate Plan revision.'
+    );
+  }
+  recordSessionProviderControlSettlementV2(
+    state,
+    sealSessionProviderControlSettlementV2({
+      kind: 'userInterventionDecision',
+      runId: state.runId,
+      inputId: state.currentInputId,
+      controlEpoch: state.controlEpoch,
+      predecessorProviderTurnId: outcome.providerTurnId,
+      nextTargetKind: disposition === 'planAccepted'
+        ? 'planAction'
+        : disposition === 'guidanceReplan'
+          ? 'planning'
+          : disposition === 'researchRevision'
+            ? 'interventionResearch'
+            : 'none',
+      control: cloneJson(outcome.control),
+      decision: cloneJson(decision),
+      disposition,
+      ...(acceptedPlanRevision ? { acceptedPlanRevision } : {}),
+      recordedAt: decision.recordedAt,
+    })
+  );
+}
+
 function planDecisionKey(decision: SessionPlanDecisionV2): string {
   return JSON.stringify([
     decision.planRevision,
     decision.decision,
     decision.guidance ?? '',
   ]);
+}
+
+function carrySettledPlanActionsV4(
+  state: SessionKernelLoopStateV2,
+  plan: SessionNaturalLanguagePlanV2
+): SessionNaturalLanguagePlanV2 {
+  if (!state.plan || state.plan.planRevision === plan.planRevision) {
+    return cloneJson(plan);
+  }
+  const predecessorPlanRef = {
+    planRevision: state.plan.planRevision,
+    planDigest: sha256Hash(canonicalJson(state.plan)),
+  };
+  if (
+    plan.predecessorPlanRef
+    && canonicalJson(plan.predecessorPlanRef)
+      !== canonicalJson(predecessorPlanRef)
+  ) {
+    throw new SessionKernelLoopError(
+      'session_kernel_plan_predecessor_mismatch',
+      'A new Plan revision does not bind the exact predecessor Plan.'
+    );
+  }
+  const carriedSettlementRefs = Object.values(
+    state.planActionSettlements
+  )
+    .sort((left, right) =>
+      left.planActionId.localeCompare(right.planActionId)
+    )
+    .map((settlement) => ({
+      planRevision: settlement.planRevision,
+      planActionId: settlement.planActionId,
+      settlementDigest: sha256Hash(canonicalJson(settlement)),
+      kernelFactRefs: Object.values(state.factsById)
+        .filter((fact) =>
+          fact.lineage.planActionIds.includes(settlement.planActionId)
+        )
+        .sort((left, right) =>
+          left.ledgerSequence - right.ledgerSequence
+          || left.factId.localeCompare(right.factId)
+        )
+        .map((fact) => fact.factId),
+    }));
+  return {
+    ...cloneJson(plan),
+    predecessorPlanRef,
+    carriedSettlementRefs,
+  };
+}
+
+function requireInterventionSelectionFactsV4(
+  state: SessionKernelLoopStateV2,
+  intervention: NonNullable<SessionKernelLoopStateV2['userIntervention']>,
+  selectedOptionId: string
+): void {
+  const facts = Object.values(state.factsById);
+  for (const option of intervention.options) {
+    for (const action of option.actions) {
+      const matching = facts.some((fact) =>
+        fact.domain === 'authorization'
+        && fact.lineage.operationId === action.operationId
+        && fact.lineage.planActionIds.includes(action.planActionId)
+        && canonicalJson(fact.details).includes(action.preview.previewId)
+        && (
+          option.optionId === selectedOptionId
+          || canonicalJson(fact.details).includes(selectedOptionId)
+        )
+      );
+      if (!matching) {
+        throw new SessionKernelLoopError(
+          'session_kernel_user_intervention_kernel_facts_missing',
+          'Session cannot accept an intervention candidate until exact selected and superseded Kernel authorization facts are reconciled.'
+        );
+      }
+    }
+  }
 }
 
 function cloneJson<T>(value: T): T {

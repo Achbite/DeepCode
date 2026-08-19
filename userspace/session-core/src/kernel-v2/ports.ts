@@ -35,6 +35,16 @@ export interface SessionKernelProjectionReceiptV2 {
   delivered: boolean;
 }
 
+export interface SessionKernelProjectionDeliveryOptionsV2 {
+  /**
+   * Cancels only presentation delivery. The projection event remains durably
+   * staged and can be replayed without changing its identity or digest.
+   */
+  signal?: AbortSignal;
+  /** A bounded delivery deadline; it never authorizes skipping an event. */
+  deadlineMs?: number;
+}
+
 export class SessionKernelProjectionDeliveryErrorV2 extends Error {
   constructor(
     readonly projectionId: string,
@@ -140,10 +150,14 @@ export interface SessionKernelProjectionPortV2 {
    * requests can replay after an unknown transport outcome.
    */
   project(
-    event: SessionKernelProjectionEventV2
+    event: SessionKernelProjectionEventV2,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2>;
 
-  flushPending(runId: string): Promise<void>;
+  flushPending(
+    runId: string,
+    options?: SessionKernelProjectionDeliveryOptionsV2
+  ): Promise<void>;
 }
 
 export interface SessionKernelClockPortV2 {

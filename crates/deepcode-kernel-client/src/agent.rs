@@ -1,10 +1,270 @@
 use crate::{KernelClientError, KernelClientResult};
-use deepcode_kernel_abi::validate_agent_input_attachments_v2 as validate_attachment_slice_v2;
+use deepcode_kernel_abi::validate_agent_input_attachments_v3 as validate_attachment_slice_v3;
 pub use deepcode_kernel_abi::{
-    AgentInputAttachmentKindV2, AgentInputAttachmentScopeV2, AgentInputAttachmentV2,
+    AgentInputAttachmentKindV3, AgentInputAttachmentScopeV3, AgentInputAttachmentV3,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentConversationTargetV1 {
+    pub schema_version: String,
+    pub target_id: String,
+    pub target_revision: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub workspace_scope_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentProjectConversationTargetV1 {
+    pub schema_version: String,
+    pub target_id: String,
+    pub target_revision: String,
+    pub project_id: String,
+    pub workspace_scope_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum AgentConversationDraftTargetV1 {
+    Public {
+        schema_version: String,
+        target_id: String,
+        target_revision: String,
+        workspace_scope_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_hash: Option<String>,
+    },
+    Project {
+        schema_version: String,
+        target_id: String,
+        target_revision: String,
+        project_id: String,
+        workspace_scope_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_binding_ref: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_binding_identity: Option<String>,
+    },
+}
+
+impl AgentConversationDraftTargetV1 {
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        let (schema_version, target_id, target_revision, workspace_scope_key) = match self {
+            Self::Public {
+                schema_version,
+                target_id,
+                target_revision,
+                workspace_scope_key,
+                ..
+            }
+            | Self::Project {
+                schema_version,
+                target_id,
+                target_revision,
+                workspace_scope_key,
+                ..
+            } => (
+                schema_version,
+                target_id,
+                target_revision,
+                workspace_scope_key,
+            ),
+        };
+        let project_valid = match self {
+            Self::Public { .. } => true,
+            Self::Project { project_id, .. } => !project_id.trim().is_empty(),
+        };
+        if schema_version != "deepcode.host.conversation-draft-target.v1"
+            || target_id.trim().is_empty()
+            || target_revision.trim().is_empty()
+            || workspace_scope_key.trim().is_empty()
+            || !project_valid
+        {
+            return Err(KernelClientError::Api(
+                "agent_conversation_draft_target_invalid: conversationDraftTarget is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComposerProfileV1 {
+    pub profile_id: String,
+    pub name: String,
+    pub model: String,
+    pub provider_flavor: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComposerProjectionV1 {
+    pub schema_version: String,
+    pub revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_target: Option<AgentConversationTargetV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_draft_target: Option<AgentConversationDraftTargetV1>,
+    pub enabled_profiles: Vec<AgentComposerProfileV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_profile_id: Option<String>,
+    pub selection_mutable: bool,
+    pub can_submit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_run: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_interaction: Option<Value>,
+}
+
+impl AgentComposerProjectionV1 {
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        if self.schema_version != "deepcode.host.composer-projection.v1"
+            || self.revision.trim().is_empty()
+            || self.enabled_profiles.iter().any(|profile| {
+                profile.profile_id.trim().is_empty()
+                    || profile.name.trim().is_empty()
+                    || profile.model.trim().is_empty()
+                    || profile.provider_flavor.trim().is_empty()
+            })
+        {
+            return Err(KernelClientError::Api(
+                "agent_composer_projection_invalid: Composer projection is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        if self.selected_profile_id.as_deref().is_some_and(|selected| {
+            !self
+                .enabled_profiles
+                .iter()
+                .any(|profile| profile.profile_id == selected)
+        }) {
+            return Err(KernelClientError::Api(
+                "agent_composer_projection_invalid: selected Profile is not enabled".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComposerProjectionStreamEventV1 {
+    pub schema_version: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub revision: String,
+    pub projection: AgentComposerProjectionV1,
+}
+
+impl AgentComposerProjectionStreamEventV1 {
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        self.projection.validate()?;
+        if self.schema_version != "deepcode.host.composer-projection-stream.v1"
+            || !matches!(self.event_type.as_str(), "snapshot" | "updated")
+            || self.revision.trim().is_empty()
+            || self.revision != self.projection.revision
+        {
+            return Err(KernelClientError::Api(
+                "agent_composer_projection_stream_invalid: Composer replacement envelope is inconsistent"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AgentProjectConversationTargetV1 {
+    pub fn from_project(project: &Value) -> KernelClientResult<Self> {
+        let value = project.get("conversationTarget").cloned().ok_or_else(|| {
+            KernelClientError::Api(
+                "agent_project_conversation_target_missing: Project response has no canonical conversationTarget"
+                    .to_string(),
+            )
+        })?;
+        let target: Self = serde_json::from_value(value).map_err(|error| {
+            KernelClientError::Api(format!(
+                "agent_project_conversation_target_invalid: invalid canonical conversationTarget: {error}"
+            ))
+        })?;
+        target.validate()?;
+        Ok(target)
+    }
+
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        if self.schema_version != "deepcode.host.project-conversation-target.v1"
+            || self.target_id.trim().is_empty()
+            || self.target_revision.trim().is_empty()
+            || self.project_id.trim().is_empty()
+            || self.workspace_scope_key.trim().is_empty()
+        {
+            return Err(KernelClientError::Api(
+                "agent_project_conversation_target_invalid: project conversationTarget is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AgentConversationTargetV1 {
+    pub fn from_session(session: &Value) -> KernelClientResult<Self> {
+        let value = session.get("conversationTarget").cloned().ok_or_else(|| {
+            KernelClientError::Api(
+                "agent_conversation_target_missing: Session response has no canonical conversationTarget"
+                    .to_string(),
+            )
+        })?;
+        let target: Self = serde_json::from_value(value).map_err(|error| {
+            KernelClientError::Api(format!(
+                "agent_conversation_target_invalid: invalid canonical conversationTarget: {error}"
+            ))
+        })?;
+        target.validate()?;
+        Ok(target)
+    }
+
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        if self.schema_version != "deepcode.host.conversation-target.v1"
+            || self.target_id.trim().is_empty()
+            || self.target_revision.trim().is_empty()
+            || self.session_id.trim().is_empty()
+            || self.workspace_scope_key.trim().is_empty()
+        {
+            return Err(KernelClientError::Api(
+                "agent_conversation_target_invalid: conversationTarget is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +281,46 @@ pub struct CreateAgentSessionRequest {
     pub workspace_id: Option<String>,
     pub workspace_hash: Option<String>,
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartConversationDraftRunRequest {
+    pub conversation_draft_target: AgentConversationDraftTargetV1,
+    pub profile_id: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<AgentInputAttachmentV3>>,
+    pub caller_request_id: String,
+}
+
+impl StartConversationDraftRunRequest {
+    pub fn new(
+        conversation_draft_target: AgentConversationDraftTargetV1,
+        profile_id: impl Into<String>,
+        content: impl Into<String>,
+        caller_request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            conversation_draft_target,
+            profile_id: profile_id.into(),
+            content: content.into(),
+            attachments: None,
+            caller_request_id: caller_request_id.into(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_draft_target.validate()?;
+        if self.profile_id.trim().is_empty() || self.content.trim().is_empty() {
+            return Err(KernelClientError::Api(
+                "conversation_draft_admission_invalid: Draft admission requires a selected Profile and one non-empty user input"
+                    .to_string(),
+            ));
+        }
+        validate_agent_input_attachments_v3(self.attachments.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,7 +348,7 @@ pub struct StartAgentRunRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_workspace: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<AgentInputAttachmentV2>>,
+    pub attachments: Option<Vec<AgentInputAttachmentV3>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,11 +359,26 @@ pub struct StartAgentRunRequest {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_set_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_projection_cursor: Option<u64>,
+    pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
 
 impl StartAgentRunRequest {
-    pub fn ask(content: impl Into<String>, caller_request_id: impl Into<String>) -> Self {
+    pub fn ask(
+        content: impl Into<String>,
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
+    ) -> Self {
         Self {
             op: "ask".to_string(),
             content: Some(content.into()),
@@ -75,6 +390,12 @@ impl StartAgentRunRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            option_id: None,
+            interaction_id: None,
+            interaction_revision: None,
+            candidate_set_digest: None,
+            expected_projection_cursor: None,
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
@@ -83,6 +404,7 @@ impl StartAgentRunRequest {
         kind: impl Into<String>,
         decision: impl Into<String>,
         caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
     ) -> Self {
         Self {
             op: "resolveDecision".to_string(),
@@ -95,26 +417,22 @@ impl StartAgentRunRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            option_id: None,
+            interaction_id: None,
+            interaction_revision: None,
+            candidate_set_digest: None,
+            expected_projection_cursor: None,
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
         validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()?;
         match self.op.as_str() {
             "ask" => {
-                validate_agent_input_attachments_v2(self.attachments.as_deref())?;
-                if self.no_workspace == Some(true)
-                    && self
-                        .attachments
-                        .as_ref()
-                        .is_some_and(|attachments| !attachments.is_empty())
-                {
-                    return Err(KernelClientError::Api(
-                        "agent_input_attachment_workspace_required: attachments require a bound workspace"
-                            .to_string(),
-                    ));
-                }
+                validate_agent_input_attachments_v3(self.attachments.as_deref())?;
                 if self
                     .content
                     .as_deref()
@@ -130,6 +448,11 @@ impl StartAgentRunRequest {
                     || self.guidance.is_some()
                     || self.run_id.is_some()
                     || self.target_id.is_some()
+                    || self.option_id.is_some()
+                    || self.interaction_id.is_some()
+                    || self.interaction_revision.is_some()
+                    || self.candidate_set_digest.is_some()
+                    || self.expected_projection_cursor.is_some()
                 {
                     return Err(KernelClientError::Api(
                         "session_operation_v2_invalid: ask cannot carry decision identity"
@@ -139,7 +462,7 @@ impl StartAgentRunRequest {
             }
             "resolveDecision" => {
                 let kind = self.decision_kind.as_deref();
-                if !matches!(kind, Some("plan" | "permission"))
+                if !matches!(kind, Some("plan" | "permission" | "userIntervention"))
                     || self
                         .decision
                         .as_deref()
@@ -158,6 +481,52 @@ impl StartAgentRunRequest {
                 {
                     return Err(KernelClientError::Api(
                         "session_interaction_identity_required: decision requires plan/permission, decision, runId, and targetId".to_string(),
+                    ));
+                }
+                if kind == Some("userIntervention") {
+                    let decision = self.decision.as_deref();
+                    if !matches!(decision, Some("select" | "revise" | "reject"))
+                        || self
+                            .interaction_id
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                        || self
+                            .interaction_revision
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                        || self
+                            .candidate_set_digest
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                        || self.expected_projection_cursor.is_none()
+                        || (decision == Some("select")
+                            && self
+                                .option_id
+                                .as_deref()
+                                .map(str::trim)
+                                .is_none_or(str::is_empty))
+                        || (decision == Some("revise")
+                            && self
+                                .guidance
+                                .as_deref()
+                                .map(str::trim)
+                                .is_none_or(str::is_empty))
+                    {
+                        return Err(KernelClientError::Api(
+                            "session_intervention_identity_required: intervention decisions require exact interaction revision, candidate-set digest, projection cursor, and decision payload".to_string(),
+                        ));
+                    }
+                } else if self.option_id.is_some()
+                    || self.interaction_id.is_some()
+                    || self.interaction_revision.is_some()
+                    || self.candidate_set_digest.is_some()
+                    || self.expected_projection_cursor.is_some()
+                {
+                    return Err(KernelClientError::Api(
+                        "session_operation_v2_invalid: plan and permission decisions cannot carry intervention identity".to_string(),
                     ));
                 }
                 if self.content.is_some()
@@ -185,18 +554,24 @@ impl StartAgentRunRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunCallerRequest {
+    pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
 
 impl AgentRunCallerRequest {
-    pub fn new(caller_request_id: impl Into<String>) -> Self {
+    pub fn new(
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
+    ) -> Self {
         Self {
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
-        validate_caller_request_id(&self.caller_request_id)
+        validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()
     }
 }
 
@@ -209,29 +584,36 @@ pub struct AgentRunGuidanceRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_workspace: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<AgentInputAttachmentV2>>,
+    pub attachments: Option<Vec<AgentInputAttachmentV3>>,
+    pub conversation_target: AgentConversationTargetV1,
     pub caller_request_id: String,
 }
 
 impl AgentRunGuidanceRequest {
-    pub fn new(guidance: impl Into<String>, caller_request_id: impl Into<String>) -> Self {
+    pub fn new(
+        guidance: impl Into<String>,
+        caller_request_id: impl Into<String>,
+        conversation_target: AgentConversationTargetV1,
+    ) -> Self {
         Self {
             guidance: guidance.into(),
             workspace_path: None,
             no_workspace: None,
             attachments: None,
+            conversation_target,
             caller_request_id: caller_request_id.into(),
         }
     }
 
     pub(crate) fn validate(&self) -> KernelClientResult<()> {
         validate_caller_request_id(&self.caller_request_id)?;
+        self.conversation_target.validate()?;
         if self.guidance.trim().is_empty() {
             return Err(KernelClientError::Api(
                 "empty_guidance: guidance must not be empty".to_string(),
             ));
         }
-        validate_agent_input_attachments_v2(self.attachments.as_deref())?;
+        validate_agent_input_attachments_v3(self.attachments.as_deref())?;
         if self.no_workspace == Some(true) && self.workspace_path.is_some() {
             return Err(KernelClientError::Api(
                 "agent_guidance_workspace_conflict: guidance cannot request both a workspace path and no-workspace mode"
@@ -242,13 +624,13 @@ impl AgentRunGuidanceRequest {
     }
 }
 
-fn validate_agent_input_attachments_v2(
-    attachments: Option<&[AgentInputAttachmentV2]>,
+fn validate_agent_input_attachments_v3(
+    attachments: Option<&[AgentInputAttachmentV3]>,
 ) -> KernelClientResult<()> {
     let Some(attachments) = attachments else {
         return Ok(());
     };
-    validate_attachment_slice_v2(attachments)
+    validate_attachment_slice_v3(attachments)
         .map_err(|error| KernelClientError::Api(format!("{}: {}", error.code, error.message)))
 }
 
