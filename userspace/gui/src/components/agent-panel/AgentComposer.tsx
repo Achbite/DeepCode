@@ -46,6 +46,7 @@ interface AgentComposerProps {
   ) => void | Promise<void>;
   submissionScopeId?: string | null;
   canCancelCurrentRun?: boolean;
+  cancellationPending?: boolean;
   onStop: () => void;
   onAddAttachment: (attachment: AgentInputAttachmentV3) => void;
   onRemoveAttachment: (
@@ -68,8 +69,6 @@ interface AgentModifiedFileView {
 }
 
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
-const PRIMARY_DECISION_OPTION_ID = '__primary__';
-
 function attachmentLabel(attachment: AgentInputAttachmentV3, language: UiLanguage): string {
   const kind = attachment.kind === 'directory'
     ? t(language, 'agent.composer.dir')
@@ -250,6 +249,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   onSubmissionSettled,
   submissionScopeId = null,
   canCancelCurrentRun = false,
+  cancellationPending = false,
   onStop,
   onAddAttachment,
   onRemoveAttachment,
@@ -279,7 +279,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   submissionScopeRef.current = submissionScopeId;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const defaultDecisionOptionRef = useRef<HTMLButtonElement | null>(null);
-  const focusedOptionClickConfirmRef = useRef<string | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
   const previewEditor = String(
     useSettingsStore((s) => s.effectiveSettings['workbench.previewEditor'] ?? 'vscode')
@@ -298,7 +297,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   useEffect(() => {
     setDecisionCopyStatus('idle');
-    focusedOptionClickConfirmRef.current = null;
     if (pendingDecision?.kind === 'userIntervention') {
       const defaultOption = pendingDecision.intervention.options.find((option) => option.recommended)
         ?? pendingDecision.intervention.options[0];
@@ -451,7 +449,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       ? pendingSubmissionCancellable || canCancelCurrentRun
       : canCancelCurrentRun
   );
-  const sendDisabled = cancellable
+  const sendDisabled = cancellationPending
+    ? true
+    : cancellable
     ? false
     : submissionPending
       ? true
@@ -461,7 +461,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           ? decisionResolving
             || (pendingDecision.kind === 'userIntervention' && !selectedDecisionOptionId)
           : submissionPending || sendBlocked || !value.trim();
-  const sendLabel = decisionResolving
+  const sendLabel = cancellationPending
+    ? t(language, 'agent.composer.stopping')
+    : decisionResolving
     ? t(language, 'agent.composer.decision.resolving')
     : cancellable
     ? t(language, 'agent.composer.stop')
@@ -477,26 +479,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (previewEditor === 'vscode') {
       openVscodeFile(absolutePath);
     }
-  };
-
-  const armFocusedOptionClick = (
-    _event: React.MouseEvent<HTMLButtonElement>,
-    optionId: string
-  ) => {
-    focusedOptionClickConfirmRef.current = document.activeElement === defaultDecisionOptionRef.current
-      ? optionId
-      : null;
-  };
-
-  const activatePrimaryDecisionOption = (event: React.MouseEvent<HTMLButtonElement>) => {
-    if (!pendingDecision || pendingDecision.resolving) return;
-    if (pendingDecision.kind === 'userIntervention') return;
-    if (focusedOptionClickConfirmRef.current === PRIMARY_DECISION_OPTION_ID) {
-      send();
-      return;
-    }
-    event.currentTarget.focus();
-    focusedOptionClickConfirmRef.current = null;
   };
 
   const requestInterventionRevision = () => {
@@ -630,8 +612,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                       disabled={decisionResolving}
                       title={decisionSubmitTitle(pendingDecision!, '', language)}
                       ref={defaultDecisionOptionRef}
-                      onMouseDown={(event) => armFocusedOptionClick(event, PRIMARY_DECISION_OPTION_ID)}
-                      onClick={activatePrimaryDecisionOption}
+                      onClick={send}
                     >
                       <span className="agent-composer-decision__number">1</span>
                       <span className="agent-composer-decision__option-body">
@@ -841,7 +822,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             disabled={sendDisabled}
             type="button"
             title={cancellable
-              ? t(language, 'agent.composer.stopTitle')
+              ? cancellationPending
+                ? t(language, 'agent.composer.stopping')
+                : t(language, 'agent.composer.stopTitle')
               : sendBlockedTitle ?? t(language, 'agent.composer.sendTitle')}
           >
             {sendLabel}

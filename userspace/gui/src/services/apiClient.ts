@@ -61,6 +61,7 @@ import type {
   StartAgentRunRequest,
   StartConversationDraftRunRequest,
   AgentComposerProjectionV1,
+  AgentComposerProjectionStreamEventV1,
   PrivateAnalysisLeaseReceiptV1,
   PrivateAnalysisProjectionV1,
   PrivateAnalysisRevokeReceiptV1,
@@ -68,7 +69,11 @@ import type {
   CreateUserAttachmentGrantRequestV1,
   UserAttachmentGrantResultV1,
 } from '@deepcode/protocol';
-import { PRIVATE_ANALYSIS_LEASE_HEADER_V1 } from '@deepcode/protocol';
+import {
+  decodeAgentComposerProjectionV1,
+  decodeAgentComposerProjectionStreamEventV1,
+  PRIVATE_ANALYSIS_LEASE_HEADER_V1,
+} from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getHostAdmissionHeaders, getKernelApiBase } from './hostTarget';
 
@@ -358,6 +363,13 @@ export class AgentTimelineStreamProtocolError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AgentTimelineStreamProtocolError';
+  }
+}
+
+export class AgentComposerStreamProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentComposerStreamProtocolError';
   }
 }
 
@@ -924,7 +936,65 @@ export function getAgentComposer(
     projectId: request.projectId,
     sessionId: request.sessionId,
   });
-  return getJson<AgentComposerProjectionV1>(`${API_BASE}/agent/composer${qs}`, signal);
+  return getJson<unknown>(`${API_BASE}/agent/composer${qs}`, signal)
+    .then((response) => response.ok && response.data
+      ? {
+          ...response,
+          data: decodeAgentComposerProjectionV1(response.data, request),
+        }
+      : response as ApiResponse<AgentComposerProjectionV1>);
+}
+
+export function streamAgentComposer(
+  request: { projectId?: string; sessionId?: string },
+  onEvent: (event: AgentComposerProjectionStreamEventV1) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const qs = buildQuery({
+    projectId: request.projectId,
+    sessionId: request.sessionId,
+  });
+  return streamSse(
+    `${API_BASE}/agent/composer/stream${qs}`,
+    ['snapshot', 'updated'],
+    (event) => {
+      if (event.event === 'error') {
+        const detail = isRecord(event.data)
+          ? stringField(event.data, 'message') ?? stringField(event.data, 'code')
+          : null;
+        if (isRecord(event.data) && event.data.code === 'invalid_sse_payload') {
+          throw new AgentComposerStreamProtocolError(
+            detail ?? 'Composer projection stream returned invalid JSON.'
+          );
+        }
+        throw new Error(detail ?? 'Composer projection stream disconnected');
+      }
+      if (event.event !== 'snapshot' && event.event !== 'updated') {
+        throw new AgentComposerStreamProtocolError(
+          'Composer projection stream returned an invalid replacement envelope.'
+        );
+      }
+      let decoded: AgentComposerProjectionStreamEventV1;
+      try {
+        decoded = decodeAgentComposerProjectionStreamEventV1(
+          event.data,
+          request
+        );
+      } catch {
+        throw new AgentComposerStreamProtocolError(
+          'Composer projection stream returned an invalid or stale target binding.'
+        );
+      }
+      if (decoded.type !== event.event) {
+        throw new AgentComposerStreamProtocolError(
+          'Composer projection stream event type does not match its envelope.'
+        );
+      }
+      onEvent(decoded);
+    },
+    [],
+    signal
+  );
 }
 
 export function startConversationDraftRun(

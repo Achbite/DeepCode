@@ -1899,6 +1899,10 @@ mod tests {
             kind: "plan".to_string(),
             run_id: "run-generic".to_string(),
             target_id: "target-generic".to_string(),
+            interaction_revision: None,
+            candidate_set_digest: None,
+            projection_cursor: None,
+            option_ids: Vec::new(),
         }
     }
 
@@ -1927,17 +1931,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_session_waits_for_matching_initial_snapshot_before_opening_stream() {
+    async fn new_session_stream_uses_pending_identity_without_binding_stale_snapshot() {
         let mut app = test_tui_app();
         app.current_session_id = Some("session-old".to_string());
         app.timeline = Some(timeline_snapshot("session-old", "kernel-run-old"));
         app.pending_run = Some(PendingRun {
             operation: RunOperation::Ask,
             session_id: "session-new".to_string(),
-            run_id: "host-run-new".to_string(),
-            kernel_run_id: "kernel-run-new".to_string(),
+            baseline_revision: 0,
             timeline_stream: None,
-            projection_terminal_since: None,
             last_projection_activity_at: Instant::now(),
             last_watchdog_snapshot_at: Instant::now(),
             stream_reconnect_not_before: Instant::now(),
@@ -1950,8 +1952,8 @@ mod tests {
         assert!(
             app.pending_run
                 .as_ref()
-                .is_some_and(|pending| pending.timeline_stream.is_none()),
-            "stale prior-Session projection opened a timeline stream"
+                .is_some_and(|pending| pending.timeline_stream.is_some()),
+            "pending Session identity did not open the typed timeline stream"
         );
 
         app.timeline = Some(timeline_snapshot("session-new", "kernel-run-new"));
@@ -1961,7 +1963,7 @@ mod tests {
             app.pending_run
                 .as_ref()
                 .is_some_and(|pending| pending.timeline_stream.is_some()),
-            "matching initial snapshot did not open the typed timeline stream"
+            "matching projection unexpectedly replaced or closed the typed timeline stream"
         );
 
         app.pending_run = None;

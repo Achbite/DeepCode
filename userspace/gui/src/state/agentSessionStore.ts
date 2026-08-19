@@ -29,7 +29,7 @@ import {
   activateAgentSession,
   archiveAgentSession,
   deleteAgentSession,
-  cancelCurrentAgentRun,
+  cancelAgentRunById,
   createAgentSession,
   getAgentTimeline,
   getCurrentAgentSession,
@@ -125,7 +125,7 @@ interface AgentSessionActions {
     content: string,
     profileId: string
   ) => Promise<AgentSession | null>;
-  cancelCurrentRun: () => Promise<void>;
+  cancelCurrentRun: (runId?: string) => Promise<void>;
   acceptPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   rejectPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
@@ -957,13 +957,21 @@ interface AgentSessionSelectionSnapshot {
 type CanonicalHostSelection =
   | {
       kind: 'ready';
+      sessions: AgentSession[];
+      currentSessionId: string;
       session: AgentSession;
       timeline: AgentTimelineResult;
       sessionAttachments: AgentInputAttachmentV3[];
       attachmentError: string | null;
     }
-  | { kind: 'empty' }
-  | { kind: 'invalid'; session: AgentSession; message: string }
+  | { kind: 'empty'; sessions: AgentSession[]; currentSessionId?: undefined }
+  | {
+      kind: 'invalid';
+      sessions: AgentSession[];
+      currentSessionId: string;
+      session: AgentSession;
+      message: string;
+    }
   | { kind: 'unavailable'; message: string };
 
 function captureAgentSessionSelection(
@@ -1009,30 +1017,41 @@ function finishAgentSessionSelection(
 async function readCanonicalHostSelection(
   scope: ListAgentSessionsRequest
 ): Promise<CanonicalHostSelection> {
-  let current;
+  let listed;
   try {
-    current = await getCurrentAgentSession(scope);
+    listed = await listAgentSessions(scope);
   } catch (error) {
     return {
       kind: 'unavailable',
       message: error instanceof Error ? error.message : String(error),
     };
   }
-  if (!current.ok) {
+  if (!listed.ok || !listed.data) {
     return {
       kind: 'unavailable',
-      message: current.message ?? current.error ?? 'Agent session lookup failed',
+      message: listed.message ?? listed.error ?? 'Agent session lookup failed',
     };
   }
-  if (!current.data) return { kind: 'empty' };
+  const sessions = listed.data.sessions;
+  const currentSessionId = listed.data.currentSessionId;
+  if (!currentSessionId) return { kind: 'empty', sessions };
 
-  const session = current.data.session;
+  const session = sessions.find((item) => item.id === currentSessionId);
+  if (!session) {
+    return {
+      kind: 'unavailable',
+      message: 'Canonical Session list referenced a current Session that was not publicly visible.',
+    };
+  }
+
   let timelineResult;
   try {
     timelineResult = await boundedAgentTimelineRequest(session.id);
   } catch (error) {
     return {
       kind: 'invalid',
+      sessions,
+      currentSessionId,
       session,
       message: error instanceof Error ? error.message : String(error),
     };
@@ -1040,6 +1059,8 @@ async function readCanonicalHostSelection(
   if (!timelineResult.ok || !timelineResult.data) {
     return {
       kind: 'invalid',
+      sessions,
+      currentSessionId,
       session,
       message: timelineResult.message
         ?? timelineResult.error
@@ -1053,6 +1074,8 @@ async function readCanonicalHostSelection(
     if (!await validateProjectedRunIdentity(timeline)) {
       return {
         kind: 'invalid',
+        sessions,
+        currentSessionId,
         session,
         message: 'Canonical Session run identity is unavailable.',
       };
@@ -1063,6 +1086,8 @@ async function readCanonicalHostSelection(
     );
     return {
       kind: 'ready',
+      sessions,
+      currentSessionId,
       session,
       timeline,
       sessionAttachments: restoredAttachments.sessionAttachments,
@@ -1071,6 +1096,8 @@ async function readCanonicalHostSelection(
   } catch (error) {
     return {
       kind: 'invalid',
+      sessions,
+      currentSessionId,
       session,
       message: error instanceof Error ? error.message : String(error),
     };
@@ -1085,14 +1112,11 @@ function applyCanonicalHostSelection(
   if (selection.kind === 'ready') {
     canonicalTimelineStaleSessions.delete(selection.session.id);
     canonicalTimelineFailClosedSessions.delete(selection.session.id);
-    useAgentSessionStore.setState((state) => ({
+    useAgentSessionStore.setState({
       session: selection.session,
       localWorkspaceScopeKey: selection.session.conversationTarget.workspaceScopeKey,
-      sessions: [
-        selection.session,
-        ...state.sessions.filter((item) => item.id !== selection.session.id),
-      ],
-      currentSessionId: selection.session.id,
+      sessions: selection.sessions,
+      currentSessionId: selection.currentSessionId,
       timeline: selection.timeline,
       profileId: selection.session.profileId,
       messageAttachments: [],
@@ -1100,23 +1124,20 @@ function applyCanonicalHostSelection(
       pendingPermission: pendingPermissionFromTimeline(selection.timeline),
       resolvingPermission: null,
       resolvingPlan: null,
-      errorMessage: selection.attachmentError,
+      errorMessage: selection.attachmentError ?? fallbackError ?? null,
       loading: false,
       selectionReady: true,
-    }));
+    });
     return;
   }
   if (selection.kind === 'invalid') {
     canonicalTimelineStaleSessions.add(selection.session.id);
     canonicalTimelineFailClosedSessions.add(selection.session.id);
-    useAgentSessionStore.setState((state) => ({
+    useAgentSessionStore.setState({
       session: selection.session,
       localWorkspaceScopeKey: selection.session.conversationTarget.workspaceScopeKey,
-      sessions: [
-        selection.session,
-        ...state.sessions.filter((item) => item.id !== selection.session.id),
-      ],
-      currentSessionId: selection.session.id,
+      sessions: selection.sessions,
+      currentSessionId: selection.currentSessionId,
       timeline: null,
       profileId: selection.session.profileId,
       messageAttachments: [],
@@ -1127,13 +1148,14 @@ function applyCanonicalHostSelection(
       errorMessage: selection.message || fallbackError || null,
       loading: false,
       selectionReady: false,
-    }));
+    });
     return;
   }
   useAgentSessionStore.setState({
     session: null,
     localWorkspaceScopeKey: selectionScopeKey,
-    currentSessionId: undefined,
+    sessions: selection.sessions,
+    currentSessionId: selection.currentSessionId,
     timeline: null,
     profileId: undefined,
     messageAttachments: [],
@@ -1518,23 +1540,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           selectionGeneration !== agentSessionSelectionGeneration
           || selectionScopeKey !== currentWorkspaceScopeKey()
         ) return;
-        if (canonical.kind === 'unavailable') {
-          if (previousSelection.session) {
-            markCanonicalTimelineStale(previousSelection.session.id);
-          }
-          set({
-            ...restoredAgentSessionSelection(previousSelection, errorMessage),
-            selectionReady: false,
-          });
-          return;
+        if (previousSelection.session) {
+          markCanonicalTimelineStale(previousSelection.session.id);
         }
-        applyCanonicalHostSelection(canonical, selectionScopeKey, errorMessage);
-        if (canonical.kind === 'ready') {
-          if (canonical.session.id !== sessionId) {
-            set({ errorMessage });
-          }
-          settledAgentSessionSelectionGeneration = selectionGeneration;
-        }
+        set({
+          ...restoredAgentSessionSelection(previousSelection, errorMessage),
+          ...(canonical.kind === 'unavailable'
+            ? {}
+            : { sessions: canonical.sessions }),
+          selectionReady: false,
+        });
       };
 
       let activatedSession: AgentSession | null = null;
@@ -1758,15 +1773,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             return { deleted: false, chooseNext: false };
           }
           applyCanonicalHostSelection(canonical, selectionScopeKey, errorMessage);
+          const targetStillVisible = canonical.sessions.some(
+            (session) => session.id === sessionId
+          );
           if (canonical.kind === 'ready') {
-            if (canonical.session.id === sessionId) {
-              set({ errorMessage });
-            }
+            if (targetStillVisible) set({ errorMessage });
             settledAgentSessionSelectionGeneration = selectionGeneration;
-            return { deleted: canonical.session.id !== sessionId, chooseNext: false };
+            return { deleted: !targetStillVisible, chooseNext: false };
           }
           return {
-            deleted: canonical.kind === 'empty',
+            deleted: !targetStillVisible,
             chooseNext: canonical.kind === 'empty',
           };
         };
@@ -1819,16 +1835,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         }
 
         const message = result.message ?? 'Agent session delete failed';
-        if (hostCallerMutationDisposition(result) === 'rejected') {
-          if (
-            selectionGeneration === agentSessionSelectionGeneration
-            && selectionScopeKey === currentWorkspaceScopeKey()
-          ) {
-            set(restoredAgentSessionSelection(rollbackSelection, message));
-            settledAgentSessionSelectionGeneration = selectionGeneration;
-          }
-          return { deleted: false, chooseNext: false };
-        }
         return reconcileUnknownResult(message);
       }, selectionScopeKey);
     } finally {
@@ -2427,9 +2433,17 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
   },
 
-  cancelCurrentRun: async () => {
+  cancelCurrentRun: async (runIdOverride) => {
     const session = get().session;
     if (!session) return;
+    const runId = runIdOverride ?? get().timeline?.runProjection?.runId;
+    if (!runId) {
+      set({
+        errorMessage:
+          'Shared Projection has no exact active Run identity to cancel.',
+      });
+      return;
+    }
     if (get().cancellingSessionIds.includes(session.id)) return;
     set((state) => ({
       cancellingSessionIds: addInFlightSessionId(state.cancellingSessionIds, session.id),
@@ -2439,8 +2453,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const stopProgressWatcher = startCanonicalProgressWatcher(session.id);
     try {
       const callerRequestId = newHostCallerRequestId('cancel');
-      const result = await cancelCurrentAgentRun(
+      const result = await cancelAgentRunById(
         session.id,
+        runId,
         callerRequestId,
         session.conversationTarget
       );

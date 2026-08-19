@@ -86,6 +86,34 @@ export interface KernelStartResult {
   started: boolean;
   blocked: boolean;
   message: string;
+  status: HostStartupStatusV1;
+}
+
+export interface HostStartupStatusV1 {
+  schemaVersion: 'deepcode.host-shell.startup-status.v1';
+  revision: number;
+  attemptId: string;
+  mode: 'managed' | 'connectOnly';
+  phase: 'idle' | 'starting' | 'ready' | 'external' | 'blocked' | 'failed' | 'stopped';
+  stage:
+    | 'permissionPreflight'
+    | 'startAdmission'
+    | 'binaryResolution'
+    | 'daemonSpawn'
+    | 'daemonIdentity'
+    | 'daemonRecovery'
+    | 'proxySpawn'
+    | 'proxyIdentity'
+    | 'proxyHealth'
+    | 'ready'
+    | 'connectOnly';
+  code: string;
+  reasonCode?: string;
+  message: string;
+  retryable: boolean;
+  ownsProcesses: boolean;
+  diagnosticRef?: string;
+  updatedAt: string;
 }
 
 export function healthVersion(health?: HealthStatus): string {
@@ -185,6 +213,27 @@ export async function startKernelAfterPermission(): Promise<ApiResponse<KernelSt
     return {
       ok: false,
       error: 'kernel_start_failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function getHostStartupStatus(): Promise<ApiResponse<HostStartupStatusV1>> {
+  const invoke = getTauriInvoke();
+  if (!invoke) {
+    return {
+      ok: false,
+      error: 'host_startup_status_unavailable',
+      message: 'Host startup status is only available in the desktop shell.',
+    };
+  }
+  try {
+    const result = await invoke<HostStartupStatusV1>('deepcode_host_startup_status');
+    return { ok: true, data: result };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'host_startup_status_failed',
       message: err instanceof Error ? err.message : String(err),
     };
   }
@@ -492,6 +541,14 @@ export function getAgentComposer(
   signal?: AbortSignal
 ): Promise<ApiResponse<api.AgentComposerProjectionV1>> {
   return api.getAgentComposer(request, signal);
+}
+
+export function streamAgentComposer(
+  request: { projectId?: string; sessionId?: string },
+  onEvent: Parameters<typeof api.streamAgentComposer>[1],
+  signal?: AbortSignal
+): Promise<void> {
+  return api.streamAgentComposer(request, onEvent, signal);
 }
 
 export function startConversationDraftRun(

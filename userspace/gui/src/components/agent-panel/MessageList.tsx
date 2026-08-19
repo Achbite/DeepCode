@@ -28,6 +28,7 @@ interface MessageListProps {
   timeline: AgentTimelineResult;
   loading?: boolean;
   language: UiLanguage;
+  suppressedBlockIds?: ReadonlySet<string>;
 }
 
 function blockText(block: AgentTimelineBlock, language: UiLanguage): string {
@@ -397,8 +398,15 @@ function workOperationStatusLabel(
   return language === 'zh-CN' ? label[0] : label[1];
 }
 
-const MessageList: React.FC<MessageListProps> = ({ timeline, loading = false, language }) => {
-  const hasParts = timeline.turns.some((turn) => turn.parts.length > 0);
+const MessageList: React.FC<MessageListProps> = ({
+  timeline,
+  loading = false,
+  language,
+  suppressedBlockIds,
+}) => {
+  const hasParts = timeline.turns.some((turn) => turn.parts.some((part) =>
+    part.kind !== 'block' || !suppressedBlockIds?.has(part.blockId)
+  ));
   const currentActivity = timeline.runProjection?.currentActivity ?? null;
   const waitingForUser = timeline.runProjection?.status === 'waitingUser'
     || timeline.runProjection?.wait?.kind === 'user';
@@ -420,6 +428,7 @@ const MessageList: React.FC<MessageListProps> = ({ timeline, loading = false, la
           <React.Fragment key={turn.id}>
             {turn.parts.map((part) => {
               if (part.kind === 'block') {
+                if (suppressedBlockIds?.has(part.blockId)) return null;
                 const block = blocksById.get(part.blockId);
                 return block
                   ? <ProjectedBlock key={`block:${block.id}`} block={block} language={language} />

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import type {
   AgentComposerProjectionV1,
   AgentTimelineResult,
@@ -9,8 +9,8 @@ import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
 import {
+  findCanonicalPendingInteractionBlockId,
   findPendingComposerDecisionFromProjection,
-  type AgentComposerPendingDecision,
 } from '../../components/agent-panel/pendingDecision';
 import DeepCodeTimeline from './DeepCodeTimeline';
 import PrivateAnalysisViewer from './PrivateAnalysisViewer';
@@ -71,6 +71,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
   const resolvingIntervention = useAgentSessionStore((s) => s.resolvingIntervention);
@@ -84,25 +85,18 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const resolveUserIntervention = useAgentSessionStore((s) => s.resolveUserIntervention);
-  const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
-  const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
   const [analysisOpen, setAnalysisOpen] = useState(false);
-  const sessionRunning = Boolean(
-    timeline.runProjection
-    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
-      timeline.runProjection.status
-    )
-  );
+  const activeComposerRun = composerProjection?.activeRun;
+  const sessionRunning = Boolean(activeComposerRun);
   const waitingForUser = timeline.runProjection?.status === 'waitingUser'
     || timeline.runProjection?.wait?.kind === 'user';
   const cancellableRun = Boolean(
-    !forceHome
-    && timeline.runProjection
-    && ['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
-      timeline.runProjection.status
-    )
+    !forceHome && activeComposerRun?.status === 'active'
+  );
+  const cancellationPending = Boolean(
+    session?.id && cancellingSessionIds.includes(session.id)
   );
 
   useEffect(() => {
@@ -127,29 +121,20 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       resolvingPermission,
       resolvingIntervention,
     });
-  const pendingDecisionKey = pendingDecisionIdentity(pendingDecision);
-  const pendingDecisionTypewriterActive = Boolean(
-    pendingDecision?.blockId && timelineTypewriterBlockIds.includes(pendingDecision.blockId)
-  );
-  useEffect(() => {
-    if (!pendingDecisionKey) {
-      setRevealedPendingDecisionKey(null);
-      return;
-    }
-    if (!pendingDecisionTypewriterActive) {
-      setRevealedPendingDecisionKey(pendingDecisionKey);
-    }
-  }, [pendingDecisionKey, pendingDecisionTypewriterActive]);
-  const decisionReadyForComposer = Boolean(
-    pendingDecisionKey &&
-    revealedPendingDecisionKey === pendingDecisionKey &&
-    !pendingDecisionTypewriterActive
+  const pendingInteractionBlockId = pendingDecision?.kind === 'userIntervention'
+    ? findCanonicalPendingInteractionBlockId(timeline)
+    : null;
+  const suppressedBlockIds = useMemo(
+    () => pendingInteractionBlockId
+      ? new Set([pendingInteractionBlockId])
+      : undefined,
+    [pendingInteractionBlockId]
   );
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
-  const composerPendingDecision = decisionReadyForComposer && !pendingDecisionResolving && pendingDecision?.kind !== 'permission'
+  const composerPendingDecision = pendingDecision?.kind !== 'permission'
     ? pendingDecision
     : null;
-  const pendingPermissionRequest = decisionReadyForComposer && pendingDecision?.kind === 'permission'
+  const pendingPermissionRequest = pendingDecision?.kind === 'permission'
     ? pendingDecision.request
     : null;
   const showHome = forceHome || (
@@ -176,6 +161,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       canCancelCurrentRun={Boolean(
         session?.id && cancellableRun
       )}
+      cancellationPending={cancellationPending}
       onSend={async (content) => {
         requestFollowLatest();
         if (onDraftSend) return onDraftSend(content, selectedProfileId);
@@ -201,7 +187,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
             .catch(() => undefined);
         }
       }}
-      onStop={() => void cancelCurrentRun()}
+      onStop={() => void cancelCurrentRun(activeComposerRun?.runId)}
       onAddAttachment={addAttachment}
       onRemoveAttachment={removeAttachment}
       footerControls={(
@@ -316,9 +302,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           language={language}
           followLatestSignal={followLatestSignal}
           scrollWatchElement={bottomChromeElement}
-          onTypewriterBlocksChange={(blockIds) => {
-            setTimelineTypewriterBlockIds(blockIds);
-          }}
+          suppressedBlockIds={suppressedBlockIds}
           onPlanResolve={(runId, planId, decision, guidance) => {
             requestFollowLatest();
             void resolvePlan(runId, planId, decision, guidance);
@@ -378,16 +362,5 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     </div>
   );
 };
-
-function pendingDecisionIdentity(decision: AgentComposerPendingDecision | null): string | null {
-  if (!decision) return null;
-  if (decision.kind === 'plan') {
-    return `${decision.kind}:${decision.runId}:${decision.planId}`;
-  }
-  if (decision.kind === 'userIntervention') {
-    return `${decision.kind}:${decision.interactionId}:${decision.interactionRevision}:${decision.candidateSetDigest}`;
-  }
-  return `${decision.kind}:${decision.requestId}`;
-}
 
 export default DeepCodeAgentPanel;

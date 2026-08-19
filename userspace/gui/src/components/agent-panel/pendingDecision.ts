@@ -50,6 +50,38 @@ export function findPendingComposerDecisionFromProjection(input: {
   return withResolvingState(active, input);
 }
 
+export function findCanonicalPendingInteractionBlockId(
+  timeline: AgentTimelineResult
+): string | null {
+  const pending = timeline.interactionProjection?.pending;
+  if (
+    !pending?.blockId
+    || (pending.kind !== 'plan' && pending.kind !== 'userIntervention')
+  ) {
+    return null;
+  }
+  const matches = timeline.turns.flatMap((turn) =>
+    turn.blocks.filter((block) => block.id === pending.blockId)
+  );
+  if (matches.length !== 1) return null;
+  const block = matches[0];
+  const interaction = block.interaction;
+  if (
+    !interaction
+    || block.kind !== pending.kind
+    || interaction.kind !== pending.kind
+    || interaction.interactionId !== pending.interactionId
+    || interaction.interactionRevision !== pending.interactionRevision
+    || interaction.targetId !== pending.targetId
+    || interaction.runId !== pending.runId
+    || (interaction.state !== 'open' && interaction.state !== 'submitting')
+    || block.confirmable !== true
+  ) {
+    return null;
+  }
+  return block.id;
+}
+
 function withResolvingState(
   active: AgentTimelinePendingInteraction,
   input: {

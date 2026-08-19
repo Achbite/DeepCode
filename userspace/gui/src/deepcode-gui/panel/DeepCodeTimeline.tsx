@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentTimelineAttachment,
   AgentTimelineBlock,
@@ -38,7 +38,7 @@ interface DeepCodeTimelineProps {
   language: UiLanguage;
   followLatestSignal?: number;
   scrollWatchElement?: HTMLElement | null;
-  onTypewriterBlocksChange?: (blockIds: string[]) => void;
+  suppressedBlockIds?: ReadonlySet<string>;
   onPlanResolve?: (
     runId: string,
     planId: string,
@@ -56,7 +56,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   language,
   followLatestSignal = 0,
   scrollWatchElement = null,
-  onTypewriterBlocksChange,
+  suppressedBlockIds,
   onPlanResolve,
 }) => {
   const view = timeline;
@@ -118,14 +118,6 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     return undefined;
   }, [animatingBlockIds, loading, playbackVisibleBlockIds, viewWithActive]);
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
-  useEffect(() => {
-    onTypewriterBlocksChange?.([...animatingBlockIds]);
-  }, [animatingBlockIds, onTypewriterBlocksChange]);
-
-  useEffect(() => () => {
-    onTypewriterBlocksChange?.([]);
-  }, [onTypewriterBlocksChange]);
-
   const setFollowMode = useCallback((mode: TimelineFollowMode) => {
     followModeRef.current = mode;
     if (mode === 'following') {
@@ -192,8 +184,23 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
   const scrollToTimelineEndIfFollowing = useCallback(() => {
     if (followModeRef.current !== 'following') return;
-    scrollToTimelineEnd({ requireFollowing: true });
-  }, [scrollToTimelineEnd]);
+    if (liveScrollFrameRef.current === null) {
+      liveScrollFrameRef.current = window.requestAnimationFrame(() => {
+        liveScrollFrameRef.current = null;
+        if (followModeRef.current === 'following') {
+          scrollToTimelineEndNow();
+        }
+      });
+    }
+    if (liveScrollTimeoutRef.current === null) {
+      liveScrollTimeoutRef.current = window.setTimeout(() => {
+        liveScrollTimeoutRef.current = null;
+        if (followModeRef.current === 'following') {
+          scrollToTimelineEndNow();
+        }
+      }, 80);
+    }
+  }, [scrollToTimelineEndNow]);
 
   useEffect(() => () => {
     if (liveScrollFrameRef.current !== null) {
@@ -339,6 +346,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             playbackVisibleBlockIds={playbackVisibleBlockIds}
             playbackTextLengths={assistantPlayback.visibleLengths}
             animatingBlockIds={animatingBlockIds}
+            suppressedBlockIds={suppressedBlockIds}
             onLiveContentChange={scrollToTimelineEndIfFollowing}
             onPlanResolve={onPlanResolve}
           />
@@ -563,7 +571,7 @@ function useAssistantPlayback(
       next.set(blockId, nextIndex);
       if (nextIndex >= target.content.length) enrolledRef.current.delete(blockId);
       visibleLengthsRef.current = next;
-      setVisibleLengths(next);
+      startTransition(() => setVisibleLengths(next));
       timer = window.setTimeout(tick, bufferedTypewriterDelay('normal'));
     };
     tick();
@@ -652,11 +660,14 @@ const TurnCard: React.FC<{
   playbackVisibleBlockIds: Set<string>;
   playbackTextLengths: Map<string, number>;
   animatingBlockIds: Set<string>;
+  suppressedBlockIds?: ReadonlySet<string>;
   onLiveContentChange: () => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, currentActivity, language, transportPending, showActions, playbackVisibleBlockIds, playbackTextLengths, animatingBlockIds, onLiveContentChange, onPlanResolve }) => {
+}> = ({ turn, currentActivity, language, transportPending, showActions, playbackVisibleBlockIds, playbackTextLengths, animatingBlockIds, suppressedBlockIds, onLiveContentChange, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
-  const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
+  const visibleBlocks = turn.blocks.filter((block) =>
+    isVisibleTimelineBlock(block) && !suppressedBlockIds?.has(block.id)
+  );
   const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
   const blocksById = new Map(blocks.map((block) => [block.id, block]));
   const workSegmentsById = new Map(

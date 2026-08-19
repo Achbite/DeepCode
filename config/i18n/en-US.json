@@ -595,6 +595,7 @@
     "agent.composer.stopTitle": "Stop current Agent run",
     "agent.composer.sendTitle": "Send message",
     "agent.composer.stop": "Stop",
+    "agent.composer.stopping": "Stopping…",
     "agent.composer.send": "Send",
     "agent.profile.selector": "Model used by this session",
     "agent.profile.loading": "Loading model profiles",

@@ -9,7 +9,10 @@ import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
-import { findPendingComposerDecisionFromProjection } from './pendingDecision';
+import {
+  findCanonicalPendingInteractionBlockId,
+  findPendingComposerDecisionFromProjection,
+} from './pendingDecision';
 import { timelineOrEmpty } from '../../utils/uiTimelineProjection';
 import './agentPanel.css';
 
@@ -67,8 +70,14 @@ const AgentPanel: React.FC = () => {
     resolvingIntervention,
   });
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
-  const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
+  const composerPendingDecision = pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
+  const pendingInteractionBlockId = pendingDecision?.kind === 'userIntervention'
+    ? findCanonicalPendingInteractionBlockId(timelineProjection)
+    : null;
+  const suppressedBlockIds = pendingInteractionBlockId
+    ? new Set([pendingInteractionBlockId])
+    : undefined;
   const agentBusy = loading
     || projectedRunActive
     || activeSessionMutation
@@ -119,6 +128,7 @@ const AgentPanel: React.FC = () => {
         timeline={timelineProjection}
         loading={agentBusy && !waitingForUser}
         language={language}
+        suppressedBlockIds={suppressedBlockIds}
       />
 
       {pendingPermissionRequest && (
@@ -159,7 +169,10 @@ const AgentPanel: React.FC = () => {
         canCancelCurrentRun={Boolean(
           session?.id && cancellableRun
         )}
-        onStop={() => void cancelCurrentRun()}
+        cancellationPending={Boolean(
+          session?.id && cancellingSessionIds.includes(session.id)
+        )}
+        onStop={() => void cancelCurrentRun(timeline?.runProjection?.runId)}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
         pendingDecision={composerPendingDecision}

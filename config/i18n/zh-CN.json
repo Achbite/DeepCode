@@ -595,6 +595,7 @@
     "agent.composer.stopTitle": "停止当前 Agent 运行",
     "agent.composer.sendTitle": "发送消息",
     "agent.composer.stop": "停止",
+    "agent.composer.stopping": "正在停止…",
     "agent.composer.send": "发送",
     "agent.profile.selector": "本会话使用的模型",
     "agent.profile.loading": "正在加载模型配置",
