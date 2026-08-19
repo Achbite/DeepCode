@@ -7,6 +7,14 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PRODUCT_VERSION="$(
+  awk -F '"' '/^[[:space:]]*"version"[[:space:]]*:/ { print $4; exit }' "$ROOT_DIR/package.json"
+)"
+if [[ ! "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf '==[macos-package][error]== invalid canonical product version in %s/package.json: %s\n' \
+    "$ROOT_DIR" "${PRODUCT_VERSION:-<missing>}" >&2
+  exit 2
+fi
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 BUILD_COMMIT="${DEEPCODE_BUILD_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')}"
 BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1105,9 +1113,9 @@ write_app_info_plist() {
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>$PRODUCT_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0</string>
+  <string>$PRODUCT_VERSION</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSHighResolutionCapable</key>
