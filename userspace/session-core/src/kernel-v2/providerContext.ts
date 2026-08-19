@@ -9,10 +9,10 @@ import {
 } from '../cache/canonicalizer.js';
 import type {
   SessionContextMemoryEntryV2,
-  SessionContextMemoryV2,
+  SessionContextMemoryV3,
 } from './sessionMemory.js';
 import {
-  SESSION_CONTEXT_MEMORY_V2_SCHEMA,
+  SESSION_CONTEXT_MEMORY_V3_SCHEMA,
 } from './sessionMemory.js';
 import type {
   SessionProviderContextAssemblyV2,
@@ -65,7 +65,7 @@ type ProviderConversationMemoryItemV2 =
     }
   | {
       kind: 'currentRunUserInput';
-      input: Pick<SessionUserInputRecordV2, 'text'>;
+      input: Pick<SessionUserInputRecordV2, 'inputId' | 'text'>;
     };
 
 export function buildSessionProviderContextV2(
@@ -371,13 +371,9 @@ export function providerWireToolDefinitionsV2(
       description: tool.description,
       inputSchema: tool.inputSchema,
     })),
-    sessionPlanProposalToolV5(
-      callableTools.map((tool) => tool.toolId)
-    ),
+    sessionPlanProposalToolV5(callableTools),
     sessionPlanActionCompleteToolV2(),
-    sessionInterventionProposalToolV1(
-      callableTools.map((tool) => tool.toolId)
-    ),
+    sessionInterventionProposalToolV1(callableTools),
   ];
 }
 
@@ -403,8 +399,10 @@ export function sessionProviderTurnFrameV1(
     | 'currentInput'
     | 'target'
     | 'guidance'
+    | 'runId'
     | 'controlEpoch'
     | 'plan'
+    | 'kernelFacts'
   >
 ): unknown {
   return {
@@ -423,6 +421,18 @@ export function sessionProviderTurnFrameV1(
       ...(input.plan
         ? { planRevision: input.plan.planRevision }
         : {}),
+    },
+    planEvidenceAuthority: {
+      snapshotHighWater: input.kernelFacts.snapshotHighWater,
+      omittedCount: input.kernelFacts.omittedCount,
+      factIds: input.kernelFacts.facts
+        .filter((fact) =>
+          fact.lineage.runId === input.runId
+          && fact.lineage.controlEpoch === input.controlEpoch
+        )
+        .map((fact) => fact.factId)
+        .sort(),
+      policy: 'Historical messages and facts are semantic reference only. A mutation Plan may cite only the exact current canonical fact IDs listed here. Re-read relevant resources when current evidence is missing; never guess or substitute an identity.',
     },
     guidance: [...input.guidance],
     responseLanguage: {
@@ -603,11 +613,11 @@ function providerPlanActionSummaryV2(
 }
 
 function memoryWithSelectedEntries(
-  memory: SessionContextMemoryV2,
+  memory: SessionContextMemoryV3,
   selected: readonly SessionContextMemoryEntryV2[]
-): SessionContextMemoryV2 {
+): SessionContextMemoryV3 {
   const withoutDigest = {
-    schemaVersion: SESSION_CONTEXT_MEMORY_V2_SCHEMA,
+    schemaVersion: SESSION_CONTEXT_MEMORY_V3_SCHEMA,
     sessionId: memory.sessionId,
     sourceEventVersion: memory.sourceEventVersion,
     sourceEventCount: memory.sourceEventCount,
@@ -618,6 +628,12 @@ function memoryWithSelectedEntries(
     truncated:
       memory.truncated || selected.length < memory.entries.length,
     entries: selected.map(cloneJson),
+    historicalReadCandidateCount:
+      memory.historicalReadCandidateCount,
+    omittedHistoricalReadCandidateCount:
+      memory.omittedHistoricalReadCandidateCount,
+    historicalReadCandidates:
+      memory.historicalReadCandidates.map(cloneJson),
     ...(memory.providerConversationHead
       ? {
           providerConversationHead: cloneJson(
@@ -647,6 +663,7 @@ function providerConversationMemoryItems(
       .map((candidate) => ({
         kind: 'currentRunUserInput' as const,
         input: {
+          inputId: candidate.inputId,
           text: candidate.text,
         },
       })),
@@ -654,7 +671,7 @@ function providerConversationMemoryItems(
 }
 
 function conversationMemoryWithSelectedItems(
-  priorSessionMemory: SessionContextMemoryV2,
+  priorSessionMemory: SessionContextMemoryV3,
   previouslyOmittedRunInputs: number,
   allItems: readonly ProviderConversationMemoryItemV2[],
   selectedItems: readonly ProviderConversationMemoryItemV2[]
@@ -663,12 +680,18 @@ function conversationMemoryWithSelectedItems(
     typeof PROVIDER_TURN_CONVERSATION_MEMORY_V3_SCHEMA;
   currentRunUserInputs: {
     omittedCount: number;
-    entries: Array<{ text: string }>;
+    entries: Array<{ inputId: string; text: string }>;
+  };
+  referencePolicy: {
+    historicalMessages: 'semanticReference';
+    mutationPlanEvidence: 'currentCanonicalFactsOnly';
   };
   priorSessionMemory: {
     omittedEntryCount: number;
     truncated: boolean;
     entries: Array<{
+      sourceEventId: string;
+      sourceRunId?: string;
       role: SessionContextMemoryEntryV2['role'];
       text: string;
       attachments: SessionContextMemoryEntryV2['attachments'];
@@ -698,6 +721,10 @@ function conversationMemoryWithSelectedItems(
   return {
     schemaVersion:
       PROVIDER_TURN_CONVERSATION_MEMORY_V3_SCHEMA,
+    referencePolicy: {
+      historicalMessages: 'semanticReference',
+      mutationPlanEvidence: 'currentCanonicalFactsOnly',
+    },
     currentRunUserInputs: {
       omittedCount:
         previouslyOmittedRunInputs
@@ -717,6 +744,10 @@ function conversationMemoryWithSelectedItems(
         || selectedPriorEntries.length
           < priorSessionMemory.entries.length,
       entries: selectedPriorEntries.map((entry) => ({
+        sourceEventId: entry.sourceEventId,
+        ...(entry.sourceRunId
+          ? { sourceRunId: entry.sourceRunId }
+          : {}),
         role: entry.role,
         text: entry.text,
         attachments: cloneJson(entry.attachments),

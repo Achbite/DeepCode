@@ -34,13 +34,13 @@ import {
   sameSessionFinalAnswerAuthorityV3,
 } from './review.js';
 import type {
-  SessionContextMemoryV2,
+  SessionContextMemoryV3,
 } from './sessionMemory.js';
 
 export interface SessionKernelHostRunnerOpenV2 {
   workspaceBindingRef: string;
   initialInput: SessionUserInputRecordV2;
-  sessionMemory: SessionContextMemoryV2;
+  sessionMemory: SessionContextMemoryV3;
   providerProfile: SessionProviderProfileBootstrapV2;
   signal?: AbortSignal;
 }
@@ -460,6 +460,12 @@ export class SessionKernelHostRunnerV2 {
       return { kind: 'interrupted', result };
     }
     if (result.kind === 'rejected') {
+      return {
+        kind: 'replanRequired',
+        guidance: [result.guidance],
+      };
+    }
+    if (result.kind === 'sessionControlRejected') {
       return {
         kind: 'replanRequired',
         guidance: [result.guidance],

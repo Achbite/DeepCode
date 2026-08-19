@@ -6347,8 +6347,7 @@ function defaultCollapsed(kind: string, status: AgentTimelineStatus): boolean {
   return status === 'completed'
     && kind !== 'assistant_msg'
     && kind !== 'user_msg'
-    && kind !== 'plan_card'
-    && kind !== 'review_summary';
+    && kind !== 'plan_card';
 }
 
 function stripUndefinedProjectionFields(value: AgentTimelineResult): void {

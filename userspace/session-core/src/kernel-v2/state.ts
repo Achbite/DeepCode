@@ -11,6 +11,7 @@ import {
 } from '../cache/canonicalizer.js';
 import {
   createSessionKernelLineageStateV2,
+  recordSessionCapabilityLeaseV2,
   registerSessionOperationPlanActionLineageV2,
   registerSessionPlanActionLineageV2,
   type SessionKernelLineageStateV2,
@@ -26,8 +27,8 @@ import {
   validateAgentInputAttachmentsV3,
 } from './inputAttachmentsV2.js';
 import {
-  validateSessionContextMemoryV2,
-  type SessionContextMemoryV2,
+  validateSessionContextMemoryV3,
+  type SessionContextMemoryV3,
 } from './sessionMemory.js';
 import {
   abortSessionProviderToolCallQueueV2,
@@ -35,6 +36,11 @@ import {
   validateSessionProviderToolCallQueueV2,
   type SessionProviderToolCallQueueV2,
 } from './providerToolCallQueue.js';
+import {
+  settlementMatchesProviderOutcomeV2,
+  validateSessionProviderControlSettlementV2,
+} from './providerControlSettlementV2.js';
+import { utf8Prefix } from './utf8.js';
 import {
   SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
   SESSION_KERNEL_LOOP_V2_SCHEMA,
@@ -53,6 +59,7 @@ import {
   type SessionPlanDecisionV2,
   type SessionProviderTurnRecordV2,
   type SessionProviderOutcomeRecordV2,
+  type SessionProviderControlSettlementV2,
   type SessionProviderProfileBootstrapV2,
   type SessionPlanActionSettlementV2,
   type SessionReviewFactAccumulatorV2,
@@ -78,7 +85,7 @@ export interface SessionKernelLoopStateV2 {
   schemaVersion: typeof SESSION_KERNEL_LOOP_V2_SCHEMA;
   runId: string;
   workspaceBindingDigest: string;
-  sessionMemory: SessionContextMemoryV2;
+  sessionMemory: SessionContextMemoryV3;
   providerProfile: SessionProviderProfileBootstrapV2;
   controlEpoch: number;
   currentInputId: string;
@@ -107,6 +114,7 @@ export interface SessionKernelLoopStateV2 {
   providerToolCallQueue?: SessionProviderToolCallQueueV2;
   providerOutcomes: SessionProviderOutcomeRecordV2[];
   providerOutcomeHistoryOmittedCount: number;
+  pendingProviderControlSettlement?: SessionProviderControlSettlementV2;
   planActionSettlements: Record<string, SessionPlanActionSettlementV2>;
   operationPlanActionBindings: Record<
     string,
@@ -241,7 +249,7 @@ export interface SessionKernelCheckpointV2 {
  */
 export interface SessionKernelCheckpointRecoveryInputV3 {
   workspaceBindingDigest: string;
-  sessionMemory: SessionContextMemoryV2;
+  sessionMemory: SessionContextMemoryV3;
   providerProfile: SessionProviderProfileBootstrapV2;
   toolContext: ToolContextBundleV2;
 }
@@ -252,7 +260,7 @@ export interface SessionKernelInitialStateV2 {
   controlEpoch: number;
   initialInput: SessionUserInputRecordV2;
   toolContext: ToolContextBundleV2;
-  sessionMemory: SessionContextMemoryV2;
+  sessionMemory: SessionContextMemoryV3;
   providerProfile: SessionProviderProfileBootstrapV2;
 }
 
@@ -261,7 +269,7 @@ export function createSessionKernelLoopStateV2(
 ): SessionKernelLoopStateV2 {
   positiveEpoch(initial.controlEpoch);
   validateUserInput(initial.initialInput);
-  validateSessionContextMemoryV2(initial.sessionMemory);
+  validateSessionContextMemoryV3(initial.sessionMemory);
   validateProviderProfile(initial.providerProfile);
   return {
     schemaVersion: SESSION_KERNEL_LOOP_V2_SCHEMA,
@@ -304,7 +312,7 @@ export function restoreSessionKernelLoopStateV2(
   expected: {
     runId: string;
     workspaceBindingDigest: string;
-    sessionMemory: SessionContextMemoryV2;
+    sessionMemory: SessionContextMemoryV3;
     providerProfile: SessionProviderProfileBootstrapV2;
   }
 ): SessionKernelLoopStateV2 {
@@ -330,7 +338,7 @@ export function restoreSessionKernelLoopStateV2(
     );
   }
   positiveEpoch(state.controlEpoch);
-  validateSessionContextMemoryV2(state.sessionMemory);
+  validateSessionContextMemoryV3(state.sessionMemory);
   validateProviderProfile(state.providerProfile);
   validateSessionToolContextStateV2(state.toolContext);
   state.inputs.forEach(validateUserInput);
@@ -347,10 +355,13 @@ export function restoreSessionKernelLoopStateV2(
   state.inputHistoryOmittedCount += boundedInputs.omittedCount;
   if (state.plan) {
     validatePlan(state.plan);
-    if (state.plan.inputId !== state.currentInputId) {
+    if (
+      state.plan.inputId !== state.currentInputId
+      || state.plan.controlEpoch !== state.controlEpoch
+    ) {
       throw new SessionKernelStateError(
         'session_kernel_checkpoint_plan_input_mismatch',
-        'Checkpoint Plan does not belong to the current user input.'
+        'Checkpoint Plan does not belong to the current user input and control epoch.'
       );
     }
   }
@@ -440,6 +451,7 @@ export function restoreSessionKernelLoopStateV2(
   state.providerOutcomes = boundedOutcomes.records;
   state.providerOutcomeHistoryOmittedCount +=
     boundedOutcomes.omittedCount;
+  validatePendingProviderControlSettlementV2(state);
   state.planActionSettlements ??= {};
   if (state.providerTurn) {
     validateProviderTurnResponse(
@@ -681,6 +693,12 @@ export function recordSessionPlanV2(
       'The persisted Plan does not belong to the current user input.'
     );
   }
+  if (plan.controlEpoch !== state.controlEpoch) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_epoch_mismatch',
+      'The persisted Plan does not belong to the current control epoch.'
+    );
+  }
   if (state.plan && state.plan.planRevision !== plan.planRevision) {
     const expectedPredecessor = {
       planRevision: state.plan.planRevision,
@@ -768,6 +786,107 @@ export function recordSessionPlanV2(
     kind: 'plan',
     planRevision: plan.planRevision,
   };
+  return next;
+}
+
+export function recordSelectedInterventionCandidatePreviewsV4(
+  state: SessionKernelLoopStateV2
+): SessionKernelLoopStateV2 {
+  const intervention = state.userIntervention;
+  const decision = state.userInterventionDecision;
+  if (!intervention || decision?.decision !== 'select' || !decision.optionId) {
+    throw new SessionKernelStateError(
+      'session_kernel_intervention_candidate_selection_missing',
+      'Candidate preview activation requires the exact durable intervention selection.'
+    );
+  }
+  const selectedOption = intervention.options.find(
+    (option) => option.optionId === decision.optionId
+  );
+  const candidatePlan = selectedOption?.candidatePlan;
+  if (
+    selectedOption?.kind !== 'executable'
+    || !candidatePlan
+    || state.plan?.planRevision !== candidatePlan.planRevision
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_intervention_candidate_plan_mismatch',
+      'Candidate previews must bind the exact selected executable Plan revision.'
+    );
+  }
+  validateUserInterventionStateV4(state);
+  const expectedPreviews: Record<string, CapabilityScopePreviewRecordV2> = {};
+  for (const candidateAction of selectedOption.actions) {
+    if (expectedPreviews[candidateAction.operationId]) {
+      throw new SessionKernelStateError(
+        'session_kernel_intervention_candidate_preview_duplicate',
+        'A selected intervention candidate contains duplicate operation previews.'
+      );
+    }
+    expectedPreviews[candidateAction.operationId] = cloneJson(
+      candidateAction.preview
+    );
+  }
+  if (Object.keys(expectedPreviews).length !== candidatePlan.actions.length) {
+    throw new SessionKernelStateError(
+      'session_kernel_intervention_candidate_preview_incomplete',
+      'Every selected intervention PlanAction requires its exact candidate preview.'
+    );
+  }
+  if (
+    Object.keys(state.previews).length > 0
+    && canonicalJson(state.previews) !== canonicalJson(expectedPreviews)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_intervention_candidate_preview_conflict',
+      'The active Plan already contains different canonical scope previews.'
+    );
+  }
+  const next = cloneSessionKernelLoopStateV2(state);
+  next.previews = expectedPreviews;
+  for (const candidateAction of selectedOption.actions) {
+    const matchingFacts = Object.values(next.factsById).filter((fact) => {
+      const details = stateRecord(fact.details);
+      const identity = stateRecord(details?.identity);
+      const lease = fact.lineage.capabilityLease;
+      return fact.domain === 'authorization'
+        && fact.factKind === 'capabilityIssued'
+        && fact.lineage.runId === next.runId
+        && fact.lineage.controlEpoch === next.controlEpoch
+        && fact.lineage.operationId === candidateAction.operationId
+        && fact.lineage.planActionIds.length === 1
+        && fact.lineage.planActionIds[0] === candidateAction.planActionId
+        && lease !== undefined
+        && identity?.runId === next.runId
+        && identity?.controlEpoch === next.controlEpoch
+        && identity?.planRevision === candidatePlan.planRevision
+        && identity?.planActionId === candidateAction.planActionId
+        && identity?.operationId === candidateAction.operationId
+        && identity?.previewId === candidateAction.preview.previewId
+        && identity?.leaseId === lease.leaseId
+        && identity?.leaseVersion === lease.version
+        && details?.toolId === candidateAction.toolId
+        && details?.scopeDigest === candidateAction.preview.scopeDigest
+        && lease.scopeDigest === candidateAction.preview.scopeDigest
+        && details?.authorizationDigest
+          === candidateAction.preview.authorizationDigest
+        && canonicalJson(details?.contextRef)
+          === canonicalJson(candidateAction.preview.contextRef);
+    });
+    if (matchingFacts.length !== 1) {
+      throw new SessionKernelStateError(
+        'session_kernel_intervention_candidate_lease_fact_invalid',
+        'Each selected intervention PlanAction requires one exact Kernel-issued capability lease fact.'
+      );
+    }
+    const lease = matchingFacts[0]!.lineage.capabilityLease!;
+    next.lineage = recordSessionCapabilityLeaseV2(next.lineage, {
+      operationId: candidateAction.operationId,
+      planActionId: candidateAction.planActionId,
+      lease,
+    });
+  }
+  currentSessionPlanScopePreviewsV2(next, candidatePlan);
   return next;
 }
 
@@ -946,6 +1065,7 @@ export function recordSessionUserInputV2(
   next.interventionResearch = undefined;
   next.userIntervention = undefined;
   next.userInterventionDecision = undefined;
+  next.pendingProviderControlSettlement = undefined;
   next.projectedPlanRevision = undefined;
   next.projectedPlanDecisionKey = undefined;
   next.previews = {};
@@ -989,6 +1109,98 @@ export function recordSessionProviderOutcomeV2(
   state.providerOutcomes = bounded.records;
   state.providerOutcomeHistoryOmittedCount +=
     bounded.omittedCount;
+}
+
+export function recordSessionProviderControlSettlementV2(
+  state: SessionKernelLoopStateV2,
+  settlement: SessionProviderControlSettlementV2
+): void {
+  validateSessionProviderControlSettlementV2(settlement, {
+    runId: state.runId,
+    inputId: state.currentInputId,
+    controlEpoch: state.controlEpoch,
+  });
+  const predecessor = state.providerOutcomes.at(-1);
+  if (!settlementMatchesProviderOutcomeV2(settlement, predecessor)) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_control_settlement_predecessor_invalid',
+      'Provider control settlement does not bind the exact latest durable control outcome.'
+    );
+  }
+  if (
+    state.pendingProviderControlSettlement
+    && canonicalJson(state.pendingProviderControlSettlement)
+      !== canonicalJson(settlement)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_control_settlement_conflict',
+      'A different Provider control settlement is already pending.'
+    );
+  }
+  state.pendingProviderControlSettlement = cloneJson(settlement);
+}
+
+export function consumeSessionProviderControlSettlementV2(
+  state: SessionKernelLoopStateV2,
+  providerTurnId: string,
+  targetKind: SessionProviderTurnRecordV2['target']['kind']
+): void {
+  const settlement = state.pendingProviderControlSettlement;
+  if (!settlement) return;
+  if (
+    settlement.nextTargetKind === 'none'
+    || settlement.nextTargetKind !== targetKind
+    || providerTurnId === settlement.predecessorProviderTurnId
+    || state.providerTurn?.providerTurnId !== providerTurnId
+    || state.providerTurn.target.kind !== targetKind
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_control_settlement_target_invalid',
+      'Provider turn does not consume the exact pending control settlement target.'
+    );
+  }
+  state.pendingProviderControlSettlement = undefined;
+}
+
+function validatePendingProviderControlSettlementV2(
+  state: SessionKernelLoopStateV2
+): void {
+  const settlement = state.pendingProviderControlSettlement;
+  if (!settlement) return;
+  try {
+    validateSessionProviderControlSettlementV2(settlement, {
+      runId: state.runId,
+      inputId: state.currentInputId,
+      controlEpoch: state.controlEpoch,
+    });
+  } catch {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_control_settlement_invalid',
+      'Checkpoint Provider control settlement is not exact durable v2 data.'
+    );
+  }
+  const predecessor = state.providerOutcomes.at(-1);
+  if (!settlementMatchesProviderOutcomeV2(settlement, predecessor)) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_control_settlement_predecessor_invalid',
+      'Checkpoint Provider control settlement does not bind the latest durable control outcome.'
+    );
+  }
+  const turn = state.providerTurn;
+  if (
+    turn
+    && turn.providerTurnId !== settlement.predecessorProviderTurnId
+    && (
+      settlement.nextTargetKind === 'none'
+      || turn.target.kind !== settlement.nextTargetKind
+      || turn.controlEpoch !== state.controlEpoch
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_control_settlement_target_invalid',
+      'Checkpoint Provider turn conflicts with its pending control settlement target.'
+    );
+  }
 }
 
 export function recordSessionTerminalAnswerCandidateV1(
@@ -1674,12 +1886,17 @@ export function cloneSessionKernelLoopStateV2(
 function validatePlan(plan: SessionNaturalLanguagePlanV2): void {
   requiredIdentity(plan.runId, 'runId');
   requiredIdentity(plan.inputId, 'inputId');
+  positiveEpoch(plan.controlEpoch);
   requiredIdentity(plan.planRevision, 'planRevision');
   requiredText(plan.title, 'plan.title');
   requiredText(plan.objective, 'plan.objective');
   requiredText(plan.narrative, 'plan.narrative');
   requiredText(plan.recordedAt, 'plan.recordedAt');
-  validatePlanEvidenceV4(plan.evidence);
+  validatePlanEvidenceV4(
+    plan.evidence,
+    plan.runId,
+    plan.controlEpoch
+  );
   if (plan.predecessorPlanRef) {
     requiredIdentity(
       plan.predecessorPlanRef.planRevision,
@@ -1771,16 +1988,20 @@ function validatePlan(plan: SessionNaturalLanguagePlanV2): void {
 }
 
 function validatePlanEvidenceV4(
-  evidence: SessionNaturalLanguagePlanV2['evidence']
+  evidence: SessionNaturalLanguagePlanV2['evidence'],
+  runId: string,
+  controlEpoch: number
 ): void {
   if (
     !evidence
     || !Array.isArray(evidence.kernelFactRefs)
     || !Array.isArray(evidence.readResources)
+    || !Array.isArray(evidence.historicalRebinds)
     || !Array.isArray(evidence.blockingUnknowns)
     || !Array.isArray(evidence.nonBlockingUnknowns)
     || evidence.kernelFactRefs.length > 512
     || evidence.readResources.length > 512
+    || evidence.historicalRebinds.length > 512
     || evidence.blockingUnknowns.length > 128
     || evidence.nonBlockingUnknowns.length > 128
     || new Set(evidence.kernelFactRefs).size
@@ -1815,6 +2036,109 @@ function validatePlanEvidenceV4(
     resource.factRefs.forEach((factRef) =>
       requiredIdentity(factRef, 'plan.evidence.resourceFactRef')
     );
+  });
+  const rebindIds = new Set<string>();
+  evidence.historicalRebinds.forEach((rebind) => {
+    requiredIdentity(rebind.rebindId, 'plan.evidence.rebindId');
+    requiredIdentity(
+      rebind.sourceEventId,
+      'plan.evidence.rebind.sourceEventId'
+    );
+    requiredDigestV2(
+      rebind.sourceEventDigest,
+      'plan.evidence.rebind.sourceEventDigest'
+    );
+    positiveEpoch(rebind.sourceEventVersion);
+    requiredIdentity(
+      rebind.sourceRunId,
+      'plan.evidence.rebind.sourceRunId'
+    );
+    requiredIdentity(
+      rebind.sourceFactId,
+      'plan.evidence.rebind.sourceFactId'
+    );
+    positiveEpoch(rebind.sourceControlEpoch);
+    requiredIdentity(
+      rebind.sourceOperationId,
+      'plan.evidence.rebind.sourceOperationId'
+    );
+    requiredIdentity(
+      rebind.sourceToolId,
+      'plan.evidence.rebind.sourceToolId'
+    );
+    requiredDigestV2(
+      rebind.subjectDigest,
+      'plan.evidence.rebind.subjectDigest'
+    );
+    requiredDigestV2(
+      rebind.sourceEvidenceDigest,
+      'plan.evidence.rebind.sourceEvidenceDigest'
+    );
+    requiredDigestV2(
+      rebind.sourceCandidateDigest,
+      'plan.evidence.rebind.sourceCandidateDigest'
+    );
+    requiredIdentity(
+      rebind.currentRunId,
+      'plan.evidence.rebind.currentRunId'
+    );
+    positiveEpoch(rebind.currentControlEpoch);
+    requiredIdentity(
+      rebind.currentFactRef,
+      'plan.evidence.rebind.currentFactRef'
+    );
+    requiredDigestV2(
+      rebind.currentEvidenceDigest,
+      'plan.evidence.rebind.currentEvidenceDigest'
+    );
+    requiredIdentity(
+      rebind.resourceRef,
+      'plan.evidence.rebind.resourceRef'
+    );
+    const resource = evidence.readResources.find((candidate) =>
+      candidate.resourceRef === rebind.resourceRef
+    );
+    const withoutId = {
+      sourceEventId: rebind.sourceEventId,
+      sourceEventDigest: rebind.sourceEventDigest,
+      sourceEventVersion: rebind.sourceEventVersion,
+      sourceRunId: rebind.sourceRunId,
+      sourceFactId: rebind.sourceFactId,
+      sourceControlEpoch: rebind.sourceControlEpoch,
+      sourceOperationId: rebind.sourceOperationId,
+      sourceToolId: rebind.sourceToolId,
+      subjectDigest: rebind.subjectDigest,
+      sourceEvidenceDigest: rebind.sourceEvidenceDigest,
+      sourceCandidateDigest: rebind.sourceCandidateDigest,
+      currentRunId: rebind.currentRunId,
+      currentControlEpoch: rebind.currentControlEpoch,
+      currentFactRef: rebind.currentFactRef,
+      currentEvidenceDigest: rebind.currentEvidenceDigest,
+      resourceRef: rebind.resourceRef,
+      contentRelation: rebind.contentRelation,
+    };
+    const expectedId = `historical-rebind-${sha256Hash(
+      canonicalJson(withoutId)
+    ).slice('sha256:'.length)}`;
+    if (
+      !rebindIds.add(rebind.rebindId)
+      || rebind.rebindId !== expectedId
+      || rebind.sourceRunId === runId
+      || rebind.currentRunId !== runId
+      || rebind.currentControlEpoch !== controlEpoch
+      || (
+        rebind.contentRelation !== 'sameDigest'
+        && rebind.contentRelation !== 'changedDigest'
+      )
+      || !resource
+      || resource.digest !== rebind.currentEvidenceDigest
+      || !resource.factRefs.includes(rebind.currentFactRef)
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_plan_evidence_rebind_invalid',
+        'Historical evidence rebinds must bind one verified source receipt to the exact current read evidence.'
+      );
+    }
   });
   const unknownIds = new Set<string>();
   for (const unknown of [
@@ -2211,7 +2535,13 @@ function validateUserInterventionStateV4(
       )
       .map((action) => action.manifest.planActionId)
   );
-  if (affectedActionIds.some((actionId) => !currentUnsettled.has(actionId))) {
+  // After selection, affectedPlanActionIds intentionally name the immutable
+  // predecessor suffix recorded by the card.  The selected candidate Plan is
+  // instead bound by its predecessor digest and candidate-set decision above.
+  if (
+    !selectedCandidatePlan
+    && affectedActionIds.some((actionId) => !currentUnsettled.has(actionId))
+  ) {
     throw invalidInterventionStateV4(
       'The intervention card references a settled or non-current action.'
     );
@@ -2795,6 +3125,7 @@ function validateProviderTurnResponse(
   }
   const native = completion.nativeCompletion;
   const settledSessionControl = outcome?.outputKind === 'plan'
+    || outcome?.outputKind === 'planEvidenceRefresh'
     || outcome?.outputKind === 'planActionComplete'
     || outcome?.outputKind === 'intervention';
   const pendingSessionControl = turn.status === 'active'
@@ -2997,7 +3328,7 @@ function validateTerminalAnswerCandidateV1(
       outcome.providerTurnId === candidate.providerTurnId
       && outcome.outputKind === 'answer'
       && outcome.recordedAt === candidate.recordedAt
-      && outcome.summary === candidate.text.slice(0, 8_192)
+      && outcome.summary === utf8Prefix(candidate.text, 8_192)
     )
   ) {
     throw new SessionKernelStateError(

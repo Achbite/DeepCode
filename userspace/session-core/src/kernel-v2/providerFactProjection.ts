@@ -113,12 +113,18 @@ function factMatcherForTarget(
   state: SessionKernelLoopStateV2,
   target: SessionProviderTurnTargetV2
 ): (fact: KernelFactProjectionV2) => boolean {
-  if (target.kind === 'planning') return () => false;
+  if (
+    target.kind === 'planning'
+    || target.kind === 'interventionResearch'
+  ) {
+    return (fact) =>
+      fact.lineage.runId === state.runId
+      && fact.lineage.controlEpoch === state.controlEpoch;
+  }
   if (target.kind === 'finalAnswer') return () => true;
   if (target.kind === 'contextRead') {
     return (fact) => fact.lineage.operationId === target.operationId;
   }
-  if (target.kind === 'interventionResearch') return () => true;
   const planActionId = target.planActionId;
   const operationIds = new Set(
     state.lineage.planActions[planActionId]?.operationIds ?? []

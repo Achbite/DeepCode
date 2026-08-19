@@ -16,6 +16,7 @@ import {
 import type {
   SessionKernelPersistencePortV2,
   SessionKernelProjectionReceiptV2,
+  SessionKernelProjectionDeliveryOptionsV2,
   SessionKernelProjectionPortV2,
   SessionKernelStoredOperationResultV2,
   SessionKernelStoredOperationResultRefV2,
@@ -48,11 +49,13 @@ import type {
   SessionPlanActionSettlementV2,
   SessionPlanDecisionV2,
   SessionProviderAuthorityBindingV3,
+  SessionProviderControlSettlementV2,
   SessionProviderOutcomeRecordV2,
   SessionProviderTerminalOrderedItemV3,
   SessionProviderTurnDispatchRecordV3,
   SessionProviderTurnDurableEvidenceV3,
   SessionProviderTurnRecordV2,
+  SessionProviderTurnOutputV2,
   SessionProviderTurnTargetV2,
   SessionProviderTurnTerminalRecordV3,
   SessionToolContextSnapshotRecordV3,
@@ -74,6 +77,7 @@ import {
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
   SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
 } from './types.js';
+import { utf8Prefix } from './utf8.js';
 import {
   decodeAgentInputAttachmentsV3,
   decodeUserAttachmentContextsV1,
@@ -101,6 +105,8 @@ import {
 } from './providerStreamV1.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
+  rehydratePersistedProviderInterventionOutputV2,
+  rehydratePersistedProviderPlanOutputV2,
 } from './SessionKernelProviderAdapterV2.js';
 import {
   validateCurrentSessionKernelProjectionEventV2,
@@ -301,6 +307,7 @@ interface SessionKernelCompactCheckpointV3 {
     interventionResearch?: SessionInterventionResearchV4;
     userIntervention?: SessionUserInterventionV4;
     userInterventionDecision?: SessionUserInterventionDecisionV4;
+    pendingProviderControlSettlement?: SessionProviderControlSettlementV2;
     pendingGuidance: string[];
     providerReservation?: SessionKernelCompactProviderReservationV3;
     providerQueue?: SessionKernelCompactProviderQueueV3;
@@ -1619,7 +1626,8 @@ implements SessionKernelPersistencePortV2 {
 export interface SessionKernelHostProjectionSinkV2 {
   publish(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2>;
 }
 
@@ -1632,7 +1640,8 @@ implements SessionKernelProjectionPortV2 {
   ) {}
 
   async project(
-    event: SessionKernelProjectionEventV2
+    event: SessionKernelProjectionEventV2,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
     await this.persistence.persistProjection(event);
     if (this.sink) {
@@ -1640,7 +1649,8 @@ implements SessionKernelProjectionPortV2 {
       try {
         receipt = await this.sink.publish(
           cloneJson(event),
-          () => this.projectionHistoryThrough(event.projectionId)
+          () => this.projectionHistoryThrough(event.projectionId),
+          options
         );
       } catch (error) {
         throw new SessionKernelProjectionDeliveryErrorV2(
@@ -1667,7 +1677,10 @@ implements SessionKernelProjectionPortV2 {
     };
   }
 
-  async flushPending(runId: string): Promise<void> {
+  async flushPending(
+    runId: string,
+    options?: SessionKernelProjectionDeliveryOptionsV2
+  ): Promise<void> {
     if (!this.sink) return;
     const pending = await this.persistence
       .loadUndeliveredProjections(runId);
@@ -1675,7 +1688,8 @@ implements SessionKernelProjectionPortV2 {
       try {
         await this.sink.publish(
           cloneJson(event),
-          () => this.projectionHistoryThrough(event.projectionId)
+          () => this.projectionHistoryThrough(event.projectionId),
+          options
         );
       } catch (error) {
         throw new SessionKernelProjectionDeliveryErrorV2(
@@ -2935,6 +2949,7 @@ function decodeCompactCheckpointV3(
       'interventionResearch',
       'userIntervention',
       'userInterventionDecision',
+      'pendingProviderControlSettlement',
       'providerReservation',
       'providerQueue',
       'runCancellation',
@@ -3129,6 +3144,13 @@ function decodeCompactCheckpointV3(
             userInterventionDecision: cloneJson(
               active.userInterventionDecision
             ) as SessionUserInterventionDecisionV4,
+          }),
+      ...(active.pendingProviderControlSettlement === undefined
+        ? {}
+        : {
+            pendingProviderControlSettlement: cloneJson(
+              active.pendingProviderControlSettlement
+            ) as SessionProviderControlSettlementV2,
           }),
       pendingGuidance: active.pendingGuidance.map((guidance) =>
         requiredText(guidance, 'pendingGuidance')
@@ -4568,6 +4590,13 @@ function compactCheckpointFromStateV3(input: {
             ),
           }
         : {}),
+      ...(state.pendingProviderControlSettlement
+        ? {
+            pendingProviderControlSettlement: cloneJson(
+              state.pendingProviderControlSettlement
+            ),
+          }
+        : {}),
       pendingGuidance: cloneJson(state.pendingGuidance),
       ...(providerReservation ? { providerReservation } : {}),
       ...(providerQueue ? { providerQueue } : {}),
@@ -4887,6 +4916,9 @@ function materializeCompactCheckpointV3(input: {
   state.userInterventionDecision = cloneJson(
     checkpoint.active.userInterventionDecision
   );
+  state.pendingProviderControlSettlement = cloneJson(
+    checkpoint.active.pendingProviderControlSettlement
+  );
   state.pendingGuidance = cloneJson(checkpoint.active.pendingGuidance);
   state.factBarriers = cloneJson(checkpoint.active.factBarriers);
   state.publicRequests = Object.fromEntries(
@@ -5050,7 +5082,7 @@ function recoverPromotedCandidateFinalAnswerV1(
       outcome.providerTurnId === candidate.providerTurnId
       && outcome.outputKind === 'answer'
       && outcome.recordedAt === candidate.recordedAt
-      && outcome.summary === candidate.text.slice(0, 8_192)
+      && outcome.summary === utf8Prefix(candidate.text, 8_192)
     )
   ) {
     throw new UnsupportedHistorySchemaError(
@@ -5250,7 +5282,7 @@ function recoverFinalAnswerFromTerminalV3(
     !outcome
     || outcome.outputKind !== 'answer'
     || outcome.recordedAt !== terminal.recordedAt
-    || outcome.summary !== text.slice(0, 8_192)
+    || outcome.summary !== utf8Prefix(text, 8_192)
     || canonicalJson(outcome.providerResult)
       !== canonicalJson(terminal.data.providerResult)
   ) {
@@ -5300,7 +5332,8 @@ function materializeProviderOutcomesV3(
   recovery: SessionKernelCheckpointRecoveryInputV3
 ): SessionProviderOutcomeRecordV2[] {
   const seen = new Set<string>();
-  return refs.map((ref) => {
+  const outcomes: SessionProviderOutcomeRecordV2[] = [];
+  for (const ref of refs) {
     if (seen.has(ref.recordId)) {
       throw new UnsupportedHistorySchemaError(
         'provider-terminal-history-duplicate'
@@ -5338,7 +5371,7 @@ function materializeProviderOutcomesV3(
       terminal.providerTurnId,
       committedCheckpoints
     );
-    return materializeProviderOutcomeV3({
+    outcomes.push(materializeProviderOutcomeV3({
       terminalRef: ref,
       evidence: {
         dispatch: evidence.dispatch,
@@ -5347,8 +5380,10 @@ function materializeProviderOutcomesV3(
       source,
       byId,
       recovery,
-    });
-  });
+      priorOutcomes: outcomes,
+    }));
+  }
+  return outcomes;
 }
 
 function providerOutcomeSourceCheckpointV3(
@@ -5388,8 +5423,16 @@ function materializeProviderOutcomeV3(input: {
   source: SessionKernelCompactCheckpointV3;
   byId: ReadonlyMap<string, SessionKernelPersistenceRecordV3>;
   recovery: SessionKernelCheckpointRecoveryInputV3;
+  priorOutcomes: readonly SessionProviderOutcomeRecordV2[];
 }): SessionProviderOutcomeRecordV2 {
-  const { terminalRef, evidence, source, byId, recovery } = input;
+  const {
+    terminalRef,
+    evidence,
+    source,
+    byId,
+    recovery,
+    priorOutcomes,
+  } = input;
   const reservation = source.active.providerReservation!;
   const dispatch = evidence.dispatch;
   const terminal = evidence.terminal;
@@ -5512,7 +5555,10 @@ function materializeProviderOutcomeV3(input: {
     providerTurnId: reservation.providerTurnId,
     purpose: reservation.purpose,
     runId: source.authority.runId,
+    controlEpoch: source.authority.controlEpoch,
     currentInput,
+    providerOutcomes: cloneJson(priorOutcomes),
+    sessionMemory: cloneJson(recovery.sessionMemory),
     providerProfile: cloneJson(recovery.providerProfile),
     ...(plan ? { plan: cloneJson(plan) } : {}),
     target: cloneJson(target),
@@ -5523,11 +5569,44 @@ function materializeProviderOutcomeV3(input: {
     terminal,
     recovery.providerProfile.providerProfileId
   );
-  const output = adaptSessionKernelProviderBackendOutputV2(
-    semanticInput,
-    backendOutput,
-    terminal.recordedAt
-  );
+  let output: SessionProviderTurnOutputV2;
+  if (backendOutput.kind === 'plan') {
+    const planRef = source.authority.planRef;
+    if (!planRef) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-outcome-plan-ref-missing'
+      );
+    }
+    output = rehydratePersistedProviderPlanOutputV2(
+      semanticInput,
+      backendOutput,
+      cloneJson(resolveRecordRefV3(
+        byId,
+        planRef,
+        'plan'
+      ).data) as SessionNaturalLanguagePlanV2,
+      terminal.recordedAt
+    );
+  } else if (backendOutput.kind === 'intervention') {
+    const persistedIntervention = source.active.userIntervention;
+    if (!persistedIntervention) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-outcome-intervention-record-missing'
+      );
+    }
+    output = rehydratePersistedProviderInterventionOutputV2(
+      semanticInput,
+      backendOutput,
+      cloneJson(persistedIntervention),
+      terminal.recordedAt
+    );
+  } else {
+    output = adaptSessionKernelProviderBackendOutputV2(
+      semanticInput,
+      backendOutput,
+      terminal.recordedAt
+    );
+  }
   if (output.kind !== 'toolIntent' && reservation.status !== 'completed') {
     throw new UnsupportedHistorySchemaError(
       'provider-outcome-reservation-status-mismatch'
@@ -5600,13 +5679,49 @@ function materializeProviderOutcomeV3(input: {
       terminal.recordedAt
     );
   }
-  const summary = providerOutputSummaryV3(output);
-  return {
+  if (output.kind === 'planEvidenceRefresh') {
+    return {
+      providerTurnId: reservation.providerTurnId,
+      outputKind: output.kind,
+      recordedAt: terminal.recordedAt,
+      summary: utf8Prefix(output.guidance, 8_192),
+      control: cloneJson(output.control),
+      refresh: cloneJson(output.refresh),
+      providerResult: cloneJson(output.providerResult),
+    };
+  }
+  const base = {
     providerTurnId: reservation.providerTurnId,
-    outputKind: output.kind,
     recordedAt: terminal.recordedAt,
-    ...(summary === undefined ? {} : { summary }),
+    ...(providerOutputSummaryV3(output) === undefined
+      ? {}
+      : { summary: providerOutputSummaryV3(output) }),
     providerResult: cloneJson(output.providerResult),
+  };
+  if (output.kind === 'plan') {
+    return {
+      ...base,
+      outputKind: output.kind,
+      control: cloneJson(output.control),
+    };
+  }
+  if (output.kind === 'planActionComplete') {
+    return {
+      ...base,
+      outputKind: output.kind,
+      control: cloneJson(output.control),
+    };
+  }
+  if (output.kind === 'intervention') {
+    return {
+      ...base,
+      outputKind: output.kind,
+      control: cloneJson(output.control),
+    };
+  }
+  return {
+    ...base,
+    outputKind: output.kind,
   };
 }
 
@@ -5821,15 +5936,22 @@ function providerOutputSummaryV3(
     { kind: 'toolIntent' }
   >
 ): string | undefined {
-  if (output.kind === 'answer') return output.text.slice(0, 8_192);
-  if (output.kind === 'noTool') return output.guidance?.slice(0, 8_192);
+  if (output.kind === 'answer') return utf8Prefix(output.text, 8_192);
+  if (output.kind === 'noTool') {
+    return output.guidance === undefined
+      ? undefined
+      : utf8Prefix(output.guidance, 8_192);
+  }
+  if (output.kind === 'planEvidenceRefresh') {
+    return utf8Prefix(output.guidance, 8_192);
+  }
   if (output.kind === 'planActionComplete') {
     return `PlanAction outcome: ${output.outcome}`;
   }
   if (output.kind === 'intervention') {
-    return output.proposal.problemSummary.slice(0, 8_192);
+    return utf8Prefix(output.proposal.problemSummary, 8_192);
   }
-  return `${output.plan.title}\n${output.plan.objective}`.slice(0, 8_192);
+  return utf8Prefix(`${output.plan.title}\n${output.plan.objective}`, 8_192);
 }
 
 function terminalFinalTextV3(
@@ -6061,7 +6183,10 @@ function materializeCompletedProviderResponseV3(
     providerTurnId: reservation.providerTurnId,
     purpose: reservation.purpose,
     runId: state.runId,
+    controlEpoch: state.controlEpoch,
     currentInput: currentSessionUserInputV2(state),
+    providerOutcomes: cloneJson(state.providerOutcomes),
+    sessionMemory: cloneJson(state.sessionMemory),
     providerProfile: cloneJson(state.providerProfile),
     ...(state.plan?.planRevision === reservation.planRevision
       ? { plan: cloneJson(state.plan) }
@@ -6083,11 +6208,38 @@ function materializeCompletedProviderResponseV3(
     terminal,
     state.providerProfile.providerProfileId
   );
-  const output = adaptSessionKernelProviderBackendOutputV2(
-    input,
-    backendOutput,
-    terminal.recordedAt
-  );
+  let output: SessionProviderTurnOutputV2;
+  if (backendOutput.kind === 'plan') {
+    if (!state.plan) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-terminal-recovery-plan-missing'
+      );
+    }
+    output = rehydratePersistedProviderPlanOutputV2(
+      input,
+      backendOutput,
+      cloneJson(state.plan),
+      terminal.recordedAt
+    );
+  } else if (backendOutput.kind === 'intervention') {
+    if (!state.userIntervention) {
+      throw new UnsupportedHistorySchemaError(
+        'provider-terminal-recovery-intervention-missing'
+      );
+    }
+    output = rehydratePersistedProviderInterventionOutputV2(
+      input,
+      backendOutput,
+      cloneJson(state.userIntervention),
+      terminal.recordedAt
+    );
+  } else {
+    output = adaptSessionKernelProviderBackendOutputV2(
+      input,
+      backendOutput,
+      terminal.recordedAt
+    );
+  }
   return {
     items: cloneJson(output.items),
     completion: cloneJson(output.completion),

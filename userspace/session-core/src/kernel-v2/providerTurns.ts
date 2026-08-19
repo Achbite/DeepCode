@@ -17,7 +17,9 @@ import {
 import {
   currentSessionUserInputV2,
   currentSessionWorkAuthorityV3,
+  consumeSessionProviderControlSettlementV2,
   recordSessionContextReadWorkAuthorityV3,
+  recordSessionProviderControlSettlementV2,
   recordSessionProviderOutcomeV2,
   recordSessionTerminalAnswerCandidateV1,
   sameSessionWorkAuthorityV3,
@@ -74,13 +76,20 @@ import {
 } from './SessionKernelHttpProviderBackendV2.js';
 import {
   adaptSessionKernelProviderBackendOutputV2,
+  SessionKernelProviderAdapterError,
   type SessionProviderInterventionProposalV1,
   SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
   SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
-import type { SessionKernelProjectionReceiptV2 } from './ports.js';
+import {
+  SessionKernelProjectionDeliveryErrorV2,
+} from './ports.js';
+import type {
+  SessionKernelProjectionDeliveryOptionsV2,
+  SessionKernelProjectionReceiptV2,
+} from './ports.js';
 import type {
   SessionKernelLoopResultV2,
   SessionNaturalLanguagePlanV2,
@@ -93,12 +102,17 @@ import type {
   SessionProviderTurnDurableEvidenceV3,
   SessionProviderTurnDispatchRecordV3,
   SessionProviderTurnInputV2,
+  SessionProviderOutcomeRecordV2,
   SessionProviderTurnOutputV2,
   SessionProviderStructuredRepairV1,
 } from './types.js';
 import {
   SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA,
 } from './types.js';
+import {
+  sealSessionProviderControlSettlementV2,
+} from './providerControlSettlementV2.js';
+import { utf8Prefix } from './utf8.js';
 
 export interface SessionKernelProviderTurnHostV2 {
   readState(): SessionKernelLoopStateV2;
@@ -109,7 +123,8 @@ export interface SessionKernelProviderTurnHostV2 {
     projectionId: string,
     kind: SessionKernelProjectionEventV2['kind'],
     data: unknown,
-    recordedAt?: string
+    recordedAt?: string,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2>;
 
   reconcileFacts(): Promise<void>;
@@ -164,7 +179,10 @@ type SessionProviderEvidenceBindingInputV3 = Pick<
 
 type SessionProviderSealedInputV3 =
   SessionProviderEvidenceBindingInputV3
-  & Pick<SessionProviderTurnInputV2, 'toolContext' | 'kernelFacts'>;
+  & Pick<
+    SessionProviderTurnInputV2,
+    'toolContext' | 'kernelFacts' | 'sessionMemory' | 'providerOutcomes'
+  >;
 
 type SessionProviderTurnExecutionRequestV2 =
   SessionProviderTurnRequestV2 & {
@@ -474,7 +492,7 @@ export class SessionKernelProviderTurnsV2 {
   private async projectStructuredRepairState(
     providerTurnId: string,
     repair: SessionProviderStructuredRepairV1,
-    evidence: SessionProviderTurnDurableEvidenceV3
+    signal?: AbortSignal
   ): Promise<void> {
     try {
       await this.host.project(
@@ -486,25 +504,22 @@ export class SessionKernelProviderTurnsV2 {
           code: repair.errorCode,
           stage: 'provider.structuredRepair',
           currentActivityCode: 'session.validating',
-          sourceTerminalKind: repair.sourceTerminalKind,
-          failureDigest: repair.failureDigest,
-          ...(evidence.terminal?.data.providerResult
-            ? {
-                providerOutcome:
-                  evidence.terminal.data.providerResult,
-              }
-            : {}),
-        }
+        },
+        undefined,
+        signal ? { signal } : undefined
       );
-    } catch {
-      // Recovery remains durable even when its replaceable presentation
-      // state cannot be published immediately.
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (!stagedProjectionDeliveryCanDefer(error)) throw error;
+      // The repair request is already durable. A presentation delivery
+      // failure must not replace the scheduled Session continuation with an
+      // unrelated transport error; the pending projection remains in the
+      // durable outbox for later delivery.
     }
   }
 
   private async projectStructuredRepairNoProgress(
-    providerTurnId: string,
-    evidence: SessionProviderTurnDurableEvidenceV3
+    providerTurnId: string
   ): Promise<void> {
     try {
       await this.host.project(
@@ -518,17 +533,12 @@ export class SessionKernelProviderTurnsV2 {
           message:
             'Structured Provider repair reproduced the same invalid response.',
           stage: 'provider.structuredRepairNoProgress',
-          ...(evidence.terminal?.data.providerResult
-            ? {
-                providerOutcome:
-                  evidence.terminal.data.providerResult,
-              }
-            : {}),
         }
       );
-    } catch {
-      // The failed checkpoint remains canonical when presentation delivery
-      // cannot settle in this process.
+    } catch (error) {
+      if (!stagedProjectionDeliveryCanDefer(error)) throw error;
+      // The failed repair boundary and its no-effect proof are already
+      // durable. Presentation delivery remains retryable through the outbox.
     }
   }
 
@@ -606,6 +616,13 @@ export class SessionKernelProviderTurnsV2 {
         providerOutcomes: state.providerOutcomes,
         providerOutcomeOmittedCount:
           state.providerOutcomeHistoryOmittedCount,
+        ...(state.pendingProviderControlSettlement
+          ? {
+              pendingProviderControlSettlement: cloneJson(
+                state.pendingProviderControlSettlement
+              ),
+            }
+          : {}),
         sessionMemory: state.sessionMemory,
         providerProfile: state.providerProfile,
         ...(state.plan ? { plan: state.plan } : {}),
@@ -694,17 +711,32 @@ export class SessionKernelProviderTurnsV2 {
         };
         this.providerAbort = { reservation, controller };
         await this.host.saveCheckpoint();
-        await this.host.project(
-          `provider:${providerTurnId}:started`,
-          'provider.started',
-          {
-            providerTurnId,
-            controlEpoch: state.controlEpoch,
-            contextRef: binding.contextRef,
-            factProjection: state.providerTurn.factProjection,
-            contextAssembly: state.providerTurn.contextAssembly,
+        try {
+          await this.host.project(
+            `provider:${providerTurnId}:started`,
+            'provider.started',
+            {
+              providerTurnId,
+              controlEpoch: state.controlEpoch,
+              contextRef: binding.contextRef,
+              factProjection: state.providerTurn.factProjection,
+              contextAssembly: state.providerTurn.contextAssembly,
+            },
+            undefined,
+            { signal: controller.signal }
+          );
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          if (stagedProjectionDeliveryCanDefer(error)) {
+            // The admission event is already durable. A transient delivery
+            // failure must not create an active-no-dispatch reservation; the
+            // ordered outbox will publish it before later presentation facts.
+          } else {
+            state.providerTurn.status = 'failed';
+            await this.host.saveCheckpoint();
+            throw error;
           }
-        );
+        }
       } finally {
         this.endAdmissionCommit(startCommit);
       }
@@ -722,13 +754,15 @@ export class SessionKernelProviderTurnsV2 {
             reservation,
             generation,
             providerTurnId,
-            state.controlEpoch
+            state.controlEpoch,
+            controller.signal
           ),
           publicActivityObserver: this.publicActivityObserverForTurn(
             reservation,
             generation,
             providerTurnId,
-            state.controlEpoch
+            state.controlEpoch,
+            controller.signal
           ),
           signal: controller.signal,
         });
@@ -852,7 +886,7 @@ export class SessionKernelProviderTurnsV2 {
                 await this.projectStructuredRepairState(
                   providerTurnId,
                   scheduledRepair,
-                  evidence
+                  controller.signal
                 );
               } else if (request.target.kind !== 'finalAnswer') {
                 try {
@@ -872,6 +906,8 @@ export class SessionKernelProviderTurnsV2 {
                           ? 'provider.outputValidation'
                           : 'provider.requestTurn',
                       ...(evidence.terminal?.data.terminalKind === 'completed'
+                        && safeErrorCode(terminalError)
+                          !== 'session_kernel_provider_structured_repair_no_progress'
                         ? {
                             providerOutcome:
                               evidence.terminal.data.providerResult,
@@ -895,10 +931,6 @@ export class SessionKernelProviderTurnsV2 {
             );
           }
           throw terminalError;
-        }
-      } finally {
-        if (this.providerAbort?.reservation === reservation) {
-          this.providerAbort = undefined;
         }
       }
 
@@ -1071,6 +1103,9 @@ export class SessionKernelProviderTurnsV2 {
       }
       return result;
     } finally {
+      if (this.providerAbort?.reservation === reservation) {
+        this.providerAbort = undefined;
+      }
       if (this.reservation === reservation) {
         this.reservation = undefined;
       }
@@ -1119,6 +1154,11 @@ export class SessionKernelProviderTurnsV2 {
         (guidance) => !acknowledgedGuidance.has(guidance)
       );
     acceptingState.providerTurn.response = response;
+    consumeSessionProviderControlSettlementV2(
+      acceptingState,
+      providerTurnId,
+      request.target.kind
+    );
     await this.host.saveCheckpoint();
 
     if (
@@ -1140,6 +1180,28 @@ export class SessionKernelProviderTurnsV2 {
       await this.host.recordProviderPlan(output.plan);
       return {
         result: { kind: 'plan', plan: output.plan },
+        queuedToolIntents: false,
+      };
+    }
+    if (output.kind === 'planEvidenceRefresh') {
+      if (!output.guidance.trim()) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_plan_evidence_guidance_missing',
+          'Recoverable Plan evidence rejection requires deterministic revalidation guidance.'
+        );
+      }
+      if (!acceptingState.pendingGuidance.includes(output.guidance)) {
+        acceptingState.pendingGuidance.push(output.guidance);
+      }
+      await this.host.saveCheckpoint();
+      return {
+        result: {
+          kind: 'sessionControlRejected',
+          providerTurnId,
+          controlKind: 'planEvidenceRefresh',
+          evidenceDebtDigest: output.refresh.evidenceDebtDigest,
+          guidance: output.guidance,
+        },
         queuedToolIntents: false,
       };
     }
@@ -1292,19 +1354,59 @@ export class SessionKernelProviderTurnsV2 {
       };
     }
     current.providerTurn.status = 'completed';
-    const outcome = output.kind === 'noTool' && output.repair
-      ? repairedSessionProviderOutcomeV2(
-          providerTurnId,
-          output,
-          recordedAt
-        )
-      : {
-          providerTurnId,
-          outputKind: output.kind,
-          recordedAt,
-          ...providerOutcomeSummary(output),
-          providerResult: output.providerResult,
-        };
+    let outcome: SessionProviderOutcomeRecordV2;
+    if (output.kind === 'noTool' && output.repair) {
+      outcome = repairedSessionProviderOutcomeV2(
+        providerTurnId,
+        output,
+        recordedAt
+      );
+    } else if (output.kind === 'planEvidenceRefresh') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        summary: utf8Prefix(output.guidance, 8_192),
+        control: cloneJson(output.control),
+        refresh: cloneJson(output.refresh),
+        providerResult: output.providerResult,
+      };
+    } else if (output.kind === 'plan') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        control: cloneJson(output.control),
+        providerResult: output.providerResult,
+      };
+    } else if (output.kind === 'planActionComplete') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        control: cloneJson(output.control),
+        providerResult: output.providerResult,
+      };
+    } else if (output.kind === 'intervention') {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        control: cloneJson(output.control),
+        providerResult: output.providerResult,
+      };
+    } else {
+      outcome = {
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt,
+        ...providerOutcomeSummary(output),
+        providerResult: output.providerResult,
+      };
+    }
     const existingOutcome = current.providerOutcomes.find(
       (candidate) => candidate.providerTurnId === providerTurnId
     );
@@ -1319,6 +1421,48 @@ export class SessionKernelProviderTurnsV2 {
     }
     if (!existingOutcome) {
       recordSessionProviderOutcomeV2(current, outcome);
+    }
+    if (output.kind === 'planEvidenceRefresh') {
+      recordSessionProviderControlSettlementV2(
+        current,
+        sealSessionProviderControlSettlementV2({
+          kind: 'planEvidenceRefresh',
+          runId: current.runId,
+          inputId: current.currentInputId,
+          controlEpoch: current.controlEpoch,
+          predecessorProviderTurnId: providerTurnId,
+          nextTargetKind: 'planning',
+          control: cloneJson(output.control),
+          refresh: cloneJson(output.refresh),
+          recordedAt,
+        })
+      );
+    } else if (output.kind === 'planActionComplete') {
+      if (!planActionSettlement) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_action_settlement_missing',
+          'PlanActionComplete lost its exact durable settlement.'
+        );
+      }
+      const hasRemainingAction = current.plan?.actions.some((action) =>
+        !current.planActionSettlements[action.manifest.planActionId]
+      ) ?? false;
+      recordSessionProviderControlSettlementV2(
+        current,
+        sealSessionProviderControlSettlementV2({
+          kind: 'planActionComplete',
+          runId: current.runId,
+          inputId: current.currentInputId,
+          controlEpoch: current.controlEpoch,
+          predecessorProviderTurnId: providerTurnId,
+          nextTargetKind: hasRemainingAction
+            ? 'planAction'
+            : 'finalAnswer',
+          control: cloneJson(output.control),
+          settlement: cloneJson(planActionSettlement),
+          recordedAt,
+        })
+      );
     }
     await this.host.saveCheckpoint();
     const workAuthority = currentSessionWorkAuthorityV3(current);
@@ -1571,6 +1715,15 @@ export class SessionKernelProviderTurnsV2 {
       purpose: turn.purpose,
       runId: state.runId,
       currentInput: currentSessionUserInputV2(state),
+      providerOutcomes: cloneJson(state.providerOutcomes),
+      ...(state.pendingProviderControlSettlement
+        ? {
+            pendingProviderControlSettlement: cloneJson(
+              state.pendingProviderControlSettlement
+            ),
+          }
+        : {}),
+      sessionMemory: cloneJson(state.sessionMemory),
       providerProfile: cloneJson(state.providerProfile),
       ...(state.plan
         && state.plan.planRevision === turn.planRevision
@@ -1614,8 +1767,7 @@ export class SessionKernelProviderTurnsV2 {
           delete turn.nextStructuredRepair;
           await this.host.saveCheckpoint();
           await this.projectStructuredRepairNoProgress(
-            turn.providerTurnId,
-            evidence
+            turn.providerTurnId
           );
           return;
         }
@@ -1627,8 +1779,7 @@ export class SessionKernelProviderTurnsV2 {
       if (turn.nextStructuredRepair) {
         await this.projectStructuredRepairState(
           turn.providerTurnId,
-          turn.nextStructuredRepair,
-          evidence
+          turn.nextStructuredRepair
         );
       }
       return;
@@ -1662,8 +1813,7 @@ export class SessionKernelProviderTurnsV2 {
         delete turn.nextStructuredRepair;
         await this.host.saveCheckpoint();
         await this.projectStructuredRepairNoProgress(
-          turn.providerTurnId,
-          evidence
+          turn.providerTurnId
         );
         return;
       }
@@ -1671,8 +1821,7 @@ export class SessionKernelProviderTurnsV2 {
       await this.host.saveCheckpoint();
       await this.projectStructuredRepairState(
         turn.providerTurnId,
-        repair,
-        evidence
+        repair
       );
       return;
     }
@@ -2201,8 +2350,7 @@ export class SessionKernelProviderTurnsV2 {
           state,
           currentAction,
           source,
-          index,
-          lease
+          index
         )
       : providerCallIdentity(
           state,
@@ -2725,7 +2873,8 @@ export class SessionKernelProviderTurnsV2 {
     reservation: symbol,
     generation: number,
     providerTurnId: string,
-    controlEpoch: number
+    controlEpoch: number,
+    signal: AbortSignal
   ): NonNullable<SessionProviderTurnInputV2['publicTextObserver']> {
     return async (delta) => {
       if (
@@ -2781,7 +2930,9 @@ export class SessionKernelProviderTurnsV2 {
               ? { providerPhase: delta.providerPhase }
               : {}),
             textDelta: delta.textDelta,
-          }
+          },
+          undefined,
+          { signal }
         );
         if (this.resultIsStale(
           reservation,
@@ -2803,7 +2954,8 @@ export class SessionKernelProviderTurnsV2 {
     reservation: symbol,
     generation: number,
     providerTurnId: string,
-    controlEpoch: number
+    controlEpoch: number,
+    signal: AbortSignal
   ): NonNullable<SessionProviderTurnInputV2['publicActivityObserver']> {
     return async (activity) => {
       if (
@@ -2850,7 +3002,9 @@ export class SessionKernelProviderTurnsV2 {
             controlEpoch,
             activitySequence: activity.activitySequence,
             currentActivityCode: activity.code,
-          }
+          },
+          undefined,
+          { signal }
         );
         if (this.resultIsStale(
           reservation,
@@ -2897,28 +3051,52 @@ function providerOutcomeSummary(
   output: import('./types.js').SessionProviderTurnOutputV2
 ): { summary?: string } {
   if (output.kind === 'answer') {
-    return { summary: output.text.slice(0, 8_192) };
+    return { summary: utf8Prefix(output.text, 8_192) };
   }
   if (output.kind === 'noTool' && output.guidance) {
-    return { summary: output.guidance.slice(0, 8_192) };
+    return { summary: utf8Prefix(output.guidance, 8_192) };
   }
   if (output.kind === 'plan') {
     return {
-      summary: `${output.plan.title}\n${output.plan.objective}`
-        .slice(0, 8_192),
+      summary: utf8Prefix(
+        `${output.plan.title}\n${output.plan.objective}`,
+        8_192
+      ),
     };
+  }
+  if (output.kind === 'planEvidenceRefresh') {
+    return { summary: utf8Prefix(output.guidance, 8_192) };
   }
   if (output.kind === 'planActionComplete') {
     return { summary: `PlanAction outcome: ${output.outcome}` };
   }
   if (output.kind === 'intervention') {
     return {
-      summary: `${output.proposal.problemSummary}\n${
-        output.proposal.options.map((option) => option.title).join('\n')
-      }`.slice(0, 8_192),
+      summary: utf8Prefix(
+        `${output.proposal.problemSummary}\n${
+          output.proposal.options.map((option) => option.title).join('\n')
+        }`,
+        8_192
+      ),
     };
   }
   return {};
+}
+
+function stagedProjectionDeliveryCanDefer(error: unknown): boolean {
+  if (!(error instanceof SessionKernelProjectionDeliveryErrorV2)) {
+    return false;
+  }
+  if (error.deliveryStage === 'deliveryReceipt') {
+    return true;
+  }
+  const cause = error.deliveryError;
+  if (cause instanceof TypeError) {
+    return true;
+  }
+  return cause !== null
+    && typeof cause === 'object'
+    && (cause as { retryable?: unknown }).retryable === true;
 }
 
 function candidateCanPromoteToFinalAnswerV1(
@@ -3137,7 +3315,10 @@ function structuredRepairForProviderFailureV1(input: {
   }
   if (
     terminal?.terminalKind !== 'completed'
-    || !(input.error instanceof SessionKernelProviderTransportError)
+    || !(
+      input.error instanceof SessionKernelProviderTransportError
+      || input.error instanceof SessionKernelProviderAdapterError
+    )
     || !repairableCompletedSessionControlErrorV1(
       input.request.target,
       input.error.code
@@ -3209,6 +3390,10 @@ function repairableCompletedSessionControlErrorV1(
       'session_kernel_provider_plan_proposal_invalid',
       'session_kernel_provider_plan_proposal_conflict',
       'session_kernel_provider_plan_proposal_phase_conflict',
+      'session_kernel_provider_plan_tool_unavailable',
+      'session_kernel_provider_plan_read_action_invalid',
+      'session_kernel_provider_plan_scope_shape_invalid',
+      'session_kernel_provider_plan_arguments_invalid',
     ].includes(errorCode);
   }
   if (target.kind === 'interventionResearch') {
@@ -3216,6 +3401,10 @@ function repairableCompletedSessionControlErrorV1(
       'session_kernel_provider_intervention_invalid',
       'session_kernel_provider_intervention_proposal_conflict',
       'session_kernel_provider_intervention_proposal_phase_conflict',
+      'session_kernel_provider_plan_tool_unavailable',
+      'session_kernel_provider_plan_read_action_invalid',
+      'session_kernel_provider_plan_scope_shape_invalid',
+      'session_kernel_provider_plan_arguments_invalid',
     ].includes(errorCode);
   }
   if (target.kind === 'planAction') {
@@ -3355,7 +3544,10 @@ function terminalItemsMatchProviderOutputV3(
   );
   if (
     targetKind === 'planning'
-    && output.kind === 'plan'
+    && (
+      output.kind === 'plan'
+      || output.kind === 'planEvidenceRefresh'
+    )
   ) {
     try {
       const controlItems = terminalItems.filter(
@@ -3383,8 +3575,24 @@ function terminalItemsMatchProviderOutputV3(
         phase: 'commentary' as const,
         text: item.text,
       }));
-      return canonicalJson(outputItems) === canonicalJson(normalizedTextItems)
-        && providerPlanMatchesDraftV3(output.plan, draft);
+      if (canonicalJson(outputItems) !== canonicalJson(normalizedTextItems)) {
+        return false;
+      }
+      if (output.kind === 'plan') {
+        const decodedArguments = JSON.parse(
+          controlItems[0]!.arguments
+        ) as unknown;
+        return providerPlanMatchesDraftV3(output.plan, draft)
+          && controlItems[0]!.callId === output.control.callId
+          && sha256Hash(canonicalJson(decodedArguments))
+            === output.control.argumentsDigest;
+      }
+      const decodedArguments = JSON.parse(
+        controlItems[0]!.arguments
+      ) as unknown;
+      return controlItems[0]!.callId === output.control.callId
+        && sha256Hash(canonicalJson(decodedArguments))
+          === output.control.argumentsDigest;
     } catch {
       return false;
     }
@@ -3658,15 +3866,15 @@ function planActionProviderCallIdentity(
   state: SessionKernelLoopStateV2,
   action: SessionPlanActionV2,
   source: ProviderKernelToolSourceV2,
-  callIndex: number,
-  lease: CapabilityLeaseRefV2 | undefined
+  callIndex: number
 ): {
   operationId: string;
   idempotencyKey: string;
 } {
+  // A preview lease proves approval; it is not an effect submission. The
+  // first physical call must still consume the manifest operation identity.
   if (
-    !lease
-    && callIndex === 0
+    callIndex === 0
     && !planManifestOperationWasPreviouslySubmitted(
       state,
       action.manifest.operationId

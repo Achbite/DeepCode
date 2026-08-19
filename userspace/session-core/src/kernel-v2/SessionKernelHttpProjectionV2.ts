@@ -25,6 +25,7 @@ import type {
   SessionKernelHostProjectionSinkV2,
 } from './SessionKernelHttpPersistenceV2.js';
 import type {
+  SessionKernelProjectionDeliveryOptionsV2,
   SessionKernelProjectionReceiptV2,
 } from './ports.js';
 import type {
@@ -56,6 +57,7 @@ const MAX_PRIOR_EVENTS_PAGE_COUNT = 128;
 const MAX_PRIOR_EVENTS_PAGE_UTF8_BYTES = 1024 * 1024;
 const MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_UTF8_BYTES =
   8 * 1024 * 1024;
+const DEFAULT_PROJECTION_DELIVERY_DEADLINE_MS = 15_000;
 
 export interface SessionKernelPublicProjectionPayloadV2 {
   schemaVersion: typeof SESSION_KERNEL_PUBLIC_PROJECTION_V2_SCHEMA;
@@ -195,10 +197,11 @@ implements SessionKernelHostProjectionSinkV2 {
 
   async publish(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
     const publication = this.publicationTail.then(() =>
-      this.publishSerial(event, projectionHistory)
+      this.publishSerial(event, projectionHistory, options)
     );
     this.publicationTail = publication.then(
       () => undefined,
@@ -209,36 +212,53 @@ implements SessionKernelHostProjectionSinkV2 {
 
   private async publishSerial(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    options?: SessionKernelProjectionDeliveryOptionsV2
   ): Promise<SessionKernelProjectionReceiptV2> {
-    const projectionId = requiredIdentity(event.projectionId, 'projectionId');
-    const eventDigest = sha256Hash(canonicalJson(event));
-    const replay = this.lastPublished?.projectionId === projectionId
-      ? this.lastPublished
-      : undefined;
-    if (replay) {
-      if (replay.eventDigest !== eventDigest) {
-        throw new SessionKernelProjectionTransportError(
-          'session_kernel_projection_identity_conflict',
-          'Session projection identity was reused with different content.'
+    const delivery = projectionDeliveryAbortScope(options);
+    try {
+      const projectionId = requiredIdentity(
+        event.projectionId,
+        'projectionId'
+      );
+      const eventDigest = sha256Hash(canonicalJson(event));
+      const replay = this.lastPublished?.projectionId === projectionId
+        ? this.lastPublished
+        : undefined;
+      if (replay) {
+        if (replay.eventDigest !== eventDigest) {
+          throw new SessionKernelProjectionTransportError(
+            'session_kernel_projection_identity_conflict',
+            'Session projection identity was reused with different content.'
+          );
+        }
+        const receipt = await this.sendProjectionRequest(
+          replay.request,
+          delivery.signal
         );
+        this.currentTimeline = cloneJson(replay.timeline);
+        return receipt;
       }
-      const receipt = await this.sendProjectionRequest(replay.request);
-      this.currentTimeline = cloneJson(replay.timeline);
+      const prepared = await this.prepareProjectionRequest(
+        event,
+        projectionHistory,
+        delivery.signal
+      );
+      const receipt = await this.sendProjectionRequest(
+        prepared.request,
+        delivery.signal
+      );
+      this.commitPreparedProjection(prepared);
       return receipt;
+    } finally {
+      delivery.dispose();
     }
-    const prepared = await this.prepareProjectionRequest(
-      event,
-      projectionHistory
-    );
-    const receipt = await this.sendProjectionRequest(prepared.request);
-    this.commitPreparedProjection(prepared);
-    return receipt;
   }
 
   private async prepareProjectionRequest(
     event: SessionKernelProjectionEventV2,
-    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>
+    projectionHistory: () => Promise<SessionKernelProjectionEventV2[]>,
+    signal: AbortSignal
   ): Promise<PreparedHostProjectionV2> {
     assertNoTransportCapabilities(event);
     const projectionId = requiredIdentity(
@@ -272,8 +292,8 @@ implements SessionKernelHostProjectionSinkV2 {
           sessionKernelAgentEventV2(this.sessionId, projection)
       );
       const [priorEvents, priorTimeline] = await Promise.all([
-        this.priorEventsForProjection(),
-        this.priorTimelineForProjection(),
+        this.priorEventsForProjection(signal),
+        this.priorTimelineForProjection(signal),
       ]);
       const agentEvents = [
         ...priorEvents,
@@ -359,7 +379,8 @@ implements SessionKernelHostProjectionSinkV2 {
   }
 
   private async sendProjectionRequest(
-    request: SessionKernelHostProjectionRequestV2
+    request: SessionKernelHostProjectionRequestV2,
+    signal: AbortSignal
   ): Promise<SessionKernelProjectionReceiptV2> {
     const { projectionId, projectionDigest } = request;
     const encodedRequest = JSON.stringify(request);
@@ -379,6 +400,7 @@ implements SessionKernelHostProjectionSinkV2 {
         'x-deepcode-run-capability': this.#runCapability,
       },
       body: encodedRequest,
+      signal,
     });
     if (!response.ok) {
       const failure = await projectionHttpFailure(
@@ -387,7 +409,8 @@ implements SessionKernelHostProjectionSinkV2 {
       );
       throw new SessionKernelProjectionTransportError(
         failure.code,
-        failure.message
+        failure.message,
+        failure.retryable
       );
     }
     const rawReply: unknown = await response.json();
@@ -454,14 +477,14 @@ implements SessionKernelHostProjectionSinkV2 {
     };
   }
 
-  private priorEventsForProjection(): Promise<AgentEvent[]> {
+  private priorEventsForProjection(signal: AbortSignal): Promise<AgentEvent[]> {
     if (this.priorSessionEvents.omittedEventCount === 0) {
       return Promise.resolve(
         cloneJson(this.priorSessionEvents.events)
       );
     }
     if (!this.fullPriorSessionEvents) {
-      const loading = this.fetchFrozenPriorEvents();
+      const loading = this.fetchFrozenPriorEvents(signal);
       const recoverable = loading.catch((error: unknown) => {
         if (this.fullPriorSessionEvents === recoverable) {
           this.fullPriorSessionEvents = undefined;
@@ -473,13 +496,13 @@ implements SessionKernelHostProjectionSinkV2 {
     return this.fullPriorSessionEvents.then(cloneJson);
   }
 
-  private priorTimelineForProjection():
+  private priorTimelineForProjection(signal: AbortSignal):
   Promise<AgentTimelineResult | undefined> {
     if (this.priorSessionEvents.sourceEventVersion === 0) {
       return Promise.resolve(undefined);
     }
     if (!this.frozenPriorTimeline) {
-      const loading = this.fetchFrozenPriorTimeline();
+      const loading = this.fetchFrozenPriorTimeline(signal);
       const recoverable = loading.catch((error: unknown) => {
         if (this.frozenPriorTimeline === recoverable) {
           this.frozenPriorTimeline = undefined;
@@ -491,7 +514,7 @@ implements SessionKernelHostProjectionSinkV2 {
     return this.frozenPriorTimeline.then(cloneJson);
   }
 
-  private async fetchFrozenPriorTimeline():
+  private async fetchFrozenPriorTimeline(signal: AbortSignal):
   Promise<AgentTimelineResult> {
     const response = await this.fetchImpl(this.priorTimelineEndpoint, {
       method: 'GET',
@@ -499,6 +522,7 @@ implements SessionKernelHostProjectionSinkV2 {
         'x-deepcode-run-id': this.runId,
         'x-deepcode-run-capability': this.#runCapability,
       },
+      signal,
     });
     if (!response.ok) {
       throw new SessionKernelProjectionTransportError(
@@ -566,7 +590,9 @@ implements SessionKernelHostProjectionSinkV2 {
     return timeline;
   }
 
-  private async fetchFrozenPriorEvents(): Promise<AgentEvent[]> {
+  private async fetchFrozenPriorEvents(
+    signal: AbortSignal
+  ): Promise<AgentEvent[]> {
     const events: AgentEvent[] = [];
     let continuation: string | null = null;
     do {
@@ -580,6 +606,7 @@ implements SessionKernelHostProjectionSinkV2 {
         headers: {
           'x-deepcode-run-capability': this.#runCapability,
         },
+        signal,
       });
       if (!response.ok) {
         const failure = await priorEventsHttpFailure(response);
@@ -776,7 +803,11 @@ function mergeTimelineTokenUsage(
 async function projectionHttpFailure(
   response: Response,
   projectionId: string
-): Promise<{ code: string; message: string }> {
+): Promise<{ code: string; message: string; retryable: boolean }> {
+  const retryable = response.status === 408
+    || response.status === 425
+    || response.status === 429
+    || response.status >= 500;
   try {
     const envelope = objectRecord(await response.json());
     const nestedError = objectRecord(envelope?.error);
@@ -793,7 +824,7 @@ async function projectionHttpFailure(
       && message.length > 0
       && new TextEncoder().encode(message).byteLength <= 8_192
     ) {
-      return { code, message };
+      return { code, message, retryable };
     }
   } catch {
     // Preserve a typed local transport failure for non-v2 Host responses.
@@ -802,11 +833,13 @@ async function projectionHttpFailure(
     ? {
         code: 'session_kernel_projection_identity_conflict',
         message: `Projection ${projectionId} conflicts with Host content.`,
+        retryable: false,
       }
     : {
         code: 'session_kernel_projection_http_failed',
         message:
           `Session v2 projection failed with HTTP ${response.status}.`,
+        retryable,
       };
 }
 
@@ -1206,6 +1239,7 @@ function publicPresentation(
         data?.orderedItems
       );
       const orderedItems = outputKind === 'plan'
+        || outputKind === 'planEvidenceRefresh'
         ? []
         : decodedOrderedItems;
       const terminalScope = publicTerminalScope(data);
@@ -1396,18 +1430,6 @@ function publicPresentation(
             code: textField(data, 'code'),
             providerTurnId: textField(data, 'providerTurnId'),
             currentActivityCode: 'session.validating',
-            sourceTerminalKind: textField(
-              data,
-              'sourceTerminalKind'
-            ),
-            failureDigest: textField(data, 'failureDigest'),
-            ...(data?.providerOutcome === undefined
-              ? {}
-              : {
-                  providerOutcome: publicProviderOutcome(
-                    data.providerOutcome
-                  ),
-                }),
             summary:
               'Validating Provider structured output before retry.',
           },
@@ -1722,6 +1744,7 @@ type CurrentProjectionFieldSchema = Readonly<
 const CURRENT_PLAN_FIELDS = {
   runId: 'identity',
   inputId: 'identity',
+  controlEpoch: 'positiveInteger',
   planRevision: 'identity',
   title: 'string',
   objective: 'string',
@@ -2236,6 +2259,7 @@ function currentProviderCompletedProjectionData(
     'answer',
     'noTool',
     'toolIntent',
+    'planEvidenceRefresh',
     'planActionComplete',
     'intervention',
   ]);
@@ -2496,18 +2520,11 @@ function currentDiagnosticProjectionData(
           code: 'identity',
           stage: 'string',
           currentActivityCode: 'string',
-          sourceTerminalKind: 'string',
-          failureDigest: 'identity',
-        },
-        { providerOutcome: 'object' }
+        }
       );
       projectionEnum(data, 'status', ['recovering']);
       projectionEnum(data, 'currentActivityCode', [
         'session.validating',
-      ]);
-      projectionEnum(data, 'sourceTerminalKind', [
-        'failed',
-        'completed',
       ]);
       break;
     case 'provider.structuredRepairNoProgress':
@@ -2520,8 +2537,7 @@ function currentDiagnosticProjectionData(
           code: 'identity',
           message: 'string',
           stage: 'string',
-        },
-        { providerOutcome: 'object' }
+        }
       );
       projectionEnum(data, 'status', ['failed']);
       projectionEnum(data, 'terminalScope', ['turn']);
@@ -2561,7 +2577,9 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
     }
   }
   validateCurrentPlanEvidence(
-    projectionObject(plan, 'evidence')
+    projectionObject(plan, 'evidence'),
+    plan.runId as string,
+    plan.controlEpoch as number
   );
   if (plan.predecessorPlanRef !== undefined) {
     const predecessor = exactCurrentProjectionValue(
@@ -2665,7 +2683,9 @@ function validateCurrentPlan(data: Record<string, unknown>): void {
 }
 
 function validateCurrentPlanEvidence(
-  evidence: Record<string, unknown>
+  evidence: Record<string, unknown>,
+  runId: string,
+  controlEpoch: number
 ): void {
   const current = exactCurrentProjectionValue(
     evidence,
@@ -2673,6 +2693,7 @@ function validateCurrentPlanEvidence(
     {
       kernelFactRefs: 'array',
       readResources: 'array',
+      historicalRebinds: 'array',
       blockingUnknowns: 'array',
       nonBlockingUnknowns: 'array',
       coverage: 'string',
@@ -2705,6 +2726,10 @@ function validateCurrentPlanEvidence(
     );
   }
   const resourceRefs = new Set<string>();
+  const resourceEvidence = new Map<string, {
+    digest: string;
+    factRefs: string[];
+  }>();
   readResources.forEach((value, index) => {
     const resource = exactCurrentProjectionValue(
       value,
@@ -2736,6 +2761,79 @@ function validateCurrentPlanEvidence(
       `plan.evidence.readResources[${String(index)}].factRefs`,
       true
     );
+    resourceEvidence.set(resourceRef, {
+      digest: resource.digest as string,
+      factRefs: projectionArray(resource, 'factRefs') as string[],
+    });
+  });
+
+  const historicalRebinds = projectionArray(
+    current,
+    'historicalRebinds'
+  );
+  if (historicalRebinds.length > 512) {
+    throw invalidCurrentProjectionData(
+      'plan.evidence.historicalRebinds',
+      'historical evidence rebinds exceed the current object bound'
+    );
+  }
+  const rebindIds = new Set<string>();
+  historicalRebinds.forEach((value, index) => {
+    const rebind = exactCurrentProjectionValue(
+      value,
+      `plan.evidence.historicalRebinds[${String(index)}]`,
+      {
+        rebindId: 'identity',
+        sourceEventId: 'identity',
+        sourceEventDigest: 'identity',
+        sourceEventVersion: 'positiveInteger',
+        sourceRunId: 'identity',
+        sourceFactId: 'identity',
+        sourceControlEpoch: 'positiveInteger',
+        sourceOperationId: 'identity',
+        sourceToolId: 'identity',
+        subjectDigest: 'identity',
+        sourceEvidenceDigest: 'identity',
+        sourceCandidateDigest: 'identity',
+        currentRunId: 'identity',
+        currentControlEpoch: 'positiveInteger',
+        currentFactRef: 'identity',
+        currentEvidenceDigest: 'identity',
+        resourceRef: 'identity',
+        contentRelation: 'string',
+      }
+    );
+    for (const digestField of [
+      'sourceEventDigest',
+      'subjectDigest',
+      'sourceEvidenceDigest',
+      'sourceCandidateDigest',
+      'currentEvidenceDigest',
+    ] as const) {
+      currentProjectionDigest(
+        rebind[digestField],
+        `plan.evidence.historicalRebinds[${String(index)}].${digestField}`
+      );
+    }
+    const resource = resourceEvidence.get(rebind.resourceRef as string);
+    if (
+      !rebindIds.add(rebind.rebindId as string)
+      || rebind.sourceRunId === runId
+      || rebind.currentRunId !== runId
+      || rebind.currentControlEpoch !== controlEpoch
+      || (
+        rebind.contentRelation !== 'sameDigest'
+        && rebind.contentRelation !== 'changedDigest'
+      )
+      || !resource
+      || resource.digest !== rebind.currentEvidenceDigest
+      || !resource.factRefs.includes(rebind.currentFactRef as string)
+    ) {
+      throw invalidCurrentProjectionData(
+        'plan.evidence.historicalRebinds',
+        'historical rebind must reference exact current read evidence'
+      );
+    }
   });
 
   const blocking = projectionArray(current, 'blockingUnknowns');
@@ -4023,10 +4121,59 @@ function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function projectionDeliveryAbortScope(
+  options: SessionKernelProjectionDeliveryOptionsV2 | undefined
+): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const external = options?.signal;
+  const deadlineMs = options?.deadlineMs
+    ?? DEFAULT_PROJECTION_DELIVERY_DEADLINE_MS;
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
+    throw new SessionKernelProjectionTransportError(
+      'session_kernel_projection_deadline_invalid',
+      'Session projection delivery deadline must be a positive integer.'
+    );
+  }
+  const abortFromExternal = (): void => {
+    controller.abort(
+      external?.reason
+      ?? new SessionKernelProjectionTransportError(
+        'session_kernel_projection_delivery_cancelled',
+        'Session projection delivery was cancelled.'
+      )
+    );
+  };
+  if (external?.aborted) {
+    abortFromExternal();
+  } else {
+    external?.addEventListener('abort', abortFromExternal, { once: true });
+  }
+  const timer = setTimeout(() => {
+    controller.abort(
+      new SessionKernelProjectionTransportError(
+        'session_kernel_projection_delivery_timeout',
+        `Session projection delivery exceeded ${deadlineMs}ms.`,
+        true
+      )
+    );
+  }, deadlineMs);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', abortFromExternal);
+    },
+  };
+}
+
 export class SessionKernelProjectionTransportError extends Error {
   constructor(
     readonly code: string,
-    message: string
+    message: string,
+    readonly retryable = false
   ) {
     super(message);
     this.name = 'SessionKernelProjectionTransportError';

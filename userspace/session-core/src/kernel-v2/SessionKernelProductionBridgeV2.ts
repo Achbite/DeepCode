@@ -58,7 +58,7 @@ import {
   decodeUserAttachmentContextsV1,
 } from './inputAttachmentsV2.js';
 import {
-  buildSessionContextMemoryV2,
+  buildSessionContextMemoryV3,
   decodeSessionPriorEventsSourceV2,
   type SessionPriorEventsSourceV2,
 } from './sessionMemory.js';
@@ -1451,7 +1451,7 @@ async function createProductionRunner(
       workspaceBindingRef:
         request.prefetchedRun.workspaceBindingRef,
       initialInput: request.initialInput,
-      sessionMemory: buildSessionContextMemoryV2({
+      sessionMemory: buildSessionContextMemoryV3({
         source: request.priorSessionEvents,
         excludeRunId: request.runId,
       }),
@@ -2920,6 +2920,18 @@ function productionContinuation(
       pendingRequestLanes,
     };
   }
+  if (
+    outcome.kind === 'userInterventionDecisionRecorded'
+    && outcome.result.disposition === 'planAccepted'
+    && (
+      !outcome.result.planRevision
+      || state.plan?.planRevision !== outcome.result.planRevision
+      || state.planDecision?.planRevision !== outcome.result.planRevision
+      || state.planDecision.decision !== 'accept'
+    )
+  ) {
+    return awaitingKernelFacts(state);
+  }
   const waitContinuation = state.activeWait
     ? continuationForWait(state, state.activeWait, planAction)
     : undefined;
@@ -3312,6 +3324,8 @@ function continuationForLoopResult(
             ...planRevisionField(state),
           }
         : readyToResumePlanning([result.guidance]);
+    case 'sessionControlRejected':
+      return readyToResumePlanning([result.guidance]);
     case 'manualRecovery':
       return {
         kind: 'manualRecoveryRequired',

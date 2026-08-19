@@ -2,6 +2,7 @@ import type {
   AgentInputAttachmentV3,
   LlmChatMessage,
   LlmReasoningTransport,
+  CapabilityScopeRejectionReasonV2,
   CapabilityScopePreviewRecordV2,
   DeadlineRequestV2,
   InvocationCancelReplyV2,
@@ -14,7 +15,7 @@ import type {
   ToolIntentV2,
 } from '@deepcode/protocol';
 import type {
-  SessionContextMemoryV2,
+  SessionContextMemoryV3,
 } from './sessionMemory.js';
 import type {
   SessionKernelCapabilityPreviewBatchRequestV2,
@@ -282,7 +283,7 @@ export interface SessionProviderContextReceiptV2 {
   };
   inputTokenBudget: number;
   estimatedInputTokens: number;
-  memory: SessionContextMemoryV2;
+  memory: SessionContextMemoryV3;
   trimming: {
     strategy: 'utf8-bytes-upper-bound.v2';
     sections: SessionProviderContextSectionReceiptV2[];
@@ -342,9 +343,31 @@ export interface SessionPlanUnknownV4 {
   impact: string;
 }
 
+export interface SessionHistoricalEvidenceRebindV1 {
+  rebindId: string;
+  sourceEventId: string;
+  sourceEventDigest: string;
+  sourceEventVersion: number;
+  sourceRunId: string;
+  sourceFactId: string;
+  sourceControlEpoch: number;
+  sourceOperationId: string;
+  sourceToolId: string;
+  subjectDigest: string;
+  sourceEvidenceDigest: string;
+  sourceCandidateDigest: string;
+  currentRunId: string;
+  currentControlEpoch: number;
+  currentFactRef: string;
+  currentEvidenceDigest: string;
+  resourceRef: string;
+  contentRelation: 'sameDigest' | 'changedDigest';
+}
+
 export interface SessionPlanEvidenceV4 {
   kernelFactRefs: string[];
   readResources: SessionPlanEvidenceResourceV4[];
+  historicalRebinds: SessionHistoricalEvidenceRebindV1[];
   blockingUnknowns: SessionPlanUnknownV4[];
   nonBlockingUnknowns: SessionPlanUnknownV4[];
   coverage: string;
@@ -369,6 +392,7 @@ export interface SessionCarriedSettlementRefV4 {
 export interface SessionNaturalLanguagePlanV2 {
   runId: string;
   inputId: string;
+  controlEpoch: number;
   planRevision: string;
   title: string;
   objective: string;
@@ -555,7 +579,8 @@ export interface SessionProviderTurnInputV2 {
   conversationInputOmittedCount: number;
   providerOutcomes: readonly SessionProviderOutcomeRecordV2[];
   providerOutcomeOmittedCount: number;
-  sessionMemory: SessionContextMemoryV2;
+  pendingProviderControlSettlement?: SessionProviderControlSettlementV2;
+  sessionMemory: SessionContextMemoryV3;
   providerProfile: SessionProviderProfileBootstrapV2;
   plan?: SessionNaturalLanguagePlanV2;
   planDecision?: SessionPlanDecisionV2;
@@ -640,6 +665,106 @@ export interface SessionProviderToolSettlementV2 {
   settledAt: string;
 }
 
+export interface SessionProviderPlanEvidenceRefreshV1 {
+  errorCode:
+    | 'session_kernel_provider_plan_evidence_stale'
+    | 'session_kernel_provider_plan_resource_evidence_mismatch'
+    | 'session_kernel_provider_plan_blocking_unknowns'
+    | 'session_kernel_provider_plan_evidence_debt_unresolved';
+  staleFactRefs: string[];
+  resourceRefs: string[];
+  readSubjectDigests: string[];
+  blockingUnknownIds: string[];
+  candidateScopeDigest: string;
+  requiresCurrentRead: boolean;
+  snapshotHighWater: number;
+  factSetDigest: string;
+  evidenceDebtDigest: string;
+}
+
+export interface SessionProviderPlanControlReceiptV1 {
+  schemaVersion: 'deepcode.session.plan-proposal.v5';
+  callId: string;
+  toolName: 'deepcode_session_plan_propose_v5';
+  argumentsDigest: string;
+}
+
+export type SessionProviderControlReceiptV2 =
+  | SessionProviderPlanControlReceiptV1
+  | {
+      schemaVersion: 'deepcode.session.plan-action-complete.v2';
+      callId: string;
+      toolName: 'deepcode_session_plan_action_complete_v2';
+      argumentsDigest: string;
+    }
+  | {
+      schemaVersion: 'deepcode.session.intervention-proposal.v1';
+      callId: string;
+      toolName: 'deepcode_session_intervention_propose_v1';
+      argumentsDigest: string;
+    };
+
+export interface SessionProviderPlanPreviewRejectionV1 {
+  planRevision: string;
+  rejections: Array<{
+    planActionId: string;
+    operationId: string;
+    toolId: string;
+    reason: CapabilityScopeRejectionReasonV2;
+    guidance: string;
+  }>;
+}
+
+interface SessionProviderControlSettlementBaseV2 {
+  schemaVersion: 'deepcode.session.provider-control-settlement.v2';
+  runId: string;
+  inputId: string;
+  controlEpoch: number;
+  predecessorProviderTurnId: string;
+  nextTargetKind:
+    | 'planning'
+    | 'planAction'
+    | 'interventionResearch'
+    | 'finalAnswer'
+    | 'none';
+  control: SessionProviderControlReceiptV2;
+  recordedAt: string;
+  settlementDigest: string;
+}
+
+/**
+ * Private, non-authorizing proof that closes one native Session control call.
+ * The Daemon may replay this receipt into Provider history, but it cannot use
+ * it to create Kernel capability, a Plan decision, or an execution fact.
+ */
+export type SessionProviderControlSettlementV2 =
+  | (SessionProviderControlSettlementBaseV2 & {
+      kind: 'planEvidenceRefresh';
+      refresh: SessionProviderPlanEvidenceRefreshV1;
+    })
+  | (SessionProviderControlSettlementBaseV2 & {
+      kind: 'planPreviewRejected';
+      preview: SessionProviderPlanPreviewRejectionV1;
+    })
+  | (SessionProviderControlSettlementBaseV2 & {
+      kind: 'planDecision';
+      decision: SessionPlanDecisionV2;
+    })
+  | (SessionProviderControlSettlementBaseV2 & {
+      kind: 'planActionComplete';
+      settlement: SessionPlanActionSettlementV2;
+    })
+  | (SessionProviderControlSettlementBaseV2 & {
+      kind: 'userInterventionDecision';
+      decision: SessionUserInterventionDecisionV4;
+      disposition:
+        | 'planAccepted'
+        | 'guidanceReplan'
+        | 'researchRevision'
+        | 'runCancellationRequired';
+      acceptedPlanRevision?: string;
+    });
+
 export type SessionProviderOutcomeRecordV2 =
   | (SessionProviderOutcomeRecordBaseV2 & {
       outputKind: 'toolIntent';
@@ -648,10 +773,39 @@ export type SessionProviderOutcomeRecordV2 =
       toolCalls: SessionProviderSettledToolCallV2[];
     })
   | (SessionProviderOutcomeRecordBaseV2 & {
-      outputKind: Exclude<
-        SessionProviderTurnOutputV2['kind'],
-        'toolIntent'
+      outputKind: 'planEvidenceRefresh';
+      control: SessionProviderPlanControlReceiptV1;
+      refresh: SessionProviderPlanEvidenceRefreshV1;
+      toolCallReceipt?: never;
+      toolSettlement?: never;
+    })
+  | (SessionProviderOutcomeRecordBaseV2 & {
+      outputKind: 'plan';
+      control: SessionProviderPlanControlReceiptV1;
+      toolCallReceipt?: never;
+      toolSettlement?: never;
+    })
+  | (SessionProviderOutcomeRecordBaseV2 & {
+      outputKind: 'planActionComplete';
+      control: Extract<
+        SessionProviderControlReceiptV2,
+        { schemaVersion: 'deepcode.session.plan-action-complete.v2' }
       >;
+      toolCallReceipt?: never;
+      toolSettlement?: never;
+    })
+  | (SessionProviderOutcomeRecordBaseV2 & {
+      outputKind: 'intervention';
+      control: Extract<
+        SessionProviderControlReceiptV2,
+        { schemaVersion: 'deepcode.session.intervention-proposal.v1' }
+      >;
+      toolCallReceipt?: never;
+      toolSettlement?: never;
+    })
+  | (SessionProviderOutcomeRecordBaseV2 & {
+      outputKind: 'answer' | 'noTool';
+      control?: never;
       toolCallReceipt?: never;
       toolSettlement?: never;
     });
@@ -660,6 +814,13 @@ export type SessionProviderTurnOutputV2 = (
   | {
       kind: 'plan';
       plan: SessionNaturalLanguagePlanV2;
+      control: SessionProviderPlanControlReceiptV1;
+    }
+  | {
+      kind: 'planEvidenceRefresh';
+      guidance: string;
+      control: SessionProviderPlanControlReceiptV1;
+      refresh: SessionProviderPlanEvidenceRefreshV1;
     }
   | {
       kind: 'toolIntent';
@@ -1159,6 +1320,13 @@ export type SessionKernelLoopResultV2 =
   | {
       kind: 'rejected';
       operationId: string;
+      guidance: string;
+    }
+  | {
+      kind: 'sessionControlRejected';
+      providerTurnId: string;
+      controlKind: 'planEvidenceRefresh';
+      evidenceDebtDigest: string;
       guidance: string;
     }
   | {

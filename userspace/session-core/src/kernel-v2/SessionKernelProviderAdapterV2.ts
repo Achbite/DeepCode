@@ -6,6 +6,8 @@ import {
   type RawToolArgumentsV2,
   type RequestedResourceV2,
   type ScopeIntentV2,
+  type ToolAuthorizationShapeV2,
+  type ToolDescriptorV2,
 } from '@deepcode/protocol';
 import {
   canonicalJson,
@@ -22,14 +24,19 @@ import type {
   SessionPlanActionCompletionOutcomeV2,
   SessionProviderCompletionReceiptV1,
   SessionProviderOrderedItemV2,
+  SessionProviderPlanEvidenceRefreshV1,
   SessionProviderResultMetadataV2,
   SessionProviderToolCallReceiptV2,
   SessionProviderTurnInputV2,
   SessionProviderTurnOutputV2,
+  SessionUserInterventionV4,
 } from './types.js';
 import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
 } from './types.js';
+import {
+  SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
+} from './factKinds.js';
 
 export const SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA =
   'deepcode.session.plan-proposal.v5' as const;
@@ -72,21 +79,25 @@ export function sessionPlanActionCompleteToolV2(): ProviderWireToolDefinition {
 }
 
 export function sessionPlanProposalToolV5(
-  admittedToolIds: readonly string[]
+  admittedTools: readonly ToolDescriptorV2[]
 ): ProviderWireToolDefinition {
   if (
-    admittedToolIds.length === 0
-    || new Set(admittedToolIds).size !== admittedToolIds.length
-    || admittedToolIds.some(
-      (toolId) =>
-        !/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/u.test(toolId)
+    admittedTools.length === 0
+    || admittedTools.some((tool) => tool.availability !== 'ready')
+    || admittedTools.some(
+      (tool, index) =>
+        !/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/u.test(tool.toolId)
+        || (index > 0 && admittedTools[index - 1]!.toolId >= tool.toolId)
     )
   ) {
     throw new SessionKernelProviderAdapterError(
       'session_kernel_provider_plan_tool_catalog_invalid',
-      'The Session Plan control requires one non-empty exact admitted ToolId catalog.'
+      'The Session Plan control requires one non-empty strictly ordered ready Kernel ToolDescriptor catalog.'
     );
   }
+  const mutationTools = admittedTools.filter(
+    (tool) => tool.effectClass === 'mutation'
+  );
   return {
     name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
     description: [
@@ -125,20 +136,7 @@ export function sessionPlanProposalToolV5(
               minItems: 1,
               maxItems: 128,
               items: {
-                type: 'object',
-                additionalProperties: false,
-                required: [
-                  'toolId',
-                  'scopeIntent',
-                ],
-                properties: {
-                  toolId: {
-                    type: 'string',
-                    enum: [...admittedToolIds],
-                  },
-                  scopeIntent: sessionPlanScopeIntentSchemaV3(),
-                  deadline: sessionPlanDeadlineSchemaV2(),
-                },
+                oneOf: mutationTools.map(sessionPlanActionSchemaV5),
               },
             },
           },
@@ -210,9 +208,9 @@ function sessionPlanEvidenceSchemaV4(): unknown {
 }
 
 export function sessionInterventionProposalToolV1(
-  admittedToolIds: readonly string[]
+  admittedTools: readonly ToolDescriptorV2[]
 ): ProviderWireToolDefinition {
-  const planDefinition = sessionPlanProposalToolV5(admittedToolIds);
+  const planDefinition = sessionPlanProposalToolV5(admittedTools);
   const planSchema = (
     planDefinition.inputSchema as {
       properties: { plan: unknown };
@@ -298,50 +296,69 @@ export function sessionInterventionProposalToolV1(
   };
 }
 
-function sessionPlanScopeIntentSchemaV3(): unknown {
+function sessionPlanActionSchemaV5(
+  tool: ToolDescriptorV2
+): Record<string, unknown> {
   return {
-    oneOf: [
-      {
-        type: 'object',
-        additionalProperties: false,
-        required: ['kind', 'data'],
-        properties: {
-          kind: { type: 'string', const: 'resourceScope' },
-          data: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['requestedResources'],
-            properties: {
-              requestedResources: {
-                type: 'array',
-                minItems: 1,
-                maxItems: 256,
-                items: sessionPlanRequestedResourceSchemaV2(),
-              },
+    type: 'object',
+    additionalProperties: false,
+    required: ['toolId', 'scopeIntent'],
+    properties: {
+      toolId: {
+        type: 'string',
+        const: tool.toolId,
+      },
+      scopeIntent: sessionPlanScopeIntentSchemaV3(
+        tool.authorizationShape,
+        tool.inputSchema
+      ),
+      deadline: sessionPlanDeadlineSchemaV2(),
+    },
+  };
+}
+
+function sessionPlanScopeIntentSchemaV3(
+  authorizationShape: ToolAuthorizationShapeV2,
+  toolInputSchema: ToolDescriptorV2['inputSchema']
+): unknown {
+  if (authorizationShape === 'resourceScope') {
+    return {
+      type: 'object',
+      additionalProperties: false,
+      required: ['kind', 'data'],
+      properties: {
+        kind: { type: 'string', const: 'resourceScope' },
+        data: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['requestedResources'],
+          properties: {
+            requestedResources: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 256,
+              items: sessionPlanRequestedResourceSchemaV2(),
             },
           },
         },
       },
-      {
+    };
+  }
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['kind', 'data'],
+    properties: {
+      kind: { type: 'string', const: 'exactInvocation' },
+      data: {
         type: 'object',
         additionalProperties: false,
-        required: ['kind', 'data'],
+        required: ['rawArguments'],
         properties: {
-          kind: { type: 'string', const: 'exactInvocation' },
-          data: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['rawArguments'],
-            properties: {
-              rawArguments: {
-                type: 'object',
-                additionalProperties: true,
-              },
-            },
-          },
+          rawArguments: cloneJson(toolInputSchema),
         },
       },
-    ],
+    },
   };
 }
 
@@ -580,7 +597,10 @@ export type SessionKernelProviderAdapterInputV2 = Pick<
   | 'providerTurnId'
   | 'purpose'
   | 'runId'
+  | 'controlEpoch'
   | 'currentInput'
+  | 'sessionMemory'
+  | 'providerOutcomes'
   | 'providerProfile'
   | 'plan'
   | 'target'
@@ -647,16 +667,35 @@ export function adaptSessionKernelProviderBackendOutputV2(
             'A Provider plan is accepted only for a Session planning turn.'
           );
         }
-        return {
-          kind: 'plan',
-          ...completionFields,
-          plan: materializeProviderPlanV2(
+        try {
+          return {
+            kind: 'plan',
+            ...completionFields,
+            plan: materializeProviderPlanV2(
+              input,
+              output.plan,
+              recordedAt
+            ),
+            control: cloneJson(output.planProposal),
+            providerResult: output.providerResult,
+          };
+        } catch (error) {
+          if (!isRecoverablePlanEvidenceErrorV1(error)) throw error;
+          const refresh = planEvidenceRefreshV1(
             input,
             output.plan,
-            recordedAt
-          ),
-          providerResult: output.providerResult,
-        };
+            error.code,
+            output.planProposal.argumentsDigest
+          );
+          return {
+            kind: 'planEvidenceRefresh',
+            ...completionFields,
+            guidance: planEvidenceRefreshGuidanceV1(refresh),
+            control: cloneJson(output.planProposal),
+            refresh,
+            providerResult: output.providerResult,
+          };
+        }
       case 'intervention':
         if (input.target.kind !== 'interventionResearch') {
           throw new SessionKernelProviderAdapterError(
@@ -773,6 +812,368 @@ export function adaptSessionKernelProviderBackendOutputV2(
           providerResult: output.providerResult,
         };
     }
+}
+
+/**
+ * Rehydrates an already admitted Provider Plan from its immutable Plan record.
+ * Recovery must validate the original sealed proposal against the durable
+ * semantic result; it must not re-run current evidence admission rules against
+ * historical Kernel facts that compact checkpoints intentionally omit.
+ */
+export function rehydratePersistedProviderPlanOutputV2(
+  input: SessionKernelProviderAdapterInputV2,
+  output: Extract<SessionKernelProviderBackendOutputV2, { kind: 'plan' }>,
+  persistedPlan: SessionNaturalLanguagePlanV2,
+  recordedAt: string
+): Extract<SessionProviderTurnOutputV2, { kind: 'plan' }> {
+  if (
+    input.target.kind !== 'planning'
+    || input.purpose === 'finalAnswer'
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_target_invalid',
+      'A persisted Provider plan must bind one planning turn.'
+    );
+  }
+  assertCompletedProviderBackendOutputV2(input, output);
+  const normalized = normalizePlanDraft(output.plan);
+  assertPersistedProviderPlanV2(
+    input,
+    normalized,
+    persistedPlan,
+    recordedAt
+  );
+  return {
+    kind: 'plan',
+    items: cloneJson(output.items),
+    completion: cloneJson(output.completion),
+    plan: cloneJson(persistedPlan),
+    control: cloneJson(output.planProposal),
+    providerResult: cloneJson(output.providerResult),
+  };
+}
+
+/**
+ * Rehydrates an already admitted Provider intervention from the immutable
+ * Session intervention record. Historical recovery validates the original
+ * sealed proposal and candidate Plan identities without re-running current
+ * Kernel-fact admission against compacted historical evidence.
+ */
+export function rehydratePersistedProviderInterventionOutputV2(
+  input: SessionKernelProviderAdapterInputV2,
+  output: Extract<
+    SessionKernelProviderBackendOutputV2,
+    { kind: 'intervention' }
+  >,
+  persistedIntervention: SessionUserInterventionV4,
+  recordedAt: string
+): Extract<SessionProviderTurnOutputV2, { kind: 'intervention' }> {
+  if (input.target.kind !== 'interventionResearch') {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_intervention_target_invalid',
+      'A persisted Provider intervention must bind one intervention research turn.'
+    );
+  }
+  assertCompletedProviderBackendOutputV2(input, output);
+  const normalized = normalizeInterventionDraftV1(output.draft);
+  if (
+    persistedIntervention.runId !== input.runId
+    || persistedIntervention.inputId !== input.currentInput.inputId
+    || persistedIntervention.controlEpoch !== input.controlEpoch
+    || persistedIntervention.recordedAt !== recordedAt
+    || persistedIntervention.problemSummary !== normalized.problemSummary
+    || persistedIntervention.recommendation !== normalized.recommendation
+    || canonicalJson(persistedIntervention.relevantFactRefs)
+      !== canonicalJson(normalized.relevantFactRefs)
+    || canonicalJson(persistedIntervention.affectedPlanActionIds)
+      !== canonicalJson(normalized.affectedPlanActionIds)
+    || persistedIntervention.options.length !== normalized.options.length
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_persisted_intervention_mismatch',
+      'The sealed Provider proposal does not match its immutable admitted intervention record.'
+    );
+  }
+  const options = normalized.options.map((option, index) => {
+    const persisted = persistedIntervention.options[index];
+    if (!persisted) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_persisted_intervention_mismatch',
+        'The persisted intervention lost a Provider option identity.'
+      );
+    }
+    const {
+      candidatePlan,
+      ...presentation
+    } = option;
+    if (
+      persisted.optionId !== presentation.optionId
+      || persisted.kind !== presentation.kind
+      || persisted.title !== presentation.title
+      || persisted.description !== presentation.description
+      || canonicalJson(persisted.tradeoffs)
+        !== canonicalJson(presentation.tradeoffs)
+      || persisted.recommended !== presentation.recommended
+      || (persisted.candidatePlan === undefined)
+        !== (candidatePlan === undefined)
+    ) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_persisted_intervention_mismatch',
+        'A sealed Provider intervention option does not match its immutable admitted record.'
+      );
+    }
+    if (!candidatePlan || !persisted.candidatePlan) {
+      return presentation;
+    }
+    const admittedCandidatePlan = {
+      ...cloneJson(persisted.candidatePlan),
+      carriedSettlementRefs: [],
+    };
+    assertPersistedProviderPlanV2(
+      input,
+      candidatePlan,
+      admittedCandidatePlan,
+      recordedAt
+    );
+    return {
+      ...presentation,
+      candidatePlan: admittedCandidatePlan,
+    };
+  });
+  return {
+    kind: 'intervention',
+    items: cloneJson(output.items),
+    completion: cloneJson(output.completion),
+    proposal: {
+      problemSummary: normalized.problemSummary,
+      ...(normalized.recommendation
+        ? { recommendation: normalized.recommendation }
+        : {}),
+      relevantFactRefs: [...normalized.relevantFactRefs],
+      affectedPlanActionIds: [...normalized.affectedPlanActionIds],
+      options,
+    },
+    control: cloneJson(output.control),
+    providerResult: cloneJson(output.providerResult),
+  };
+}
+
+function assertPersistedProviderPlanV2(
+  input: SessionKernelProviderAdapterInputV2,
+  normalized: SessionProviderPlanDraftV2,
+  persistedPlan: SessionNaturalLanguagePlanV2,
+  recordedAt: string
+): void {
+  const normalizedEvidence = {
+    kernelFactRefs: persistedPlan.evidence.kernelFactRefs,
+    readResources: persistedPlan.evidence.readResources.map((resource) => ({
+      resourceRef: resource.resourceRef,
+      summary: resource.summary,
+      factRefs: resource.factRefs,
+    })),
+    blockingUnknowns: persistedPlan.evidence.blockingUnknowns,
+    nonBlockingUnknowns: persistedPlan.evidence.nonBlockingUnknowns,
+    coverage: persistedPlan.evidence.coverage,
+  };
+  const digest = sha256Hash(canonicalJson({
+    providerTurnId: input.providerTurnId,
+    runId: input.runId,
+    plan: {
+      ...normalized,
+      evidence: persistedPlan.evidence,
+    },
+  })).slice('sha256:'.length);
+  const planRevision = `plan-${digest}`;
+  const predecessorPlanRef = input.plan
+    ? {
+        planRevision: input.plan.planRevision,
+        planDigest: sha256Hash(canonicalJson(input.plan)),
+      }
+    : undefined;
+  const expectedActions = normalized.actions.map((action, index) => {
+    const ordinal = String(index + 1).padStart(4, '0');
+    const planActionId = `plan-action-${digest}-${ordinal}`;
+    const operationId = `operation-${digest}-${ordinal}`;
+    return {
+      taskId: `task-${digest}-${ordinal}`,
+      manifest: createScopeManifestV2({
+        planRevision,
+        planActionId,
+        operationId,
+        toolId: action.toolId,
+        scopeIntent: action.scopeIntent,
+      }),
+      idempotencyKey: `intent-${digest}-${ordinal}`,
+      deadline: action.deadline ?? {
+        kind: 'contractDefault' as const,
+        data: {},
+      },
+    };
+  });
+  if (
+    persistedPlan.runId !== input.runId
+    || persistedPlan.inputId !== input.currentInput.inputId
+    || persistedPlan.controlEpoch !== input.controlEpoch
+    || persistedPlan.recordedAt !== recordedAt
+    || persistedPlan.planRevision !== planRevision
+    || persistedPlan.title !== normalized.title
+    || persistedPlan.objective !== normalized.objective
+    || persistedPlan.narrative !== normalized.narrative
+    || canonicalJson(normalizedEvidence)
+      !== canonicalJson(normalized.evidence)
+    || canonicalJson(persistedPlan.predecessorPlanRef)
+      !== canonicalJson(predecessorPlanRef)
+    || persistedPlan.carriedSettlementRefs.length !== 0
+    || canonicalJson(persistedPlan.actions)
+      !== canonicalJson(expectedActions)
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_persisted_plan_mismatch',
+      'The sealed Provider proposal does not match its immutable admitted Plan record.'
+    );
+  }
+}
+
+const RECOVERABLE_PLAN_EVIDENCE_ERROR_CODES_V1 = [
+  'session_kernel_provider_plan_evidence_stale',
+  'session_kernel_provider_plan_resource_evidence_mismatch',
+  'session_kernel_provider_plan_blocking_unknowns',
+  'session_kernel_provider_plan_evidence_debt_unresolved',
+] as const;
+
+type RecoverablePlanEvidenceErrorCodeV1 =
+  typeof RECOVERABLE_PLAN_EVIDENCE_ERROR_CODES_V1[number];
+
+type PlanEvidenceRefreshV1 = Extract<
+  SessionProviderTurnOutputV2,
+  { kind: 'planEvidenceRefresh' }
+>['refresh'];
+
+function isRecoverablePlanEvidenceErrorV1(
+  error: unknown
+): error is SessionKernelProviderAdapterError & {
+  code: RecoverablePlanEvidenceErrorCodeV1;
+} {
+  return error instanceof SessionKernelProviderAdapterError
+    && RECOVERABLE_PLAN_EVIDENCE_ERROR_CODES_V1.some(
+      (code) => code === error.code
+    );
+}
+
+function planEvidenceRefreshV1(
+  input: SessionKernelProviderAdapterInputV2,
+  draft: SessionProviderPlanDraftV2,
+  errorCode: RecoverablePlanEvidenceErrorCodeV1,
+  proposalArgumentsDigest: string
+): PlanEvidenceRefreshV1 {
+  const normalized = normalizePlanDraft(draft);
+  const kernelFacts = input.kernelFacts ?? {
+    snapshotHighWater: 0,
+    omittedCount: 0,
+    facts: [],
+  };
+  const currentFactIds = [...new Set(
+    kernelFacts.facts
+      .filter((fact) =>
+        fact.lineage.runId === input.runId
+        && fact.lineage.controlEpoch === input.controlEpoch
+      )
+      .map((fact) => fact.factId)
+  )].sort();
+  const currentFactIdSet = new Set(currentFactIds);
+  const proposedFactRefs = [
+    ...normalized.evidence.kernelFactRefs,
+    ...normalized.evidence.readResources.flatMap(
+      (resource) => resource.factRefs
+    ),
+  ];
+  const staleFactRefs = [...new Set(
+    proposedFactRefs.filter((factRef) => !currentFactIdSet.has(factRef))
+  )].sort();
+  const candidateScopeDigest = planCandidateScopeDigestV1(normalized);
+  const pendingDebt = pendingPlanEvidenceDebtV1(input, normalized);
+  const matchedHistoricalCandidates = input.sessionMemory.historicalReadCandidates
+    .filter((candidate) =>
+      staleFactRefs.includes(candidate.sourceFactId)
+      || normalized.evidence.readResources.some((resource) =>
+        candidate.resourceRefs.includes(resource.resourceRef)
+      )
+    );
+  const resourceRefs = [...new Set(
+    [
+      ...normalized.evidence.readResources.map(
+        (resource) => resource.resourceRef
+      ),
+      ...matchedHistoricalCandidates
+        .flatMap((candidate) => candidate.resourceRefs),
+    ]
+  )].sort();
+  const readSubjectDigests = [...new Set([
+    ...matchedHistoricalCandidates.map((candidate) => candidate.subjectDigest),
+    ...(pendingDebt?.readSubjectDigests ?? []),
+  ])].sort();
+  const blockingUnknownIds = normalized.evidence.blockingUnknowns
+    .map((unknown) => unknown.unknownId)
+    .sort();
+  const requiresCurrentRead = pendingDebt?.requiresCurrentRead === true
+    || staleFactRefs.length > 0
+    || resourceRefs.length > 0
+    || readSubjectDigests.length > 0;
+  return {
+    errorCode,
+    staleFactRefs,
+    resourceRefs,
+    readSubjectDigests,
+    blockingUnknownIds,
+    candidateScopeDigest,
+    requiresCurrentRead,
+    snapshotHighWater: kernelFacts.snapshotHighWater,
+    factSetDigest: sha256Hash(canonicalJson({
+      schemaVersion: 'deepcode.session.plan-evidence-fact-set.v1',
+      snapshotHighWater: kernelFacts.snapshotHighWater,
+      omittedCount: kernelFacts.omittedCount,
+      factIds: currentFactIds,
+    })),
+    evidenceDebtDigest: sha256Hash(canonicalJson({
+      schemaVersion: 'deepcode.session.plan-evidence-debt.v1',
+      errorCode,
+      proposalArgumentsDigest,
+      candidateScopeDigest,
+      requiresCurrentRead,
+      staleFactRefs,
+      resourceRefs,
+      readSubjectDigests,
+      blockingUnknownIds,
+    })),
+  };
+}
+
+function planEvidenceRefreshGuidanceV1(
+  refresh: PlanEvidenceRefreshV1
+): string {
+  const reasons = [
+    refresh.staleFactRefs.length > 0
+      ? `${refresh.staleFactRefs.length} cited fact reference(s) are outside the current canonical Kernel snapshot`
+      : undefined,
+    refresh.readSubjectDigests.length > 0
+      ? `${refresh.readSubjectDigests.length} previously observed read subject(s) require current canonical revalidation`
+      : refresh.resourceRefs.length > 0
+        ? 'the cited resource instances require replacement by current canonical read evidence'
+      : undefined,
+    refresh.blockingUnknownIds.length > 0
+      ? `${refresh.blockingUnknownIds.length} blocking unknown(s) remain`
+      : undefined,
+    refresh.requiresCurrentRead
+      ? 'the current mutation scope still requires at least one canonical read observation'
+      : undefined,
+  ].filter((value): value is string => value !== undefined);
+  return [
+    'The proposed mutation Plan was not admitted and grants no authority.',
+    reasons.length > 0 ? `Reason: ${reasons.join('; ')}.` : '',
+    'Prior conversation text and old Run facts are semantic reference only.',
+    'Use the ready read tools to revalidate the directly relevant resources, then cite only fact IDs supplied by the current planEvidenceAuthority frame.',
+    'Do not guess, translate, or substitute fact IDs. If permitted reads cannot eliminate a blocking unknown, ask one concise clarification question instead of resubmitting the same Plan.',
+  ].filter(Boolean).join(' ');
 }
 
 function assertCompletedProviderBackendOutputV2(
@@ -1091,8 +1492,11 @@ export function materializeProviderPlanV2(
     SessionProviderTurnInputV2,
     | 'providerTurnId'
     | 'runId'
+    | 'controlEpoch'
     | 'currentInput'
     | 'toolContext'
+    | 'sessionMemory'
+    | 'providerOutcomes'
     | 'plan'
   > & { kernelFacts?: SessionProviderTurnInputV2['kernelFacts'] },
   draft: SessionProviderPlanDraftV2,
@@ -1106,12 +1510,23 @@ export function materializeProviderPlanV2(
     );
   }
   const exactFacts = input.kernelFacts
-    ? new Map(input.kernelFacts.facts.map((fact) => [fact.factId, fact]))
+    ? new Map(
+        input.kernelFacts.facts
+          .filter((fact) =>
+            fact.lineage.runId === input.runId
+            && fact.lineage.controlEpoch === input.controlEpoch
+          )
+          .map((fact) => [fact.factId, fact])
+      )
     : undefined;
   const evidence = materializeProviderPlanEvidenceV5(
     normalized.evidence,
-    exactFacts
+    exactFacts,
+    input.controlEpoch,
+    input.runId,
+    input.sessionMemory.historicalReadCandidates
   );
+  assertPendingPlanEvidenceDebtResolvedV1(input, normalized, evidence);
   const admittedPlanningTools = new Map(
     input.toolContext.tools
       .map((tool) => [tool.toolId, tool])
@@ -1156,6 +1571,7 @@ export function materializeProviderPlanV2(
   return {
     runId: input.runId,
     inputId: input.currentInput.inputId,
+    controlEpoch: input.controlEpoch,
     planRevision,
     title: normalized.title,
     objective: normalized.objective,
@@ -1289,9 +1705,66 @@ function normalizePlanDraft(
   };
 }
 
+function planCandidateScopeDigestV1(
+  draft: SessionProviderPlanDraftV2
+): string {
+  const actions = draft.actions.map((action) => canonicalJson({
+    toolId: action.toolId,
+    scopeIntent: action.scopeIntent,
+  })).sort();
+  return sha256Hash(canonicalJson({
+    schemaVersion: 'deepcode.session.plan-candidate-scope.v1',
+    actions,
+  }));
+}
+
+function pendingPlanEvidenceDebtV1(
+  input: Pick<SessionProviderTurnInputV2, 'providerOutcomes'>,
+  draft: SessionProviderPlanDraftV2
+): SessionProviderPlanEvidenceRefreshV1 | undefined {
+  const candidateScopeDigest = planCandidateScopeDigestV1(draft);
+  for (let index = input.providerOutcomes.length - 1; index >= 0; index -= 1) {
+    const outcome = input.providerOutcomes[index]!;
+    if (outcome.outputKind === 'plan') return undefined;
+    if (
+      outcome.outputKind === 'planEvidenceRefresh'
+      && outcome.refresh.candidateScopeDigest === candidateScopeDigest
+    ) {
+      return outcome.refresh;
+    }
+  }
+  return undefined;
+}
+
+function assertPendingPlanEvidenceDebtResolvedV1(
+  input: Pick<SessionProviderTurnInputV2, 'providerOutcomes'>,
+  draft: SessionProviderPlanDraftV2,
+  evidence: SessionPlanEvidenceV4
+): void {
+  const pending = pendingPlanEvidenceDebtV1(input, draft);
+  if (!pending) return;
+  const reboundSubjects = new Set(
+    evidence.historicalRebinds.map((rebind) => rebind.subjectDigest)
+  );
+  if (
+    (pending.requiresCurrentRead && evidence.readResources.length === 0)
+    || pending.readSubjectDigests.some(
+      (subjectDigest) => !reboundSubjects.has(subjectDigest)
+    )
+  ) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_plan_evidence_debt_unresolved',
+      'The current mutation scope still lacks the current-Run read evidence required by its latest Plan evidence rejection.'
+    );
+  }
+}
+
 function materializeProviderPlanEvidenceV5(
   evidence: SessionProviderPlanEvidenceDraftV4,
-  exactFacts: ReadonlyMap<string, KernelFactProjectionV2> | undefined
+  exactFacts: ReadonlyMap<string, KernelFactProjectionV2> | undefined,
+  controlEpoch: number,
+  runId: string,
+  historicalCandidates: SessionProviderTurnInputV2['sessionMemory']['historicalReadCandidates']
 ): SessionPlanEvidenceV4 {
   const evidenceFactRefs = new Set(evidence.kernelFactRefs);
   for (const resource of evidence.readResources) {
@@ -1307,6 +1780,7 @@ function materializeProviderPlanEvidenceV5(
   }
 
   const canonicalResourceRefs = new Set<string>();
+  const historicalRebinds: SessionPlanEvidenceV4['historicalRebinds'] = [];
   const readResources = evidence.readResources.map((resource) => {
     const referencedFacts = resource.factRefs.map(
       (factRef) => exactFacts!.get(factRef)!
@@ -1323,17 +1797,19 @@ function materializeProviderPlanEvidenceV5(
         && operationIds.has(fact.lineage.operationId)
       )
     );
-    const candidates = relatedFacts.flatMap(
-      canonicalReadEvidenceCandidatesV5
+    const candidates = relatedFacts.flatMap((fact) =>
+      canonicalReadEvidenceCandidatesV5(
+        fact,
+        controlEpoch,
+        relatedFacts
+      )
     );
     const exactMatches = candidates.filter(
       (candidate) => candidate.resourceRef === resource.resourceRef
     );
     const selected = exactMatches.length === 1
       ? exactMatches[0]
-      : candidates.length === 1
-        ? candidates[0]
-        : undefined;
+      : undefined;
     if (!selected) {
       throw new SessionKernelProviderAdapterError(
         'session_kernel_provider_plan_resource_evidence_mismatch',
@@ -1347,12 +1823,53 @@ function materializeProviderPlanEvidenceV5(
       );
     }
     canonicalResourceRefs.add(selected.resourceRef);
+    const historical = [...historicalCandidates]
+      .filter((candidate) =>
+        candidate.sourceRunId !== runId
+        && candidate.subjectDigest === selected.subjectDigest
+      )
+      .sort((left, right) =>
+        right.sourceEventVersion - left.sourceEventVersion
+        || right.sourceEventId.localeCompare(left.sourceEventId)
+        || right.candidateDigest.localeCompare(left.candidateDigest)
+      )[0];
+    if (historical) {
+      const withoutId = {
+        sourceEventId: historical.sourceEventId,
+        sourceEventDigest: historical.sourceEventDigest,
+        sourceEventVersion: historical.sourceEventVersion,
+        sourceRunId: historical.sourceRunId,
+        sourceFactId: historical.sourceFactId,
+        sourceControlEpoch: historical.sourceControlEpoch,
+        sourceOperationId: historical.sourceOperationId,
+        sourceToolId: historical.toolId,
+        subjectDigest: historical.subjectDigest,
+        sourceEvidenceDigest: historical.sourceEvidenceDigest,
+        sourceCandidateDigest: historical.candidateDigest,
+        currentRunId: runId,
+        currentControlEpoch: controlEpoch,
+        currentFactRef: selected.factRef,
+        currentEvidenceDigest: selected.digest,
+        resourceRef: selected.resourceRef,
+        contentRelation: historical.sourceEvidenceDigest === selected.digest
+          ? 'sameDigest' as const
+          : 'changedDigest' as const,
+      };
+      historicalRebinds.push({
+        rebindId: `historical-rebind-${sha256Hash(
+          canonicalJson(withoutId)
+        ).slice('sha256:'.length)}`,
+        ...withoutId,
+      });
+    }
     return {
       resourceRef: selected.resourceRef,
       digest: selected.digest,
       summary: resource.summary,
       factRefs: uniqueSortedIdentities(
-        [...resource.factRefs, selected.factRef],
+        resource.factRefs.includes(selected.factRef)
+          ? resource.factRefs
+          : [...resource.factRefs, selected.factRef],
         'plan.evidence.resourceFactRefs'
       ),
     };
@@ -1361,6 +1878,7 @@ function materializeProviderPlanEvidenceV5(
   return {
     kernelFactRefs: evidence.kernelFactRefs,
     readResources,
+    historicalRebinds,
     blockingUnknowns: evidence.blockingUnknowns,
     nonBlockingUnknowns: evidence.nonBlockingUnknowns,
     coverage: evidence.coverage,
@@ -1368,15 +1886,69 @@ function materializeProviderPlanEvidenceV5(
 }
 
 function canonicalReadEvidenceCandidatesV5(
-  fact: KernelFactProjectionV2
-): Array<{ resourceRef: string; digest: string; factRef: string }> {
-  if (fact.domain !== 'effect') return [];
+  fact: KernelFactProjectionV2,
+  controlEpoch: number,
+  relatedFacts: readonly KernelFactProjectionV2[]
+): Array<{
+  resourceRef: string;
+  digest: string;
+  factRef: string;
+  toolId: string;
+  subjectDigest: string;
+}> {
+  if (
+    fact.domain !== 'effect'
+    || fact.lineage.controlEpoch !== controlEpoch
+    || !SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(
+      fact.factKind
+    )
+  ) return [];
   const details = providerEvidenceRecordV5(fact.details);
   const identity = providerEvidenceRecordV5(details?.identity);
   const authority = providerEvidenceRecordV5(identity?.authority);
   const digest = details?.evidenceDigest;
+  const subjects = relatedFacts.flatMap((candidate) => {
+    if (
+      candidate.factKind !== 'toolIntentAdmitted'
+      || candidate.lineage.operationId !== fact.lineage.operationId
+    ) return [];
+    const admission = providerEvidenceRecordV5(candidate.details);
+    const admissionIdentity = providerEvidenceRecordV5(admission?.identity);
+    const admissionAuthority = providerEvidenceRecordV5(
+      admissionIdentity?.authority
+    );
+    if (
+      admissionAuthority?.kind !== 'read'
+      || typeof admission?.toolId !== 'string'
+      || !admission.toolId
+      || typeof admission.canonicalArgumentsDigest !== 'string'
+      || !/^sha256:[0-9a-f]{64}$/u.test(
+        admission.canonicalArgumentsDigest
+      )
+      || typeof admission.workspaceBindingDigest !== 'string'
+      || !/^sha256:[0-9a-f]{64}$/u.test(
+        admission.workspaceBindingDigest
+      )
+    ) return [];
+    return [{
+      toolId: admission.toolId,
+      subjectDigest: sha256Hash(canonicalJson({
+        schemaVersion: 'deepcode.session.read-subject.v1',
+        toolId: admission.toolId,
+        canonicalArgumentsDigest: admission.canonicalArgumentsDigest,
+        workspaceBindingDigest: admission.workspaceBindingDigest,
+      })),
+    }];
+  });
+  const uniqueSubjects = [...new Map(
+    subjects.map((subject) => [canonicalJson(subject), subject])
+  ).values()];
+  const subject = uniqueSubjects.length === 1
+    ? uniqueSubjects[0]
+    : undefined;
   if (
     authority?.kind !== 'read'
+    || !subject
     || typeof digest !== 'string'
     || !/^sha256:[0-9a-f]{64}$/u.test(digest)
   ) {
@@ -1396,6 +1968,8 @@ function canonicalReadEvidenceCandidatesV5(
     resourceRef,
     digest,
     factRef: fact.factId,
+    toolId: subject.toolId,
+    subjectDigest: subject.subjectDigest,
   }));
 }
 

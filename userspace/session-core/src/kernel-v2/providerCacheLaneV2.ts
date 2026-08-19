@@ -8,6 +8,7 @@ import {
 } from '../cache/canonicalizer.js';
 import type {
   SessionProviderTurnInputV2,
+  SessionProviderControlSettlementV2,
   SessionProviderStructuredRepairV1,
   SessionWorkAuthorityV3,
 } from './types.js';
@@ -17,6 +18,9 @@ import type {
 import type {
   SessionKernelProviderCachePredecessorV2,
 } from './providerStreamV1.js';
+import {
+  SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
+} from './factKinds.js';
 
 export const SESSION_PROVIDER_ADMISSION_SIDECAR_V2_SCHEMA =
   'deepcode.session.provider-admission-sidecar.v2' as const;
@@ -125,6 +129,12 @@ export interface SessionProviderAdmissionSidecarV2 {
    * enter this private sidecar.
    */
   continuationOutcomes?: SessionProviderContinuationOutcomeV2[];
+  /**
+   * Exact private settlement for the immediately preceding Session control.
+   * It closes Provider-native tool topology only; it grants no Kernel or Plan
+   * authority and never enters the stable Provider prefix.
+   */
+  controlSettlement?: SessionProviderControlSettlementV2;
   structuredRepair?: SessionProviderStructuredRepairV1;
   cacheLane: {
     laneId: string;
@@ -375,6 +385,8 @@ export function buildSessionProviderAdmissionSidecarV2(
       turn,
       input.cacheLane
     );
+  const controlSettlement =
+    sessionProviderControlSettlementV2(turn, input.cacheLane);
   return {
     schemaVersion: SESSION_PROVIDER_ADMISSION_SIDECAR_V2_SCHEMA,
     sessionId: turn.sessionMemory.sessionId,
@@ -425,12 +437,46 @@ export function buildSessionProviderAdmissionSidecarV2(
           continuationOutcomes: continuation,
         }
       : {}),
+    ...(controlSettlement ? { controlSettlement } : {}),
     ...(input.cacheLane.relationKind === 'sameTurnStructuredRepair'
       && turn.structuredRepair
       ? { structuredRepair: cloneJson(turn.structuredRepair) }
       : {}),
     cacheLane: cloneJson(input.cacheLane),
   };
+}
+
+function sessionProviderControlSettlementV2(
+  turn: SessionProviderTurnInputV2,
+  cacheLane: SessionProviderCacheLanePlanV2
+): SessionProviderAdmissionSidecarV2['controlSettlement'] {
+  if (
+    cacheLane.mode !== 'append'
+    || cacheLane.relationKind
+      !== 'sameTurnSessionControlContinuation'
+  ) {
+    if (turn.pendingProviderControlSettlement) {
+      throw new Error(
+        'Pending Session control settlement requires an exact control continuation append.'
+      );
+    }
+    return undefined;
+  }
+  const settlement = turn.pendingProviderControlSettlement;
+  if (
+    !settlement
+    || settlement.predecessorProviderTurnId
+      !== cacheLane.predecessorRequestId
+    || settlement.runId !== turn.runId
+    || settlement.inputId !== turn.currentInput.inputId
+    || settlement.controlEpoch !== turn.controlEpoch
+    || settlement.nextTargetKind !== turn.target.kind
+  ) {
+    throw new Error(
+      'Session control continuation requires one exact pending settlement.'
+    );
+  }
+  return cloneJson(settlement);
 }
 
 function sessionProviderContinuationOutcomesV2(
@@ -562,7 +608,10 @@ function sessionProviderToolSettlementEvidenceMessageV1(
       (fact) => fact.lineage.operationId === call.operationId
     );
     const readResources = facts.flatMap((fact) => {
-      if (fact.domain !== 'effect') return [];
+      if (
+        fact.domain !== 'effect'
+        || !SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(fact.factKind)
+      ) return [];
       const details = providerEvidenceRecordV1(fact.details);
       const identity = providerEvidenceRecordV1(details?.identity);
       const authority = providerEvidenceRecordV1(identity?.authority);
@@ -648,6 +697,7 @@ function sessionProviderSameTurnRelationV2(
   }
   if (
     predecessor.outputKind === 'plan'
+    || predecessor.outputKind === 'planEvidenceRefresh'
     || predecessor.outputKind === 'planActionComplete'
     || predecessor.outputKind === 'intervention'
   ) {
@@ -687,18 +737,37 @@ function sessionStructuredRepairMessagesV1(
         ...(repair.sourceResponseDigest
           ? { sourceResponseDigest: repair.sourceResponseDigest }
           : {}),
-        instruction:
-          'Re-emit the intended response as one complete schema-valid response. Do not repeat commentary, do not claim execution, and do not change the requested task or authority.',
+        instruction: structuredRepairInstructionV1(repair.errorCode),
       }),
     },
     cloneJson(finalMessage),
   ];
 }
 
+function structuredRepairInstructionV1(errorCode: string): string {
+  if ([
+    'session_kernel_provider_plan_tool_unavailable',
+    'session_kernel_provider_plan_read_action_invalid',
+    'session_kernel_provider_plan_scope_shape_invalid',
+    'session_kernel_provider_plan_arguments_invalid',
+  ].includes(errorCode)) {
+    return [
+      'Re-emit the intended response as one complete schema-valid response.',
+      'A Plan may contain only mutation actions, and each action must use the exact scopeIntent branch exposed for its ToolId by deepcode_session_plan_propose_v5.',
+      'Execute reads as ordinary Kernel tool calls before proposing the Plan; do not put reads in Plan actions.',
+      'Do not repeat commentary, claim execution, change the requested task, or expand authority.',
+    ].join(' ');
+  }
+  return 'Re-emit the intended response as one complete schema-valid response. Do not repeat commentary, do not claim execution, and do not change the requested task or authority.';
+}
+
 function sessionControlTransitionMessagesV1(
   turn: SessionProviderTurnInputV2
 ): LlmChatMessage[] {
-  if (turn.purpose !== 'continuation') {
+  if (
+    turn.purpose !== 'continuation'
+    && turn.purpose !== 'finalAnswer'
+  ) {
     throw new Error(
       'Session control continuation must remain in the current authoritative user turn.'
     );

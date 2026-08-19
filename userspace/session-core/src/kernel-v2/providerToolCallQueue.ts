@@ -19,6 +19,7 @@ import {
   SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2,
 } from './factKinds.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
+import { utf8Prefix } from './utf8.js';
 import {
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   type SessionProviderCompletionReceiptV1,
@@ -1092,7 +1093,9 @@ export function repairedSessionProviderOutcomeV2(
     providerTurnId,
     outputKind: 'toolIntent',
     recordedAt,
-    ...(output.guidance ? { summary: output.guidance.slice(0, 8_192) } : {}),
+    ...(output.guidance
+      ? { summary: utf8Prefix(output.guidance, 8_192) }
+      : {}),
     toolCallReceipt: receipt,
     toolSettlement: {
       status: 'aborted',
@@ -1509,8 +1512,19 @@ function previewMatchesApprovedPlanAction(
   approved: CapabilityScopePreviewRecordV2,
   candidate: SessionProviderMutationCandidatePreviewV4
 ): boolean {
+  // Kernel digests bind a preview to its origin and preview identity. A
+  // planDiscovery preview therefore cannot share those digests with the
+  // approved Plan preview even when the invocation and canonical scope are
+  // exact. Kernel re-canonicalizes the subsequent ToolIntent, so Session
+  // compares the shared authority identities and semantic scope here.
   return discovery.runId === approved.runId
+    && candidate.runId === approved.runId
     && discovery.controlEpoch === approved.controlEpoch
+    && candidate.controlEpoch === approved.controlEpoch
+    && discovery.planRevision === approved.planRevision
+    && candidate.planRevision === approved.planRevision
+    && discovery.planActionId === approved.planActionId
+    && candidate.planActionId === approved.planActionId
     && discovery.toolId === approved.toolId
     && candidate.toolId === approved.toolId
     && canonicalJson(discovery.contextRef) === canonicalJson(approved.contextRef)
@@ -1518,8 +1532,6 @@ function previewMatchesApprovedPlanAction(
       === canonicalJson(approved.authorizationBinding)
     && canonicalJson(discovery.canonicalScope)
       === canonicalJson(approved.canonicalScope)
-    && discovery.scopeDigest === approved.scopeDigest
-    && discovery.authorizationDigest === approved.authorizationDigest
     && discovery.toolContractDigest === approved.toolContractDigest
     && discovery.effectClass === approved.effectClass
     && discovery.effectScope === approved.effectScope
@@ -1683,7 +1695,14 @@ function validateExactSessionProviderOutcomeRecordV2(
       'recordedAt',
       'providerResult',
     ],
-    ['summary', 'toolCallReceipt', 'toolSettlement', 'toolCalls']
+    [
+      'summary',
+      'toolCallReceipt',
+      'toolSettlement',
+      'toolCalls',
+      'control',
+      'refresh',
+    ]
   );
   const providerTurnId = requiredIdentity(
     record.providerTurnId,
@@ -1730,6 +1749,9 @@ function validateExactSessionProviderOutcomeRecordV2(
   }
 
   if (record.outputKind === 'toolIntent') {
+    if (record.control !== undefined || record.refresh !== undefined) {
+      throw invalidQueue();
+    }
     const receipt = exactOutcomeObject(
       record.toolCallReceipt,
       [
@@ -1888,6 +1910,115 @@ function validateExactSessionProviderOutcomeRecordV2(
     return;
   }
 
+  if (record.outputKind === 'planEvidenceRefresh') {
+    if (
+      Object.prototype.hasOwnProperty.call(record, 'toolCallReceipt')
+      || Object.prototype.hasOwnProperty.call(record, 'toolSettlement')
+      || Object.prototype.hasOwnProperty.call(record, 'toolCalls')
+    ) {
+      throw invalidQueue();
+    }
+    const control = exactOutcomeObject(
+      record.control,
+      ['schemaVersion', 'callId', 'toolName', 'argumentsDigest']
+    );
+    if (
+      control.schemaVersion !== 'deepcode.session.plan-proposal.v5'
+      || control.toolName !== 'deepcode_session_plan_propose_v5'
+    ) {
+      throw invalidQueue();
+    }
+    requiredIdentity(control.callId, 'providerOutcome.control.callId');
+    requiredDigest(
+      control.argumentsDigest,
+      'providerOutcome.control.argumentsDigest'
+    );
+    const refresh = exactOutcomeObject(
+      record.refresh,
+      [
+        'errorCode',
+        'staleFactRefs',
+        'resourceRefs',
+        'readSubjectDigests',
+        'blockingUnknownIds',
+        'candidateScopeDigest',
+        'requiresCurrentRead',
+        'snapshotHighWater',
+        'factSetDigest',
+        'evidenceDebtDigest',
+      ]
+    );
+    if (![
+      'session_kernel_provider_plan_evidence_stale',
+      'session_kernel_provider_plan_resource_evidence_mismatch',
+      'session_kernel_provider_plan_blocking_unknowns',
+      'session_kernel_provider_plan_evidence_debt_unresolved',
+    ].includes(String(refresh.errorCode))) {
+      throw invalidQueue();
+    }
+    for (const [field, value] of [
+      ['staleFactRefs', refresh.staleFactRefs],
+      ['resourceRefs', refresh.resourceRefs],
+      ['blockingUnknownIds', refresh.blockingUnknownIds],
+    ] as const) {
+      if (
+        !Array.isArray(value)
+        || value.length > 512
+        || new Set(value).size !== value.length
+        || value.some((item) => {
+          try {
+            requiredIdentity(item, `providerOutcome.refresh.${field}`);
+            return false;
+          } catch {
+            return true;
+          }
+        })
+      ) {
+        throw invalidQueue();
+      }
+    }
+    const readSubjectDigests = refresh.readSubjectDigests;
+    if (
+      !Array.isArray(readSubjectDigests)
+      || readSubjectDigests.length > 512
+      || new Set(readSubjectDigests).size !== readSubjectDigests.length
+      || readSubjectDigests.some((digest, index) => {
+        try {
+          requiredDigest(
+            digest,
+            'providerOutcome.refresh.readSubjectDigest'
+          );
+          return index > 0
+            && readSubjectDigests[index - 1] >= digest;
+        } catch {
+          return true;
+        }
+      })
+    ) {
+      throw invalidQueue();
+    }
+    if (
+      !Number.isSafeInteger(refresh.snapshotHighWater)
+      || Number(refresh.snapshotHighWater) < 0
+      || typeof refresh.requiresCurrentRead !== 'boolean'
+    ) {
+      throw invalidQueue();
+    }
+    requiredDigest(
+      refresh.candidateScopeDigest,
+      'providerOutcome.refresh.candidateScopeDigest'
+    );
+    requiredDigest(
+      refresh.factSetDigest,
+      'providerOutcome.refresh.factSetDigest'
+    );
+    requiredDigest(
+      refresh.evidenceDebtDigest,
+      'providerOutcome.refresh.evidenceDebtDigest'
+    );
+    return;
+  }
+
   if (
     record.outputKind !== 'plan'
     && record.outputKind !== 'answer'
@@ -1901,9 +2032,57 @@ function validateExactSessionProviderOutcomeRecordV2(
     Object.prototype.hasOwnProperty.call(record, 'toolCallReceipt')
     || Object.prototype.hasOwnProperty.call(record, 'toolSettlement')
     || Object.prototype.hasOwnProperty.call(record, 'toolCalls')
+    || Object.prototype.hasOwnProperty.call(record, 'refresh')
   ) {
     throw invalidQueue();
   }
+  if (
+    record.outputKind === 'plan'
+    || record.outputKind === 'planActionComplete'
+    || record.outputKind === 'intervention'
+  ) {
+    validateProviderControlReceiptV2(
+      record.control,
+      record.outputKind
+    );
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(record, 'control')) {
+    throw invalidQueue();
+  }
+}
+
+function validateProviderControlReceiptV2(
+  value: unknown,
+  outputKind: 'plan' | 'planActionComplete' | 'intervention'
+): void {
+  const control = exactOutcomeObject(
+    value,
+    ['schemaVersion', 'callId', 'toolName', 'argumentsDigest']
+  );
+  const expected = outputKind === 'plan'
+    ? {
+        schemaVersion: 'deepcode.session.plan-proposal.v5',
+        toolName: 'deepcode_session_plan_propose_v5',
+      }
+    : outputKind === 'planActionComplete'
+      ? {
+          schemaVersion: 'deepcode.session.plan-action-complete.v2',
+          toolName: 'deepcode_session_plan_action_complete_v2',
+        }
+      : {
+          schemaVersion: 'deepcode.session.intervention-proposal.v1',
+          toolName: 'deepcode_session_intervention_propose_v1',
+        };
+  if (
+    control.schemaVersion !== expected.schemaVersion
+    || control.toolName !== expected.toolName
+  ) throw invalidQueue();
+  requiredIdentity(control.callId, 'providerOutcome.control.callId');
+  requiredDigest(
+    control.argumentsDigest,
+    'providerOutcome.control.argumentsDigest'
+  );
 }
 
 function validateProviderToolRejectionV2(

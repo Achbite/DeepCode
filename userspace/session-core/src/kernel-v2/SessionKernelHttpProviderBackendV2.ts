@@ -210,7 +210,7 @@ function providerContinuationParentIdV2(
   expectedProfileId: string
 ): string | undefined {
   if (
-    input.purpose !== 'continuation'
+    (input.purpose !== 'continuation' && input.purpose !== 'finalAnswer')
     || input.structuredRepair
     || input.providerProfile.reasoningTransport !== 'openaiPlaintext'
   ) return undefined;
@@ -228,13 +228,29 @@ function providerContinuationParentIdV2(
   }
   if (
     previous.outputKind === 'plan'
+    || previous.outputKind === 'planEvidenceRefresh'
     || previous.outputKind === 'planActionComplete'
     || previous.outputKind === 'intervention'
   ) {
+    const settlement = input.pendingProviderControlSettlement;
+    if (
+      !settlement
+      || settlement.predecessorProviderTurnId !== previous.providerTurnId
+      || settlement.runId !== input.runId
+      || settlement.inputId !== input.currentInput.inputId
+      || settlement.controlEpoch !== input.controlEpoch
+      || settlement.nextTargetKind !== input.target.kind
+    ) {
+      throw new Error(
+        'Session control continuation is missing its exact durable settlement.'
+      );
+    }
     return previous.providerTurnId;
   }
   if (
-    previous.outputKind !== 'toolIntent'
+    input.purpose !== 'continuation'
+    || input.pendingProviderControlSettlement !== undefined
+    || previous.outputKind !== 'toolIntent'
     || previous.toolCallReceipt.providerTurnId
       !== previous.providerTurnId
     || previous.toolCallReceipt.callCount <= 0
