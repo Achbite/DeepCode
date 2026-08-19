@@ -24,6 +24,7 @@ import {
   createFactsPage,
   createInitialState,
   createPlan,
+  createPlanDiscoveryPreviewBatch,
   createPreview,
   corpusFact,
   openSessionHarness,
@@ -65,6 +66,14 @@ export const contractCases = [
   {
     id: 'provider_token_usage_projection_is_canonical_digest_safe',
     run: providerTokenUsageProjectionIsCanonicalDigestSafe,
+  },
+  {
+    id: 'failed_provider_usage_is_projected_once_from_diagnostic',
+    run: failedProviderUsageIsProjectedOnceFromDiagnostic,
+  },
+  {
+    id: 'abi_v3_read_review_folds_into_final_fact_receipt',
+    run: abiV3ReadReviewFoldsIntoFinalFactReceipt,
   },
   {
     id: 'draft_review_stays_private_and_final_review_projects_once',
@@ -186,10 +195,200 @@ async function providerTokenUsageProjectionIsCanonicalDigestSafe() {
   );
 }
 
+async function failedProviderUsageIsProjectedOnceFromDiagnostic() {
+  const sessionId = 'session-failed-provider-token-usage';
+  const runId = 'run-failed-provider-token-usage';
+  const providerTurnId = 'provider-turn-failed-token-usage';
+  const providerOutcome = {
+    providerProfileId: 'provider-profile-failed-token-usage',
+    provider: 'deepseek',
+    model: 'deepseek-failed-token-usage-contract',
+    usage: {
+      prompt_cache_hit_tokens: 19_072,
+      prompt_cache_miss_tokens: 2_179,
+      cached_tokens: 19_072,
+      prompt_tokens: 21_251,
+      completion_tokens: 6_875,
+      total_tokens: 28_126,
+    },
+  };
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [
+      agentEvent(
+        sessionId,
+        'event-failed-token-usage-user',
+        'user_msg',
+        runId,
+        {
+          inputId: 'input-failed-token-usage',
+          text: 'Build a mutation Plan.',
+          attachments: [],
+        },
+        0
+      ),
+      agentEvent(
+        sessionId,
+        'event-failed-token-usage-started',
+        'workflow_stage',
+        runId,
+        {
+          projectionKind: 'provider.started',
+          providerTurnId,
+        },
+        1
+      ),
+      agentEvent(
+        sessionId,
+        'event-failed-token-usage-diagnostic',
+        'error',
+        runId,
+        {
+          projectionKind: 'diagnostic',
+          providerTurnId,
+          code: 'session_kernel_provider_plan_evidence_stale',
+          message: 'Provider output validation failed.',
+          providerOutcome,
+        },
+        2
+      ),
+      agentEvent(
+        sessionId,
+        'event-failed-token-usage-diagnostic-replay',
+        'error',
+        runId,
+        {
+          projectionKind: 'diagnostic',
+          providerTurnId,
+          code: 'session_kernel_provider_plan_evidence_stale',
+          message: 'Provider output validation failed.',
+          providerOutcome,
+        },
+        3
+      ),
+    ],
+  });
+  assert.equal(projection.tokenUsageProjection.requests.length, 1);
+  assert.deepEqual(projection.tokenUsageProjection.totals, {
+    promptCacheHitTokens: 19_072,
+    promptCacheMissTokens: 2_179,
+    cachedTokens: 19_072,
+    promptTokens: 21_251,
+    completionTokens: 6_875,
+    totalTokens: 28_126,
+    providerCallCount: 1,
+    providers: ['deepseek'],
+  });
+  assert.deepEqual(
+    projection.tokenUsageProjection.requests[0].stages,
+    ['diagnostic']
+  );
+}
+
+async function abiV3ReadReviewFoldsIntoFinalFactReceipt() {
+  const sessionId = 'session-read-review-fold';
+  let state = createSessionKernelLoopStateV2(createInitialState());
+  state = reconcileSessionKernelFactsPageV2(
+    state,
+    createFactsPage([
+      corpusFact('effectContextReadObserved', {
+        factId: 'fact-read-review-fold',
+        ledgerSequence: 1,
+        runSequence: 1,
+        identities: {
+          runId: RUN_ID,
+          contextReadOperationId: 'operation-read-review-fold',
+          contextReadInvocationId: 'invocation-read-review-fold',
+          contextReadAttemptId: 'attempt-read-review-fold',
+          contextReadEffectId: 'effect-read-review-fold',
+        },
+      }),
+    ], {
+      requestedAfterLedgerSequence: 0,
+      snapshotHighWater: 1,
+    })
+  ).state;
+  const draft = buildSessionKernelReviewV2(
+    state,
+    '2026-07-29T00:05:01.000Z'
+  );
+  const review = {
+    ...draft,
+    status: 'final',
+    finalizedAt: '2026-07-29T00:05:02.000Z',
+  };
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [
+      agentEvent(
+        sessionId,
+        'event-read-review-user',
+        'user_msg',
+        RUN_ID,
+        {
+          inputId: 'input-read-review-fold',
+          text: 'Inspect the workspace.',
+          attachments: [],
+        },
+        0
+      ),
+      reviewProjectionEvent(sessionId, RUN_ID, 1, review),
+      sessionKernelAgentEventV2(sessionId, {
+        projectionId: 'provider-read-review-final',
+        runId: RUN_ID,
+        recordedAt: '2026-07-29T00:05:03.000Z',
+        kind: 'provider.completed',
+        data: {
+          providerTurnId: 'provider-turn-read-review-final',
+          controlEpoch: 1,
+          outputKind: 'answer',
+          terminalScope: 'turn',
+          orderedItems: [{
+            kind: 'text',
+            phase: 'final_answer',
+            text: 'Workspace inspection complete.',
+          }],
+          result: {
+            kind: 'answer',
+            text: 'Workspace inspection complete.',
+          },
+          reviewRevision: review.revision,
+          snapshotHighWater: review.snapshotHighWater,
+          providerOutcome: {
+            providerProfileId: 'provider-profile-read-review',
+            provider: 'deepseek',
+            model: 'deepseek-read-review',
+          },
+        },
+      }),
+    ],
+  });
+  const reviewBlocks = projection.turns.flatMap((turn) =>
+    turn.blocks.filter((block) => block.kind === 'review')
+  );
+  assert.equal(
+    reviewBlocks.length,
+    0,
+    'successful ABI v3 read facts must not create a standalone Review block'
+  );
+  const finalBlock = projection.turns.flatMap((turn) => turn.blocks).find(
+    (block) => block.kind === 'assistant'
+      && block.entryRole === 'finalAnswer'
+  );
+  assert.equal(finalBlock?.structuredProjection?.kind, 'review');
+  assert.equal(
+    finalBlock.structuredProjection.sections.some(
+      (section) => section.sectionId === 'actualEffects'
+    ),
+    true,
+    'the canonical read fact must remain available in the folded receipt'
+  );
+}
+
 async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   const harness = await openSessionHarness();
   const plan = createPlan();
-  await persistPreviewAndAcceptPlan(harness, plan);
+  const { preview } = await persistPreviewAndAcceptPlan(harness, plan);
   harness.enqueueProvider(providerToolIntents([
     {
       callId: 'provider-call-review-queue-1',
@@ -203,13 +402,21 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     },
   ]));
   harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, preview)
+  );
+  harness.enqueueKernel(
+    'previewCapabilityBatch',
+    (request) => createPlanDiscoveryPreviewBatch(request, preview)
+  );
+  harness.enqueueKernel(
     'submitToolIntent',
     (request) => admittedReply(harness, request, {
       invocationId: 'invocation-review-queue-1',
       attemptId: 'attempt-review-queue-1',
     })
   );
-  const admitted = await harness.loop.runProviderTurn({
+  const classified = await harness.loop.runProviderTurn({
     reason: 'planExecution',
     target: {
       kind: 'planAction',
@@ -217,7 +424,14 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     },
     remainingToolCallBudget: 2,
   });
+  assert.equal(classified.kind, 'noTool');
+  const secondClassification =
+    await harness.loop.resumePendingProviderToolCalls();
+  assert.equal(secondClassification.kind, 'noTool');
+  const admitted = await harness.loop.resumePendingProviderToolCalls();
   assert.equal(admitted.kind, 'admitted');
+  const providerTurnCountBeforeQueueReentry =
+    harness.providerInputs.length;
   assert.equal(
     harness.loop.snapshot().providerToolCallQueue.outcomeRecorded,
     false
@@ -321,7 +535,7 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
   );
   assert.equal(
     harness.providerInputs.length,
-    1,
+    providerTurnCountBeforeQueueReentry,
     'an active queue must reject a new Provider turn before transport'
   );
 
@@ -372,7 +586,10 @@ async function canonicalTerminalFactsSettleQueueBeforeNextProviderOrReview() {
     remainingToolCallBudget: 1,
   });
   assert.deepEqual(continued, { kind: 'noTool' });
-  assert.equal(harness.providerInputs.length, 2);
+  assert.equal(
+    harness.providerInputs.length,
+    providerTurnCountBeforeQueueReentry + 1
+  );
   settled = harness.loop.snapshot();
   const review = buildSessionKernelReviewV2(
     settled,

@@ -10,6 +10,9 @@ import {
   SESSION_KERNEL_PERSISTENCE_V3_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA,
   SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
   SESSION_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA,
@@ -17,12 +20,12 @@ import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
   SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
   SessionKernelLoopV2,
-  buildSessionPlanConfirmationAuthorityV2,
+  SessionKernelProviderTransportError,
+  StrictSessionKernelProviderAdapterV2,
+  adaptSessionKernelProviderBackendOutputV2,
   canonicalJson,
-  checkpointSessionKernelStateV2,
   prepareSessionKernelFactReplayV3,
   providerWireToolNameV2,
-  recordSessionPlanConfirmationAuthorityV2,
   sha256Hash,
 } from '../../dist/index.js';
 export { assert };
@@ -109,18 +112,22 @@ export function createInput(overrides = {}) {
     opaqueInputRef: overrides.opaqueInputRef ?? 'session-input:initial',
     text: overrides.text ?? 'Inspect the current workspace safely.',
     attachments: clone(overrides.attachments ?? []),
+    attachmentContexts: clone(overrides.attachmentContexts ?? []),
     recordedAt: overrides.recordedAt ?? NOW,
   };
 }
 function createSessionMemory(sessionId = 'session-v2-contract') {
   const value = {
-    schemaVersion: 'deepcode.session.context-memory.v2',
+    schemaVersion: 'deepcode.session.context-memory.v3',
     sessionId,
     sourceEventVersion: 0,
     sourceEventCount: 0,
     omittedEntryCount: 0,
     truncated: false,
     entries: [],
+    historicalReadCandidateCount: 0,
+    omittedHistoricalReadCandidateCount: 0,
+    historicalReadCandidates: [],
   };
   return {
     ...value,
@@ -178,11 +185,24 @@ export function createPlan(overrides = {}) {
   return {
     runId: overrides.runId ?? RUN_ID,
     inputId: overrides.inputId ?? 'input-initial',
+    controlEpoch: overrides.controlEpoch ?? 1,
     planRevision,
     title: overrides.title ?? 'Write reviewed output',
     objective: overrides.objective ?? 'Write one file inside the workspace.',
     narrative: overrides.narrative
       ?? 'Use the approved PlanAction and report canonical facts.',
+    evidence: clone(overrides.evidence ?? {
+      kernelFactRefs: [],
+      readResources: [],
+      historicalRebinds: [],
+      blockingUnknowns: [],
+      nonBlockingUnknowns: [],
+      coverage: 'The requested workspace mutation is fully scoped by the user input.',
+    }),
+    ...(overrides.predecessorPlanRef
+      ? { predecessorPlanRef: clone(overrides.predecessorPlanRef) }
+      : {}),
+    carriedSettlementRefs: clone(overrides.carriedSettlementRefs ?? []),
     actions: clone(overrides.actions ?? [action]),
     recordedAt: overrides.recordedAt ?? NOW,
   };
@@ -229,7 +249,139 @@ export function createPreviewBatch(request, runId) {
     })),
   };
 }
+export function createPlanDiscoveryPreviewBatch(request, approvedPreview) {
+  return {
+    runId: approvedPreview.runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => {
+      assert.equal(item.origin.kind, 'planDiscovery');
+      return {
+        kind: 'previewed',
+        data: {
+          preview: {
+            ...clone(approvedPreview),
+            previewId: `preview-${item.origin.data.discoveryId}`,
+            planRevision: request.planRevision,
+            planActionId: item.planActionId,
+            operationId: item.operationId,
+            toolId: item.toolId,
+            origin: clone(item.origin),
+          },
+        },
+      };
+    }),
+  };
+}
+export function createOutOfPlanDiscoveryPreviewBatch(
+  request,
+  approvedPreview,
+  path = 'expanded.txt'
+) {
+  assert.equal(request.items.length, 1);
+  const item = request.items[0];
+  assert.equal(item.origin.kind, 'planDiscovery');
+  assert.equal(previewItemPath(item), path);
+  const preview = scopedPreviewForItem(
+    request,
+    item,
+    approvedPreview,
+    `preview-${item.origin.data.discoveryId}`,
+    path
+  );
+  return {
+    runId: approvedPreview.runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: [{ kind: 'previewed', data: { preview } }],
+  };
+}
+export function createInterventionCandidatePreviewBatch(
+  request,
+  approvedPreview
+) {
+  return {
+    runId: approvedPreview.runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => {
+      assert.equal(item.origin.kind, 'interventionCandidate');
+      const path = previewItemPath(item);
+      return {
+        kind: 'previewed',
+        data: {
+          preview: scopedPreviewForItem(
+            request,
+            item,
+            approvedPreview,
+            [
+              'preview-intervention',
+              item.origin.data.optionId,
+              item.planActionId,
+            ].join('-'),
+            path
+          ),
+        },
+      };
+    }),
+  };
+}
+function scopedPreviewForItem(
+  request,
+  item,
+  approvedPreview,
+  previewId,
+  path
+) {
+  const canonicalResourceRef = `workspace:Write:${path}`;
+  const scopeDigest = sha256Hash(canonicalJson({
+    kind: 'workspace',
+    path,
+    access: 'write',
+  }));
+  return {
+    ...clone(approvedPreview),
+    previewId,
+    planRevision: request.planRevision,
+    planActionId: item.planActionId,
+    operationId: item.operationId,
+    toolId: item.toolId,
+    origin: clone(item.origin),
+    scopeDigest,
+    authorizationDigest: sha256Hash(canonicalJson({
+      previewId,
+      scopeDigest,
+      origin: item.origin,
+    })),
+    canonicalScope: {
+      kind: 'workspace',
+      data: {
+        targets: [{
+          ...clone(approvedPreview.canonicalScope.data.targets[0]),
+          relativePath: path,
+        }],
+      },
+    },
+    approvalView: {
+      ...clone(approvedPreview.approvalView),
+      scopeDigest,
+      canonicalTargets: [canonicalResourceRef],
+      resourcePresentation: [{
+        canonicalResourceRef,
+        kind: 'workspacePath',
+        label: path,
+        workspaceRelativePath: path,
+      }],
+      summary: `Mutate using ${item.toolId} within 1 canonical target(s)`,
+    },
+  };
+}
 function previewItemPath(item) {
+  if (item.rawArguments) {
+    const path = item.rawArguments.path;
+    assert.equal(typeof path, 'string');
+    return path;
+  }
   if (item.scopeIntent.kind === 'exactInvocation') {
     const path = item.scopeIntent.data.rawArguments.path;
     assert.equal(typeof path, 'string');
@@ -325,7 +477,7 @@ export function admittedReply(harness, request, overrides = {}) {
   const suffix = intent.operationId.slice(-16);
   const invocationId = overrides.invocationId ?? `invocation-${suffix}`;
   const attemptId = overrides.attemptId ?? `attempt-${suffix}`;
-  const contextRead = intent.authority.kind === 'contextRead';
+  const contextRead = intent.authority.kind === 'read';
   const mutationContextRead = contextRead && intent.toolContextRef.contextVersion === 3;
   const expanded = !contextRead
     && intent.rawArguments.path === 'expanded.txt';
@@ -806,9 +958,30 @@ export function createSessionHarness(options = {}) {
       if (!providerOutputs.length) throw new Error('provider output queue is empty');
       const output = providerOutputs.shift();
       if (output instanceof Error) throw output;
-      const resolved = clone(
-        typeof output === 'function' ? await output(input) : output
-      );
+      const value = typeof output === 'function'
+        ? await output(input)
+        : output;
+      if (value?.harnessProviderFailure) {
+        const failure = value.harnessProviderFailure;
+        store.providerEvidence.set(
+          input.providerTurnId,
+          createFailedProviderEvidence(input, failure.errorCode, {
+            recordedAt: new Date(
+              Date.parse(NOW) + store.clockSequence++
+            ).toISOString(),
+            structuredFailure: failure.structuredFailure,
+            providerResult: failure.providerResult,
+          })
+        );
+        throw new SessionKernelProviderTransportError(
+          failure.errorCode,
+          failure.message,
+          undefined,
+          clone(failure.structuredFailure),
+          clone(failure.providerResult.usage)
+        );
+      }
+      const resolved = clone(value);
       store.providerEvidence.set(
         input.providerTurnId,
         createProviderEvidence(input, resolved, {
@@ -888,69 +1061,160 @@ export async function persistPreviewAndAcceptPlan(
   harness,
   plan = createPlan()
 ) {
-  await harness.loop.recordPlan(plan);
+  const draft = providerPlanDraftFromMaterializedPlan(plan);
+  const controlArguments = {
+    schemaVersion: 'deepcode.session.plan-proposal.v5',
+    plan: clone(draft),
+  };
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'plan',
+    controlArguments,
+  }));
+  const backendOutput = {
+    kind: 'plan',
+    plan: clone(draft),
+    planProposal: {
+      schemaVersion: 'deepcode.session.plan-proposal.v5',
+      callId: 'call-harness-plan-confirmation',
+      toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
+      argumentsDigest: sha256Hash(canonicalJson(controlArguments)),
+    },
+    items: [{
+      kind: 'text',
+      phase: 'commentary',
+      text: 'The mutation Plan is ready for user confirmation.',
+    }],
+    completion: createProviderCompletionReceipt(responseDigest, {
+      hasToolCalls: true,
+      reasoningTransport:
+        harness.initial.providerProfile.reasoningTransport,
+    }),
+    providerResult: {
+      providerProfileId:
+        harness.initial.providerProfile.providerProfileId,
+      provider: 'contract-provider',
+      model: 'contract-model',
+    },
+    responseDigest,
+  };
+  const adapter = new StrictSessionKernelProviderAdapterV2(
+    { async requestTurn() { return clone(backendOutput); } },
+    {
+      now: () => new Date(
+        Date.parse(NOW) + harness.store.clockSequence
+      ).toISOString(),
+    }
+  );
+  const restoreTerminalEvidence = installPlanningTerminalEvidence(
+    harness,
+    draft,
+    backendOutput.planProposal.callId
+  );
+  harness.enqueueProvider((input) => adapter.requestTurn(input));
+  let proposed;
+  try {
+    proposed = await harness.loop.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+    });
+  } finally {
+    restoreTerminalEvidence();
+  }
+  assert.equal(proposed.kind, 'plan');
+  replaceObjectContents(plan, proposed.plan);
   harness.enqueueKernel(
     'previewCapabilityBatch',
-    (request) => createPreviewBatch(request, harness.initial.runId)
+    (request) => createMaterializedPlanPreviewBatch(
+      request,
+      harness.initial.runId
+    )
   );
   const preview = await harness.loop.previewPlan(plan.planRevision);
   assert.equal(preview.results.length, plan.actions.length);
   assert.equal(preview.results[0].kind, 'previewed');
-  const providerTurnId = 'provider-turn-harness-plan-confirmation';
-  const confirmationEvent = {
-    projectionId: [
-      'run',
-      harness.initial.runId,
-      'plan',
-      plan.planRevision,
-      'confirmation-ready',
-    ].join(':'),
-    runId: harness.initial.runId,
-    recordedAt: NOW,
-    kind: 'plan.confirmationReady',
-    data: {
-      planRevision: plan.planRevision,
-      providerTurnId,
-      plan: clone(plan),
-      scopePreviews: preview.results.map((result) => {
-        assert.equal(result.kind, 'previewed');
-        return clone(result.data.preview);
-      }),
-      recordedAt: NOW,
-    },
-  };
-  const confirmationReceipt = await harness.ports.projection.project(
-    confirmationEvent
-  );
-  let state = harness.loop.snapshot();
-  state = recordSessionPlanConfirmationAuthorityV2(
-    state,
-    buildSessionPlanConfirmationAuthorityV2(state, {
-      providerTurnId,
-      providerResponseDigest: sha256Hash(canonicalJson({
-        kind: 'harness-plan-confirmation',
-        planRevision: plan.planRevision,
-      })),
-      recordedAt: NOW,
-      confirmationProjection: {
-        projectionId: confirmationReceipt.projectionId,
-        projectionDigest: confirmationReceipt.projectionDigest,
-      },
-    })
-  );
-  await harness.ports.persistence.persistCheckpoint(
-    checkpointSessionKernelStateV2(state, NOW)
-  );
-  harness.loop = await SessionKernelLoopV2.open(
-    harness.initial,
-    harness.ports,
-    { factsPageLimit: 32, maxFactsPagesPerWake: 8 }
-  );
+  await harness.loop.publishPlanConfirmationReady(plan.planRevision);
   await harness.loop.decidePlan({
     planRevision: plan.planRevision,
     decision: 'accept',
   });
   return { plan, preview: preview.results[0].data.preview };
+}
+
+function providerPlanDraftFromMaterializedPlan(plan) {
+  return {
+    title: plan.title,
+    objective: plan.objective,
+    narrative: plan.narrative,
+    evidence: {
+      kernelFactRefs: clone(plan.evidence.kernelFactRefs),
+      readResources: clone(plan.evidence.readResources),
+      blockingUnknowns: clone(plan.evidence.blockingUnknowns),
+      nonBlockingUnknowns: clone(plan.evidence.nonBlockingUnknowns),
+      coverage: plan.evidence.coverage,
+    },
+    actions: plan.actions.map((action) => ({
+      toolId: action.manifest.toolId,
+      scopeIntent: clone(action.manifest.scopeIntent),
+      deadline: clone(action.deadline),
+    })),
+  };
+}
+
+function replaceObjectContents(target, source) {
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, clone(source));
+}
+
+function installPlanningTerminalEvidence(harness, draft, callId) {
+  const map = harness.store.providerEvidence;
+  const originalSet = map.set;
+  const proposalArguments = {
+    schemaVersion: 'deepcode.session.plan-proposal.v5',
+    plan: clone(draft),
+  };
+  map.set = function setPlanningEvidence(providerTurnId, evidence) {
+    const terminal = evidence.terminal;
+    if (terminal?.data.terminalKind === 'completed') {
+      terminal.data.orderedItems.push({
+        kind: 'toolCall',
+        index: terminal.data.orderedItems.length,
+        callId,
+        name: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
+        arguments: canonicalJson(proposalArguments),
+      });
+      terminal.ref.recordDigest = sha256Hash(canonicalJson(terminal.data));
+    }
+    return originalSet.call(this, providerTurnId, evidence);
+  };
+  return () => {
+    map.set = originalSet;
+  };
+}
+
+function createMaterializedPlanPreviewBatch(request, runId) {
+  const template = {
+    ...clone(KERNEL_CAPABILITY_PREVIEWS.sessionDefault),
+    runId,
+    controlEpoch: request.expectedControlEpoch,
+    contextRef: clone(request.toolContextRef),
+  };
+  return {
+    runId,
+    acceptedControlEpoch: request.expectedControlEpoch,
+    planRevision: request.planRevision,
+    results: request.items.map((item) => ({
+      kind: 'previewed',
+      data: {
+        preview: scopedPreviewForItem(
+          request,
+          item,
+          template,
+          `preview-${item.planActionId}`,
+          previewItemPath(item)
+        ),
+      },
+    })),
+  };
 }
 export function providerToolIntent(
   toolId,
@@ -1031,6 +1295,61 @@ export function providerAnswer(text = 'Session answer') {
   };
 }
 
+export function providerStructuredFailure(overrides = {}) {
+  const errorCode = 'provider_tool_call_arguments_invalid';
+  const toolName = overrides.toolName
+    ?? SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME;
+  const originalArguments = overrides.originalArguments
+    ?? '{"plan":{]}invalid';
+  const call = {
+    index: 0,
+    callId: overrides.callId ?? 'call-structured-failure',
+    toolName,
+    originalArgumentsDigest: sha256Hash(originalArguments),
+  };
+  const failureDigest = sha256Hash(canonicalJson({
+    errorCode,
+    calls: [{
+      index: call.index,
+      toolName: call.toolName,
+      originalArgumentsDigest: call.originalArgumentsDigest,
+    }],
+  }));
+  const structuredFailure = {
+    schemaVersion: 'deepcode.provider.structured-output-failure.v1',
+    disposition: 'repairableNoMutation',
+    errorCode,
+    failureDigest,
+    nativeCompletion: {
+      providerKind: 'openaiCompatible',
+      terminalSignal: '[DONE]',
+      finishReason: 'tool_calls',
+    },
+    calls: [call],
+  };
+  const usage = clone(overrides.usage ?? {
+    promptCacheHitTokens: 75,
+    promptCacheMissTokens: 25,
+    inputTokens: 100,
+    outputTokens: 16,
+    totalTokens: 116,
+  });
+  return (input) => ({
+    harnessProviderFailure: {
+      errorCode,
+      message:
+        'Provider returned invalid structured output after a complete native response.',
+      structuredFailure,
+      providerResult: {
+        providerProfileId: input.providerProfile.providerProfileId,
+        provider: 'contract-provider',
+        model: 'contract-model',
+        usage,
+      },
+    },
+  });
+}
+
 export function providerPlanActionComplete(
   outcome = 'completed',
   callId = `plan-action-complete-${outcome}`
@@ -1064,6 +1383,48 @@ export function providerPlanActionComplete(
       model: 'contract-model',
     },
   });
+}
+
+export function providerIntervention(
+  draft,
+  callId = 'intervention-proposal-1'
+) {
+  const controlArguments = {
+    schemaVersion: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+    intervention: clone(draft),
+  };
+  const responseDigest = sha256Hash(canonicalJson({
+    kind: 'intervention',
+    callId,
+    controlArguments,
+  }));
+  return (input) => {
+    const output = adaptSessionKernelProviderBackendOutputV2(input, {
+      kind: 'intervention',
+      draft: clone(draft),
+      control: {
+        schemaVersion: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+        callId,
+        toolName: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
+        argumentsDigest: sha256Hash(canonicalJson(controlArguments)),
+      },
+      items: [],
+      completion: createProviderCompletionReceipt(responseDigest, {
+        hasToolCalls: true,
+        reasoningTransport: input.providerProfile.reasoningTransport,
+      }),
+      providerResult: {
+        providerProfileId: 'provider-profile-v2-contract',
+        provider: 'contract-provider',
+        model: 'contract-model',
+      },
+      responseDigest,
+    }, NOW);
+    return {
+      ...output,
+      testInterventionDraft: clone(draft),
+    };
+  };
 }
 
 export function providerOrderedToolItems(calls) {
@@ -1177,6 +1538,18 @@ function createProviderEvidence(input, output, options = {}) {
       }),
     });
   }
+  if (output.kind === 'intervention') {
+    orderedItems.push({
+      kind: 'toolCall',
+      index: orderedItems.length,
+      callId: output.control.callId,
+      name: output.control.toolName,
+      arguments: canonicalJson({
+        schemaVersion: output.control.schemaVersion,
+        intervention: output.testInterventionDraft,
+      }),
+    });
+  }
   const terminalData = {
     schemaVersion: SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA,
     providerTurnId: input.providerTurnId,
@@ -1254,6 +1627,12 @@ export function createFailedProviderEvidence(
     reasonCode,
     traceRef,
     orderedItems: [],
+    ...(options.structuredFailure
+      ? { structuredFailure: clone(options.structuredFailure) }
+      : {}),
+    ...(options.providerResult
+      ? { providerResult: clone(options.providerResult) }
+      : {}),
   };
   const terminalRef = {
     recordId:

@@ -40,6 +40,9 @@ import {
   SessionKernelHostRunnerV2,
   type SessionPlanActionDriveStepV2,
 } from './SessionKernelHostRunnerV2.js';
+import type {
+  SessionKernelRunCancelResultV2,
+} from './SessionKernelLoopV2.js';
 import {
   canFinalizeSessionKernelReviewV2,
   sessionKernelPlanActionSettledV2,
@@ -51,10 +54,11 @@ import {
   sessionKernelFactBarriersPendingV2,
 } from './factBarriers.js';
 import {
-  decodeAgentInputAttachmentsV2,
+  decodeAgentInputAttachmentsV3,
+  decodeUserAttachmentContextsV1,
 } from './inputAttachmentsV2.js';
 import {
-  buildSessionContextMemoryV2,
+  buildSessionContextMemoryV3,
   decodeSessionPriorEventsSourceV2,
   type SessionPriorEventsSourceV2,
 } from './sessionMemory.js';
@@ -76,6 +80,9 @@ import type {
   SessionKernelReviewV2,
   SessionPlanDecisionV2,
   SessionProviderProfileBootstrapV2,
+  SessionUserInterventionDecisionResultV4,
+  SessionUserInterventionDecisionV4,
+  SessionUserInterventionV4,
   SessionUserInputRecordV2,
   SessionWorkAuthorityV3,
 } from './types.js';
@@ -114,7 +121,6 @@ export interface SessionKernelProductionResumePlanActionV2 {
   data: {
     planActionId: string;
     expectedPlanRevision: string;
-    providerCallBudget: number;
     guidance: string[];
   };
 }
@@ -173,6 +179,21 @@ export interface SessionKernelProductionDecidePlanV2 {
     planRevision: string;
     decision: SessionPlanDecisionV2['decision'];
     guidance?: string;
+  };
+}
+
+export interface SessionKernelProductionDecideUserInterventionV4 {
+  kind: 'decideUserIntervention';
+  data: {
+    interactionId: string;
+    interactionRevision: string;
+    candidateSetDigest: string;
+    decision: 'select' | 'revise' | 'reject';
+    optionId?: string;
+    guidance?: string;
+    callerRequestId: string;
+    callerRequestDigest: string;
+    cancelOperationId?: string;
   };
 }
 
@@ -240,6 +261,7 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionPreviewPlanV2
   | SessionKernelProductionPublishPlanConfirmationReadyV2
   | SessionKernelProductionDecidePlanV2
+  | SessionKernelProductionDecideUserInterventionV4
   | SessionKernelProductionObserveCapabilityDecisionV2
   | SessionKernelProductionReconcileWakeV2
   | SessionKernelProductionReconcileFactsV2
@@ -281,6 +303,8 @@ export interface SessionKernelProductionStateSummaryV2 {
     planRevision?: string;
   };
   activeWait?: SessionActiveWaitV2;
+  userIntervention?: SessionUserInterventionV4;
+  userInterventionDecision?: SessionUserInterventionDecisionV4;
   factsAfterLedgerSequence: number;
   factsSnapshotHighWater: number;
   factsRunSequenceHighWater: number;
@@ -350,6 +374,11 @@ export type SessionKernelProductionOutcomeV2 =
       decision: SessionPlanDecisionV2;
     }
   | {
+      kind: 'userInterventionDecisionRecorded';
+      result: SessionUserInterventionDecisionResultV4;
+      cancellation?: SessionKernelRunCancelResultV2;
+    }
+  | {
       kind: 'capabilityDecisionObserved';
       decision: 'allow' | 'deny';
       result?: SessionKernelLoopResultV2;
@@ -417,6 +446,12 @@ export type SessionKernelProductionContinuationV2 =
       disposition: 'autoIssuable' | 'requiresUserDecision';
       planActionId?: string;
       expectedPlanRevision?: string;
+    }
+  | {
+      kind: 'awaitingUserIntervention';
+      interactionId: string;
+      interactionRevision: string;
+      candidateSetDigest: string;
     }
   | {
       kind: 'awaitingKernelWake';
@@ -490,13 +525,6 @@ export type SessionKernelProductionContinuationV2 =
   | {
       kind: 'userInputSuperseded';
       inputId: string;
-    }
-  | {
-      kind: 'providerBudgetExhausted';
-      providerCallBudget: number;
-      completedProviderCalls: number;
-      planActionId: string;
-      expectedPlanRevision: string;
     }
   | {
       kind: 'terminalProviderAnswer';
@@ -962,11 +990,12 @@ export class SessionKernelProductionActorV2 {
     }
     this.terminalCancellation = identity;
     const authorityGeneration = ++this.authorityGeneration;
-    const ordinaryQuiescence =
-      this.markActiveOrdinarySuperseded('userRequested');
+    // Cancellation owns an independent control lane. Abort the ordinary
+    // operation immediately, but do not wait for its Host response receipt:
+    // the Loop's provider/request fences establish semantic quiescence.
+    this.markActiveOrdinarySuperseded('userRequested');
     const predecessor = this.inputTransitionTail;
     const transition = predecessor.then(async () => {
-      await ordinaryQuiescence;
       const activeRunner = await runner;
       const durableCancellation =
         activeRunner.snapshot().runCancellation;
@@ -1422,7 +1451,7 @@ async function createProductionRunner(
       workspaceBindingRef:
         request.prefetchedRun.workspaceBindingRef,
       initialInput: request.initialInput,
-      sessionMemory: buildSessionContextMemoryV2({
+      sessionMemory: buildSessionContextMemoryV3({
         source: request.priorSessionEvents,
         excludeRunId: request.runId,
       }),
@@ -1568,8 +1597,6 @@ async function executeProductionOperation(
           operation.data.planActionId,
           operation.data.expectedPlanRevision,
           {
-            providerCallBudget:
-              operation.data.providerCallBudget,
             guidance: operation.data.guidance,
           }
         ),
@@ -1601,6 +1628,42 @@ async function executeProductionOperation(
         kind: 'planDecisionRecorded',
         decision: await runner.decidePlan(operation.data),
       };
+    case 'decideUserIntervention': {
+      const result = await runner.decideUserIntervention({
+        interactionId: operation.data.interactionId,
+        interactionRevision: operation.data.interactionRevision,
+        candidateSetDigest: operation.data.candidateSetDigest,
+        decision: operation.data.decision,
+        ...(operation.data.optionId
+          ? { optionId: operation.data.optionId }
+          : {}),
+        ...(operation.data.guidance !== undefined
+          ? { guidance: operation.data.guidance }
+          : {}),
+        callerRequestId: operation.data.callerRequestId,
+      });
+      if (result.disposition !== 'runCancellationRequired') {
+        return {
+          kind: 'userInterventionDecisionRecorded',
+          result,
+        };
+      }
+      if (!operation.data.cancelOperationId) {
+        throw new SessionKernelProductionBridgeError(
+          'session_kernel_production_intervention_cancel_identity_missing'
+        );
+      }
+      const cancellation = await runner.cancelRun({
+        callerRequestId: operation.data.callerRequestId,
+        callerRequestDigest: operation.data.callerRequestDigest,
+        cancelOperationId: operation.data.cancelOperationId,
+      });
+      return {
+        kind: 'userInterventionDecisionRecorded',
+        result,
+        cancellation,
+      };
+    }
     case 'observeCapabilityDecision': {
       const state = runner.snapshot();
       requireExactCapabilityWait(
@@ -1701,9 +1764,14 @@ function requireCancelFrameCorrelation(
   operationRequestId: string,
   operation: SessionKernelProductionOperationV2
 ): void {
+  const cancelOperationId = operation.kind === 'cancelRun'
+    ? operation.data.cancelOperationId
+    : operation.kind === 'decideUserIntervention'
+      ? operation.data.cancelOperationId
+      : undefined;
   if (
-    operation.kind === 'cancelRun'
-    && operation.data.cancelOperationId !== operationRequestId
+    cancelOperationId !== undefined
+    && cancelOperationId !== operationRequestId
   ) {
     throw invalidProductionRequest(
       'session_kernel_production_run_cancellation_identity_mismatch'
@@ -1899,6 +1967,7 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       'opaqueInputRef',
       'text',
       'attachments',
+      'attachmentContexts',
       'recordedAt',
     ]
   );
@@ -1912,6 +1981,7 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       'session_kernel_production_recorded_at_invalid'
     );
   }
+  const attachments = decodeAgentInputAttachmentsV3(record.attachments);
   return {
     inputId: identity(record.inputId, 'inputId'),
     opaqueInputRef: boundedText(
@@ -1920,7 +1990,11 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       64 * 1024
     ),
     text: boundedText(record.text, 'text', 1024 * 1024),
-    attachments: decodeAgentInputAttachmentsV2(record.attachments),
+    attachments,
+    attachmentContexts: decodeUserAttachmentContextsV1(
+      record.attachmentContexts,
+      attachments
+    ),
     recordedAt,
   };
 }
@@ -1953,19 +2027,9 @@ function decodeOperation(
       [
         'planActionId',
         'expectedPlanRevision',
-        'providerCallBudget',
         'guidance',
       ]
     );
-    if (
-      !Number.isSafeInteger(body.providerCallBudget)
-      || Number(body.providerCallBudget) < 1
-      || Number(body.providerCallBudget) > 256
-    ) {
-      throw invalidProductionRequest(
-        'session_kernel_production_resume_options_invalid'
-      );
-    }
     return {
       kind: tagged.kind,
       data: {
@@ -1977,7 +2041,6 @@ function decodeOperation(
           body.expectedPlanRevision,
           'expectedPlanRevision'
         ),
-        providerCallBudget: Number(body.providerCallBudget),
         guidance: decodeGuidance(body.guidance),
       },
     };
@@ -2095,6 +2158,78 @@ function decodeOperation(
         planRevision: identity(body.planRevision, 'planRevision'),
         decision: body.decision,
         ...(guidance !== undefined ? { guidance } : {}),
+      },
+    };
+  }
+  if (tagged.kind === 'decideUserIntervention') {
+    const body = exactObject(
+      data,
+      [
+        'interactionId',
+        'interactionRevision',
+        'candidateSetDigest',
+        'decision',
+        'callerRequestId',
+        'callerRequestDigest',
+      ],
+      ['optionId', 'guidance', 'cancelOperationId']
+    );
+    if (
+      body.decision !== 'select'
+      && body.decision !== 'revise'
+      && body.decision !== 'reject'
+    ) {
+      throw invalidProductionRequest(
+        'session_kernel_production_intervention_decision_invalid'
+      );
+    }
+    const optionId = body.optionId === undefined
+      ? undefined
+      : identity(body.optionId, 'optionId');
+    const guidance = body.guidance === undefined
+      ? undefined
+      : optionalText(body.guidance, 'guidance', 64 * 1024);
+    const cancelOperationId = body.cancelOperationId === undefined
+      ? undefined
+      : identity(body.cancelOperationId, 'cancelOperationId');
+    if (
+      (guidance !== undefined && guidance.trim() !== guidance)
+      || (body.decision === 'select') !== Boolean(optionId)
+      || (body.decision === 'revise' && !guidance?.trim())
+      || (body.decision !== 'select' && optionId !== undefined)
+      || (body.decision === 'reject') !== Boolean(cancelOperationId)
+    ) {
+      throw invalidProductionRequest(
+        'session_kernel_production_intervention_payload_invalid'
+      );
+    }
+    return {
+      kind: tagged.kind,
+      data: {
+        interactionId: identity(
+          body.interactionId,
+          'interactionId'
+        ),
+        interactionRevision: identity(
+          body.interactionRevision,
+          'interactionRevision'
+        ),
+        candidateSetDigest: sha256Digest(
+          body.candidateSetDigest,
+          'candidateSetDigest'
+        ),
+        decision: body.decision,
+        ...(optionId ? { optionId } : {}),
+        ...(guidance !== undefined ? { guidance } : {}),
+        callerRequestId: identity(
+          body.callerRequestId,
+          'callerRequestId'
+        ),
+        callerRequestDigest: sha256Digest(
+          body.callerRequestDigest,
+          'callerRequestDigest'
+        ),
+        ...(cancelOperationId ? { cancelOperationId } : {}),
       },
     };
   }
@@ -2311,6 +2446,8 @@ function decodeWorkAuthority(
 ): SessionWorkAuthorityV3 {
   const tagged = exactObject(value, ['kind'], [
     'planRevision',
+    'batchSequence',
+    'predecessorDigest',
     'operationIds',
     'digest',
   ]);
@@ -2328,12 +2465,17 @@ function decodeWorkAuthority(
   }
   const body = exactObject(
     value,
-    ['kind', 'operationIds', 'digest']
+    [
+      'kind',
+      'batchSequence',
+      'predecessorDigest',
+      'operationIds',
+      'digest',
+    ]
   );
   if (
     !Array.isArray(body.operationIds)
     || body.operationIds.length === 0
-    || body.operationIds.length > 8_192
   ) {
     throw invalidProductionRequest(
       'session_kernel_production_work_authority_invalid'
@@ -2343,14 +2485,31 @@ function decodeWorkAuthority(
     identity(operationId, 'operationId')
   );
   const normalized = [...new Set(operationIds)].sort();
+  const batchSequence = safeNonnegativeInteger(
+    body.batchSequence,
+    'batchSequence'
+  );
+  const predecessorDigest = body.predecessorDigest === null
+    ? null
+    : sha256Digest(
+        body.predecessorDigest,
+        'predecessorDigest'
+      );
   const digest = sha256Digest(body.digest, 'digest');
   if (
+    batchSequence < 1
+    || (batchSequence === 1
+      ? predecessorDigest !== null
+      : predecessorDigest === null)
+    ||
     normalized.length !== operationIds.length
     || normalized.some((operationId, index) =>
       operationId !== operationIds[index]
     )
     || digest !== sha256Hash(canonicalJson({
       kind: 'contextRead',
+      batchSequence,
+      predecessorDigest,
       operationIds,
     }))
   ) {
@@ -2358,7 +2517,13 @@ function decodeWorkAuthority(
       'session_kernel_production_work_authority_invalid'
     );
   }
-  return { kind: 'contextRead', operationIds, digest };
+  return {
+    kind: 'contextRead',
+    batchSequence,
+    predecessorDigest,
+    operationIds,
+    digest,
+  };
 }
 
 function decodeStoredRunCancellationSuccess(
@@ -2644,6 +2809,16 @@ function summarizeState(
     ...(state.activeWait
       ? { activeWait: cloneJson(state.activeWait) }
       : {}),
+    ...(state.userIntervention
+      ? { userIntervention: cloneJson(state.userIntervention) }
+      : {}),
+    ...(state.userInterventionDecision
+      ? {
+          userInterventionDecision: cloneJson(
+            state.userInterventionDecision
+          ),
+        }
+      : {}),
     factsAfterLedgerSequence:
       state.lineage.cursor.afterLedgerSequence,
     factsSnapshotHighWater:
@@ -2718,6 +2893,17 @@ function productionContinuation(
       projectionDigest: outcome.projection.projectionDigest,
     };
   }
+  if (
+    outcome.kind === 'userInterventionDecisionRecorded'
+    && outcome.cancellation
+  ) {
+    return {
+      kind: 'terminalRunCancelled',
+      cancelOperationId: outcome.cancellation.cancelOperationId,
+      projectionId: outcome.cancellation.projection.projectionId,
+      projectionDigest: outcome.cancellation.projection.projectionDigest,
+    };
+  }
   const planAction = planActionContinuationContext(
     state,
     previousState,
@@ -2734,12 +2920,33 @@ function productionContinuation(
       pendingRequestLanes,
     };
   }
+  if (
+    outcome.kind === 'userInterventionDecisionRecorded'
+    && outcome.result.disposition === 'planAccepted'
+    && (
+      !outcome.result.planRevision
+      || state.plan?.planRevision !== outcome.result.planRevision
+      || state.planDecision?.planRevision !== outcome.result.planRevision
+      || state.planDecision.decision !== 'accept'
+    )
+  ) {
+    return awaitingKernelFacts(state);
+  }
   const waitContinuation = state.activeWait
     ? continuationForWait(state, state.activeWait, planAction)
     : undefined;
   if (waitContinuation) return waitContinuation;
   if (!sessionKernelFactsAreReady(state)) {
     return awaitingKernelFacts(state);
+  }
+  if (
+    outcome.kind === 'userInterventionDecisionRecorded'
+    && outcome.result.disposition === 'researchRevision'
+  ) {
+    return readyToDrivePlanAction(planAction);
+  }
+  if (state.interventionResearch && !state.userIntervention) {
+    return readyToDrivePlanAction(planAction);
   }
   if (state.pendingGuidance.length > 0) {
     return state.plan
@@ -2880,6 +3087,23 @@ function productionContinuation(
               : [],
             ...planRevisionField(state),
           };
+    case 'userInterventionDecisionRecorded':
+      if (outcome.result.disposition === 'planAccepted') {
+        return readyForPlanAction(state, planAction);
+      }
+      if (outcome.result.disposition === 'researchRevision') {
+        return readyToDrivePlanAction(planAction);
+      }
+      if (outcome.result.disposition === 'guidanceReplan') {
+        return {
+          kind: 'replanRequired',
+          guidance: [...state.pendingGuidance],
+          ...planRevisionField(state),
+        };
+      }
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_intervention_cancellation_missing'
+      );
     case 'capabilityDecisionObserved':
       return outcome.result
         ? continuationForLoopResult(
@@ -2978,10 +3202,16 @@ function continuationForWait(
   wait: SessionActiveWaitV2,
   fallbackPlanAction?: PlanActionContinuationContextV2
 ): SessionKernelProductionContinuationV2 {
-  const planAction = planActionForOperation(
-    state,
-    wait.operationId
-  ) ?? fallbackPlanAction;
+  if (wait.kind === 'userIntervention') {
+    return {
+      kind: 'awaitingUserIntervention',
+      interactionId: wait.interactionId,
+      interactionRevision: wait.interactionRevision,
+      candidateSetDigest: wait.candidateSetDigest,
+    };
+  }
+  const planAction = planActionForOperation(state, wait.operationId)
+    ?? fallbackPlanAction;
   switch (wait.kind) {
     case 'capability': {
       if (wait.decisionHint) {
@@ -3094,6 +3324,8 @@ function continuationForLoopResult(
             ...planRevisionField(state),
           }
         : readyToResumePlanning([result.guidance]);
+    case 'sessionControlRejected':
+      return readyToResumePlanning([result.guidance]);
     case 'manualRecovery':
       return {
         kind: 'manualRecoveryRequired',
@@ -3133,15 +3365,10 @@ function continuationForDriveStep(
         guidance: [...step.guidance],
         ...planRevisionField(state),
       };
-    case 'budgetExhausted':
-      return {
-        kind: 'providerBudgetExhausted',
-        providerCallBudget: step.providerCallBudget,
-        completedProviderCalls: step.completedProviderCalls,
-        ...requiredPlanActionFields(planAction),
-      };
     case 'toolCallsProgressed':
       return readyToDriveOrFinalize(state, planAction);
+    case 'interventionResearchProgressed':
+      return readyToDrivePlanAction(planAction);
     case 'interrupted':
       throw new SessionKernelProductionBridgeError(
         'session_kernel_production_stale_continuation_unbound'
@@ -3154,10 +3381,16 @@ function continuationForStandaloneWait(
   state: SessionKernelLoopStateV2,
   fallbackPlanAction?: PlanActionContinuationContextV2
 ): SessionKernelProductionContinuationV2 {
-  const planAction = planActionForOperation(
-    state,
-    wait.operationId
-  ) ?? fallbackPlanAction;
+  if (wait.kind === 'userIntervention') {
+    return {
+      kind: 'awaitingUserIntervention',
+      interactionId: wait.interactionId,
+      interactionRevision: wait.interactionRevision,
+      candidateSetDigest: wait.candidateSetDigest,
+    };
+  }
+  const planAction = planActionForOperation(state, wait.operationId)
+    ?? fallbackPlanAction;
   if (wait.kind === 'capability') {
     return wait.decisionHint
       ? {
@@ -3268,10 +3501,12 @@ function planActionContinuationContext(
     }
   }
   const currentWait = state.activeWait
+    && state.activeWait.kind !== 'userIntervention'
     ? planActionForOperation(state, state.activeWait.operationId)
     : undefined;
   if (currentWait) return currentWait;
   const previousWait = previousState.activeWait
+    && previousState.activeWait.kind !== 'userIntervention'
     ? planActionForOperation(
         previousState,
         previousState.activeWait.operationId

@@ -4115,6 +4115,7 @@ fn update_materialized_state(
             AuthorizationFactV2::ScopePreviewed { .. }
             | AuthorizationFactV2::CapabilityIssued { .. }
             | AuthorizationFactV2::CapabilityDenied { .. }
+            | AuthorizationFactV2::InterventionCandidateSuperseded { .. }
             | AuthorizationFactV2::ExpansionDenied { .. }
             | AuthorizationFactV2::ExpansionAllowed { .. }
             | AuthorizationFactV2::TrustGranted { .. }

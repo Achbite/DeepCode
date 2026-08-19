@@ -143,16 +143,94 @@ pub struct CapabilityScopePreviewItemV2 {
     pub operation_id: OperationId,
     pub idempotency_key: String,
     pub tool_id: ToolIdV2,
-    pub scope_intent: ScopeIntentV2,
+    pub scope_intent: Option<ScopeIntentV2>,
+    pub raw_arguments: Option<RawToolArgumentsV2>,
     pub deadline: DeadlineRequestV2,
+    pub origin: CapabilityScopePreviewOriginV3,
 }
 
 impl CapabilityScopePreviewItemV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         validate_text("idempotencyKey", &self.idempotency_key)?;
-        self.scope_intent.validate()?;
-        self.deadline.validate()
+        match (&self.origin, &self.scope_intent, &self.raw_arguments) {
+            (CapabilityScopePreviewOriginV3::PlanDiscovery { .. }, None, Some(raw_arguments)) => {
+                raw_arguments.validate()?
+            }
+            (
+                CapabilityScopePreviewOriginV3::Plan {}
+                | CapabilityScopePreviewOriginV3::InterventionCandidate { .. },
+                Some(scope_intent),
+                None,
+            ) => scope_intent.validate()?,
+            _ => {
+                return Err(invalid_value(
+                    "previewIntent",
+                    "must match exactly one origin-specific preview intent",
+                ))
+            }
+        }
+        self.deadline.validate()?;
+        self.origin.validate()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CapabilityScopePreviewOriginV3 {
+    Plan {},
+    PlanDiscovery {
+        discovery_id: String,
+    },
+    InterventionCandidate {
+        interaction_id: String,
+        interaction_revision: String,
+        candidate_set_digest: String,
+        option_id: String,
+    },
+}
+
+impl CapabilityScopePreviewOriginV3 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        match self {
+            Self::Plan {} => Ok(()),
+            Self::PlanDiscovery { discovery_id } => {
+                validate_text("origin.discoveryId", discovery_id)
+            }
+            Self::InterventionCandidate {
+                interaction_id,
+                interaction_revision,
+                candidate_set_digest,
+                option_id,
+            } => {
+                validate_text("origin.interactionId", interaction_id)?;
+                validate_text("origin.interactionRevision", interaction_revision)?;
+                validate_sha256_digest("origin.candidateSetDigest", candidate_set_digest)?;
+                validate_text("origin.optionId", option_id)
+            }
+        }
+    }
+
+    pub const fn is_preview_only(&self) -> bool {
+        !matches!(self, Self::Plan {})
+    }
+}
+
+fn validate_sha256_digest(field: &'static str, value: &str) -> Result<(), V2ValidationError> {
+    if value.len() != 71
+        || !value.starts_with("sha256:")
+        || !value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_value(field, "must be a lowercase sha256 digest"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,6 +604,7 @@ pub struct CapabilityScopePreviewRecordV2 {
     pub plan_action_id: PlanActionIdV2,
     pub operation_id: OperationId,
     pub tool_id: ToolIdV2,
+    pub origin: CapabilityScopePreviewOriginV3,
     pub authorization_binding: CapabilityAuthorizationBindingV2,
     pub canonical_scope: ResourceScopeV2,
     pub scope_digest: CapabilityScopeDigestV2,
@@ -542,6 +621,7 @@ pub struct CapabilityScopePreviewRecordV2 {
 
 impl CapabilityScopePreviewRecordV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
+        self.origin.validate()?;
         if self.effective_deadline_ms == 0 {
             return Err(zero_value("effectiveDeadlineMs"));
         }

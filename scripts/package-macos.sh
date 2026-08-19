@@ -39,7 +39,7 @@ TUI_COMMAND_NAME=""
 COPY_ROOT_WEB_DIST="0"
 WRITE_TUI_LAUNCHER="0"
 BIN_DIR="$ROOT_DIR/bin/macos-arm64"
-KERNEL_ABI_VERSION="deepcode.kernel.abi.v2"
+KERNEL_ABI_VERSION="deepcode.kernel.abi.v3"
 TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
 SESSION_BRIDGE_NAME="hostBridgeV2.js"
 

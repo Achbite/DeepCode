@@ -29,10 +29,10 @@ use deepcode_kernel_abi::v2::{
     TransitionIdentityV2, WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    ControlCancellationReplyV2, ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2,
-    DeadlineRequestV2, EpochPreconditionV2, InvalidFieldViolationV2, InvalidRequestReasonV2,
-    InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, MutationCommandKindV2,
-    RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
+    CapabilityScopePreviewOriginV3, ControlCancellationReplyV2, ControlEpochAdvanceV2,
+    ControlEpochAdvancedReplyV2, DeadlineRequestV2, EpochPreconditionV2, InvalidFieldViolationV2,
+    InvalidRequestReasonV2, InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2,
+    MutationCommandKindV2, RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, KernelError, ToolContractDigestV2};
 use deepcode_kernel_abi::{RequestedResourceV2, ToolEffectScopeV2, ToolIdV2};
@@ -3857,6 +3857,35 @@ fn authorization_resolution_edge_matches(
             AuthorizationFactV2::ScopePreviewed {
                 identity: source,
                 preview_id,
+                origin:
+                    CapabilityScopePreviewOriginV3::InterventionCandidate {
+                        interaction_id: source_interaction_id,
+                        interaction_revision: source_interaction_revision,
+                        candidate_set_digest: source_candidate_set_digest,
+                        option_id: source_option_id,
+                    },
+                ..
+            },
+            AuthorizationFactV2::InterventionCandidateSuperseded {
+                identity,
+                preview_id: superseded_preview_id,
+                interaction_id,
+                interaction_revision,
+                candidate_set_digest,
+                selected_option_id,
+            },
+        ) => {
+            same_authorization_subject(identity, source)
+                && superseded_preview_id == preview_id
+                && interaction_id == source_interaction_id
+                && interaction_revision == source_interaction_revision
+                && candidate_set_digest == source_candidate_set_digest
+                && selected_option_id != source_option_id
+        }
+        (
+            AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id,
                 scope_digest,
                 ..
             },
@@ -4028,6 +4057,7 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
                 current,
                 AuthorizationFactV2::CapabilityIssued { .. }
                     | AuthorizationFactV2::CapabilityDenied { .. }
+                    | AuthorizationFactV2::InterventionCandidateSuperseded { .. }
                     | AuthorizationFactV2::ExpansionAllowed { .. }
                     | AuthorizationFactV2::ExpansionDenied { .. }
             ) =>

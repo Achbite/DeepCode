@@ -381,6 +381,14 @@ async fn proxy_api(
     {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
+    if uri.path().contains("/private-analysis") {
+        if let Some(lease) = headers
+            .get("x-deepcode-private-analysis-lease")
+            .and_then(|value| value.to_str().ok())
+        {
+            request = request.header("x-deepcode-private-analysis-lease", lease);
+        }
+    }
     let request = if method == Method::GET && uri.path().ends_with("/stream") {
         request
     } else {
@@ -424,6 +432,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("PATCH", ["api", "workspaces", "current", "settings"])
         | ("GET", ["api", "fs", "initial-locations"])
         | ("GET", ["api", "fs", "browse"])
+        | ("POST", ["api", "host", "user-attachments"])
         | ("POST", ["api", "host", "inspect"])
         | ("POST", ["api", "host", "skills", "scan-mount"])
         | ("GET", ["api", "host", "skills"])
@@ -443,6 +452,9 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "agent", "sessions"])
         | ("GET", ["api", "agent", "projects"])
         | ("POST", ["api", "agent", "projects"])
+        | ("GET", ["api", "agent", "composer"])
+        | ("GET", ["api", "agent", "composer", "stream"])
+        | ("POST", ["api", "agent", "conversation-drafts", "runs"])
         | ("GET", ["api", "agent", "sessions", "current"])
         | ("GET", ["api", "browser", "runtime-status"])
         | ("POST", ["api", "browser", "open"])
@@ -456,6 +468,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("GET", ["api", "agent", "projects", _])
         | ("PATCH", ["api", "agent", "projects", _])
         | ("DELETE", ["api", "agent", "projects", _])
+        | ("DELETE", ["api", "host", "user-attachments", _])
         | ("POST", ["api", "agent", "projects", _, "rebind"])
         | ("POST", ["api", "agent", "sessions", _, "activate"])
         | ("POST", ["api", "agent", "sessions", _, "archive"])
@@ -468,6 +481,9 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "cancel"])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "guidance"])
         | ("POST", ["api", "agent", "sessions", _, "runs", _, "authority", "revoke"])
+        | ("POST", ["api", "agent", "sessions", _, "private-analysis", "lease"])
+        | ("DELETE", ["api", "agent", "sessions", _, "private-analysis", "lease"])
+        | ("GET", ["api", "agent", "sessions", _, "private-analysis"])
         | ("GET", ["api", "agent", "sessions", _, "timeline", "stream"]) => true,
         _ => false,
     }

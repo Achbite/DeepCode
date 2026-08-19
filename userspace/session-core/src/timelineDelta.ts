@@ -1,18 +1,21 @@
 import type {
   AgentEvent,
+  AgentTimelineBlock,
   AgentTimelineDelta,
+  AgentTimelineDeltaOperationV4,
   AgentTimelineDeliveryMode,
   AgentTimelineResult,
   AgentTimelineRootProjectionReplacements,
   AgentTimelineSnapshot,
   AgentTimelineTurn,
+  ConversationTextAppendV4,
 } from '@deepcode/protocol';
 import {
-  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+  AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+  AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
 } from '@deepcode/protocol';
 import {
-  assertSharedConversationProjectionV2,
+  assertSharedConversationProjectionV3,
   buildNarrativeTimelineProjection,
 } from './projectionV2.js';
 
@@ -46,9 +49,9 @@ export function isNativeWorkSegmentsTimelineSnapshot(
   if (!isRecord(snapshot)) return false;
   if (
     snapshot.schemaVersion
-      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
+      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4
     || snapshot.shapeVersion
-      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4
     || !Array.isArray(snapshot.turns)
   ) {
     return false;
@@ -113,19 +116,19 @@ export function normalizeAgentTimelineSnapshot(
   if (!isNativeWorkSegmentsTimelineSnapshot(snapshot)) {
     throw new UnsupportedTimelineHistorySchemaError();
   }
-  assertSharedConversationProjectionV2(snapshot);
+  assertSharedConversationProjectionV3(snapshot);
   return snapshot;
 }
 
-export function rebuildSharedConversationProjectionV2(
+export function rebuildSharedConversationProjectionV3(
   sessionId: string,
   sourceEvents: AgentEvent[],
   staleSnapshot: AgentTimelineSnapshot,
   minimumRevision = (staleSnapshot.revision ?? 0) + 1
 ): AgentTimelineResult {
-  assertSharedConversationProjectionV2(staleSnapshot);
+  assertSharedConversationProjectionV3(staleSnapshot);
   if (staleSnapshot.sessionId !== sessionId) {
-    throw new Error('session_projection_repair_native_v2_required');
+    throw new Error('session_projection_repair_native_v3_required');
   }
   return {
     ...buildNarrativeTimelineProjection({
@@ -159,17 +162,35 @@ export function createAgentTimelineDelta(
     current.turns.map((turn) => [turn.id, turn])
   );
   const nextTurnIds = new Set(next.turns.map((turn) => turn.id));
-  const turnReplacements = next.turns.filter((turn) => {
+  const turnReplacements: AgentTimelineTurn[] = [];
+  const operations: AgentTimelineDeltaOperationV4[] = [];
+  for (const turn of next.turns) {
     const existing = currentTurns.get(turn.id);
-    return !existing || !jsonEqual(existing, turn);
-  });
+    if (!existing) {
+      turnReplacements.push(turn);
+      continue;
+    }
+    if (jsonEqual(existing, turn)) continue;
+    const append = exactTextAppendV3(existing, turn);
+    if (append) {
+      operations.push({ kind: 'text.append', append });
+    } else {
+      turnReplacements.push(turn);
+    }
+  }
   const removedTurnIds = current.turns
     .filter((turn) => !nextTurnIds.has(turn.id))
     .map((turn) => turn.id);
+  if (!jsonEqual(current.runProjection, next.runProjection)) {
+    operations.push({
+      kind: 'run.updated',
+      runProjection: next.runProjection ?? null,
+    });
+  }
 
   return {
-    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
     sessionId: next.sessionId,
     baseRevision: current.revision,
     revision: next.revision,
@@ -178,6 +199,7 @@ export function createAgentTimelineDelta(
     eventCount: next.eventCount,
     turnReplacements,
     removedTurnIds,
+    operations,
     rootReplacements: changedRootProjections(current, next),
   };
 }
@@ -205,6 +227,7 @@ export function createProviderComposingTimelineDelta(
     throw new Error('provider_composing_timeline_delta_invalid');
   }
   let replacement: AgentTimelineTurn | undefined;
+  let append: ConversationTextAppendV4 | undefined;
   for (let index = 0; index < current.turns.length; index += 1) {
     const before = current.turns[index]!;
     const after = next.turns[index]!;
@@ -215,12 +238,13 @@ export function createProviderComposingTimelineDelta(
       if (before === after) {
         throw new Error('provider_composing_timeline_delta_turn_unchanged');
       }
-      replacement = after;
+      append = exactTextAppendV3(before, after);
+      if (!append) replacement = after;
     } else if (before !== after) {
       throw new Error('provider_composing_timeline_delta_cross_turn_change');
     }
   }
-  if (!replacement || current.runProjection === next.runProjection) {
+  if ((!replacement && !append) || current.runProjection === next.runProjection) {
     throw new Error('provider_composing_timeline_delta_missing_change');
   }
   return {
@@ -232,11 +256,13 @@ export function createProviderComposingTimelineDelta(
     sourceEventVersion: next.sourceEventVersion,
     generatedAt: next.generatedAt,
     eventCount: next.eventCount,
-    turnReplacements: [replacement],
+    turnReplacements: replacement ? [replacement] : [],
     removedTurnIds: [],
-    rootReplacements: {
-      runProjection: next.runProjection,
-    },
+    operations: [
+      ...(append ? [{ kind: 'text.append' as const, append }] : []),
+      { kind: 'run.updated', runProjection: next.runProjection ?? null },
+    ],
+    rootReplacements: {},
   };
 }
 
@@ -269,9 +295,22 @@ export function applyAgentTimelineDelta(
   const replacements = new Map(
     delta.turnReplacements.map((turn) => [turn.id, turn])
   );
+  const appendedTurnIds = new Set(
+    delta.operations
+      .filter((operation) => operation.kind === 'text.append')
+      .map((operation) => operation.append.turnId)
+  );
   for (const turnId of removed) {
     if (replacements.has(turnId)) {
       throw new Error('timeline_delta_turn_conflict');
+    }
+    if (appendedTurnIds.has(turnId)) {
+      throw new Error('timeline_delta_text_append_removed_turn_conflict');
+    }
+  }
+  for (const turnId of appendedTurnIds) {
+    if (replacements.has(turnId)) {
+      throw new Error('timeline_delta_text_append_replacement_conflict');
     }
   }
 
@@ -292,6 +331,19 @@ export function applyAgentTimelineDelta(
     (left.sequence ?? Number.MAX_SAFE_INTEGER)
       - (right.sequence ?? Number.MAX_SAFE_INTEGER)
   );
+  for (const operation of delta.operations) {
+    if (operation.kind !== 'text.append') continue;
+    const turnIndex = turns.findIndex(
+      (turn) => turn.id === operation.append.turnId
+    );
+    if (turnIndex < 0) {
+      throw new Error('timeline_delta_text_append_turn_missing');
+    }
+    turns[turnIndex] = applyTextAppendV3(
+      turns[turnIndex]!,
+      operation.append
+    );
+  }
 
   const result: AgentTimelineResult = {
     ...current,
@@ -304,6 +356,14 @@ export function applyAgentTimelineDelta(
     turns,
   };
   applyRootProjectionReplacements(result, delta.rootReplacements);
+  for (const operation of delta.operations) {
+    if (operation.kind !== 'run.updated') continue;
+    if (operation.runProjection === null) {
+      delete result.runProjection;
+    } else {
+      result.runProjection = operation.runProjection;
+    }
+  }
   assertNativeTimeline(result);
   return result;
 }
@@ -396,8 +456,8 @@ export function timelineAsReplay(
 
 export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
   return {
-    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2,
-    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2,
+    schemaVersion: AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4,
+    shapeVersion: AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4,
     sessionId,
     revision: 0,
     sourceEventVersion: 0,
@@ -413,7 +473,7 @@ function assertNativeTimeline(
   if (!isNativeWorkSegmentsTimelineSnapshot(timeline)) {
     throw new Error('shared_conversation_projection_native_shape_required');
   }
-  assertSharedConversationProjectionV2(timeline);
+  assertSharedConversationProjectionV3(timeline);
 }
 
 function assertTimelineDelta(delta: AgentTimelineDelta): void {
@@ -428,15 +488,16 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     'eventCount',
     'turnReplacements',
     'removedTurnIds',
+    'operations',
     'rootReplacements',
   ];
   if (
     !isRecord(delta)
     || !hasExactKeys(delta, deltaKeys)
     || delta.schemaVersion
-      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V2
+      !== AGENT_SHARED_CONVERSATION_PROJECTION_SCHEMA_V4
     || delta.shapeVersion
-      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V2
+      !== AGENT_SHARED_CONVERSATION_WORK_SEGMENTS_SHAPE_V4
     || typeof delta.sessionId !== 'string'
     || delta.sessionId.length === 0
     || !isNonnegativeSafeInteger(delta.baseRevision)
@@ -447,11 +508,11 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     || !isNonnegativeSafeInteger(delta.eventCount)
     || !Array.isArray(delta.turnReplacements)
     || !Array.isArray(delta.removedTurnIds)
+    || !Array.isArray(delta.operations)
     || !isRecord(delta.rootReplacements)
     || !hasOnlyKeys(delta.rootReplacements, [
       'taskProjection',
       'interactionProjection',
-      'runProjection',
       'tokenUsageProjection',
       'workspaceProjection',
     ])
@@ -481,6 +542,39 @@ function assertTimelineDelta(delta: AgentTimelineDelta): void {
     }
     removedIds.add(turnId);
   }
+  let runUpdateCount = 0;
+  const appendTargets = new Set<string>();
+  for (const operation of delta.operations) {
+    if (!isRecord(operation) || typeof operation.kind !== 'string') {
+      throw new Error('invalid_timeline_delta_operation');
+    }
+    if (operation.kind === 'run.updated') {
+      if (
+        !hasExactKeys(operation, ['kind', 'runProjection'])
+        || operation.runProjection === undefined
+      ) {
+        throw new Error('invalid_timeline_delta_run_update');
+      }
+      runUpdateCount += 1;
+      if (runUpdateCount > 1) {
+        throw new Error('timeline_delta_run_update_duplicate');
+      }
+      continue;
+    }
+    if (
+      operation.kind !== 'text.append'
+      || !hasExactKeys(operation, ['kind', 'append'])
+      || !validTextAppendV3(operation.append)
+    ) {
+      throw new Error('invalid_timeline_delta_text_append');
+    }
+    const append = operation.append as unknown as ConversationTextAppendV4;
+    const target = `${append.turnId}\u0000${append.blockId}`;
+    if (appendTargets.has(target)) {
+      throw new Error('timeline_delta_text_append_duplicate');
+    }
+    appendTargets.add(target);
+  }
 }
 
 function changedRootProjections(
@@ -499,9 +593,6 @@ function changedRootProjections(
   ) {
     replacements.interactionProjection =
       next.interactionProjection ?? null;
-  }
-  if (!jsonEqual(current.runProjection, next.runProjection)) {
-    replacements.runProjection = next.runProjection ?? null;
   }
   if (
     !jsonEqual(
@@ -543,13 +634,6 @@ function applyRootProjectionReplacements(
         replacements.interactionProjection;
     }
   }
-  if (hasOwn(replacements, 'runProjection')) {
-    if (replacements.runProjection === null) {
-      delete timeline.runProjection;
-    } else if (replacements.runProjection !== undefined) {
-      timeline.runProjection = replacements.runProjection;
-    }
-  }
   if (hasOwn(replacements, 'tokenUsageProjection')) {
     if (replacements.tokenUsageProjection === null) {
       delete timeline.tokenUsageProjection;
@@ -566,6 +650,162 @@ function applyRootProjectionReplacements(
         replacements.workspaceProjection;
     }
   }
+}
+
+function exactTextAppendV3(
+  before: AgentTimelineTurn,
+  after: AgentTimelineTurn
+): ConversationTextAppendV4 | undefined {
+  if (
+    before.id !== after.id
+    || before.blocks.length !== after.blocks.length
+    || !jsonEqual(
+      { ...before, blocks: [] },
+      { ...after, blocks: [] }
+    )
+  ) {
+    return undefined;
+  }
+  let append: ConversationTextAppendV4 | undefined;
+  for (let index = 0; index < before.blocks.length; index += 1) {
+    const previousBlock = before.blocks[index]!;
+    const nextBlock = after.blocks[index]!;
+    if (jsonEqual(previousBlock, nextBlock)) continue;
+    if (append) return undefined;
+    append = exactBlockTextAppendV3(before.id, previousBlock, nextBlock);
+    if (!append) return undefined;
+  }
+  return append;
+}
+
+function exactBlockTextAppendV3(
+  turnId: string,
+  before: AgentTimelineBlock,
+  after: AgentTimelineBlock
+): ConversationTextAppendV4 | undefined {
+  const baseRevision = before.revision ?? 0;
+  const blockRevision = after.revision ?? 0;
+  const beforeBody = before.bodyMarkdown ?? '';
+  const afterBody = after.bodyMarkdown ?? '';
+  const beforeRefs = before.provenance.sourceEventRefs;
+  const afterRefs = after.provenance.sourceEventRefs;
+  if (
+    before.id !== after.id
+    || before.kind !== 'assistant'
+    || before.narrativeKind !== 'assistantText'
+    || after.kind !== 'assistant'
+    || after.narrativeKind !== 'assistantText'
+    || baseRevision < 1
+    || blockRevision !== baseRevision + 1
+    || !afterBody.startsWith(beforeBody)
+    || !after.summary.startsWith(before.summary)
+    || afterBody.slice(beforeBody.length)
+      !== after.summary.slice(before.summary.length)
+    || afterBody.length === beforeBody.length
+    || afterRefs.length <= beforeRefs.length
+    || !beforeRefs.every((ref, index) => afterRefs[index] === ref)
+    || new Set(afterRefs).size !== afterRefs.length
+  ) {
+    return undefined;
+  }
+  const sourceEventRefs = afterRefs.slice(beforeRefs.length);
+  if (
+    sourceEventRefs.length === 0
+    || sourceEventRefs.some((ref) => !ref.trim())
+  ) {
+    return undefined;
+  }
+  const normalizedAfter: AgentTimelineBlock = {
+    ...after,
+    revision: before.revision,
+    summary: before.summary,
+    bodyMarkdown: before.bodyMarkdown,
+    provenance: {
+      ...after.provenance,
+      sourceEventRefs: beforeRefs,
+    },
+  };
+  if (!jsonEqual(before, normalizedAfter)) return undefined;
+  return {
+    turnId,
+    blockId: after.id,
+    baseBlockRevision: baseRevision,
+    blockRevision,
+    textDelta: afterBody.slice(beforeBody.length),
+    sourceEventRefs,
+  };
+}
+
+function validTextAppendV3(value: unknown): value is ConversationTextAppendV4 {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      'turnId',
+      'blockId',
+      'baseBlockRevision',
+      'blockRevision',
+      'textDelta',
+      'sourceEventRefs',
+    ])
+    || typeof value.turnId !== 'string'
+    || value.turnId.length === 0
+    || typeof value.blockId !== 'string'
+    || value.blockId.length === 0
+    || !isNonnegativeSafeInteger(value.baseBlockRevision)
+    || value.baseBlockRevision < 1
+    || !isNonnegativeSafeInteger(value.blockRevision)
+    || value.blockRevision !== value.baseBlockRevision + 1
+    || typeof value.textDelta !== 'string'
+    || value.textDelta.length === 0
+    || !Array.isArray(value.sourceEventRefs)
+    || value.sourceEventRefs.length === 0
+    || value.sourceEventRefs.some(
+      (ref) => typeof ref !== 'string' || ref.length === 0
+    )
+    || new Set(value.sourceEventRefs).size !== value.sourceEventRefs.length
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function applyTextAppendV3(
+  turn: AgentTimelineTurn,
+  append: ConversationTextAppendV4
+): AgentTimelineTurn {
+  if (turn.id !== append.turnId) {
+    throw new Error('timeline_delta_text_append_turn_mismatch');
+  }
+  const blockIndex = turn.blocks.findIndex(
+    (block) => block.id === append.blockId
+  );
+  if (blockIndex < 0) {
+    throw new Error('timeline_delta_text_append_block_missing');
+  }
+  const block = turn.blocks[blockIndex]!;
+  const blockRevision = block.revision ?? 0;
+  const currentRefs = block.provenance.sourceEventRefs;
+  if (
+    block.kind !== 'assistant'
+    || block.narrativeKind !== 'assistantText'
+    || blockRevision !== append.baseBlockRevision
+    || append.blockRevision !== append.baseBlockRevision + 1
+    || append.sourceEventRefs.some((ref) => currentRefs.includes(ref))
+  ) {
+    throw new Error('timeline_delta_text_append_contract_invalid');
+  }
+  const blocks = [...turn.blocks];
+  blocks[blockIndex] = {
+    ...block,
+    revision: append.blockRevision,
+    summary: `${block.summary}${append.textDelta}`,
+    bodyMarkdown: `${block.bodyMarkdown ?? ''}${append.textDelta}`,
+    provenance: {
+      ...block.provenance,
+      sourceEventRefs: [...currentRefs, ...append.sourceEventRefs],
+    },
+  };
+  return { ...turn, blocks };
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {

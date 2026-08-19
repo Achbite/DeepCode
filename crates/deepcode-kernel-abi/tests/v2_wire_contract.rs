@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use deepcode_kernel_abi::v2::*;
 use deepcode_kernel_abi::v2_command::{
     decode_kernel_command_v2, CapabilityApprovalViewV2, CapabilityResourcePresentationKindV2,
-    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
-    CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandV2,
-    KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2,
-    KernelWireErrorV2, MutationCommandKindV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
-    ToolIntentSubmitV2,
+    CapabilityResourcePresentationV2, CapabilityScopeDispositionV2, CapabilityScopePreviewOriginV3,
+    CapabilityScopePreviewRecordV2, CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2,
+    KernelCommandV2, KernelFactProjectionPageV2, KernelFactProjectionV2, KernelFactsQueryScopedV2,
+    KernelReplyV2, KernelWireErrorV2, MutationCommandKindV2, ToolIntentRejectionReasonV2,
+    ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, capability_authorization_digest_v2, capability_scope_digest_v2,
@@ -156,7 +156,7 @@ fn digest_text(fill: char) -> String {
     format!("sha256:{}", fill.to_string().repeat(64))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MutationPreviewVector<'a> {
     run_id: &'a str,
     plan_revision: &'a str,
@@ -168,6 +168,7 @@ struct MutationPreviewVector<'a> {
     scope_delta: &'a [&'a str],
     target_observation_fill: char,
     decision_class: &'a str,
+    origin: CapabilityScopePreviewOriginV3,
 }
 
 fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreviewRecordV2 {
@@ -269,6 +270,7 @@ fn mutation_preview(vector: MutationPreviewVector<'_>) -> CapabilityScopePreview
         plan_action_id,
         operation_id,
         tool_id,
+        origin: vector.origin,
         authorization_binding,
         canonical_scope,
         scope_digest: scope_digest.clone(),
@@ -309,6 +311,7 @@ fn corpus_normal_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &[],
         target_observation_fill: '9',
         decision_class: "capability",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
     })
 }
 
@@ -324,6 +327,7 @@ fn corpus_expanded_allow_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &["expanded.txt"],
         target_observation_fill: '7',
         decision_class: "scopeExpansion",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
     })
 }
 
@@ -339,6 +343,7 @@ fn corpus_deny_normal_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &[],
         target_observation_fill: '9',
         decision_class: "capability",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
     })
 }
 
@@ -354,6 +359,7 @@ fn corpus_expanded_deny_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &["expanded.txt"],
         target_observation_fill: '7',
         decision_class: "scopeExpansion",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
     })
 }
 
@@ -369,6 +375,7 @@ fn session_default_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &[],
         target_observation_fill: '9',
         decision_class: "capability",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
     })
 }
 
@@ -384,6 +391,7 @@ fn session_second_action_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &[],
         target_observation_fill: '8',
         decision_class: "capability",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
     })
 }
 
@@ -399,6 +407,67 @@ fn session_first_action_preview() -> CapabilityScopePreviewRecordV2 {
         scope_delta: &[],
         target_observation_fill: '9',
         decision_class: "capability",
+        origin: CapabilityScopePreviewOriginV3::Plan {},
+    })
+}
+
+fn session_plan_discovery_preview() -> CapabilityScopePreviewRecordV2 {
+    mutation_preview(MutationPreviewVector {
+        run_id: "run-session-v2-contract",
+        plan_revision: "plan-revision-1",
+        plan_action_id: "plan-action-write-output",
+        operation_id: "operation-plan-discovery-expanded",
+        preview_id: "preview-plan-discovery-expanded",
+        path: "expanded.txt",
+        approved_paths: &["expanded.txt"],
+        scope_delta: &["expanded.txt"],
+        target_observation_fill: '7',
+        decision_class: "planDiscovery",
+        origin: CapabilityScopePreviewOriginV3::PlanDiscovery {
+            discovery_id: "discovery-wire-golden-1".to_owned(),
+        },
+    })
+}
+
+fn session_intervention_candidate_selected_preview() -> CapabilityScopePreviewRecordV2 {
+    mutation_preview(MutationPreviewVector {
+        run_id: "run-session-v2-contract",
+        plan_revision: "plan-revision-intervention-selected",
+        plan_action_id: "plan-action-intervention-selected",
+        operation_id: "operation-intervention-selected",
+        preview_id: "preview-intervention-selected",
+        path: "expanded.txt",
+        approved_paths: &["expanded.txt"],
+        scope_delta: &["expanded.txt"],
+        target_observation_fill: '7',
+        decision_class: "interventionCandidate",
+        origin: CapabilityScopePreviewOriginV3::InterventionCandidate {
+            interaction_id: "user-intervention-wire-golden-1".to_owned(),
+            interaction_revision: "intervention-revision-wire-golden-1".to_owned(),
+            candidate_set_digest: digest_text('a'),
+            option_id: "option-selected".to_owned(),
+        },
+    })
+}
+
+fn session_intervention_candidate_superseded_preview() -> CapabilityScopePreviewRecordV2 {
+    mutation_preview(MutationPreviewVector {
+        run_id: "run-session-v2-contract",
+        plan_revision: "plan-revision-intervention-superseded",
+        plan_action_id: "plan-action-intervention-superseded",
+        operation_id: "operation-intervention-superseded",
+        preview_id: "preview-intervention-superseded",
+        path: "alternate.txt",
+        approved_paths: &["alternate.txt"],
+        scope_delta: &["alternate.txt"],
+        target_observation_fill: '6',
+        decision_class: "interventionCandidate",
+        origin: CapabilityScopePreviewOriginV3::InterventionCandidate {
+            interaction_id: "user-intervention-wire-golden-1".to_owned(),
+            interaction_revision: "intervention-revision-wire-golden-1".to_owned(),
+            candidate_set_digest: digest_text('a'),
+            option_id: "option-superseded".to_owned(),
+        },
     })
 }
 
@@ -410,6 +479,15 @@ fn kernel_capability_previews() -> BTreeMap<&'static str, CapabilityScopePreview
         ("corpusNormalDeny", corpus_deny_normal_preview()),
         ("sessionDefault", session_default_preview()),
         ("sessionFirstAction", session_first_action_preview()),
+        (
+            "sessionInterventionCandidateSelected",
+            session_intervention_candidate_selected_preview(),
+        ),
+        (
+            "sessionInterventionCandidateSuperseded",
+            session_intervention_candidate_superseded_preview(),
+        ),
+        ("sessionPlanDiscovery", session_plan_discovery_preview()),
         ("sessionSecondAction", session_second_action_preview()),
     ])
 }
@@ -472,7 +550,7 @@ fn corpus_invocation_authority(version: u64) -> InvocationAuthorityV2 {
 }
 
 fn corpus_context_read_authority() -> InvocationAuthorityV2 {
-    InvocationAuthorityV2::ContextRead {
+    InvocationAuthorityV2::Read {
         tool_context_ref: corpus_context_ref(),
         settings_digest: SettingsCeilingDigestV2::parse(digest_text('e'))
             .expect("valid settings digest"),
@@ -482,7 +560,7 @@ fn corpus_context_read_authority() -> InvocationAuthorityV2 {
 }
 
 fn corpus_mutation_context_read_authority() -> InvocationAuthorityV2 {
-    InvocationAuthorityV2::ContextRead {
+    InvocationAuthorityV2::Read {
         tool_context_ref: corpus_previous_context_ref(),
         settings_digest: SettingsCeilingDigestV2::parse(digest_text('e'))
             .expect("valid settings digest"),
@@ -1729,7 +1807,7 @@ fn shared_kernel_session_v2_golden_vectors_decode_in_rust() {
     .expect("parse shared Kernel-Session v2 golden fixture");
     assert_eq!(
         fixture["schemaVersion"],
-        "deepcode.kernel-session.wire-golden.v2"
+        "deepcode.kernel-session.wire-golden.v3"
     );
 
     let context_value = fixture["kernelToolContext"].clone();

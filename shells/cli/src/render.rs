@@ -36,21 +36,32 @@ pub(crate) fn render_timeline(timeline: &AgentTimelineSnapshot) -> Result<(), St
 }
 
 fn render_timeline_block(block: &deepcode_kernel_client::AgentTimelineBlock) -> Result<(), String> {
-    if block.entry_role == AgentTimelineEntryRole::FinalAnswer
-        && block.durability != AgentTimelineDurability::Committed
-    {
-        return Ok(());
-    }
     let kind = timeline_block_kind_label(block);
     let title = (!block.title.trim().is_empty())
         .then_some(block.title.as_str())
         .unwrap_or(kind);
     let body = timeline_block_text(block)?;
-    println!("  {kind}: {title}");
+    let answer_state = block
+        .answer_state
+        .map(answer_state_label)
+        .map(|state| format!(" [{state}]"))
+        .unwrap_or_default();
+    println!("  {kind}{answer_state}: {title}");
     for line in body.lines().take(24) {
         println!("    {line}");
     }
     Ok(())
+}
+
+fn answer_state_label(state: deepcode_kernel_client::AgentTimelineAnswerState) -> &'static str {
+    use deepcode_kernel_client::AgentTimelineAnswerState::*;
+    match state {
+        Streaming => "streaming",
+        Provisional => "provisional",
+        Committed => "committed",
+        Stale => "stale",
+        Rejected => "rejected",
+    }
 }
 
 fn timeline_block_text(
@@ -171,6 +182,7 @@ fn timeline_block_kind_label(block: &deepcode_kernel_client::AgentTimelineBlock)
         Assistant => "assistant",
         Permission => "permission",
         Plan => "plan",
+        UserIntervention => "user-intervention",
         Review => "review",
         Error => "error",
     }
@@ -601,6 +613,44 @@ pub(crate) fn find_pending_session_decision(
     Some(PendingSessionDecision { run_id, target_id })
 }
 
+pub(crate) fn find_pending_user_intervention_decision(
+    timeline: &AgentTimelineSnapshot,
+    interaction_id: &str,
+) -> Option<PendingUserInterventionDecision> {
+    let pending = match timeline.interaction_projection.as_ref()?.pending.as_ref()? {
+        deepcode_kernel_client::AgentTimelinePendingInteraction::UserIntervention(pending) => {
+            pending
+        }
+        _ => return None,
+    };
+    let intervention = &pending.intervention;
+    if pending.interaction_id != interaction_id
+        || pending.target_id != interaction_id
+        || pending.interaction_revision != intervention.interaction_revision
+        || pending.interaction_id != intervention.interaction_id
+        || pending.candidate_set_digest != intervention.candidate_set_digest
+        || pending.run_id.trim().is_empty()
+        || pending.interaction_revision.trim().is_empty()
+        || pending.candidate_set_digest.trim().is_empty()
+    {
+        return None;
+    }
+    let projection = timeline.run_projection.as_ref()?;
+    let wait = projection.wait.0.as_ref()?;
+    if projection.run_id != pending.run_id || wait.interaction_id.as_deref() != Some(interaction_id)
+    {
+        return None;
+    }
+    Some(PendingUserInterventionDecision {
+        interaction_id: pending.interaction_id.clone(),
+        interaction_revision: pending.interaction_revision.clone(),
+        candidate_set_digest: pending.candidate_set_digest.clone(),
+        projection_cursor: timeline.revision,
+        run_id: pending.run_id.clone(),
+        target_id: pending.target_id.clone(),
+    })
+}
+
 pub(crate) fn extract_committed_final_text_v2(timeline: &AgentTimelineSnapshot) -> Option<String> {
     let projection = timeline.run_projection.as_ref()?;
     if projection.status != AgentTimelineRunStatus::Succeeded {
@@ -624,6 +674,9 @@ pub(crate) fn extract_committed_final_text_v2(timeline: &AgentTimelineSnapshot) 
         let block = blocks_by_id.get(block_id.as_str())?;
         if block.entry_role != AgentTimelineEntryRole::FinalAnswer
             || block.durability != AgentTimelineDurability::Committed
+            || block.answer_state.is_some_and(|state| {
+                state != deepcode_kernel_client::AgentTimelineAnswerState::Committed
+            })
         {
             continue;
         }
@@ -746,10 +799,15 @@ Usage:
   DeepCode-CLI sessions delete <session-id>
   DeepCode-CLI sessions archive <session-id>
   DeepCode-CLI timeline [session-id]
+  DeepCode-CLI analysis show [--session <id>] [session-id]
+  DeepCode-CLI analysis follow [--session <id>] [session-id]
   DeepCode-CLI permission allow <permission-id>
   DeepCode-CLI permission deny <permission-id>
   DeepCode-CLI decision plan <accept|reject|revise> [--session <id>] [run-id] [plan-revision] [guidance]
   DeepCode-CLI decision permission <accept|reject> [--session <id>] [run-id] [target-id]
+  DeepCode-CLI decision intervention <interaction-id> select --option <id> [--guidance <text>]
+  DeepCode-CLI decision intervention <interaction-id> revise --guidance <text>
+  DeepCode-CLI decision intervention <interaction-id> reject [--guidance <text>]
   DeepCode-CLI ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
 
 Options:
@@ -768,7 +826,8 @@ Environment:
 Session Runtime:
   Ordinary input is submitted to daemon /api/agent/sessions/:id/runs.
   CLI only polls run status and renders shared timeline projection.
-  Decision run-id/target-id are optional when the current shared timeline has one pending matching decision.
+  Plan/permission run-id and target-id are optional when the current shared timeline has one pending matching decision.
+  Intervention decisions always bind the exact projected interaction revision, candidate digest, and cursor.
   If the daemon session runtime is missing, run `pnpm --filter @deepcode/session-core build`
   or use a packaged distribution that includes session-core/dist, node_modules/@deepcode/protocol,
   and node/bin/node.
@@ -796,12 +855,16 @@ Sessions:
   /timeline             Print current session timeline
 
 Permissions and decisions:
-  /decision ...         Resolve an exact plan or permission wait through the shared Session Runtime
+  /decision ...         Resolve an exact plan, permission, or user-intervention wait through the shared Session Runtime
   decision plan accept  Confirm the latest pending plan in the shared timeline projection
   decision plan revise  Submit review guidance for a pending plan
   decision plan reject  End a pending plan
   decision permission accept|reject
                         Resolve the exact pending permission through a canonical decision run
+  decision intervention <interaction-id> select --option <id> [--guidance <text>]
+  decision intervention <interaction-id> revise --guidance <text>
+  decision intervention <interaction-id> reject [--guidance <text>]
+                        Resolve the exact projected intervention candidate set
   any text              Send a message through the shared Session Runtime
 
 Non-interactive:

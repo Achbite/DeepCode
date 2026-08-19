@@ -5,9 +5,10 @@ use deepcode_kernel_abi::v2::{
     RunId, UserDecisionRefV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2, CapabilityScopePreviewReplyV2,
-    CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2,
-    KernelCommandV2, KernelReplyV2, RunOpenV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
+    CapabilityScopePreviewBatchV2, CapabilityScopePreviewItemV2, CapabilityScopePreviewOriginV3,
+    CapabilityScopePreviewReplyV2, CommandHandlingV2, DeadlineRequestV2, KernelCommandEnvelopeV2,
+    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelReplyV2, RunOpenV2,
+    ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::{
     CapabilityLeaseRefV2, CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2,
@@ -262,13 +263,15 @@ pub(super) fn preview_plan_action(
                 operation_id: operation_id.clone(),
                 idempotency_key: format!("idempotency-{operation_id}"),
                 tool_id: tool_id.clone(),
-                scope_intent: ScopeIntentV2::ResourceScope {
+                scope_intent: Some(ScopeIntentV2::ResourceScope {
                     requested_resources: vec![RequestedResourceV2::WorkspacePath {
                         path: path.to_owned(),
                         access: ResourceAccessV2::Write,
                     }],
-                },
+                }),
+                raw_arguments: None,
                 deadline: DeadlineRequestV2::ContractDefault {},
+                origin: CapabilityScopePreviewOriginV3::Plan {},
             }],
             tool_context_ref: opened.tool_context_ref.clone(),
         }),

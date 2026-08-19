@@ -753,6 +753,156 @@ button {
   overflow-wrap: anywhere;
 }
 
+.deepcode-private-analysis {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+}
+
+.deepcode-private-analysis__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.36);
+  backdrop-filter: blur(2px);
+}
+
+.deepcode-private-analysis__panel {
+  position: absolute;
+  top: 36px;
+  right: 36px;
+  bottom: 36px;
+  display: flex;
+  width: min(720px, calc(100vw - 72px));
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #d9dde4;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.24);
+}
+
+.deepcode-private-analysis__panel > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid #eceef2;
+}
+
+.deepcode-private-analysis__panel h2,
+.deepcode-private-analysis__panel p {
+  margin: 0;
+}
+
+.deepcode-private-analysis__panel h2 {
+  color: #252a31;
+  font-size: 16px;
+}
+
+.deepcode-private-analysis__panel header p {
+  max-width: 600px;
+  margin-top: 5px;
+  color: #737b87;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.deepcode-private-analysis__panel header button,
+.deepcode-private-analysis__open {
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #68707b;
+  cursor: pointer;
+}
+
+.deepcode-private-analysis__panel header button {
+  width: 28px;
+  height: 28px;
+  font-size: 20px;
+}
+
+.deepcode-private-analysis__open {
+  width: auto !important;
+  padding: 4px 8px !important;
+  font-size: 11px !important;
+}
+
+.deepcode-private-analysis__status,
+.deepcode-private-analysis__error {
+  padding: 8px 20px;
+  font-size: 11px;
+}
+
+.deepcode-private-analysis__status {
+  border-bottom: 1px solid #eceef2;
+  color: #68707b;
+}
+
+.deepcode-private-analysis__error {
+  background: #fff1f1;
+  color: #b42318;
+}
+
+.deepcode-private-analysis__items {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 20px 24px;
+}
+
+.deepcode-private-analysis__empty {
+  padding: 48px 16px;
+  color: #8a919c;
+  text-align: center;
+}
+
+.deepcode-private-analysis__item {
+  border-bottom: 1px solid #eceef2;
+  padding: 10px 0;
+}
+
+.deepcode-private-analysis__item summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  color: #555e69;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.deepcode-private-analysis__item summary code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-private-analysis__item summary strong[data-status="failed"],
+.deepcode-private-analysis__item summary strong[data-status="limitExceeded"] {
+  color: #b42318;
+}
+
+.deepcode-private-analysis__item pre {
+  max-height: 440px;
+  margin: 10px 0 0;
+  overflow: auto;
+  border-radius: 8px;
+  background: #f5f6f8;
+  padding: 12px;
+  color: #303741;
+  font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+.deepcode-private-analysis__item ul,
+.deepcode-private-analysis__reason {
+  margin: 8px 0 0;
+  color: #68707b;
+  font-size: 11px;
+}
+
 .deepcode-gui-event-list {
   display: grid;
   gap: 6px;
@@ -3069,6 +3219,18 @@ button {
 
 .deepcode-gui-assistant-text .markdown-content p {
   margin: 0 0 12px;
+}
+
+.deepcode-gui-assistant-text .agent-answer-settlement {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.deepcode-gui-assistant-text .agent-answer-settlement--stale,
+.deepcode-gui-assistant-text .agent-answer-settlement--rejected {
+  color: #9a6324;
 }
 
 .deepcode-gui-assistant-narration {

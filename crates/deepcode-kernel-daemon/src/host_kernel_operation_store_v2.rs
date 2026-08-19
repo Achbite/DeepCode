@@ -8,7 +8,7 @@ use crate::host_workspace_registry_v2::HostWorkspaceRehydrateRecordV2;
 use crate::session_bootstrap_v2::{
     HostProviderProfileBootstrapV2, HostSessionPriorEventsV2, HOST_SESSION_PRIOR_EVENTS_SCHEMA_V3,
 };
-use crate::AgentInputAttachmentV2;
+use crate::{AgentInputAttachmentV3, UserAttachmentContextV1};
 use deepcode_kernel_abi::v2_command::{KernelCommandEnvelopeV2, KernelCommandV2, RunOpenReplyV2};
 use deepcode_kernel_abi::WorkspaceBindingRefV2;
 use rusqlite::{
@@ -29,7 +29,7 @@ const BOOTSTRAP_SCHEMA_V2: &str = "deepcode.host.kernel-run-bootstrap.v2";
 const CALLER_REQUEST_SCHEMA_V2: &str = "deepcode.host.caller-request.v3";
 const OPERATION_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-operation.v2";
 const ATTEMPT_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-dispatch-attempt.v2";
-const HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v3";
+const HISTORY_SCHEMA_V3: &str = "deepcode.session.kernel-persistence.v4";
 const PRODUCTION_FRAME_SCHEMA_V2: &str = "deepcode.session.kernel-production-request-frame.v2";
 const PRODUCTION_REQUEST_SCHEMA_V2: &str = "deepcode.session.kernel-production-request.v2";
 const PRODUCTION_RESPONSE_SCHEMA_V2: &str = "deepcode.session.kernel-production-response.v2";
@@ -62,7 +62,8 @@ pub(crate) struct HostKernelBootstrapInitialInputV2 {
     pub(crate) input_id: String,
     pub(crate) opaque_input_ref: String,
     pub(crate) text: String,
-    pub(crate) attachments: Vec<AgentInputAttachmentV2>,
+    pub(crate) attachments: Vec<AgentInputAttachmentV3>,
+    pub(crate) attachment_contexts: Vec<UserAttachmentContextV1>,
     pub(crate) recorded_at: String,
 }
 
@@ -476,6 +477,42 @@ impl HostKernelOperationStoreV2 {
                 return Ok(None);
             };
             decode_caller_request_binding(stored, request_kind, request_digest, true).map(Some)
+        })
+    }
+
+    pub(crate) fn caller_request_host_run_id(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        expected_request_kind: &str,
+    ) -> Result<Option<String>, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        validate_bounded_identity(caller_request_id, "callerRequestId", 512)?;
+        validate_bounded_identity(expected_request_kind, "requestKind", 128)?;
+        self.with_connection(|connection| {
+            let Some(stored) = stored_caller_request(connection, session_id, caller_request_id)?
+            else {
+                return Ok(None);
+            };
+            let request_kind = stored.request_kind.clone();
+            let request_digest = stored.request_digest.clone();
+            let binding =
+                decode_caller_request_binding(stored, &request_kind, &request_digest, true)?;
+            if binding.request_kind != expected_request_kind {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_kind_conflict",
+                    "Caller request identity is already bound to a different command kind",
+                ));
+            }
+            let host_run_id = binding
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    corrupt("Caller request binding has no canonical Host Run identity")
+                })?;
+            validate_bounded_identity(host_run_id, "hostRunId", 512)?;
+            Ok(Some(host_run_id.to_string()))
         })
     }
 
@@ -1065,6 +1102,276 @@ impl HostKernelOperationStoreV2 {
         reclaimed_at: &str,
     ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
         self.reclaim_caller_request_drive_inner(binding, owner_instance_id, reclaimed_at, true)
+    }
+
+    /// Reclaims only the narrow, structurally proven intervention-selection
+    /// failure that used to persist Kernel selection before Session could
+    /// close its intervention wait. The immutable indeterminate outcome stays
+    /// intact; ownership is reclaimed solely to finish the missing Session
+    /// control settlement without dispatching any selected mutation.
+    pub(crate) fn reclaim_indeterminate_intervention_caller_request_drive(
+        &self,
+        binding: &HostCallerRequestBindingReceiptV2,
+        owner_instance_id: &str,
+        reclaimed_at: &str,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_bounded_identity(reclaimed_at, "driveStartedAt", 1024)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "host_caller_request_not_found",
+                    "Intervention settlement recovery requires an exact durable caller binding",
+                )
+            })?;
+            let current = decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                true,
+            )?;
+            validate_indeterminate_intervention_recovery_boundary(
+                transaction,
+                &current,
+                binding.outcome_digest.as_deref(),
+            )?;
+            let host_run_id = current
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Intervention settlement recovery has no exact Host Run identity",
+                    )
+                })?;
+            let run = stored_run_by_session_host(transaction, &binding.session_id, host_run_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_run_not_found",
+                        "Intervention settlement recovery is bound to a missing Run",
+                    )
+                })?;
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+                || run.drive_caller_request_id.as_deref()
+                    != Some(binding.caller_request_id.as_str())
+                || run.drive_request_digest.as_deref() != Some(binding.request_digest.as_str())
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_run_drive_conflict",
+                    "Intervention settlement recovery no longer owns the exact active Run drive",
+                ));
+            }
+            if current.drive_owner_instance_id.as_deref() != Some(owner_instance_id) {
+                let changed = transaction
+                    .execute(
+                        "UPDATE host_caller_requests
+                         SET drive_owner_instance_id = ?1, drive_started_at = ?2
+                         WHERE session_id = ?3 AND caller_request_id = ?4
+                           AND request_digest = ?5 AND outcome_digest = ?6
+                           AND drive_state = 'Driving' AND drive_owner_instance_id = ?7",
+                        params![
+                            owner_instance_id,
+                            reclaimed_at,
+                            binding.session_id,
+                            binding.caller_request_id,
+                            binding.request_digest,
+                            binding.outcome_digest,
+                            current.drive_owner_instance_id,
+                        ],
+                    )
+                    .map_err(|error| {
+                        database_error("host_intervention_recovery_reclaim_failed", error)
+                    })?;
+                if changed != 1 {
+                    return Err(HostV2StorageError::conflict(
+                        "host_intervention_recovery_reclaim_conflict",
+                        "Intervention settlement recovery ownership changed before reclaim",
+                    ));
+                }
+            }
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::io(
+                    "host_intervention_recovery_reclaim_lost",
+                    "Reclaimed intervention caller disappeared before commit",
+                )
+            })?;
+            decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                false,
+            )
+        })
+    }
+
+    /// Releases the old caller drive only after two new, caller-correlated
+    /// Session control operations have durably succeeded: the recovered
+    /// intervention decision and its exact facts reconciliation. The caller's
+    /// original indeterminate outcome is intentionally not rewritten.
+    pub(crate) fn release_recovered_indeterminate_intervention_drive(
+        &self,
+        binding: &HostCallerRequestBindingReceiptV2,
+        owner_instance_id: &str,
+        decision_settlement: &HostKernelOperationSettlementReceiptV2,
+        reconcile_settlement: &HostKernelOperationSettlementReceiptV2,
+    ) -> Result<(), HostV2StorageError> {
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(
+                transaction,
+                &binding.session_id,
+                &binding.caller_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "host_caller_request_not_found",
+                    "Recovered intervention release requires an exact durable caller binding",
+                )
+            })?;
+            let current = decode_caller_request_binding(
+                stored,
+                &binding.request_kind,
+                &binding.request_digest,
+                true,
+            )?;
+            validate_indeterminate_intervention_recovery_boundary(
+                transaction,
+                &current,
+                binding.outcome_digest.as_deref(),
+            )?;
+            if current.drive_owner_instance_id.as_deref() != Some(owner_instance_id) {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_owner_conflict",
+                    "Only the exact reclaimed owner may release the recovered intervention drive",
+                ));
+            }
+            let host_run_id = current
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Recovered intervention release has no exact Host Run identity",
+                    )
+                })?;
+            let run = stored_run_by_session_host(transaction, &binding.session_id, host_run_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_run_not_found",
+                        "Recovered intervention release is bound to a missing Run",
+                    )
+                })?;
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+                || run.drive_caller_request_id.as_deref()
+                    != Some(binding.caller_request_id.as_str())
+                || run.drive_request_digest.as_deref() != Some(binding.request_digest.as_str())
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_run_drive_conflict",
+                    "Recovered intervention release no longer owns the exact active Run drive",
+                ));
+            }
+            let decision_operation = require_recovery_operation(
+                transaction,
+                &run,
+                &current,
+                decision_settlement,
+                "decideUserIntervention",
+            )?;
+            let reconcile_operation = require_recovery_operation(
+                transaction,
+                &run,
+                &current,
+                reconcile_settlement,
+                "reconcileFacts",
+            )?;
+            if reconcile_operation.operation_sequence <= decision_operation.operation_sequence {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_sequence_conflict",
+                    "Facts reconciliation did not follow the recovered intervention decision",
+                ));
+            }
+            let HostKernelOperationSettlementV2::Succeeded {
+                response: decision_response,
+                ..
+            } = &decision_settlement.settlement
+            else {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_decision_incomplete",
+                    "Recovered intervention decision is not durably successful",
+                ));
+            };
+            let decision_high_water = decision_response
+                .pointer("/state/factsSnapshotHighWater")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_intervention_recovery_high_water_missing",
+                        "Recovered intervention decision has no exact facts high-water",
+                    )
+                })?;
+            let reconcile_frame = decode_stored_production_frame(&reconcile_operation)?;
+            if reconcile_frame
+                .pointer("/request/operation/data/observedHighWater")
+                .and_then(Value::as_u64)
+                != Some(decision_high_water)
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_high_water_conflict",
+                    "Recovered facts reconciliation does not bind the decision high-water",
+                ));
+            }
+            let HostKernelOperationSettlementV2::Succeeded { continuation, .. } =
+                &reconcile_settlement.settlement
+            else {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_reconcile_incomplete",
+                    "Recovered intervention facts reconciliation is not durably successful",
+                ));
+            };
+            if continuation.get("kind").and_then(Value::as_str) != Some("readyToDrivePlanAction") {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_boundary_invalid",
+                    "Recovered intervention did not stop at the next unexecuted Plan action",
+                ));
+            }
+            let released = transaction
+                .execute(
+                    "UPDATE host_kernel_runs
+                     SET drive_caller_request_id = NULL, drive_request_digest = NULL
+                     WHERE session_id = ?1 AND host_run_id = ?2
+                       AND lifecycle = 'Active'
+                       AND drive_caller_request_id = ?3 AND drive_request_digest = ?4",
+                    params![
+                        binding.session_id,
+                        host_run_id,
+                        binding.caller_request_id,
+                        binding.request_digest,
+                    ],
+                )
+                .map_err(|error| {
+                    database_error("host_intervention_recovery_release_failed", error)
+                })?;
+            if released != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_intervention_recovery_release_conflict",
+                    "Recovered intervention drive changed before durable release",
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn reclaim_caller_request_drive_inner(
@@ -1833,12 +2140,14 @@ impl HostKernelOperationStoreV2 {
         if require_zero_operations
             && !matches!(
                 request_kind,
-                HOST_DECISION_REQUEST_KIND_V2 | HOST_USER_INPUT_REQUEST_KIND_V2
+                HOST_RUN_OPEN_REQUEST_KIND_V2
+                    | HOST_DECISION_REQUEST_KIND_V2
+                    | HOST_USER_INPUT_REQUEST_KIND_V2
             )
         {
             return Err(HostV2StorageError::invalid(
                 "host_caller_request_abandon_kind_invalid",
-                "Only ordinary decision or user-input callers may use zero-effect abandonment",
+                "Only RunOpen, decision, or user-input callers may use zero-effect abandonment",
             ));
         }
         if !require_zero_operations
@@ -4247,6 +4556,190 @@ fn prepared_operation_caller_correlation(
     )))
 }
 
+fn validate_indeterminate_intervention_recovery_boundary(
+    connection: &Connection,
+    binding: &HostCallerRequestBindingReceiptV2,
+    expected_outcome_digest: Option<&str>,
+) -> Result<(), HostV2StorageError> {
+    if binding.request_kind != HOST_DECISION_REQUEST_KIND_V2
+        || binding.drive_state != HostCallerRequestDriveStateV2::Driving
+        || binding.admission.is_none()
+        || binding.outcome_digest.as_deref() != expected_outcome_digest
+        || binding
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("disposition"))
+            .and_then(Value::as_str)
+            != Some("indeterminate")
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_boundary_conflict",
+            "Caller is not the exact admitted indeterminate decision selected for recovery",
+        ));
+    }
+    let identity = &binding.response_identity;
+    let selected_preview_ids = identity
+        .get("selectedPreviewIds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_intervention_recovery_identity_invalid",
+                "Intervention recovery has no selected preview identities",
+            )
+        })?;
+    if identity.get("decisionKind").and_then(Value::as_str) != Some("userIntervention")
+        || identity.get("decision").and_then(Value::as_str) != Some("select")
+        || identity
+            .get("optionId")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || selected_preview_ids.is_empty()
+        || selected_preview_ids
+            .iter()
+            .any(|value| value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_identity_invalid",
+            "Only an executable intervention selection may use automatic Session settlement recovery",
+        ));
+    }
+    let operation_request_id = identity
+        .get("operationRequestId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_intervention_recovery_operation_missing",
+                "Intervention recovery has no original operation identity",
+            )
+        })?;
+    let operation =
+        stored_operation_by_request(connection, operation_request_id)?.ok_or_else(|| {
+            HostV2StorageError::not_found(
+                "host_intervention_recovery_operation_missing",
+                "Intervention recovery cannot find its original Session operation",
+            )
+        })?;
+    validate_stored_operation(&operation)?;
+    if operation.caller_request_id.as_deref() != Some(binding.caller_request_id.as_str())
+        || operation.caller_request_digest.as_deref() != Some(binding.request_digest.as_str())
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_operation_conflict",
+            "Original intervention operation lacks the exact caller correlation",
+        ));
+    }
+    let frame = decode_stored_production_frame(&operation)?;
+    if frame
+        .pointer("/request/operation/kind")
+        .and_then(Value::as_str)
+        != Some("decideUserIntervention")
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_operation_conflict",
+            "Original caller operation is not an intervention decision",
+        ));
+    }
+    let settlement = verified_settlement_receipt(connection, &operation)?;
+    let HostKernelOperationSettlementV2::FailedRecoverable { boundary, .. } =
+        &settlement.settlement
+    else {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_settlement_conflict",
+            "Original intervention operation is not a recoverable facts-query boundary",
+        ));
+    };
+    if boundary.disposition != HostKernelFailureDispositionV2::QueryFacts
+        || boundary.commit != HostKernelFailureCommitV2::Unknown
+        || boundary.effect != HostKernelFailureEffectV2::Possible
+        || boundary.pending_request_lanes != vec![HostKernelPendingRequestLaneV2::Query]
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_settlement_conflict",
+            "Original intervention failure does not match the exact safe recovery boundary",
+        ));
+    }
+    let pending_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM host_kernel_operations
+             WHERE caller_request_id = ?1 AND caller_request_digest = ?2
+               AND settlement_digest IS NULL",
+            params![binding.caller_request_id, binding.request_digest],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            database_error("host_intervention_recovery_pending_query_failed", error)
+        })?;
+    if pending_count != 0 {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_pending_conflict",
+            "Intervention recovery cannot proceed while a caller-correlated operation is unresolved",
+        ));
+    }
+    Ok(())
+}
+
+fn require_recovery_operation(
+    connection: &Connection,
+    run: &StoredRunV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+    expected: &HostKernelOperationSettlementReceiptV2,
+    expected_kind: &str,
+) -> Result<StoredOperationV2, HostV2StorageError> {
+    let operation = stored_operation_by_request(connection, &expected.operation_request_id)?
+        .ok_or_else(|| {
+            HostV2StorageError::not_found(
+                "host_intervention_recovery_operation_missing",
+                "Recovered Session operation is missing from the durable Host ledger",
+            )
+        })?;
+    validate_stored_operation(&operation)?;
+    if operation.run_row_id != run.id
+        || operation.caller_request_id.as_deref() != Some(binding.caller_request_id.as_str())
+        || operation.caller_request_digest.as_deref() != Some(binding.request_digest.as_str())
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_operation_conflict",
+            "Recovered Session operation does not belong to the exact caller and Run",
+        ));
+    }
+    let frame = decode_stored_production_frame(&operation)?;
+    if frame
+        .pointer("/request/operation/kind")
+        .and_then(Value::as_str)
+        != Some(expected_kind)
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_operation_conflict",
+            "Recovered Session operation kind does not match its settlement role",
+        ));
+    }
+    if expected_kind == "decideUserIntervention"
+        && (frame
+            .pointer("/request/operation/data/callerRequestId")
+            .and_then(Value::as_str)
+            != Some(binding.caller_request_id.as_str())
+            || frame
+                .pointer("/request/operation/data/callerRequestDigest")
+                .and_then(Value::as_str)
+                != Some(binding.request_digest.as_str()))
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_operation_conflict",
+            "Recovered intervention decision does not bind the original caller identity",
+        ));
+    }
+    let receipt = verified_settlement_receipt(connection, &operation)?;
+    if receipt.settlement_digest != expected.settlement_digest
+        || receipt.settlement != expected.settlement
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_intervention_recovery_settlement_conflict",
+            "Recovered Session settlement changed before drive release",
+        ));
+    }
+    Ok(operation)
+}
+
 struct StoredCallerRequestV2 {
     schema_version: String,
     session_id: String,
@@ -4897,8 +5390,12 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
             "Host Kernel initial input exceeds its bounded size",
         ));
     }
-    crate::validate_agent_input_attachment_slice_v2(&input.initial_input.attachments)
+    crate::validate_agent_input_attachment_slice_v3(&input.initial_input.attachments)
         .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    crate::validate_user_attachment_contexts_v1(
+        &input.initial_input.attachments,
+        &input.initial_input.attachment_contexts,
+    )?;
     input.provider_profile.validate()?;
     input.prior_session_events.validate(&input.session_id)?;
     validate_workspace_shape(

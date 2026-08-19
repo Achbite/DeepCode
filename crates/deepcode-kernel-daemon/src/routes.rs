@@ -43,6 +43,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
+        .route(
+            "/api/host/user-attachments",
+            post(user_attachment_grant_create_v1),
+        )
+        .route(
+            "/api/host/user-attachments/:attachment_id",
+            delete(user_attachment_grant_revoke_v1),
+        )
         .route("/api/host/inspect", post(host_inspect))
         .route("/api/host/skills/scan-mount", post(skill_mount_scan))
         .route(
@@ -59,6 +67,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(provider_trace_metadata_list),
         )
         .route(
+            "/api/host/provider-cache-telemetry/:session_id",
+            get(provider_cache_telemetry_page),
+        )
+        .route(
             "/api/host/provider-traces/:session_id/:provider_turn_id/export-capability",
             post(provider_trace_export_capability_mint),
         )
@@ -69,6 +81,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/llm/chat/stream",
             post(llm_chat_stream).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/llm/cache/predecessors/:provider_turn_id",
+            get(provider_cache_predecessor),
         )
         .route("/api/runtime/shell", get(runtime_shell))
         .route("/api/terminal/capabilities", get(terminal_capabilities))
@@ -115,6 +131,15 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/agent/projects/:project_id/rebind",
             post(agent_project_rebind),
         )
+        .route("/api/agent/composer", get(agent_composer_projection_v1))
+        .route(
+            "/api/agent/composer/stream",
+            get(agent_composer_projection_stream_v1),
+        )
+        .route(
+            "/api/agent/conversation-drafts/runs",
+            post(agent_conversation_draft_run_start),
+        )
         .route("/api/agent/sessions/current", get(agent_session_current))
         .route(
             "/api/agent/sessions/:session_id/activate",
@@ -131,6 +156,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/agent/sessions/:session_id/active-run",
             get(agent_session_active_run),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/current/cancel",
+            post(agent_session_current_run_cancel),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/current/guidance",
+            post(agent_session_current_run_guidance),
         )
         .route(
             "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projections",
@@ -165,6 +198,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/agent/sessions/:session_id/timeline/stream",
             get(agent_session_timeline_stream),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/private-analysis/lease",
+            post(private_analysis_lease_mint_v1).delete(private_analysis_lease_revoke_v1),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/private-analysis",
+            get(private_analysis_page_v1),
         )
         .route(
             "/api/agent/sessions/:session_id",

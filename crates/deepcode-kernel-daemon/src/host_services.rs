@@ -15,6 +15,7 @@ use crate::host_workspace_registry_v2::{
 };
 use crate::prelude::*;
 use crate::session_kernel_v2_store::{SessionKernelProjectionSinkV2, SessionKernelV2Store};
+use crate::user_attachment_v1::UserAttachmentStoreV1;
 use deepcode_kernel_abi::v2::{RunId, RunRetirementReasonCodeV2};
 use deepcode_kernel_abi::{
     HostInspectionResult, HostResultSource, HostSkillActivationStatus, HostSkillAdapterKind,
@@ -662,6 +663,7 @@ pub(crate) struct HostServices {
     pub(crate) kernel_operations_v2: HostKernelOperationStoreV2,
     pub(crate) session_kernel_v2: SessionKernelV2Store,
     pub(crate) projection_v2: SessionKernelProjectionSinkV2,
+    pub(crate) user_attachments_v1: UserAttachmentStoreV1,
     kernel_v2_service: KernelSessionServiceV2,
 }
 
@@ -712,6 +714,12 @@ impl HostServices {
             projection_v2: SessionKernelProjectionSinkV2::new(
                 sessions_dir.clone(),
                 active_runs_v2.clone(),
+            ),
+            user_attachments_v1: UserAttachmentStoreV1::new(
+                sessions_dir
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| sessions_dir.clone()),
             ),
             kernel_operations_v2,
             active_runs_v2,

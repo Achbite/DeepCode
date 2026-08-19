@@ -1,19 +1,27 @@
 use crate::host_run_broker_v2::HostActiveRunBrokerV2;
 use crate::host_v2_storage::{
     append_json_line_durable, canonical_json_bytes, canonical_sha256,
-    reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
-    validate_safe_session_identity, validate_sha256_digest, value_without_field,
-    with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
+    reject_transport_capabilities, sha256_path_component, sha256_prefixed, stable_json_sha256,
+    validate_bounded_identity, validate_safe_session_identity, validate_sha256_digest,
+    value_without_field, with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
+use crate::provider_cache_admission_v2::{
+    SessionProviderControlSettlementSidecarV2, SessionProviderConversationHeadV1,
+    SessionProviderStructuredRepairSidecarV1, SessionProviderToolContextRefSidecarV1,
+};
 use crate::provider_trace_v1::{
     ProviderTraceErrorV1, ProviderTraceIdentityV1, ProviderTraceMetadataV1, ProviderTracePurposeV1,
     ProviderTraceStoreV1, ProviderTraceTerminalKindV1, ProviderTraceTerminalRecoveryV1,
     ProviderTraceTerminalV1, ProviderTraceWriterV1,
 };
 use crate::session_bootstrap_v2::HostSessionPriorEventsV2;
+use crate::user_attachment_v1::{validate_user_attachment_contexts_v1, UserAttachmentContextV1};
 use crate::AppState;
+use crate::{
+    PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1, PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1,
+};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -29,31 +37,33 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v3";
+const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v4";
 const SESSION_KERNEL_PERSISTENCE_RECORD_V3_SCHEMA: &str =
-    "deepcode.session.kernel-persistence-record.v3";
+    "deepcode.session.kernel-persistence-record.v4";
 const SESSION_KERNEL_PERSISTENCE_APPEND_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-append-request.v2";
 const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-list-reply.v2";
 const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-append-reply.v2";
-const SESSION_KERNEL_CHECKPOINT_V3_SCHEMA: &str = "deepcode.session.kernel-checkpoint.v3";
+const SESSION_KERNEL_CHECKPOINT_V3_SCHEMA: &str = "deepcode.session.kernel-checkpoint.v4";
 const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA: &str =
     "deepcode.session.kernel-operation-result.v2";
-const SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA: &str = "deepcode.session.provider-turn-dispatch.v3";
-const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA: &str = "deepcode.session.provider-turn-terminal.v3";
+const SESSION_PROVIDER_TURN_DISPATCH_V3_SCHEMA: &str = "deepcode.session.provider-turn-dispatch.v4";
+const SESSION_PROVIDER_TURN_TERMINAL_V3_SCHEMA: &str = "deepcode.session.provider-turn-terminal.v4";
 const SESSION_KERNEL_TOOL_CONTEXT_SNAPSHOT_V3_SCHEMA: &str =
-    "deepcode.session.tool-context-snapshot.v3";
+    "deepcode.session.tool-context-snapshot.v4";
 const SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA: &str = "deepcode.provider-stream-terminal.v1";
-const SESSION_KERNEL_REVIEW_RECORD_V3_SCHEMA: &str = "deepcode.session.review-record.v3";
+const SESSION_KERNEL_REVIEW_RECORD_V3_SCHEMA: &str = "deepcode.session.review-record.v4";
 const SESSION_KERNEL_REVIEW_PROJECTION_V2_SCHEMA: &str =
     "deepcode.session.kernel-review-projection.v2";
 const SESSION_KERNEL_PLAN_ACTION_SETTLEMENT_RECORD_V3_SCHEMA: &str =
-    "deepcode.session.plan-action-settlement-record.v3";
+    "deepcode.session.plan-action-settlement-record.v4";
 const SESSION_KERNEL_PUBLIC_REQUEST_SETTLEMENT_V3_SCHEMA: &str =
-    "deepcode.session.public-request-settlement.v3";
-const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA: &str = "deepcode.session.projection-record.v3";
+    "deepcode.session.public-request-settlement.v4";
+const SESSION_KERNEL_PROJECTION_RECORD_V3_SCHEMA: &str = "deepcode.session.projection-record.v4";
+const SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA: &str =
+    "deepcode.session.terminal-answer-candidate.v1";
 const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-request.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA: &str =
@@ -72,7 +82,6 @@ const MAX_PRIOR_EVENTS_SINGLE_EVENT_PAGE_BYTES_V2: usize = 8 * 1024 * 1024;
 const MAX_PRIOR_EVENTS_PROJECTION_BYTES_V2: usize = 12 * 1024 * 1024;
 const MAX_PRIOR_EVENTS_PAGE_CACHE_V2: usize = 4;
 const MAX_SAFE_INTEGER_V3: u64 = 9_007_199_254_740_991;
-const MAX_CONTEXT_READ_WORK_AUTHORITY_OPERATIONS_V3: usize = 8_192;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -86,6 +95,8 @@ pub(crate) enum SessionWorkAuthorityV3 {
         plan_revision: String,
     },
     ContextRead {
+        batch_sequence: u64,
+        predecessor_digest: Option<String>,
         operation_ids: Vec<String>,
         digest: String,
     },
@@ -113,13 +124,21 @@ pub(crate) fn validate_session_work_authority_v3(
             validate_bounded_identity(plan_revision, "workAuthority.planRevision", 512)
         }
         SessionWorkAuthorityV3::ContextRead {
+            batch_sequence,
+            predecessor_digest,
             operation_ids,
             digest,
         } => {
-            if operation_ids.is_empty()
-                || operation_ids.len() > MAX_CONTEXT_READ_WORK_AUTHORITY_OPERATIONS_V3
+            if *batch_sequence == 0
+                || *batch_sequence > MAX_SAFE_INTEGER_V3
+                || (*batch_sequence == 1 && predecessor_digest.is_some())
+                || (*batch_sequence > 1 && predecessor_digest.is_none())
+                || operation_ids.is_empty()
             {
                 return Err(work_authority_invalid());
+            }
+            if let Some(predecessor_digest) = predecessor_digest {
+                validate_sha256_digest(predecessor_digest, "workAuthority.predecessorDigest")?;
             }
             let mut previous: Option<&str> = None;
             for operation_id in operation_ids {
@@ -134,12 +153,14 @@ pub(crate) fn validate_session_work_authority_v3(
             validate_sha256_digest(digest, "workAuthority.digest")?;
             let expected = canonical_sha256(&json!({
                 "kind": "contextRead",
+                "batchSequence": batch_sequence,
+                "predecessorDigest": predecessor_digest,
                 "operationIds": operation_ids,
             }))?;
             if digest != &expected {
                 return Err(HostV2StorageError::invalid(
                     "session_kernel_work_authority_digest_mismatch",
-                    "Context-read work authority digest does not match its exact operation identities",
+                    "Context-read work authority digest does not match its current batch and predecessor chain",
                 ));
             }
             Ok(())
@@ -334,6 +355,8 @@ struct SessionProviderCompletionReceiptV1 {
     reasoning_digest: String,
     response_digest: String,
     trace: SessionProviderCompletionTraceV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_output_recovery: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +413,8 @@ struct SessionProviderTurnTerminalDataV3 {
     completion: Option<SessionProviderCompletionReceiptV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_result: Option<SessionProviderResultV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_failure: Option<Value>,
     trace_ref: SessionProviderTraceRefV3,
     ordered_items: Vec<SessionProviderOrderedItemV3>,
 }
@@ -419,9 +444,11 @@ struct SessionKernelCompactProviderReservationV3 {
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    remaining_tool_call_budget: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     correction: Option<SessionKernelToolCorrectionV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_repair: Option<SessionProviderStructuredRepairSidecarV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_structured_repair: Option<SessionProviderStructuredRepairSidecarV1>,
     control_epoch: u64,
     context_ref: ToolContextRefV2,
     fact_projection: Value,
@@ -519,11 +546,19 @@ struct SessionKernelCompactActiveV3 {
     pending_epoch_input_ref: Option<SessionProviderTurnRecordRefV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_wait: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intervention_research: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_intervention: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_intervention_decision: Option<Value>,
     pending_guidance: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_reservation: Option<SessionKernelCompactProviderReservationV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_queue: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_provider_control_settlement: Option<SessionProviderControlSettlementSidecarV2>,
     fact_barriers: Value,
     public_requests: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -561,9 +596,28 @@ struct SessionKernelCompactFinalAnswerV3 {
     #[serde(skip_serializing_if = "Option::is_none")]
     stale_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    committed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     failed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionKernelCompactTerminalAnswerCandidateV1 {
+    schema_version: String,
+    provider_turn_id: String,
+    input_id: String,
+    control_epoch: u64,
+    language_revision: u64,
+    snapshot_high_water: u64,
+    work_authority: SessionWorkAuthorityV3,
+    text_digest: String,
+    source_event_refs: Vec<String>,
+    recorded_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,6 +634,8 @@ struct SessionKernelCompactCheckpointV3 {
     refs: SessionKernelCompactRefsV3,
     #[serde(skip_serializing_if = "Option::is_none")]
     final_answer: Option<SessionKernelCompactFinalAnswerV3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_answer_candidate: Option<SessionKernelCompactTerminalAnswerCandidateV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -635,17 +691,32 @@ pub(crate) struct SessionKernelV2Store {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionProviderTurnAdmissionV2 {
     pub(crate) provider_turn_id: String,
+    pub(crate) run_id: String,
     pub(crate) purpose: ProviderTracePurposeV1,
     pub(crate) control_epoch: u64,
     pub(crate) current_input_id: String,
     pub(crate) current_input_digest: String,
+    pub(crate) context_assembly_digest: String,
+    pub(crate) provider_conversation_head: Option<SessionProviderConversationHeadV1>,
+    pub(crate) target: Value,
+    pub(crate) tool_context_ref: SessionProviderToolContextRefSidecarV1,
     pub(crate) provider_profile_id: String,
     pub(crate) provider_profile_revision: String,
     pub(crate) plan_revision: Option<String>,
     pub(crate) work_authority: Option<SessionWorkAuthorityV3>,
-    pub(crate) remaining_tool_call_budget: Option<u64>,
     pub(crate) review_revision: Option<u64>,
     pub(crate) snapshot_high_water: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionProviderTurnPredecessorEvidenceV3 {
+    pub(crate) admission: SessionProviderTurnAdmissionV2,
+    pub(crate) request_digest: String,
+    pub(crate) terminal_kind: SessionProviderTurnTerminalKindV3,
+    pub(crate) terminal_reason_code: Option<String>,
+    pub(crate) trace_terminal_digest: String,
+    pub(crate) trace_seal_digest: String,
+    pub(crate) trace_record_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,6 +755,7 @@ pub(crate) struct SessionProviderTurnTerminalCommitV3 {
     pub(crate) response_digest: Option<String>,
     pub(crate) completion: Option<Value>,
     pub(crate) provider_result: Option<Value>,
+    pub(crate) structured_failure: Option<Value>,
     pub(crate) ordered_items: Vec<Value>,
 }
 
@@ -858,6 +930,19 @@ impl SessionKernelV2Store {
         provider_turn_admission_from_records(&records, run_id, provider_turn_id)
     }
 
+    pub(crate) fn provider_turn_predecessor_evidence(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        capability: &RunCapabilityV2,
+        provider_turn_id: &str,
+    ) -> Result<SessionProviderTurnPredecessorEvidenceV3, HostV2StorageError> {
+        validate_bounded_identity(provider_turn_id, "providerTurnId", 512)?;
+        let records = self.list(session_id, run_id, capability)?;
+        provider_turn_predecessor_evidence_from_records(&records, run_id, provider_turn_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit_provider_dispatch(
         &self,
         capability: &RunCapabilityV2,
@@ -866,6 +951,27 @@ impl SessionKernelV2Store {
         trace_store: &ProviderTraceStoreV1,
         trace_identity: ProviderTraceIdentityV1,
         exact_request_body: &[u8],
+    ) -> Result<SessionProviderTurnDispatchCommitV3, ProviderTraceErrorV1> {
+        self.commit_provider_dispatch_with_private_binding(
+            capability,
+            expected_admission,
+            exact_request_binding,
+            trace_store,
+            trace_identity,
+            exact_request_body,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_provider_dispatch_with_private_binding(
+        &self,
+        capability: &RunCapabilityV2,
+        expected_admission: &SessionProviderTurnAdmissionV2,
+        exact_request_binding: &SessionProviderDispatchBindingV2,
+        trace_store: &ProviderTraceStoreV1,
+        trace_identity: ProviderTraceIdentityV1,
+        exact_request_body: &[u8],
+        admission_sidecar: Option<&Value>,
     ) -> Result<SessionProviderTurnDispatchCommitV3, ProviderTraceErrorV1> {
         let session_id = trace_identity.session_id.clone();
         let run_id = trace_identity.run_id.clone();
@@ -1034,9 +1140,10 @@ impl SessionKernelV2Store {
                         ));
                     }
                     let mut trace = trace_store
-                        .begin_or_reopen_exact_request_only_turn(
+                        .begin_or_reopen_exact_request_only_turn_with_private_binding(
                             trace_identity,
                             exact_request_body,
+                            admission_sidecar,
                         )
                         .map_err(|error| HostV2StorageError::io(error.code, error.message))?;
                     let append_result = append_daemon_record_locked(
@@ -1610,6 +1717,7 @@ fn provider_turn_terminal_data(
         response_digest: terminal.response_digest,
         completion,
         provider_result,
+        structured_failure: terminal.structured_failure,
         trace_ref: SessionProviderTraceRefV3 {
             terminal_digest: trace.terminal_digest.clone(),
             seal_digest: trace.seal_digest.clone(),
@@ -1649,7 +1757,8 @@ fn provider_terminal_commit_from_recovery(
             reason_code: recovery.reason_code.clone(),
             response_digest: None,
             completion: None,
-            provider_result: None,
+            provider_result: recovery.structured_failure_provider_result.clone(),
+            structured_failure: recovery.structured_failure.clone(),
             ordered_items: Vec::new(),
         });
     }
@@ -1676,8 +1785,10 @@ fn provider_terminal_commit_from_recovery(
                 "terminalDigest": recovery.metadata.terminal_digest.clone(),
                 "recordCount": recovery.metadata.record_count,
             },
+            "structuredOutputRecovery": completed.structured_output_recovery.clone(),
         })),
         provider_result: Some(completed.provider_result.clone()),
+        structured_failure: None,
         ordered_items: completed.ordered_items.clone(),
     })
 }
@@ -1749,7 +1860,36 @@ fn provider_turn_admission_from_records(
     run_id: &str,
     provider_turn_id: &str,
 ) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
-    let (checkpoint_index, checkpoint) = latest_committed_checkpoint(records)?;
+    let checkpoints = committed_checkpoint_chain(records)?;
+    let latest = checkpoints
+        .last()
+        .ok_or_else(provider_turn_admission_missing)?;
+    provider_turn_admission_from_checkpoint(
+        records,
+        run_id,
+        provider_turn_id,
+        latest.record_index,
+        &latest.checkpoint,
+    )
+}
+
+fn provider_turn_admission_from_checkpoint(
+    records: &[SessionKernelPersistenceRecordV3],
+    run_id: &str,
+    provider_turn_id: &str,
+    checkpoint_index: usize,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<SessionProviderTurnAdmissionV2, HostV2StorageError> {
+    if !checkpoint
+        .active
+        .provider_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.provider_turn_id == provider_turn_id && reservation.status == "active"
+        })
+    {
+        return Err(provider_turn_admission_missing());
+    }
     let authority = &checkpoint.authority;
     if authority.run_id != run_id {
         return Err(provider_turn_admission_invalid());
@@ -1834,6 +1974,27 @@ fn provider_turn_admission_from_records(
         .and_then(|value| value.get("sections"))
         .and_then(Value::as_array)
         .ok_or_else(provider_turn_admission_invalid)?;
+    let context_memory = context_assembly
+        .get("memory")
+        .and_then(Value::as_object)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let memory_source_event_version = context_memory
+        .get("sourceEventVersion")
+        .and_then(Value::as_u64)
+        .ok_or_else(provider_turn_admission_invalid)?;
+    let provider_conversation_head = context_memory
+        .get("providerConversationHead")
+        .cloned()
+        .map(|value| {
+            let head: SessionProviderConversationHeadV1 =
+                serde_json::from_value(value).map_err(|_| provider_turn_admission_invalid())?;
+            head.validate(&current_input.session_id)?;
+            if head.source_event_version > memory_source_event_version {
+                return Err(provider_turn_admission_invalid());
+            }
+            Ok(head)
+        })
+        .transpose()?;
     let current_input_sections = sections
         .iter()
         .filter(|section| section.get("section").and_then(Value::as_str) == Some("currentInput"))
@@ -1924,7 +2085,7 @@ fn provider_turn_admission_from_records(
             let (review_revision, snapshot_high_water) = final_answer_review_binding(
                 records,
                 checkpoint_index,
-                &checkpoint,
+                checkpoint,
                 provider_turn,
                 work_authority,
                 plan_revision.as_deref(),
@@ -1942,15 +2103,31 @@ fn provider_turn_admission_from_records(
         };
     let admission = SessionProviderTurnAdmissionV2 {
         provider_turn_id: provider_turn_id.to_string(),
+        run_id: run_id.to_string(),
         purpose: provider_turn.purpose,
         control_epoch: authority.control_epoch,
         current_input_id: authority.current_input_id.clone(),
         current_input_digest: current_input_digest.to_string(),
+        context_assembly_digest: stable_json_sha256(&Value::Object(context_assembly.clone()))?,
+        provider_conversation_head,
+        target: provider_turn.target.clone(),
+        tool_context_ref: SessionProviderToolContextRefSidecarV1 {
+            context_version: u64::from(provider_turn.context_ref.context_version.get()),
+            catalog_digest: provider_turn
+                .context_ref
+                .catalog_digest
+                .as_str()
+                .to_string(),
+            context_digest: provider_turn
+                .context_ref
+                .context_digest
+                .as_str()
+                .to_string(),
+        },
         provider_profile_id: provider_profile_id.to_string(),
         provider_profile_revision: provider_profile_revision.to_string(),
         plan_revision,
         work_authority,
-        remaining_tool_call_budget: provider_turn.remaining_tool_call_budget,
         review_revision,
         snapshot_high_water,
     };
@@ -1958,13 +2135,101 @@ fn provider_turn_admission_from_records(
     Ok(admission)
 }
 
-fn latest_committed_checkpoint(
+fn provider_turn_predecessor_evidence_from_records(
     records: &[SessionKernelPersistenceRecordV3],
-) -> Result<(usize, SessionKernelCompactCheckpointV3), HostV2StorageError> {
-    committed_checkpoint_chain(records)?
-        .last()
-        .map(|entry| (entry.record_index, entry.checkpoint.clone()))
-        .ok_or_else(provider_turn_admission_missing)
+    run_id: &str,
+    provider_turn_id: &str,
+) -> Result<SessionProviderTurnPredecessorEvidenceV3, HostV2StorageError> {
+    let dispatch_record_id = provider_turn_dispatch_record_id(run_id, provider_turn_id);
+    let (dispatch_index, dispatch_record) = records
+        .iter()
+        .enumerate()
+        .find(|(_, record)| record.record_id == dispatch_record_id)
+        .ok_or_else(provider_turn_predecessor_dispatch_missing)?;
+    if dispatch_record.record_kind != SessionKernelPersistenceRecordKindV3::ProviderTurnDispatch {
+        return Err(provider_turn_predecessor_invalid());
+    }
+    let dispatch = validate_provider_turn_dispatch_record(dispatch_record, run_id)?;
+    if dispatch.provider_turn_id != provider_turn_id {
+        return Err(provider_turn_predecessor_invalid());
+    }
+
+    let checkpoints = committed_checkpoint_chain(records)?;
+    let admitted_checkpoint = checkpoints
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.record_index < dispatch_index
+                && entry
+                    .checkpoint
+                    .active
+                    .provider_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| {
+                        reservation.provider_turn_id == provider_turn_id
+                            && reservation.status == "active"
+                    })
+        })
+        .ok_or_else(provider_turn_admission_missing)?;
+    let admission = provider_turn_admission_from_checkpoint(
+        records,
+        run_id,
+        provider_turn_id,
+        admitted_checkpoint.record_index,
+        &admitted_checkpoint.checkpoint,
+    )?;
+    if !provider_dispatch_matches_admission(&dispatch, run_id, &admission) {
+        return Err(provider_turn_predecessor_invalid());
+    }
+
+    let terminal_record_id = provider_turn_terminal_record_id(run_id, provider_turn_id);
+    let (terminal_index, terminal_record) = records
+        .iter()
+        .enumerate()
+        .find(|(_, record)| record.record_id == terminal_record_id)
+        .ok_or_else(provider_turn_predecessor_terminal_missing)?;
+    if terminal_index <= dispatch_index
+        || terminal_record.record_kind != SessionKernelPersistenceRecordKindV3::ProviderTurnTerminal
+    {
+        return Err(provider_turn_predecessor_invalid());
+    }
+    let terminal = validate_provider_turn_terminal_record(terminal_record, run_id)?;
+    if terminal.provider_turn_id != provider_turn_id
+        || terminal.dispatch_ref.record_id != dispatch_record.record_id
+        || terminal.dispatch_ref.record_digest != dispatch_record.record_digest
+        || terminal.authority_binding != dispatch.authority_binding
+    {
+        return Err(provider_turn_predecessor_invalid());
+    }
+
+    Ok(SessionProviderTurnPredecessorEvidenceV3 {
+        admission,
+        request_digest: dispatch.request_digest,
+        terminal_kind: terminal.terminal_kind,
+        terminal_reason_code: terminal.reason_code,
+        trace_terminal_digest: terminal.trace_ref.terminal_digest,
+        trace_seal_digest: terminal.trace_ref.seal_digest,
+        trace_record_count: terminal.trace_ref.record_count,
+    })
+}
+
+fn provider_dispatch_matches_admission(
+    dispatch: &SessionProviderTurnDispatchDataV3,
+    run_id: &str,
+    admission: &SessionProviderTurnAdmissionV2,
+) -> bool {
+    let authority = &dispatch.authority_binding;
+    dispatch.provider_turn_id == admission.provider_turn_id
+        && dispatch.purpose == admission.purpose
+        && authority.run_id == run_id
+        && authority.input_id == admission.current_input_id
+        && authority.control_epoch == admission.control_epoch
+        && authority.current_input_digest == admission.current_input_digest
+        && authority.plan_revision == admission.plan_revision
+        && authority.review_revision == admission.review_revision
+        && authority.snapshot_high_water == admission.snapshot_high_water
+        && authority.provider_profile_id == admission.provider_profile_id
+        && authority.provider_profile_revision_digest == admission.provider_profile_revision
 }
 
 struct CommittedCheckpointEntryV3<'a> {
@@ -2101,7 +2366,10 @@ fn validate_checkpoint_work_authority_records(
                 }
             }
         }
-        Some(SessionWorkAuthorityV3::ContextRead { .. }) | None => {}
+        Some(SessionWorkAuthorityV3::ContextRead { .. }) => {
+            validate_context_read_work_authority_chain(records, exclusive_end, checkpoint)?;
+        }
+        None => {}
     }
     if let Some(review_ref) = &checkpoint.refs.review {
         let review_record = resolve_record_ref_before(records, exclusive_end, review_ref)?;
@@ -2145,7 +2413,183 @@ fn validate_checkpoint_work_authority_records(
     } else if checkpoint.final_answer.is_some() {
         return Err(compact_final_answer_invalid());
     }
+    validate_terminal_answer_candidate_records(records, exclusive_end, checkpoint)?;
     Ok(())
+}
+
+fn validate_context_read_work_authority_chain(
+    records: &[SessionKernelPersistenceRecordV3],
+    exclusive_end: usize,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<(), HostV2StorageError> {
+    let Some(SessionWorkAuthorityV3::ContextRead {
+        batch_sequence,
+        predecessor_digest,
+        operation_ids,
+        digest,
+    }) = checkpoint.authority.work_authority.as_ref()
+    else {
+        return Err(compact_checkpoint_authority_invalid());
+    };
+    let previous = checkpoint
+        .parent_ref
+        .as_ref()
+        .map(|parent_ref| resolve_record_ref_before(records, exclusive_end, parent_ref))
+        .transpose()?
+        .map(decode_compact_checkpoint_record)
+        .transpose()?;
+    let previous_authority = previous.as_ref().and_then(|parent| {
+        (parent.authority.control_epoch == checkpoint.authority.control_epoch)
+            .then_some(parent.authority.work_authority.as_ref())
+            .flatten()
+    });
+    match previous_authority {
+        Some(SessionWorkAuthorityV3::ContextRead {
+            batch_sequence: previous_sequence,
+            operation_ids: previous_operation_ids,
+            digest: previous_digest,
+            predecessor_digest: previous_predecessor_digest,
+        }) if previous_sequence == batch_sequence => {
+            if previous_predecessor_digest != predecessor_digest
+                || previous_operation_ids != operation_ids
+                || previous_digest != digest
+            {
+                return Err(compact_checkpoint_authority_invalid());
+            }
+        }
+        Some(SessionWorkAuthorityV3::ContextRead {
+            batch_sequence: previous_sequence,
+            digest: previous_digest,
+            ..
+        }) => {
+            if previous_sequence.checked_add(1) != Some(*batch_sequence)
+                || predecessor_digest.as_deref() != Some(previous_digest.as_str())
+            {
+                return Err(compact_checkpoint_authority_invalid());
+            }
+        }
+        Some(SessionWorkAuthorityV3::Plan { .. }) | None => {
+            if *batch_sequence != 1 || predecessor_digest.is_some() {
+                return Err(compact_checkpoint_authority_invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_answer_candidate_records(
+    records: &[SessionKernelPersistenceRecordV3],
+    exclusive_end: usize,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<(), HostV2StorageError> {
+    let Some(candidate) = &checkpoint.terminal_answer_candidate else {
+        return Ok(());
+    };
+    let before = records
+        .get(..exclusive_end)
+        .ok_or_else(terminal_answer_candidate_invalid)?;
+    let terminal_record_id =
+        provider_turn_terminal_record_id(&checkpoint.authority.run_id, &candidate.provider_turn_id);
+    let terminal_record = before
+        .iter()
+        .find(|record| record.record_id == terminal_record_id)
+        .ok_or_else(terminal_answer_candidate_invalid)?;
+    let terminal =
+        validate_provider_turn_terminal_record(terminal_record, &checkpoint.authority.run_id)?;
+    if terminal.terminal_kind != SessionProviderTurnTerminalKindV3::Completed
+        || terminal.authority_binding.input_id != candidate.input_id
+        || terminal.authority_binding.control_epoch != candidate.control_epoch
+        || terminal_record.recorded_at != candidate.recorded_at
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    let dispatch_record =
+        resolve_record_ref_before(records, exclusive_end, &terminal.dispatch_ref)?;
+    let dispatch =
+        validate_provider_turn_dispatch_record(dispatch_record, &checkpoint.authority.run_id)?;
+    if dispatch.provider_turn_id != candidate.provider_turn_id
+        || dispatch.purpose == ProviderTracePurposeV1::FinalAnswer
+        || dispatch.authority_binding != terminal.authority_binding
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    let terminal_text = provider_terminal_final_text(&terminal.ordered_items);
+    if terminal_text.trim().is_empty()
+        || sha256_prefixed(terminal_text.as_bytes()) != candidate.text_digest
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    for source_ref in &candidate.source_event_refs {
+        let mut matched = false;
+        for record in before
+            .iter()
+            .filter(|record| record.record_kind == SessionKernelPersistenceRecordKindV3::Projection)
+        {
+            let projection = decode_projection_record(record)?;
+            let Some(event) = projection.event.as_object() else {
+                return Err(terminal_answer_candidate_invalid());
+            };
+            if event.get("projectionId").and_then(Value::as_str) != Some(source_ref.as_str()) {
+                continue;
+            }
+            let data = event
+                .get("data")
+                .and_then(Value::as_object)
+                .ok_or_else(terminal_answer_candidate_invalid)?;
+            matched = event.get("kind").and_then(Value::as_str) == Some("provider.completed")
+                && data.get("providerTurnId").and_then(Value::as_str)
+                    == Some(candidate.provider_turn_id.as_str())
+                && data.get("outputKind").and_then(Value::as_str) == Some("answer");
+            break;
+        }
+        if !matched {
+            return Err(terminal_answer_candidate_invalid());
+        }
+    }
+    let reservation = checkpoint
+        .active
+        .provider_reservation
+        .as_ref()
+        .ok_or_else(terminal_answer_candidate_invalid)?;
+    let terminal_ref = SessionProviderTurnRecordRefV3 {
+        record_id: terminal_record.record_id.clone(),
+        record_digest: terminal_record.record_digest.clone(),
+    };
+    if reservation.provider_turn_id != candidate.provider_turn_id
+        || reservation.status != "completed"
+        || reservation.terminal_ref.as_ref() != Some(&terminal_ref)
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    Ok(())
+}
+
+fn provider_terminal_final_text(items: &[SessionProviderOrderedItemV3]) -> String {
+    let text_items = items
+        .iter()
+        .filter_map(|item| match item {
+            SessionProviderOrderedItemV3::Text { phase, text } => Some((phase, text)),
+            SessionProviderOrderedItemV3::ToolCall { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let first_final = text_items
+        .iter()
+        .position(|(phase, _)| matches!(phase, SessionProviderTextPhaseV3::FinalAnswer));
+    let last_commentary = text_items
+        .iter()
+        .rposition(|(phase, _)| matches!(phase, SessionProviderTextPhaseV3::Commentary));
+    text_items
+        .iter()
+        .enumerate()
+        .filter(|(index, (phase, _))| match first_final {
+            Some(first) => *index >= first,
+            None => {
+                last_commentary.is_none_or(|last| *index > last)
+                    && matches!(phase, SessionProviderTextPhaseV3::Unknown)
+            }
+        })
+        .map(|(_, (_, text))| text.as_str())
+        .collect()
 }
 
 fn validate_checkpoint_continuation(
@@ -2536,6 +2980,27 @@ fn provider_turn_admission_invalid() -> HostV2StorageError {
     HostV2StorageError::conflict(
         "provider_turn_admission_invalid",
         "Provider transport durable Session turn admission is invalid",
+    )
+}
+
+fn provider_turn_predecessor_dispatch_missing() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_predecessor_dispatch_missing",
+        "Provider cache predecessor has no exact durable dispatch",
+    )
+}
+
+fn provider_turn_predecessor_terminal_missing() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_predecessor_terminal_missing",
+        "Provider cache predecessor has no exact durable terminal",
+    )
+}
+
+fn provider_turn_predecessor_invalid() -> HostV2StorageError {
+    HostV2StorageError::conflict(
+        "provider_turn_predecessor_invalid",
+        "Provider cache predecessor durable admission, dispatch, and terminal do not form one exact chain",
     )
 }
 
@@ -3000,9 +3465,7 @@ fn decode_compact_checkpoint_record(
         (Some(SessionWorkAuthorityV3::ContextRead { .. }), None, None) => {}
         _ => return Err(compact_checkpoint_authority_invalid()),
     }
-    if authority.plan_confirmation.is_some() && authority.plan_ref.is_none()
-        || authority.plan_decision_ref.is_some() && authority.plan_confirmation.is_none()
-    {
+    if authority.plan_confirmation.is_some() && authority.plan_ref.is_none() {
         return Err(compact_checkpoint_authority_invalid());
     }
     if let Some(plan_ref) = &authority.plan_ref {
@@ -3053,6 +3516,25 @@ fn decode_compact_checkpoint_record(
     if let Some(reservation) = &checkpoint.active.provider_reservation {
         validate_provider_reservation(reservation, authority)?;
     }
+    if let Some(settlement) = &checkpoint.active.pending_provider_control_settlement {
+        settlement.validate()?;
+        if settlement.run_id() != authority.run_id
+            || settlement.input_id() != authority.current_input_id
+            || settlement.control_epoch() != authority.control_epoch
+        {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_checkpoint_control_settlement_invalid",
+                "Session Kernel checkpoint control settlement does not bind current authority",
+            ));
+        }
+    }
+    validate_compact_intervention_state(&checkpoint.active, authority)?;
+    if authority.plan_decision_ref.is_some()
+        && authority.plan_confirmation.is_none()
+        && !compact_checkpoint_has_intervention_accepted_plan(&checkpoint)
+    {
+        return Err(compact_checkpoint_authority_invalid());
+    }
     if let Some(review_ref) = &checkpoint.refs.review {
         validate_record_ref(review_ref, "reviewRef")?;
     }
@@ -3065,7 +3547,842 @@ fn decode_compact_checkpoint_record(
     if let Some(final_answer) = &checkpoint.final_answer {
         validate_compact_final_answer(final_answer, authority)?;
     }
+    if let Some(candidate) = &checkpoint.terminal_answer_candidate {
+        validate_compact_terminal_answer_candidate(candidate, &checkpoint)?;
+    }
+    match (
+        checkpoint
+            .final_answer
+            .as_ref()
+            .and_then(|answer| answer.commit_kind.as_deref()),
+        checkpoint.final_answer.as_ref(),
+        checkpoint.terminal_answer_candidate.as_ref(),
+    ) {
+        (Some("candidatePromotion"), Some(final_answer), Some(candidate))
+            if final_answer.provider_turn_id.as_deref()
+                == Some(candidate.provider_turn_id.as_str())
+                && final_answer.binding.input_id == candidate.input_id
+                && final_answer.binding.control_epoch == candidate.control_epoch
+                && final_answer.binding.snapshot_high_water == candidate.snapshot_high_water
+                && final_answer.binding.work_authority == candidate.work_authority => {}
+        (Some("candidatePromotion"), _, _) => {
+            return Err(compact_final_answer_invalid());
+        }
+        _ => {}
+    }
     Ok(checkpoint)
+}
+
+fn compact_checkpoint_has_intervention_accepted_plan(
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> bool {
+    let Some(SessionWorkAuthorityV3::Plan { plan_revision }) =
+        checkpoint.authority.work_authority.as_ref()
+    else {
+        return false;
+    };
+    let Some(intervention) = checkpoint
+        .active
+        .user_intervention
+        .as_ref()
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(decision) = checkpoint
+        .active
+        .user_intervention_decision
+        .as_ref()
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if decision.get("decision").and_then(Value::as_str) != Some("select") {
+        return false;
+    }
+    let Some(option_id) = decision.get("optionId").and_then(Value::as_str) else {
+        return false;
+    };
+    intervention
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                let Some(option) = option.as_object() else {
+                    return false;
+                };
+                option.get("optionId").and_then(Value::as_str) == Some(option_id)
+                    && option.get("kind").and_then(Value::as_str) == Some("executable")
+                    && option
+                        .get("candidatePlan")
+                        .and_then(Value::as_object)
+                        .and_then(|plan| plan.get("planRevision"))
+                        .and_then(Value::as_str)
+                        == Some(plan_revision.as_str())
+            })
+        })
+}
+
+fn validate_compact_intervention_state(
+    active: &SessionKernelCompactActiveV3,
+    authority: &SessionKernelCompactAuthorityV3,
+) -> Result<(), HostV2StorageError> {
+    let research = active
+        .intervention_research
+        .as_ref()
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)
+        })
+        .transpose()?;
+    let intervention = active
+        .user_intervention
+        .as_ref()
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)
+        })
+        .transpose()?;
+    let decision = active
+        .user_intervention_decision
+        .as_ref()
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)
+        })
+        .transpose()?;
+
+    let user_intervention_wait = active
+        .active_wait
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|wait| wait.get("kind").and_then(Value::as_str) == Some("userIntervention"));
+
+    let Some(research) = research else {
+        if intervention.is_some() || decision.is_some() || user_intervention_wait.is_some() {
+            return Err(compact_intervention_state_invalid());
+        }
+        return Ok(());
+    };
+
+    validate_private_projection_fields(
+        research,
+        &[
+            "schemaVersion",
+            "runId",
+            "inputId",
+            "controlEpoch",
+            "researchId",
+            "triggerProviderTurnId",
+            "predecessorPlanRef",
+            "triggerCandidates",
+            "triggerCandidateSetDigest",
+            "evidenceProgressDigest",
+            "guidanceRevision",
+            "startedAt",
+            "updatedAt",
+        ],
+        &["previousEvidenceProgressDigest", "lastCandidateSetDigest"],
+        &[
+            "runId",
+            "inputId",
+            "researchId",
+            "triggerProviderTurnId",
+            "startedAt",
+            "updatedAt",
+        ],
+        &[],
+        &["triggerCandidates"],
+        &["predecessorPlanRef"],
+        &["controlEpoch", "guidanceRevision"],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    if research.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.intervention-research.v1")
+        || research.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
+        || research.get("inputId").and_then(Value::as_str)
+            != Some(authority.current_input_id.as_str())
+        || research.get("controlEpoch").and_then(Value::as_u64) != Some(authority.control_epoch)
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    for field in [
+        "triggerCandidateSetDigest",
+        "evidenceProgressDigest",
+        "previousEvidenceProgressDigest",
+        "lastCandidateSetDigest",
+    ] {
+        if let Some(value) = research.get(field) {
+            validate_sha256_digest(
+                value
+                    .as_str()
+                    .ok_or_else(compact_intervention_state_invalid)?,
+                "interventionDigest",
+            )
+            .map_err(|_| compact_intervention_state_invalid())?;
+        }
+    }
+    let predecessor = research
+        .get("predecessorPlanRef")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    validate_private_projection_fields(
+        predecessor,
+        &["planRevision", "planDigest"],
+        &[],
+        &["planRevision"],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    validate_sha256_digest(
+        predecessor
+            .get("planDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?,
+        "interventionPredecessorPlanDigest",
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+
+    let candidates = research
+        .get("triggerCandidates")
+        .and_then(Value::as_array)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    if candidates.is_empty() || candidates.len() > 128 {
+        return Err(compact_intervention_state_invalid());
+    }
+    let mut discovery_ids = HashSet::new();
+    let mut operation_ids = HashSet::new();
+    let mut digest_candidates = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let candidate = candidate
+            .as_object()
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_private_projection_fields(
+            candidate,
+            &[
+                "discoveryId",
+                "operationId",
+                "toolId",
+                "argumentsDigest",
+                "classification",
+            ],
+            &["preview", "rejection"],
+            &["discoveryId", "operationId", "toolId"],
+            &[],
+            &[],
+            &["preview", "rejection"],
+            &[],
+            &[],
+        )
+        .map_err(|_| compact_intervention_state_invalid())?;
+        let discovery_id = candidate
+            .get("discoveryId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let operation_id = candidate
+            .get("operationId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let tool_id = candidate
+            .get("toolId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let arguments_digest = candidate
+            .get("argumentsDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_sha256_digest(arguments_digest, "interventionArgumentsDigest")
+            .map_err(|_| compact_intervention_state_invalid())?;
+        if !discovery_ids.insert(discovery_id)
+            || !operation_ids.insert(operation_id)
+            || !matches!(
+                candidate.get("classification").and_then(Value::as_str),
+                Some("planned" | "outOfPlan")
+            )
+            || candidate.contains_key("preview") == candidate.contains_key("rejection")
+        {
+            return Err(compact_intervention_state_invalid());
+        }
+
+        let mut digest_candidate = serde_json::Map::new();
+        digest_candidate.insert(
+            "discoveryId".to_string(),
+            Value::String(discovery_id.to_string()),
+        );
+        digest_candidate.insert(
+            "operationId".to_string(),
+            Value::String(operation_id.to_string()),
+        );
+        digest_candidate.insert("toolId".to_string(), Value::String(tool_id.to_string()));
+        digest_candidate.insert(
+            "argumentsDigest".to_string(),
+            Value::String(arguments_digest.to_string()),
+        );
+        digest_candidate.insert(
+            "classification".to_string(),
+            candidate
+                .get("classification")
+                .expect("validated intervention classification")
+                .clone(),
+        );
+        if let Some(preview_value) = candidate.get("preview") {
+            let preview = decode_private_scope_preview(preview_value, "interventionPreview")
+                .map_err(|_| compact_intervention_state_invalid())?;
+            let preview_object = preview_value
+                .as_object()
+                .ok_or_else(compact_intervention_state_invalid)?;
+            let origin = preview_object
+                .get("origin")
+                .and_then(Value::as_object)
+                .ok_or_else(compact_intervention_state_invalid)?;
+            let origin_data = origin
+                .get("data")
+                .and_then(Value::as_object)
+                .ok_or_else(compact_intervention_state_invalid)?;
+            if preview.run_id.as_str() != authority.run_id
+                || preview.control_epoch.get() != authority.control_epoch
+                || preview.operation_id.as_str() != operation_id
+                || preview.tool_id.as_str() != tool_id
+                || origin.get("kind").and_then(Value::as_str) != Some("planDiscovery")
+                || origin_data.get("discoveryId").and_then(Value::as_str) != Some(discovery_id)
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+            digest_candidate.insert(
+                "previewId".to_string(),
+                preview_object
+                    .get("previewId")
+                    .expect("validated intervention preview id")
+                    .clone(),
+            );
+            digest_candidate.insert(
+                "scopeDigest".to_string(),
+                preview_object
+                    .get("scopeDigest")
+                    .expect("validated intervention scope digest")
+                    .clone(),
+            );
+        } else {
+            let rejection = candidate
+                .get("rejection")
+                .and_then(Value::as_object)
+                .ok_or_else(compact_intervention_state_invalid)?;
+            validate_private_projection_fields(
+                rejection,
+                &["reason", "guidance"],
+                &[],
+                &["reason"],
+                &["guidance"],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .map_err(|_| compact_intervention_state_invalid())?;
+            if rejection
+                .get("guidance")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+            digest_candidate.insert("rejection".to_string(), Value::Object(rejection.clone()));
+        }
+        digest_candidates.push(Value::Object(digest_candidate));
+    }
+    let expected_trigger_digest = canonical_sha256(&Value::Array(digest_candidates))
+        .map_err(|_| compact_intervention_state_invalid())?;
+    if research
+        .get("triggerCandidateSetDigest")
+        .and_then(Value::as_str)
+        != Some(expected_trigger_digest.as_str())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+
+    let interaction_id = format!(
+        "user-intervention-{}",
+        research
+            .get("researchId")
+            .and_then(Value::as_str)
+            .expect("validated research identity")
+    );
+    let mut option_ids = HashSet::new();
+    if let Some(intervention) = intervention {
+        validate_compact_user_intervention(
+            intervention,
+            research,
+            authority,
+            &interaction_id,
+            &mut option_ids,
+        )?;
+    }
+    if let Some(decision) = decision {
+        validate_compact_user_intervention_decision(
+            decision,
+            intervention,
+            research,
+            &interaction_id,
+            &option_ids,
+        )?;
+    }
+
+    match (intervention, decision, user_intervention_wait) {
+        (Some(card), None, Some(wait)) => {
+            validate_private_projection_fields(
+                wait,
+                &[
+                    "kind",
+                    "interactionId",
+                    "interactionRevision",
+                    "candidateSetDigest",
+                    "sinceHighWater",
+                ],
+                &[],
+                &["interactionId", "interactionRevision"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["sinceHighWater"],
+            )
+            .map_err(|_| compact_intervention_state_invalid())?;
+            if wait.get("interactionId") != card.get("interactionId")
+                || wait.get("interactionRevision") != card.get("interactionRevision")
+                || wait.get("candidateSetDigest") != card.get("candidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        (Some(_), None, None) | (_, Some(_), Some(_)) | (None, _, Some(_)) => {
+            return Err(compact_intervention_state_invalid());
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_compact_user_intervention(
+    intervention: &serde_json::Map<String, Value>,
+    research: &serde_json::Map<String, Value>,
+    authority: &SessionKernelCompactAuthorityV3,
+    expected_interaction_id: &str,
+    option_ids: &mut HashSet<String>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        intervention,
+        &[
+            "schemaVersion",
+            "runId",
+            "inputId",
+            "controlEpoch",
+            "interactionId",
+            "interactionRevision",
+            "candidateSetDigest",
+            "problemSummary",
+            "relevantFactRefs",
+            "affectedPlanActionIds",
+            "options",
+            "evidenceProgressDigest",
+            "recordedAt",
+        ],
+        &["recommendation"],
+        &[
+            "runId",
+            "inputId",
+            "interactionId",
+            "interactionRevision",
+            "recordedAt",
+        ],
+        &["problemSummary", "recommendation"],
+        &["relevantFactRefs", "affectedPlanActionIds", "options"],
+        &[],
+        &["controlEpoch"],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    let candidate_set_digest = intervention
+        .get("candidateSetDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    validate_sha256_digest(candidate_set_digest, "interventionCandidateSetDigest")
+        .map_err(|_| compact_intervention_state_invalid())?;
+    validate_sha256_digest(
+        intervention
+            .get("evidenceProgressDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?,
+        "interventionEvidenceProgressDigest",
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    if intervention.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.user-intervention.v1")
+        || intervention.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
+        || intervention.get("inputId").and_then(Value::as_str)
+            != Some(authority.current_input_id.as_str())
+        || intervention.get("controlEpoch").and_then(Value::as_u64) != Some(authority.control_epoch)
+        || intervention.get("interactionId").and_then(Value::as_str)
+            != Some(expected_interaction_id)
+        || intervention.get("evidenceProgressDigest") != research.get("evidenceProgressDigest")
+        || intervention
+            .get("interactionRevision")
+            .and_then(Value::as_str)
+            != Some(
+                format!(
+                    "intervention-revision-{}",
+                    candidate_set_digest.trim_start_matches("sha256:")
+                )
+                .as_str(),
+            )
+        || research.get("lastCandidateSetDigest") != intervention.get("candidateSetDigest")
+        || intervention
+            .get("problemSummary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    for (field, require_non_empty) in [
+        ("relevantFactRefs", false),
+        ("affectedPlanActionIds", false),
+    ] {
+        validate_private_unique_identities(
+            intervention
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(compact_intervention_state_invalid)?,
+            "interventionIdentity",
+            require_non_empty,
+        )
+        .map_err(|_| compact_intervention_state_invalid())?;
+    }
+
+    let options = intervention
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    if options.is_empty() || options.len() > 16 {
+        return Err(compact_intervention_state_invalid());
+    }
+    for option in options {
+        let option = option
+            .as_object()
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_private_projection_fields(
+            option,
+            &[
+                "optionId",
+                "kind",
+                "title",
+                "description",
+                "tradeoffs",
+                "recommended",
+                "actions",
+            ],
+            &["candidatePlan"],
+            &["optionId"],
+            &["title", "description"],
+            &["tradeoffs", "actions"],
+            &["candidatePlan"],
+            &[],
+            &[],
+        )
+        .map_err(|_| compact_intervention_state_invalid())?;
+        let option_id = option
+            .get("optionId")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let kind = option
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let tradeoffs = option
+            .get("tradeoffs")
+            .and_then(Value::as_array)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        let actions = option
+            .get("actions")
+            .and_then(Value::as_array)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        if !option_ids.insert(option_id.to_string())
+            || !matches!(kind, "executable" | "guidanceOnly")
+            || option.get("recommended").and_then(Value::as_bool).is_none()
+            || ["title", "description"].iter().any(|field| {
+                option
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            || tradeoffs.is_empty()
+            || tradeoffs.len() > 32
+            || tradeoffs.iter().any(|tradeoff| {
+                tradeoff
+                    .as_str()
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            || (kind == "executable") != option.contains_key("candidatePlan")
+            || (kind == "executable") != !actions.is_empty()
+        {
+            return Err(compact_intervention_state_invalid());
+        }
+        if kind == "guidanceOnly" {
+            continue;
+        }
+        let plan = option
+            .get("candidatePlan")
+            .and_then(Value::as_object)
+            .ok_or_else(compact_intervention_state_invalid)?;
+        validate_private_plan(plan).map_err(|_| compact_intervention_state_invalid())?;
+        if plan.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
+            || plan.get("inputId").and_then(Value::as_str)
+                != Some(authority.current_input_id.as_str())
+            || plan.get("predecessorPlanRef") != research.get("predecessorPlanRef")
+            || plan
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_none_or(|plan_actions| plan_actions.len() != actions.len())
+        {
+            return Err(compact_intervention_state_invalid());
+        }
+        let plan_actions = plan
+            .get("actions")
+            .and_then(Value::as_array)
+            .expect("validated candidate Plan actions");
+        for (candidate_action, plan_action) in actions.iter().zip(plan_actions) {
+            validate_compact_intervention_candidate_action(
+                candidate_action,
+                plan_action,
+                authority,
+                intervention,
+                option_id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_compact_intervention_candidate_action(
+    candidate_action: &Value,
+    plan_action: &Value,
+    authority: &SessionKernelCompactAuthorityV3,
+    intervention: &serde_json::Map<String, Value>,
+    option_id: &str,
+) -> Result<(), HostV2StorageError> {
+    let action = candidate_action
+        .as_object()
+        .ok_or_else(compact_intervention_state_invalid)?;
+    validate_private_projection_fields(
+        action,
+        &[
+            "planActionId",
+            "operationId",
+            "toolId",
+            "summary",
+            "preview",
+        ],
+        &[],
+        &["planActionId", "operationId", "toolId"],
+        &["summary"],
+        &[],
+        &["preview"],
+        &[],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    if action
+        .get("summary")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    let manifest = plan_action
+        .get("manifest")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    for field in ["planActionId", "operationId", "toolId"] {
+        if action.get(field) != manifest.get(field) {
+            return Err(compact_intervention_state_invalid());
+        }
+    }
+    let preview_value = action
+        .get("preview")
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let preview = decode_private_scope_preview(preview_value, "interventionCandidatePreview")
+        .map_err(|_| compact_intervention_state_invalid())?;
+    let preview_object = preview_value
+        .as_object()
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let origin = preview_object
+        .get("origin")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let origin_data = origin
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    if preview.run_id.as_str() != authority.run_id
+        || preview.control_epoch.get() != authority.control_epoch
+        || preview.plan_revision.as_str()
+            != manifest
+                .get("planRevision")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || preview.plan_action_id.as_str()
+            != action
+                .get("planActionId")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || preview.operation_id.as_str()
+            != action
+                .get("operationId")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || preview.tool_id.as_str()
+            != action
+                .get("toolId")
+                .and_then(Value::as_str)
+                .ok_or_else(compact_intervention_state_invalid)?
+        || origin.get("kind").and_then(Value::as_str) != Some("interventionCandidate")
+        || origin_data.get("interactionId") != intervention.get("interactionId")
+        || origin_data.get("interactionRevision") != intervention.get("interactionRevision")
+        || origin_data.get("candidateSetDigest") != intervention.get("candidateSetDigest")
+        || origin_data.get("optionId").and_then(Value::as_str) != Some(option_id)
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    Ok(())
+}
+
+fn validate_compact_user_intervention_decision(
+    decision: &serde_json::Map<String, Value>,
+    intervention: Option<&serde_json::Map<String, Value>>,
+    research: &serde_json::Map<String, Value>,
+    expected_interaction_id: &str,
+    option_ids: &HashSet<String>,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        decision,
+        &[
+            "interactionId",
+            "interactionRevision",
+            "candidateSetDigest",
+            "decision",
+            "callerRequestId",
+            "recordedAt",
+        ],
+        &["optionId", "guidance"],
+        &[
+            "interactionId",
+            "interactionRevision",
+            "callerRequestId",
+            "recordedAt",
+        ],
+        &["guidance"],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .map_err(|_| compact_intervention_state_invalid())?;
+    let decision_kind = decision
+        .get("decision")
+        .and_then(Value::as_str)
+        .ok_or_else(compact_intervention_state_invalid)?;
+    let option_id = decision.get("optionId").and_then(Value::as_str);
+    let guidance = decision.get("guidance").and_then(Value::as_str);
+    if !matches!(decision_kind, "select" | "revise" | "reject")
+        || decision.get("interactionId").and_then(Value::as_str) != Some(expected_interaction_id)
+        || guidance.is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(compact_intervention_state_invalid());
+    }
+    match decision_kind {
+        "select" => {
+            let card = intervention.ok_or_else(compact_intervention_state_invalid)?;
+            if option_id.is_none_or(|value| !option_ids.contains(value))
+                || decision.get("interactionRevision") != card.get("interactionRevision")
+                || decision.get("candidateSetDigest") != card.get("candidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        "revise" => {
+            if option_id.is_some()
+                || guidance.is_none()
+                || intervention.is_some()
+                || decision.get("candidateSetDigest") != research.get("lastCandidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        "reject" => {
+            let card = intervention.ok_or_else(compact_intervention_state_invalid)?;
+            if option_id.is_some()
+                || decision.get("interactionRevision") != card.get("interactionRevision")
+                || decision.get("candidateSetDigest") != card.get("candidateSetDigest")
+            {
+                return Err(compact_intervention_state_invalid());
+            }
+        }
+        _ => unreachable!("validated intervention decision kind"),
+    }
+    Ok(())
+}
+
+fn compact_intervention_state_invalid() -> HostV2StorageError {
+    HostV2StorageError::invalid(
+        "session_kernel_checkpoint_intervention_invalid",
+        "Session Kernel compact checkpoint intervention state is not one exact current authority",
+    )
+}
+
+fn validate_compact_terminal_answer_candidate(
+    candidate: &SessionKernelCompactTerminalAnswerCandidateV1,
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> Result<(), HostV2StorageError> {
+    if candidate.schema_version != SESSION_TERMINAL_ANSWER_CANDIDATE_V1_SCHEMA
+        || candidate.control_epoch == 0
+        || candidate.control_epoch > MAX_SAFE_INTEGER_V3
+        || candidate.language_revision != candidate.control_epoch
+        || candidate.snapshot_high_water > checkpoint.cursor.snapshot_high_water
+        || candidate.input_id != checkpoint.authority.current_input_id
+        || candidate.control_epoch != checkpoint.authority.control_epoch
+        || Some(&candidate.work_authority) != checkpoint.authority.work_authority.as_ref()
+        || candidate.source_event_refs.is_empty()
+    {
+        return Err(terminal_answer_candidate_invalid());
+    }
+    validate_bounded_identity(
+        &candidate.provider_turn_id,
+        "terminalAnswerCandidate.providerTurnId",
+        512,
+    )?;
+    validate_bounded_identity(&candidate.input_id, "terminalAnswerCandidate.inputId", 512)?;
+    validate_session_work_authority_v3(&candidate.work_authority)?;
+    validate_sha256_digest(&candidate.text_digest, "terminalAnswerCandidate.textDigest")?;
+    validate_bounded_identity(
+        &candidate.recorded_at,
+        "terminalAnswerCandidate.recordedAt",
+        1024,
+    )?;
+    let mut source_refs = HashSet::new();
+    for source_ref in &candidate.source_event_refs {
+        validate_bounded_identity(source_ref, "terminalAnswerCandidate.sourceEventRef", 512)?;
+        if !source_refs.insert(source_ref.as_str()) {
+            return Err(terminal_answer_candidate_invalid());
+        }
+    }
+    Ok(())
 }
 
 fn validate_plan_confirmation_authority_v2(
@@ -3173,25 +4490,38 @@ fn validate_compact_final_answer(
         ("providerTurnId", final_answer.provider_turn_id.as_deref()),
         ("startedAt", final_answer.started_at.as_deref()),
         ("staleAt", final_answer.stale_at.as_deref()),
+        ("committedAt", final_answer.committed_at.as_deref()),
         ("failedAt", final_answer.failed_at.as_deref()),
         ("lastErrorCode", final_answer.last_error_code.as_deref()),
+        ("commitKind", final_answer.commit_kind.as_deref()),
     ] {
         if let Some(value) = value {
             validate_bounded_identity(value, field, 1024)?;
         }
     }
-    let shape_invalid = match final_answer.status.as_str() {
-        "pending" => final_answer.provider_turn_id.is_some(),
-        "requesting" => {
-            final_answer.provider_turn_id.is_none() || final_answer.started_at.is_none()
-        }
-        "stale" => false,
-        "committed" => final_answer.provider_turn_id.is_none(),
-        "finalAnswerFailed" => {
-            final_answer.failed_at.is_none() || final_answer.last_error_code.is_none()
-        }
-        _ => true,
-    };
+    let commit_shape_invalid = final_answer.status != "committed"
+        && (final_answer.committed_at.is_some() || final_answer.commit_kind.is_some())
+        || final_answer
+            .commit_kind
+            .as_deref()
+            .is_some_and(|kind| !matches!(kind, "candidatePromotion" | "finalSynthesis"));
+    let shape_invalid = commit_shape_invalid
+        || match final_answer.status.as_str() {
+            "pending" => final_answer.provider_turn_id.is_some(),
+            "requesting" => {
+                final_answer.provider_turn_id.is_none() || final_answer.started_at.is_none()
+            }
+            "stale" => false,
+            "committed" => {
+                final_answer.provider_turn_id.is_none()
+                    || final_answer.committed_at.is_none()
+                    || final_answer.commit_kind.is_none()
+            }
+            "finalAnswerFailed" => {
+                final_answer.failed_at.is_none() || final_answer.last_error_code.is_none()
+            }
+            _ => true,
+        };
     if shape_invalid {
         return Err(compact_final_answer_invalid());
     }
@@ -3202,6 +4532,13 @@ fn compact_final_answer_invalid() -> HostV2StorageError {
     HostV2StorageError::invalid(
         "session_kernel_checkpoint_final_answer_invalid",
         "Session Kernel compact checkpoint finalAnswer control is invalid",
+    )
+}
+
+fn terminal_answer_candidate_invalid() -> HostV2StorageError {
+    HostV2StorageError::invalid(
+        "session_kernel_terminal_answer_candidate_invalid",
+        "Session Kernel terminal answer candidate does not bind exact durable Provider and Session facts",
     )
 }
 
@@ -3223,12 +4560,8 @@ fn validate_provider_reservation(
     if reservation.control_epoch != authority.control_epoch
         || !matches!(
             target_kind,
-            "planning" | "planAction" | "contextRead" | "finalAnswer"
+            "planning" | "planAction" | "contextRead" | "interventionResearch" | "finalAnswer"
         )
-        || (target_kind == "planAction") != reservation.remaining_tool_call_budget.is_some()
-        || reservation
-            .remaining_tool_call_budget
-            .is_some_and(|budget| budget == 0 || budget > 256)
         || !reservation.fact_projection.is_object()
         || !reservation.context_assembly.is_object()
     {
@@ -3248,6 +4581,48 @@ fn validate_provider_reservation(
         if correction.retry_ordinal < 2 || correction.retry_ordinal > MAX_SAFE_INTEGER_V3 {
             return Err(provider_turn_admission_invalid());
         }
+    }
+    for repair in [
+        reservation.structured_repair.as_ref(),
+        reservation.next_structured_repair.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if repair.schema_version != "deepcode.session.provider-structured-repair.v1"
+            || !matches!(repair.source_terminal_kind.as_str(), "failed" | "completed")
+            || (repair.source_terminal_kind == "completed")
+                != repair.source_response_digest.is_some()
+        {
+            return Err(provider_turn_admission_invalid());
+        }
+        validate_bounded_identity(
+            &repair.predecessor_provider_turn_id,
+            "structuredRepair.predecessorProviderTurnId",
+            512,
+        )?;
+        validate_bounded_identity(&repair.error_code, "structuredRepair.errorCode", 256)?;
+        validate_sha256_digest(&repair.failure_digest, "structuredRepair.failureDigest")?;
+        if let Some(response_digest) = &repair.source_response_digest {
+            validate_sha256_digest(response_digest, "structuredRepair.sourceResponseDigest")?;
+        }
+    }
+    if reservation
+        .structured_repair
+        .as_ref()
+        .is_some_and(|repair| {
+            reservation.purpose != ProviderTracePurposeV1::Continuation
+                || repair.predecessor_provider_turn_id == reservation.provider_turn_id
+        })
+        || reservation
+            .next_structured_repair
+            .as_ref()
+            .is_some_and(|repair| {
+                reservation.status != "failed"
+                    || repair.predecessor_provider_turn_id != reservation.provider_turn_id
+            })
+    {
+        return Err(provider_turn_admission_invalid());
     }
     if let Some(dispatch_ref) = &reservation.dispatch_ref {
         validate_record_ref(dispatch_ref, "dispatchRef")?;
@@ -3585,9 +4960,35 @@ fn validate_provider_turn_terminal_data(
             {
                 return Err(provider_completed_terminal_invalid());
             }
+            if data.structured_failure.is_some() {
+                return Err(provider_completed_terminal_invalid());
+            }
         }
-        SessionProviderTurnTerminalKindV3::Failed
-        | SessionProviderTurnTerminalKindV3::Cancelled
+        SessionProviderTurnTerminalKindV3::Failed => {
+            let reason_code = data
+                .reason_code
+                .as_deref()
+                .ok_or_else(provider_noncompleted_terminal_invalid)?;
+            validate_bounded_identity(reason_code, "reasonCode", 256)?;
+            if data.response_digest.is_some()
+                || data.completion.is_some()
+                || !data.ordered_items.is_empty()
+            {
+                return Err(provider_noncompleted_terminal_invalid());
+            }
+            match (&data.structured_failure, &data.provider_result) {
+                (Some(failure), Some(result)) => {
+                    validate_provider_structured_failure(failure)?;
+                    validate_provider_result(result, &data.authority_binding)?;
+                    if failure.get("errorCode").and_then(Value::as_str) != Some(reason_code) {
+                        return Err(provider_noncompleted_terminal_invalid());
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(provider_noncompleted_terminal_invalid()),
+            }
+        }
+        SessionProviderTurnTerminalKindV3::Cancelled
         | SessionProviderTurnTerminalKindV3::LimitExceeded => {
             let reason_code = data
                 .reason_code
@@ -3597,6 +4998,7 @@ fn validate_provider_turn_terminal_data(
             if data.response_digest.is_some()
                 || data.completion.is_some()
                 || data.provider_result.is_some()
+                || data.structured_failure.is_some()
                 || !data.ordered_items.is_empty()
             {
                 return Err(provider_noncompleted_terminal_invalid());
@@ -3616,6 +5018,9 @@ fn validate_provider_completion(
     }
     validate_sha256_digest(&completion.reasoning_digest, "reasoningDigest")?;
     validate_sha256_digest(&completion.response_digest, "completion.responseDigest")?;
+    if let Some(recovery) = &completion.structured_output_recovery {
+        validate_provider_structured_recovery(recovery)?;
+    }
     validate_sha256_digest(&completion.trace.seal_digest, "completion.trace.sealDigest")?;
     validate_sha256_digest(
         &completion.trace.terminal_digest,
@@ -3636,6 +5041,162 @@ fn validate_provider_completion(
     };
     if completion.reasoning_transport != expected_transport {
         return Err(provider_completed_terminal_invalid());
+    }
+    Ok(())
+}
+
+fn validate_provider_structured_recovery(value: &Value) -> Result<(), HostV2StorageError> {
+    let object = value
+        .as_object()
+        .ok_or_else(provider_completed_terminal_invalid)?;
+    require_exact_object_keys(
+        object,
+        &[
+            "schemaVersion",
+            "disposition",
+            "errorCode",
+            "failureDigest",
+            "calls",
+        ],
+        "provider_structured_output_recovery_invalid",
+    )?;
+    if object.get("schemaVersion").and_then(Value::as_str)
+        != Some(PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1)
+        || object.get("disposition").and_then(Value::as_str) != Some("normalizedProposalControl")
+        || object.get("errorCode").and_then(Value::as_str)
+            != Some("provider_tool_call_arguments_invalid")
+    {
+        return Err(provider_completed_terminal_invalid());
+    }
+    validate_provider_structured_calls(object, true)?;
+    Ok(())
+}
+
+fn validate_provider_structured_failure(value: &Value) -> Result<(), HostV2StorageError> {
+    let object = value
+        .as_object()
+        .ok_or_else(provider_noncompleted_terminal_invalid)?;
+    require_exact_object_keys(
+        object,
+        &[
+            "schemaVersion",
+            "disposition",
+            "errorCode",
+            "failureDigest",
+            "nativeCompletion",
+            "calls",
+        ],
+        "provider_structured_output_failure_invalid",
+    )?;
+    if object.get("schemaVersion").and_then(Value::as_str)
+        != Some(PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1)
+        || object.get("disposition").and_then(Value::as_str) != Some("repairableNoMutation")
+        || object.get("errorCode").and_then(Value::as_str)
+            != Some("provider_tool_call_arguments_invalid")
+    {
+        return Err(provider_noncompleted_terminal_invalid());
+    }
+    validate_provider_native_completion(
+        object
+            .get("nativeCompletion")
+            .ok_or_else(provider_noncompleted_terminal_invalid)?,
+    )?;
+    validate_provider_structured_calls(object, false)?;
+    Ok(())
+}
+
+fn validate_provider_structured_calls(
+    object: &serde_json::Map<String, Value>,
+    normalized: bool,
+) -> Result<(), HostV2StorageError> {
+    let calls = object
+        .get("calls")
+        .and_then(Value::as_array)
+        .filter(|calls| !calls.is_empty() && calls.len() <= 32)
+        .ok_or_else(provider_noncompleted_terminal_invalid)?;
+    let mut digest_calls = Vec::with_capacity(calls.len());
+    for call in calls {
+        let call = call
+            .as_object()
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let expected_keys = if normalized {
+            [
+                "index",
+                "callId",
+                "toolName",
+                "originalArgumentsDigest",
+                "normalizedArgumentsDigest",
+                "appendedSuffix",
+            ]
+            .as_slice()
+        } else {
+            ["index", "callId", "toolName", "originalArgumentsDigest"].as_slice()
+        };
+        require_exact_object_keys(
+            call,
+            expected_keys,
+            "provider_structured_output_call_invalid",
+        )?;
+        let index = call
+            .get("index")
+            .and_then(Value::as_i64)
+            .filter(|index| *index >= 0 && *index < 32)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let call_id = call
+            .get("callId")
+            .and_then(Value::as_str)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let tool_name = call
+            .get("toolName")
+            .and_then(Value::as_str)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        let original_digest = call
+            .get("originalArgumentsDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(provider_noncompleted_terminal_invalid)?;
+        validate_bounded_identity(call_id, "structuredOutput.callId", 1024)?;
+        validate_bounded_identity(tool_name, "structuredOutput.toolName", 1024)?;
+        validate_sha256_digest(original_digest, "structuredOutput.originalArgumentsDigest")?;
+        if normalized {
+            if !matches!(
+                tool_name,
+                "deepcode_session_plan_propose_v5" | "deepcode_session_intervention_propose_v1"
+            ) {
+                return Err(provider_completed_terminal_invalid());
+            }
+            let normalized_digest = call
+                .get("normalizedArgumentsDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(provider_completed_terminal_invalid)?;
+            validate_sha256_digest(
+                normalized_digest,
+                "structuredOutput.normalizedArgumentsDigest",
+            )?;
+            let suffix = call
+                .get("appendedSuffix")
+                .and_then(Value::as_str)
+                .filter(|suffix| {
+                    !suffix.is_empty()
+                        && suffix.len() <= 32
+                        && suffix
+                            .chars()
+                            .all(|character| matches!(character, '}' | ']'))
+                })
+                .ok_or_else(provider_completed_terminal_invalid)?;
+            let _ = suffix;
+        }
+        digest_calls.push(json!({
+            "index": index,
+            "toolName": tool_name,
+            "originalArgumentsDigest": original_digest,
+        }));
+    }
+    let expected_digest = stable_json_sha256(&json!({
+        "errorCode": "provider_tool_call_arguments_invalid",
+        "calls": digest_calls,
+    }))?;
+    if object.get("failureDigest").and_then(Value::as_str) != Some(expected_digest.as_str()) {
+        return Err(provider_noncompleted_terminal_invalid());
     }
     Ok(())
 }
@@ -3830,6 +5391,7 @@ fn persisted_input_record_id<'a>(
         )
     })?;
     let expected_keys = [
+        "attachmentContexts",
         "attachments",
         "inputId",
         "opaqueInputRef",
@@ -3892,15 +5454,33 @@ fn persisted_input_record_id<'a>(
             )
         })?;
     validate_bounded_identity(recorded_at, "recordedAt", 1024)?;
-    deepcode_kernel_abi::decode_agent_input_attachments_v2(object.get("attachments").ok_or_else(
-        || {
+    let attachments = deepcode_kernel_abi::decode_agent_input_attachments_v3(
+        object.get("attachments").ok_or_else(|| {
             HostV2StorageError::invalid(
                 "session_kernel_input_record_invalid",
                 "Session Kernel input record has no attachments",
             )
-        },
-    )?)
+        })?,
+    )
     .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    let attachment_contexts: Vec<UserAttachmentContextV1> = serde_json::from_value(
+        object
+            .get("attachmentContexts")
+            .ok_or_else(|| {
+                HostV2StorageError::invalid(
+                    "session_kernel_input_record_invalid",
+                    "Session Kernel input record has no attachmentContexts",
+                )
+            })?
+            .clone(),
+    )
+    .map_err(|_| {
+        HostV2StorageError::invalid(
+            "session_kernel_input_record_invalid",
+            "Session Kernel attachmentContexts use an invalid strict envelope",
+        )
+    })?;
+    validate_user_attachment_contexts_v1(&attachments, &attachment_contexts)?;
     Ok(input_id)
 }
 
@@ -4360,6 +5940,7 @@ struct SessionKernelTimelineDeltaV2 {
     event_count: u64,
     turn_replacements: Vec<Value>,
     removed_turn_ids: Vec<String>,
+    operations: Vec<Value>,
     root_replacements: BTreeMap<String, Value>,
 }
 
@@ -4438,6 +6019,7 @@ pub(crate) struct SessionKernelProjectionSinkV2 {
     active_runs: HostActiveRunBrokerV2,
     projections: Arc<Mutex<HashMap<String, BTreeMap<String, (String, Value)>>>>,
     prior_event_prefixes: Arc<Mutex<HashMap<String, Arc<Vec<Value>>>>>,
+    latest_timelines: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl SessionKernelProjectionSinkV2 {
@@ -4447,6 +6029,7 @@ impl SessionKernelProjectionSinkV2 {
             active_runs,
             projections: Arc::new(Mutex::new(HashMap::new())),
             prior_event_prefixes: Arc::new(Mutex::new(HashMap::new())),
+            latest_timelines: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4473,7 +6056,7 @@ impl SessionKernelProjectionSinkV2 {
         )?;
         let path = self.projection_path(session_id, host_run_id)?;
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        let replayed = with_storage_path_lock(&guard_path, || {
+        let (replayed, timeline) = with_storage_path_lock(&guard_path, || {
             let timeline = self.preflight_public_projection(session_id, &request)?;
             let replayed = if projection_request_replayed(&path, session_id, host_run_id, &request)?
             {
@@ -4508,9 +6091,14 @@ impl SessionKernelProjectionSinkV2 {
             }
             self.publish_agent_event_locked(session_id, &request)?;
             self.publish_timeline_locked(session_id, &request, &timeline)?;
-            Ok(replayed)
+            Ok((replayed, timeline))
         })?;
         self.remember_projection(session_id, host_run_id, &request)?;
+        self.remember_latest_timeline(session_id, &timeline)?;
+        if composer_projection_may_change_for_session_event(&request.event.kind) {
+            self.active_runs
+                .notify_composer_projection(session_id, "sessionInteractionUpdated");
+        }
         Ok(SessionKernelHostProjectionReplyV2 {
             schema_version: SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA,
             projection_id: request.projection_id,
@@ -5110,15 +6698,20 @@ impl SessionKernelProjectionSinkV2 {
         &self,
         session_id: &str,
     ) -> Result<Option<Value>, HostV2StorageError> {
+        if let Some(timeline) = self.cached_latest_timeline(session_id)? {
+            return normalize_public_timeline_for_view(&timeline).map(Some);
+        }
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        with_storage_path_lock(&guard_path, || {
+        let timeline = with_storage_path_lock(&guard_path, || {
             let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
-            let records = read_public_timeline_records(&path, session_id)?;
-            records
-                .last()
-                .map(|record| normalize_latest_public_timeline(&record.timeline))
-                .transpose()
-        })
+            let records = read_public_timeline_records_for_view(&path, session_id)?;
+            Ok(records.last().map(|record| record.timeline.clone()))
+        })?;
+        let Some(timeline) = timeline else {
+            return Ok(None);
+        };
+        self.remember_latest_timeline(session_id, &timeline)?;
+        normalize_public_timeline_for_view(&timeline).map(Some)
     }
 
     pub(crate) fn latest_timeline_for_run(
@@ -5127,11 +6720,21 @@ impl SessionKernelProjectionSinkV2 {
         run_id: &str,
     ) -> Result<Option<Value>, HostV2StorageError> {
         validate_bounded_identity(run_id, "runId", 512)?;
+        if let Some(timeline) = self.cached_latest_timeline(session_id)? {
+            let cached_run_id = timeline
+                .get("runProjection")
+                .and_then(Value::as_object)
+                .and_then(|run| run.get("runId"))
+                .and_then(Value::as_str);
+            if cached_run_id == Some(run_id) {
+                return normalize_latest_public_timeline(&timeline).map(Some);
+            }
+        }
         let guard_path = public_projection_guard_path(self.sessions_dir.as_ref(), session_id)?;
-        with_storage_path_lock(&guard_path, || {
+        let (timeline, latest) = with_storage_path_lock(&guard_path, || {
             let path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
             let records = read_public_timeline_records(&path, session_id)?;
-            records
+            let timeline = records
                 .iter()
                 .rev()
                 .find(|record| {
@@ -5143,9 +6746,16 @@ impl SessionKernelProjectionSinkV2 {
                         .and_then(Value::as_str)
                         == Some(run_id)
                 })
-                .map(|record| normalize_latest_public_timeline(&record.timeline))
-                .transpose()
-        })
+                .map(|record| record.timeline.clone());
+            let latest = records.last().map(|record| record.timeline.clone());
+            Ok((timeline, latest))
+        })?;
+        if let Some(latest) = latest {
+            self.remember_latest_timeline(session_id, &latest)?;
+        }
+        timeline
+            .map(|timeline| normalize_latest_public_timeline(&timeline))
+            .transpose()
     }
 
     pub(crate) fn frozen_prior_timeline(
@@ -5249,6 +6859,38 @@ impl SessionKernelProjectionSinkV2 {
         Ok(())
     }
 
+    fn cached_latest_timeline(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Value>, HostV2StorageError> {
+        self.latest_timelines
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "session_kernel_public_timeline_cache_unavailable",
+                    "Session public timeline cache is unavailable",
+                )
+            })
+            .map(|timelines| timelines.get(session_id).cloned())
+    }
+
+    fn remember_latest_timeline(
+        &self,
+        session_id: &str,
+        timeline: &Value,
+    ) -> Result<(), HostV2StorageError> {
+        self.latest_timelines
+            .lock()
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "session_kernel_public_timeline_cache_unavailable",
+                    "Session public timeline cache is unavailable",
+                )
+            })?
+            .insert(session_id.to_string(), timeline.clone());
+        Ok(())
+    }
+
     fn projection_path(
         &self,
         session_id: &str,
@@ -5263,6 +6905,20 @@ impl SessionKernelProjectionSinkV2 {
             .join("host-projections")
             .join(format!("{}.jsonl", sha256_path_component(host_run_id))))
     }
+}
+
+fn composer_projection_may_change_for_session_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "plan.confirmationReady"
+            | "plan.decided"
+            | "capability.awaiting"
+            | "authorization.decided"
+            | "userIntervention.changed"
+            | "wait.changed"
+            | "review.revised"
+            | "run.cancelled"
+    )
 }
 
 fn preflight_projection_store_append(
@@ -5360,6 +7016,7 @@ fn validate_projection_request(
             | "provider.started"
             | "provider.composing"
             | "provider.completed"
+            | "provider.answerState"
             | "provider.stale"
             | "toolIntent.submitted"
             | "capability.awaiting"
@@ -5367,6 +7024,7 @@ fn validate_projection_request(
             | "authorization.decided"
             | "review.revised"
             | "planAction.completed"
+            | "userIntervention.changed"
             | "run.cancelled"
             | "wait.changed"
             | "diagnostic"
@@ -5420,8 +7078,8 @@ fn validate_projection_timeline_update(
                     "Only Provider composing projections may use a timeline delta",
                 ));
             }
-            if delta.schema_version != "deepcode.shared-conversation-projection.v2"
-                || delta.shape_version != "deepcode.shared-conversation.work-segments.v2"
+            if delta.schema_version != "deepcode.shared-conversation-projection.v4"
+                || delta.shape_version != "deepcode.shared-conversation.work-segments.v4"
                 || delta.session_id != session_id
             {
                 return Err(HostV2StorageError::invalid(
@@ -5452,7 +7110,6 @@ fn validate_projection_timeline_update(
             let allowed_roots = HashSet::from([
                 "taskProjection",
                 "interactionProjection",
-                "runProjection",
                 "tokenUsageProjection",
                 "workspaceProjection",
             ]);
@@ -5494,6 +7151,11 @@ fn validate_projection_timeline_update(
                     ));
                 }
             }
+            validate_timeline_delta_operations_v3(
+                &delta.operations,
+                &replacement_ids,
+                &removed_ids,
+            )?;
             Ok(())
         }
     }
@@ -5514,6 +7176,186 @@ fn validate_projection_snapshot(
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_identity_mismatch",
             "Session public timeline belongs to another Session",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_timeline_delta_operations_v3(
+    operations: &[Value],
+    replacement_ids: &HashSet<&str>,
+    removed_ids: &HashSet<&str>,
+) -> Result<(), HostV2StorageError> {
+    let mut run_updates = 0_u8;
+    let mut append_targets = HashSet::new();
+    for operation in operations {
+        let object = operation.as_object().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_timeline_operation_invalid",
+                "Session timeline delta operation must be an exact object",
+            )
+        })?;
+        match object.get("kind").and_then(Value::as_str) {
+            Some("run.updated") => {
+                if object.len() != 2 || !object.contains_key("runProjection") {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_run_update_invalid",
+                        "Session timeline run.updated must contain only kind and runProjection",
+                    ));
+                }
+                run_updates = run_updates.saturating_add(1);
+                if run_updates > 1 {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_run_update_duplicate",
+                        "Session timeline delta contains more than one run.updated operation",
+                    ));
+                }
+                let run_projection = object
+                    .get("runProjection")
+                    .expect("run.updated field checked");
+                if !run_projection.is_null() && !run_projection.is_object() {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_run_update_invalid",
+                        "Session timeline run.updated projection must be an object or null",
+                    ));
+                }
+            }
+            Some("text.append") => {
+                if object.len() != 2 {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_invalid",
+                        "Session timeline text.append must contain only kind and append",
+                    ));
+                }
+                let append = object
+                    .get("append")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires an append object",
+                        )
+                    })?;
+                let required = [
+                    "turnId",
+                    "blockId",
+                    "baseBlockRevision",
+                    "blockRevision",
+                    "textDelta",
+                    "sourceEventRefs",
+                ];
+                if append.len() != required.len()
+                    || required.iter().any(|field| !append.contains_key(*field))
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_invalid",
+                        "Session timeline text.append does not use the exact v3 shape",
+                    ));
+                }
+                let turn_id = append
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires turnId",
+                        )
+                    })?;
+                let block_id = append
+                    .get("blockId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires blockId",
+                        )
+                    })?;
+                validate_bounded_identity(turn_id, "textAppend.turnId", 512)?;
+                validate_bounded_identity(block_id, "textAppend.blockId", 512)?;
+                if replacement_ids.contains(turn_id) || removed_ids.contains(turn_id) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_conflict",
+                        "Session timeline text.append conflicts with a turn replacement or removal",
+                    ));
+                }
+                if !append_targets.insert((turn_id, block_id)) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_duplicate",
+                        "Session timeline delta repeats a text append target",
+                    ));
+                }
+                let base_revision = append
+                    .get("baseBlockRevision")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0 && *value <= MAX_SAFE_INTEGER_V3)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append base revision must be positive and safe",
+                        )
+                    })?;
+                let block_revision = append
+                    .get("blockRevision")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value <= MAX_SAFE_INTEGER_V3)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append revision must be safe",
+                        )
+                    })?;
+                if base_revision.checked_add(1) != Some(block_revision) {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_revision_invalid",
+                        "Session timeline text.append must advance exactly one block revision",
+                    ));
+                }
+                if append
+                    .get("textDelta")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_invalid",
+                        "Session timeline text.append textDelta must be non-empty",
+                    ));
+                }
+                let source_refs = append
+                    .get("sourceEventRefs")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        HostV2StorageError::invalid(
+                            "session_kernel_timeline_text_append_invalid",
+                            "Session timeline text.append requires sourceEventRefs",
+                        )
+                    })?;
+                let mut unique_refs = HashSet::new();
+                if source_refs.is_empty()
+                    || source_refs.iter().any(|source_ref| {
+                        source_ref
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .is_none_or(|value| !unique_refs.insert(value))
+                    })
+                {
+                    return Err(HostV2StorageError::invalid(
+                        "session_kernel_timeline_text_append_source_invalid",
+                        "Session timeline text.append source refs must be non-empty and unique",
+                    ));
+                }
+            }
+            _ => {
+                return Err(HostV2StorageError::invalid(
+                    "session_kernel_timeline_operation_invalid",
+                    "Session timeline delta operation kind is unsupported",
+                ))
+            }
+        }
+    }
+    if run_updates != 1 {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_timeline_run_update_missing",
+            "Provider composing timeline delta requires exactly one run.updated operation",
         ));
     }
     Ok(())
@@ -5645,6 +7487,15 @@ fn apply_projection_timeline_delta(
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX)
     });
+    for operation in &delta.operations {
+        if operation.get("kind").and_then(Value::as_str) == Some("text.append") {
+            let append = operation
+                .get("append")
+                .and_then(Value::as_object)
+                .expect("timeline text.append validated before application");
+            apply_timeline_text_append_v3(&mut turns, append)?;
+        }
+    }
     timeline.insert("schemaVersion".to_string(), json!(delta.schema_version));
     timeline.insert("shapeVersion".to_string(), json!(delta.shape_version));
     timeline.insert("sessionId".to_string(), json!(delta.session_id));
@@ -5663,7 +7514,135 @@ fn apply_projection_timeline_delta(
             timeline.insert(field.clone(), replacement.clone());
         }
     }
+    for operation in &delta.operations {
+        if operation.get("kind").and_then(Value::as_str) != Some("run.updated") {
+            continue;
+        }
+        let run_projection = operation
+            .get("runProjection")
+            .expect("timeline run.updated validated before application");
+        if run_projection.is_null() {
+            timeline.remove("runProjection");
+        } else {
+            timeline.insert("runProjection".to_string(), run_projection.clone());
+        }
+    }
     Ok(Value::Object(timeline))
+}
+
+fn apply_timeline_text_append_v3(
+    turns: &mut [Value],
+    append: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    let turn_id = append
+        .get("turnId")
+        .and_then(Value::as_str)
+        .expect("timeline text.append turnId validated");
+    let block_id = append
+        .get("blockId")
+        .and_then(Value::as_str)
+        .expect("timeline text.append blockId validated");
+    let base_revision = append
+        .get("baseBlockRevision")
+        .and_then(Value::as_u64)
+        .expect("timeline text.append base revision validated");
+    let block_revision = append
+        .get("blockRevision")
+        .and_then(Value::as_u64)
+        .expect("timeline text.append block revision validated");
+    let text_delta = append
+        .get("textDelta")
+        .and_then(Value::as_str)
+        .expect("timeline text.append text validated");
+    let source_refs = append
+        .get("sourceEventRefs")
+        .and_then(Value::as_array)
+        .expect("timeline text.append source refs validated");
+    let turn = turns
+        .iter_mut()
+        .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_timeline_text_append_turn_missing",
+                "Session timeline text.append target turn does not exist",
+            )
+        })?;
+    let blocks = turn
+        .get_mut("blocks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline turn has no blocks",
+            )
+        })?;
+    let block = blocks
+        .iter_mut()
+        .find(|block| block.get("id").and_then(Value::as_str) == Some(block_id))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_timeline_text_append_block_missing",
+                "Session timeline text.append target block does not exist",
+            )
+        })?;
+    if block.get("kind").and_then(Value::as_str) != Some("assistant")
+        || block.get("narrativeKind").and_then(Value::as_str) != Some("assistantText")
+        || block.get("revision").and_then(Value::as_u64) != Some(base_revision)
+    {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_timeline_text_append_contract_invalid",
+            "Session timeline text.append does not match the canonical assistant block",
+        ));
+    }
+    let summary = block
+        .get("summary")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline block has no summary",
+            )
+        })?;
+    let body = block
+        .get("bodyMarkdown")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let next_summary = format!("{summary}{text_delta}");
+    let next_body = format!("{body}{text_delta}");
+    let provenance = block
+        .get_mut("provenance")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline block has no provenance",
+            )
+        })?;
+    let current_refs = provenance
+        .get_mut("sourceEventRefs")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Canonical Session timeline block has no source refs",
+            )
+        })?;
+    if source_refs
+        .iter()
+        .any(|source_ref| current_refs.contains(source_ref))
+    {
+        return Err(HostV2StorageError::conflict(
+            "session_kernel_timeline_text_append_source_conflict",
+            "Session timeline text.append source refs do not monotonically extend the block",
+        ));
+    }
+    current_refs.extend(source_refs.iter().cloned());
+    block.insert("revision".to_string(), json!(block_revision));
+    block.insert("summary".to_string(), json!(next_summary));
+    block.insert("bodyMarkdown".to_string(), json!(next_body));
+    Ok(())
 }
 
 fn validate_resolved_projection_digest(
@@ -5723,7 +7702,7 @@ fn validate_private_projection_event_data(
                 &["controlEpoch"],
                 &[],
             )?;
-            deepcode_kernel_abi::decode_agent_input_attachments_v2(
+            deepcode_kernel_abi::decode_agent_input_attachments_v3(
                 data.get("attachments").expect("required attachments"),
             )
             .map_err(|error| {
@@ -5827,6 +7806,25 @@ fn validate_private_projection_event_data(
             }
         }
         "provider.completed" => validate_private_provider_completed(data)?,
+        "provider.answerState" => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "controlEpoch",
+                    "answerState",
+                    "reasonCode",
+                ],
+                &[],
+                &["providerTurnId", "reasonCode"],
+                &["answerState"],
+                &[],
+                &[],
+                &["controlEpoch"],
+                &[],
+            )?;
+            require_private_enum(data, "answerState", &["stale", "rejected"])?;
+        }
         "provider.stale" => validate_private_projection_fields(
             data,
             &["providerTurnId"],
@@ -6029,6 +8027,7 @@ fn validate_private_projection_event_data(
                 &["completed", "no_op", "blocked", "skipped", "unexecuted"],
             )?;
         }
+        "userIntervention.changed" => validate_private_user_intervention(data)?,
         "run.cancelled" => validate_private_projection_fields(
             data,
             &[
@@ -6062,6 +8061,128 @@ fn validate_private_projection_event_data(
     Ok(())
 }
 
+fn validate_private_user_intervention(
+    data: &serde_json::Map<String, Value>,
+) -> Result<(), HostV2StorageError> {
+    let state = data
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match state {
+        "open" => validate_private_projection_fields(
+            data,
+            &["state", "wait", "intervention"],
+            &[],
+            &[],
+            &["state"],
+            &[],
+            &["wait", "intervention"],
+            &[],
+            &[],
+        )?,
+        "accepted" => validate_private_projection_fields(
+            data,
+            &["state", "intervention", "decision", "acceptedPlanRevision"],
+            &[],
+            &["acceptedPlanRevision"],
+            &["state"],
+            &[],
+            &["intervention", "decision"],
+            &[],
+            &[],
+        )?,
+        "needsRevision" | "guidanceReplan" | "rejected" => {
+            validate_private_projection_fields(
+                data,
+                &["state", "intervention", "decision"],
+                &[],
+                &[],
+                &["state"],
+                &[],
+                &["intervention", "decision"],
+                &[],
+                &[],
+            )?;
+        }
+        _ => {
+            return Err(private_projection_data_invalid(
+                "User intervention state is not current",
+            ))
+        }
+    }
+    let intervention = data
+        .get("intervention")
+        .and_then(Value::as_object)
+        .ok_or_else(|| private_projection_data_invalid("User intervention card is invalid"))?;
+    for field in [
+        "runId",
+        "inputId",
+        "interactionId",
+        "interactionRevision",
+        "candidateSetDigest",
+        "evidenceProgressDigest",
+        "recordedAt",
+    ] {
+        let value = intervention
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid("User intervention identity is missing")
+            })?;
+        validate_bounded_identity(value, field, 64 * 1024)?;
+    }
+    if intervention.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.user-intervention.v1")
+        || intervention
+            .get("problemSummary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || intervention
+            .get("controlEpoch")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || intervention
+            .get("options")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(private_projection_data_invalid(
+            "User intervention card is incomplete",
+        ));
+    }
+    if state == "open" {
+        let wait = data
+            .get("wait")
+            .and_then(Value::as_object)
+            .ok_or_else(|| private_projection_data_invalid("User intervention wait is invalid"))?;
+        if wait.get("kind").and_then(Value::as_str) != Some("userIntervention")
+            || wait.get("interactionId") != intervention.get("interactionId")
+            || wait.get("interactionRevision") != intervention.get("interactionRevision")
+            || wait.get("candidateSetDigest") != intervention.get("candidateSetDigest")
+        {
+            return Err(private_projection_data_invalid(
+                "User intervention wait identity does not match its card",
+            ));
+        }
+    } else {
+        let decision = data
+            .get("decision")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                private_projection_data_invalid("User intervention decision is invalid")
+            })?;
+        if decision.get("interactionId") != intervention.get("interactionId")
+            || decision.get("interactionRevision") != intervention.get("interactionRevision")
+            || decision.get("candidateSetDigest") != intervention.get("candidateSetDigest")
+        {
+            return Err(private_projection_data_invalid(
+                "User intervention decision identity does not match its card",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_private_projection_fields(
     data: &serde_json::Map<String, Value>,
@@ -6074,16 +8195,22 @@ fn validate_private_projection_fields(
     positive_integers: &[&str],
     non_negative_integers: &[&str],
 ) -> Result<(), HostV2StorageError> {
-    if data
+    let unknown_fields = data
         .keys()
-        .any(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
-        || required
-            .iter()
-            .any(|field| !data.contains_key(*field) || data.get(*field) == Some(&Value::Null))
-    {
-        return Err(private_projection_data_invalid(
-            "Session private projection contains unknown fields or omits required current fields",
-        ));
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_fields = required
+        .iter()
+        .filter(|field| !data.contains_key(**field) || data.get(**field) == Some(&Value::Null))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() || !missing_fields.is_empty() {
+        return Err(private_projection_data_invalid(format!(
+            "Session private projection fields are not current (unknown: [{}]; missing: [{}])",
+            unknown_fields.join(", "),
+            missing_fields.join(", ")
+        )));
     }
     for field in identities {
         if let Some(value) = data.get(*field) {
@@ -6135,7 +8262,7 @@ fn validate_private_projection_fields(
     Ok(())
 }
 
-fn private_projection_data_invalid(message: &'static str) -> HostV2StorageError {
+fn private_projection_data_invalid(message: impl Into<String>) -> HostV2StorageError {
     HostV2StorageError::invalid("session_kernel_projection_data_invalid", message)
 }
 
@@ -6162,19 +8289,22 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
         &[
             "runId",
             "inputId",
+            "controlEpoch",
             "planRevision",
             "title",
             "objective",
             "narrative",
+            "evidence",
+            "carriedSettlementRefs",
             "actions",
             "recordedAt",
         ],
-        &[],
+        &["predecessorPlanRef"],
         &["runId", "inputId", "planRevision", "recordedAt"],
         &["title", "objective", "narrative"],
-        &["actions"],
-        &[],
-        &[],
+        &["carriedSettlementRefs", "actions"],
+        &["evidence", "predecessorPlanRef"],
+        &["controlEpoch"],
         &[],
     )?;
     if ["title", "objective", "narrative"].iter().any(|field| {
@@ -6186,6 +8316,52 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
             "Session private Plan text must be non-empty",
         ));
     }
+    let run_id = data
+        .get("runId")
+        .and_then(Value::as_str)
+        .expect("validated private Plan run identity");
+    let control_epoch = data
+        .get("controlEpoch")
+        .and_then(Value::as_u64)
+        .expect("validated private Plan control epoch");
+    validate_private_plan_evidence(
+        data.get("evidence")
+            .and_then(Value::as_object)
+            .expect("validated private Plan evidence"),
+        run_id,
+        control_epoch,
+    )?;
+    if let Some(predecessor) = data.get("predecessorPlanRef") {
+        let predecessor = predecessor
+            .as_object()
+            .expect("validated predecessor Plan ref");
+        validate_private_projection_fields(
+            predecessor,
+            &["planRevision", "planDigest"],
+            &[],
+            &["planRevision"],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )?;
+        validate_sha256_digest(
+            predecessor
+                .get("planDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    private_projection_data_invalid("Predecessor Plan digest is invalid")
+                })?,
+            "predecessorPlanRef.planDigest",
+        )
+        .map_err(|_| private_projection_data_invalid("Predecessor Plan digest is invalid"))?;
+    }
+    validate_private_carried_settlements(
+        data.get("carriedSettlementRefs")
+            .and_then(Value::as_array)
+            .expect("validated carried settlement refs"),
+    )?;
     let plan_revision = data
         .get("planRevision")
         .and_then(Value::as_str)
@@ -6201,6 +8377,395 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
     }
     for action in actions {
         validate_private_plan_action(action, plan_revision)?;
+    }
+    Ok(())
+}
+
+fn validate_private_plan_evidence(
+    evidence: &serde_json::Map<String, Value>,
+    run_id: &str,
+    control_epoch: u64,
+) -> Result<(), HostV2StorageError> {
+    validate_private_projection_fields(
+        evidence,
+        &[
+            "kernelFactRefs",
+            "readResources",
+            "historicalRebinds",
+            "blockingUnknowns",
+            "nonBlockingUnknowns",
+            "coverage",
+        ],
+        &[],
+        &[],
+        &["coverage"],
+        &[
+            "kernelFactRefs",
+            "readResources",
+            "historicalRebinds",
+            "blockingUnknowns",
+            "nonBlockingUnknowns",
+        ],
+        &[],
+        &[],
+        &[],
+    )?;
+    if evidence
+        .get("coverage")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence coverage must be non-empty",
+        ));
+    }
+    let fact_refs = evidence
+        .get("kernelFactRefs")
+        .and_then(Value::as_array)
+        .expect("validated Plan fact refs");
+    if fact_refs.len() > 512 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence contains too many Kernel fact refs",
+        ));
+    }
+    validate_private_unique_identities(fact_refs, "planEvidence.kernelFactRef", false)?;
+
+    let resources = evidence
+        .get("readResources")
+        .and_then(Value::as_array)
+        .expect("validated Plan read resources");
+    if resources.len() > 512 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence contains too many read resources",
+        ));
+    }
+    let mut resource_refs = HashSet::new();
+    let mut resource_evidence = HashMap::<String, (String, HashSet<String>)>::new();
+    for resource in resources {
+        let resource = resource.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private Plan read evidence is invalid")
+        })?;
+        validate_private_projection_fields(
+            resource,
+            &["resourceRef", "digest", "summary", "factRefs"],
+            &[],
+            &["resourceRef"],
+            &["summary"],
+            &["factRefs"],
+            &[],
+            &[],
+            &[],
+        )?;
+        let resource_ref = resource
+            .get("resourceRef")
+            .and_then(Value::as_str)
+            .expect("validated resource ref");
+        if !resource_refs.insert(resource_ref) {
+            return Err(private_projection_data_invalid(
+                "Session private Plan read evidence resource refs are not unique",
+            ));
+        }
+        if resource
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(private_projection_data_invalid(
+                "Session private Plan read evidence summary must be non-empty",
+            ));
+        }
+        let resource_digest = resource
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid(
+                    "Session private Plan read evidence digest is invalid",
+                )
+            })?;
+        validate_sha256_digest(resource_digest, "planEvidence.readResource.digest").map_err(
+            |_| {
+                private_projection_data_invalid(
+                    "Session private Plan read evidence digest is invalid",
+                )
+            },
+        )?;
+        let resource_fact_refs = resource
+            .get("factRefs")
+            .and_then(Value::as_array)
+            .expect("validated resource fact refs");
+        validate_private_unique_identities(
+            resource_fact_refs,
+            "planEvidence.resourceFactRef",
+            true,
+        )?;
+        resource_evidence.insert(
+            resource_ref.to_owned(),
+            (
+                resource_digest.to_owned(),
+                resource_fact_refs
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        );
+    }
+
+    let historical_rebinds = evidence
+        .get("historicalRebinds")
+        .and_then(Value::as_array)
+        .expect("validated historical evidence rebinds");
+    if historical_rebinds.len() > 512 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan contains too many historical evidence rebinds",
+        ));
+    }
+    let mut rebind_ids = HashSet::new();
+    for rebind in historical_rebinds {
+        let rebind = rebind.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private historical evidence rebind is invalid")
+        })?;
+        validate_private_projection_fields(
+            rebind,
+            &[
+                "rebindId",
+                "sourceEventId",
+                "sourceEventDigest",
+                "sourceEventVersion",
+                "sourceRunId",
+                "sourceFactId",
+                "sourceControlEpoch",
+                "sourceOperationId",
+                "sourceToolId",
+                "subjectDigest",
+                "sourceEvidenceDigest",
+                "sourceCandidateDigest",
+                "currentRunId",
+                "currentControlEpoch",
+                "currentFactRef",
+                "currentEvidenceDigest",
+                "resourceRef",
+                "contentRelation",
+            ],
+            &[],
+            &[
+                "rebindId",
+                "sourceEventId",
+                "sourceRunId",
+                "sourceFactId",
+                "sourceOperationId",
+                "sourceToolId",
+                "currentRunId",
+                "currentFactRef",
+                "resourceRef",
+            ],
+            &["contentRelation"],
+            &[],
+            &[],
+            &[
+                "sourceEventVersion",
+                "sourceControlEpoch",
+                "currentControlEpoch",
+            ],
+            &[],
+        )?;
+        for digest_field in [
+            "sourceEventDigest",
+            "subjectDigest",
+            "sourceEvidenceDigest",
+            "sourceCandidateDigest",
+            "currentEvidenceDigest",
+        ] {
+            validate_sha256_digest(
+                rebind
+                    .get(digest_field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        private_projection_data_invalid(
+                            "Session private historical evidence digest is invalid",
+                        )
+                    })?,
+                "planEvidence.historicalRebind.digest",
+            )
+            .map_err(|_| {
+                private_projection_data_invalid(
+                    "Session private historical evidence digest is invalid",
+                )
+            })?;
+        }
+        let rebind_id = rebind
+            .get("rebindId")
+            .and_then(Value::as_str)
+            .expect("validated historical rebind identity");
+        let source_run_id = rebind
+            .get("sourceRunId")
+            .and_then(Value::as_str)
+            .expect("validated historical source run identity");
+        let current_run_id = rebind
+            .get("currentRunId")
+            .and_then(Value::as_str)
+            .expect("validated historical current run identity");
+        let current_control_epoch = rebind
+            .get("currentControlEpoch")
+            .and_then(Value::as_u64)
+            .expect("validated historical current control epoch");
+        let resource_ref = rebind
+            .get("resourceRef")
+            .and_then(Value::as_str)
+            .expect("validated historical resource identity");
+        let current_fact_ref = rebind
+            .get("currentFactRef")
+            .and_then(Value::as_str)
+            .expect("validated historical current fact identity");
+        let current_evidence_digest = rebind
+            .get("currentEvidenceDigest")
+            .and_then(Value::as_str)
+            .expect("validated historical current evidence digest");
+        let content_relation = rebind
+            .get("contentRelation")
+            .and_then(Value::as_str)
+            .expect("validated historical content relation");
+        let bound_resource = resource_evidence.get(resource_ref);
+        if !rebind_ids.insert(rebind_id)
+            || source_run_id == run_id
+            || current_run_id != run_id
+            || current_control_epoch != control_epoch
+            || !matches!(content_relation, "sameDigest" | "changedDigest")
+            || bound_resource.is_none_or(|(digest, fact_refs)| {
+                digest != current_evidence_digest || !fact_refs.contains(current_fact_ref)
+            })
+        {
+            return Err(private_projection_data_invalid(
+                "Session private historical rebind must bind an earlier Run to exact current read evidence",
+            ));
+        }
+    }
+
+    let blocking = evidence
+        .get("blockingUnknowns")
+        .and_then(Value::as_array)
+        .expect("validated blocking unknowns");
+    let non_blocking = evidence
+        .get("nonBlockingUnknowns")
+        .and_then(Value::as_array)
+        .expect("validated non-blocking unknowns");
+    if blocking.len() > 128 || non_blocking.len() > 128 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan evidence contains too many unknowns",
+        ));
+    }
+    let mut unknown_ids = HashSet::new();
+    for unknown in blocking.iter().chain(non_blocking.iter()) {
+        let unknown = unknown.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private Plan unknown is invalid")
+        })?;
+        validate_private_projection_fields(
+            unknown,
+            &["unknownId", "question", "impact"],
+            &[],
+            &["unknownId"],
+            &["question", "impact"],
+            &[],
+            &[],
+            &[],
+            &[],
+        )?;
+        let unknown_id = unknown
+            .get("unknownId")
+            .and_then(Value::as_str)
+            .expect("validated unknown identity");
+        if !unknown_ids.insert(unknown_id)
+            || ["question", "impact"].iter().any(|field| {
+                unknown
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+        {
+            return Err(private_projection_data_invalid(
+                "Session private Plan unknowns are incomplete or not unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_carried_settlements(settlements: &[Value]) -> Result<(), HostV2StorageError> {
+    let mut action_ids = HashSet::new();
+    for settlement in settlements {
+        let settlement = settlement.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private carried settlement is invalid")
+        })?;
+        validate_private_projection_fields(
+            settlement,
+            &[
+                "planRevision",
+                "planActionId",
+                "settlementDigest",
+                "kernelFactRefs",
+            ],
+            &[],
+            &["planRevision", "planActionId"],
+            &[],
+            &["kernelFactRefs"],
+            &[],
+            &[],
+            &[],
+        )?;
+        let action_id = settlement
+            .get("planActionId")
+            .and_then(Value::as_str)
+            .expect("validated carried action identity");
+        if !action_ids.insert(action_id) {
+            return Err(private_projection_data_invalid(
+                "Session private carried PlanAction identities are not unique",
+            ));
+        }
+        validate_sha256_digest(
+            settlement
+                .get("settlementDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    private_projection_data_invalid("Carried settlement digest is invalid")
+                })?,
+            "carriedSettlement.settlementDigest",
+        )
+        .map_err(|_| private_projection_data_invalid("Carried settlement digest is invalid"))?;
+        validate_private_unique_identities(
+            settlement
+                .get("kernelFactRefs")
+                .and_then(Value::as_array)
+                .expect("validated carried settlement fact refs"),
+            "carriedSettlement.kernelFactRef",
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_private_unique_identities(
+    values: &[Value],
+    field: &'static str,
+    require_non_empty: bool,
+) -> Result<(), HostV2StorageError> {
+    if require_non_empty && values.is_empty() {
+        return Err(private_projection_data_invalid(
+            "Session private identity list must be non-empty",
+        ));
+    }
+    let mut identities = HashSet::new();
+    for value in values {
+        let value = value.as_str().ok_or_else(|| {
+            private_projection_data_invalid("Session private identity list is invalid")
+        })?;
+        validate_bounded_identity(value, field, 64 * 1024).map_err(|_| {
+            private_projection_data_invalid("Session private identity list is invalid")
+        })?;
+        if !identities.insert(value) {
+            return Err(private_projection_data_invalid(
+                "Session private identity list is not unique",
+            ));
+        }
     }
     Ok(())
 }
@@ -6426,17 +8991,32 @@ fn validate_private_scope_projection(
                 ));
             }
         }
-        Some("rejected") => validate_private_projection_fields(
-            reply,
-            &["toolId", "reason", "guidance"],
-            &[],
-            &["toolId", "reason"],
-            &["guidance"],
-            &[],
-            &[],
-            &[],
-            &[],
-        )?,
+        Some("rejected") => {
+            validate_private_projection_fields(
+                reply,
+                &[
+                    "planActionId",
+                    "operationId",
+                    "toolId",
+                    "reason",
+                    "guidance",
+                ],
+                &[],
+                &["planActionId", "operationId", "toolId", "reason"],
+                &["guidance"],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            if reply.get("planActionId") != data.get("planActionId")
+                || reply.get("operationId") != data.get("operationId")
+            {
+                return Err(private_projection_data_invalid(
+                    "Rejected scope preview does not match its PlanAction projection binding",
+                ));
+            }
+        }
         _ => {
             return Err(private_projection_data_invalid(
                 "Session private scope reply kind is not current",
@@ -6619,10 +9199,12 @@ fn validate_private_provider_completed(
             "toolCallReceipt",
             "reviewRevision",
             "snapshotHighWater",
+            "candidateSourceEventRefs",
+            "answerState",
         ],
         &["providerTurnId"],
         &[],
-        &["orderedItems"],
+        &["orderedItems", "candidateSourceEventRefs"],
         &["providerOutcome", "result", "toolCallReceipt"],
         &["controlEpoch", "reviewRevision"],
         &["snapshotHighWater"],
@@ -6635,10 +9217,32 @@ fn validate_private_provider_completed(
             "answer",
             "noTool",
             "toolIntent",
+            "planEvidenceRefresh",
             "planActionComplete",
+            "intervention",
         ],
     )?;
     require_private_enum(data, "terminalScope", &["turn", "providerTurn"])?;
+    if data.get("outputKind").and_then(Value::as_str) == Some("planEvidenceRefresh")
+        && data.get("terminalScope").and_then(Value::as_str) != Some("providerTurn")
+    {
+        return Err(private_projection_data_invalid(
+            "Plan evidence refresh can settle only the current Provider turn",
+        ));
+    }
+    if let Some(answer_state) = data.get("answerState").and_then(Value::as_str) {
+        if !matches!(answer_state, "provisional" | "committed")
+            || data.get("outputKind").and_then(Value::as_str) != Some("answer")
+            || (answer_state == "provisional"
+                && data.get("terminalScope").and_then(Value::as_str) != Some("providerTurn"))
+            || (answer_state == "committed"
+                && data.get("terminalScope").and_then(Value::as_str) != Some("turn"))
+        {
+            return Err(private_projection_data_invalid(
+                "Session private answerState does not match Provider answer settlement",
+            ));
+        }
+    }
     if data.contains_key("status") {
         require_private_enum(data, "status", &["responseAccepted"])?;
     }
@@ -6657,6 +9261,34 @@ fn validate_private_provider_completed(
         return Err(private_projection_data_invalid(
             "Session private final Review binding does not match a terminal Provider answer",
         ));
+    }
+    if let Some(source_refs) = data.get("candidateSourceEventRefs") {
+        let source_refs = source_refs
+            .as_array()
+            .expect("validated candidate source refs array");
+        let mut unique_refs = HashSet::new();
+        if source_refs.is_empty()
+            || !has_review_revision
+            || data.get("outputKind").and_then(Value::as_str) != Some("answer")
+            || data.get("terminalScope").and_then(Value::as_str) != Some("turn")
+        {
+            return Err(private_projection_data_invalid(
+                "Session private candidate refs do not bind a reviewed terminal answer",
+            ));
+        }
+        for source_ref in source_refs {
+            let source_ref = source_ref.as_str().ok_or_else(|| {
+                private_projection_data_invalid(
+                    "Session private candidate source ref is not an identity",
+                )
+            })?;
+            validate_bounded_identity(source_ref, "candidateSourceEventRef", 512)?;
+            if !unique_refs.insert(source_ref) {
+                return Err(private_projection_data_invalid(
+                    "Session private candidate source refs are not unique",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -6695,7 +9327,7 @@ fn validate_private_tool_intent(
         &["expectedControlEpoch"],
         &[],
     )?;
-    require_private_enum(data, "authorityKind", &["planAction", "contextRead"])?;
+    require_private_enum(data, "authorityKind", &["planAction", "read"])?;
     require_private_enum(
         data,
         "replyKind",
@@ -6795,6 +9427,49 @@ fn validate_private_diagnostic(
     data: &serde_json::Map<String, Value>,
 ) -> Result<(), HostV2StorageError> {
     match data.get("stage").and_then(Value::as_str) {
+        Some("provider.structuredRepair") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "status",
+                    "code",
+                    "stage",
+                    "currentActivityCode",
+                ],
+                &[],
+                &["providerTurnId", "code"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "status", &["recovering"])?;
+            require_private_enum(data, "currentActivityCode", &["session.validating"])?;
+        }
+        Some("provider.structuredRepairNoProgress") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "status",
+                    "terminalScope",
+                    "code",
+                    "message",
+                    "stage",
+                ],
+                &["providerOutcome"],
+                &["providerTurnId", "code"],
+                &["message"],
+                &[],
+                &["providerOutcome"],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "status", &["failed"])?;
+            require_private_enum(data, "terminalScope", &["turn"])?;
+        }
         Some("provider.toolCallQueue") => {
             validate_private_projection_fields(
                 data,
@@ -7116,9 +9791,9 @@ fn read_public_timeline_records(
         }
         reject_transport_capabilities(&record.timeline)?;
         if record.timeline.get("schemaVersion").and_then(Value::as_str)
-            != Some("deepcode.shared-conversation-projection.v2")
+            != Some("deepcode.shared-conversation-projection.v4")
             || record.timeline.get("shapeVersion").and_then(Value::as_str)
-                != Some("deepcode.shared-conversation.work-segments.v2")
+                != Some("deepcode.shared-conversation.work-segments.v4")
         {
             return Err(HostV2StorageError::conflict(
                 "UnsupportedHistorySchema",
@@ -7166,11 +9841,162 @@ fn read_public_timeline_records(
     Ok(records)
 }
 
-fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
+fn read_public_timeline_records_for_view(
+    path: &FsPath,
+    session_id: &str,
+) -> Result<Vec<HostSessionPublicTimelineRecordV2>, HostV2StorageError> {
+    let mut records: Vec<HostSessionPublicTimelineRecordV2> = Vec::new();
+    let mut projections = HashMap::new();
+    let mut history_schema: Option<&'static str> = None;
+    for value in read_bounded_json_lines(path)? {
+        let record: HostSessionPublicTimelineRecordV2 =
+            serde_json::from_value(value).map_err(|error| {
+                HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_history_corrupt",
+                    format!("decode Session public timeline record: {error}"),
+                )
+            })?;
+        if record.schema_version != HOST_SESSION_PUBLIC_TIMELINE_V2_SCHEMA
+            || canonical_sha256(&record.timeline)? != record.timeline_digest
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Session public timeline failed schema or digest validation",
+            ));
+        }
+        reject_transport_capabilities(&record.timeline)?;
+        let schema = match (
+            record.timeline.get("schemaVersion").and_then(Value::as_str),
+            record.timeline.get("shapeVersion").and_then(Value::as_str),
+        ) {
+            (
+                Some("deepcode.shared-conversation-projection.v4"),
+                Some("deepcode.shared-conversation.work-segments.v4"),
+            ) => "v3",
+            (
+                Some("deepcode.shared-conversation-projection.v2"),
+                Some("deepcode.shared-conversation.work-segments.v2"),
+            ) => "v2",
+            _ => {
+                return Err(HostV2StorageError::conflict(
+                    "UnsupportedHistorySchema",
+                    "Prior public Session projection uses an unsupported schema or shape",
+                ))
+            }
+        };
+        if history_schema.is_some_and(|existing| existing != schema) {
+            return Err(HostV2StorageError::conflict(
+                "UnsupportedHistorySchema",
+                "Mixed v2/v3 public Session projection history is not readable",
+            ));
+        }
+        history_schema = Some(schema);
+        if schema == "v3" {
+            normalize_latest_public_timeline(&record.timeline)?;
+        }
+        if record.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id)
+            || timeline_u64(&record.timeline, "revision")? != record.timeline_revision
+            || timeline_u64(&record.timeline, "sourceEventVersion")? != record.source_event_version
+            || timeline_u64(&record.timeline, "eventCount")? > record.source_event_version
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_public_timeline_history_corrupt",
+                "Session public timeline record has inconsistent identity or version",
+            ));
+        }
+        if let Some(existing) = projections.get(&record.projection_id) {
+            if existing != &record {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_identity_conflict",
+                    "Session public timeline history has conflicting projection content",
+                ));
+            }
+            continue;
+        }
+        if let Some(previous) = records.last() {
+            if record.timeline_revision <= previous.timeline_revision
+                || record.source_event_version <= previous.source_event_version
+            {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_history_corrupt",
+                    "Session public timeline history is not strictly monotonic",
+                ));
+            }
+        }
+        projections.insert(record.projection_id.clone(), record.clone());
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn normalize_public_timeline_for_view(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        == Some("deepcode.shared-conversation-projection.v4")
+        && timeline.get("shapeVersion").and_then(Value::as_str)
+            == Some("deepcode.shared-conversation.work-segments.v4")
+    {
+        return normalize_latest_public_timeline(timeline);
+    }
     if timeline.get("schemaVersion").and_then(Value::as_str)
         != Some("deepcode.shared-conversation-projection.v2")
         || timeline.get("shapeVersion").and_then(Value::as_str)
             != Some("deepcode.shared-conversation.work-segments.v2")
+    {
+        return Err(HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            "Prior public Session projection uses an unsupported schema or shape",
+        ));
+    }
+    let mut normalized = timeline.clone();
+    let object = normalized.as_object_mut().ok_or_else(|| {
+        HostV2StorageError::conflict(
+            "session_kernel_public_timeline_history_corrupt",
+            "Legacy public Session projection is not an object",
+        )
+    })?;
+    if let Some(run_projection) = object
+        .get_mut("runProjection")
+        .and_then(Value::as_object_mut)
+    {
+        let terminal = run_projection.get("phase").and_then(Value::as_str) == Some("settled")
+            && matches!(
+                run_projection.get("status").and_then(Value::as_str),
+                Some("succeeded" | "failed" | "cancelled")
+            );
+        if !terminal {
+            return Err(HostV2StorageError::conflict(
+                "session_language_policy_unavailable",
+                "Legacy v2 Session can only be viewed after its Run reached a terminal state",
+            ));
+        }
+        run_projection.insert("currentActivity".to_string(), Value::Null);
+        run_projection.insert("wait".to_string(), Value::Null);
+    }
+    object.insert(
+        "schemaVersion".to_string(),
+        json!("deepcode.shared-conversation-projection.v4"),
+    );
+    object.insert(
+        "shapeVersion".to_string(),
+        json!("deepcode.shared-conversation.work-segments.v4"),
+    );
+    crate::session_public_projection_v2::validate_work_segments_shared_projection_timeline(
+        &normalized,
+    )
+    .map_err(|message| {
+        HostV2StorageError::conflict(
+            "UnsupportedHistorySchema",
+            format!("Legacy v2 Session cannot be normalized as a read-only v3 view: {message}"),
+        )
+    })?;
+    Ok(normalized)
+}
+
+fn normalize_latest_public_timeline(timeline: &Value) -> Result<Value, HostV2StorageError> {
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.shared-conversation-projection.v4")
+        || timeline.get("shapeVersion").and_then(Value::as_str)
+            != Some("deepcode.shared-conversation.work-segments.v4")
     {
         return Err(HostV2StorageError::conflict(
             "UnsupportedHistorySchema",
@@ -7293,7 +10119,7 @@ fn validate_public_agent_event(
                     "Session v2 user event requires the exact nested attachment DTO",
                 )
             })?;
-        deepcode_kernel_abi::decode_agent_input_attachments_v2(attachments).map_err(|error| {
+        deepcode_kernel_abi::decode_agent_input_attachments_v3(attachments).map_err(|error| {
             HostV2StorageError::invalid(
                 "session_kernel_public_event_attachment_invalid",
                 format!(
@@ -7644,6 +10470,36 @@ fn validate_public_agent_event_payload(
                 "summary",
             ],
         ),
+        "userIntervention.changed" => (
+            &[
+                "status",
+                "decisionKind",
+                "interactionId",
+                "interactionRevision",
+                "candidateSetDigest",
+                "targetId",
+                "blockId",
+                "title",
+                "summary",
+                "intervention",
+                "decision",
+                "selectedOptionId",
+                "guidance",
+                "acceptedPlanRevision",
+            ],
+            &[
+                "status",
+                "decisionKind",
+                "interactionId",
+                "interactionRevision",
+                "candidateSetDigest",
+                "targetId",
+                "blockId",
+                "title",
+                "summary",
+                "intervention",
+            ],
+        ),
         "provider.composing" => (
             &[
                 "status",
@@ -7674,6 +10530,7 @@ fn validate_public_agent_event_payload(
                 "providerOutcome",
                 "reviewRevision",
                 "snapshotHighWater",
+                "answerState",
             ],
             &[
                 "status",
@@ -7682,6 +10539,22 @@ fn validate_public_agent_event_payload(
                 "terminalScope",
                 "outputKind",
                 "providerOutcome",
+            ],
+        ),
+        "provider.answerState" => (
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "answerState",
+                "reasonCode",
+            ],
+            &[
+                "status",
+                "providerTurnId",
+                "controlEpoch",
+                "answerState",
+                "reasonCode",
             ],
         ),
         "provider.started" if payload.contains_key("currentActivityCode") => (
@@ -7748,6 +10621,27 @@ fn validate_public_agent_event_payload(
             &["status", "reason", "targetId", "decisionKind", "summary"],
             &["status", "reason", "summary"],
         ),
+        "diagnostic"
+            if event_kind == "workflow_stage"
+                && payload.get("status").and_then(Value::as_str) == Some("recovering") =>
+        {
+            (
+                &[
+                    "status",
+                    "code",
+                    "providerTurnId",
+                    "currentActivityCode",
+                    "summary",
+                ],
+                &[
+                    "status",
+                    "code",
+                    "providerTurnId",
+                    "currentActivityCode",
+                    "summary",
+                ],
+            )
+        }
         "diagnostic" if event_kind == "workflow_stage" => (
             &["status", "code", "providerTurnId", "reason", "orderedItems"],
             &["status", "code", "providerTurnId", "orderedItems"],
@@ -7851,10 +10745,7 @@ fn validate_public_agent_event_payload(
                 && channel == "tool"
                 && visibility == "both"
                 && matches!(status, Some("admitted" | "awaitingCapability" | "rejected"))
-                && matches!(
-                    payload_text("authorityKind"),
-                    Some("planAction" | "contextRead")
-                )
+                && matches!(payload_text("authorityKind"), Some("planAction" | "read"))
                 && match status {
                     Some("admitted" | "awaitingCapability") => {
                         payload.contains_key("invocationId") && !payload.contains_key("replyReason")
@@ -7868,7 +10759,7 @@ fn validate_public_agent_event_payload(
                     Some("planAction") => {
                         payload.contains_key("planRevision") && payload.contains_key("planActionId")
                     }
-                    Some("contextRead") => {
+                    Some("read") => {
                         !payload.contains_key("planRevision")
                             && !payload.contains_key("planActionId")
                     }
@@ -7921,6 +10812,29 @@ fn validate_public_agent_event_payload(
                     Some("completed" | "no_op" | "blocked" | "skipped" | "unexecuted")
                 )
         }
+        "userIntervention.changed" => {
+            event_kind == "user_intervention"
+                && channel == "task"
+                && visibility == "both"
+                && payload_text("decisionKind") == Some("userIntervention")
+                && payload_text("targetId") == payload_text("interactionId")
+                && matches!(
+                    status,
+                    Some("awaitingUserDecision" | "accepted" | "rejected" | "needsRevision")
+                )
+                && match status {
+                    Some("awaitingUserDecision") => !payload.contains_key("decision"),
+                    Some("accepted") => {
+                        payload_text("decision") == Some("select")
+                            && payload.contains_key("acceptedPlanRevision")
+                    }
+                    Some("rejected") => payload_text("decision") == Some("reject"),
+                    Some("needsRevision") => {
+                        matches!(payload_text("decision"), Some("select" | "revise"))
+                    }
+                    _ => false,
+                }
+        }
         "provider.composing" => {
             event_kind == "assistant_msg"
                 && channel == "progress"
@@ -7936,7 +10850,15 @@ fn validate_public_agent_event_payload(
                 && visibility == "conversation"
                 && matches!(
                     payload_text("outputKind"),
-                    Some("plan" | "toolIntent" | "answer" | "noTool" | "planActionComplete")
+                    Some(
+                        "plan"
+                            | "toolIntent"
+                            | "answer"
+                            | "noTool"
+                            | "planEvidenceRefresh"
+                            | "planActionComplete"
+                            | "intervention"
+                    )
                 )
                 && match payload_text("terminalScope") {
                     Some("turn") => {
@@ -7948,6 +10870,13 @@ fn validate_public_agent_event_payload(
                     Some("providerTurn") => event_kind == "workflow_stage" && channel == "progress",
                     _ => false,
                 }
+        }
+        "provider.answerState" => {
+            event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "conversation"
+                && status == Some("completed")
+                && matches!(payload_text("answerState"), Some("stale" | "rejected"))
         }
         "provider.started" => {
             event_kind == "workflow_stage"
@@ -7997,9 +10926,13 @@ fn validate_public_agent_event_payload(
                 }
         }
         "diagnostic" => {
-            (event_kind == "workflow_stage" && channel == "progress" && visibility == "trace")
-                && status == Some("blocked")
-                && payload_text("code") == Some("session_kernel_provider_tool_calls_aborted")
+            (event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "trace"
+                && ((status == Some("blocked")
+                    && payload_text("code") == Some("session_kernel_provider_tool_calls_aborted"))
+                    || (status == Some("recovering")
+                        && payload_text("currentActivityCode") == Some("session.validating"))))
                 || (event_kind == "error"
                     && channel == "error"
                     && visibility == "conversation"
@@ -8269,6 +11202,31 @@ fn validate_public_projection_payload_types(
             public_integer(payload, "controlEpoch", true)?;
             public_integer(payload, "snapshotHighWater", false)?;
         }
+        "userIntervention.changed" => {
+            for field in [
+                "interactionId",
+                "interactionRevision",
+                "candidateSetDigest",
+                "targetId",
+                "blockId",
+            ] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "decisionKind", "title", "summary"] {
+                public_string(payload, field, false)?;
+            }
+            for field in ["decision", "guidance"] {
+                public_optional_string(payload, field, false)?;
+            }
+            for field in ["selectedOptionId", "acceptedPlanRevision"] {
+                public_optional_string(payload, field, true)?;
+            }
+            validate_public_user_intervention(
+                payload
+                    .get("intervention")
+                    .expect("required user intervention"),
+            )?;
+        }
         "provider.composing" => {
             public_string(payload, "providerTurnId", true)?;
             public_integer(payload, "controlEpoch", true)?;
@@ -8293,7 +11251,10 @@ fn validate_public_projection_payload_types(
             }
             public_integer(payload, "controlEpoch", true)?;
             if payload.contains_key("orderedItems") {
-                if payload.get("outputKind").and_then(Value::as_str) == Some("plan") {
+                if matches!(
+                    payload.get("outputKind").and_then(Value::as_str),
+                    Some("plan" | "planEvidenceRefresh")
+                ) {
                     return Err(public_projection_shape_invalid(
                         "Planning completion cannot publish Provider text before confirmation settlement",
                     ));
@@ -8321,6 +11282,35 @@ fn validate_public_projection_payload_types(
             if has_review_revision {
                 public_integer(payload, "reviewRevision", true)?;
                 public_integer(payload, "snapshotHighWater", false)?;
+            }
+            if let Some(answer_state) = payload.get("answerState").and_then(Value::as_str) {
+                if !matches!(answer_state, "provisional" | "committed")
+                    || payload.get("outputKind").and_then(Value::as_str) != Some("answer")
+                    || (answer_state == "provisional"
+                        && payload.get("terminalScope").and_then(Value::as_str)
+                            != Some("providerTurn"))
+                    || (answer_state == "committed"
+                        && payload.get("terminalScope").and_then(Value::as_str) != Some("turn"))
+                {
+                    return Err(public_projection_shape_invalid(
+                        "answerState does not match Provider answer settlement",
+                    ));
+                }
+            }
+        }
+        "provider.answerState" => {
+            public_string(payload, "providerTurnId", true)?;
+            public_integer(payload, "controlEpoch", true)?;
+            for field in ["status", "answerState", "reasonCode"] {
+                public_string(payload, field, false)?;
+            }
+            if !matches!(
+                payload.get("answerState").and_then(Value::as_str),
+                Some("stale" | "rejected")
+            ) {
+                return Err(public_projection_shape_invalid(
+                    "provider answer settlement state is invalid",
+                ));
             }
         }
         "provider.started" => {
@@ -8361,6 +11351,17 @@ fn validate_public_projection_payload_types(
             public_optional_string(payload, "targetId", true)?;
             public_optional_string(payload, "decisionKind", false)?;
         }
+        "diagnostic"
+            if event_kind == "workflow_stage"
+                && payload.get("status").and_then(Value::as_str) == Some("recovering") =>
+        {
+            for field in ["providerTurnId", "code"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "currentActivityCode", "summary"] {
+                public_string(payload, field, false)?;
+            }
+        }
         "diagnostic" if event_kind == "workflow_stage" => {
             public_string(payload, "providerTurnId", true)?;
             for field in ["status", "code"] {
@@ -8389,6 +11390,167 @@ fn validate_public_projection_payload_types(
             return Err(public_projection_shape_invalid(
                 "Public projection kind is not current",
             ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_user_intervention(value: &Value) -> Result<(), HostV2StorageError> {
+    let intervention = public_exact_object(
+        value,
+        &[
+            "schemaVersion",
+            "interactionId",
+            "interactionRevision",
+            "candidateSetDigest",
+            "problemSummary",
+            "relevantFacts",
+            "affectedPlanActionIds",
+            "options",
+            "allowsFreeform",
+        ],
+        &["recommendation"],
+        "User intervention",
+    )?;
+    if public_string(intervention, "schemaVersion", false)?
+        != "deepcode.session.user-intervention.v1"
+        || !public_boolean(intervention, "allowsFreeform")?
+    {
+        return Err(public_projection_shape_invalid(
+            "User intervention schema or freeform contract is invalid",
+        ));
+    }
+    for field in ["interactionId", "interactionRevision", "candidateSetDigest"] {
+        public_string(intervention, field, true)?;
+    }
+    public_string(intervention, "problemSummary", false)?;
+    public_optional_string(intervention, "recommendation", false)?;
+    validate_public_identity_array(
+        intervention
+            .get("relevantFacts")
+            .expect("required intervention fact refs"),
+        "userIntervention.relevantFacts",
+    )?;
+    validate_public_identity_array(
+        intervention
+            .get("affectedPlanActionIds")
+            .expect("required affected PlanActions"),
+        "userIntervention.affectedPlanActionIds",
+    )?;
+    let options = public_array(intervention, "options")?;
+    if options.is_empty() || options.len() > 16 {
+        return Err(public_projection_shape_invalid(
+            "User intervention must contain 1..=16 options",
+        ));
+    }
+    let mut option_ids = HashSet::new();
+    for value in options {
+        let option = public_exact_object(
+            value,
+            &["id", "label", "kind", "tradeoffs", "actions"],
+            &[
+                "description",
+                "recommended",
+                "candidatePlanRevision",
+                "candidatePlanDigest",
+            ],
+            "User intervention option",
+        )?;
+        let option_id = public_string(option, "id", true)?;
+        if !option_ids.insert(option_id) {
+            return Err(public_projection_shape_invalid(
+                "User intervention option ids must be unique",
+            ));
+        }
+        public_string(option, "label", false)?;
+        public_optional_string(option, "description", false)?;
+        if option.contains_key("recommended") {
+            public_boolean(option, "recommended")?;
+        }
+        let kind = public_string(option, "kind", false)?;
+        if !matches!(kind, "executable" | "guidanceOnly") {
+            return Err(public_projection_shape_invalid(
+                "User intervention option kind is invalid",
+            ));
+        }
+        validate_public_string_array(
+            option.get("tradeoffs").expect("required tradeoffs"),
+            "userIntervention.option.tradeoffs",
+        )?;
+        let actions = public_array(option, "actions")?;
+        let executable = kind == "executable";
+        if executable
+            != (option.contains_key("candidatePlanRevision")
+                && option.contains_key("candidatePlanDigest")
+                && !actions.is_empty())
+            || (!executable
+                && (option.contains_key("candidatePlanRevision")
+                    || option.contains_key("candidatePlanDigest")
+                    || !actions.is_empty()))
+        {
+            return Err(public_projection_shape_invalid(
+                "User intervention option authority shape is invalid",
+            ));
+        }
+        public_optional_string(option, "candidatePlanRevision", true)?;
+        public_optional_string(option, "candidatePlanDigest", true)?;
+        for action in actions {
+            let action = public_exact_object(
+                action,
+                &[
+                    "planActionId",
+                    "operationId",
+                    "toolId",
+                    "summary",
+                    "riskLevel",
+                    "canonicalTargets",
+                    "scopeDelta",
+                    "previewId",
+                    "previewDigest",
+                ],
+                &[],
+                "User intervention candidate action",
+            )?;
+            for field in [
+                "planActionId",
+                "operationId",
+                "toolId",
+                "previewId",
+                "previewDigest",
+            ] {
+                public_string(action, field, true)?;
+            }
+            public_string(action, "summary", false)?;
+            if !matches!(
+                public_string(action, "riskLevel", false)?,
+                "low" | "medium" | "high" | "critical"
+            ) {
+                return Err(public_projection_shape_invalid(
+                    "User intervention action risk is invalid",
+                ));
+            }
+            for field in ["canonicalTargets", "scopeDelta"] {
+                validate_public_string_array(
+                    action
+                        .get(field)
+                        .expect("required intervention action list"),
+                    field,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_string_array(value: &Value, field: &str) -> Result<(), HostV2StorageError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| public_projection_shape_invalid(format!("{field} must be an array")))?;
+    for value in values {
+        if value.as_str().is_none() {
+            return Err(public_projection_shape_invalid(format!(
+                "{field} must contain strings"
+            )));
         }
     }
     Ok(())
@@ -8960,6 +12122,7 @@ fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageErr
                 "canonicalAction",
                 "targets",
                 "effectSummary",
+                "readEvidence",
             ],
             "Operation fact",
         )?;
@@ -8992,6 +12155,9 @@ fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageErr
         if let Some(targets) = fact.get("targets") {
             validate_public_identity_array(targets, "operationFact.targets")?;
         }
+        if let Some(read_evidence) = fact.get("readEvidence") {
+            validate_public_read_evidence(fact, read_evidence)?;
+        }
         if fact.contains_key("toolId") != fact.contains_key("canonicalAction")
             || (fact.contains_key("toolId")
                 && fact.get("toolId").and_then(Value::as_str)
@@ -9001,6 +12167,81 @@ fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageErr
                 "Operation fact canonicalAction differs from toolId",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_public_read_evidence(
+    operation_fact: &serde_json::Map<String, Value>,
+    value: &Value,
+) -> Result<(), HostV2StorageError> {
+    let evidence = public_exact_object(
+        value,
+        &[
+            "authorityKind",
+            "controlEpoch",
+            "evidenceDigest",
+            "resourceRefs",
+            "subjectDigest",
+            "toolId",
+        ],
+        &[],
+        "Operation read evidence",
+    )?;
+    if public_string(evidence, "authorityKind", false)? != "read"
+        || operation_fact.get("domain").and_then(Value::as_str) != Some("effect")
+        || !matches!(
+            operation_fact.get("factKind").and_then(Value::as_str),
+            Some(
+                "toolObserved"
+                    | "toolObservedAfterCancel"
+                    | "toolObservedAfterDeadline"
+                    | "toolObservedAfterCancelAndDeadline"
+            )
+        )
+        || operation_fact
+            .get("operationId")
+            .and_then(Value::as_str)
+            .is_none()
+        || operation_fact.get("toolId") != evidence.get("toolId")
+    {
+        return Err(public_projection_shape_invalid(
+            "Operation read evidence is not bound to an observed read effect",
+        ));
+    }
+    public_integer(evidence, "controlEpoch", true)?;
+    public_string(evidence, "toolId", true)?;
+    let digest = public_string(evidence, "evidenceDigest", true)?;
+    validate_sha256_digest(digest, "operationFact.readEvidence.evidenceDigest").map_err(|_| {
+        public_projection_shape_invalid("Operation read evidence digest is not canonical")
+    })?;
+    let subject_digest = public_string(evidence, "subjectDigest", true)?;
+    validate_sha256_digest(subject_digest, "operationFact.readEvidence.subjectDigest").map_err(
+        |_| public_projection_shape_invalid("Operation read subject digest is not canonical"),
+    )?;
+    let resource_refs = public_array(evidence, "resourceRefs")?;
+    if resource_refs.is_empty() {
+        return Err(public_projection_shape_invalid(
+            "Operation read evidence requires at least one resource reference",
+        ));
+    }
+    validate_public_identity_array(
+        evidence
+            .get("resourceRefs")
+            .expect("required read evidence resource refs"),
+        "operationFact.readEvidence.resourceRefs",
+    )?;
+    let mut previous: Option<&str> = None;
+    for resource_ref in resource_refs {
+        let resource_ref = resource_ref
+            .as_str()
+            .expect("validated read evidence resource ref");
+        if previous.is_some_and(|candidate| candidate >= resource_ref) {
+            return Err(public_projection_shape_invalid(
+                "Operation read evidence resource references are not canonical",
+            ));
+        }
+        previous = Some(resource_ref);
     }
     Ok(())
 }
@@ -9045,6 +12286,7 @@ fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError
                     &["kind", "ordinal", "callId", "toolName", "toolId"],
                     &[
                         "operationId",
+                        "previewId",
                         "status",
                         "invocationId",
                         "terminalFactId",
@@ -9066,6 +12308,7 @@ fn validate_public_ordered_items(value: &Value) -> Result<(), HostV2StorageError
                 }
                 for field in [
                     "operationId",
+                    "previewId",
                     "invocationId",
                     "terminalFactId",
                     "terminalFactKind",
@@ -9490,39 +12733,9 @@ fn validate_public_review_query(value: &Value) -> Result<(), HostV2StorageError>
 }
 
 fn validate_public_work_authority(value: &Value) -> Result<(), HostV2StorageError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| public_projection_shape_invalid("Review authority must be an object"))?;
-    match object.get("kind").and_then(Value::as_str) {
-        Some("plan") => {
-            let object = public_exact_object(
-                value,
-                &["kind", "planRevision"],
-                &[],
-                "Review Plan authority",
-            )?;
-            public_string(object, "planRevision", true)?;
-        }
-        Some("contextRead") => {
-            let object = public_exact_object(
-                value,
-                &["kind", "operationIds", "digest"],
-                &[],
-                "Review context authority",
-            )?;
-            public_string(object, "digest", true)?;
-            validate_public_identity_array(
-                object.get("operationIds").expect("required operation ids"),
-                "reviewAuthority.operationIds",
-            )?;
-        }
-        _ => {
-            return Err(public_projection_shape_invalid(
-                "Review authority kind is not current",
-            ))
-        }
-    }
-    Ok(())
+    decode_session_work_authority_v3(value)
+        .map(|_| ())
+        .map_err(|_| public_projection_shape_invalid("Review authority is not current"))
 }
 
 fn public_agent_event_id(event: &Value) -> Result<&str, HostV2StorageError> {

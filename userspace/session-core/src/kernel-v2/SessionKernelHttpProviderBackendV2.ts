@@ -14,7 +14,8 @@ import {
   providerCallableToolsV2,
   providerWireToolNameV2,
   providerWireToolDefinitionsV2,
-  sessionPlanningResponseContractReminderV2,
+  sessionOrchestrationContractV2,
+  sessionProviderTurnFrameV1,
 } from './providerContext.js';
 import type {
   SessionKernelProviderBackendOutputV2,
@@ -22,12 +23,15 @@ import type {
   SessionKernelProviderOrderedItemV2,
   SessionProviderPlanActionDraftV2,
   SessionProviderPlanDraftV2,
+  SessionProviderInterventionDraftV1,
 } from './SessionKernelProviderAdapterV2.js';
 import {
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+  SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
   SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
-  SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
+  SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
 } from './SessionKernelProviderAdapterV2.js';
 import type {
   SessionPlanActionCompletionOutcomeV2,
@@ -42,6 +46,15 @@ import {
 import {
   isExactSessionProviderOutcomeRecordV2,
 } from './providerToolCallQueue.js';
+import {
+  buildSessionProviderAdmissionSidecarV2,
+  planSessionProviderCacheLaneV2,
+  sessionProviderSemanticMessagesV2,
+} from './providerCacheLaneV2.js';
+import type {
+  SessionProviderCacheLanePlanV2,
+  SessionProviderCacheLaneResetReasonV1,
+} from './providerCacheLaneV2.js';
 import type {
   SessionKernelLlmStreamResultV2,
   SessionKernelLlmStreamToolItemV2,
@@ -77,49 +90,82 @@ implements SessionKernelProviderBackendV2 {
     input: SessionProviderTurnInputV2
   ): Promise<SessionKernelProviderBackendOutputV2> {
     assertProviderToolContextBindingV2(input);
-    const purpose = input.purpose;
-    const parentRequestId = providerContinuationParentIdV2(
+    const parentCandidateId = input.structuredRepair
+      ?.predecessorProviderTurnId
+      ?? input.exactReplayPredecessorId
+      ?? providerContinuationParentIdV2(input, this.profileId)
+      ?? providerConversationHeadParentIdV2(input, this.profileId);
+    const tools = providerWireToolDefinitionsV2(input);
+    const predecessor = parentCandidateId
+      ? await this.transport.inspectCachePredecessor(
+          parentCandidateId,
+          this.profileId,
+          input.providerTurnId,
+          input.signal
+        )
+      : undefined;
+    let cacheLane = planSessionProviderCacheLaneV2({
+      turn: input,
+      fullContextMessages: input.contextAssembly.messages,
+      tools,
+      ...(predecessor ? { predecessor } : {}),
+    });
+    let semanticMessages = sessionProviderSemanticMessagesV2(
       input,
-      this.profileId
+      cacheLane,
+      predecessor
     );
-    const request: LlmChatRequest = {
-      requestId: input.providerTurnId,
-      ...(parentRequestId ? { parentRequestId } : {}),
-      profileId: this.profileId,
-      stream: true,
-      messages: cloneJson(input.contextAssembly.messages),
-      tools: providerWireToolDefinitionsV2(input),
-      providerOptions: {
-        deepcode: {
-          sessionKernelV2: {
-            contextVersion: input.toolContext.contextRef.contextVersion,
-            catalogDigest: input.toolContext.contextRef.catalogDigest,
-            contextDigest: input.toolContext.contextRef.contextDigest,
-            factsSnapshotHighWater:
-              input.kernelFacts.snapshotHighWater,
-            factsOmittedCount: input.kernelFacts.omittedCount,
-            providerProfileRevisionDigest:
-              input.providerProfile.providerProfileRevisionDigest,
-            reasoningTransport:
-              input.providerProfile.reasoningTransport,
-            memoryContextDigest:
-              input.contextAssembly.receipt.memory.contextDigest,
-            contextAssemblyDigest: sha256Hash(
-              canonicalJson(input.contextAssembly.receipt)
-            ),
-            userTurnId: input.currentInput.inputId,
-            controlEpoch: input.controlEpoch,
-            purpose,
-          },
-        },
-      },
-    };
-    const response = await this.transport.request(
-      request,
-      input.signal,
-      input.publicTextObserver,
-      input.publicActivityObserver
+    let request = sessionProviderRequestV1(
+      input,
+      this.profileId,
+      tools,
+      semanticMessages,
+      cacheLane
     );
+    let response: SessionKernelLlmStreamResultV2;
+    try {
+      response = await this.transport.request(
+        request,
+        input.signal,
+        input.publicTextObserver,
+        input.publicActivityObserver
+      );
+    } catch (error) {
+      const resetReason = cacheLaneResetReasonForPreflightV1(error);
+      if (
+        (
+          cacheLane.mode !== 'append'
+          && cacheLane.mode !== 'exactReplay'
+        )
+        || resetReason === undefined
+        || input.signal.aborted
+      ) throw error;
+      cacheLane = planSessionProviderCacheLaneV2({
+        turn: input,
+        fullContextMessages: input.contextAssembly.messages,
+        tools,
+        ...(predecessor ? { predecessor } : {}),
+        forcedResetReason: resetReason,
+      });
+      semanticMessages = sessionProviderSemanticMessagesV2(
+        input,
+        cacheLane,
+        predecessor
+      );
+      request = sessionProviderRequestV1(
+        input,
+        this.profileId,
+        tools,
+        semanticMessages,
+        cacheLane
+      );
+      response = await this.transport.request(
+        request,
+        input.signal,
+        input.publicTextObserver,
+        input.publicActivityObserver
+      );
+    }
     return decodeSessionKernelLlmStreamResultV2(
       input,
       response,
@@ -128,11 +174,46 @@ implements SessionKernelProviderBackendV2 {
   }
 }
 
+function sessionProviderRequestV1(
+  input: SessionProviderTurnInputV2,
+  profileId: string,
+  tools: ReturnType<typeof providerWireToolDefinitionsV2>,
+  semanticMessages: LlmChatRequest['messages'],
+  cacheLane: SessionProviderCacheLanePlanV2
+): LlmChatRequest {
+  const sidecar = buildSessionProviderAdmissionSidecarV2({
+    turn: input,
+    semanticMessages,
+    fullContextMessages: input.contextAssembly.messages,
+    tools,
+    cacheLane,
+  });
+  return {
+    requestId: input.providerTurnId,
+    ...(cacheLane.predecessorRequestId
+      ? { parentRequestId: cacheLane.predecessorRequestId }
+      : {}),
+    profileId,
+    stream: true,
+    messages: semanticMessages,
+    tools,
+    providerOptions: {
+      deepcode: {
+        sessionKernelV2: sidecar,
+      },
+    },
+  };
+}
+
 function providerContinuationParentIdV2(
   input: SessionProviderTurnInputV2,
   expectedProfileId: string
 ): string | undefined {
-  if (input.purpose !== 'continuation') return undefined;
+  if (
+    (input.purpose !== 'continuation' && input.purpose !== 'finalAnswer')
+    || input.structuredRepair
+    || input.providerProfile.reasoningTransport !== 'openaiPlaintext'
+  ) return undefined;
   const previous = input.providerOutcomes.at(-1);
   if (
     input.providerProfile.providerProfileId !== expectedProfileId
@@ -140,17 +221,108 @@ function providerContinuationParentIdV2(
       previous,
       expectedProfileId
     )
-    || previous.outputKind !== 'toolIntent'
-    || previous.toolSettlement.status !== 'completed'
     || previous.providerResult.providerProfileId
       !== input.providerProfile.providerProfileId
+  ) {
+    return undefined;
+  }
+  if (
+    previous.outputKind === 'plan'
+    || previous.outputKind === 'planEvidenceRefresh'
+    || previous.outputKind === 'planActionComplete'
+    || previous.outputKind === 'intervention'
+  ) {
+    const settlement = input.pendingProviderControlSettlement;
+    if (
+      !settlement
+      || settlement.predecessorProviderTurnId !== previous.providerTurnId
+      || settlement.runId !== input.runId
+      || settlement.inputId !== input.currentInput.inputId
+      || settlement.controlEpoch !== input.controlEpoch
+      || settlement.nextTargetKind !== input.target.kind
+    ) {
+      throw new Error(
+        'Session control continuation is missing its exact durable settlement.'
+      );
+    }
+    return previous.providerTurnId;
+  }
+  if (
+    input.purpose !== 'continuation'
+    || input.pendingProviderControlSettlement !== undefined
+    || previous.outputKind !== 'toolIntent'
     || previous.toolCallReceipt.providerTurnId
       !== previous.providerTurnId
     || previous.toolCallReceipt.callCount <= 0
+    || previous.toolCalls.length !== previous.toolCallReceipt.callCount
+    || previous.toolCalls.some((call, index) =>
+      call.ordinal !== index + 1
+    )
+    || (
+      previous.toolSettlement.status === 'completed'
+      && previous.toolCalls.some((call) => call.status !== 'completed')
+    )
+    || (
+      previous.toolSettlement.status === 'aborted'
+      && previous.toolCalls.every((call) => call.status === 'completed')
+    )
   ) {
     return undefined;
   }
   return previous.providerTurnId;
+}
+
+function providerConversationHeadParentIdV2(
+  input: SessionProviderTurnInputV2,
+  expectedProfileId: string
+): string | undefined {
+  const head = input.sessionMemory.providerConversationHead;
+  if (
+    input.purpose !== 'primary'
+    || input.exactReplayPredecessorId
+    || !head
+    || input.providerProfile.reasoningTransport !== 'openaiPlaintext'
+    || input.providerProfile.providerProfileId !== expectedProfileId
+    || head.sessionId !== input.sessionMemory.sessionId
+    || head.providerProfileId !== expectedProfileId
+  ) return undefined;
+  return head.providerTurnId;
+}
+
+function cacheLaneResetReasonForPreflightV1(
+  error: unknown
+): SessionProviderCacheLaneResetReasonV1 | undefined {
+  if (!(error instanceof SessionKernelProviderTransportError)) {
+    return undefined;
+  }
+  const reasons: Readonly<Record<
+    string,
+    SessionProviderCacheLaneResetReasonV1
+  >> = {
+    provider_cache_lane_reset_required_daemon_trace_unavailable:
+      'daemonTraceUnavailable',
+    provider_cache_lane_reset_required_daemon_trace_invalid:
+      'daemonTraceInvalid',
+    provider_cache_lane_reset_required_legacy_session_cold_start:
+      'legacySessionColdStart',
+    provider_cache_lane_reset_required_semantic_lane_changed:
+      'semanticLaneChanged',
+    provider_cache_lane_reset_required_provider_profile_changed:
+      'providerProfileChanged',
+    provider_cache_lane_reset_required_model_changed:
+      'modelChanged',
+    provider_cache_lane_reset_required_system_contract_changed:
+      'systemContractChanged',
+    provider_cache_lane_reset_required_tool_schema_changed:
+      'toolSchemaChanged',
+    provider_cache_lane_reset_required_response_format_changed:
+      'responseFormatChanged',
+    provider_cache_lane_reset_required_context_compaction:
+      'contextCompaction',
+    provider_cache_lane_exact_replay_mismatch:
+      'semanticLaneChanged',
+  };
+  return reasons[error.code];
 }
 
 /**
@@ -173,9 +345,7 @@ export function decodeSessionKernelLlmStreamResultV2(
       response,
       expectedProfileId
     );
-    const exposed = input.target.kind === 'finalAnswer'
-      ? []
-      : providerCallableToolsV2(input);
+    const exposed = providerCallableToolsV2(input);
     const encodedNames = new Map(
       exposed.map((tool) => [
         providerWireToolNameV2(tool.toolId),
@@ -193,7 +363,7 @@ export function decodeSessionKernelLlmStreamResultV2(
       );
     }
     const planProposalCalls = streamCalls.filter(
-      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME
+      (item) => item.name === SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME
     );
     if (planProposalCalls.length > 0) {
       if (
@@ -225,16 +395,18 @@ export function decodeSessionKernelLlmStreamResultV2(
           'A Session Plan proposal may follow commentary but cannot share or precede final answer text.'
         );
       }
-      const plan = decodeProviderPlanProposalArgumentsV2(
-        control.arguments
+      const plan = normalizeProviderPlanToolIdsV2(
+        decodeProviderPlanProposalArgumentsV2(control.arguments),
+        encodedNames,
+        new Set(exposed.map((tool) => tool.toolId))
       );
       return {
         kind: 'plan',
         plan,
         planProposal: {
-          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA,
+          schemaVersion: SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA,
           callId: requiredIdentity(control.callId, 'callId'),
-          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V3_TOOL_NAME,
+          toolName: SESSION_PROVIDER_PLAN_PROPOSAL_V5_TOOL_NAME,
           argumentsDigest: sha256Hash(canonicalJson(
             decodeProviderNativeArguments(control.arguments)
           )),
@@ -296,6 +468,67 @@ export function decodeSessionKernelLlmStreamResultV2(
           schemaVersion: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_SCHEMA,
           callId: requiredIdentity(control.callId, 'callId'),
           toolName: SESSION_PROVIDER_PLAN_ACTION_COMPLETE_V2_TOOL_NAME,
+          argumentsDigest: sha256Hash(canonicalJson(decodedArguments)),
+        },
+        items: textItems.map((item) => ({
+          kind: 'text',
+          phase: 'commentary',
+          text: item.text,
+        })),
+        completion: response.completion,
+        providerResult,
+        responseDigest: response.completion.responseDigest,
+      };
+    }
+    const interventionCalls = streamCalls.filter(
+      (item) =>
+        item.name === SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME
+    );
+    if (interventionCalls.length > 0) {
+      if (
+        input.target.kind !== 'interventionResearch'
+        || interventionCalls.length !== 1
+        || streamCalls.length !== 1
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_intervention_proposal_conflict',
+          'A Session intervention proposal must be the only control or Kernel tool in one intervention research response.'
+        );
+      }
+      const control = interventionCalls[0]!;
+      const controlIndex = response.items.indexOf(control);
+      const textItems = response.items.filter(
+        (item): item is Extract<
+          SessionKernelLlmStreamResultV2['items'][number],
+          { kind: 'text' }
+        > => item.kind === 'text'
+      );
+      if (
+        response.items.slice(controlIndex + 1).some(
+          (item) => item.kind === 'text'
+        )
+        || textItems.some((item) => item.phase === 'final_answer')
+      ) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_intervention_proposal_phase_conflict',
+          'A Session intervention proposal may follow commentary but cannot share or precede final-answer text.'
+        );
+      }
+      const decodedArguments = decodeProviderNativeArguments(
+        control.arguments
+      );
+      const draft = normalizeProviderInterventionToolIdsV1(
+        decodeProviderInterventionArgumentsV1(decodedArguments),
+        encodedNames,
+        new Set(exposed.map((tool) => tool.toolId))
+      );
+      return {
+        kind: 'intervention',
+        draft,
+        control: {
+          schemaVersion: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA,
+          callId: requiredIdentity(control.callId, 'callId'),
+          toolName: SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_TOOL_NAME,
           argumentsDigest: sha256Hash(canonicalJson(decodedArguments)),
         },
         items: textItems.map((item) => ({
@@ -396,6 +629,53 @@ export function decodeSessionKernelLlmStreamResultV2(
     };
 }
 
+function normalizeProviderPlanToolIdsV2(
+  plan: SessionProviderPlanDraftV2,
+  encodedNames: ReadonlyMap<string, string>,
+  admittedToolIds: ReadonlySet<string>
+): SessionProviderPlanDraftV2 {
+  return {
+    ...plan,
+    actions: plan.actions.map((action) => {
+      const canonicalToolId = admittedToolIds.has(action.toolId)
+        ? action.toolId
+        : encodedNames.get(action.toolId);
+      if (!canonicalToolId || !admittedToolIds.has(canonicalToolId)) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_plan_tool_unknown',
+          'Provider Plan referenced a tool outside the exact admitted ToolContext.'
+        );
+      }
+      return {
+        ...action,
+        toolId: canonicalToolId,
+      };
+    }),
+  };
+}
+
+function normalizeProviderInterventionToolIdsV1(
+  draft: SessionProviderInterventionDraftV1,
+  encodedNames: ReadonlyMap<string, string>,
+  admittedToolIds: ReadonlySet<string>
+): SessionProviderInterventionDraftV1 {
+  return {
+    ...draft,
+    options: draft.options.map((option) => ({
+      ...option,
+      ...(option.candidatePlan
+        ? {
+            candidatePlan: normalizeProviderPlanToolIdsV2(
+              option.candidatePlan,
+              encodedNames,
+              admittedToolIds
+            ),
+          }
+        : {}),
+    })),
+  };
+}
+
 /**
  * Rehydrates one daemon-written completed terminal into the exact live stream
  * result shape, then routes it through the shared sealed-response decoder.
@@ -461,7 +741,11 @@ function assertProviderToolContextBindingV2(
 ): void {
   const bundle = input.toolContext.bundle;
   const contextRef = input.toolContext.contextRef;
-  const planningTarget = input.target.kind === 'planning';
+  const messages = input.contextAssembly.messages;
+  const systemMessages = messages.filter(
+    (message) => message.role === 'system'
+  );
+  const finalMessage = messages.at(-1);
   if (
     input.toolContext.fixedPrompt !== bundle.fixedPrompt
     || canonicalJson(input.toolContext.tools)
@@ -470,17 +754,17 @@ function assertProviderToolContextBindingV2(
     || contextRef.catalogDigest !== bundle.catalogDigest
     || contextRef.contextDigest !== bundle.contextDigest
     || bundle.tools.some((tool) => tool.availability !== 'ready')
-    || input.contextAssembly.messages.length !== (planningTarget ? 9 : 8)
-    || input.contextAssembly.messages[0]?.role !== 'system'
-    || input.contextAssembly.messages[0]?.content
+    || messages.length < 3
+    || systemMessages.length !== 2
+    || messages[0]?.role !== 'system'
+    || messages[0]?.content
       !== bundle.fixedPrompt
-    || (
-      planningTarget
-      && (
-        input.contextAssembly.messages.at(-1)?.role !== 'system'
-        || input.contextAssembly.messages.at(-1)?.content
-          !== sessionPlanningResponseContractReminderV2()
-      )
+    || messages[1]?.role !== 'system'
+    || messages[1]?.content !== sessionOrchestrationContractV2()
+    || messages.slice(2).some((message) => message.role !== 'user')
+    || finalMessage?.role !== 'user'
+    || finalMessage.content !== canonicalJson(
+      sessionProviderTurnFrameV1(input)
     )
     || input.contextAssembly.receipt.providerProfile
       .providerProfileId
@@ -506,7 +790,7 @@ export function decodeProviderPlanProposalArgumentsV2(
   const record = objectRecord(decoded);
   if (!record) throw invalidPlanningResult();
   exactKeys(record, ['schemaVersion', 'plan']);
-  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V3_SCHEMA) {
+  if (record.schemaVersion !== SESSION_PROVIDER_PLAN_PROPOSAL_V5_SCHEMA) {
     throw invalidPlanningResult();
   }
   return decodeProviderPlanDraft(record.plan);
@@ -535,6 +819,104 @@ export function decodeProviderPlanActionCompleteArgumentsV2(
   return record.outcome;
 }
 
+export function decodeProviderInterventionArgumentsV1(
+  value: unknown
+): SessionProviderInterventionDraftV1 {
+  const decoded = decodeRawToolArgumentsV2(value);
+  const record = objectRecord(decoded);
+  if (!record) throw invalidInterventionResult();
+  exactKeys(record, ['schemaVersion', 'intervention']);
+  if (
+    record.schemaVersion !== SESSION_PROVIDER_INTERVENTION_PROPOSAL_V1_SCHEMA
+  ) {
+    throw invalidInterventionResult();
+  }
+  const intervention = objectRecord(record.intervention);
+  if (!intervention) throw invalidInterventionResult();
+  exactKeys(
+    intervention,
+    ['problemSummary', 'relevantFactRefs', 'affectedPlanActionIds', 'options'],
+    ['recommendation']
+  );
+  if (
+    !Array.isArray(intervention.relevantFactRefs)
+    || !Array.isArray(intervention.affectedPlanActionIds)
+    || !Array.isArray(intervention.options)
+    || intervention.relevantFactRefs.length > 512
+    || intervention.affectedPlanActionIds.length > 256
+    || intervention.options.length < 1
+    || intervention.options.length > 16
+  ) {
+    throw invalidInterventionResult();
+  }
+  return {
+    problemSummary: requiredText(
+      intervention.problemSummary,
+      'problemSummary'
+    ),
+    ...(intervention.recommendation !== undefined
+      ? {
+          recommendation: requiredText(
+            intervention.recommendation,
+            'recommendation'
+          ),
+        }
+      : {}),
+    relevantFactRefs: intervention.relevantFactRefs.map((factRef) =>
+      requiredIdentity(factRef, 'relevantFactRef')
+    ),
+    affectedPlanActionIds: intervention.affectedPlanActionIds.map((actionId) =>
+      requiredIdentity(actionId, 'affectedPlanActionId')
+    ),
+    options: intervention.options.map((value) => {
+      const option = objectRecord(value);
+      if (!option) throw invalidInterventionResult();
+      exactKeys(
+        option,
+        [
+          'optionId',
+          'kind',
+          'title',
+          'description',
+          'tradeoffs',
+          'recommended',
+        ],
+        ['candidatePlan']
+      );
+      if (
+        (option.kind !== 'executable' && option.kind !== 'guidanceOnly')
+        || !Array.isArray(option.tradeoffs)
+        || option.tradeoffs.length < 1
+        || option.tradeoffs.length > 32
+        || typeof option.recommended !== 'boolean'
+        || (option.kind === 'executable') !== (option.candidatePlan !== undefined)
+      ) {
+        throw invalidInterventionResult();
+      }
+      return {
+        optionId: requiredIdentity(option.optionId, 'optionId'),
+        kind: option.kind,
+        title: requiredText(option.title, 'option.title'),
+        description: requiredText(option.description, 'option.description'),
+        tradeoffs: option.tradeoffs.map((tradeoff) =>
+          requiredText(tradeoff, 'option.tradeoff')
+        ),
+        recommended: option.recommended,
+        ...(option.candidatePlan !== undefined
+          ? { candidatePlan: decodeProviderPlanDraft(option.candidatePlan) }
+          : {}),
+      };
+    }),
+  };
+}
+
+function invalidInterventionResult(): SessionKernelProviderTransportError {
+  return new SessionKernelProviderTransportError(
+    'session_kernel_provider_intervention_invalid',
+    'Intervention proposal arguments are not one exact deepcode.session.intervention-proposal.v1 record.'
+  );
+}
+
 function invalidPlanActionComplete(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
     'session_kernel_provider_plan_action_complete_invalid',
@@ -549,7 +931,7 @@ function decodeProviderPlanDraft(
   if (!record) throw invalidPlanningResult();
   exactKeys(
     record,
-    ['title', 'objective', 'narrative', 'actions']
+    ['title', 'objective', 'narrative', 'evidence', 'actions']
   );
   if (!Array.isArray(record.actions)) {
     throw invalidPlanningResult();
@@ -561,7 +943,71 @@ function decodeProviderPlanDraft(
     title: requiredText(record.title, 'title'),
     objective: requiredText(record.objective, 'objective'),
     narrative: requiredText(record.narrative, 'narrative'),
+    evidence: decodePlanEvidenceV4(record.evidence),
     actions: record.actions.map(decodePlanAction),
+  };
+}
+
+function decodePlanEvidenceV4(
+  value: unknown
+): SessionProviderPlanDraftV2['evidence'] {
+  const record = objectRecord(value);
+  if (!record) throw invalidPlanningResult();
+  exactKeys(record, [
+    'kernelFactRefs',
+    'readResources',
+    'blockingUnknowns',
+    'nonBlockingUnknowns',
+    'coverage',
+  ]);
+  if (
+    !Array.isArray(record.kernelFactRefs)
+    || !Array.isArray(record.readResources)
+    || !Array.isArray(record.blockingUnknowns)
+    || !Array.isArray(record.nonBlockingUnknowns)
+    || record.kernelFactRefs.length > 512
+    || record.readResources.length > 512
+    || record.blockingUnknowns.length > 128
+    || record.nonBlockingUnknowns.length > 128
+  ) {
+    throw invalidPlanningResult();
+  }
+  const decodeUnknown = (unknown: unknown) => {
+    const item = objectRecord(unknown);
+    if (!item) throw invalidPlanningResult();
+    exactKeys(item, ['unknownId', 'question', 'impact']);
+    return {
+      unknownId: requiredIdentity(item.unknownId, 'unknownId'),
+      question: requiredText(item.question, 'question'),
+      impact: requiredText(item.impact, 'impact'),
+    };
+  };
+  return {
+    kernelFactRefs: record.kernelFactRefs.map((factRef) =>
+      requiredIdentity(factRef, 'kernelFactRef')
+    ),
+    readResources: record.readResources.map((resource) => {
+      const item = objectRecord(resource);
+      if (!item) throw invalidPlanningResult();
+      exactKeys(item, ['resourceRef', 'summary', 'factRefs']);
+      if (
+        !Array.isArray(item.factRefs)
+        || item.factRefs.length < 1
+        || item.factRefs.length > 256
+      ) {
+        throw invalidPlanningResult();
+      }
+      return {
+        resourceRef: requiredIdentity(item.resourceRef, 'resourceRef'),
+        summary: requiredText(item.summary, 'resourceSummary'),
+        factRefs: item.factRefs.map((factRef) =>
+          requiredIdentity(factRef, 'resourceFactRef')
+        ),
+      };
+    }),
+    blockingUnknowns: record.blockingUnknowns.map(decodeUnknown),
+    nonBlockingUnknowns: record.nonBlockingUnknowns.map(decodeUnknown),
+    coverage: requiredText(record.coverage, 'coverage'),
   };
 }
 
@@ -786,6 +1232,6 @@ function requiredText(value: unknown, _field: string): string {
 function invalidPlanningResult(): SessionKernelProviderTransportError {
   return new SessionKernelProviderTransportError(
     'session_kernel_provider_plan_proposal_invalid',
-    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v3 record.'
+    'Session Plan proposal arguments are not one exact deepcode.session.plan-proposal.v5 record.'
   );
 }

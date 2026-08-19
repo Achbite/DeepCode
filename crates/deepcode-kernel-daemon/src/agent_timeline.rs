@@ -152,13 +152,13 @@ pub(crate) async fn agent_session_timeline(
             Some(timeline) => ApiResponse::ok(timeline),
             None => ApiResponse::error(
                 "agent_timeline_unavailable",
-                "Session v2 public timeline is not available",
+                "Session v3 public timeline is not available",
             ),
         },
         Err(error) => ApiResponse::error(
             error.code,
             format!(
-                "Session v2 public timeline is unavailable: {}",
+                "Session v3 public timeline is unavailable: {}",
                 error.message
             ),
         ),
@@ -170,8 +170,8 @@ fn empty_timeline_for_verified_session(session: &Value, session_id: &str) -> Opt
         return None;
     }
     let timeline = json!({
-        "schemaVersion": "deepcode.shared-conversation-projection.v2",
-        "shapeVersion": "deepcode.shared-conversation.work-segments.v2",
+        "schemaVersion": "deepcode.shared-conversation-projection.v4",
+        "shapeVersion": "deepcode.shared-conversation.work-segments.v4",
         "sessionId": session_id,
         "revision": 0,
         "sourceEventVersion": 0,
@@ -528,6 +528,7 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
     }
     let mut next_ids = std::collections::HashSet::new();
     let mut replacements = Vec::new();
+    let mut operations = Vec::new();
     for turn in next_turns {
         let id = turn
             .get("id")
@@ -536,7 +537,18 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
         if !next_ids.insert(id) {
             return Err("timeline repeats a turn id".to_string());
         }
-        if base_by_id.get(id).copied() != Some(turn) {
+        if let Some(before) = base_by_id.get(id).copied() {
+            if before != turn {
+                if let Some(append) = exact_timeline_text_append_v3(before, turn) {
+                    operations.push(json!({
+                        "kind": "text.append",
+                        "append": append,
+                    }));
+                } else {
+                    replacements.push(turn.clone());
+                }
+            }
+        } else {
             replacements.push(turn.clone());
         }
     }
@@ -549,7 +561,6 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
     for key in [
         "taskProjection",
         "interactionProjection",
-        "runProjection",
         "tokenUsageProjection",
         "workspaceProjection",
     ] {
@@ -559,6 +570,12 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
                 next.get(key).cloned().unwrap_or(Value::Null),
             );
         }
+    }
+    if base.get("runProjection") != next.get("runProjection") {
+        operations.push(json!({
+            "kind": "run.updated",
+            "runProjection": next.get("runProjection").cloned().unwrap_or(Value::Null),
+        }));
     }
     Ok(json!({
         "schemaVersion": next.get("schemaVersion").cloned().unwrap_or(Value::Null),
@@ -571,7 +588,122 @@ fn create_timeline_delta(base: &Value, next: &Value) -> Result<Value, String> {
         "eventCount": event_count,
         "turnReplacements": replacements,
         "removedTurnIds": removed,
+        "operations": operations,
         "rootReplacements": root_replacements,
+    }))
+}
+
+fn exact_timeline_text_append_v3(before: &Value, after: &Value) -> Option<Value> {
+    let mut before_without_blocks = before.as_object()?.clone();
+    let mut after_without_blocks = after.as_object()?.clone();
+    let before_blocks = before_without_blocks.remove("blocks")?.as_array()?.clone();
+    let after_blocks = after_without_blocks.remove("blocks")?.as_array()?.clone();
+    if before_without_blocks != after_without_blocks || before_blocks.len() != after_blocks.len() {
+        return None;
+    }
+    let turn_id = before.get("id")?.as_str()?;
+    let mut append = None;
+    for (previous, next) in before_blocks.iter().zip(after_blocks.iter()) {
+        if previous == next {
+            continue;
+        }
+        if append.is_some() {
+            return None;
+        }
+        append = exact_timeline_block_text_append_v3(turn_id, previous, next);
+        append.as_ref()?;
+    }
+    append
+}
+
+fn exact_timeline_block_text_append_v3(
+    turn_id: &str,
+    before: &Value,
+    after: &Value,
+) -> Option<Value> {
+    let before_object = before.as_object()?;
+    let after_object = after.as_object()?;
+    let block_id = before_object.get("id")?.as_str()?;
+    if after_object.get("id")?.as_str()? != block_id
+        || before_object.get("kind")?.as_str()? != "assistant"
+        || after_object.get("kind")?.as_str()? != "assistant"
+        || before_object.get("narrativeKind")?.as_str()? != "assistantText"
+        || after_object.get("narrativeKind")?.as_str()? != "assistantText"
+    {
+        return None;
+    }
+    let base_revision = before_object.get("revision")?.as_u64()?;
+    let block_revision = after_object.get("revision")?.as_u64()?;
+    if base_revision == 0 || base_revision.checked_add(1)? != block_revision {
+        return None;
+    }
+    let before_summary = before_object.get("summary")?.as_str()?;
+    let after_summary = after_object.get("summary")?.as_str()?;
+    let before_body = before_object
+        .get("bodyMarkdown")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let after_body = after_object
+        .get("bodyMarkdown")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !after_summary.starts_with(before_summary)
+        || !after_body.starts_with(before_body)
+        || after_body.len() == before_body.len()
+        || after_summary[before_summary.len()..] != after_body[before_body.len()..]
+    {
+        return None;
+    }
+    let before_refs = before_object
+        .get("provenance")?
+        .get("sourceEventRefs")?
+        .as_array()?;
+    let after_refs = after_object
+        .get("provenance")?
+        .get("sourceEventRefs")?
+        .as_array()?;
+    if after_refs.len() <= before_refs.len()
+        || before_refs
+            .iter()
+            .zip(after_refs.iter())
+            .any(|(left, right)| left != right)
+    {
+        return None;
+    }
+    let new_refs = after_refs[before_refs.len()..].to_vec();
+    let mut unique = std::collections::HashSet::new();
+    if after_refs.iter().any(|value| {
+        value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .is_none_or(|value| !unique.insert(value))
+    }) {
+        return None;
+    }
+    let mut normalized = after_object.clone();
+    normalized.insert("revision".to_string(), json!(base_revision));
+    normalized.insert("summary".to_string(), json!(before_summary));
+    if before_object.contains_key("bodyMarkdown") {
+        normalized.insert("bodyMarkdown".to_string(), json!(before_body));
+    } else {
+        normalized.remove("bodyMarkdown");
+    }
+    let mut provenance = normalized.get("provenance")?.as_object()?.clone();
+    provenance.insert(
+        "sourceEventRefs".to_string(),
+        Value::Array(before_refs.clone()),
+    );
+    normalized.insert("provenance".to_string(), Value::Object(provenance));
+    if Value::Object(normalized) != *before {
+        return None;
+    }
+    Some(json!({
+        "turnId": turn_id,
+        "blockId": block_id,
+        "baseBlockRevision": base_revision,
+        "blockRevision": block_revision,
+        "textDelta": &after_body[before_body.len()..],
+        "sourceEventRefs": new_refs,
     }))
 }
 

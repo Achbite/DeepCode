@@ -788,7 +788,7 @@ pub struct CapabilityAwaitingIdentityV2 {
     deny_unknown_fields
 )]
 pub enum InvocationAuthorityV2 {
-    ContextRead {
+    Read {
         tool_context_ref: ToolContextRefV2,
         settings_digest: SettingsCeilingDigestV2,
         policy_evaluation_digest: PolicyEvaluationDigestV2,
@@ -805,14 +805,14 @@ impl InvocationAuthorityV2 {
     pub fn capability_lease(&self) -> Option<&CapabilityLeaseRefV2> {
         match self {
             Self::PlanAction { lease, .. } => Some(lease),
-            Self::ContextRead { .. } => None,
+            Self::Read { .. } => None,
         }
     }
 
     pub fn plan_action_id(&self) -> Option<&PlanActionIdV2> {
         match self {
             Self::PlanAction { plan_action_id, .. } => Some(plan_action_id),
-            Self::ContextRead { .. } => None,
+            Self::Read { .. } => None,
         }
     }
 }
@@ -1327,6 +1327,7 @@ pub enum AuthorizationFactV2 {
         identity: AuthorizationIdentityV2,
         preview_id: CapabilityScopePreviewIdV2,
         tool_id: ToolIdV2,
+        origin: crate::v2_command::CapabilityScopePreviewOriginV3,
         authorization_binding: CapabilityAuthorizationBindingV2,
         scope_digest: CapabilityScopeDigestV2,
         tool_contract_digest: ToolContractDigestV2,
@@ -1348,6 +1349,14 @@ pub enum AuthorizationFactV2 {
         scope_digest: CapabilityScopeDigestV2,
         authorization_digest: CapabilityAuthorizationDigestV2,
         guidance: String,
+    },
+    InterventionCandidateSuperseded {
+        identity: AuthorizationIdentityV2,
+        preview_id: CapabilityScopePreviewIdV2,
+        interaction_id: String,
+        interaction_revision: String,
+        candidate_set_digest: String,
+        selected_option_id: String,
     },
     CapabilityAwaiting {
         identity: CapabilityAwaitingIdentityV2,
@@ -1744,6 +1753,29 @@ impl KernelFactPayloadV2 {
                 ));
             }
         }
+        if let Self::Authorization(AuthorizationFactV2::InterventionCandidateSuperseded {
+            interaction_id,
+            interaction_revision,
+            candidate_set_digest,
+            selected_option_id,
+            ..
+        }) = self
+        {
+            validate_bounded_text("fact.interactionId", interaction_id)?;
+            validate_bounded_text("fact.interactionRevision", interaction_revision)?;
+            validate_bounded_text("fact.selectedOptionId", selected_option_id)?;
+            if candidate_set_digest.len() != 71
+                || !candidate_set_digest.starts_with("sha256:")
+                || !candidate_set_digest[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(invalid_value(
+                    "fact.candidateSetDigest",
+                    "must be a lowercase sha256 digest",
+                ));
+            }
+        }
         let resources = self.resource_ids();
         if !strictly_sorted_unique_ids(&resources) {
             return Err(invalid_value("resourceIds", "must be sorted and unique"));
@@ -2042,6 +2074,7 @@ impl AuthorizationFactV2 {
         match self {
             Self::ScopePreviewed { identity, .. }
             | Self::CapabilityDenied { identity, .. }
+            | Self::InterventionCandidateSuperseded { identity, .. }
             | Self::ExpansionDenied { identity, .. }
             | Self::TrustGranted { identity, .. }
             | Self::TrustRevoked { identity, .. } => &identity.run_id,
@@ -2058,6 +2091,7 @@ impl AuthorizationFactV2 {
         match self {
             Self::ScopePreviewed { identity, .. }
             | Self::CapabilityDenied { identity, .. }
+            | Self::InterventionCandidateSuperseded { identity, .. }
             | Self::ExpansionDenied { identity, .. }
             | Self::TrustGranted { identity, .. }
             | Self::TrustRevoked { identity, .. } => identity.control_epoch,
@@ -2074,6 +2108,7 @@ impl AuthorizationFactV2 {
         match self {
             Self::ScopePreviewed { identity, .. }
             | Self::CapabilityDenied { identity, .. }
+            | Self::InterventionCandidateSuperseded { identity, .. }
             | Self::ExpansionDenied { identity, .. }
             | Self::TrustGranted { identity, .. }
             | Self::TrustRevoked { identity, .. } => &identity.causation_fact_id,
@@ -2090,6 +2125,7 @@ impl AuthorizationFactV2 {
         match self {
             Self::ScopePreviewed { identity, .. }
             | Self::CapabilityDenied { identity, .. }
+            | Self::InterventionCandidateSuperseded { identity, .. }
             | Self::ExpansionDenied { identity, .. }
             | Self::TrustGranted { identity, .. }
             | Self::TrustRevoked { identity, .. } => Some(&identity.operation_id),
@@ -2120,6 +2156,7 @@ impl AuthorizationFactV2 {
         match self {
             Self::ScopePreviewed { identity, .. }
             | Self::CapabilityDenied { identity, .. }
+            | Self::InterventionCandidateSuperseded { identity, .. }
             | Self::ExpansionDenied { identity, .. }
             | Self::TrustGranted { identity, .. }
             | Self::TrustRevoked { identity, .. } => Some(&identity.correlation_set),
@@ -2136,6 +2173,7 @@ impl AuthorizationFactV2 {
         match self {
             Self::ScopePreviewed { identity, .. }
             | Self::CapabilityDenied { identity, .. }
+            | Self::InterventionCandidateSuperseded { identity, .. }
             | Self::ExpansionDenied { identity, .. }
             | Self::TrustGranted { identity, .. }
             | Self::TrustRevoked { identity, .. } => Some(&identity.plan_action_id),
@@ -2382,7 +2420,7 @@ pub fn command_request_digest_v2(
         .and_then(|object| object.get("data"))
         .ok_or_else(|| invalid_value("command", "must use the typed kind/data representation"))?;
     typed_digest_newtype(
-        "deepcode.kernel.abi.v2/command-request",
+        "deepcode.kernel.abi.v3/command-request",
         &serde_json::json!({
             "abiVersion": KERNEL_ABI_V2_VERSION,
             "commandKind": command.kind(),
@@ -2397,7 +2435,7 @@ pub fn idempotency_key_hash_v2(
 ) -> Result<IdempotencyKeyHashV2, V2ValidationError> {
     validate_bounded_text("idempotencyKey", idempotency_key)?;
     typed_digest_newtype(
-        "deepcode.kernel.abi.v2/idempotency-key",
+        "deepcode.kernel.abi.v3/idempotency-key",
         &serde_json::json!({"runId":run_id,"idempotencyKey":idempotency_key}),
     )
 }
@@ -2408,7 +2446,7 @@ pub fn workspace_binding_digest_v2(
 ) -> Result<WorkspaceBindingDigestV2, V2ValidationError> {
     validate_private_canonical_path(platform, "canonicalRootUtf8", canonical_root_utf8)?;
     typed_digest_newtype(
-        "deepcode.kernel.abi.v2/workspace-binding",
+        "deepcode.kernel.abi.v3/workspace-binding",
         &serde_json::json!({
             "platform":platform,
             "canonicalRootUtf8":canonical_root_utf8,
@@ -2422,7 +2460,7 @@ pub fn settings_ceiling_digest_v2(
     if !settings.is_object() {
         return Err(invalid_value("settingsCeiling", "must be a JSON object"));
     }
-    typed_digest_newtype("deepcode.kernel.abi.v2/settings-ceiling", settings)
+    typed_digest_newtype("deepcode.kernel.abi.v3/settings-ceiling", settings)
 }
 
 pub fn invocation_policy_evaluation_digest_v2(
@@ -2434,7 +2472,7 @@ pub fn invocation_policy_evaluation_digest_v2(
     lease: Option<&CapabilityLeaseRefV2>,
 ) -> Result<PolicyEvaluationDigestV2, V2ValidationError> {
     typed_digest_newtype(
-        "deepcode.kernel.abi.v2/invocation-policy-evaluation",
+        "deepcode.kernel.abi.v3/invocation-policy-evaluation",
         &serde_json::json!({
             "runId":run_id,
             "controlEpoch":control_epoch,
@@ -2446,7 +2484,7 @@ pub fn invocation_policy_evaluation_digest_v2(
                     "kind":"planAction",
                     "lease":lease,
                 }),
-                None => serde_json::json!({"kind":"contextRead"}),
+                None => serde_json::json!({"kind":"read"}),
             },
         }),
     )
@@ -2465,7 +2503,7 @@ pub fn target_revalidation_digest_v2(
     pre_effect_observation: &TargetRevalidationObservationV2,
 ) -> Result<TargetRevalidationDigestV2, V2ValidationError> {
     typed_digest_newtype(
-        "deepcode.kernel.abi.v2/target-revalidation",
+        "deepcode.kernel.abi.v3/target-revalidation",
         &serde_json::json!({
             "runId":run_id,
             "operationId":operation_id,
@@ -2497,7 +2535,7 @@ pub fn target_revalidation_set_digest_v2(
         ));
     }
     typed_digest_newtype(
-        "deepcode.kernel.abi.v2/target-revalidation-set",
+        "deepcode.kernel.abi.v3/target-revalidation-set",
         &serde_json::json!({
             "runId":run_id,
             "operationId":operation_id,
@@ -2553,7 +2591,7 @@ pub fn network_response_digest_v2<T: Serialize>(
 pub fn executor_evidence_digest_v2<T: Serialize>(
     value: &T,
 ) -> Result<ExecutorEvidenceDigestV2, V2ValidationError> {
-    typed_digest_newtype("deepcode.kernel.abi.v2/executor-evidence", value)
+    typed_digest_newtype("deepcode.kernel.abi.v3/executor-evidence", value)
 }
 
 pub fn canonical_json_bytes_v2(value: &Value) -> Result<Vec<u8>, V2ValidationError> {

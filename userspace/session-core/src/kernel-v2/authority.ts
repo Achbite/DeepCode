@@ -75,11 +75,11 @@ export function contextReadAuthorityV2(purpose: string): ToolIntentAuthorityV2 {
   if (!purpose.trim() || purpose.length > 1024) {
     throw new SessionKernelAuthorityError(
       'session_kernel_authority_context_purpose_invalid',
-      'contextRead purpose must contain 1..=1024 characters.'
+      'read purpose must contain 1..=1024 characters.'
     );
   }
   return {
-    kind: 'contextRead',
+    kind: 'read',
     data: { purpose },
   };
 }

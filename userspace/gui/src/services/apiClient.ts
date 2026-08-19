@@ -59,6 +59,20 @@ import type {
   KernelHostInspectionResult,
   AgentRunGuidanceRequest,
   StartAgentRunRequest,
+  StartConversationDraftRunRequest,
+  AgentComposerProjectionV1,
+  AgentComposerProjectionStreamEventV1,
+  PrivateAnalysisLeaseReceiptV1,
+  PrivateAnalysisProjectionV1,
+  PrivateAnalysisRevokeReceiptV1,
+  AgentConversationTargetV1,
+  CreateUserAttachmentGrantRequestV1,
+  UserAttachmentGrantResultV1,
+} from '@deepcode/protocol';
+import {
+  decodeAgentComposerProjectionV1,
+  decodeAgentComposerProjectionStreamEventV1,
+  PRIVATE_ANALYSIS_LEASE_HEADER_V1,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getHostAdmissionHeaders, getKernelApiBase } from './hostTarget';
@@ -67,14 +81,19 @@ const API_BASE = getKernelApiBase();
 
 interface SendJsonOptions {
   signal?: AbortSignal;
+  headers?: Record<string, string>;
 }
 
 export type {
-  AgentInputAttachmentV2,
+  AgentInputAttachmentV3,
   AgentRunGuidanceRequest,
   AskAgentRunRequest,
   ResolveAgentRunDecisionRequest,
   StartAgentRunRequest,
+  StartConversationDraftRunRequest,
+  AgentComposerProjectionV1,
+  AgentConversationDraftTargetV1,
+  AgentConversationTargetV1,
 } from '@deepcode/protocol';
 
 function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRequest {
@@ -85,6 +104,24 @@ function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRe
       workspacePath: request.workspacePath,
       noWorkspace: request.noWorkspace,
       attachments: request.attachments,
+      conversationTarget: request.conversationTarget,
+      callerRequestId: request.callerRequestId,
+    };
+  }
+  if (request.decisionKind === 'userIntervention') {
+    return {
+      op: 'resolveDecision',
+      decisionKind: request.decisionKind,
+      decision: request.decision,
+      optionId: request.optionId,
+      guidance: request.guidance,
+      runId: request.runId,
+      targetId: request.targetId,
+      interactionId: request.interactionId,
+      interactionRevision: request.interactionRevision,
+      candidateSetDigest: request.candidateSetDigest,
+      expectedProjectionCursor: request.expectedProjectionCursor,
+      conversationTarget: request.conversationTarget,
       callerRequestId: request.callerRequestId,
     };
   }
@@ -95,6 +132,7 @@ function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRe
     guidance: request.guidance,
     runId: request.runId,
     targetId: request.targetId,
+    conversationTarget: request.conversationTarget,
     callerRequestId: request.callerRequestId,
   };
 }
@@ -253,11 +291,12 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
 /** 通用 GET 包装 */
 async function getJson<T>(
   url: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  headers: Record<string, string> = {}
 ): Promise<ApiResponse<T>> {
   try {
     const response = await fetch(url, {
-      headers: getHostAdmissionHeaders(),
+      headers: { ...getHostAdmissionHeaders(), ...headers },
       signal,
     });
     if (!response.ok) {
@@ -286,6 +325,7 @@ async function sendJson<T>(
       headers: {
         'Content-Type': 'application/json',
         ...getHostAdmissionHeaders(),
+        ...options.headers,
       },
       body: JSON.stringify(body),
       signal: options.signal,
@@ -323,6 +363,13 @@ export class AgentTimelineStreamProtocolError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AgentTimelineStreamProtocolError';
+  }
+}
+
+export class AgentComposerStreamProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentComposerStreamProtocolError';
   }
 }
 
@@ -528,7 +575,7 @@ export function patchWorkspaceSettings(
   );
 }
 
-// ---- 文件系统浏览（仅用于"Open Workspace"对话框）----
+// ---- Host 文件系统浏览（工作区与用户主动选择附件共用）----
 
 export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
   return getJson<InitialLocations>(`${API_BASE}/fs/initial-locations`);
@@ -539,6 +586,33 @@ export function browsePath(
 ): Promise<ApiResponse<BrowsePathResult>> {
   const qs = buildQuery({ path: absolutePath });
   return getJson<BrowsePathResult>(`${API_BASE}/fs/browse${qs}`);
+}
+
+export function createUserAttachmentGrant(
+  request: CreateUserAttachmentGrantRequestV1
+): Promise<ApiResponse<UserAttachmentGrantResultV1>> {
+  return sendJson<UserAttachmentGrantResultV1>(
+    `${API_BASE}/host/user-attachments`,
+    'POST',
+    request
+  );
+}
+
+export interface UserAttachmentRevocationResultV1 {
+  schemaVersion: 'deepcode.host.user-attachment-revocation.v1';
+  attachmentId: string;
+  resourceId: string;
+  revokedAt: string;
+}
+
+export function revokeUserAttachmentGrant(
+  attachmentId: string
+): Promise<ApiResponse<UserAttachmentRevocationResultV1>> {
+  return sendJson<UserAttachmentRevocationResultV1>(
+    `${API_BASE}/host/user-attachments/${encodeURIComponent(attachmentId)}`,
+    'DELETE',
+    {}
+  );
 }
 
 export function scanSkillMount(
@@ -854,6 +928,124 @@ export function startAgentRun(
   );
 }
 
+export function getAgentComposer(
+  request: { projectId?: string; sessionId?: string } = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<AgentComposerProjectionV1>> {
+  const qs = buildQuery({
+    projectId: request.projectId,
+    sessionId: request.sessionId,
+  });
+  return getJson<unknown>(`${API_BASE}/agent/composer${qs}`, signal)
+    .then((response) => response.ok && response.data
+      ? {
+          ...response,
+          data: decodeAgentComposerProjectionV1(response.data, request),
+        }
+      : response as ApiResponse<AgentComposerProjectionV1>);
+}
+
+export function streamAgentComposer(
+  request: { projectId?: string; sessionId?: string },
+  onEvent: (event: AgentComposerProjectionStreamEventV1) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const qs = buildQuery({
+    projectId: request.projectId,
+    sessionId: request.sessionId,
+  });
+  return streamSse(
+    `${API_BASE}/agent/composer/stream${qs}`,
+    ['snapshot', 'updated'],
+    (event) => {
+      if (event.event === 'error') {
+        const detail = isRecord(event.data)
+          ? stringField(event.data, 'message') ?? stringField(event.data, 'code')
+          : null;
+        if (isRecord(event.data) && event.data.code === 'invalid_sse_payload') {
+          throw new AgentComposerStreamProtocolError(
+            detail ?? 'Composer projection stream returned invalid JSON.'
+          );
+        }
+        throw new Error(detail ?? 'Composer projection stream disconnected');
+      }
+      if (event.event !== 'snapshot' && event.event !== 'updated') {
+        throw new AgentComposerStreamProtocolError(
+          'Composer projection stream returned an invalid replacement envelope.'
+        );
+      }
+      let decoded: AgentComposerProjectionStreamEventV1;
+      try {
+        decoded = decodeAgentComposerProjectionStreamEventV1(
+          event.data,
+          request
+        );
+      } catch {
+        throw new AgentComposerStreamProtocolError(
+          'Composer projection stream returned an invalid or stale target binding.'
+        );
+      }
+      if (decoded.type !== event.event) {
+        throw new AgentComposerStreamProtocolError(
+          'Composer projection stream event type does not match its envelope.'
+        );
+      }
+      onEvent(decoded);
+    },
+    [],
+    signal
+  );
+}
+
+export function startConversationDraftRun(
+  request: StartConversationDraftRunRequest
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendReplayableHostMutation<AgentRunResult>(
+    `${API_BASE}/agent/conversation-drafts/runs`,
+    request
+  );
+}
+
+export function mintPrivateAnalysisLease(
+  sessionId: string,
+  callerRequestId: string
+): Promise<ApiResponse<PrivateAnalysisLeaseReceiptV1>> {
+  return sendJson<PrivateAnalysisLeaseReceiptV1>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/private-analysis/lease`,
+    'POST',
+    { callerRequestId }
+  );
+}
+
+export function getPrivateAnalysis(
+  sessionId: string,
+  capability: string,
+  request: { afterCursor?: string; limit?: number } = {},
+  signal?: AbortSignal
+): Promise<ApiResponse<PrivateAnalysisProjectionV1>> {
+  const qs = buildQuery({
+    afterCursor: request.afterCursor,
+    limit: request.limit === undefined ? undefined : String(request.limit),
+  });
+  return getJson<PrivateAnalysisProjectionV1>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/private-analysis${qs}`,
+    signal,
+    { [PRIVATE_ANALYSIS_LEASE_HEADER_V1]: capability }
+  );
+}
+
+export function revokePrivateAnalysisLease(
+  sessionId: string,
+  capability: string
+): Promise<ApiResponse<PrivateAnalysisRevokeReceiptV1>> {
+  return sendJson<PrivateAnalysisRevokeReceiptV1>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/private-analysis/lease`,
+    'DELETE',
+    {},
+    { headers: { [PRIVATE_ANALYSIS_LEASE_HEADER_V1]: capability } }
+  );
+}
+
 export function getAgentRun(
   sessionId: string,
   runId: string,
@@ -868,11 +1060,23 @@ export function getAgentRun(
 export function cancelAgentRunById(
   sessionId: string,
   runId: string,
-  callerRequestId: string
+  callerRequestId: string,
+  conversationTarget: AgentConversationTargetV1
 ): Promise<ApiResponse<AgentRunResult>> {
   return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
-    { callerRequestId }
+    { callerRequestId, conversationTarget }
+  );
+}
+
+export function cancelCurrentAgentRun(
+  sessionId: string,
+  callerRequestId: string,
+  conversationTarget: AgentConversationTargetV1
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendReplayableHostMutation<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/current/cancel`,
+    { callerRequestId, conversationTarget }
   );
 }
 
@@ -888,6 +1092,24 @@ export function submitAgentRunGuidance(
       workspacePath: request.workspacePath,
       noWorkspace: request.noWorkspace,
       attachments: request.attachments,
+      conversationTarget: request.conversationTarget,
+      callerRequestId: request.callerRequestId,
+    }
+  );
+}
+
+export function submitCurrentAgentRunGuidance(
+  sessionId: string,
+  request: AgentRunGuidanceRequest
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendReplayableHostMutation<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/current/guidance`,
+    {
+      guidance: request.guidance,
+      workspacePath: request.workspacePath,
+      noWorkspace: request.noWorkspace,
+      attachments: request.attachments,
+      conversationTarget: request.conversationTarget,
       callerRequestId: request.callerRequestId,
     }
   );

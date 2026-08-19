@@ -30,6 +30,10 @@ export const contractCases = [
     run: providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOrProjectionFailure,
   },
   {
+    id: 'structured_provider_recovery_is_shared_state_without_private_failure_payloads',
+    run: structuredProviderRecoveryIsSharedStateWithoutPrivateFailurePayloads,
+  },
+  {
     id: 'preview_rejection_marks_only_target_needs_revision_and_creates_no_work_segment',
     run: previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegment,
   },
@@ -103,7 +107,7 @@ async function sharedProjectionAcceptsOnlyExactWorkSegmentsShape() {
   });
   assert.throws(
     () => normalizeAgentTimelineSnapshot(legacyFieldOnCurrentShape),
-    /session_projection_v2_root_field_invalid/u,
+    /session_projection_v3_root_field_invalid/u,
     'current shape must reject every removed compatibility field'
   );
 
@@ -197,7 +201,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
         operationId: 'operation-read',
         toolId: 'fs.read',
         expectedControlEpoch: 1,
-        authorityKind: 'contextRead',
+        authorityKind: 'read',
         replyKind: 'admitted',
         invocationId: 'invocation-read',
       }
@@ -304,7 +308,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
         operationId: 'operation-raw-arguments-rejected',
         toolId: 'fs.read',
         expectedControlEpoch: 1,
-        authorityKind: 'contextRead',
+        authorityKind: 'read',
         replyKind: 'admitted',
         invocationId: 'invocation-raw-arguments-rejected',
         rawArguments: { path: rawArgumentsSentinel },
@@ -324,7 +328,7 @@ async function workSegmentOrdersCommentaryToolsAndCanonicalEffectsWithoutLifecyc
       operationId: 'operation-raw-arguments-omitted',
       toolId: 'fs.read',
       expectedControlEpoch: 1,
-      authorityKind: 'contextRead',
+      authorityKind: 'read',
       replyKind: 'admitted',
       invocationId: 'invocation-raw-arguments-omitted',
     }
@@ -674,6 +678,106 @@ async function providerComposingArchivesBeforePublishAndAdmitsZeroToolsOnStaleOr
   );
 }
 
+async function structuredProviderRecoveryIsSharedStateWithoutPrivateFailurePayloads() {
+  const sessionId = 'session-structured-recovery-projection';
+  const runId = 'run-structured-recovery-projection';
+  const providerTurnId = 'provider-turn-structured-recovery';
+  const input = publicProjectionEvent(
+    sessionId,
+    runId,
+    1,
+    'input.persisted',
+    {
+      inputId: 'input-structured-recovery-projection',
+      opaqueInputRef: 'opaque-structured-recovery-projection',
+      text: 'Prepare a mutation plan.',
+      attachments: [],
+      recordedAt: timestamp(1),
+      controlEpoch: 1,
+    }
+  );
+  const recovering = publicProjectionEvent(
+    sessionId,
+    runId,
+    2,
+    'diagnostic',
+    {
+      providerTurnId,
+      status: 'recovering',
+      code: 'provider_tool_call_arguments_invalid',
+      stage: 'provider.structuredRepair',
+      currentActivityCode: 'session.validating',
+    }
+  );
+  assert.equal(recovering.kind, 'workflow_stage');
+  assert.equal(recovering.payload.visibility, 'trace');
+  assert.equal(recovering.payload.status, 'recovering');
+  assert.equal(
+    recovering.payload.currentActivityCode,
+    'session.validating'
+  );
+
+  const recoveringProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [input, recovering],
+  });
+  assertSharedConversationProjectionV2(recoveringProjection);
+  assert.equal(recoveringProjection.runProjection.status, 'active');
+  assert.equal(
+    recoveringProjection.runProjection.currentActivity.code,
+    'session.validating'
+  );
+  assert.equal(
+    recoveringProjection.turns[0].blocks.some((block) =>
+      block.provenance.sourceEventRefs.includes(recovering.id)
+    ),
+    false,
+    'replaceable recovery state must not become a permanent conversation card'
+  );
+
+  const failed = publicProjectionEvent(
+    sessionId,
+    runId,
+    3,
+    'diagnostic',
+    {
+      providerTurnId,
+      status: 'failed',
+      terminalScope: 'turn',
+      code: 'session_kernel_provider_structured_repair_no_progress',
+      message: 'Structured Provider repair made no progress.',
+      stage: 'provider.structuredRepairNoProgress',
+    }
+  );
+  const failedProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [input, recovering, failed],
+  });
+  assertSharedConversationProjectionV2(failedProjection);
+  assert.equal(failedProjection.runProjection.status, 'failed');
+  assert.equal(failedProjection.runProjection.phase, 'settled');
+  assert.equal(failedProjection.runProjection.currentActivity, null);
+  const publicBytes = JSON.stringify({
+    recovering,
+    failed,
+    failedProjection,
+  });
+  for (const privateField of [
+    'structuredFailure',
+    'nativeCompletion',
+    'originalArgumentsDigest',
+    'normalizedArgumentsDigest',
+    'appendedSuffix',
+    'rawProvider',
+  ]) {
+    assert.equal(
+      publicBytes.includes(privateField),
+      false,
+      `public recovery projection leaked ${privateField}`
+    );
+  }
+}
+
 async function previewRejectionMarksOnlyTargetNeedsRevisionAndCreatesNoWorkSegment() {
   const sessionId = 'session-preview-rejection-contract';
   const runId = 'run-preview-rejection-contract';
@@ -993,10 +1097,20 @@ function threeActionPlan(runId, identity = 'authority') {
   return {
     runId,
     inputId: `input-${runId}`,
+    controlEpoch: 1,
     planRevision,
     title: `Reviewed ${identity} plan`,
     objective: `Exercise exact ${identity} PlanAction projection.`,
     narrative: `Use only the exact accepted ${identity} Plan.`,
+    evidence: {
+      kernelFactRefs: [],
+      readResources: [],
+      historicalRebinds: [],
+      blockingUnknowns: [],
+      nonBlockingUnknowns: [],
+      coverage: `All ${identity} mutation targets are explicitly scoped.`,
+    },
+    carriedSettlementRefs: [],
     actions: [
       action(1, `${identity}-first.txt`),
       action(2, `${identity}-second.txt`),
@@ -1062,6 +1176,10 @@ function scopePreviewsForPlan(plan) {
       planActionId: action.manifest.planActionId,
       operationId: action.manifest.operationId,
       toolId: action.manifest.toolId,
+      origin: {
+        kind: 'plan',
+        data: {},
+      },
       authorizationBinding: {
         kind: 'resourceScope',
         data: {},

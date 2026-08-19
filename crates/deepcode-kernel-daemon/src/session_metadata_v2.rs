@@ -20,8 +20,13 @@ const SESSION_METADATA_REQUIRED_FIELDS: &[&str] = &[
     "updatedAt",
 ];
 
-const SESSION_METADATA_OPTIONAL_FIELDS: &[&str] =
-    &["projectId", "workspaceBinding", "archivedAt", "deletion"];
+const SESSION_METADATA_OPTIONAL_FIELDS: &[&str] = &[
+    "projectId",
+    "workspaceBinding",
+    "archivedAt",
+    "deletion",
+    "firstInputAdmission",
+];
 
 const WORKSPACE_BINDING_FIELDS: &[&str] = &[
     "workspaceId",
@@ -163,7 +168,87 @@ fn validate_session_metadata_entry(session: &Value) -> Result<&str, String> {
     if let Some(deletion) = entry.get("deletion") {
         validate_deletion_state(deletion)?;
     }
+    if let Some(admission) = entry.get("firstInputAdmission") {
+        validate_first_input_admission(admission)?;
+    }
     Ok(id)
+}
+
+fn validate_first_input_admission(admission: &Value) -> Result<(), String> {
+    let schema = admission
+        .get("schemaVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unsupported_history("Session firstInputAdmission has no schemaVersion"))?;
+    let admission = match schema {
+        "deepcode.host.project-session-admission.v1" => {
+            let admission = exact_object(
+                admission,
+                &[
+                    "schemaVersion",
+                    "projectId",
+                    "callerRequestId",
+                    "requestDigest",
+                    "status",
+                    "createdAt",
+                    "updatedAt",
+                ],
+                &[],
+                "Session firstInputAdmission",
+            )?;
+            required_string(admission, "projectId", "Session firstInputAdmission")?;
+            admission
+        }
+        "deepcode.host.conversation-draft-admission.v1" => {
+            let admission = exact_object(
+                admission,
+                &[
+                    "schemaVersion",
+                    "targetKind",
+                    "projectId",
+                    "callerRequestId",
+                    "requestDigest",
+                    "status",
+                    "createdAt",
+                    "updatedAt",
+                ],
+                &[],
+                "Session firstInputAdmission",
+            )?;
+            match required_string(admission, "targetKind", "Session firstInputAdmission")? {
+                "public" if admission.get("projectId").is_some_and(Value::is_null) => {}
+                "project" => {
+                    required_string(admission, "projectId", "Session firstInputAdmission")?;
+                }
+                _ => {
+                    return Err(unsupported_history(
+                        "Session firstInputAdmission targetKind and projectId do not match",
+                    ))
+                }
+            }
+            admission
+        }
+        _ => {
+            return Err(unsupported_history(
+                "Session firstInputAdmission uses an unsupported schema",
+            ))
+        }
+    };
+    required_string(admission, "callerRequestId", "Session firstInputAdmission")?;
+    let request_digest =
+        required_string(admission, "requestDigest", "Session firstInputAdmission")?;
+    crate::host_v2_storage::validate_sha256_digest(request_digest, "requestDigest")
+        .map_err(|error| unsupported_history(error.message))?;
+    match required_string(admission, "status", "Session firstInputAdmission")? {
+        "pending" | "admitted" => {}
+        _ => {
+            return Err(unsupported_history(
+                "Session firstInputAdmission status must use the current closed set",
+            ))
+        }
+    }
+    required_string(admission, "createdAt", "Session firstInputAdmission")?;
+    required_string(admission, "updatedAt", "Session firstInputAdmission")?;
+    Ok(())
 }
 
 fn validate_workspace_binding(binding: &Value) -> Result<(), String> {
@@ -305,7 +390,7 @@ fn unsupported_history(message: impl std::fmt::Display) -> String {
 pub(crate) fn restored_current_session_ids_by_scope(sessions: &[Value]) -> HashMap<String, String> {
     let mut current = HashMap::new();
     for session in sessions {
-        if !session_is_selectable(session) {
+        if !session_is_publicly_selectable(session) {
             continue;
         }
         let Some(session_id) = session.get("id").and_then(Value::as_str) else {

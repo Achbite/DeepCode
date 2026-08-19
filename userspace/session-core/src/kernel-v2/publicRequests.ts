@@ -59,6 +59,7 @@ import {
 } from './factBarriers.js';
 import {
   abortSessionProviderToolCallQueueV2,
+  markSessionProviderMutationPreviewedV4,
   markSessionProviderToolCallSubmittedV2,
 } from './providerToolCallQueue.js';
 
@@ -202,6 +203,29 @@ export class SessionKernelPublicRequestsV2 {
   ): Promise<SessionKernelPublicRequestOutcomeV2 | undefined> {
     const request = this.pending(lane);
     return request ? this.execute(request) : undefined;
+  }
+
+  async settleFactsQueryCursorMismatchForRecovery(
+    expectedAfterLedgerSequence: number
+  ): Promise<boolean> {
+    const request = this.pending('query');
+    if (
+      !request
+      || request.intent.kind !== 'factsQuery'
+      || request.intent.payload.afterLedgerSequence
+        === expectedAfterLedgerSequence
+    ) {
+      return false;
+    }
+    await this.settleDeterministicFailure(
+      request,
+      new SessionKernelPortError(
+        'session_kernel_fact_query_recovery_cursor_superseded',
+        'A persisted read-only facts query no longer continues the restored Session replay cursor and was superseded before canonical fact replay.',
+        'deterministic'
+      )
+    );
+    return true;
   }
 
   async execute(
@@ -771,16 +795,34 @@ function applyPublicRequestOutcome(
               'Capability preview batch item lost its persisted PlanAction correlation.'
             );
           }
-          if (result.kind === 'previewed') {
-            nextPreviews[result.data.preview.operationId] =
-              result.data.preview;
-          } else {
-            delete nextPreviews[item.operationId];
-            appendUniqueGuidance(nextGuidance, result.data.guidance);
+          if (item.origin.kind === 'plan') {
+            if (result.kind === 'previewed') {
+              nextPreviews[result.data.preview.operationId] =
+                result.data.preview;
+            } else {
+              delete nextPreviews[item.operationId];
+              appendUniqueGuidance(nextGuidance, result.data.guidance);
+            }
           }
         }
         state.previews = nextPreviews;
         state.pendingGuidance = nextGuidance;
+        if (record.intent.payload.items.some(
+          (item) => item.origin.kind === 'planDiscovery'
+        )) {
+          if (
+            record.intent.payload.items.length !== 1
+            || !markSessionProviderMutationPreviewedV4(state, {
+              requestId: record.requestId,
+              reply: outcome.reply,
+            })
+          ) {
+            throw new SessionKernelPublicRequestError(
+              'session_kernel_plan_discovery_preview_correlation_mismatch',
+              'Plan-discovery preview does not match the durable Provider mutation candidate.'
+            );
+          }
+        }
       }
       break;
     case 'toolIntentSubmit':
@@ -819,8 +861,8 @@ function applyPublicRequestOutcome(
           requestId: record.requestId,
           pageFactIds: outcome.reply.facts.map((fact) => fact.factId),
           pageFactCount: outcome.reply.facts.length,
-          operationFacts: outcome.reply.facts.map(
-            publicWorkFactProjection
+          operationFacts: outcome.reply.facts.map((fact) =>
+            publicWorkFactProjection(fact, result.state)
           ),
           nextAfterLedgerSequence:
             outcome.reply.nextAfterLedgerSequence,
@@ -1166,15 +1208,29 @@ function authorizationDecisionPreviewId(
 }
 
 function publicWorkFactProjection(
-  fact: KernelFactProjectionV2
+  fact: KernelFactProjectionV2,
+  state: SessionKernelLoopStateV2
 ): Record<string, unknown> {
   const details = factDetailData(fact.details);
   const toolId =
     typeof details.toolId === 'string'
       ? details.toolId
-      : undefined;
+      : fact.lineage.operationId
+        ? state.lineage.operations[fact.lineage.operationId]?.toolId
+        : undefined;
   const resourceIds = [...fact.lineage.resourceIds];
   const targets = publicCanonicalWorkspaceTargets(details);
+  const subjectDigest = publicReadSubjectDigest(
+    state,
+    fact.lineage.operationId,
+    toolId
+  );
+  const readEvidence = publicReadEvidenceProjection(
+    fact,
+    details,
+    toolId,
+    subjectDigest
+  );
   return {
     factId: fact.factId,
     domain: fact.domain,
@@ -1192,6 +1248,7 @@ function publicWorkFactProjection(
         }
       : {}),
     ...(targets.length > 0 ? { targets } : {}),
+    ...(readEvidence ? { readEvidence } : {}),
     ...(SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(fact.factKind)
       ? {
           effectSummary: resourceIds.length > 0
@@ -1200,6 +1257,85 @@ function publicWorkFactProjection(
         }
       : {}),
   };
+}
+
+function publicReadEvidenceProjection(
+  fact: KernelFactProjectionV2,
+  details: Record<string, unknown>,
+  toolId: string | undefined,
+  subjectDigest: string | undefined
+): Record<string, unknown> | undefined {
+  if (
+    fact.domain !== 'effect'
+    || !SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(fact.factKind)
+    || !fact.lineage.operationId
+    || !toolId
+    || !subjectDigest
+  ) {
+    return undefined;
+  }
+  const identity = objectValue(details.identity);
+  const authority = objectValue(identity?.authority);
+  const evidenceDigest = typeof details.evidenceDigest === 'string'
+    && /^sha256:[0-9a-f]{64}$/u.test(details.evidenceDigest)
+      ? details.evidenceDigest
+      : undefined;
+  const affected = Array.isArray(details.affectedResourceIds)
+    ? details.affectedResourceIds.filter(
+        (value): value is string =>
+          typeof value === 'string' && value.length > 0
+      )
+    : [];
+  const resourceRefs = [...new Set([
+    ...affected,
+    ...fact.lineage.resourceIds,
+  ])].sort();
+  if (
+    authority?.kind !== 'read'
+    || !evidenceDigest
+    || resourceRefs.length === 0
+  ) return undefined;
+  return {
+    authorityKind: 'read',
+    controlEpoch: fact.lineage.controlEpoch,
+    evidenceDigest,
+    resourceRefs,
+    subjectDigest,
+    toolId,
+  };
+}
+
+function publicReadSubjectDigest(
+  state: SessionKernelLoopStateV2,
+  operationId: string | undefined,
+  toolId: string | undefined
+): string | undefined {
+  if (!operationId || !toolId) return undefined;
+  const subjects = Object.values(state.factsById).flatMap((candidate) => {
+    if (
+      candidate.lineage.operationId !== operationId
+      || candidate.factKind !== 'toolIntentAdmitted'
+    ) return [];
+    const details = factDetailData(candidate.details);
+    const identity = objectValue(details.identity);
+    const authority = objectValue(identity?.authority);
+    if (
+      authority?.kind !== 'read'
+      || details.toolId !== toolId
+      || typeof details.canonicalArgumentsDigest !== 'string'
+      || !/^sha256:[0-9a-f]{64}$/u.test(details.canonicalArgumentsDigest)
+      || typeof details.workspaceBindingDigest !== 'string'
+      || !/^sha256:[0-9a-f]{64}$/u.test(details.workspaceBindingDigest)
+    ) return [];
+    return [sha256Hash(canonicalJson({
+      schemaVersion: 'deepcode.session.read-subject.v1',
+      toolId,
+      canonicalArgumentsDigest: details.canonicalArgumentsDigest,
+      workspaceBindingDigest: details.workspaceBindingDigest,
+    }))];
+  });
+  const unique = [...new Set(subjects)];
+  return unique.length === 1 ? unique[0] : undefined;
 }
 
 function publicCanonicalWorkspaceTargets(

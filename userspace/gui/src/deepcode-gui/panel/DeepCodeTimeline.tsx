@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentTimelineAttachment,
   AgentTimelineBlock,
@@ -13,6 +13,12 @@ import type {
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ActivityIndicator from '../../components/agent-panel/ActivityIndicator';
+import {
+  AnswerSettlementStatus,
+  isAnswerBusy,
+  isAnswerCommitted,
+  isAnswerPlaybackIncremental,
+} from '../../components/agent-panel/AnswerSettlementStatus';
 import {
   FinalFactReceipt,
   hasStructuredProjection,
@@ -32,7 +38,7 @@ interface DeepCodeTimelineProps {
   language: UiLanguage;
   followLatestSignal?: number;
   scrollWatchElement?: HTMLElement | null;
-  onTypewriterBlocksChange?: (blockIds: string[]) => void;
+  suppressedBlockIds?: ReadonlySet<string>;
   onPlanResolve?: (
     runId: string,
     planId: string,
@@ -50,21 +56,18 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   language,
   followLatestSignal = 0,
   scrollWatchElement = null,
-  onTypewriterBlocksChange,
+  suppressedBlockIds,
   onPlanResolve,
 }) => {
   const view = timeline;
   const currentActivity = view.runProjection?.currentActivity ?? null;
   const waitingForUser = view.runProjection?.status === 'waitingUser'
     || view.runProjection?.wait?.kind === 'user';
-  const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
-    () => new Map()
-  );
   const typewriterEnabled = useSettingsStore((s) =>
     Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
   );
-  const typewriterBlockIds = useTypewriterBlockIds(view, typewriterEnabled);
   const viewWithActive = view;
+  const assistantPlayback = useAssistantPlayback(viewWithActive, typewriterEnabled);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineContentRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
@@ -85,22 +88,9 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const timelineDensity = useSettingsStore((s) =>
     String(s.effectiveSettings['gui.timelineDensity'] ?? 'normal')
   );
-  const typewriterBlockLengths = useMemo(
-    () => collectTypewriterBlockLengths(viewWithActive, typewriterBlockIds),
-    [typewriterBlockIds, viewWithActive]
-  );
-  const typewriterBlockLengthSignature = useMemo(
-    () => [...typewriterBlockLengths.entries()]
-      .map(([blockId, textLength]) => `${blockId}:${textLength}`)
-      .sort()
-      .join('|'),
-    [typewriterBlockLengths]
-  );
-  const animatingBlockIds = useMemo(() => new Set(
-    [...typewriterBlockLengths.entries()]
-      .filter(([blockId, textLength]) => (completedTypewriterBlockLengths.get(blockId) ?? 0) < textLength)
-      .map(([blockId]) => blockId)
-  ), [completedTypewriterBlockLengths, typewriterBlockLengths]);
+  const typewriterBlockLengths = assistantPlayback.targetLengths;
+  const completedTypewriterBlockLengths = assistantPlayback.visibleLengths;
+  const animatingBlockIds = assistantPlayback.animatingBlockIds;
   const playbackVisibleBlockIds = usePlaybackVisibleBlockIds(
     viewWithActive,
     animatingBlockIds,
@@ -108,7 +98,14 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     typewriterBlockLengths
   );
   const actionBarTurnId = useMemo(() => {
-    if (loading || viewWithActive.interactionProjection?.pending) return undefined;
+    const runStatus = viewWithActive.runProjection?.status;
+    const sharedRunSettled = runStatus === undefined
+      || runStatus === 'succeeded'
+      || runStatus === 'failed'
+      || runStatus === 'cancelled';
+    if (!sharedRunSettled || loading || viewWithActive.interactionProjection?.pending) {
+      return undefined;
+    }
     for (const turn of [...viewWithActive.turns].reverse()) {
       if (turn.status !== 'completed' && turn.status !== 'failed') continue;
       const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
@@ -121,39 +118,6 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     return undefined;
   }, [animatingBlockIds, loading, playbackVisibleBlockIds, viewWithActive]);
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
-  useEffect(() => {
-    setCompletedTypewriterBlockLengths((current) => {
-      let changed = false;
-      const next = new Map<string, number>();
-      for (const [blockId, completedLength] of current) {
-        const currentLength = typewriterBlockLengths.get(blockId);
-        if (currentLength !== undefined && currentLength >= completedLength) {
-          next.set(blockId, completedLength);
-        } else {
-          changed = true;
-        }
-      }
-      return changed || next.size !== current.size ? next : current;
-    });
-  }, [typewriterBlockLengthSignature, typewriterBlockLengths]);
-
-  useEffect(() => {
-    onTypewriterBlocksChange?.([...animatingBlockIds]);
-  }, [animatingBlockIds, onTypewriterBlocksChange]);
-
-  useEffect(() => () => {
-    onTypewriterBlocksChange?.([]);
-  }, [onTypewriterBlocksChange]);
-
-  const markTypewriterComplete = useCallback((blockId: string, textLength: number) => {
-    setCompletedTypewriterBlockLengths((current) => {
-      if ((current.get(blockId) ?? 0) >= textLength) return current;
-      const next = new Map(current);
-      next.set(blockId, textLength);
-      return next;
-    });
-  }, []);
-
   const setFollowMode = useCallback((mode: TimelineFollowMode) => {
     followModeRef.current = mode;
     if (mode === 'following') {
@@ -220,8 +184,23 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
   const scrollToTimelineEndIfFollowing = useCallback(() => {
     if (followModeRef.current !== 'following') return;
-    scrollToTimelineEnd({ requireFollowing: true });
-  }, [scrollToTimelineEnd]);
+    if (liveScrollFrameRef.current === null) {
+      liveScrollFrameRef.current = window.requestAnimationFrame(() => {
+        liveScrollFrameRef.current = null;
+        if (followModeRef.current === 'following') {
+          scrollToTimelineEndNow();
+        }
+      });
+    }
+    if (liveScrollTimeoutRef.current === null) {
+      liveScrollTimeoutRef.current = window.setTimeout(() => {
+        liveScrollTimeoutRef.current = null;
+        if (followModeRef.current === 'following') {
+          scrollToTimelineEndNow();
+        }
+      }, 80);
+    }
+  }, [scrollToTimelineEndNow]);
 
   useEffect(() => () => {
     if (liveScrollFrameRef.current !== null) {
@@ -365,9 +344,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             transportPending={loading && turnIndex === viewWithActive.turns.length - 1}
             showActions={turn.id === actionBarTurnId}
             playbackVisibleBlockIds={playbackVisibleBlockIds}
-            typewriterBlockIds={animatingBlockIds}
+            playbackTextLengths={assistantPlayback.visibleLengths}
+            animatingBlockIds={animatingBlockIds}
+            suppressedBlockIds={suppressedBlockIds}
             onLiveContentChange={scrollToTimelineEndIfFollowing}
-            onTypewriterComplete={markTypewriterComplete}
             onPlanResolve={onPlanResolve}
           />
         ))}
@@ -455,79 +435,190 @@ function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): s
     .join('|');
   const activity = view.runProjection?.currentActivity;
   const activitySignature = activity
-    ? `${activity.code}:${activity.updatedAt}:${activity.operationId ?? ''}`
+    ? `${activity.activityId}:${activity.revision}:${activity.updatedAt}`
     : 'none';
   return `${lastTurn.id}:${lastTurn.status}:${loading ? 'running' : 'idle'}:${blockSignature}:${workSignature}:${activitySignature}`;
 }
 
-function useTypewriterBlockIds(
+interface AssistantPlaybackState {
+  visibleLengths: Map<string, number>;
+  targetLengths: Map<string, number>;
+  animatingBlockIds: Set<string>;
+}
+
+function useAssistantPlayback(
   view: AgentTimelineResult,
   enabled: boolean
-): Set<string> {
-  const activeSessionIdRef = useRef<string | null>(null);
-  const seenBlockIdsRef = useRef<Set<string>>(new Set());
-  const typewriterBlockIdsRef = useRef<Set<string>>(new Set());
+): AssistantPlaybackState {
+  const targets = useMemo(() => new Map(
+    flattenTimelineBlocks(view)
+      .filter(isAssistantPlaybackBlock)
+      .map((block) => [
+        block.id,
+        {
+          content: assistantPlaybackText(block),
+          deliveryMode: block.deliveryMode,
+          answerState: block.answerState,
+          revision: block.revision ?? 0,
+        },
+      ])
+  ), [view]);
+  const targetsRef = useRef(targets);
+  targetsRef.current = targets;
+  const sessionIdRef = useRef(view.sessionId);
+  const previousContentRef = useRef(new Map(
+    [...targets].map(([blockId, target]) => [blockId, target.content])
+  ));
+  const enrolledRef = useRef(new Set<string>());
+  const visibleLengthsRef = useRef(new Map(
+    [...targets].map(([blockId, target]) => [blockId, target.content.length])
+  ));
+  const [visibleLengths, setVisibleLengths] = useState<Map<string, number>>(
+    () => new Map([...targets].map(([blockId, target]) => [
+      blockId,
+      target.content.length,
+    ]))
+  );
+  const playbackSignature = useMemo(
+    () => [...targets]
+      .map(([blockId, target]) =>
+        `${blockId}:${target.revision}:${target.deliveryMode ?? 'replay'}:${target.answerState ?? 'legacy'}:${target.content.length}`
+      )
+      .join('|'),
+    [targets]
+  );
 
-  return useMemo(() => {
-    const sessionId = view.sessionId;
-    const candidateBlocks = collectTypewriterBlocks(view);
-    const visibleBlocks = flattenTimelineBlocks(view)
-      .filter((block) => visibleTypewriterMarkdown(block).length > 0);
-    const visibleBlockById = new Map(visibleBlocks.map((block) => [block.id, block]));
-    if (activeSessionIdRef.current !== sessionId) {
-      activeSessionIdRef.current = sessionId;
-      seenBlockIdsRef.current = new Set();
-      typewriterBlockIdsRef.current = new Set(
-        enabled
-          ? candidateBlocks.filter(isBufferedDeliveryBlock).map((block) => block.id)
-          : []
+  useLayoutEffect(() => {
+    if (sessionIdRef.current !== view.sessionId) {
+      sessionIdRef.current = view.sessionId;
+      enrolledRef.current = new Set();
+      previousContentRef.current = new Map(
+        [...targets].map(([blockId, target]) => [blockId, target.content])
+      );
+      const next = new Map(
+        [...targets].map(([blockId, target]) => [blockId, target.content.length])
+      );
+      visibleLengthsRef.current = next;
+      setVisibleLengths(next);
+      return;
+    }
+
+    const enrolled = new Set(enrolledRef.current);
+    const previousContent = previousContentRef.current;
+    const next = new Map<string, number>();
+    for (const [blockId, target] of targets) {
+      const previous = previousContent.get(blockId);
+      const currentVisible = visibleLengthsRef.current.get(blockId);
+      if (previous === undefined) {
+        if (
+          enabled
+          && isAnswerPlaybackIncremental(target.deliveryMode, target.answerState)
+        ) {
+          enrolled.add(blockId);
+          next.set(blockId, 0);
+        } else {
+          next.set(blockId, target.content.length);
+        }
+        continue;
+      }
+      if (!isAnswerPlaybackIncremental(target.deliveryMode, target.answerState)) {
+        enrolled.delete(blockId);
+        next.set(blockId, target.content.length);
+        continue;
+      }
+      if (!target.content.startsWith(previous) || !enabled) {
+        enrolled.delete(blockId);
+        next.set(blockId, target.content.length);
+        continue;
+      }
+      if (
+        target.content.length > previous.length
+        && isAnswerPlaybackIncremental(target.deliveryMode, target.answerState)
+      ) {
+        enrolled.add(blockId);
+      }
+      next.set(
+        blockId,
+        enrolled.has(blockId)
+          ? Math.min(currentVisible ?? previous.length, target.content.length)
+          : target.content.length
       );
     }
-
-    typewriterBlockIdsRef.current = new Set(
-      [...typewriterBlockIdsRef.current].filter((blockId) => {
-        const block = visibleBlockById.get(blockId);
-        return Boolean(block && isBufferedDeliveryBlock(block));
-      })
+    enrolledRef.current = new Set(
+      [...enrolled].filter((blockId) => targets.has(blockId))
     );
-    for (const block of candidateBlocks) {
-      const blockId = block.id;
-      if (seenBlockIdsRef.current.has(blockId)) continue;
-      seenBlockIdsRef.current.add(blockId);
-      if (enabled && isBufferedDeliveryBlock(block)) {
-        typewriterBlockIdsRef.current.add(blockId);
-      }
-    }
+    previousContentRef.current = new Map(
+      [...targets].map(([blockId, target]) => [blockId, target.content])
+    );
+    visibleLengthsRef.current = next;
+    setVisibleLengths((current) => mapNumbersEqual(current, next) ? current : next);
+  }, [enabled, playbackSignature, targets, view.sessionId]);
 
-    if (!enabled) typewriterBlockIdsRef.current.clear();
+  useEffect(() => {
+    let timer: number | null = null;
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      const active = [...targetsRef.current].find(([blockId, target]) =>
+        enrolledRef.current.has(blockId)
+        && (visibleLengthsRef.current.get(blockId) ?? 0) < target.content.length
+      );
+      if (!active) return;
+      const [blockId, target] = active;
+      const currentIndex = visibleLengthsRef.current.get(blockId) ?? 0;
+      const nextIndex = bufferedTypewriterNextIndex(target.content, currentIndex, 'normal');
+      const next = new Map(visibleLengthsRef.current);
+      next.set(blockId, nextIndex);
+      if (nextIndex >= target.content.length) enrolledRef.current.delete(blockId);
+      visibleLengthsRef.current = next;
+      startTransition(() => setVisibleLengths(next));
+      timer = window.setTimeout(tick, bufferedTypewriterDelay('normal'));
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [enabled, playbackSignature]);
 
-    return new Set(typewriterBlockIdsRef.current);
-  }, [enabled, view]);
-}
-
-function collectTypewriterBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
-  return view.turns.flatMap((turn) =>
-    turn.blocks
-      .filter((block) => {
-        const markdown = visibleTypewriterMarkdown(block);
-        return markdown.length > 0 && shouldAnimateTimelineBlock(block);
-      })
+  const targetLengths = useMemo(
+    () => new Map(
+      [...targets].map(([blockId, target]) => [blockId, target.content.length])
+    ),
+    [targets]
   );
+  const animatingBlockIds = useMemo(
+    () => new Set(
+      [...targetLengths]
+        .filter(([blockId, targetLength]) =>
+          (visibleLengths.get(blockId) ?? targetLength) < targetLength
+        )
+        .map(([blockId]) => blockId)
+    ),
+    [targetLengths, visibleLengths]
+  );
+  return { visibleLengths, targetLengths, animatingBlockIds };
 }
 
-function collectTypewriterBlockLengths(
-  view: AgentTimelineResult,
-  blockIds: Set<string>
-): Map<string, number> {
-  const lengths = new Map<string, number>();
-  for (const turn of view.turns) {
-    for (const block of turn.blocks) {
-      if (!blockIds.has(block.id)) continue;
-      const textLength = visibleTypewriterMarkdown(block).length;
-      if (textLength > 0) lengths.set(block.id, textLength);
-    }
+function isAssistantPlaybackBlock(block: AgentTimelineBlock): boolean {
+  return block.kind === 'assistant'
+    && (block.narrativeKind === 'assistantText' || block.narrativeKind === undefined)
+    && assistantPlaybackText(block).length > 0;
+}
+
+function assistantPlaybackText(block: AgentTimelineBlock): string {
+  return block.bodyMarkdown ?? block.summary ?? '';
+}
+
+function mapNumbersEqual(
+  left: ReadonlyMap<string, number>,
+  right: ReadonlyMap<string, number>
+): boolean {
+  if (left.size !== right.size) return false;
+  for (const [key, value] of left) {
+    if (right.get(key) !== value) return false;
   }
-  return lengths;
+  return true;
 }
 
 function usePlaybackVisibleBlockIds(
@@ -560,20 +651,6 @@ function usePlaybackVisibleBlockIds(
   }, [animatingBlockIds, completedLengths, currentLengths, view]);
 }
 
-function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
-  if (!isBufferedDeliveryBlock(block)) return false;
-  return block.narrativeKind === 'assistantText' ||
-    block.narrativeKind === 'permission' ||
-    block.narrativeKind === 'diagnostic' ||
-    block.kind === 'plan' ||
-    block.kind === 'review' ||
-    (!block.narrativeKind && block.kind === 'assistant');
-}
-
-function isBufferedDeliveryBlock(block: AgentTimelineBlock): boolean {
-  return block.deliveryMode === 'buffered';
-}
-
 const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   currentActivity: AgentTimelineCurrentActivity | null;
@@ -581,13 +658,16 @@ const TurnCard: React.FC<{
   transportPending: boolean;
   showActions: boolean;
   playbackVisibleBlockIds: Set<string>;
-  typewriterBlockIds: Set<string>;
+  playbackTextLengths: Map<string, number>;
+  animatingBlockIds: Set<string>;
+  suppressedBlockIds?: ReadonlySet<string>;
   onLiveContentChange: () => void;
-  onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, currentActivity, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ turn, currentActivity, language, transportPending, showActions, playbackVisibleBlockIds, playbackTextLengths, animatingBlockIds, suppressedBlockIds, onLiveContentChange, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
-  const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
+  const visibleBlocks = turn.blocks.filter((block) =>
+    isVisibleTimelineBlock(block) && !suppressedBlockIds?.has(block.id)
+  );
   const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
   const blocksById = new Map(blocks.map((block) => [block.id, block]));
   const workSegmentsById = new Map(
@@ -610,7 +690,7 @@ const TurnCard: React.FC<{
   const actionsReady = showActions &&
     !transportPending &&
     blocks.length === visibleBlocks.length &&
-    visibleBlocks.every((block) => !typewriterBlockIds.has(block.id));
+    visibleBlocks.every((block) => !animatingBlockIds.has(block.id));
 
   return (
     <section className={`deepcode-gui-turn deepcode-gui-turn--${turn.status}`}>
@@ -625,15 +705,14 @@ const TurnCard: React.FC<{
             key={part.block.id}
             block={part.block}
             language={language}
-            animateAssistant={typewriterBlockIds.has(part.block.id)}
+            visibleTextLength={playbackTextLengths.get(part.block.id)}
             interactionsEnabled={
               !transportPending &&
               turn.status !== 'running' &&
-              !typewriterBlockIds.has(part.block.id) &&
+              !animatingBlockIds.has(part.block.id) &&
               !actionsReady
             }
             onLiveContentChange={onLiveContentChange}
-            onTypewriterComplete={onTypewriterComplete}
             onPlanResolve={onPlanResolve}
           />
         ) : (
@@ -657,7 +736,7 @@ const CurrentActivityLine: React.FC<{
   <div className="deepcode-gui-current-activity" role="status" aria-live="polite">
     <ActivityIndicator
       activityKey={activity
-        ? `${activity.code}:${activity.workSegmentId ?? ''}:${activity.operationId ?? ''}`
+        ? `${activity.activityId}:${activity.revision}`
         : 'transport-pending'}
       label={currentActivityLabel(activity, language)}
       variant={activity?.code === 'retry.backoff' ? 'retry' : 'default'}
@@ -832,16 +911,8 @@ function workSegmentSummary(
 
 function currentWorkOperation(
   segment: AgentTimelineWorkSegment,
-  currentActivity: AgentTimelineCurrentActivity | null
+  _currentActivity: AgentTimelineCurrentActivity | null
 ): AgentTimelineWorkOperation | undefined {
-  if (
-    currentActivity?.operationId
-    && currentActivity.workSegmentId === segment.id
-  ) {
-    return segment.operations.find((operation) =>
-      operation.operationId === currentActivity.operationId
-    );
-  }
   if (segment.activeOperationId) {
     return segment.operations.find((operation) =>
       operation.operationId === segment.activeOperationId
@@ -984,11 +1055,11 @@ const DeepCodeAttachmentChips: React.FC<{
   if (attachments.length === 0) return null;
   return (
     <div className="agent-message-attachments" aria-label={t(language, 'agent.message.attachments')}>
-      {attachments.map((attachment, index) => (
+      {attachments.map((attachment) => (
         <span
-          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          key={`${attachment.scope}:${attachment.attachmentId}`}
           className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
-          title={attachment.path}
+          title={attachment.displayName}
         >
           <span className="agent-message-attachment__kind">
             {attachmentKindLabel(attachment, language)}
@@ -1005,12 +1076,11 @@ const DeepCodeAttachmentChips: React.FC<{
 const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
-  animateAssistant?: boolean;
+  visibleTextLength?: number;
   interactionsEnabled: boolean;
   onLiveContentChange: () => void;
-  onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, interactionsEnabled, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ block, language, visibleTextLength, interactionsEnabled, onLiveContentChange, onPlanResolve }) => {
   if (!isVisibleTimelineBlock(block)) return null;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
@@ -1028,20 +1098,40 @@ const TimelineBlock: React.FC<{
   }
 
   if (block.kind === 'assistant') {
+    const content = visibleTypewriterMarkdown(block, language);
+    const playbackComplete = visibleTextLength === undefined
+      || visibleTextLength >= content.length;
+    const answerStateClass = block.answerState
+      ? ` deepcode-gui-assistant-text--${block.answerState}`
+      : '';
     return (
-      <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}${phaseClassName(block)}`}>
-        <TypewriterMarkdown
-          content={visibleTypewriterMarkdown(block, language)}
-          animate={animateAssistant}
-          streaming={block.deliveryMode === 'live'}
-          speed="normal"
+      <article
+        className={`deepcode-gui-assistant-text${answerStateClass}${narrativeClass}${densityClass}${phaseClassName(block)}`}
+        data-answer-state={block.answerState}
+        aria-busy={isAnswerBusy(block.answerState)}
+      >
+        <AssistantPlaybackMarkdown
+          content={content}
+          visibleTextLength={visibleTextLength}
+          streaming={
+            isAnswerPlaybackIncremental(block.deliveryMode, block.answerState)
+            || !playbackComplete
+          }
           onVisibleContentChange={onLiveContentChange}
-          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
         />
-        <FinalFactReceipt
-          projection={block.structuredProjection}
+        <AnswerSettlementStatus
+          answerState={block.answerState}
           language={language}
         />
+        {playbackComplete
+          && block.durability === 'committed'
+          && isAnswerCommitted(block.answerState)
+          && (
+          <FinalFactReceipt
+            projection={block.structuredProjection}
+            language={language}
+          />
+        )}
       </article>
     );
   }
@@ -1051,10 +1141,10 @@ const TimelineBlock: React.FC<{
       <PlanBlock
         block={block}
         language={language}
-        animate={animateAssistant}
+        animate={false}
         showActions={interactionsEnabled}
         onLiveContentChange={onLiveContentChange}
-        onTypewriterComplete={onTypewriterComplete}
+        onTypewriterComplete={() => undefined}
         onPlanResolve={onPlanResolve}
       />
     );
@@ -1065,10 +1155,10 @@ const TimelineBlock: React.FC<{
       <ReviewBlock
         block={block}
         language={language}
-        animate={animateAssistant}
+        animate={false}
         showActions={interactionsEnabled}
         onLiveContentChange={onLiveContentChange}
-        onTypewriterComplete={onTypewriterComplete}
+        onTypewriterComplete={() => undefined}
       />
     );
   }
@@ -1084,16 +1174,33 @@ const TimelineBlock: React.FC<{
         {block.bodyMarkdown && (
           <TypewriterMarkdown
             content={block.bodyMarkdown}
-            animate={animateAssistant && shouldAnimateTimelineBlock(block)}
+            animate={false}
             streaming={block.deliveryMode === 'live'}
             speed="normal"
             onVisibleContentChange={onLiveContentChange}
-            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
         )}
       </div>
     </details>
   );
+};
+
+const AssistantPlaybackMarkdown: React.FC<{
+  content: string;
+  visibleTextLength?: number;
+  streaming: boolean;
+  onVisibleContentChange: () => void;
+}> = ({ content, visibleTextLength, streaming, onVisibleContentChange }) => {
+  const visibleLength = visibleTextLength === undefined
+    ? content.length
+    : Math.max(0, Math.min(visibleTextLength, content.length));
+  const renderedContent = content.slice(0, visibleLength);
+  useLayoutEffect(() => {
+    onVisibleContentChange();
+  }, [onVisibleContentChange, renderedContent]);
+  return streaming
+    ? <BufferedMarkdownStream content={renderedContent} streaming />
+    : <MarkdownContent content={renderedContent} />;
 };
 
 const ReviewBlock: React.FC<{
@@ -1148,7 +1255,7 @@ const ReviewBlock: React.FC<{
           <StructuredProjectionTypewriter
             projection={block.structuredProjection}
             language={language}
-            animate={animate && shouldAnimateTimelineBlock(block)}
+            animate={animate}
             speed="normal"
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
@@ -1156,7 +1263,7 @@ const ReviewBlock: React.FC<{
         ) : markdown ? (
           <TypewriterMarkdown
             content={markdown}
-            animate={animate && shouldAnimateTimelineBlock(block)}
+            animate={animate}
             streaming={block.deliveryMode === 'live'}
             speed="normal"
             onVisibleContentChange={onLiveContentChange}
@@ -1295,7 +1402,7 @@ const PlanBlock: React.FC<{
           <StructuredProjectionTypewriter
             projection={block.structuredProjection}
             language={language}
-            animate={animate && shouldAnimateTimelineBlock(block)}
+            animate={animate}
             speed="normal"
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
@@ -1560,6 +1667,7 @@ function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = '
 
 function isActionableAgentOutputBlock(block: AgentTimelineBlock): boolean {
   if (block.kind === 'review' || block.narrativeKind === 'review') return true;
+  if (block.kind === 'assistant' && !isAnswerCommitted(block.answerState)) return false;
   if (block.narrativeKind) return block.narrativeKind === 'assistantText';
   return block.kind === 'assistant';
 }
@@ -1594,6 +1702,9 @@ function blockCopyBody(block: AgentTimelineBlock, language: UiLanguage): string 
 }
 
 function visibleTypewriterMarkdown(block: AgentTimelineBlock, language?: UiLanguage): string {
+  if (block.kind === 'assistant') {
+    return localizedTimelineText(language ?? 'zh-CN', assistantPlaybackText(block));
+  }
   if (block.kind === 'plan' || block.narrativeKind === 'plan') return planBlockMarkdown(block, language ?? 'zh-CN');
   if (block.kind === 'review' || block.narrativeKind === 'review') return reviewBlockMarkdown(block, language ?? 'zh-CN');
   return localizedTimelineText(language ?? 'zh-CN', (block.bodyMarkdown ?? block.summary ?? '').trim());
@@ -1644,7 +1755,7 @@ function attachmentKindLabel(attachment: AgentTimelineAttachment, language: UiLa
 }
 
 function attachmentDisplayPath(attachment: AgentTimelineAttachment): string {
-  return attachment.path || '.';
+  return attachment.displayName;
 }
 
 function attachmentCopyText(attachments: AgentTimelineAttachment[], language: UiLanguage): string {

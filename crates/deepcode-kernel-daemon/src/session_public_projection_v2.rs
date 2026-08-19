@@ -1,8 +1,8 @@
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
-const PROJECTION_SCHEMA_V2: &str = "deepcode.shared-conversation-projection.v2";
-const WORK_SEGMENTS_SHAPE_V2: &str = "deepcode.shared-conversation.work-segments.v2";
+const PROJECTION_SCHEMA_V4: &str = "deepcode.shared-conversation-projection.v4";
+const WORK_SEGMENTS_SHAPE_V4: &str = "deepcode.shared-conversation.work-segments.v4";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROVIDER_USAGE_TOKENS: u64 = 1_000_000_000_000;
 
@@ -36,11 +36,11 @@ fn validate_work_segments_projection(timeline: &Value) -> Result<(), String> {
         &allowed_root,
         "projection",
     )?;
-    if object.get("schemaVersion").and_then(Value::as_str) != Some(PROJECTION_SCHEMA_V2) {
-        return Err("Session v2 public projection has an unsupported schema".to_string());
+    if object.get("schemaVersion").and_then(Value::as_str) != Some(PROJECTION_SCHEMA_V4) {
+        return Err("Session v4 public projection has an unsupported schema".to_string());
     }
-    if object.get("shapeVersion").and_then(Value::as_str) != Some(WORK_SEGMENTS_SHAPE_V2) {
-        return Err("Session v2 public projection requires the work-segments shape".to_string());
+    if object.get("shapeVersion").and_then(Value::as_str) != Some(WORK_SEGMENTS_SHAPE_V4) {
+        return Err("Session v4 public projection requires the work-segments shape".to_string());
     }
     reject_private_projection_fields(timeline)?;
     validate_projection_identity(object)?;
@@ -77,9 +77,7 @@ struct NativeProjectionIdentities<'a> {
     turn_ids: HashSet<&'a str>,
     block_ids: HashSet<&'a str>,
     work_segment_ids: HashSet<&'a str>,
-    work_segment_turn_ids: HashMap<&'a str, &'a str>,
     operation_ids: HashSet<&'a str>,
-    operation_segment_ids: HashMap<&'a str, &'a str>,
 }
 
 fn validate_projection_identity(object: &Map<String, Value>) -> Result<(), String> {
@@ -164,7 +162,6 @@ fn validate_native_turn<'a>(
                 "Session v2 public projection repeats work segment {segment_id}"
             ));
         }
-        identities.work_segment_turn_ids.insert(segment_id, turn_id);
     }
 
     validate_turn_parts(
@@ -352,6 +349,7 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         "narrativeKind",
         "entryRole",
         "providerPhase",
+        "answerState",
         "title",
         "summary",
         "status",
@@ -385,7 +383,15 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
     )?;
     validate_required_enum(
         object.get("kind"),
-        &["user", "assistant", "permission", "plan", "review", "error"],
+        &[
+            "user",
+            "assistant",
+            "permission",
+            "plan",
+            "userIntervention",
+            "review",
+            "error",
+        ],
         "block.kind",
     )?;
     validate_optional_enum(
@@ -395,6 +401,7 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
             "assistantText",
             "plan",
             "permission",
+            "userIntervention",
             "review",
             "diagnostic",
         ],
@@ -415,6 +422,11 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         object.get("providerPhase"),
         &["commentary", "final_answer"],
         "block.providerPhase",
+    )?;
+    validate_optional_enum(
+        object.get("answerState"),
+        &["streaming", "provisional", "committed", "stale", "rejected"],
+        "block.answerState",
     )?;
     validate_native_block_semantics(object)?;
     required_identity(object.get("title"), "block.title")?;
@@ -456,7 +468,7 @@ fn validate_native_block(block: &Value) -> Result<&str, String> {
         validate_display_hints(display_hints)?;
     }
     if let Some(attachments) = object.get("attachments") {
-        deepcode_kernel_abi::decode_agent_input_attachments_v2(attachments).map_err(|error| {
+        deepcode_kernel_abi::decode_agent_input_attachments_v3(attachments).map_err(|error| {
             format!(
                 "Session v2 public projection block {block_id} has invalid attachments: {}",
                 error.code
@@ -482,6 +494,7 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
         .and_then(Value::as_str)
         .unwrap_or_default();
     let provider_phase = object.get("providerPhase").and_then(Value::as_str);
+    let answer_state = object.get("answerState").and_then(Value::as_str);
     let provenance = object.get("provenance").and_then(Value::as_object);
     let provenance_origin = provenance
         .and_then(|value| value.get("origin"))
@@ -501,6 +514,7 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
             narrative_kind == "assistantText"
                 && provenance_origin == Some("provider")
                 && provenance_authority == Some("session")
+                && (answer_state.is_none() || entry_role == "finalAnswer")
                 && match provider_phase {
                     Some("commentary") => entry_role == "agentUpdate",
                     Some("final_answer") => entry_role == "finalAnswer",
@@ -515,6 +529,11 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
         }
         "plan" => {
             narrative_kind == "plan" && entry_role == "interaction" && provider_phase.is_none()
+        }
+        "userIntervention" => {
+            narrative_kind == "userIntervention"
+                && entry_role == "interaction"
+                && provider_phase.is_none()
         }
         "review" => {
             narrative_kind == "review" && entry_role == "interaction" && provider_phase.is_none()
@@ -535,7 +554,7 @@ fn validate_native_block_semantics(object: &Map<String, Value>) -> Result<(), St
         );
     }
     if (object.contains_key("decisionRequest") || object.contains_key("interaction"))
-        && !matches!(kind, "plan" | "permission")
+        && !matches!(kind, "plan" | "permission" | "userIntervention")
     {
         return Err(
             "Session v2 public projection interaction data is only valid on plan or permission blocks"
@@ -824,7 +843,7 @@ fn validate_interaction_view(value: &Value) -> Result<(), String> {
     validate_interaction_identity(object, "block interaction")?;
     validate_required_enum(
         object.get("kind"),
-        &["plan", "permission"],
+        &["plan", "permission", "userIntervention"],
         "block interaction.kind",
     )?;
     validate_required_enum(
@@ -981,9 +1000,6 @@ fn validate_work_segment<'a>(
                 "Session v2 public projection repeats operation {operation_id}"
             ));
         }
-        identities
-            .operation_segment_ids
-            .insert(operation_id, segment_id);
         local_operation_statuses.insert(operation_id, operation_status);
     }
     match object.get("attention") {
@@ -1419,6 +1435,18 @@ fn validate_interaction_projection(value: &Value, block_ids: &HashSet<&str>) -> 
             "title",
             "summary",
         ]),
+        "userIntervention" => HashSet::from([
+            "kind",
+            "interactionId",
+            "interactionRevision",
+            "targetId",
+            "runId",
+            "candidateSetDigest",
+            "intervention",
+            "blockId",
+            "title",
+            "summary",
+        ]),
         _ => {
             return Err(
                 "Session v2 public interactionProjection.pending.kind is invalid".to_string(),
@@ -1461,9 +1489,205 @@ fn validate_interaction_projection(value: &Value, block_ids: &HashSet<&str>) -> 
                 "interactionProjection.pending.planId",
             )?;
         }
+        "userIntervention" => {
+            required_identity(pending.get("runId"), "interactionProjection.pending.runId")?;
+            required_identity(
+                pending.get("candidateSetDigest"),
+                "interactionProjection.pending.candidateSetDigest",
+            )?;
+            if pending.get("targetId") != pending.get("interactionId") {
+                return Err(
+                    "Session v2 user intervention target must equal interaction identity"
+                        .to_string(),
+                );
+            }
+            let intervention = pending.get("intervention").ok_or_else(|| {
+                "Session v2 user intervention projection requires its card".to_string()
+            })?;
+            validate_user_intervention_view(intervention)?;
+            let intervention = intervention.as_object().expect("validated intervention");
+            if intervention.get("interactionId") != pending.get("interactionId")
+                || intervention.get("interactionRevision") != pending.get("interactionRevision")
+                || intervention.get("candidateSetDigest") != pending.get("candidateSetDigest")
+            {
+                return Err(
+                    "Session v2 user intervention card identity does not match pending interaction"
+                        .to_string(),
+                );
+            }
+        }
         _ => unreachable!(),
     }
     Ok(())
+}
+
+fn validate_user_intervention_view(value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Session v2 public user intervention must be an object".to_string())?;
+    let allowed = HashSet::from([
+        "schemaVersion",
+        "interactionId",
+        "interactionRevision",
+        "candidateSetDigest",
+        "problemSummary",
+        "recommendation",
+        "relevantFacts",
+        "affectedPlanActionIds",
+        "options",
+        "allowsFreeform",
+    ]);
+    reject_unknown_fields(
+        object.keys().map(String::as_str),
+        &allowed,
+        "userIntervention",
+    )?;
+    if object.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.user-intervention.v1")
+        || object
+            .get("problemSummary")
+            .and_then(Value::as_str)
+            .is_none()
+        || object.get("allowsFreeform").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("Session v2 public user intervention contract is invalid".to_string());
+    }
+    for field in ["interactionId", "interactionRevision", "candidateSetDigest"] {
+        required_identity(object.get(field), &format!("userIntervention.{field}"))?;
+    }
+    validate_optional_strings(object, &["recommendation"], "userIntervention")?;
+    validate_string_array(
+        object.get("relevantFacts"),
+        "userIntervention.relevantFacts",
+    )?;
+    validate_string_array(
+        object.get("affectedPlanActionIds"),
+        "userIntervention.affectedPlanActionIds",
+    )?;
+    let options = object
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Session v2 user intervention requires options".to_string())?;
+    if options.is_empty() || options.len() > 16 {
+        return Err("Session v2 user intervention option count is invalid".to_string());
+    }
+    let mut option_ids = HashSet::new();
+    for option in options {
+        let option = option
+            .as_object()
+            .ok_or_else(|| "Session v2 user intervention option must be an object".to_string())?;
+        let allowed = HashSet::from([
+            "id",
+            "label",
+            "description",
+            "recommended",
+            "kind",
+            "tradeoffs",
+            "candidatePlanRevision",
+            "candidatePlanDigest",
+            "actions",
+        ]);
+        reject_unknown_fields(
+            option.keys().map(String::as_str),
+            &allowed,
+            "userIntervention.option",
+        )?;
+        let option_id = required_identity(option.get("id"), "userIntervention.option.id")?;
+        if !option_ids.insert(option_id) {
+            return Err("Session v2 user intervention option ids repeat".to_string());
+        }
+        required_identity(option.get("label"), "userIntervention.option.label")?;
+        validate_optional_strings(option, &["description"], "userIntervention.option")?;
+        if option
+            .get("recommended")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("Session v2 intervention recommended flag is invalid".to_string());
+        }
+        let kind = option
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(kind, "executable" | "guidanceOnly") {
+            return Err("Session v2 intervention option kind is invalid".to_string());
+        }
+        validate_string_array(option.get("tradeoffs"), "userIntervention.option.tradeoffs")?;
+        let actions = option
+            .get("actions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Session v2 intervention option actions are invalid".to_string())?;
+        let executable = kind == "executable";
+        if executable
+            != (option.get("candidatePlanRevision").is_some()
+                && option.get("candidatePlanDigest").is_some()
+                && !actions.is_empty())
+            || (!executable
+                && (option.get("candidatePlanRevision").is_some()
+                    || option.get("candidatePlanDigest").is_some()
+                    || !actions.is_empty()))
+        {
+            return Err("Session v2 intervention option authority is invalid".to_string());
+        }
+        for field in ["candidatePlanRevision", "candidatePlanDigest"] {
+            if let Some(value) = option.get(field) {
+                required_identity(Some(value), &format!("userIntervention.option.{field}"))?;
+            }
+        }
+        for action in actions {
+            validate_user_intervention_action(action)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_user_intervention_action(value: &Value) -> Result<(), String> {
+    let action = value
+        .as_object()
+        .ok_or_else(|| "Session v2 user intervention action must be an object".to_string())?;
+    let allowed = HashSet::from([
+        "planActionId",
+        "operationId",
+        "toolId",
+        "summary",
+        "riskLevel",
+        "canonicalTargets",
+        "scopeDelta",
+        "previewId",
+        "previewDigest",
+    ]);
+    reject_unknown_fields(
+        action.keys().map(String::as_str),
+        &allowed,
+        "userIntervention.action",
+    )?;
+    for field in [
+        "planActionId",
+        "operationId",
+        "toolId",
+        "previewId",
+        "previewDigest",
+    ] {
+        required_identity(
+            action.get(field),
+            &format!("userIntervention.action.{field}"),
+        )?;
+    }
+    if action.get("summary").and_then(Value::as_str).is_none() {
+        return Err("Session v2 intervention action summary is invalid".to_string());
+    }
+    validate_required_enum(
+        action.get("riskLevel"),
+        &["low", "medium", "high", "critical"],
+        "userIntervention.action.riskLevel",
+    )?;
+    validate_string_array(
+        action.get("canonicalTargets"),
+        "userIntervention.action.canonicalTargets",
+    )?;
+    validate_string_array(
+        action.get("scopeDelta"),
+        "userIntervention.action.scopeDelta",
+    )
 }
 
 fn validate_interaction_identity(object: &Map<String, Value>, field: &str) -> Result<(), String> {
@@ -1750,28 +1974,10 @@ fn validate_run_projection(
         Some(activity) => {
             validate_current_activity(activity)?;
             let activity = activity.as_object().expect("validated currentActivity");
-            let work_segment_id = activity.get("workSegmentId").and_then(Value::as_str);
-            if let Some(work_segment_id) = work_segment_id {
-                if turn_id.is_none()
-                    || identities
-                        .work_segment_turn_ids
-                        .get(work_segment_id)
-                        .copied()
-                        != turn_id
-                {
+            if let Some(detail_block_id) = activity.get("detailBlockId").and_then(Value::as_str) {
+                if !identities.block_ids.contains(detail_block_id) {
                     return Err(
-                        "Session v2 public projection currentActivity references another turn work segment"
-                            .to_string(),
-                    );
-                }
-            }
-            if let Some(operation_id) = activity.get("operationId").and_then(Value::as_str) {
-                if work_segment_id.is_none()
-                    || identities.operation_segment_ids.get(operation_id).copied()
-                        != work_segment_id
-                {
-                    return Err(
-                        "Session v2 public projection currentActivity operation does not belong to its work segment"
+                        "Session v3 public projection currentActivity references a missing block"
                             .to_string(),
                     );
                 }
@@ -1852,14 +2058,19 @@ fn validate_run_projection_semantics(object: &Map<String, Value>) -> Result<(), 
 
 fn validate_current_activity(value: &Value) -> Result<(), String> {
     let object = value.as_object().ok_or_else(|| {
-        "Session v2 public projection currentActivity must be an object".to_string()
+        "Session v3 public projection currentActivity must be an object".to_string()
     })?;
     let allowed = HashSet::from([
+        "activityId",
+        "revision",
         "code",
-        "summary",
-        "operationId",
-        "workSegmentId",
+        "source",
+        "status",
+        "startedAt",
         "updatedAt",
+        "message",
+        "detailBlockId",
+        "providerRequestId",
     ]);
     reject_unknown_fields(
         object.keys().map(String::as_str),
@@ -1881,18 +2092,55 @@ fn validate_current_activity(value: &Value) -> Result<(), String> {
         ],
         "currentActivity.code",
     )?;
-    if object.get("code").and_then(Value::as_str) == Some("provider.reasoning")
-        && object.contains_key("summary")
-    {
+    required_identity(object.get("activityId"), "currentActivity.activityId")?;
+    if required_safe_integer(object.get("revision"), "currentActivity.revision")? == 0 {
         return Err(
-            "Session v2 public projection provider reasoning activity cannot expose a summary"
+            "Session v3 public projection currentActivity revision must be positive".to_string(),
+        );
+    }
+    validate_required_enum(
+        object.get("source"),
+        &["session", "provider", "resource", "kernel", "retry"],
+        "currentActivity.source",
+    )?;
+    validate_required_enum(object.get("status"), &["active"], "currentActivity.status")?;
+    let code = object
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected_source = if code.starts_with("provider.") {
+        "provider"
+    } else if code.starts_with("resource.") {
+        "resource"
+    } else if code.starts_with("kernel.") {
+        "kernel"
+    } else if code.starts_with("retry.") {
+        "retry"
+    } else {
+        "session"
+    };
+    if object.get("source").and_then(Value::as_str) != Some(expected_source) {
+        return Err(
+            "Session v3 public projection currentActivity source does not match its code"
                 .to_string(),
         );
     }
+    if object.get("code").and_then(Value::as_str) == Some("provider.reasoning")
+        && object.contains_key("message")
+    {
+        return Err(
+            "Session v3 public projection provider reasoning activity cannot expose a message"
+                .to_string(),
+        );
+    }
+    required_identity(object.get("startedAt"), "currentActivity.startedAt")?;
     required_identity(object.get("updatedAt"), "currentActivity.updatedAt")?;
+    if let Some(message) = object.get("message") {
+        validate_localized_text(message, "currentActivity.message")?;
+    }
     validate_optional_strings(
         object,
-        &["summary", "operationId", "workSegmentId"],
+        &["detailBlockId", "providerRequestId"],
         "currentActivity",
     )
 }
@@ -1900,15 +2148,17 @@ fn validate_current_activity(value: &Value) -> Result<(), String> {
 fn validate_wait(value: &Value) -> Result<(), String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "Session v2 public projection wait must be an object".to_string())?;
-    let allowed = HashSet::from(["kind", "reason", "interactionId"]);
+        .ok_or_else(|| "Session v3 public projection wait must be an object".to_string())?;
+    let allowed = HashSet::from(["kind", "since", "reasonCode", "retryAt", "interactionId"]);
     reject_unknown_fields(object.keys().map(String::as_str), &allowed, "wait")?;
     validate_required_enum(
         object.get("kind"),
         &["user", "external", "paused"],
         "wait.kind",
     )?;
-    validate_optional_strings(object, &["reason", "interactionId"], "wait")
+    required_identity(object.get("since"), "wait.since")?;
+    required_identity(object.get("reasonCode"), "wait.reasonCode")?;
+    validate_optional_strings(object, &["retryAt", "interactionId"], "wait")
 }
 
 fn validate_provenance(value: Option<&Value>, field: &str) -> Result<(), String> {

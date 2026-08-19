@@ -1,11 +1,17 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import { canonicalJson } from '../cache/canonicalizer.js';
+import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 import type {
   SessionKernelTransportPrivateAuthV2,
 } from './SessionKernelPortV2.js';
 import type {
   SessionProviderCompletionReceiptV1,
+  SessionProviderStructuredOutputCallV1,
+  SessionProviderStructuredOutputFailureV1,
+  SessionProviderStructuredOutputRecoveryV1,
 } from './types.js';
+import type {
+  SessionProviderCacheLaneResetReasonV1,
+} from './providerCacheLaneV2.js';
 import {
   SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
 } from './types.js';
@@ -90,7 +96,68 @@ export interface SessionKernelLlmStreamResultV2 {
   completion: SessionProviderCompletionReceiptV1;
 }
 
+export type SessionKernelProviderCachePredecessorV2 =
+  | {
+      schemaVersion:
+        'deepcode.session.provider-cache-predecessor.v2';
+      status: 'available';
+      sessionId: string;
+      runId: string;
+      userTurnId: string;
+      providerTurnId: string;
+      controlEpoch: number;
+      terminalKind: 'completed' | 'failed';
+      replayEligible: boolean;
+      terminalReasonCode?: string;
+      externalRequestDigest: string;
+      externalRequestBytes: number;
+      providerProfileRevisionDigest: string;
+      providerProfileId: string;
+      provider: string;
+      model: string;
+      targetKind:
+        | 'planning'
+        | 'contextRead'
+        | 'planAction'
+        | 'interventionResearch'
+        | 'finalAnswer';
+      targetBindingDigest: string;
+      toolSchemaDigest: string;
+      responseFormatDigest: string;
+      toolContextRef: {
+        contextVersion: number;
+        catalogDigest: string;
+        contextDigest: string;
+      };
+      cacheLane: {
+        laneId: string;
+        laneRevision: number;
+        relationKind:
+          | 'bootstrap'
+          | 'sameTurnToolContinuation'
+          | 'sameTurnSessionControlContinuation'
+          | 'sameTurnStructuredRepair'
+          | 'nextUserTurn'
+          | 'exactReplay'
+          | 'reset';
+        stablePrefixDigest: string;
+      };
+    }
+  | {
+      schemaVersion:
+        'deepcode.session.provider-cache-predecessor.v2';
+      status: 'unavailable';
+      providerTurnId: string;
+      reasonCode: SessionProviderCacheLaneResetReasonV1;
+    };
+
 export interface SessionKernelLlmTransportV2 {
+  inspectCachePredecessor(
+    providerTurnId: string,
+    profileId: string,
+    currentProviderTurnId: string,
+    signal: AbortSignal
+  ): Promise<SessionKernelProviderCachePredecessorV2>;
   request(
     request: LlmChatRequest,
     signal: AbortSignal,
@@ -121,6 +188,69 @@ implements SessionKernelLlmTransportV2 {
     private readonly fetchImpl: typeof fetch = fetch
   ) {
     this.#runCapability = privateAuth.runCapability;
+  }
+
+  async inspectCachePredecessor(
+    providerTurnId: string,
+    profileId: string,
+    currentProviderTurnId: string,
+    signal: AbortSignal
+  ): Promise<SessionKernelProviderCachePredecessorV2> {
+    let response: Response;
+    try {
+      const url = new URL(
+        `${normalizeApiBase(this.apiBase)}/api/llm/cache/predecessors/${encodeURIComponent(providerTurnId)}`
+      );
+      url.searchParams.set('profileId', profileId);
+      url.searchParams.set(
+        'currentProviderTurnId',
+        currentProviderTurnId
+      );
+      response = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: {
+          'x-deepcode-run-capability': this.#runCapability,
+          'x-deepcode-session-id': this.sessionId,
+          'x-deepcode-run-id': this.runId,
+        },
+        signal,
+      });
+    } catch (error) {
+      if (signal.aborted) {
+        throw new SessionKernelProviderTransportError(
+          'session_kernel_provider_cancelled',
+          'Provider cache predecessor inspection was cancelled.'
+        );
+      }
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_transport_failed',
+        safeProviderTransportMessage(
+          error,
+          'Provider cache predecessor inspection failed before receiving an HTTP response.'
+        )
+      );
+    }
+    if (!response.ok) {
+      await cancelBody(response.body);
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_http_failed',
+        `Provider cache predecessor inspection failed with HTTP ${response.status}.`,
+        response.status
+      );
+    }
+    let payload: unknown;
+    try {
+      payload = await response.json() as unknown;
+    } catch {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_cache_predecessor_invalid',
+        'Provider cache predecessor response is not valid JSON.'
+      );
+    }
+    return decodeProviderCachePredecessorV2(
+      payload,
+      providerTurnId
+    );
   }
 
   async request(
@@ -649,7 +779,7 @@ export async function consumeProviderSseV1(
         exactKeys(
           event.data,
           ['type', 'requestId', 'error'],
-          ['message']
+          ['message', 'structuredFailure']
         );
         const providerErrorCode = identity(
           event.data.error,
@@ -665,7 +795,14 @@ export async function consumeProviderSseV1(
         }
         throw new SessionKernelProviderTransportError(
           providerErrorCode,
-          providerPublicErrorMessage(providerErrorCode)
+          providerPublicErrorMessage(providerErrorCode),
+          undefined,
+          event.data.structuredFailure === undefined
+            ? undefined
+            : decodeStructuredOutputFailureV1(
+                event.data.structuredFailure
+              ),
+          usage
         );
       case 'provider_reasoning_delta':
         throw protocolViolation(
@@ -863,7 +1000,7 @@ function decodeCompletionReceipt(
     'reasoningDigest',
     'responseDigest',
     'trace',
-  ]);
+  ], ['structuredOutputRecovery']);
   if (
     receipt.schemaVersion
       !== SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA
@@ -972,6 +1109,12 @@ function decodeCompletionReceipt(
       'Provider reasoningTransport conflicts with native completion kind.'
     );
   }
+  const structuredOutputRecovery = receipt.structuredOutputRecovery
+    === undefined
+    ? undefined
+    : decodeStructuredOutputRecoveryV1(
+        receipt.structuredOutputRecovery
+      );
   return {
     schemaVersion: SESSION_PROVIDER_COMPLETION_RECEIPT_V1_SCHEMA,
     nativeCompletion,
@@ -994,7 +1137,286 @@ function decodeCompletionReceipt(
       ),
       recordCount: Number(trace.recordCount),
     },
+    ...(structuredOutputRecovery
+      ? { structuredOutputRecovery }
+      : {}),
   };
+}
+
+export function decodeStructuredOutputRecoveryV1(
+  value: unknown
+): SessionProviderStructuredOutputRecoveryV1 {
+  const recordValue = record(value, 'structuredOutputRecovery');
+  exactKeys(recordValue, [
+    'schemaVersion',
+    'disposition',
+    'errorCode',
+    'failureDigest',
+    'calls',
+  ]);
+  if (
+    recordValue.schemaVersion
+      !== 'deepcode.provider.structured-output-recovery.v1'
+    || recordValue.disposition !== 'normalizedProposalControl'
+    || recordValue.errorCode
+      !== 'provider_tool_call_arguments_invalid'
+  ) {
+    throw protocolViolation(
+      'Provider structured-output recovery identity is invalid.'
+    );
+  }
+  const calls = decodeStructuredOutputCallsV1(
+    recordValue.calls,
+    true
+  );
+  const failureDigest = digest(
+    recordValue.failureDigest,
+    'structuredOutputRecovery.failureDigest'
+  );
+  assertStructuredOutputFailureDigestV1(calls, failureDigest);
+  return {
+    schemaVersion: recordValue.schemaVersion,
+    disposition: recordValue.disposition,
+    errorCode: recordValue.errorCode,
+    failureDigest,
+    calls,
+  };
+}
+
+export function decodeStructuredOutputFailureV1(
+  value: unknown
+): SessionProviderStructuredOutputFailureV1 {
+  const recordValue = record(value, 'structuredFailure');
+  exactKeys(recordValue, [
+    'schemaVersion',
+    'disposition',
+    'errorCode',
+    'failureDigest',
+    'nativeCompletion',
+    'calls',
+  ]);
+  if (
+    recordValue.schemaVersion
+      !== 'deepcode.provider.structured-output-failure.v1'
+    || recordValue.disposition !== 'repairableNoMutation'
+    || recordValue.errorCode
+      !== 'provider_tool_call_arguments_invalid'
+  ) {
+    throw protocolViolation(
+      'Provider structured-output failure identity is invalid.'
+    );
+  }
+  const calls = decodeStructuredOutputCallsV1(
+    recordValue.calls,
+    false
+  );
+  const failureDigest = digest(
+    recordValue.failureDigest,
+    'structuredFailure.failureDigest'
+  );
+  assertStructuredOutputFailureDigestV1(calls, failureDigest);
+  return {
+    schemaVersion: recordValue.schemaVersion,
+    disposition: recordValue.disposition,
+    errorCode: recordValue.errorCode,
+    failureDigest,
+    nativeCompletion: decodeStructuredNativeCompletionV1(
+      recordValue.nativeCompletion
+    ),
+    calls,
+  };
+}
+
+function decodeStructuredOutputCallsV1(
+  value: unknown,
+  normalized: boolean
+): SessionProviderStructuredOutputCallV1[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 32) {
+    throw protocolViolation(
+      'Provider structured-output call evidence is invalid.'
+    );
+  }
+  const indexes = new Set<number>();
+  const callIds = new Set<string>();
+  return value.map((candidate, ordinal) => {
+    const call = record(candidate, `structuredOutput.calls[${ordinal}]`);
+    exactKeys(
+      call,
+      ['index', 'callId', 'toolName', 'originalArgumentsDigest'],
+      normalized
+        ? ['normalizedArgumentsDigest', 'appendedSuffix']
+        : []
+    );
+    const index = call.index;
+    if (
+      !Number.isSafeInteger(index)
+      || Number(index) < 0
+      || Number(index) >= 32
+      || indexes.has(Number(index))
+    ) {
+      throw protocolViolation(
+        'Provider structured-output call index is invalid.'
+      );
+    }
+    indexes.add(Number(index));
+    const callId = identity(call.callId, 'structuredOutput.callId', 1024);
+    if (callIds.has(callId)) {
+      throw protocolViolation(
+        'Provider structured-output call identities must be unique.'
+      );
+    }
+    callIds.add(callId);
+    const toolName = identity(
+      call.toolName,
+      'structuredOutput.toolName',
+      1024
+    );
+    const originalArgumentsDigest = digest(
+      call.originalArgumentsDigest,
+      'structuredOutput.originalArgumentsDigest'
+    );
+    if (!normalized) {
+      return {
+        index: Number(index),
+        callId,
+        toolName,
+        originalArgumentsDigest,
+      };
+    }
+    if (
+      toolName !== 'deepcode_session_plan_propose_v5'
+      && toolName !== 'deepcode_session_intervention_propose_v1'
+    ) {
+      throw protocolViolation(
+        'Only Session proposal controls may be deterministically normalized.'
+      );
+    }
+    const appendedSuffix = text(
+      call.appendedSuffix,
+      'structuredOutput.appendedSuffix',
+      32
+    );
+    if (
+      !appendedSuffix
+      || !/^[}\]]+$/u.test(appendedSuffix)
+    ) {
+      throw protocolViolation(
+        'Provider structured-output normalization suffix is invalid.'
+      );
+    }
+    return {
+      index: Number(index),
+      callId,
+      toolName,
+      originalArgumentsDigest,
+      normalizedArgumentsDigest: digest(
+        call.normalizedArgumentsDigest,
+        'structuredOutput.normalizedArgumentsDigest'
+      ),
+      appendedSuffix,
+    };
+  });
+}
+
+function assertStructuredOutputFailureDigestV1(
+  calls: readonly SessionProviderStructuredOutputCallV1[],
+  failureDigest: string
+): void {
+  const expected = sha256Hash(canonicalJson({
+    errorCode: 'provider_tool_call_arguments_invalid',
+    calls: calls.map((call) => ({
+      index: call.index,
+      toolName: call.toolName,
+      originalArgumentsDigest: call.originalArgumentsDigest,
+    })),
+  }));
+  if (expected !== failureDigest) {
+    throw protocolViolation(
+      'Provider structured-output failure digest is invalid.'
+    );
+  }
+}
+
+function decodeStructuredNativeCompletionV1(
+  value: unknown
+): SessionProviderStructuredOutputFailureV1['nativeCompletion'] {
+  const native = record(value, 'structuredFailure.nativeCompletion');
+  switch (native.providerKind) {
+    case 'openaiCompatible':
+      exactKeys(native, [
+        'providerKind',
+        'terminalSignal',
+        'finishReason',
+      ]);
+      if (
+        native.terminalSignal !== '[DONE]'
+        || (
+          native.finishReason !== 'stop'
+          && native.finishReason !== 'tool_calls'
+        )
+      ) throw protocolViolation('Structured failure native completion is invalid.');
+      return {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+        finishReason: native.finishReason,
+      };
+    case 'anthropic':
+      exactKeys(native, ['providerKind', 'terminalSignal']);
+      if (native.terminalSignal !== 'message_stop') {
+        throw protocolViolation('Structured failure native completion is invalid.');
+      }
+      return {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+      };
+    case 'ollama':
+      exactKeys(native, ['providerKind', 'terminalSignal']);
+      if (native.terminalSignal !== 'done:true') {
+        throw protocolViolation('Structured failure native completion is invalid.');
+      }
+      return {
+        providerKind: native.providerKind,
+        terminalSignal: native.terminalSignal,
+      };
+    default:
+      throw protocolViolation('Structured failure native completion is invalid.');
+  }
+}
+
+function applyStructuredOutputRecoveryV1(
+  toolItems: Map<number, SessionKernelLlmStreamToolItemV2>,
+  recovery: SessionProviderStructuredOutputRecoveryV1 | undefined
+): void {
+  if (!recovery) return;
+  for (const call of recovery.calls) {
+    const item = toolItems.get(call.index);
+    if (
+      !item
+      || item.callId !== call.callId
+      || item.name !== call.toolName
+      || sha256Hash(item.arguments) !== call.originalArgumentsDigest
+      || !call.appendedSuffix
+      || !call.normalizedArgumentsDigest
+    ) {
+      throw protocolViolation(
+        'Provider structured-output recovery does not bind the streamed call.'
+      );
+    }
+    const normalized = `${item.arguments}${call.appendedSuffix}`;
+    if (sha256Hash(normalized) !== call.normalizedArgumentsDigest) {
+      throw protocolViolation(
+        'Provider structured-output recovery digest is invalid.'
+      );
+    }
+    try {
+      JSON.parse(normalized);
+    } catch {
+      throw protocolViolation(
+        'Provider structured-output recovery did not produce valid JSON.'
+      );
+    }
+    item.arguments = normalized;
+  }
 }
 
 function materializeCompletedItems(
@@ -1002,6 +1424,10 @@ function materializeCompletedItems(
   toolItems: Map<number, SessionKernelLlmStreamToolItemV2>,
   completion: SessionProviderCompletionReceiptV1
 ): SessionKernelLlmStreamResultV2['items'] {
+  applyStructuredOutputRecoveryV1(
+    toolItems,
+    completion.structuredOutputRecovery
+  );
   const callIds = new Set<string>();
   for (const item of toolItems.values()) {
     identity(item.callId, 'toolCall.id', 1024);
@@ -1304,6 +1730,322 @@ function nativeToolIndex(value: unknown): number {
   return Number(value);
 }
 
+function decodeProviderCachePredecessorV2(
+  value: unknown,
+  expectedProviderTurnId: string
+): SessionKernelProviderCachePredecessorV2 {
+  const envelope = record(value, 'cachePredecessorEnvelope');
+  exactKeys(envelope, ['ok', 'data', 'error', 'message']);
+  if (envelope.ok !== true) {
+    const code = typeof envelope.error === 'string'
+      ? envelope.error
+      : 'session_kernel_provider_cache_predecessor_failed';
+    throw new SessionKernelProviderTransportError(
+      code,
+      'Provider cache predecessor inspection was rejected.'
+    );
+  }
+  const data = record(envelope.data, 'cachePredecessor');
+  const schemaVersion = identity(
+    data.schemaVersion,
+    'cachePredecessor.schemaVersion',
+    128
+  );
+  if (
+    schemaVersion
+      !== 'deepcode.session.provider-cache-predecessor.v2'
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor schema is unsupported.'
+    );
+  }
+  const providerTurnId = identity(
+    data.providerTurnId,
+    'cachePredecessor.providerTurnId',
+    512
+  );
+  if (providerTurnId !== expectedProviderTurnId) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor identity does not match the request.'
+    );
+  }
+  if (data.status === 'unavailable') {
+    exactKeys(data, [
+      'schemaVersion',
+      'status',
+      'providerTurnId',
+      'reasonCode',
+    ]);
+    const reasonCode = identity(
+      data.reasonCode,
+      'cachePredecessor.reasonCode',
+      128
+    );
+    if (!isCacheLaneResetReasonV1(reasonCode)) {
+      throw new SessionKernelProviderTransportError(
+        'session_kernel_provider_cache_predecessor_invalid',
+        'Provider cache predecessor reset reason is unsupported.'
+      );
+    }
+    return {
+      schemaVersion,
+      status: 'unavailable',
+      providerTurnId,
+      reasonCode,
+    };
+  }
+  if (data.status !== 'available') {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor status is unsupported.'
+    );
+  }
+  exactKeys(data, [
+    'schemaVersion',
+    'status',
+    'sessionId',
+    'runId',
+    'userTurnId',
+    'providerTurnId',
+    'controlEpoch',
+    'terminalKind',
+    'replayEligible',
+    'terminalReasonCode',
+    'externalRequestDigest',
+    'externalRequestBytes',
+    'providerProfileRevisionDigest',
+    'providerProfileId',
+    'provider',
+    'model',
+    'targetKind',
+    'targetBindingDigest',
+    'toolSchemaDigest',
+    'responseFormatDigest',
+    'toolContextRef',
+    'cacheLane',
+  ]);
+  const externalRequestBytes = positiveSafeInteger(
+    data.externalRequestBytes,
+    'cachePredecessor.externalRequestBytes'
+  );
+  const targetKind = identity(
+    data.targetKind,
+    'cachePredecessor.targetKind',
+    64
+  );
+  if (
+    targetKind !== 'planning'
+    && targetKind !== 'contextRead'
+    && targetKind !== 'planAction'
+    && targetKind !== 'interventionResearch'
+    && targetKind !== 'finalAnswer'
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor target kind is unsupported.'
+    );
+  }
+  const terminalKind = identity(
+    data.terminalKind,
+    'cachePredecessor.terminalKind',
+    32
+  );
+  if (terminalKind !== 'completed' && terminalKind !== 'failed') {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor terminal kind is unsupported.'
+    );
+  }
+  if (typeof data.replayEligible !== 'boolean') {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor replay eligibility is invalid.'
+    );
+  }
+  const terminalReasonCode = data.terminalReasonCode === null
+    ? undefined
+    : identity(
+        data.terminalReasonCode,
+        'cachePredecessor.terminalReasonCode',
+        256
+      );
+  if (
+    data.replayEligible
+      !== (
+        terminalKind === 'failed'
+        && terminalReasonCode === 'provider_retryable_no_mutation'
+      )
+    || (terminalKind === 'completed' && terminalReasonCode !== undefined)
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor replay evidence is inconsistent.'
+    );
+  }
+  const toolContextRef = record(
+    data.toolContextRef,
+    'cachePredecessor.toolContextRef'
+  );
+  exactKeys(toolContextRef, [
+    'contextVersion',
+    'catalogDigest',
+    'contextDigest',
+  ]);
+  const cacheLane = record(
+    data.cacheLane,
+    'cachePredecessor.cacheLane'
+  );
+  exactKeys(cacheLane, [
+    'laneId',
+    'laneRevision',
+    'relationKind',
+    'stablePrefixDigest',
+  ]);
+  const relationKind = identity(
+    cacheLane.relationKind,
+    'cachePredecessor.cacheLane.relationKind',
+    64
+  );
+  if (![
+    'bootstrap',
+    'sameTurnToolContinuation',
+    'sameTurnSessionControlContinuation',
+    'sameTurnStructuredRepair',
+    'nextUserTurn',
+    'exactReplay',
+    'reset',
+  ].includes(relationKind)) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      'Provider cache predecessor relation kind is unsupported.'
+    );
+  }
+  return {
+    schemaVersion,
+    status: 'available',
+    sessionId: identity(
+      data.sessionId,
+      'cachePredecessor.sessionId',
+      512
+    ),
+    runId: identity(data.runId, 'cachePredecessor.runId', 512),
+    userTurnId: identity(
+      data.userTurnId,
+      'cachePredecessor.userTurnId',
+      512
+    ),
+    providerTurnId,
+    controlEpoch: positiveSafeInteger(
+      data.controlEpoch,
+      'cachePredecessor.controlEpoch'
+    ),
+    terminalKind,
+    replayEligible: data.replayEligible,
+    ...(terminalReasonCode ? { terminalReasonCode } : {}),
+    externalRequestDigest: digest(
+      data.externalRequestDigest,
+      'cachePredecessor.externalRequestDigest'
+    ),
+    externalRequestBytes,
+    providerProfileRevisionDigest: digest(
+      data.providerProfileRevisionDigest,
+      'cachePredecessor.providerProfileRevisionDigest'
+    ),
+    providerProfileId: identity(
+      data.providerProfileId,
+      'cachePredecessor.providerProfileId',
+      512
+    ),
+    provider: identity(
+      data.provider,
+      'cachePredecessor.provider',
+      512
+    ),
+    model: identity(data.model, 'cachePredecessor.model', 512),
+    targetKind,
+    targetBindingDigest: digest(
+      data.targetBindingDigest,
+      'cachePredecessor.targetBindingDigest'
+    ),
+    toolSchemaDigest: digest(
+      data.toolSchemaDigest,
+      'cachePredecessor.toolSchemaDigest'
+    ),
+    responseFormatDigest: digest(
+      data.responseFormatDigest,
+      'cachePredecessor.responseFormatDigest'
+    ),
+    toolContextRef: {
+      contextVersion: positiveSafeInteger(
+        toolContextRef.contextVersion,
+        'cachePredecessor.toolContextRef.contextVersion'
+      ),
+      catalogDigest: digest(
+        toolContextRef.catalogDigest,
+        'cachePredecessor.toolContextRef.catalogDigest'
+      ),
+      contextDigest: digest(
+        toolContextRef.contextDigest,
+        'cachePredecessor.toolContextRef.contextDigest'
+      ),
+    },
+    cacheLane: {
+      laneId: digest(
+        cacheLane.laneId,
+        'cachePredecessor.cacheLane.laneId'
+      ),
+      laneRevision: positiveSafeInteger(
+        cacheLane.laneRevision,
+        'cachePredecessor.cacheLane.laneRevision'
+      ),
+      relationKind: relationKind as
+        | 'bootstrap'
+        | 'sameTurnToolContinuation'
+        | 'sameTurnSessionControlContinuation'
+        | 'sameTurnStructuredRepair'
+        | 'nextUserTurn'
+        | 'exactReplay'
+        | 'reset',
+      stablePrefixDigest: digest(
+        cacheLane.stablePrefixDigest,
+        'cachePredecessor.cacheLane.stablePrefixDigest'
+      ),
+    },
+  };
+}
+
+function positiveSafeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_cache_predecessor_invalid',
+      `Provider cache predecessor ${field} is invalid.`
+    );
+  }
+  return Number(value);
+}
+
+function isCacheLaneResetReasonV1(
+  value: string
+): value is SessionProviderCacheLaneResetReasonV1 {
+  return [
+    'coldStart',
+    'semanticLaneChanged',
+    'providerProfileChanged',
+    'modelChanged',
+    'systemContractChanged',
+    'toolSchemaChanged',
+    'responseFormatChanged',
+    'contextCompaction',
+    'rewind',
+    'daemonTraceUnavailable',
+    'daemonTraceInvalid',
+    'legacySessionColdStart',
+    'manualReset',
+  ].includes(value);
+}
+
 function providerPublicErrorMessage(code: string): string {
   switch (code) {
     case 'ProviderProfileMissingApiKey':
@@ -1477,7 +2219,9 @@ export class SessionKernelProviderTransportError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly httpStatus?: number
+    readonly httpStatus?: number,
+    readonly structuredFailure?: SessionProviderStructuredOutputFailureV1,
+    readonly providerUsage?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'SessionKernelProviderTransportError';

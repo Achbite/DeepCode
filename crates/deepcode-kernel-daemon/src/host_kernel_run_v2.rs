@@ -23,7 +23,7 @@ use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPri
 use crate::session_kernel_v2_store::{
     validate_session_work_authority_v3, SessionKernelV2Store, SessionWorkAuthorityV3,
 };
-use crate::AgentInputAttachmentV2;
+use crate::{AgentInputAttachmentV3, UserAttachmentContextV1};
 use deepcode_kernel_abi::v2::{
     CancellationReasonCodeV2, CancellationSourceV2, CommandRequestId, ControlFactV2, FactId,
     InputId, InvocationFactV2, KernelFactEnvelopeV2, KernelFactPayloadV2, RunId,
@@ -54,7 +54,7 @@ const SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-request.v2";
 const SESSION_KERNEL_PRODUCTION_REQUEST_FRAME_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-request-frame.v2";
-const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v3";
+const SESSION_KERNEL_PERSISTENCE_V3_SCHEMA: &str = "deepcode.session.kernel-persistence.v4";
 const SESSION_KERNEL_PREFETCHED_RUN_V2_SCHEMA: &str = "deepcode.session.prefetched-kernel-run.v2";
 const SESSION_KERNEL_PRODUCTION_RESPONSE_V2_SCHEMA: &str =
     "deepcode.session.kernel-production-response.v2";
@@ -86,7 +86,8 @@ pub(crate) struct HostKernelInitialInputV2 {
     pub(crate) input_id: InputId,
     pub(crate) opaque_input_ref: String,
     pub(crate) text: String,
-    pub(crate) attachments: Vec<AgentInputAttachmentV2>,
+    pub(crate) attachments: Vec<AgentInputAttachmentV3>,
+    pub(crate) attachment_contexts: Vec<UserAttachmentContextV1>,
     pub(crate) recorded_at: String,
 }
 
@@ -104,7 +105,6 @@ pub(crate) enum HostKernelBridgeOperationV2 {
     ResumePlanAction {
         plan_action_id: String,
         expected_plan_revision: String,
-        provider_call_budget: u16,
         guidance: Vec<String>,
     },
     UserInput {
@@ -138,6 +138,20 @@ pub(crate) enum HostKernelBridgeOperationV2 {
         decision: HostKernelPlanDecisionV2,
         #[serde(skip_serializing_if = "Option::is_none")]
         guidance: Option<String>,
+    },
+    DecideUserIntervention {
+        interaction_id: String,
+        interaction_revision: String,
+        candidate_set_digest: String,
+        decision: HostKernelInterventionDecisionV4,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        option_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        guidance: Option<String>,
+        caller_request_id: String,
+        caller_request_digest: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancel_operation_id: Option<String>,
     },
     ObserveCapabilityDecision {
         decision: HostKernelCapabilityDecisionV2,
@@ -188,6 +202,14 @@ pub(crate) enum HostKernelPlanDecisionV2 {
     Accept,
     Reject,
     Revise,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum HostKernelInterventionDecisionV4 {
+    Select,
+    Revise,
+    Reject,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -1479,17 +1501,52 @@ impl HostKernelRunCoordinatorV2 {
         &self,
         bootstrap: &HostKernelBootstrapRecordV2,
     ) -> Result<u64, HostV2StorageError> {
-        let settlement = self
+        let settlements = self
             .host_services
             .kernel_operations_v2
-            .latest_settlement(&bootstrap.session_id, &bootstrap.host_run_id)?
-            .ok_or_else(|| {
-                HostV2StorageError::conflict(
-                    "host_kernel_session_state_missing",
-                    "Active Host Kernel Run has no settled Session state",
-                )
-            })?;
-        require_successful_session_facts_high_water(&settlement)
+            .settlements_for_run(&bootstrap.session_id, &bootstrap.host_run_id)?;
+        let latest = settlements.last().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_kernel_session_state_missing",
+                "Active Host Kernel Run has no settled Session state",
+            )
+        })?;
+        match &latest.settlement {
+            HostKernelOperationSettlementV2::Succeeded { .. } => {
+                require_successful_session_facts_high_water(latest)
+            }
+            HostKernelOperationSettlementV2::FailedRecoverable { boundary, .. }
+                if boundary.disposition == HostKernelFailureDispositionV2::QueryFacts
+                    && boundary.commit == HostKernelFailureCommitV2::Unknown
+                    && boundary.effect == HostKernelFailureEffectV2::Possible
+                    && boundary.pending_request_lanes
+                        == vec![HostKernelPendingRequestLaneV2::Query] =>
+            {
+                // This exact boundary requires an authoritative Kernel facts
+                // query before the failed control settlement can be resumed.
+                // Seed that query from the most recent successful Session
+                // snapshot; never treat the older snapshot itself as proof of
+                // the failed operation or skip a terminal/other failure.
+                settlements[..settlements.len() - 1]
+                    .iter()
+                    .rev()
+                    .find_map(|settlement| {
+                        matches!(
+                            &settlement.settlement,
+                            HostKernelOperationSettlementV2::Succeeded { .. }
+                        )
+                        .then(|| require_successful_session_facts_high_water(settlement))
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        HostV2StorageError::conflict(
+                            "host_kernel_session_state_missing",
+                            "Recoverable Session operation has no prior successful facts snapshot",
+                        )
+                    })
+            }
+            _ => require_successful_session_facts_high_water(latest),
+        }
     }
 
     fn prepare_initial_dispatch(
@@ -3419,6 +3476,7 @@ fn bootstrap_initial_input(input: &HostKernelRunSpawnInputV2) -> HostKernelBoots
         opaque_input_ref: input.initial_input.opaque_input_ref.clone(),
         text: input.initial_input.text.clone(),
         attachments: input.initial_input.attachments.clone(),
+        attachment_contexts: input.initial_input.attachment_contexts.clone(),
         recorded_at: input.initial_input.recorded_at.clone(),
     }
 }
@@ -3462,11 +3520,18 @@ fn production_request_frame_from_bootstrap(
     operation: &HostKernelBridgeOperationV2,
 ) -> Result<Value, HostV2StorageError> {
     validate_bridge_operation(operation)?;
-    if let HostKernelBridgeOperationV2::CancelRun {
-        cancel_operation_id,
-        ..
-    } = operation
-    {
+    let cancel_operation_id = match operation {
+        HostKernelBridgeOperationV2::CancelRun {
+            cancel_operation_id,
+            ..
+        } => Some(cancel_operation_id),
+        HostKernelBridgeOperationV2::DecideUserIntervention {
+            cancel_operation_id,
+            ..
+        } => cancel_operation_id.as_ref(),
+        _ => None,
+    };
+    if let Some(cancel_operation_id) = cancel_operation_id {
         if cancel_operation_id != operation_request_id {
             return Err(HostV2StorageError::conflict(
                 "host_kernel_cancel_operation_identity_conflict",
@@ -3560,6 +3625,70 @@ fn validate_bridge_operation(
     match operation {
         HostKernelBridgeOperationV2::PublishPlanConfirmationReady { plan_revision } => {
             crate::host_v2_storage::validate_bounded_identity(plan_revision, "planRevision", 512)?;
+        }
+        HostKernelBridgeOperationV2::DecideUserIntervention {
+            interaction_id,
+            interaction_revision,
+            candidate_set_digest,
+            decision,
+            option_id,
+            guidance,
+            caller_request_id,
+            caller_request_digest,
+            cancel_operation_id,
+        } => {
+            for (field, value) in [
+                ("interactionId", interaction_id.as_str()),
+                ("interactionRevision", interaction_revision.as_str()),
+                ("callerRequestId", caller_request_id.as_str()),
+            ] {
+                crate::host_v2_storage::validate_bounded_identity(value, field, 512)?;
+            }
+            crate::host_v2_storage::validate_sha256_digest(
+                candidate_set_digest,
+                "candidateSetDigest",
+            )?;
+            crate::host_v2_storage::validate_sha256_digest(
+                caller_request_digest,
+                "callerRequestDigest",
+            )?;
+            if let Some(option_id) = option_id {
+                crate::host_v2_storage::validate_bounded_identity(option_id, "optionId", 512)?;
+            }
+            if let Some(guidance) = guidance {
+                if guidance.trim() != guidance || guidance.len() > 64 * 1024 {
+                    return Err(HostV2StorageError::invalid(
+                        "host_kernel_intervention_guidance_invalid",
+                        "User intervention guidance must be trimmed and bounded",
+                    ));
+                }
+            }
+            if let Some(cancel_operation_id) = cancel_operation_id {
+                crate::host_v2_storage::validate_bounded_identity(
+                    cancel_operation_id,
+                    "cancelOperationId",
+                    512,
+                )?;
+            }
+            let payload_valid = match decision {
+                HostKernelInterventionDecisionV4::Select => {
+                    option_id.is_some() && cancel_operation_id.is_none()
+                }
+                HostKernelInterventionDecisionV4::Revise => {
+                    option_id.is_none()
+                        && guidance.as_deref().is_some_and(|value| !value.is_empty())
+                        && cancel_operation_id.is_none()
+                }
+                HostKernelInterventionDecisionV4::Reject => {
+                    option_id.is_none() && cancel_operation_id.is_some()
+                }
+            };
+            if !payload_valid {
+                return Err(HostV2StorageError::invalid(
+                    "host_kernel_intervention_decision_invalid",
+                    "User intervention decision does not contain its exact closed payload",
+                ));
+            }
         }
         HostKernelBridgeOperationV2::FinalizeReview {
             expected_work_authority,
@@ -3784,6 +3913,7 @@ impl HostKernelBridgeOperationV2 {
                 | Self::ResumeAfterBackpressure { .. }
                 | Self::PreviewPlan { .. }
                 | Self::DecidePlan { .. }
+                | Self::DecideUserIntervention { .. }
                 | Self::FinalizeReview { .. }
                 | Self::RequestFinalAnswer { .. }
         )
@@ -5027,8 +5157,12 @@ fn validate_spawn_input(input: &HostKernelRunSpawnInputV2) -> Result<(), HostV2S
             "Session Kernel v2 initial input exceeds the Host limit",
         ));
     }
-    crate::validate_agent_input_attachment_slice_v2(&input.initial_input.attachments)
+    crate::validate_agent_input_attachment_slice_v3(&input.initial_input.attachments)
         .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    crate::validate_user_attachment_contexts_v1(
+        &input.initial_input.attachments,
+        &input.initial_input.attachment_contexts,
+    )?;
     input.provider_profile.validate()?;
     input.prior_session_events.validate(&input.session_id)?;
     match input.workspace.workspace_kind {

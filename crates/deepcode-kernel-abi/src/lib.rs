@@ -10,7 +10,9 @@ pub mod v2;
 pub mod v2_command;
 mod workspace;
 
-pub const KERNEL_ABI_V2_VERSION: &str = "deepcode.kernel.abi.v2";
+/// Live wire version. V2 module names are retained until the post-acceptance
+/// cleanup, but no v2 wire payload is admitted by this build.
+pub const KERNEL_ABI_V2_VERSION: &str = "deepcode.kernel.abi.v3";
 
 pub use agent_input_v2::*;
 pub use config::*;
