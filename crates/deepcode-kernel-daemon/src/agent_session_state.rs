@@ -292,11 +292,12 @@ pub(crate) fn session_is_verified_selectable(session: &Value) -> bool {
 }
 
 pub(crate) fn session_is_publicly_visible(session: &Value) -> bool {
-    session
-        .get("firstInputAdmission")
-        .and_then(|value| value.get("status"))
-        .and_then(Value::as_str)
-        .is_none_or(|status| status == "admitted")
+    !session_is_deletion_tombstone(session)
+        && session
+            .get("firstInputAdmission")
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .is_none_or(|status| status == "admitted")
 }
 
 pub(crate) fn session_is_publicly_selectable(session: &Value) -> bool {
@@ -330,7 +331,7 @@ pub(crate) fn session_has_active_run(
     state
         .host_services
         .active_runs_v2
-        .resolve_session_active_run(session_id)
+        .resolve_session_run_slot(session_id)
         .map(|active| active.is_some())
 }
 

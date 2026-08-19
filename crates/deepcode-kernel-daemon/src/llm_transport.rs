@@ -646,7 +646,12 @@ impl ProviderCacheTelemetryRecorderV1 {
         profile: &ResolvedLlmProfile,
         sidecar: SessionProviderAdmissionSidecarV2,
     ) -> Self {
-        let continuation = if identity.purpose == ProviderTracePurposeV1::Continuation {
+        let continuation = if matches!(
+            sidecar.cache_lane.relation_kind,
+            SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
+                | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
+                | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair
+        ) {
             ProviderContinuationTelemetryV1 {
                 status: ProviderContinuationStatusV1::Accepted,
                 http_status: None,
@@ -1657,9 +1662,17 @@ fn inject_provider_native_continuation(
     if parent_request_id == current_identity.provider_turn_id
         || match current_sidecar.cache_lane.relation_kind {
             SessionProviderCacheLaneRelationKindV2::SameTurnToolContinuation
-            | SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation
             | SessionProviderCacheLaneRelationKindV2::SameTurnStructuredRepair => {
                 current_identity.purpose != ProviderTracePurposeV1::Continuation
+            }
+            SessionProviderCacheLaneRelationKindV2::SameTurnSessionControlContinuation => {
+                let expected_purpose =
+                    if current_sidecar.target_binding.kind_name() == "finalAnswer" {
+                        ProviderTracePurposeV1::FinalAnswer
+                    } else {
+                        ProviderTracePurposeV1::Continuation
+                    };
+                current_identity.purpose != expected_purpose
             }
             SessionProviderCacheLaneRelationKindV2::NextUserTurn => {
                 current_identity.purpose != ProviderTracePurposeV1::Primary
@@ -1886,6 +1899,7 @@ fn inject_provider_native_continuation(
                 current_identity,
                 current_sidecar,
                 dispatch_authority,
+                false,
             )?;
             let operation_bindings = provider_native_continuation_operation_bindings(
                 &parent_sidecar.target_binding,
@@ -1923,6 +1937,7 @@ fn inject_provider_native_continuation(
                 current_identity,
                 current_sidecar,
                 dispatch_authority,
+                true,
             )?;
             let mut continuation = provider_native_session_control_continuation(
                 completed.reasoning,
@@ -2314,10 +2329,14 @@ fn provider_native_session_control_continuation(
     parent_target: &SessionProviderTargetBindingSidecarV2,
     current_sidecar: &SessionProviderAdmissionSidecarV2,
 ) -> Result<ProviderNativeContinuationV1, ProviderNativeStreamTransportErrorV1> {
-    let (expected_tool_name, allowed_next_targets) =
-        provider_native_session_control_contract(parent_target)?;
+    let expected_tool_name = provider_native_session_control_contract(parent_target)?;
+    let settlement = current_sidecar.control_settlement.as_ref().ok_or_else(|| {
+        ProviderNativeStreamTransportErrorV1::new("provider_control_settlement_missing")
+    })?;
     let next_target = current_sidecar.target_binding.kind_name();
-    if !allowed_next_targets.contains(&next_target) {
+    if settlement.expected_parent_tool_name() != expected_tool_name
+        || settlement.next_target_kind() != next_target
+    {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_control_continuation_invalid",
         ));
@@ -2363,21 +2382,25 @@ fn provider_native_session_control_continuation(
                         "provider_continuation_native_history_invalid",
                     )
                 })?;
-                let mut output = json!({
-                    "schemaVersion": "deepcode.session.control-continuation-result.v1",
-                    "status": "settled",
-                    "control": expected_tool_name,
-                    "nextTargetKind": next_target,
-                });
-                if let Some(plan_revision) = &current_sidecar.authority.plan_revision {
-                    output["planRevision"] = json!(plan_revision);
+                let control = settlement.control();
+                if call_id != control.call_id
+                    || wire_name != control.tool_name
+                    || crate::host_v2_storage::stable_json_sha256(&arguments).map_err(|_| {
+                        ProviderNativeStreamTransportErrorV1::new(
+                            "provider_control_continuation_invalid",
+                        )
+                    })? != control.arguments_digest
+                {
+                    return Err(ProviderNativeStreamTransportErrorV1::new(
+                        "provider_control_continuation_invalid",
+                    ));
                 }
                 control_tool = Some(ProviderContinuationToolV1 {
                     call_id,
                     wire_name: wire_name.clone(),
                     internal_name: internal_tool_name(&wire_name),
                     arguments,
-                    output,
+                    output: settlement.continuation_output(),
                 });
                 assistant_items.push(ProviderContinuationAssistantItemV1::Tool(0));
             }
@@ -2407,20 +2430,15 @@ fn provider_native_session_control_continuation(
 
 fn provider_native_session_control_contract(
     parent_target: &SessionProviderTargetBindingSidecarV2,
-) -> Result<(&'static str, &'static [&'static str]), ProviderNativeStreamTransportErrorV1> {
+) -> Result<&'static str, ProviderNativeStreamTransportErrorV1> {
     let contract = match parent_target {
-        SessionProviderTargetBindingSidecarV2::Planning => (
-            "deepcode_session_plan_propose_v5",
-            &["planning", "planAction"] as &'static [&'static str],
-        ),
-        SessionProviderTargetBindingSidecarV2::PlanAction { .. } => (
-            "deepcode_session_plan_action_complete_v2",
-            &["planAction", "finalAnswer"] as &'static [&'static str],
-        ),
-        SessionProviderTargetBindingSidecarV2::InterventionResearch { .. } => (
-            "deepcode_session_intervention_propose_v1",
-            &["interventionResearch", "planning", "planAction"] as &'static [&'static str],
-        ),
+        SessionProviderTargetBindingSidecarV2::Planning => "deepcode_session_plan_propose_v5",
+        SessionProviderTargetBindingSidecarV2::PlanAction { .. } => {
+            "deepcode_session_plan_action_complete_v2"
+        }
+        SessionProviderTargetBindingSidecarV2::InterventionResearch { .. } => {
+            "deepcode_session_intervention_propose_v1"
+        }
         SessionProviderTargetBindingSidecarV2::ContextRead { .. }
         | SessionProviderTargetBindingSidecarV2::FinalAnswer { .. } => {
             return Err(ProviderNativeStreamTransportErrorV1::new(
@@ -2528,10 +2546,18 @@ fn validate_provider_continuation_admission(
     current_identity: &ProviderTraceIdentityV1,
     current_sidecar: &SessionProviderAdmissionSidecarV2,
     dispatch_authority: &ProviderStreamDispatchAuthorityV1,
+    allow_final_answer_purpose: bool,
 ) -> Result<(), ProviderNativeStreamTransportErrorV1> {
     let admission = &dispatch_authority.admission;
+    let expected_purpose = if allow_final_answer_purpose
+        && current_sidecar.target_binding.kind_name() == "finalAnswer"
+    {
+        ProviderTracePurposeV1::FinalAnswer
+    } else {
+        ProviderTracePurposeV1::Continuation
+    };
     if admission.provider_turn_id != current_identity.provider_turn_id
-        || admission.purpose != ProviderTracePurposeV1::Continuation
+        || admission.purpose != expected_purpose
         || admission.control_epoch != current_identity.control_epoch
         || admission.current_input_id != current_identity.user_turn_id
         || admission.current_input_digest != current_sidecar.current_input_digest
@@ -2539,7 +2565,8 @@ fn validate_provider_continuation_admission(
         || current_sidecar.run_id != current_identity.run_id
         || current_sidecar.control_epoch != current_identity.control_epoch
         || current_sidecar.user_turn_id != current_identity.user_turn_id
-        || current_sidecar.purpose != ProviderTracePurposeV1::Continuation
+        || current_sidecar.purpose != expected_purpose
+        || current_identity.purpose != expected_purpose
     {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_continuation_invalid",
@@ -3445,11 +3472,7 @@ fn provider_dispatch_binding_from_exact_request(
     let target_kind = required_text(target.get("kind"))?;
     if !matches!(
         target_kind.as_str(),
-        "planning"
-            | "planAction"
-            | "contextRead"
-            | "interventionResearch"
-            | "finalAnswer"
+        "planning" | "planAction" | "contextRead" | "interventionResearch" | "finalAnswer"
     ) {
         return Err(ProviderNativeStreamTransportErrorV1::new(
             "provider_dispatch_request_identity_invalid",
@@ -3746,11 +3769,30 @@ async fn probe_llm_profile_native_stream_inner(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn llm_stream_response(
     profile: ResolvedLlmProfile,
     request_envelope: Value,
     request_id: String,
     trace_context: ProviderStreamTraceContextV1,
+    session_io_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Response {
+    llm_stream_response_with_composer_invalidation(
+        profile,
+        request_envelope,
+        request_id,
+        trace_context,
+        None,
+        session_io_guard,
+    )
+}
+
+pub(crate) fn llm_stream_response_with_composer_invalidation(
+    profile: ResolvedLlmProfile,
+    request_envelope: Value,
+    request_id: String,
+    trace_context: ProviderStreamTraceContextV1,
+    composer_invalidations: Option<crate::host_run_broker_v2::HostActiveRunBrokerV2>,
     session_io_guard: tokio::sync::OwnedRwLockReadGuard<()>,
 ) -> Response {
     let response_request_id = request_id.clone();
@@ -4413,6 +4455,12 @@ pub(crate) fn llm_stream_response(
                             quarantine_error.message,
                         )));
                         return;
+                    }
+                    drop(_availability_transition);
+                    if let Some(invalidations) = &composer_invalidations {
+                        invalidations.notify_all_composer_projections(
+                            "profileRevisionQuarantined",
+                        );
                     }
                 }
                 if let Some(structured_failure) = error.structured_failure {

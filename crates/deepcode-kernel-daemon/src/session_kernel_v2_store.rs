@@ -8,8 +8,8 @@ use crate::host_v2_storage::{
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
 use crate::provider_cache_admission_v2::{
-    SessionProviderConversationHeadV1, SessionProviderStructuredRepairSidecarV1,
-    SessionProviderToolContextRefSidecarV1,
+    SessionProviderControlSettlementSidecarV2, SessionProviderConversationHeadV1,
+    SessionProviderStructuredRepairSidecarV1, SessionProviderToolContextRefSidecarV1,
 };
 use crate::provider_trace_v1::{
     ProviderTraceErrorV1, ProviderTraceIdentityV1, ProviderTraceMetadataV1, ProviderTracePurposeV1,
@@ -138,10 +138,7 @@ pub(crate) fn validate_session_work_authority_v3(
                 return Err(work_authority_invalid());
             }
             if let Some(predecessor_digest) = predecessor_digest {
-                validate_sha256_digest(
-                    predecessor_digest,
-                    "workAuthority.predecessorDigest",
-                )?;
+                validate_sha256_digest(predecessor_digest, "workAuthority.predecessorDigest")?;
             }
             let mut previous: Option<&str> = None;
             for operation_id in operation_ids {
@@ -560,6 +557,8 @@ struct SessionKernelCompactActiveV3 {
     provider_reservation: Option<SessionKernelCompactProviderReservationV3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_queue: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_provider_control_settlement: Option<SessionProviderControlSettlementSidecarV2>,
     fact_barriers: Value,
     public_requests: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2190,8 +2189,7 @@ fn provider_turn_predecessor_evidence_from_records(
         .find(|(_, record)| record.record_id == terminal_record_id)
         .ok_or_else(provider_turn_predecessor_terminal_missing)?;
     if terminal_index <= dispatch_index
-        || terminal_record.record_kind
-            != SessionKernelPersistenceRecordKindV3::ProviderTurnTerminal
+        || terminal_record.record_kind != SessionKernelPersistenceRecordKindV3::ProviderTurnTerminal
     {
         return Err(provider_turn_predecessor_invalid());
     }
@@ -2369,11 +2367,7 @@ fn validate_checkpoint_work_authority_records(
             }
         }
         Some(SessionWorkAuthorityV3::ContextRead { .. }) => {
-            validate_context_read_work_authority_chain(
-                records,
-                exclusive_end,
-                checkpoint,
-            )?;
+            validate_context_read_work_authority_chain(records, exclusive_end, checkpoint)?;
         }
         None => {}
     }
@@ -3471,9 +3465,7 @@ fn decode_compact_checkpoint_record(
         (Some(SessionWorkAuthorityV3::ContextRead { .. }), None, None) => {}
         _ => return Err(compact_checkpoint_authority_invalid()),
     }
-    if authority.plan_confirmation.is_some() && authority.plan_ref.is_none()
-        || authority.plan_decision_ref.is_some() && authority.plan_confirmation.is_none()
-    {
+    if authority.plan_confirmation.is_some() && authority.plan_ref.is_none() {
         return Err(compact_checkpoint_authority_invalid());
     }
     if let Some(plan_ref) = &authority.plan_ref {
@@ -3524,7 +3516,25 @@ fn decode_compact_checkpoint_record(
     if let Some(reservation) = &checkpoint.active.provider_reservation {
         validate_provider_reservation(reservation, authority)?;
     }
+    if let Some(settlement) = &checkpoint.active.pending_provider_control_settlement {
+        settlement.validate()?;
+        if settlement.run_id() != authority.run_id
+            || settlement.input_id() != authority.current_input_id
+            || settlement.control_epoch() != authority.control_epoch
+        {
+            return Err(HostV2StorageError::invalid(
+                "session_kernel_checkpoint_control_settlement_invalid",
+                "Session Kernel checkpoint control settlement does not bind current authority",
+            ));
+        }
+    }
     validate_compact_intervention_state(&checkpoint.active, authority)?;
+    if authority.plan_decision_ref.is_some()
+        && authority.plan_confirmation.is_none()
+        && !compact_checkpoint_has_intervention_accepted_plan(&checkpoint)
+    {
+        return Err(compact_checkpoint_authority_invalid());
+    }
     if let Some(review_ref) = &checkpoint.refs.review {
         validate_record_ref(review_ref, "reviewRef")?;
     }
@@ -3561,6 +3571,56 @@ fn decode_compact_checkpoint_record(
         _ => {}
     }
     Ok(checkpoint)
+}
+
+fn compact_checkpoint_has_intervention_accepted_plan(
+    checkpoint: &SessionKernelCompactCheckpointV3,
+) -> bool {
+    let Some(SessionWorkAuthorityV3::Plan { plan_revision }) =
+        checkpoint.authority.work_authority.as_ref()
+    else {
+        return false;
+    };
+    let Some(intervention) = checkpoint
+        .active
+        .user_intervention
+        .as_ref()
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(decision) = checkpoint
+        .active
+        .user_intervention_decision
+        .as_ref()
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if decision.get("decision").and_then(Value::as_str) != Some("select") {
+        return false;
+    }
+    let Some(option_id) = decision.get("optionId").and_then(Value::as_str) else {
+        return false;
+    };
+    intervention
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                let Some(option) = option.as_object() else {
+                    return false;
+                };
+                option.get("optionId").and_then(Value::as_str) == Some(option_id)
+                    && option.get("kind").and_then(Value::as_str) == Some("executable")
+                    && option
+                        .get("candidatePlan")
+                        .and_then(Value::as_object)
+                        .and_then(|plan| plan.get("planRevision"))
+                        .and_then(Value::as_str)
+                        == Some(plan_revision.as_str())
+            })
+        })
 }
 
 fn validate_compact_intervention_state(
@@ -3646,8 +3706,7 @@ fn validate_compact_intervention_state(
         || research.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
         || research.get("inputId").and_then(Value::as_str)
             != Some(authority.current_input_id.as_str())
-        || research.get("controlEpoch").and_then(Value::as_u64)
-            != Some(authority.control_epoch)
+        || research.get("controlEpoch").and_then(Value::as_u64) != Some(authority.control_epoch)
     {
         return Err(compact_intervention_state_invalid());
     }
@@ -3754,8 +3813,14 @@ fn validate_compact_intervention_state(
         }
 
         let mut digest_candidate = serde_json::Map::new();
-        digest_candidate.insert("discoveryId".to_string(), Value::String(discovery_id.to_string()));
-        digest_candidate.insert("operationId".to_string(), Value::String(operation_id.to_string()));
+        digest_candidate.insert(
+            "discoveryId".to_string(),
+            Value::String(discovery_id.to_string()),
+        );
+        digest_candidate.insert(
+            "operationId".to_string(),
+            Value::String(operation_id.to_string()),
+        );
         digest_candidate.insert("toolId".to_string(), Value::String(tool_id.to_string()));
         digest_candidate.insert(
             "argumentsDigest".to_string(),
@@ -3829,10 +3894,7 @@ fn validate_compact_intervention_state(
             {
                 return Err(compact_intervention_state_invalid());
             }
-            digest_candidate.insert(
-                "rejection".to_string(),
-                Value::Object(rejection.clone()),
-            );
+            digest_candidate.insert("rejection".to_string(), Value::Object(rejection.clone()));
         }
         digest_candidates.push(Value::Object(digest_candidate));
     }
@@ -3967,12 +4029,13 @@ fn validate_compact_user_intervention(
         || intervention.get("runId").and_then(Value::as_str) != Some(authority.run_id.as_str())
         || intervention.get("inputId").and_then(Value::as_str)
             != Some(authority.current_input_id.as_str())
-        || intervention.get("controlEpoch").and_then(Value::as_u64)
-            != Some(authority.control_epoch)
+        || intervention.get("controlEpoch").and_then(Value::as_u64) != Some(authority.control_epoch)
         || intervention.get("interactionId").and_then(Value::as_str)
             != Some(expected_interaction_id)
         || intervention.get("evidenceProgressDigest") != research.get("evidenceProgressDigest")
-        || intervention.get("interactionRevision").and_then(Value::as_str)
+        || intervention
+            .get("interactionRevision")
+            .and_then(Value::as_str)
             != Some(
                 format!(
                     "intervention-revision-{}",
@@ -4119,7 +4182,13 @@ fn validate_compact_intervention_candidate_action(
         .ok_or_else(compact_intervention_state_invalid)?;
     validate_private_projection_fields(
         action,
-        &["planActionId", "operationId", "toolId", "summary", "preview"],
+        &[
+            "planActionId",
+            "operationId",
+            "toolId",
+            "summary",
+            "preview",
+        ],
         &[],
         &["planActionId", "operationId", "toolId"],
         &["summary"],
@@ -4232,8 +4301,7 @@ fn validate_compact_user_intervention_decision(
     let option_id = decision.get("optionId").and_then(Value::as_str);
     let guidance = decision.get("guidance").and_then(Value::as_str);
     if !matches!(decision_kind, "select" | "revise" | "reject")
-        || decision.get("interactionId").and_then(Value::as_str)
-            != Some(expected_interaction_id)
+        || decision.get("interactionId").and_then(Value::as_str) != Some(expected_interaction_id)
         || guidance.is_some_and(|value| value.trim().is_empty())
     {
         return Err(compact_intervention_state_invalid());
@@ -4492,11 +4560,7 @@ fn validate_provider_reservation(
     if reservation.control_epoch != authority.control_epoch
         || !matches!(
             target_kind,
-            "planning"
-                | "planAction"
-                | "contextRead"
-                | "interventionResearch"
-                | "finalAnswer"
+            "planning" | "planAction" | "contextRead" | "interventionResearch" | "finalAnswer"
         )
         || !reservation.fact_projection.is_object()
         || !reservation.context_assembly.is_object()
@@ -6031,6 +6095,10 @@ impl SessionKernelProjectionSinkV2 {
         })?;
         self.remember_projection(session_id, host_run_id, &request)?;
         self.remember_latest_timeline(session_id, &timeline)?;
+        if composer_projection_may_change_for_session_event(&request.event.kind) {
+            self.active_runs
+                .notify_composer_projection(session_id, "sessionInteractionUpdated");
+        }
         Ok(SessionKernelHostProjectionReplyV2 {
             schema_version: SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA,
             projection_id: request.projection_id,
@@ -6837,6 +6905,20 @@ impl SessionKernelProjectionSinkV2 {
             .join("host-projections")
             .join(format!("{}.jsonl", sha256_path_component(host_run_id))))
     }
+}
+
+fn composer_projection_may_change_for_session_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "plan.confirmationReady"
+            | "plan.decided"
+            | "capability.awaiting"
+            | "authorization.decided"
+            | "userIntervention.changed"
+            | "wait.changed"
+            | "review.revised"
+            | "run.cancelled"
+    )
 }
 
 fn preflight_projection_store_append(
@@ -8207,6 +8289,7 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
         &[
             "runId",
             "inputId",
+            "controlEpoch",
             "planRevision",
             "title",
             "objective",
@@ -8221,7 +8304,7 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
         &["title", "objective", "narrative"],
         &["carriedSettlementRefs", "actions"],
         &["evidence", "predecessorPlanRef"],
-        &[],
+        &["controlEpoch"],
         &[],
     )?;
     if ["title", "objective", "narrative"].iter().any(|field| {
@@ -8233,10 +8316,20 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
             "Session private Plan text must be non-empty",
         ));
     }
+    let run_id = data
+        .get("runId")
+        .and_then(Value::as_str)
+        .expect("validated private Plan run identity");
+    let control_epoch = data
+        .get("controlEpoch")
+        .and_then(Value::as_u64)
+        .expect("validated private Plan control epoch");
     validate_private_plan_evidence(
         data.get("evidence")
             .and_then(Value::as_object)
             .expect("validated private Plan evidence"),
+        run_id,
+        control_epoch,
     )?;
     if let Some(predecessor) = data.get("predecessorPlanRef") {
         let predecessor = predecessor
@@ -8290,12 +8383,15 @@ fn validate_private_plan(data: &serde_json::Map<String, Value>) -> Result<(), Ho
 
 fn validate_private_plan_evidence(
     evidence: &serde_json::Map<String, Value>,
+    run_id: &str,
+    control_epoch: u64,
 ) -> Result<(), HostV2StorageError> {
     validate_private_projection_fields(
         evidence,
         &[
             "kernelFactRefs",
             "readResources",
+            "historicalRebinds",
             "blockingUnknowns",
             "nonBlockingUnknowns",
             "coverage",
@@ -8306,6 +8402,7 @@ fn validate_private_plan_evidence(
         &[
             "kernelFactRefs",
             "readResources",
+            "historicalRebinds",
             "blockingUnknowns",
             "nonBlockingUnknowns",
         ],
@@ -8343,6 +8440,7 @@ fn validate_private_plan_evidence(
         ));
     }
     let mut resource_refs = HashSet::new();
+    let mut resource_evidence = HashMap::<String, (String, HashSet<String>)>::new();
     for resource in resources {
         let resource = resource.as_object().ok_or_else(|| {
             private_projection_data_invalid("Session private Plan read evidence is invalid")
@@ -8376,28 +8474,171 @@ fn validate_private_plan_evidence(
                 "Session private Plan read evidence summary must be non-empty",
             ));
         }
-        validate_sha256_digest(
-            resource
-                .get("digest")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    private_projection_data_invalid(
-                        "Session private Plan read evidence digest is invalid",
-                    )
-                })?,
-            "planEvidence.readResource.digest",
-        )
-        .map_err(|_| {
-            private_projection_data_invalid("Session private Plan read evidence digest is invalid")
-        })?;
+        let resource_digest = resource
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                private_projection_data_invalid(
+                    "Session private Plan read evidence digest is invalid",
+                )
+            })?;
+        validate_sha256_digest(resource_digest, "planEvidence.readResource.digest").map_err(
+            |_| {
+                private_projection_data_invalid(
+                    "Session private Plan read evidence digest is invalid",
+                )
+            },
+        )?;
+        let resource_fact_refs = resource
+            .get("factRefs")
+            .and_then(Value::as_array)
+            .expect("validated resource fact refs");
         validate_private_unique_identities(
-            resource
-                .get("factRefs")
-                .and_then(Value::as_array)
-                .expect("validated resource fact refs"),
+            resource_fact_refs,
             "planEvidence.resourceFactRef",
             true,
         )?;
+        resource_evidence.insert(
+            resource_ref.to_owned(),
+            (
+                resource_digest.to_owned(),
+                resource_fact_refs
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        );
+    }
+
+    let historical_rebinds = evidence
+        .get("historicalRebinds")
+        .and_then(Value::as_array)
+        .expect("validated historical evidence rebinds");
+    if historical_rebinds.len() > 512 {
+        return Err(private_projection_data_invalid(
+            "Session private Plan contains too many historical evidence rebinds",
+        ));
+    }
+    let mut rebind_ids = HashSet::new();
+    for rebind in historical_rebinds {
+        let rebind = rebind.as_object().ok_or_else(|| {
+            private_projection_data_invalid("Session private historical evidence rebind is invalid")
+        })?;
+        validate_private_projection_fields(
+            rebind,
+            &[
+                "rebindId",
+                "sourceEventId",
+                "sourceEventDigest",
+                "sourceEventVersion",
+                "sourceRunId",
+                "sourceFactId",
+                "sourceControlEpoch",
+                "sourceOperationId",
+                "sourceToolId",
+                "subjectDigest",
+                "sourceEvidenceDigest",
+                "sourceCandidateDigest",
+                "currentRunId",
+                "currentControlEpoch",
+                "currentFactRef",
+                "currentEvidenceDigest",
+                "resourceRef",
+                "contentRelation",
+            ],
+            &[],
+            &[
+                "rebindId",
+                "sourceEventId",
+                "sourceRunId",
+                "sourceFactId",
+                "sourceOperationId",
+                "sourceToolId",
+                "currentRunId",
+                "currentFactRef",
+                "resourceRef",
+            ],
+            &["contentRelation"],
+            &[],
+            &[],
+            &[
+                "sourceEventVersion",
+                "sourceControlEpoch",
+                "currentControlEpoch",
+            ],
+            &[],
+        )?;
+        for digest_field in [
+            "sourceEventDigest",
+            "subjectDigest",
+            "sourceEvidenceDigest",
+            "sourceCandidateDigest",
+            "currentEvidenceDigest",
+        ] {
+            validate_sha256_digest(
+                rebind
+                    .get(digest_field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        private_projection_data_invalid(
+                            "Session private historical evidence digest is invalid",
+                        )
+                    })?,
+                "planEvidence.historicalRebind.digest",
+            )
+            .map_err(|_| {
+                private_projection_data_invalid(
+                    "Session private historical evidence digest is invalid",
+                )
+            })?;
+        }
+        let rebind_id = rebind
+            .get("rebindId")
+            .and_then(Value::as_str)
+            .expect("validated historical rebind identity");
+        let source_run_id = rebind
+            .get("sourceRunId")
+            .and_then(Value::as_str)
+            .expect("validated historical source run identity");
+        let current_run_id = rebind
+            .get("currentRunId")
+            .and_then(Value::as_str)
+            .expect("validated historical current run identity");
+        let current_control_epoch = rebind
+            .get("currentControlEpoch")
+            .and_then(Value::as_u64)
+            .expect("validated historical current control epoch");
+        let resource_ref = rebind
+            .get("resourceRef")
+            .and_then(Value::as_str)
+            .expect("validated historical resource identity");
+        let current_fact_ref = rebind
+            .get("currentFactRef")
+            .and_then(Value::as_str)
+            .expect("validated historical current fact identity");
+        let current_evidence_digest = rebind
+            .get("currentEvidenceDigest")
+            .and_then(Value::as_str)
+            .expect("validated historical current evidence digest");
+        let content_relation = rebind
+            .get("contentRelation")
+            .and_then(Value::as_str)
+            .expect("validated historical content relation");
+        let bound_resource = resource_evidence.get(resource_ref);
+        if !rebind_ids.insert(rebind_id)
+            || source_run_id == run_id
+            || current_run_id != run_id
+            || current_control_epoch != control_epoch
+            || !matches!(content_relation, "sameDigest" | "changedDigest")
+            || bound_resource.is_none_or(|(digest, fact_refs)| {
+                digest != current_evidence_digest || !fact_refs.contains(current_fact_ref)
+            })
+        {
+            return Err(private_projection_data_invalid(
+                "Session private historical rebind must bind an earlier Run to exact current read evidence",
+            ));
+        }
     }
 
     let blocking = evidence
@@ -8976,11 +9217,19 @@ fn validate_private_provider_completed(
             "answer",
             "noTool",
             "toolIntent",
+            "planEvidenceRefresh",
             "planActionComplete",
             "intervention",
         ],
     )?;
     require_private_enum(data, "terminalScope", &["turn", "providerTurn"])?;
+    if data.get("outputKind").and_then(Value::as_str) == Some("planEvidenceRefresh")
+        && data.get("terminalScope").and_then(Value::as_str) != Some("providerTurn")
+    {
+        return Err(private_projection_data_invalid(
+            "Plan evidence refresh can settle only the current Provider turn",
+        ));
+    }
     if let Some(answer_state) = data.get("answerState").and_then(Value::as_str) {
         if !matches!(answer_state, "provisional" | "committed")
             || data.get("outputKind").and_then(Value::as_str) != Some("answer")
@@ -9178,6 +9427,49 @@ fn validate_private_diagnostic(
     data: &serde_json::Map<String, Value>,
 ) -> Result<(), HostV2StorageError> {
     match data.get("stage").and_then(Value::as_str) {
+        Some("provider.structuredRepair") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "status",
+                    "code",
+                    "stage",
+                    "currentActivityCode",
+                ],
+                &[],
+                &["providerTurnId", "code"],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "status", &["recovering"])?;
+            require_private_enum(data, "currentActivityCode", &["session.validating"])?;
+        }
+        Some("provider.structuredRepairNoProgress") => {
+            validate_private_projection_fields(
+                data,
+                &[
+                    "providerTurnId",
+                    "status",
+                    "terminalScope",
+                    "code",
+                    "message",
+                    "stage",
+                ],
+                &["providerOutcome"],
+                &["providerTurnId", "code"],
+                &["message"],
+                &[],
+                &["providerOutcome"],
+                &[],
+                &[],
+            )?;
+            require_private_enum(data, "status", &["failed"])?;
+            require_private_enum(data, "terminalScope", &["turn"])?;
+        }
         Some("provider.toolCallQueue") => {
             validate_private_projection_fields(
                 data,
@@ -10329,6 +10621,27 @@ fn validate_public_agent_event_payload(
             &["status", "reason", "targetId", "decisionKind", "summary"],
             &["status", "reason", "summary"],
         ),
+        "diagnostic"
+            if event_kind == "workflow_stage"
+                && payload.get("status").and_then(Value::as_str) == Some("recovering") =>
+        {
+            (
+                &[
+                    "status",
+                    "code",
+                    "providerTurnId",
+                    "currentActivityCode",
+                    "summary",
+                ],
+                &[
+                    "status",
+                    "code",
+                    "providerTurnId",
+                    "currentActivityCode",
+                    "summary",
+                ],
+            )
+        }
         "diagnostic" if event_kind == "workflow_stage" => (
             &["status", "code", "providerTurnId", "reason", "orderedItems"],
             &["status", "code", "providerTurnId", "orderedItems"],
@@ -10542,6 +10855,7 @@ fn validate_public_agent_event_payload(
                             | "toolIntent"
                             | "answer"
                             | "noTool"
+                            | "planEvidenceRefresh"
                             | "planActionComplete"
                             | "intervention"
                     )
@@ -10612,9 +10926,13 @@ fn validate_public_agent_event_payload(
                 }
         }
         "diagnostic" => {
-            (event_kind == "workflow_stage" && channel == "progress" && visibility == "trace")
-                && status == Some("blocked")
-                && payload_text("code") == Some("session_kernel_provider_tool_calls_aborted")
+            (event_kind == "workflow_stage"
+                && channel == "progress"
+                && visibility == "trace"
+                && ((status == Some("blocked")
+                    && payload_text("code") == Some("session_kernel_provider_tool_calls_aborted"))
+                    || (status == Some("recovering")
+                        && payload_text("currentActivityCode") == Some("session.validating"))))
                 || (event_kind == "error"
                     && channel == "error"
                     && visibility == "conversation"
@@ -10933,7 +11251,10 @@ fn validate_public_projection_payload_types(
             }
             public_integer(payload, "controlEpoch", true)?;
             if payload.contains_key("orderedItems") {
-                if payload.get("outputKind").and_then(Value::as_str) == Some("plan") {
+                if matches!(
+                    payload.get("outputKind").and_then(Value::as_str),
+                    Some("plan" | "planEvidenceRefresh")
+                ) {
                     return Err(public_projection_shape_invalid(
                         "Planning completion cannot publish Provider text before confirmation settlement",
                     ));
@@ -11029,6 +11350,17 @@ fn validate_public_projection_payload_types(
             }
             public_optional_string(payload, "targetId", true)?;
             public_optional_string(payload, "decisionKind", false)?;
+        }
+        "diagnostic"
+            if event_kind == "workflow_stage"
+                && payload.get("status").and_then(Value::as_str) == Some("recovering") =>
+        {
+            for field in ["providerTurnId", "code"] {
+                public_string(payload, field, true)?;
+            }
+            for field in ["status", "currentActivityCode", "summary"] {
+                public_string(payload, field, false)?;
+            }
         }
         "diagnostic" if event_kind == "workflow_stage" => {
             public_string(payload, "providerTurnId", true)?;
@@ -11790,6 +12122,7 @@ fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageErr
                 "canonicalAction",
                 "targets",
                 "effectSummary",
+                "readEvidence",
             ],
             "Operation fact",
         )?;
@@ -11822,6 +12155,9 @@ fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageErr
         if let Some(targets) = fact.get("targets") {
             validate_public_identity_array(targets, "operationFact.targets")?;
         }
+        if let Some(read_evidence) = fact.get("readEvidence") {
+            validate_public_read_evidence(fact, read_evidence)?;
+        }
         if fact.contains_key("toolId") != fact.contains_key("canonicalAction")
             || (fact.contains_key("toolId")
                 && fact.get("toolId").and_then(Value::as_str)
@@ -11831,6 +12167,81 @@ fn validate_public_operation_facts(value: &Value) -> Result<(), HostV2StorageErr
                 "Operation fact canonicalAction differs from toolId",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_public_read_evidence(
+    operation_fact: &serde_json::Map<String, Value>,
+    value: &Value,
+) -> Result<(), HostV2StorageError> {
+    let evidence = public_exact_object(
+        value,
+        &[
+            "authorityKind",
+            "controlEpoch",
+            "evidenceDigest",
+            "resourceRefs",
+            "subjectDigest",
+            "toolId",
+        ],
+        &[],
+        "Operation read evidence",
+    )?;
+    if public_string(evidence, "authorityKind", false)? != "read"
+        || operation_fact.get("domain").and_then(Value::as_str) != Some("effect")
+        || !matches!(
+            operation_fact.get("factKind").and_then(Value::as_str),
+            Some(
+                "toolObserved"
+                    | "toolObservedAfterCancel"
+                    | "toolObservedAfterDeadline"
+                    | "toolObservedAfterCancelAndDeadline"
+            )
+        )
+        || operation_fact
+            .get("operationId")
+            .and_then(Value::as_str)
+            .is_none()
+        || operation_fact.get("toolId") != evidence.get("toolId")
+    {
+        return Err(public_projection_shape_invalid(
+            "Operation read evidence is not bound to an observed read effect",
+        ));
+    }
+    public_integer(evidence, "controlEpoch", true)?;
+    public_string(evidence, "toolId", true)?;
+    let digest = public_string(evidence, "evidenceDigest", true)?;
+    validate_sha256_digest(digest, "operationFact.readEvidence.evidenceDigest").map_err(|_| {
+        public_projection_shape_invalid("Operation read evidence digest is not canonical")
+    })?;
+    let subject_digest = public_string(evidence, "subjectDigest", true)?;
+    validate_sha256_digest(subject_digest, "operationFact.readEvidence.subjectDigest").map_err(
+        |_| public_projection_shape_invalid("Operation read subject digest is not canonical"),
+    )?;
+    let resource_refs = public_array(evidence, "resourceRefs")?;
+    if resource_refs.is_empty() {
+        return Err(public_projection_shape_invalid(
+            "Operation read evidence requires at least one resource reference",
+        ));
+    }
+    validate_public_identity_array(
+        evidence
+            .get("resourceRefs")
+            .expect("required read evidence resource refs"),
+        "operationFact.readEvidence.resourceRefs",
+    )?;
+    let mut previous: Option<&str> = None;
+    for resource_ref in resource_refs {
+        let resource_ref = resource_ref
+            .as_str()
+            .expect("validated read evidence resource ref");
+        if previous.is_some_and(|candidate| candidate >= resource_ref) {
+            return Err(public_projection_shape_invalid(
+                "Operation read evidence resource references are not canonical",
+            ));
+        }
+        previous = Some(resource_ref);
     }
     Ok(())
 }

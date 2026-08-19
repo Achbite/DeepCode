@@ -143,6 +143,63 @@ pub struct AgentComposerProjectionV1 {
     pub pending_interaction: Option<Value>,
 }
 
+impl AgentComposerProjectionV1 {
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        if self.schema_version != "deepcode.host.composer-projection.v1"
+            || self.revision.trim().is_empty()
+            || self.enabled_profiles.iter().any(|profile| {
+                profile.profile_id.trim().is_empty()
+                    || profile.name.trim().is_empty()
+                    || profile.model.trim().is_empty()
+                    || profile.provider_flavor.trim().is_empty()
+            })
+        {
+            return Err(KernelClientError::Api(
+                "agent_composer_projection_invalid: Composer projection is incomplete or uses an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        if self.selected_profile_id.as_deref().is_some_and(|selected| {
+            !self
+                .enabled_profiles
+                .iter()
+                .any(|profile| profile.profile_id == selected)
+        }) {
+            return Err(KernelClientError::Api(
+                "agent_composer_projection_invalid: selected Profile is not enabled".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComposerProjectionStreamEventV1 {
+    pub schema_version: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub revision: String,
+    pub projection: AgentComposerProjectionV1,
+}
+
+impl AgentComposerProjectionStreamEventV1 {
+    pub(crate) fn validate(&self) -> KernelClientResult<()> {
+        self.projection.validate()?;
+        if self.schema_version != "deepcode.host.composer-projection-stream.v1"
+            || !matches!(self.event_type.as_str(), "snapshot" | "updated")
+            || self.revision.trim().is_empty()
+            || self.revision != self.projection.revision
+        {
+            return Err(KernelClientError::Api(
+                "agent_composer_projection_stream_invalid: Composer replacement envelope is inconsistent"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl AgentProjectConversationTargetV1 {
     pub fn from_project(project: &Value) -> KernelClientResult<Self> {
         let value = project.get("conversationTarget").cloned().ok_or_else(|| {

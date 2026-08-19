@@ -61,6 +61,7 @@ const DIRECT_INVOCATION_TERMINAL: &str = "terminal";
 pub(super) const RUN_CAPABILITY_VERIFIER_MATERIAL_KIND: &str = "runCapabilityVerifier";
 pub(super) const RUN_CAPABILITY_VERIFIER_BOUND: &str = "bound";
 pub(super) const AUTHORITY_MATERIAL_RETIREMENT_PENDING: &str = "retirementPending";
+pub(super) const AUTHORITY_MATERIAL_CONSUMED: &str = "consumed";
 const AUTHORITY_MATERIAL_ACTIVE: &str = "active";
 const AUTHORITY_MATERIAL_AWAITING: &str = "awaiting";
 
@@ -1293,6 +1294,7 @@ impl AuthorityService {
                 expected_lifecycles: vec![
                     AUTHORITY_MATERIAL_ACTIVE.to_owned(),
                     AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                    AUTHORITY_MATERIAL_CONSUMED.to_owned(),
                     RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
                 ],
                 next_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),

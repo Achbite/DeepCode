@@ -901,6 +901,10 @@ pub(crate) async fn llm_profiles_patch(
             .provider_trace_v1
             .mark_profile_revision_available(profile_id, profile_revision)
         {
+            state
+                .host_services
+                .active_runs_v2
+                .notify_all_composer_projections("profilesUpdated");
             return ApiResponse::error_with_data(
                 "provider_profile_reenable_record_failed",
                 "LLM Profile configuration was saved, but its explicit availability record could not be persisted",
@@ -912,6 +916,10 @@ pub(crate) async fn llm_profiles_patch(
             );
         }
     }
+    state
+        .host_services
+        .active_runs_v2
+        .notify_all_composer_projections("profilesUpdated");
     let transition = json!({
         "status": "applied",
         "executorTransition": executor_transition,
@@ -1610,7 +1618,7 @@ pub(crate) async fn llm_chat_stream(
     if let Some(response_format) = body.get("responseFormat") {
         request_envelope["responseFormat"] = response_format.clone();
     }
-    llm_stream_response(
+    llm_stream_response_with_composer_invalidation(
         profile,
         request_envelope,
         request_id,
@@ -1620,6 +1628,7 @@ pub(crate) async fn llm_chat_stream(
             identity: trace_identity,
             dispatch_authority,
         },
+        Some(state.host_services.active_runs_v2.clone()),
         session_io_guard,
     )
 }

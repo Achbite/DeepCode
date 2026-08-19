@@ -72,6 +72,8 @@ export const HOST_CONVERSATION_DRAFT_TARGET_SCHEMA_V1 =
   'deepcode.host.conversation-draft-target.v1' as const;
 export const HOST_COMPOSER_PROJECTION_SCHEMA_V1 =
   'deepcode.host.composer-projection.v1' as const;
+export const HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1 =
+  'deepcode.host.composer-projection-stream.v1' as const;
 
 /**
  * Daemon-issued identity for a public or Project draft before a Session exists.
@@ -134,6 +136,282 @@ export interface AgentComposerProjectionV1 {
   blockReason?: AgentComposerBlockReasonV1;
   activeRun?: AgentComposerActiveRunV1;
   pendingInteraction?: AgentTimelinePendingInteraction;
+}
+
+/**
+ * Full-replacement companion stream for canonical Composer state.
+ *
+ * The Host owns admission and Run-retirement facts. Shells consume this
+ * envelope instead of inferring Profile mutability from conversation text or
+ * a locally observed terminal status.
+ */
+export interface AgentComposerProjectionStreamEventV1 {
+  schemaVersion: typeof HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1;
+  type: 'snapshot' | 'updated';
+  revision: string;
+  projection: AgentComposerProjectionV1;
+}
+
+export function decodeAgentComposerProjectionV1(
+  value: unknown,
+  expected: { projectId?: string; sessionId?: string } = {}
+): AgentComposerProjectionV1 {
+  const projection = composerRecordV1(value, 'composer projection');
+  composerExactKeysV1(projection, [
+    'schemaVersion',
+    'revision',
+    'conversationTarget',
+    'conversationDraftTarget',
+    'enabledProfiles',
+    'defaultProfileId',
+    'selectedProfileId',
+    'selectionMutable',
+    'canSubmit',
+    'blockReason',
+    'activeRun',
+    'pendingInteraction',
+  ], 'composer projection');
+  if (
+    projection.schemaVersion !== HOST_COMPOSER_PROJECTION_SCHEMA_V1
+    || !composerIdentityV1(projection.revision)
+    || !Array.isArray(projection.enabledProfiles)
+    || typeof projection.selectionMutable !== 'boolean'
+    || typeof projection.canSubmit !== 'boolean'
+  ) {
+    throw new Error('agent_composer_projection_invalid');
+  }
+  const enabledProfiles = projection.enabledProfiles.map((value) => {
+    const profile = composerRecordV1(value, 'composer profile');
+    composerExactKeysV1(profile, [
+      'profileId',
+      'name',
+      'model',
+      'providerFlavor',
+      'isDefault',
+    ], 'composer profile');
+    if (
+      !composerIdentityV1(profile.profileId)
+      || !composerIdentityV1(profile.name)
+      || !composerIdentityV1(profile.model)
+      || !['openai', 'deepseek', 'zhipu'].includes(
+        String(profile.providerFlavor)
+      )
+      || typeof profile.isDefault !== 'boolean'
+    ) throw new Error('agent_composer_profile_invalid');
+    return profile as unknown as AgentComposerProfileV1;
+  });
+  const profileIds = enabledProfiles.map((profile) => profile.profileId);
+  if (new Set(profileIds).size !== profileIds.length) {
+    throw new Error('agent_composer_profile_duplicate');
+  }
+  const defaultProfileId = composerOptionalIdentityV1(
+    projection.defaultProfileId,
+    'defaultProfileId'
+  );
+  const selectedProfileId = composerOptionalIdentityV1(
+    projection.selectedProfileId,
+    'selectedProfileId'
+  );
+  if (
+    (defaultProfileId !== undefined && !profileIds.includes(defaultProfileId))
+    || (selectedProfileId !== undefined && !profileIds.includes(selectedProfileId))
+    || enabledProfiles.filter((profile) => profile.isDefault).length > 1
+    || enabledProfiles.some((profile) =>
+      profile.isDefault !== (profile.profileId === defaultProfileId)
+    )
+  ) throw new Error('agent_composer_profile_binding_invalid');
+  const conversationTarget = projection.conversationTarget === undefined
+    ? undefined
+    : decodeComposerConversationTargetV1(projection.conversationTarget);
+  const conversationDraftTarget = projection.conversationDraftTarget === undefined
+    ? undefined
+    : decodeComposerDraftTargetV1(projection.conversationDraftTarget);
+  if ((conversationTarget === undefined) === (conversationDraftTarget === undefined)) {
+    throw new Error('agent_composer_target_ambiguous');
+  }
+  if (
+    expected.sessionId !== undefined
+    && (
+      conversationTarget?.sessionId !== expected.sessionId
+      || conversationDraftTarget !== undefined
+    )
+  ) throw new Error('agent_composer_session_target_mismatch');
+  if (
+    expected.projectId !== undefined
+    && (
+      conversationTarget?.projectId !== expected.projectId
+      && (
+        conversationDraftTarget?.kind !== 'project'
+        || conversationDraftTarget.projectId !== expected.projectId
+      )
+    )
+  ) throw new Error('agent_composer_project_target_mismatch');
+  if (
+    expected.sessionId === undefined
+    && expected.projectId === undefined
+    && conversationDraftTarget?.kind !== 'public'
+  ) throw new Error('agent_composer_public_target_mismatch');
+  const blockReason = composerOptionalEnumV1(
+    projection.blockReason,
+    ['activeRun', 'pendingInteraction', 'noEnabledProfile', 'selectedProfileUnavailable'],
+    'blockReason'
+  ) as AgentComposerBlockReasonV1 | undefined;
+  const activeRun = projection.activeRun === undefined
+    ? undefined
+    : decodeComposerActiveRunV1(projection.activeRun);
+  if (
+    (blockReason === 'activeRun') !== (activeRun !== undefined)
+    || projection.selectionMutable
+      !== (activeRun === undefined && projection.pendingInteraction === undefined)
+    || projection.canSubmit
+      !== (selectedProfileId !== undefined && activeRun?.status !== 'retiring')
+    || (projection.pendingInteraction !== undefined
+      && typeof projection.pendingInteraction !== 'object')
+  ) throw new Error('agent_composer_state_invalid');
+  return {
+    schemaVersion: HOST_COMPOSER_PROJECTION_SCHEMA_V1,
+    revision: projection.revision as string,
+    ...(conversationTarget ? { conversationTarget } : {}),
+    ...(conversationDraftTarget ? { conversationDraftTarget } : {}),
+    enabledProfiles,
+    ...(defaultProfileId ? { defaultProfileId } : {}),
+    ...(selectedProfileId ? { selectedProfileId } : {}),
+    selectionMutable: projection.selectionMutable as boolean,
+    canSubmit: projection.canSubmit as boolean,
+    ...(blockReason ? { blockReason } : {}),
+    ...(activeRun ? { activeRun } : {}),
+    ...(projection.pendingInteraction === undefined
+      ? {}
+      : {
+          pendingInteraction:
+            projection.pendingInteraction as AgentTimelinePendingInteraction,
+        }),
+  };
+}
+
+export function decodeAgentComposerProjectionStreamEventV1(
+  value: unknown,
+  expected: { projectId?: string; sessionId?: string } = {}
+): AgentComposerProjectionStreamEventV1 {
+  const event = composerRecordV1(value, 'composer stream event');
+  composerExactKeysV1(event, [
+    'schemaVersion',
+    'type',
+    'revision',
+    'projection',
+  ], 'composer stream event');
+  const projection = decodeAgentComposerProjectionV1(
+    event.projection,
+    expected
+  );
+  if (
+    event.schemaVersion !== HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1
+    || (event.type !== 'snapshot' && event.type !== 'updated')
+    || event.revision !== projection.revision
+  ) throw new Error('agent_composer_projection_stream_invalid');
+  return {
+    schemaVersion: HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1,
+    type: event.type,
+    revision: projection.revision,
+    projection,
+  };
+}
+
+function decodeComposerConversationTargetV1(
+  value: unknown
+): AgentConversationTargetV1 {
+  const target = composerRecordV1(value, 'conversation target');
+  composerExactKeysV1(target, [
+    'schemaVersion', 'targetId', 'targetRevision', 'sessionId', 'projectId',
+    'workspaceScopeKey', 'workspaceBindingRef', 'workspaceBindingIdentity',
+  ], 'conversation target');
+  if (
+    target.schemaVersion !== 'deepcode.host.conversation-target.v1'
+    || !composerIdentityV1(target.targetId)
+    || !composerIdentityV1(target.targetRevision)
+    || !composerIdentityV1(target.sessionId)
+    || !composerIdentityV1(target.workspaceScopeKey)
+  ) throw new Error('agent_composer_conversation_target_invalid');
+  for (const optional of [
+    'projectId', 'workspaceBindingRef', 'workspaceBindingIdentity',
+  ] as const) composerOptionalIdentityV1(target[optional], optional);
+  return target as unknown as AgentConversationTargetV1;
+}
+
+function decodeComposerDraftTargetV1(
+  value: unknown
+): AgentConversationDraftTargetV1 {
+  const target = composerRecordV1(value, 'conversation draft target');
+  composerExactKeysV1(target, [
+    'schemaVersion', 'kind', 'targetId', 'targetRevision', 'projectId',
+    'workspaceScopeKey', 'workspaceId', 'workspaceHash',
+    'workspaceBindingRef', 'workspaceBindingIdentity',
+  ], 'conversation draft target');
+  if (
+    target.schemaVersion !== HOST_CONVERSATION_DRAFT_TARGET_SCHEMA_V1
+    || (target.kind !== 'public' && target.kind !== 'project')
+    || !composerIdentityV1(target.targetId)
+    || !composerIdentityV1(target.targetRevision)
+    || !composerIdentityV1(target.workspaceScopeKey)
+    || (target.kind === 'project' && !composerIdentityV1(target.projectId))
+  ) throw new Error('agent_composer_draft_target_invalid');
+  return target as unknown as AgentConversationDraftTargetV1;
+}
+
+function decodeComposerActiveRunV1(value: unknown): AgentComposerActiveRunV1 {
+  const run = composerRecordV1(value, 'composer active run');
+  composerExactKeysV1(run, ['hostRunId', 'runId', 'status'], 'composer active run');
+  if (
+    !composerIdentityV1(run.hostRunId)
+    || !composerIdentityV1(run.runId)
+    || (run.status !== 'active' && run.status !== 'retiring')
+  ) throw new Error('agent_composer_active_run_invalid');
+  return run as unknown as AgentComposerActiveRunV1;
+}
+
+function composerRecordV1(
+  value: unknown,
+  field: string
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`agent_composer_${field.replaceAll(' ', '_')}_invalid`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function composerExactKeysV1(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  field: string
+): void {
+  if (Object.keys(value).some((key) => !allowed.includes(key))) {
+    throw new Error(`agent_composer_${field.replaceAll(' ', '_')}_invalid`);
+  }
+}
+
+function composerIdentityV1(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() === value && value.length > 0;
+}
+
+function composerOptionalIdentityV1(
+  value: unknown,
+  field: string
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (!composerIdentityV1(value)) throw new Error(`agent_composer_${field}_invalid`);
+  return value;
+}
+
+function composerOptionalEnumV1(
+  value: unknown,
+  allowed: readonly string[],
+  field: string
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !allowed.includes(value)) {
+    throw new Error(`agent_composer_${field}_invalid`);
+  }
+  return value;
 }
 
 export const PRIVATE_ANALYSIS_PROJECTION_SCHEMA_V1 =

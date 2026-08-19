@@ -231,7 +231,19 @@ pub(crate) async fn agent_project_rebind(
         );
         return ApiResponse::error("agent_project_persist_failed", message);
     }
-    match public_agent_project_value(&result) {
+    let public_result = public_agent_project_value(&result);
+    drop(gui);
+    for session_id in &bound_session_ids {
+        state
+            .host_services
+            .active_runs_v2
+            .notify_composer_projection(session_id, "projectRebound");
+    }
+    state
+        .host_services
+        .active_runs_v2
+        .notify_all_composer_projections("projectRebound");
+    match public_result {
         Ok(project) => ApiResponse::ok(json!({ "project": project })),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
@@ -326,7 +338,19 @@ pub(crate) async fn agent_project_delete(
             .unwrap_or(error);
         return ApiResponse::error("agent_project_persist_failed", message);
     }
-    match public_agent_project_values(gui.projects.clone()) {
+    let public_result = public_agent_project_values(gui.projects.clone());
+    drop(gui);
+    for session_id in &bound_session_ids {
+        state
+            .host_services
+            .active_runs_v2
+            .notify_composer_projection(session_id, "projectDeleted");
+    }
+    state
+        .host_services
+        .active_runs_v2
+        .notify_all_composer_projections("projectDeleted");
+    match public_result {
         Ok(projects) => ApiResponse::ok(json!({ "projects": projects })),
         Err(error) => ApiResponse::error(error.code, error.message),
     }

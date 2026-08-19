@@ -44,6 +44,160 @@ pub(crate) struct SessionProviderStructuredRepairSidecarV1 {
     pub(crate) source_response_digest: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderControlReceiptSidecarV2 {
+    pub(crate) schema_version: String,
+    pub(crate) call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) arguments_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderPlanEvidenceRefreshSidecarV1 {
+    pub(crate) error_code: String,
+    pub(crate) stale_fact_refs: Vec<String>,
+    pub(crate) resource_refs: Vec<String>,
+    pub(crate) read_subject_digests: Vec<String>,
+    pub(crate) blocking_unknown_ids: Vec<String>,
+    pub(crate) candidate_scope_digest: String,
+    pub(crate) requires_current_read: bool,
+    pub(crate) snapshot_high_water: u64,
+    pub(crate) fact_set_digest: String,
+    pub(crate) evidence_debt_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderPlanPreviewRejectionItemSidecarV1 {
+    pub(crate) plan_action_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) tool_id: String,
+    pub(crate) reason: String,
+    pub(crate) guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderPlanPreviewRejectionSidecarV1 {
+    pub(crate) plan_revision: String,
+    pub(crate) rejections: Vec<SessionProviderPlanPreviewRejectionItemSidecarV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderPlanDecisionSidecarV2 {
+    pub(crate) plan_revision: String,
+    pub(crate) decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) guidance: Option<String>,
+    pub(crate) recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderPlanActionSettlementSidecarV2 {
+    pub(crate) kind: String,
+    pub(crate) plan_revision: String,
+    pub(crate) plan_action_id: String,
+    pub(crate) control_epoch: u64,
+    pub(crate) outcome: String,
+    pub(crate) provider_turn_id: String,
+    pub(crate) control_call_id: String,
+    pub(crate) control_arguments_digest: String,
+    pub(crate) snapshot_high_water: u64,
+    pub(crate) recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionProviderUserInterventionDecisionSidecarV4 {
+    pub(crate) interaction_id: String,
+    pub(crate) interaction_revision: String,
+    pub(crate) candidate_set_digest: String,
+    pub(crate) decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) option_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) guidance: Option<String>,
+    pub(crate) caller_request_id: String,
+    pub(crate) recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum SessionProviderControlSettlementSidecarV2 {
+    PlanEvidenceRefresh {
+        schema_version: String,
+        run_id: String,
+        input_id: String,
+        control_epoch: u64,
+        predecessor_provider_turn_id: String,
+        next_target_kind: String,
+        control: SessionProviderControlReceiptSidecarV2,
+        refresh: SessionProviderPlanEvidenceRefreshSidecarV1,
+        recorded_at: String,
+        settlement_digest: String,
+    },
+    PlanPreviewRejected {
+        schema_version: String,
+        run_id: String,
+        input_id: String,
+        control_epoch: u64,
+        predecessor_provider_turn_id: String,
+        next_target_kind: String,
+        control: SessionProviderControlReceiptSidecarV2,
+        preview: SessionProviderPlanPreviewRejectionSidecarV1,
+        recorded_at: String,
+        settlement_digest: String,
+    },
+    PlanDecision {
+        schema_version: String,
+        run_id: String,
+        input_id: String,
+        control_epoch: u64,
+        predecessor_provider_turn_id: String,
+        next_target_kind: String,
+        control: SessionProviderControlReceiptSidecarV2,
+        decision: SessionProviderPlanDecisionSidecarV2,
+        recorded_at: String,
+        settlement_digest: String,
+    },
+    PlanActionComplete {
+        schema_version: String,
+        run_id: String,
+        input_id: String,
+        control_epoch: u64,
+        predecessor_provider_turn_id: String,
+        next_target_kind: String,
+        control: SessionProviderControlReceiptSidecarV2,
+        settlement: SessionProviderPlanActionSettlementSidecarV2,
+        recorded_at: String,
+        settlement_digest: String,
+    },
+    UserInterventionDecision {
+        schema_version: String,
+        run_id: String,
+        input_id: String,
+        control_epoch: u64,
+        predecessor_provider_turn_id: String,
+        next_target_kind: String,
+        control: SessionProviderControlReceiptSidecarV2,
+        decision: SessionProviderUserInterventionDecisionSidecarV4,
+        disposition: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accepted_plan_revision: Option<String>,
+        recorded_at: String,
+        settlement_digest: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum SessionProviderCacheLaneResetReasonV1 {
@@ -304,6 +458,8 @@ pub(crate) struct SessionProviderAdmissionSidecarV2 {
     pub(crate) continuation_operation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) continuation_outcomes: Vec<SessionProviderContinuationOutcomeV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) control_settlement: Option<SessionProviderControlSettlementSidecarV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) structured_repair: Option<SessionProviderStructuredRepairSidecarV1>,
     pub(crate) cache_lane: SessionProviderCacheLaneSidecarV2,
@@ -639,11 +795,37 @@ impl SessionProviderAdmissionSidecarV2 {
                 "Provider append continuation operation identities are missing or out of scope",
             ));
         }
-        if control_continuation_append && self.purpose != ProviderTracePurposeV1::Continuation {
+        let expected_control_purpose = if self.target_binding.kind_name() == "finalAnswer" {
+            ProviderTracePurposeV1::FinalAnswer
+        } else {
+            ProviderTracePurposeV1::Continuation
+        };
+        if control_continuation_append != self.control_settlement.is_some()
+            || control_continuation_append && self.purpose != expected_control_purpose
+        {
             return Err(HostV2StorageError::invalid(
                 "provider_control_continuation_invalid",
-                "Session control continuation must remain in the current Provider turn authority",
+                "Session control continuation conflicts with its private settlement or Provider turn authority",
             ));
+        }
+        if let Some(settlement) = &self.control_settlement {
+            settlement.validate()?;
+            if settlement.run_id() != self.run_id
+                || settlement.input_id() != self.user_turn_id
+                || settlement.control_epoch() != self.control_epoch
+                || settlement.predecessor_provider_turn_id()
+                    != self
+                        .cache_lane
+                        .predecessor_request_id
+                        .as_deref()
+                        .unwrap_or_default()
+                || settlement.next_target_kind() != self.target_binding.kind_name()
+            {
+                return Err(HostV2StorageError::invalid(
+                    "provider_control_continuation_invalid",
+                    "Session control settlement does not bind the exact admitted continuation",
+                ));
+            }
         }
         if structured_repair_append != self.structured_repair.is_some()
             || structured_repair_append && self.purpose != ProviderTracePurposeV1::Continuation
@@ -791,6 +973,538 @@ impl SessionProviderAdmissionSidecarV2 {
         }
         Ok(())
     }
+}
+
+impl SessionProviderControlSettlementSidecarV2 {
+    pub(crate) fn run_id(&self) -> &str {
+        match self {
+            Self::PlanEvidenceRefresh { run_id, .. }
+            | Self::PlanPreviewRejected { run_id, .. }
+            | Self::PlanDecision { run_id, .. }
+            | Self::PlanActionComplete { run_id, .. }
+            | Self::UserInterventionDecision { run_id, .. } => run_id,
+        }
+    }
+
+    pub(crate) fn input_id(&self) -> &str {
+        match self {
+            Self::PlanEvidenceRefresh { input_id, .. }
+            | Self::PlanPreviewRejected { input_id, .. }
+            | Self::PlanDecision { input_id, .. }
+            | Self::PlanActionComplete { input_id, .. }
+            | Self::UserInterventionDecision { input_id, .. } => input_id,
+        }
+    }
+
+    pub(crate) fn control_epoch(&self) -> u64 {
+        match self {
+            Self::PlanEvidenceRefresh { control_epoch, .. }
+            | Self::PlanPreviewRejected { control_epoch, .. }
+            | Self::PlanDecision { control_epoch, .. }
+            | Self::PlanActionComplete { control_epoch, .. }
+            | Self::UserInterventionDecision { control_epoch, .. } => *control_epoch,
+        }
+    }
+
+    pub(crate) fn predecessor_provider_turn_id(&self) -> &str {
+        match self {
+            Self::PlanEvidenceRefresh {
+                predecessor_provider_turn_id,
+                ..
+            }
+            | Self::PlanPreviewRejected {
+                predecessor_provider_turn_id,
+                ..
+            }
+            | Self::PlanDecision {
+                predecessor_provider_turn_id,
+                ..
+            }
+            | Self::PlanActionComplete {
+                predecessor_provider_turn_id,
+                ..
+            }
+            | Self::UserInterventionDecision {
+                predecessor_provider_turn_id,
+                ..
+            } => predecessor_provider_turn_id,
+        }
+    }
+
+    pub(crate) fn next_target_kind(&self) -> &str {
+        match self {
+            Self::PlanEvidenceRefresh {
+                next_target_kind, ..
+            }
+            | Self::PlanPreviewRejected {
+                next_target_kind, ..
+            }
+            | Self::PlanDecision {
+                next_target_kind, ..
+            }
+            | Self::PlanActionComplete {
+                next_target_kind, ..
+            }
+            | Self::UserInterventionDecision {
+                next_target_kind, ..
+            } => next_target_kind,
+        }
+    }
+
+    pub(crate) fn control(&self) -> &SessionProviderControlReceiptSidecarV2 {
+        match self {
+            Self::PlanEvidenceRefresh { control, .. }
+            | Self::PlanPreviewRejected { control, .. }
+            | Self::PlanDecision { control, .. }
+            | Self::PlanActionComplete { control, .. }
+            | Self::UserInterventionDecision { control, .. } => control,
+        }
+    }
+
+    pub(crate) fn expected_parent_tool_name(&self) -> &'static str {
+        match self {
+            Self::PlanEvidenceRefresh { .. }
+            | Self::PlanPreviewRejected { .. }
+            | Self::PlanDecision { .. } => "deepcode_session_plan_propose_v5",
+            Self::PlanActionComplete { .. } => "deepcode_session_plan_action_complete_v2",
+            Self::UserInterventionDecision { .. } => "deepcode_session_intervention_propose_v1",
+        }
+    }
+
+    pub(crate) fn continuation_output(&self) -> Value {
+        match self {
+            Self::PlanEvidenceRefresh { refresh, .. } => json!({
+                "schemaVersion": "deepcode.session.control-continuation-result.v2",
+                "status": "rejected",
+                "control": self.expected_parent_tool_name(),
+                "reasonCode": "planEvidenceRefreshRequired",
+                "errorCode": refresh.error_code,
+                "nextTargetKind": self.next_target_kind(),
+                "snapshotHighWater": refresh.snapshot_high_water,
+                "factSetDigest": refresh.fact_set_digest,
+                "evidenceDebtDigest": refresh.evidence_debt_digest,
+                "staleFactRefs": refresh.stale_fact_refs,
+                "resourceRefs": refresh.resource_refs,
+                "readSubjectDigests": refresh.read_subject_digests,
+                "blockingUnknownIds": refresh.blocking_unknown_ids,
+                "candidateScopeDigest": refresh.candidate_scope_digest,
+                "requiresCurrentRead": refresh.requires_current_read,
+            }),
+            Self::PlanPreviewRejected { preview, .. } => json!({
+                "schemaVersion": "deepcode.session.control-continuation-result.v2",
+                "status": "rejected",
+                "control": self.expected_parent_tool_name(),
+                "reasonCode": "planPreviewRejected",
+                "nextTargetKind": self.next_target_kind(),
+                "planRevision": preview.plan_revision,
+                "rejections": preview.rejections,
+            }),
+            Self::PlanDecision { decision, .. } => json!({
+                "schemaVersion": "deepcode.session.control-continuation-result.v2",
+                "status": "settled",
+                "control": self.expected_parent_tool_name(),
+                "nextTargetKind": self.next_target_kind(),
+                "decision": decision.decision,
+                "planRevision": decision.plan_revision,
+            }),
+            Self::PlanActionComplete { settlement, .. } => json!({
+                "schemaVersion": "deepcode.session.control-continuation-result.v2",
+                "status": "settled",
+                "control": self.expected_parent_tool_name(),
+                "nextTargetKind": self.next_target_kind(),
+                "planRevision": settlement.plan_revision,
+                "planActionId": settlement.plan_action_id,
+                "outcome": settlement.outcome,
+                "snapshotHighWater": settlement.snapshot_high_water,
+            }),
+            Self::UserInterventionDecision {
+                decision,
+                disposition,
+                accepted_plan_revision,
+                ..
+            } => json!({
+                "schemaVersion": "deepcode.session.control-continuation-result.v2",
+                "status": "settled",
+                "control": self.expected_parent_tool_name(),
+                "nextTargetKind": self.next_target_kind(),
+                "decision": decision.decision,
+                "interactionId": decision.interaction_id,
+                "interactionRevision": decision.interaction_revision,
+                "candidateSetDigest": decision.candidate_set_digest,
+                "optionId": decision.option_id,
+                "disposition": disposition,
+                "acceptedPlanRevision": accepted_plan_revision,
+            }),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HostV2StorageError> {
+        let value = serde_json::to_value(self).map_err(|error| {
+            HostV2StorageError::invalid(
+                "provider_control_settlement_invalid",
+                format!("Encode Session control settlement: {error}"),
+            )
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "provider_control_settlement_invalid",
+                "Session control settlement must be an exact object",
+            )
+        })?;
+        let schema_version = object
+            .get("schemaVersion")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let recorded_at = object
+            .get("recordedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let settlement_digest = object
+            .get("settlementDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if schema_version != "deepcode.session.provider-control-settlement.v2"
+            || self.control_epoch() == 0
+        {
+            return Err(invalid_control_settlement());
+        }
+        for (identity, field, limit) in [
+            (self.run_id(), "controlSettlement.runId", 512),
+            (self.input_id(), "controlSettlement.inputId", 512),
+            (
+                self.predecessor_provider_turn_id(),
+                "controlSettlement.predecessorProviderTurnId",
+                512,
+            ),
+            (recorded_at, "controlSettlement.recordedAt", 1024),
+        ] {
+            validate_bounded_identity(identity, field, limit)?;
+        }
+        validate_sha256_digest(settlement_digest, "controlSettlement.settlementDigest")?;
+        let mut unsigned = value.clone();
+        unsigned
+            .as_object_mut()
+            .expect("settlement object was checked")
+            .remove("settlementDigest");
+        if stable_json_sha256(&unsigned)? != settlement_digest {
+            return Err(invalid_control_settlement());
+        }
+        validate_control_receipt(self.control(), self.expected_parent_tool_name())?;
+        match self {
+            Self::PlanEvidenceRefresh {
+                next_target_kind,
+                refresh,
+                ..
+            } => {
+                if next_target_kind != "planning"
+                    || !matches!(
+                        refresh.error_code.as_str(),
+                        "session_kernel_provider_plan_evidence_stale"
+                            | "session_kernel_provider_plan_resource_evidence_mismatch"
+                            | "session_kernel_provider_plan_blocking_unknowns"
+                            | "session_kernel_provider_plan_evidence_debt_unresolved"
+                    )
+                {
+                    return Err(invalid_control_settlement());
+                }
+                validate_control_identity_list(
+                    &refresh.stale_fact_refs,
+                    "controlSettlement.refresh.staleFactRef",
+                    512,
+                )?;
+                validate_control_identity_list(
+                    &refresh.resource_refs,
+                    "controlSettlement.refresh.resourceRef",
+                    4096,
+                )?;
+                validate_control_digest_list(
+                    &refresh.read_subject_digests,
+                    "controlSettlement.refresh.readSubjectDigest",
+                )?;
+                validate_control_identity_list(
+                    &refresh.blocking_unknown_ids,
+                    "controlSettlement.refresh.blockingUnknownId",
+                    512,
+                )?;
+                let reason_has_evidence = match refresh.error_code.as_str() {
+                    "session_kernel_provider_plan_evidence_stale" => {
+                        !refresh.stale_fact_refs.is_empty()
+                    }
+                    "session_kernel_provider_plan_resource_evidence_mismatch" => {
+                        !refresh.resource_refs.is_empty()
+                    }
+                    "session_kernel_provider_plan_blocking_unknowns" => {
+                        !refresh.blocking_unknown_ids.is_empty()
+                    }
+                    "session_kernel_provider_plan_evidence_debt_unresolved" => {
+                        refresh.requires_current_read
+                            || !refresh.resource_refs.is_empty()
+                            || !refresh.read_subject_digests.is_empty()
+                    }
+                    _ => false,
+                };
+                if !reason_has_evidence {
+                    return Err(invalid_control_settlement());
+                }
+                validate_sha256_digest(
+                    &refresh.candidate_scope_digest,
+                    "controlSettlement.refresh.candidateScopeDigest",
+                )?;
+                validate_sha256_digest(
+                    &refresh.fact_set_digest,
+                    "controlSettlement.refresh.factSetDigest",
+                )?;
+                validate_sha256_digest(
+                    &refresh.evidence_debt_digest,
+                    "controlSettlement.refresh.evidenceDebtDigest",
+                )?;
+            }
+            Self::PlanPreviewRejected {
+                next_target_kind,
+                preview,
+                ..
+            } => {
+                if next_target_kind != "planning"
+                    || preview.rejections.is_empty()
+                    || preview.rejections.len() > 128
+                {
+                    return Err(invalid_control_settlement());
+                }
+                validate_bounded_identity(
+                    &preview.plan_revision,
+                    "controlSettlement.preview.planRevision",
+                    4096,
+                )?;
+                let mut previous_key: Option<String> = None;
+                for rejection in &preview.rejections {
+                    for (identity, field) in [
+                        (
+                            rejection.plan_action_id.as_str(),
+                            "controlSettlement.preview.rejection.planActionId",
+                        ),
+                        (
+                            rejection.operation_id.as_str(),
+                            "controlSettlement.preview.rejection.operationId",
+                        ),
+                        (
+                            rejection.tool_id.as_str(),
+                            "controlSettlement.preview.rejection.toolId",
+                        ),
+                    ] {
+                        validate_bounded_identity(identity, field, 4096)?;
+                    }
+                    if !matches!(
+                        rejection.reason.as_str(),
+                        "toolNotRegistered"
+                            | "toolUnavailable"
+                            | "invalidArguments"
+                            | "requestedScopeInvalid"
+                            | "settingsDenied"
+                            | "staleToolContext"
+                            | "staleControlEpoch"
+                    ) || rejection.guidance.trim().is_empty()
+                        || rejection.guidance.len() > 65_536
+                    {
+                        return Err(invalid_control_settlement());
+                    }
+                    let key = format!(
+                        "{}\0{}\0{}",
+                        rejection.plan_action_id, rejection.operation_id, rejection.tool_id
+                    );
+                    if previous_key
+                        .as_ref()
+                        .is_some_and(|previous| previous >= &key)
+                    {
+                        return Err(invalid_control_settlement());
+                    }
+                    previous_key = Some(key);
+                }
+            }
+            Self::PlanDecision {
+                next_target_kind,
+                decision,
+                recorded_at,
+                ..
+            } => {
+                let expected_target = match decision.decision.as_str() {
+                    "accept" => "planAction",
+                    "revise" => "planning",
+                    "reject" => "finalAnswer",
+                    _ => return Err(invalid_control_settlement()),
+                };
+                if next_target_kind != expected_target
+                    || decision.recorded_at != *recorded_at
+                    || decision.plan_revision.trim().is_empty()
+                    || decision.decision == "revise"
+                        && decision
+                            .guidance
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                    || decision.decision != "revise"
+                        && decision
+                            .guidance
+                            .as_ref()
+                            .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(invalid_control_settlement());
+                }
+                validate_bounded_identity(
+                    &decision.plan_revision,
+                    "controlSettlement.decision.planRevision",
+                    512,
+                )?;
+            }
+            Self::PlanActionComplete {
+                next_target_kind,
+                settlement,
+                predecessor_provider_turn_id,
+                control_epoch,
+                control,
+                recorded_at,
+                ..
+            } => {
+                if !matches!(next_target_kind.as_str(), "planAction" | "finalAnswer")
+                    || settlement.kind != "planActionComplete"
+                    || settlement.provider_turn_id != *predecessor_provider_turn_id
+                    || settlement.control_epoch != *control_epoch
+                    || settlement.control_call_id != control.call_id
+                    || settlement.control_arguments_digest != control.arguments_digest
+                    || settlement.recorded_at != *recorded_at
+                    || !matches!(
+                        settlement.outcome.as_str(),
+                        "completed" | "no_op" | "blocked" | "skipped" | "unexecuted"
+                    )
+                {
+                    return Err(invalid_control_settlement());
+                }
+                for (identity, field) in [
+                    (
+                        settlement.plan_revision.as_str(),
+                        "controlSettlement.settlement.planRevision",
+                    ),
+                    (
+                        settlement.plan_action_id.as_str(),
+                        "controlSettlement.settlement.planActionId",
+                    ),
+                ] {
+                    validate_bounded_identity(identity, field, 512)?;
+                }
+                validate_sha256_digest(
+                    &settlement.control_arguments_digest,
+                    "controlSettlement.settlement.controlArgumentsDigest",
+                )?;
+            }
+            Self::UserInterventionDecision {
+                next_target_kind,
+                decision,
+                disposition,
+                accepted_plan_revision,
+                recorded_at,
+                ..
+            } => {
+                let expected_target = match disposition.as_str() {
+                    "planAccepted" => "planAction",
+                    "guidanceReplan" => "planning",
+                    "researchRevision" => "interventionResearch",
+                    "runCancellationRequired" => "none",
+                    _ => return Err(invalid_control_settlement()),
+                };
+                if next_target_kind != expected_target
+                    || decision.recorded_at != *recorded_at
+                    || !matches!(decision.decision.as_str(), "select" | "revise" | "reject")
+                    || (disposition == "planAccepted") != accepted_plan_revision.is_some()
+                    || decision
+                        .guidance
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(invalid_control_settlement());
+                }
+                for (identity, field) in [
+                    (
+                        decision.interaction_id.as_str(),
+                        "controlSettlement.decision.interactionId",
+                    ),
+                    (
+                        decision.interaction_revision.as_str(),
+                        "controlSettlement.decision.interactionRevision",
+                    ),
+                    (
+                        decision.caller_request_id.as_str(),
+                        "controlSettlement.decision.callerRequestId",
+                    ),
+                ] {
+                    validate_bounded_identity(identity, field, 512)?;
+                }
+                validate_sha256_digest(
+                    &decision.candidate_set_digest,
+                    "controlSettlement.decision.candidateSetDigest",
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_control_receipt(
+    control: &SessionProviderControlReceiptSidecarV2,
+    expected_tool_name: &str,
+) -> Result<(), HostV2StorageError> {
+    let expected_schema = match expected_tool_name {
+        "deepcode_session_plan_propose_v5" => "deepcode.session.plan-proposal.v5",
+        "deepcode_session_plan_action_complete_v2" => "deepcode.session.plan-action-complete.v2",
+        "deepcode_session_intervention_propose_v1" => "deepcode.session.intervention-proposal.v1",
+        _ => return Err(invalid_control_settlement()),
+    };
+    if control.schema_version != expected_schema || control.tool_name != expected_tool_name {
+        return Err(invalid_control_settlement());
+    }
+    validate_bounded_identity(&control.call_id, "controlSettlement.control.callId", 512)?;
+    validate_sha256_digest(
+        &control.arguments_digest,
+        "controlSettlement.control.argumentsDigest",
+    )?;
+    Ok(())
+}
+
+fn invalid_control_settlement() -> HostV2StorageError {
+    HostV2StorageError::invalid(
+        "provider_control_settlement_invalid",
+        "Session Provider control settlement is not exact durable v2 data",
+    )
+}
+
+fn validate_control_identity_list(
+    values: &[String],
+    field: &'static str,
+    max_identity_bytes: usize,
+) -> Result<(), HostV2StorageError> {
+    if values.len() > 128 || values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(HostV2StorageError::invalid(
+            "provider_control_continuation_invalid",
+            "Plan evidence refresh identities must be bounded, unique, and sorted",
+        ));
+    }
+    for value in values {
+        validate_bounded_identity(value, field, max_identity_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_control_digest_list(
+    values: &[String],
+    field: &'static str,
+) -> Result<(), HostV2StorageError> {
+    if values.len() > 128 || values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(HostV2StorageError::invalid(
+            "provider_control_continuation_invalid",
+            "Plan evidence refresh digests must be bounded, unique, and sorted",
+        ));
+    }
+    for value in values {
+        validate_sha256_digest(value, field)?;
+    }
+    Ok(())
 }
 
 fn invalid_cache_relation_kind() -> HostV2StorageError {

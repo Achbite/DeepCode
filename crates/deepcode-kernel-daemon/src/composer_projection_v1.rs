@@ -4,8 +4,10 @@ use crate::*;
 pub(crate) const HOST_CONVERSATION_DRAFT_TARGET_SCHEMA_V1: &str =
     "deepcode.host.conversation-draft-target.v1";
 pub(crate) const HOST_COMPOSER_PROJECTION_SCHEMA_V1: &str = "deepcode.host.composer-projection.v1";
+pub(crate) const HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1: &str =
+    "deepcode.host.composer-projection-stream.v1";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentComposerQueryV1 {
     pub(crate) project_id: Option<String>,
@@ -311,6 +313,191 @@ pub(crate) async fn agent_composer_projection_v1(
     )
 }
 
+pub(crate) async fn agent_composer_projection_stream_v1(
+    State(state): State<AppState>,
+    Query(query): Query<AgentComposerQueryV1>,
+) -> Response {
+    // Subscribe before the first snapshot so a Run transition racing with the
+    // read is queued and forces one authoritative replacement afterwards.
+    let mut invalidations = state
+        .host_services
+        .active_runs_v2
+        .subscribe_composer_invalidations();
+    let initial = match composer_projection_value_v1(&state, &query).await {
+        Ok(projection) => projection,
+        Err((code, message)) => return ApiResponse::error(code, message).into_response(),
+    };
+    let stream_state = state.clone();
+    let stream_query = query.clone();
+    let stream = async_stream::stream! {
+        let mut revision = composer_projection_revision_v1(&initial)
+            .expect("validated Composer projection has a revision")
+            .to_string();
+        yield Ok::<bytes::Bytes, std::io::Error>(
+            composer_projection_sse_bytes_v1("snapshot", &revision, initial.clone())
+        );
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // interval() completes its first tick immediately; consume it so the
+        // first heartbeat remains ten seconds after the snapshot.
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                invalidation = invalidations.recv() => {
+                    match invalidation {
+                        Ok(invalidation) => {
+                            if stream_query.session_id.as_deref().is_some_and(|session_id| {
+                                invalidation
+                                    .session_id
+                                    .as_deref()
+                                    .is_some_and(|changed_session_id| {
+                                        session_id != changed_session_id
+                                    })
+                            }) {
+                                continue;
+                            }
+                            let _reason = invalidation.reason;
+                            match composer_projection_value_v1(&stream_state, &stream_query).await {
+                                Ok(projection) => {
+                                    let Some(next_revision) = composer_projection_revision_v1(&projection) else {
+                                        yield Err::<bytes::Bytes, std::io::Error>(
+                                            std::io::Error::other(
+                                                "Composer projection replacement has no revision"
+                                            )
+                                        );
+                                        break;
+                                    };
+                                    if next_revision == revision {
+                                        continue;
+                                    }
+                                    revision = next_revision.to_string();
+                                    yield Ok::<bytes::Bytes, std::io::Error>(
+                                        composer_projection_sse_bytes_v1(
+                                            "updated",
+                                            &revision,
+                                            projection,
+                                        )
+                                    );
+                                }
+                                Err((code, message)) => {
+                                    yield Ok::<bytes::Bytes, std::io::Error>(
+                                        composer_projection_sse_error_bytes_v1(&code, &message)
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // The event is only an invalidation hint. Rebuild from
+                            // durable Host/Session facts after any lag instead of
+                            // attempting to replay an in-memory business event.
+                            match composer_projection_value_v1(&stream_state, &stream_query).await {
+                                Ok(projection) => {
+                                    let Some(next_revision) = composer_projection_revision_v1(&projection) else {
+                                        yield Err::<bytes::Bytes, std::io::Error>(
+                                            std::io::Error::other(
+                                                "Composer projection replacement has no revision"
+                                            )
+                                        );
+                                        break;
+                                    };
+                                    if next_revision != revision {
+                                        revision = next_revision.to_string();
+                                        yield Ok::<bytes::Bytes, std::io::Error>(
+                                            composer_projection_sse_bytes_v1(
+                                                "updated",
+                                                &revision,
+                                                projection,
+                                            )
+                                        );
+                                    }
+                                }
+                                Err((code, message)) => {
+                                    yield Ok::<bytes::Bytes, std::io::Error>(
+                                        composer_projection_sse_error_bytes_v1(&code, &message)
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    yield Ok::<bytes::Bytes, std::io::Error>(
+                        bytes::Bytes::from_static(b": heartbeat\n\n")
+                    );
+                }
+            }
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn composer_projection_value_v1(
+    state: &AppState,
+    query: &AgentComposerQueryV1,
+) -> Result<Value, (String, String)> {
+    let Json(response) =
+        agent_composer_projection_v1(State(state.clone()), Query(query.clone())).await;
+    if response.ok {
+        return response.data.ok_or_else(|| {
+            (
+                "agent_composer_projection_invalid".to_string(),
+                "Composer projection response has no canonical data".to_string(),
+            )
+        });
+    }
+    Err((
+        response
+            .error
+            .unwrap_or_else(|| "agent_composer_projection_unavailable".to_string()),
+        response
+            .message
+            .unwrap_or_else(|| "Composer projection is unavailable".to_string()),
+    ))
+}
+
+fn composer_projection_revision_v1(projection: &Value) -> Option<&str> {
+    projection.get("revision").and_then(Value::as_str)
+}
+
+fn composer_projection_sse_bytes_v1(
+    event: &str,
+    revision: &str,
+    projection: Value,
+) -> bytes::Bytes {
+    let payload = json!({
+        "schemaVersion": HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1,
+        "type": event,
+        "revision": revision,
+        "projection": projection,
+    });
+    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    bytes::Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
+}
+
+fn composer_projection_sse_error_bytes_v1(code: &str, message: &str) -> bytes::Bytes {
+    let data = serde_json::to_string(&json!({
+        "schemaVersion": HOST_COMPOSER_PROJECTION_STREAM_SCHEMA_V1,
+        "code": code,
+        "message": message,
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    bytes::Bytes::from(format!("event: error\ndata: {data}\n\n"))
+}
+
 fn composer_projection_response(
     state: &AppState,
     config: Value,
@@ -341,7 +528,7 @@ fn composer_projection_response(
         Some(session_id) => match state
             .host_services
             .active_runs_v2
-            .resolve_session_active_run(session_id)
+            .resolve_session_run_slot(session_id)
         {
             Ok(Some(active)) => {
                 let status = match active.lifecycle {
@@ -386,7 +573,12 @@ fn composer_projection_response(
     let selection_mutable = active_run.is_none() && pending_interaction.is_none();
     // An active Run or interaction freezes the Profile choice, not the text
     // input lane. Session still admits that input as canonical user guidance.
-    let can_submit = selected_profile_id.is_some();
+    let run_retiring = active_run
+        .as_ref()
+        .and_then(|run| run.get("status"))
+        .and_then(Value::as_str)
+        == Some("retiring");
+    let can_submit = selected_profile_id.is_some() && !run_retiring;
     let mut projection = json!({
         "schemaVersion": HOST_COMPOSER_PROJECTION_SCHEMA_V1,
         "revision": "pending",

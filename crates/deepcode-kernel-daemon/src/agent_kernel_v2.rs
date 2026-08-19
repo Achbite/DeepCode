@@ -3,7 +3,7 @@ use crate::host_kernel_operation_store_v2::{
     HostCallerRequestDriveStateV2, HostCallerRequestRecoveryEvidenceV2, HostKernelFailureCommitV2,
     HostKernelFailureDispositionV2, HostKernelFailureEffectV2, HostKernelLiveRunForDeletionV2,
     HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
-    HostKernelStoredRunLifecycleV2, HostRunCallerDriveRecoveryV2,
+    HostKernelPendingRequestLaneV2, HostKernelStoredRunLifecycleV2, HostRunCallerDriveRecoveryV2,
 };
 use crate::host_kernel_run_v2::{
     HostKernelBridgeOperationV2, HostKernelCapabilityDecisionV2, HostKernelInitialInputV2,
@@ -3666,14 +3666,191 @@ async fn execute_prepared_agent_decision_v2(
                 )
                 .await
                 .map_err(AgentKernelV2Error::from_storage)?;
+            let settlement = if matches!(decision, HostKernelInterventionDecisionV4::Select)
+                && !selected_preview_ids.is_empty()
+            {
+                let observed_high_water = success_response_v2(&settled)?
+                    .pointer("/state/factsSnapshotHighWater")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        AgentKernelV2Error::invalid(
+                            "session_kernel_facts_high_water_missing",
+                            "Executable intervention settlement has no exact facts high-water.",
+                        )
+                    })?;
+                let reconcile = HostKernelBridgeOperationV2::ReconcileFacts {
+                    observed_high_water,
+                };
+                let request_id = next_operation_request_id_v2(&settled, &reconcile)?;
+                state
+                    .kernel_session_v2
+                    .submit_operation(
+                        &active.session_id,
+                        &active.host_run_id,
+                        &request_id,
+                        reconcile,
+                    )
+                    .await
+                    .map_err(AgentKernelV2Error::from_storage)?
+            } else {
+                settled
+            };
             drive_agent_kernel_until_boundary_v2(
                 &AgentKernelDriveContextV2::from_state(state),
                 active,
-                settled,
+                settlement,
             )
             .await
         }
     }
+}
+
+/// Completes the missing Session half of an executable intervention selection
+/// whose Kernel authority facts were durably written before an older Session
+/// checkpoint rejected the still-open intervention wait. This recovery never
+/// drives the selected Plan action: it stops at `readyToDrivePlanAction` and
+/// preserves the original caller's immutable indeterminate outcome.
+async fn recover_indeterminate_intervention_selection_v2(
+    state: &AppState,
+    active: &HostActiveRunRecordV2,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<bool, AgentKernelV2Error> {
+    let prepared = decode_prepared_agent_decision_v2(binding)?;
+    let PreparedAgentDecisionV2::UserIntervention {
+        interaction_id,
+        interaction_revision,
+        candidate_set_digest,
+        expected_projection_cursor: _,
+        decision: HostKernelInterventionDecisionV4::Select,
+        option_id: Some(option_id),
+        guidance,
+        selected_preview_ids,
+        superseded_preview_ids: _,
+        operation_request_id: _,
+    } = prepared
+    else {
+        return Ok(false);
+    };
+    if selected_preview_ids.is_empty() {
+        return Ok(false);
+    }
+    let evidence = state
+        .host_services
+        .kernel_operations_v2
+        .caller_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let Some(first_settlement) = evidence.first_settlement.as_ref() else {
+        return Ok(false);
+    };
+    let HostKernelOperationSettlementV2::FailedRecoverable { boundary, .. } =
+        &first_settlement.settlement
+    else {
+        return Ok(false);
+    };
+    if boundary.disposition != HostKernelFailureDispositionV2::QueryFacts
+        || boundary.commit != HostKernelFailureCommitV2::Unknown
+        || boundary.effect != HostKernelFailureEffectV2::Possible
+        || boundary.pending_request_lanes != vec![HostKernelPendingRequestLaneV2::Query]
+    {
+        return Ok(false);
+    }
+    let reclaimed = state
+        .host_services
+        .kernel_operations_v2
+        .reclaim_indeterminate_intervention_caller_request_drive(
+            binding,
+            &state.host_services.active_runs_v2.owner_instance_id(),
+            &crate::utils::now_rfc3339_text(),
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    ensure_agent_run_cache_v2(state, active)?;
+    // The original caller-correlated Session operation is created only after
+    // `apply_host_intervention_selection_v4` returned a committed Kernel
+    // receipt. Its exact FailedRecoverable QueryFacts settlement therefore
+    // proves that selection facts and leases already exist. Reissuing the
+    // selection after restart would incorrectly require consumed previews to
+    // become pending again. Recovery instead reconciles the existing Kernel
+    // facts into Session and fails closed if those facts cannot be proven.
+    let decision_operation = HostKernelBridgeOperationV2::DecideUserIntervention {
+        interaction_id,
+        interaction_revision,
+        candidate_set_digest,
+        decision: HostKernelInterventionDecisionV4::Select,
+        option_id: Some(option_id),
+        guidance,
+        caller_request_id: reclaimed.caller_request_id.clone(),
+        caller_request_digest: reclaimed.request_digest.clone(),
+        cancel_operation_id: None,
+    };
+    let decision_request_id = stable_operation_request_id_v2(
+        "recover-intervention-decision",
+        &first_settlement.settlement_digest,
+        &decision_operation,
+    )?;
+    let decided = state
+        .kernel_session_v2
+        .submit_operation(
+            &active.session_id,
+            &active.host_run_id,
+            &decision_request_id,
+            decision_operation,
+        )
+        .await
+        .map_err(AgentKernelV2Error::from_storage)?;
+    let observed_high_water = success_response_v2(&decided)?
+        .pointer("/state/factsSnapshotHighWater")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AgentKernelV2Error::invalid(
+                "session_kernel_facts_high_water_missing",
+                "Recovered intervention settlement has no exact facts high-water.",
+            )
+        })?;
+    let reconcile_operation = HostKernelBridgeOperationV2::ReconcileFacts {
+        observed_high_water,
+    };
+    let reconcile_request_id = next_operation_request_id_v2(&decided, &reconcile_operation)?;
+    let reconciled = state
+        .kernel_session_v2
+        .submit_operation(
+            &active.session_id,
+            &active.host_run_id,
+            &reconcile_request_id,
+            reconcile_operation,
+        )
+        .await
+        .map_err(AgentKernelV2Error::from_storage)?;
+    if continuation_kind_v2(&reconciled) != Some("readyToDrivePlanAction") {
+        return Err(AgentKernelV2Error::invalid(
+            "session_intervention_recovery_boundary_invalid",
+            "Recovered intervention settlement did not stop before its first unexecuted Plan action.",
+        ));
+    }
+    state
+        .host_services
+        .kernel_operations_v2
+        .release_recovered_indeterminate_intervention_drive(
+            &reclaimed,
+            &state.host_services.active_runs_v2.owner_instance_id(),
+            &decided,
+            &reconciled,
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    mark_agent_run_v2(
+        state,
+        &active.host_run_id,
+        "waiting",
+        Some(
+            "Recovered the selected intervention to its next unexecuted Plan action; no workspace mutation was replayed."
+                .to_string(),
+        ),
+    );
+    Ok(true)
 }
 
 fn normalized_permission_decision_v2(
@@ -5414,6 +5591,10 @@ pub(crate) async fn restore_agent_kernel_caller_owners_v2(
                     require_user_input_admission_projection_v2(state, &binding)?;
                 }
                 ensure_agent_run_cache_v2(state, &active)?;
+                if recover_indeterminate_intervention_selection_v2(state, &active, &binding).await?
+                {
+                    continue;
+                }
                 mark_agent_run_v2(
                     state,
                     &active.host_run_id,

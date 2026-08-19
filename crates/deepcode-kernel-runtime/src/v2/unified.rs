@@ -6,8 +6,8 @@ use super::model::{AuthorityResult, AuthorizationTargetKey};
 use super::service::{
     initial_run_transport_generation, run_capability_verifier_digest, AuthorityService,
     DirectToolIntentRequest, DurableRunCapabilityVerifierV2, InitialToolContextInvalidationV2,
-    AUTHORITY_MATERIAL_RETIREMENT_PENDING, RUN_CAPABILITY_VERIFIER_BOUND,
-    RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
+    AUTHORITY_MATERIAL_CONSUMED, AUTHORITY_MATERIAL_RETIREMENT_PENDING,
+    RUN_CAPABILITY_VERIFIER_BOUND, RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
 };
 use crate::executors::{KernelExecutorConfig, SecretProvider};
 use deepcode_kernel_abi::v2::{
@@ -811,6 +811,37 @@ fn trust_grant_fact_matches(payload: &KernelFactPayloadV2, durable: &DurableTrus
         && expires_at == &durable.expires_at
 }
 
+fn consumed_preview_lease_id(
+    payload: &KernelFactPayloadV2,
+    durable: &DurablePreparedScopePreviewV2,
+    preview_fact_id: &FactId,
+) -> Option<CapabilityLeaseIdV2> {
+    let KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityIssued {
+        identity,
+        tool_id,
+        scope_digest,
+        authorization_digest,
+        tool_contract_digest,
+        context_ref,
+    }) = payload
+    else {
+        return None;
+    };
+    (identity.run_id == durable.record.run_id
+        && identity.control_epoch == durable.record.control_epoch
+        && identity.plan_revision == durable.record.plan_revision
+        && identity.plan_action_id == durable.record.plan_action_id
+        && identity.operation_id == durable.record.operation_id
+        && identity.preview_id == durable.record.preview_id
+        && identity.causation_fact_id == *preview_fact_id
+        && tool_id == &durable.record.tool_id
+        && scope_digest == &durable.record.scope_digest
+        && authorization_digest == &durable.authorization_digest
+        && tool_contract_digest == &durable.record.tool_contract_digest
+        && context_ref == &durable.record.context_ref)
+        .then(|| identity.lease_id.clone())
+}
+
 fn recover_authority_material(
     facts: &[KernelFactEnvelopeV2],
     material: Vec<AuthorityMaterialRecordV2>,
@@ -822,12 +853,15 @@ fn recover_authority_material(
     let retired_runs = recover_retired_runs(facts)?;
     let retirement_fences = recover_retirement_fences(facts, &retired_runs);
     let mut previews = HashMap::new();
+    let mut consumed_previews = HashMap::new();
     let mut leases = HashMap::new();
     let mut trusts = HashMap::new();
     let mut pending = HashMap::new();
     let mut run_capability_verifiers = HashMap::new();
     for record in material {
-        if record.lifecycle == AUTHORITY_MATERIAL_STALE {
+        if record.lifecycle == AUTHORITY_MATERIAL_STALE
+            && record.material_kind != AUTHORITY_MATERIAL_PREVIEW
+        {
             continue;
         }
         let retirement_pending = record.lifecycle == AUTHORITY_MATERIAL_RETIREMENT_PENDING;
@@ -847,7 +881,12 @@ fn recover_authority_material(
         };
         match record.material_kind.as_str() {
             AUTHORITY_MATERIAL_PREVIEW => {
-                if (!retirement_pending && record.lifecycle != AUTHORITY_MATERIAL_ACTIVE)
+                let consumed = record.lifecycle == AUTHORITY_MATERIAL_CONSUMED;
+                let legacy_consumed = record.lifecycle == AUTHORITY_MATERIAL_STALE;
+                if (!retirement_pending
+                    && record.lifecycle != AUTHORITY_MATERIAL_ACTIVE
+                    && !consumed
+                    && !legacy_consumed)
                     || record.lease.is_some()
                 {
                     return Err(storage_fault());
@@ -904,7 +943,29 @@ fn recover_authority_material(
                     return Err(storage_fault());
                 }
                 let preview_id = durable.record.preview_id.clone();
-                if previews
+                if consumed || legacy_consumed {
+                    let last = facts_by_id
+                        .get(&record.last_fact_id)
+                        .copied()
+                        .ok_or_else(storage_fault)?;
+                    let Some(lease_id) =
+                        consumed_preview_lease_id(&last.payload, &durable, &record.source_fact_id)
+                    else {
+                        if legacy_consumed {
+                            continue;
+                        }
+                        return Err(storage_fault());
+                    };
+                    if consumed_previews
+                        .insert(
+                            preview_id,
+                            (durable.into_prepared(record.source_fact_id), lease_id),
+                        )
+                        .is_some()
+                    {
+                        return Err(storage_fault());
+                    }
+                } else if previews
                     .insert(preview_id, durable.into_prepared(record.source_fact_id))
                     .is_some()
                 {
@@ -1212,28 +1273,39 @@ fn recover_authority_material(
         }
     }
     for lease in leases.values() {
-        let preview = previews.get(&lease.preview_id).ok_or_else(storage_fault)?;
+        let (preview, selected_lease_id) = if let Some(preview) = previews.get(&lease.preview_id) {
+            (preview, None)
+        } else {
+            let (preview, selected_lease_id) = consumed_previews
+                .get(&lease.preview_id)
+                .ok_or_else(storage_fault)?;
+            (preview, Some(selected_lease_id))
+        };
         if lease.authorization_binding != preview.record.authorization_binding
             || lease.approved_targets != preview.approved_targets
             || lease.reference.scope_digest != preview.record.scope_digest
             || lease.tool_id != preview.record.tool_id
             || lease.context_ref != preview.record.context_ref
+            || selected_lease_id.is_some_and(|lease_id| lease_id != &lease.reference.lease_id)
         {
             return Err(storage_fault());
         }
     }
     for trust in trusts.values() {
-        let matching_preview = previews.values().any(|preview| {
-            preview.record.run_id == trust.run_id
-                && preview.record.control_epoch == trust.control_epoch
-                && preview.record.plan_revision == trust.plan_revision
-                && preview.record.plan_action_id == trust.plan_action_id
-                && preview.record.operation_id == trust.issuance_operation_id
-                && preview.record.tool_id == trust.tool_id
-                && preview.record.scope_digest == trust.scope_digest
-                && preview.record.authorization_binding == trust.authorization_binding
-                && preview.approved_targets == trust.approved_targets
-        });
+        let matching_preview = previews
+            .values()
+            .chain(consumed_previews.values().map(|(preview, _)| preview))
+            .any(|preview| {
+                preview.record.run_id == trust.run_id
+                    && preview.record.control_epoch == trust.control_epoch
+                    && preview.record.plan_revision == trust.plan_revision
+                    && preview.record.plan_action_id == trust.plan_action_id
+                    && preview.record.operation_id == trust.issuance_operation_id
+                    && preview.record.tool_id == trust.tool_id
+                    && preview.record.scope_digest == trust.scope_digest
+                    && preview.record.authorization_binding == trust.authorization_binding
+                    && preview.approved_targets == trust.approved_targets
+            });
         if !matching_preview {
             return Err(storage_fault());
         }
@@ -4090,6 +4162,7 @@ impl KernelSessionServiceV2 {
                             expected_lifecycles: vec![
                                 AUTHORITY_MATERIAL_ACTIVE.to_owned(),
                                 AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                                AUTHORITY_MATERIAL_CONSUMED.to_owned(),
                             ],
                             next_lifecycle: AUTHORITY_MATERIAL_STALE.to_owned(),
                             fact_index: 1,
@@ -5118,7 +5191,7 @@ impl KernelSessionServiceV2 {
             mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
                 expected_payload_digest: None,
-                material: scope_preview_material(&preview.durable(), AUTHORITY_MATERIAL_STALE)?,
+                material: scope_preview_material(&preview.durable(), AUTHORITY_MATERIAL_CONSUMED)?,
                 fact_index,
             });
             durable_leases.push(durable);

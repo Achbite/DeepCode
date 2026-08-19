@@ -453,6 +453,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("GET", ["api", "agent", "projects"])
         | ("POST", ["api", "agent", "projects"])
         | ("GET", ["api", "agent", "composer"])
+        | ("GET", ["api", "agent", "composer", "stream"])
         | ("POST", ["api", "agent", "conversation-drafts", "runs"])
         | ("GET", ["api", "agent", "sessions", "current"])
         | ("GET", ["api", "browser", "runtime-status"])

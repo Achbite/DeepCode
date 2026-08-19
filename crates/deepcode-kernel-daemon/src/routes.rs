@@ -133,6 +133,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/agent/composer", get(agent_composer_projection_v1))
         .route(
+            "/api/agent/composer/stream",
+            get(agent_composer_projection_stream_v1),
+        )
+        .route(
             "/api/agent/conversation-drafts/runs",
             post(agent_conversation_draft_run_start),
         )

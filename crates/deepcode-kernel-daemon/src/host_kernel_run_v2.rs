@@ -1501,17 +1501,52 @@ impl HostKernelRunCoordinatorV2 {
         &self,
         bootstrap: &HostKernelBootstrapRecordV2,
     ) -> Result<u64, HostV2StorageError> {
-        let settlement = self
+        let settlements = self
             .host_services
             .kernel_operations_v2
-            .latest_settlement(&bootstrap.session_id, &bootstrap.host_run_id)?
-            .ok_or_else(|| {
-                HostV2StorageError::conflict(
-                    "host_kernel_session_state_missing",
-                    "Active Host Kernel Run has no settled Session state",
-                )
-            })?;
-        require_successful_session_facts_high_water(&settlement)
+            .settlements_for_run(&bootstrap.session_id, &bootstrap.host_run_id)?;
+        let latest = settlements.last().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_kernel_session_state_missing",
+                "Active Host Kernel Run has no settled Session state",
+            )
+        })?;
+        match &latest.settlement {
+            HostKernelOperationSettlementV2::Succeeded { .. } => {
+                require_successful_session_facts_high_water(latest)
+            }
+            HostKernelOperationSettlementV2::FailedRecoverable { boundary, .. }
+                if boundary.disposition == HostKernelFailureDispositionV2::QueryFacts
+                    && boundary.commit == HostKernelFailureCommitV2::Unknown
+                    && boundary.effect == HostKernelFailureEffectV2::Possible
+                    && boundary.pending_request_lanes
+                        == vec![HostKernelPendingRequestLaneV2::Query] =>
+            {
+                // This exact boundary requires an authoritative Kernel facts
+                // query before the failed control settlement can be resumed.
+                // Seed that query from the most recent successful Session
+                // snapshot; never treat the older snapshot itself as proof of
+                // the failed operation or skip a terminal/other failure.
+                settlements[..settlements.len() - 1]
+                    .iter()
+                    .rev()
+                    .find_map(|settlement| {
+                        matches!(
+                            &settlement.settlement,
+                            HostKernelOperationSettlementV2::Succeeded { .. }
+                        )
+                        .then(|| require_successful_session_facts_high_water(settlement))
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        HostV2StorageError::conflict(
+                            "host_kernel_session_state_missing",
+                            "Recoverable Session operation has no prior successful facts snapshot",
+                        )
+                    })
+            }
+            _ => require_successful_session_facts_high_water(latest),
+        }
     }
 
     fn prepare_initial_dispatch(

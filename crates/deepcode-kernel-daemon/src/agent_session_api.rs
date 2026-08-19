@@ -188,6 +188,8 @@ pub(crate) async fn agent_session_rename(
         .as_object()
         .filter(|object| object.contains_key("projectId"))
         .map(|_| body.get("projectId").cloned().unwrap_or(Value::Null));
+    let profile_binding_changed = requested_profile_id.is_some();
+    let project_binding_changed = requested_project_id.is_some();
     let _project_binding_guard = if requested_project_id.is_some() {
         Some(agent_project_binding_transition_lock().lock_owned().await)
     } else {
@@ -337,7 +339,15 @@ pub(crate) async fn agent_session_rename(
             gui.current_session_ids_by_scope = previous_scope_session_ids;
             return ApiResponse::error("agent_session_persist_failed", error);
         }
-        return session_result(&gui, &session_id);
+        let response = session_result(&gui, &session_id);
+        drop(gui);
+        if profile_binding_changed || project_binding_changed {
+            state
+                .host_services
+                .active_runs_v2
+                .notify_composer_projection(&session_id, "sessionBindingUpdated");
+        }
+        return response;
     }
     ApiResponse::error("agent_session_not_found", "agent session not found")
 }

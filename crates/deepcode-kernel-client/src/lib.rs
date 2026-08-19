@@ -17,13 +17,13 @@ mod private_analysis;
 mod v2;
 
 pub use agent::{
-    terminal_workspace_scope, AgentComposerProfileV1, AgentComposerProjectionV1,
-    AgentConversationDraftTargetV1, AgentConversationTargetV1, AgentInputAttachmentKindV3,
-    AgentInputAttachmentScopeV3, AgentInputAttachmentV3, AgentProjectConversationTargetV1,
-    AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult, AgentRunStatus,
-    AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
-    ListAgentSessionsRequest, StartAgentRunRequest, StartConversationDraftRunRequest,
-    TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentComposerProfileV1, AgentComposerProjectionStreamEventV1,
+    AgentComposerProjectionV1, AgentConversationDraftTargetV1, AgentConversationTargetV1,
+    AgentInputAttachmentKindV3, AgentInputAttachmentScopeV3, AgentInputAttachmentV3,
+    AgentProjectConversationTargetV1, AgentRunCallerRequest, AgentRunGuidanceRequest,
+    AgentRunResult, AgentRunStatus, AgentSessionListResult, AgentSessionResult,
+    CreateAgentSessionRequest, ListAgentSessionsRequest, StartAgentRunRequest,
+    StartConversationDraftRunRequest, TerminalWorkspaceScope,
 };
 pub use agent_projection::{
     reduce_agent_timeline_stream_event, AgentProjectionValidationError, AgentTimelineAnswerState,
@@ -67,6 +67,7 @@ pub use agent_projection::{
 };
 
 const AGENT_TIMELINE_SSE_BUFFER_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const AGENT_COMPOSER_SSE_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
 
 pub struct AgentTimelineSseStream {
     response: reqwest::Response,
@@ -116,6 +117,61 @@ impl AgentTimelineSseStream {
             let raw = self.buffer[..boundary].to_vec();
             self.buffer.drain(..boundary + separator_len);
             if let Some(event) = decode_timeline_sse_event(&raw)? {
+                self.pending.push_back(event);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct AgentComposerSseStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    pending: VecDeque<AgentComposerProjectionStreamEventV1>,
+    ended: bool,
+}
+
+impl AgentComposerSseStream {
+    pub async fn next_event(
+        &mut self,
+    ) -> KernelClientResult<Option<AgentComposerProjectionStreamEventV1>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.ended {
+                if self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    return Err(KernelClientError::Api(
+                        "Composer SSE ended with an incomplete event".to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
+            match self.response.chunk().await? {
+                Some(chunk) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    self.consume_complete_events()?;
+                    if self.buffer.len() > AGENT_COMPOSER_SSE_BUFFER_LIMIT_BYTES {
+                        return Err(KernelClientError::Api(
+                            "Composer SSE event exceeds the client buffer limit".to_string(),
+                        ));
+                    }
+                }
+                None => self.ended = true,
+            }
+        }
+    }
+
+    fn consume_complete_events(&mut self) -> KernelClientResult<()> {
+        while let Some((boundary, separator_len)) = sse_event_boundary(&self.buffer) {
+            if boundary > AGENT_COMPOSER_SSE_BUFFER_LIMIT_BYTES {
+                return Err(KernelClientError::Api(
+                    "Composer SSE event exceeds the client buffer limit".to_string(),
+                ));
+            }
+            let raw = self.buffer[..boundary].to_vec();
+            self.buffer.drain(..boundary + separator_len);
+            if let Some(event) = decode_composer_sse_event(&raw)? {
                 self.pending.push_back(event);
             }
         }
@@ -591,7 +647,48 @@ impl HttpKernelClient {
             .error_for_status()?
             .json::<Value>()
             .await?;
-        decode_api_data_with_code(value)
+        let projection = decode_api_data_with_code::<AgentComposerProjectionV1>(value)?;
+        projection.validate()?;
+        Ok(projection)
+    }
+
+    pub async fn agent_composer_projection_stream(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> KernelClientResult<AgentComposerSseStream> {
+        let mut request = self.stream_http.get(self.url("/api/agent/composer/stream"));
+        if let Some(project_id) = project_id {
+            request = request.query(&[("projectId", project_id)]);
+        }
+        if let Some(session_id) = session_id {
+            request = request.query(&[("sessionId", session_id)]);
+        }
+        let response = request
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(KernelClientError::Api(
+                "Composer stream did not return text/event-stream".to_string(),
+            ));
+        }
+        Ok(AgentComposerSseStream {
+            response,
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            ended: false,
+        })
     }
 
     pub async fn start_conversation_draft_run(
@@ -939,6 +1036,49 @@ fn decode_timeline_sse_event(raw: &[u8]) -> KernelClientResult<Option<AgentTimel
             "timeline SSE event name does not match its typed envelope".to_string(),
         )),
     }
+}
+
+fn decode_composer_sse_event(
+    raw: &[u8],
+) -> KernelClientResult<Option<AgentComposerProjectionStreamEventV1>> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| KernelClientError::Api("Composer SSE event is not valid UTF-8".to_string()))?;
+    let mut event_name = None;
+    let mut data = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line, ""));
+        match field {
+            "event" => event_name = Some(value),
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let event_name = event_name.ok_or_else(|| {
+        KernelClientError::Api("Composer SSE event has no explicit type".to_string())
+    })?;
+    if !matches!(event_name, "snapshot" | "updated") {
+        return Err(KernelClientError::Api(format!(
+            "Composer SSE returned unsupported event type {event_name}"
+        )));
+    }
+    let event = serde_json::from_str::<AgentComposerProjectionStreamEventV1>(&data.join("\n"))?;
+    event.validate()?;
+    if event.event_type != event_name {
+        return Err(KernelClientError::Api(
+            "Composer SSE event name does not match its typed envelope".to_string(),
+        ));
+    }
+    Ok(Some(event))
 }
 
 #[cfg(test)]
