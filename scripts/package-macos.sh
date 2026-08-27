@@ -47,9 +47,7 @@ TUI_COMMAND_NAME=""
 COPY_ROOT_WEB_DIST="0"
 WRITE_TUI_LAUNCHER="0"
 BIN_DIR="$ROOT_DIR/bin/macos-arm64"
-KERNEL_ABI_VERSION="deepcode.kernel.abi.v3"
-TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
-SESSION_BRIDGE_NAME="hostBridgeV2.js"
+SESSION_BRIDGE_NAME="sessionServiceBridge.js"
 
 add_requested_product() {
   local product="$1"
@@ -162,9 +160,8 @@ Environment:
 
 Clean keeps package-local user data:
   bin/macos-arm64/config
+  bin/macos-arm64/runtime/local-agent-v2
   bin/macos-arm64/sessions
-  bin/macos-arm64/conversation-archives
-  bin/macos-arm64/kernel
 USAGE
 }
 
@@ -348,7 +345,7 @@ clean_product_package_cache() {
 
 clean_shared_package_cache() {
   log "clean shared macOS package build artifacts"
-  log "preserve package-local user data: config/, sessions/, conversation-archives/, kernel/"
+  log "preserve package-local user data: config/, runtime/local-agent-v2/, sessions/"
   rm -rf "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node" "$LIBEXEC_DIR"
   rm -f \
     "$BIN_DIR/deepcode-kernel" \
@@ -726,7 +723,7 @@ copy_required_file() {
   install -m "$mode" "$src" "$dst"
 }
 
-validate_protocol_v2_dist() {
+validate_protocol_dist() {
   local dist_dir="$1"
   local label="$2"
   local emitted name source stem
@@ -753,13 +750,13 @@ validate_protocol_v2_dist() {
     [ -f "$dist_dir/$stem.d.ts" ] \
       || fail "$label protocol dist is missing $stem.d.ts"
   done
-  for name in index.js tools.js kernelAbiV2.js; do
+  for name in index.js localAgent.js tools.js; do
     [ -f "$dist_dir/$name" ] \
       || fail "$label protocol dist is missing $name"
   done
   if find "$dist_dir" -maxdepth 1 -type f \
-    \( -name 'kernel.*' -o -name 'kernelAbiV1.*' \) -print -quit | grep -q .; then
-    fail "$label protocol dist contains a retired Kernel ABI module"
+    \( -name 'agent.*' -o -name 'kernelAbiV1.*' -o -name 'kernelAbiV2.*' \) -print -quit | grep -q .; then
+    fail "$label protocol dist contains a retired Agent protocol module"
   fi
 }
 
@@ -771,13 +768,13 @@ copy_session_core_runtime() {
 
   [ -f "$session_dist/$SESSION_BRIDGE_NAME" ] || fail "session-core bridge missing at $session_dist/$SESSION_BRIDGE_NAME; build session-core before packaging"
   [ -d "$protocol_dist" ] || fail "protocol dist missing at $protocol_dist; build protocol before packaging"
-  validate_protocol_v2_dist "$protocol_dist" "source"
+  validate_protocol_dist "$protocol_dist" "source"
 
   rm -rf "$session_dst" "$protocol_dst"
   mkdir -p "$session_dst/dist" "$protocol_dst/dist"
   cp -R "$session_dist/." "$session_dst/dist/"
   cp -R "$protocol_dist/." "$protocol_dst/dist/"
-  validate_protocol_v2_dist "$protocol_dst/dist" "packaged"
+  validate_protocol_dist "$protocol_dst/dist" "packaged"
   copy_required_file "$ROOT_DIR/userspace/session-core/package.json" "$session_dst/package.json" 644
   copy_required_file "$ROOT_DIR/userspace/protocol/package.json" "$protocol_dst/package.json" 644
 
@@ -855,114 +852,31 @@ write_file_if_missing() {
   cat > "$dst"
 }
 
+copy_file_if_missing() {
+  local src="$1"
+  local dst="$2"
+  [ ! -f "$dst" ] || return 0
+  [ -f "$src" ] || fail "portable config default missing: $src"
+  mkdir -p "$(dirname "$dst")"
+  install -m 644 "$src" "$dst"
+}
+
 prepare_portable_config_root() {
-  log "prepare portable config/session/cache root"
+  log "prepare portable config and Session root"
   mkdir -p \
     "$BIN_DIR/config/user/local/settings" \
     "$BIN_DIR/config/user/local/secrets" \
-    "$BIN_DIR/sessions" \
-    "$BIN_DIR/conversation-archives" \
-    "$BIN_DIR/kernel"
+    "$BIN_DIR/runtime/local-agent-v2" \
+    "$BIN_DIR/sessions"
 
-  write_file_if_missing "$BIN_DIR/config/user/local/settings/user-settings.json" <<'JSON'
-{
-  "editor.tabSize": 4,
-  "editor.insertSpaces": true,
-  "editor.wordWrap": "off",
-  "editor.fontSize": 14,
-  "editor.fontFamily": "Consolas, 'Courier New', monospace",
-  "editor.renderWhitespace": "none",
-  "files.autoSave": "afterDelay",
-  "files.autoSaveDelay": 1000,
-  "files.hotExit": true,
-  "files.encoding": "utf8",
-  "files.eol": "\n",
-  "keyboard.enableBasicShortcuts": true,
-  "explorer.confirmDelete": false,
-  "workbench.colorTheme": "vs-dark",
-  "workbench.language": "zh-CN",
-  "workbench.styleTokenOverrides": "{}",
-  "terminal.integrated.defaultProfile.windows": "wsl",
-  "terminal.integrated.prewarm": "afterStartup",
-  "terminal.integrated.spawnTimeoutMs": 8000,
-  "agent.defaultMode": "plan",
-  "agent.defaultWorkflow": "planFirst",
-  "agent.requirementConfirmationMode": "auto",
-  "agent.reviewContinuationMode": "auto",
-  "agent.interventionLevel": "medium",
-  "agent.memory.projectMode": "confirm",
-  "agent.permissions.workspaceRead": "allow",
-  "agent.permissions.autoApprovePlans": false,
-  "agent.permissions.workspaceWrite": "ask",
-  "agent.permissions.gitWrite": "ask",
-  "agent.permissions.webRead": "deny",
-  "agent.permissions.privateWebRead": "deny",
-  "agent.permissions.processExec": "deny",
-  "agent.permissions.browserControl": "deny",
-  "agent.permissions.providerEgress": "ask",
-  "agent.web.search.endpointTemplate": "",
-  "agent.web.search.authHeaderName": "Authorization",
-  "agent.web.search.authSecretRef": "",
-  "agent.shell.autoExecuteCommands": false,
-  "skills.pythonPath": "python",
-  "skills.autoLoad": true,
-  "skills.mounts": "[]",
-  "mcp.autoLoad": false,
-  "mcp.servers": "[]",
-  "ruler.enabled": true,
-  "ruler.rules": "[{\"id\":\"default-safety\",\"name\":\"Default Safety Boundary\",\"source\":\"system\",\"priority\":100,\"path\":\"<builtin>/default-safety.md\",\"content\":\"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.\",\"enabled\":true}]"
-}
-JSON
+  copy_file_if_missing \
+    "$ROOT_DIR/config/defaults/user-settings.json" \
+    "$BIN_DIR/config/user/local/settings/user-settings.json"
+  copy_file_if_missing \
+    "$ROOT_DIR/config/defaults/llm-profiles.json" \
+    "$BIN_DIR/config/user/local/settings/llm-profiles.json"
 
-  write_file_if_missing "$BIN_DIR/config/user/local/settings/llm-profiles.json" <<'JSON'
-{
-  "profiles": [
-    {
-      "id": "deepseek-v4-flash-openai",
-      "name": "DeepSeek V4 Flash",
-      "kind": "openaiCompatible",
-      "reasoningTransport": "openaiPlaintext",
-      "providerFlavor": "deepseek",
-      "baseUrl": "https://api.deepseek.com",
-      "model": "deepseek-v4-flash",
-      "contextWindowTokens": 1000000,
-      "maxOutputTokens": 384000,
-      "temperature": 0.2,
-      "reasoningEffort": "high",
-      "thinking": "enabled",
-      "enabled": true
-    },
-    {
-      "id": "deepseek-v4-pro-openai",
-      "name": "DeepSeek V4 Pro",
-      "kind": "openaiCompatible",
-      "reasoningTransport": "openaiPlaintext",
-      "providerFlavor": "deepseek",
-      "baseUrl": "https://api.deepseek.com",
-      "model": "deepseek-v4-pro",
-      "contextWindowTokens": 1000000,
-      "maxOutputTokens": 384000,
-      "temperature": 0.2,
-      "reasoningEffort": "max",
-      "thinking": "enabled",
-      "enabled": true
-    }
-  ],
-  "defaultProfileId": "deepseek-v4-pro-openai",
-  "storePath": null
-}
-JSON
-
-  write_file_if_missing "$BIN_DIR/config/user/local/settings/agent-workflow-config.json" <<'JSON'
-{
-  "plan": {},
-  "check": {},
-  "complete": {},
-  "review": {}
-}
-JSON
-
-  write_file_if_missing "$BIN_DIR/config/README.txt" <<README
+  cat > "$BIN_DIR/config/README.txt" <<README
 DeepCode writable portable configuration
 ========================================
 
@@ -970,11 +884,10 @@ This directory is used by the macOS local package when launched through
 $APP_NAME.app or package launcher scripts.
 
 Writable runtime data:
-  config/user/local/settings/     User settings, profiles, workflow config.
+  config/user/local/settings/     User settings and Provider profiles.
   config/user/local/secrets/      Local secret references. Do not share.
-  sessions/                       Session projection and transcript cache.
-  conversation-archives/          Conversation archive exports and debug packages.
-  kernel/                         Kernel ledger and runtime records.
+  runtime/local-agent-v2/         Active v2 Catalog, Session journal, and ToolRecord stores.
+  sessions/                       Legacy v1 history retained read-only; not used for new runs.
 
 Set DEEPCODE_CONFIG_DIR to override this package-local root.
 README
@@ -1176,12 +1089,11 @@ write_readme() {
   Set DEEPCODE_NODE or DEEPCODE_SESSION_BRIDGE only when overriding that packaged
   daemon runtime. DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls the daemon session
   run hard timeout; default 600000 ms, 0 disables it.
-	  By default, this local package stores writable user data under:
+	  By default, this local package stores active writable data under:
 	    config/user/local/settings/
 	    config/user/local/secrets/
-	    sessions/
-	    conversation-archives/
-	    kernel/"
+	    runtime/local-agent-v2/
+	  sessions/ is retained as legacy v1 read-only history and is not used by new runs."
 
   app_entries=""
   gui_section=""
@@ -1229,9 +1141,8 @@ $app_entries
   libexec/$TUI_EXEC_NAME    Internal Darwin arm64 Ratatui/Crossterm TUI host.
 $asset_entries
   config/                  Package-local writable user config root.
-  sessions/                Package-local session projection/transcript cache.
-  conversation-archives/   Package-local conversation exports and debug packages.
-  kernel/                  Package-local Kernel ledger/runtime records.
+  runtime/local-agent-v2/  Active v2 Catalog, Session journal, and ToolRecord stores.
+  sessions/                Legacy v1 history retained read-only.
 
 Notes:
 $notes
@@ -1251,8 +1162,6 @@ write_build_info() {
   "sourceDirty": $SOURCE_DIRTY,
   "sourceStatusHash": "$SOURCE_STATUS_HASH",
   "sourceFingerprint": "$SOURCE_FINGERPRINT",
-  "kernelAbiVersion": "$KERNEL_ABI_VERSION",
-  "toolRegistryVersion": "$TOOL_REGISTRY_VERSION",
   "sessionBridge": "$SESSION_BRIDGE_NAME",
   "product": "$product"
 }
@@ -1315,7 +1224,7 @@ publish_product_apps() {
     fi
     sync_signed_kernel_sidecar_to_root
   done
-  verify_packaged_kernel_markers
+  verify_packaged_runtime_identity
 }
 
 finalize_shared_distribution() {
@@ -1329,11 +1238,11 @@ finalize_shared_distribution() {
   write_readme
 }
 
-verify_packaged_kernel_markers() {
+verify_packaged_runtime_identity() {
   local kernel_bin="$BIN_DIR/deepcode-kernel"
   local original_product="$PRODUCT"
   local product app_kernel_bin app_host_proxy root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product
-  local build_info_kernel_abi build_info_tool_registry build_info_session_bridge strings_file
+  local build_info_session_bridge
   local checked_app=0
   [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
   root_hash="$(shasum -a 256 "$kernel_bin" | awk '{print $1}')"
@@ -1342,13 +1251,9 @@ verify_packaged_kernel_markers() {
   for build_info in "$BIN_DIR/build-info.json"; do
     build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
     build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
-    build_info_kernel_abi="$(awk -F '"' '/"kernelAbiVersion"/ { print $4; exit }' "$build_info")"
-    build_info_tool_registry="$(awk -F '"' '/"toolRegistryVersion"/ { print $4; exit }' "$build_info")"
     build_info_session_bridge="$(awk -F '"' '/"sessionBridge"/ { print $4; exit }' "$build_info")"
     [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
     [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
-    [ "$build_info_kernel_abi" = "$KERNEL_ABI_VERSION" ] || fail "$build_info kernelAbiVersion=$build_info_kernel_abi does not match $KERNEL_ABI_VERSION"
-    [ "$build_info_tool_registry" = "$TOOL_REGISTRY_VERSION" ] || fail "$build_info toolRegistryVersion=$build_info_tool_registry does not match $TOOL_REGISTRY_VERSION"
     [ "$build_info_session_bridge" = "$SESSION_BRIDGE_NAME" ] || fail "$build_info sessionBridge=$build_info_session_bridge does not match $SESSION_BRIDGE_NAME"
   done
 
@@ -1369,29 +1274,14 @@ verify_packaged_kernel_markers() {
     build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
     build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
     build_info_product="$(awk -F '"' '/"product"/ { print $4; exit }' "$build_info")"
-    build_info_kernel_abi="$(awk -F '"' '/"kernelAbiVersion"/ { print $4; exit }' "$build_info")"
-    build_info_tool_registry="$(awk -F '"' '/"toolRegistryVersion"/ { print $4; exit }' "$build_info")"
     build_info_session_bridge="$(awk -F '"' '/"sessionBridge"/ { print $4; exit }' "$build_info")"
     [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
     [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
     [ "$build_info_product" = "$product" ] || fail "$build_info product=$build_info_product does not match app product $product"
-    [ "$build_info_kernel_abi" = "$KERNEL_ABI_VERSION" ] || fail "$build_info kernelAbiVersion=$build_info_kernel_abi does not match $KERNEL_ABI_VERSION"
-    [ "$build_info_tool_registry" = "$TOOL_REGISTRY_VERSION" ] || fail "$build_info toolRegistryVersion=$build_info_tool_registry does not match $TOOL_REGISTRY_VERSION"
     [ "$build_info_session_bridge" = "$SESSION_BRIDGE_NAME" ] || fail "$build_info sessionBridge=$build_info_session_bridge does not match $SESSION_BRIDGE_NAME"
   done
   [ "$checked_app" = "1" ] || fail "no packaged macOS app was published in $BIN_DIR"
   configure_product "$original_product"
-
-  strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
-  strings "$kernel_bin" >"$strings_file"
-  grep -Fq "$KERNEL_ABI_VERSION" "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing $KERNEL_ABI_VERSION marker"; }
-  grep -Fq "$TOOL_REGISTRY_VERSION" "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing $TOOL_REGISTRY_VERSION marker"; }
-  grep -Fq 'web.search' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing web.search"; }
-  grep -Fq 'git.status' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing git.status"; }
-  ! grep -Fq 'Kernel terminal placeholder ready' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin still contains old placeholder terminal runtime"; }
-  ! grep -Fq 'terminal runtime reserved' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin still contains reserved terminal placeholder output"; }
-  grep -Fq 'Host PTY terminal runtime is ready.' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing Host PTY terminal runtime marker"; }
-  rm -f "$strings_file"
 }
 
 run_timed_phase() {

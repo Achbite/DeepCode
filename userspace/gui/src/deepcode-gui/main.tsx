@@ -37,18 +37,20 @@ function renderBootstrapError(reason: unknown): void {
   root.appendChild(shell);
 }
 
+let reactRootCreated = false;
+
 window.addEventListener('error', (event) => {
   if (!event.error) {
     console.warn('[DeepCode-GUI browser diagnostic]', event.message);
     return;
   }
-  console.error('[DeepCode-GUI bootstrap]', event.error ?? event.message);
-  renderBootstrapError(event.error ?? event.message);
+  console.error('[DeepCode-GUI runtime]', event.error ?? event.message);
+  if (!reactRootCreated) renderBootstrapError(event.error ?? event.message);
 });
 
 window.addEventListener('unhandledrejection', (event) => {
-  console.error('[DeepCode-GUI bootstrap]', event.reason);
-  renderBootstrapError(event.reason);
+  console.error('[DeepCode-GUI runtime rejection]', event.reason);
+  if (!reactRootCreated) renderBootstrapError(event.reason);
 });
 
 class ErrorBoundary extends React.Component<
@@ -97,7 +99,9 @@ document.documentElement.dataset.shell = isTauriShell ? 'tauri' : 'browser';
 installNativeContextMenuGuard();
 
 try {
-  ReactDOM.createRoot(rootEl).render(
+  const root = ReactDOM.createRoot(rootEl);
+  reactRootCreated = true;
+  root.render(
     <React.StrictMode>
       <ErrorBoundary>
         <DeepCodeGuiApp />
@@ -105,5 +109,9 @@ try {
     </React.StrictMode>
   );
 } catch (error) {
-  renderBootstrapError(error);
+  if (!reactRootCreated) {
+    renderBootstrapError(error);
+  } else {
+    console.error('[DeepCode-GUI root render]', error);
+  }
 }

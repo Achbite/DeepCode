@@ -1,5 +1,4 @@
 mod app;
-mod model;
 mod renderer;
 
 use app::{TuiApp, TuiHostOptions};
@@ -13,6 +12,7 @@ use renderer::Renderer;
 use std::{
     env,
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -20,12 +20,18 @@ const EXIT_ACTION_REQUIRED: i32 = 5;
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse(env::args().skip(1).collect());
+    let args = match Args::parse(env::args().skip(1).collect()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            print_help();
+            std::process::exit(2);
+        }
+    };
     if args.help {
         print_help();
         return;
     }
-
     let bootstrap = match KernelBootstrap::connect(
         KernelBootstrapOptions::new(args.api).auto_start(!args.no_auto_start_kernel),
     )
@@ -33,45 +39,38 @@ async fn main() {
     {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
-            eprintln!("DeepCode-TUI failed to connect Kernel: {error}");
+            eprintln!("DeepCode TUI 无法连接 Daemon：{error}");
             std::process::exit(1);
         }
     };
-    let client = bootstrap.client().clone();
-    let renderer = Renderer::default();
     let mut app = TuiApp::new(
-        client,
-        renderer,
+        bootstrap.client().clone(),
+        Renderer,
         TuiHostOptions {
             workspace_path: args.workspace,
-            no_workspace: args.no_workspace,
+            session_id: args.session_id,
         },
     );
     app.bootstrap().await;
 
     if args.smoke {
         print!("{}", app.renderer().render_plain(&app));
-        drop(bootstrap);
         return;
     }
 
-    let terminal_mode = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let result = if terminal_mode {
+    let result = if io::stdin().is_terminal() && io::stdout().is_terminal() {
         run_terminal(app).await.map(|_| None)
     } else {
         run_plain(app).await
     };
-
     match result {
         Ok(Some(message)) => {
-            drop(bootstrap);
             eprintln!("{message}");
             std::process::exit(EXIT_ACTION_REQUIRED);
         }
         Ok(None) => {}
         Err(error) => {
-            drop(bootstrap);
-            eprintln!("DeepCode-TUI failed: {error}");
+            eprintln!("DeepCode TUI 失败：{error}");
             std::process::exit(1);
         }
     }
@@ -81,36 +80,51 @@ struct Args {
     api: Option<String>,
     help: bool,
     smoke: bool,
-    workspace: Option<String>,
-    no_workspace: bool,
+    workspace: Option<PathBuf>,
+    session_id: Option<String>,
     no_auto_start_kernel: bool,
 }
 
 impl Args {
-    fn parse(args: Vec<String>) -> Self {
+    fn parse(values: Vec<String>) -> Result<Self, String> {
         let mut parsed = Self {
             api: None,
             help: false,
             smoke: false,
-            workspace: env::var("DEEPCODE_WORKSPACE")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            no_workspace: false,
+            workspace: None,
+            session_id: None,
             no_auto_start_kernel: false,
         };
-        let mut iter = args.into_iter();
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
+        let mut index = 0;
+        while index < values.len() {
+            match values[index].as_str() {
                 "--help" | "-h" => parsed.help = true,
                 "--smoke" => parsed.smoke = true,
-                "--api" => parsed.api = iter.next(),
+                "--api" => {
+                    index += 1;
+                    parsed.api = Some(required_arg(&values, index, "--api")?.to_string());
+                }
                 "--no-auto-start-kernel" => parsed.no_auto_start_kernel = true,
-                "--workspace" | "-C" => parsed.workspace = iter.next(),
-                "--no-workspace" => parsed.no_workspace = true,
-                _ => {}
+                "--workspace" | "-C" => {
+                    index += 1;
+                    parsed.workspace =
+                        Some(PathBuf::from(required_arg(&values, index, "--workspace")?));
+                }
+                "--session" => {
+                    index += 1;
+                    parsed.session_id =
+                        Some(required_arg(&values, index, "--session")?.to_string());
+                }
+                value => return Err(format!("未知选项：{value}")),
             }
+            index += 1;
         }
-        parsed
+        if parsed.session_id.is_some() && parsed.workspace.is_some() {
+            return Err(
+                "--session 指向已有 creation snapshot，不能同时使用 -C/--workspace。".to_string(),
+            );
+        }
+        Ok(parsed)
     }
 }
 
@@ -119,40 +133,34 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     terminal.clear()?;
-
     loop {
-        app.poll_pending_run().await;
+        app.poll().await;
         terminal.draw(|frame| app.renderer().draw(frame, &app))?;
-        if event::poll(Duration::from_millis(180))? {
+        if event::poll(Duration::from_millis(150))? {
             match event::read()? {
-                CrosstermEvent::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+                CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.interrupt().await;
+                        break;
                     }
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Esc => {
+                        if app.has_pending_plan() {
+                            app.ignore_plan().await;
+                        } else {
+                            app.clear_input();
+                        }
+                    }
+                    KeyCode::Backspace => app.backspace_input(),
+                    KeyCode::Enter => {
+                        let input = app.take_input();
+                        if !app.submit_line(&input).await {
                             break;
                         }
-                        KeyCode::Esc => app.clear_input(),
-                        KeyCode::Backspace => app.backspace_input(),
-                        KeyCode::Enter => {
-                            if app.should_hold_input_for_running_turn() {
-                                app.notify_running_input_held();
-                                continue;
-                            }
-                            let line = app.take_input();
-                            if app.preview_submit_line(&line) {
-                                terminal.draw(|frame| app.renderer().draw(frame, &app))?;
-                            }
-                            if !app.submit_line(&line).await {
-                                break;
-                            }
-                        }
-                        KeyCode::Tab => app.push_input('\t'),
-                        KeyCode::Char(ch) => app.push_input(ch),
-                        _ => {}
                     }
-                }
+                    KeyCode::Tab => app.push_input('\t'),
+                    KeyCode::Char(value) => app.push_input(value),
+                    _ => {}
+                },
                 CrosstermEvent::Paste(text) => app.push_input_text(&text),
                 _ => {}
             }
@@ -165,29 +173,24 @@ async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
     print!("{}", app.renderer().render_plain(&app));
     let mut line = String::new();
     loop {
-        app.poll_pending_run().await;
         print!("DeepCode TUI> ");
         io::stdout().flush()?;
         line.clear();
-        let bytes = io::stdin().read_line(&mut line)?;
-        if bytes == 0 {
-            break;
+        if io::stdin().read_line(&mut line)? == 0 {
+            return Ok(app.take_action_required());
         }
         if !app.submit_line(line.trim()).await {
-            break;
+            return Ok(None);
         }
         while app.is_run_pending() {
-            app.poll_pending_run().await;
-            if app.is_run_pending() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            app.poll().await;
         }
         print!("{}", app.renderer().render_plain(&app));
         if let Some(message) = app.take_action_required() {
             return Ok(Some(message));
         }
     }
-    Ok(None)
 }
 
 struct TerminalGuard;
@@ -207,57 +210,24 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn required_arg<'a>(values: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
+    values
+        .get(index)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{option} 缺少参数。"))
+}
+
 fn print_help() {
     println!(
         r#"DeepCode TUI
 
-Usage:
-  DeepCode-TUI
-  DeepCode-TUI --smoke
-  DeepCode-TUI --api <url>
-  DeepCode-TUI --no-auto-start-kernel
-  DeepCode-TUI --workspace <path>
-  DeepCode-TUI --no-workspace
+用法：
+  deepcode-tui [-C <workspace>] [--session <id>]
+  deepcode-tui --smoke
 
-Workspace:
-  默认绑定当前目录；也可传 --workspace/-C 或设置 DEEPCODE_WORKSPACE。
-  --no-workspace 只用于普通对话；workspace 工具会按 Kernel 边界失败关闭。
-
-Session Runtime:
-  普通输入通过 daemon /api/agent/sessions/:id/runs 提交到共享 Session Runtime。
-  TUI 只读取 run status、timeline projection 和权限/决策事件；不维护独立会话编排。
-  若共享运行时提示缺少 session-core，请运行 pnpm --filter @deepcode/session-core build，
-  或使用包含 session-core/dist/hostBridgeV2.js、node_modules/@deepcode/protocol
-  和受信 Node runtime 的打包产物。daemon 启动时固定并校验这些资产。
-
-Kernel:
-  默认先连接 --api / DEEPCODE_API_URL / DEEPCODE_HOST:DEEPCODE_PORT。
-  本地 API 不可达时会后台启动同目录或开发产物中的 deepcode-kernel。
-  设置 DEEPCODE_KERNEL_AUTO_START=0 或传 --no-auto-start-kernel 可禁用。
-
-Interactive commands:
-  /help              显示 TUI 命令
-  /status            检查 Kernel daemon 连接
-  /workspace         显示或调整 workspace 绑定
-  /cancel            停止当前 TUI 等待并刷新共享 session projection
-  /audit             显示审计占位状态
-  /sessions          列出 Agent 会话
-  /new [title]       新建 Agent 会话
-  /use <id>          激活会话
-  /timeline [id]     读取 timeline
-  /allow <id>        允许权限请求
-  /deny <id>         拒绝权限请求
-  /decision plan <accept|reject|revise> [run-id] [target-id] [guidance]
-  /decision permission <accept|reject> [run-id] [target-id]
-  /clear             清理当前可见卡片
-  /quit              退出 TUI
-
-pending 计划/Review 时，空 Enter 或 1 确认；文本或 2 <文本> 提交 Review 信息；
-3、end、结束表示结束。/decision 是显式 fallback。
-
-普通文本会直接通过共享 Session Runtime 发送到当前会话；/allow、/deny 是
-canonical permission decision 的入口别名，不回退旧 permission endpoint。
-/decision、/cancel 是 GUI composer decision / Stop 的终端输入形式。TUI 只负责展示、
-输入和命令入口，不持有 workflow、permission 或 tool execution 事实。"#
+只有显式 -C/--workspace 会给新 Session 创建 workspace binding。
+Plan 可输入 1..N 或调整文本；Esc 明确忽略当前 Plan，空输入、EOF 与 Ctrl-C 不会忽略。
+普通文本、/attach <path>、/detach <workspace-id>、/ignore、/model <profile>、/cancel 都通过 ConversationPort。
+TUI 只渲染共享 SessionProjection，不拥有独立状态机或工具事实。"#,
     );
 }

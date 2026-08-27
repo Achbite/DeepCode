@@ -3,32 +3,26 @@ use std::fmt::Write as _;
 
 pub(super) struct DocumentReadExecutor;
 
-pub(crate) struct DocumentReadCompleteResult {
-    pub(crate) execution: KernelToolExecutionResult,
-    pub(crate) complete_text: String,
-}
-
 impl KernelToolExecutor for DocumentReadExecutor {
     fn invoke(
         &self,
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        Ok(invoke_document_read_complete(invocation, context)?.execution)
+        invoke_document_read(invocation, context)
     }
 }
 
-pub(crate) fn invoke_document_read_complete(
+fn invoke_document_read(
     invocation: KernelToolInvocation,
     context: KernelToolExecutionContext,
-) -> KernelResult<DocumentReadCompleteResult> {
+) -> KernelResult<KernelToolExecutionResult> {
     const MAX_PDF_BYTES: u64 = 16 * 1024 * 1024;
     const MAX_PDF_PAGES: usize = 50;
     const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 
-    let root = workspace_root(&context)?;
     let path = required_string(&invocation.input, "path")?;
-    let target = resolve_workspace_read_path(&root, &path)?;
+    let target = prepared_workspace_target(&context)?;
     let metadata = fs::metadata(&target)
         .map_err(|error| KernelError::Other(format!("document.read metadata: {error}")))?;
     if !metadata.is_file() {
@@ -73,9 +67,10 @@ pub(crate) fn invoke_document_read_complete(
             .expect("writing to a String cannot fail");
     }
     let text = limit_text(&joined, MAX_OUTPUT_BYTES);
-    let execution = ok(
+    Ok(ok(
         invocation.id,
         serde_json::json!({
+            "workspaceId": workspace_id(&context)?,
             "path": normalize_relative_path(&path),
             "adapter": "pdf_extract",
             "startPage": start + 1,
@@ -86,9 +81,5 @@ pub(crate) fn invoke_document_read_complete(
             "truncatedOutput": joined.len() > MAX_OUTPUT_BYTES,
             "sizeBytes": metadata.len()
         }),
-    );
-    Ok(DocumentReadCompleteResult {
-        execution,
-        complete_text: joined,
-    })
+    ))
 }

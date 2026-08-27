@@ -1,28 +1,17 @@
-use crate::prelude::*;
-use crate::*;
-use std::collections::{BTreeMap, BTreeSet};
-
-pub(crate) const PROVIDER_STREAM_TERMINAL_SCHEMA_V1: &str = "deepcode.provider-stream-terminal.v1";
-pub(crate) const PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1: &str =
-    "deepcode.provider.structured-output-recovery.v1";
-pub(crate) const PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1: &str =
-    "deepcode.provider.structured-output-failure.v1";
-
-const SESSION_PROPOSAL_CONTROL_NAMES_V1: [&str; 2] = [
-    "deepcode_session_plan_propose_v5",
-    "deepcode_session_intervention_propose_v1",
-];
+use crate::llm_transport::{internal_tool_name, LlmChatOutput, LlmToolCall, LlmToolDefinition};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderNativeStreamKindV1 {
+pub(crate) enum ProviderStreamKind {
     OpenAiCompatible,
     Anthropic,
     Ollama,
 }
 
-impl ProviderNativeStreamKindV1 {
-    pub(crate) fn from_profile_kind(kind: &str) -> Option<Self> {
-        match kind {
+impl ProviderStreamKind {
+    pub(crate) fn from_profile_kind(value: &str) -> Option<Self> {
+        match value {
             "openaiCompatible" => Some(Self::OpenAiCompatible),
             "anthropic" => Some(Self::Anthropic),
             "ollama" => Some(Self::Ollama),
@@ -42,131 +31,88 @@ impl ProviderNativeStreamKindV1 {
         match self {
             Self::OpenAiCompatible => "[DONE]",
             Self::Anthropic => "message_stop",
-            Self::Ollama => "done:true",
+            Self::Ollama => "done=true",
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderNativeStreamErrorV1 {
+pub(crate) struct ProviderStreamError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
-    pub(crate) structured_failure: Option<ProviderStructuredOutputFailureV1>,
-    pub(crate) usage: Option<Value>,
 }
 
-impl ProviderNativeStreamErrorV1 {
-    fn invalid(code: &'static str, message: impl Into<String>) -> Self {
+impl ProviderStreamError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
-            structured_failure: None,
-            usage: None,
-        }
-    }
-
-    fn structured(
-        message: impl Into<String>,
-        structured_failure: ProviderStructuredOutputFailureV1,
-        usage: Option<Value>,
-    ) -> Self {
-        Self {
-            code: "provider_tool_call_arguments_invalid",
-            message: message.into(),
-            structured_failure: Some(structured_failure),
-            usage,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProviderStructuredOutputCallV1 {
-    pub(crate) index: i64,
-    pub(crate) call_id: String,
-    pub(crate) tool_name: String,
-    pub(crate) original_arguments_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) normalized_arguments_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) appended_suffix: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProviderStructuredOutputRecoveryV1 {
-    pub(crate) schema_version: String,
-    pub(crate) disposition: String,
-    pub(crate) error_code: String,
-    pub(crate) failure_digest: String,
-    pub(crate) calls: Vec<ProviderStructuredOutputCallV1>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProviderStructuredOutputFailureV1 {
-    pub(crate) schema_version: String,
-    pub(crate) disposition: String,
-    pub(crate) error_code: String,
-    pub(crate) failure_digest: String,
-    pub(crate) native_completion: Value,
-    pub(crate) calls: Vec<ProviderStructuredOutputCallV1>,
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderEmission {
+    pub(crate) event: Value,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderPublicStreamEventV1 {
-    pub(crate) event: &'static str,
-    pub(crate) data: Value,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ProviderNormalizedEmissionV1 {
-    pub(crate) trace_event: Value,
-    pub(crate) public_event: Option<ProviderPublicStreamEventV1>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ProviderNativeCompletionV1 {
-    pub(crate) provider_kind: ProviderNativeStreamKindV1,
+pub(crate) struct ProviderCompletion {
+    pub(crate) provider_kind: ProviderStreamKind,
     pub(crate) finish_reason: Option<String>,
+    pub(crate) usage: Option<ProviderUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_input_tokens: Option<u64>,
+    pub(crate) cache_miss_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderNativeStreamResultV1 {
+pub(crate) struct ProviderStreamResult {
     pub(crate) output: LlmChatOutput,
-    pub(crate) completion: ProviderNativeCompletionV1,
-    pub(crate) structured_output_recovery: Option<ProviderStructuredOutputRecoveryV1>,
-    pub(crate) normalized_tool_arguments: BTreeMap<i64, String>,
+    pub(crate) completion: ProviderCompletion,
 }
 
 #[derive(Debug, Clone, Default)]
-struct ProviderNativeToolBufferV1 {
+struct ToolBuffer {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
-    arguments_complete: Option<Value>,
+    complete_arguments: Option<Value>,
 }
 
-#[derive(Debug)]
-pub(crate) struct ProviderNativeStreamAccumulatorV1 {
-    kind: ProviderNativeStreamKindV1,
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderStreamAccumulator {
+    kind: ProviderStreamKind,
     content: String,
     reasoning: String,
-    tool_calls: BTreeMap<i64, ProviderNativeToolBufferV1>,
-    usage: Option<Value>,
+    tool_calls: BTreeMap<i64, ToolBuffer>,
     finish_reason: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_miss_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
     source_done: bool,
 }
 
-impl ProviderNativeStreamAccumulatorV1 {
-    pub(crate) fn new(kind: ProviderNativeStreamKindV1) -> Self {
+impl ProviderStreamAccumulator {
+    pub(crate) fn new(kind: ProviderStreamKind) -> Self {
         Self {
             kind,
             content: String::new(),
             reasoning: String::new(),
             tool_calls: BTreeMap::new(),
-            usage: None,
             finish_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
+            cache_creation_input_tokens: None,
             source_done: false,
         }
     }
@@ -175,1244 +121,521 @@ impl ProviderNativeStreamAccumulatorV1 {
         self.source_done
     }
 
-    fn validate_tool_index_first_occurrence(
-        &self,
-        index: i64,
-    ) -> Result<(), ProviderNativeStreamErrorV1> {
-        if self.tool_calls.contains_key(&index) {
-            return Ok(());
-        }
-
-        match self.kind {
-            ProviderNativeStreamKindV1::OpenAiCompatible | ProviderNativeStreamKindV1::Ollama => {
-                let expected = i64::try_from(self.tool_calls.len()).unwrap_or(i64::MAX);
-                if index != expected {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_index_discontinuous",
-                        "Provider-native tool ordinals must first appear continuously from zero",
-                    ));
-                }
-            }
-            ProviderNativeStreamKindV1::Anthropic => {
-                if self
-                    .tool_calls
-                    .last_key_value()
-                    .is_some_and(|(previous, _)| index <= *previous)
-                {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_index_out_of_order",
-                        "Anthropic tool content-block indexes must first appear in native order",
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     pub(crate) fn ingest_payload(
         &mut self,
         payload: &[u8],
-    ) -> Result<Vec<ProviderNormalizedEmissionV1>, ProviderNativeStreamErrorV1> {
+    ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
         if self.source_done {
-            return Err(ProviderNativeStreamErrorV1::invalid(
+            return Err(ProviderStreamError::new(
                 "provider_stream_data_after_terminal",
-                "Provider emitted data after its native terminal marker",
+                "Provider 在完成标记后继续返回数据。",
             ));
         }
         let text = std::str::from_utf8(payload).map_err(|error| {
-            ProviderNativeStreamErrorV1::invalid(
+            ProviderStreamError::new(
                 "provider_stream_utf8_invalid",
-                format!("Provider envelope is not valid UTF-8: {error}"),
+                format!("Provider 流不是 UTF-8：{error}"),
             )
         })?;
         match self.kind {
-            ProviderNativeStreamKindV1::OpenAiCompatible => self.ingest_openai_payload(text),
-            ProviderNativeStreamKindV1::Anthropic => self.ingest_anthropic_payload(text),
-            ProviderNativeStreamKindV1::Ollama => self.ingest_ollama_payload(text),
+            ProviderStreamKind::OpenAiCompatible => self.ingest_openai(text),
+            ProviderStreamKind::Anthropic => self.ingest_anthropic(text),
+            ProviderStreamKind::Ollama => self.ingest_ollama(text),
         }
     }
 
-    pub(crate) fn finalize(
+    pub(crate) fn finalize(self) -> Result<ProviderStreamResult, ProviderStreamError> {
+        self.finalize_with_call_id_namespace(None)
+    }
+
+    pub(crate) fn finalize_for_request(
         self,
-    ) -> Result<ProviderNativeStreamResultV1, ProviderNativeStreamErrorV1> {
+        request_id: &str,
+    ) -> Result<ProviderStreamResult, ProviderStreamError> {
+        self.finalize_with_call_id_namespace(Some(request_id))
+    }
+
+    fn finalize_with_call_id_namespace(
+        self,
+        request_id: Option<&str>,
+    ) -> Result<ProviderStreamResult, ProviderStreamError> {
         if !self.source_done {
-            return Err(ProviderNativeStreamErrorV1::invalid(
+            return Err(ProviderStreamError::new(
                 "provider_stream_native_terminal_missing",
-                "Provider stream ended before its native terminal marker",
+                "Provider 流结束前没有完成标记。",
             ));
         }
-        if self.reasoning.trim().is_empty() {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_reasoning_missing",
-                "Provider turn completed without non-empty plaintext reasoning",
-            ));
-        }
-        if self.kind == ProviderNativeStreamKindV1::OpenAiCompatible && self.finish_reason.is_none()
-        {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_stream_finish_reason_missing",
-                "OpenAI-compatible stream completed without a finish_reason",
-            ));
-        }
-        if self.kind == ProviderNativeStreamKindV1::OpenAiCompatible {
-            for (expected, index) in self.tool_calls.keys().copied().enumerate() {
-                if index != i64::try_from(expected).unwrap_or(i64::MAX) {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_index_discontinuous",
-                        "OpenAI-compatible tool-call indexes must be continuous from zero",
-                    ));
-                }
-            }
-        }
-        let native_completion =
-            Self::provider_native_completion_value(self.kind, self.finish_reason.as_deref());
-        let proposal_only = !self.tool_calls.is_empty()
-            && self.tool_calls.values().all(|buffer| {
-                buffer
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| SESSION_PROPOSAL_CONTROL_NAMES_V1.contains(&name))
-            });
         let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
-        let mut structured_calls = Vec::new();
-        let mut normalized_tool_arguments = BTreeMap::new();
-        for (index, buffer) in self.tool_calls {
-            let name = buffer.name.ok_or_else(|| {
-                ProviderNativeStreamErrorV1::invalid(
+        for (index, call) in self.tool_calls {
+            let name = call.name.ok_or_else(|| {
+                ProviderStreamError::new(
                     "provider_tool_call_name_missing",
-                    format!("Provider tool call {index} has no function name"),
+                    format!("Provider 工具调用 {index} 缺少名称。"),
                 )
             })?;
-            let call_id = buffer.id.ok_or_else(|| {
-                ProviderNativeStreamErrorV1::invalid(
-                    "provider_tool_call_identity_missing",
-                    format!("Provider tool call {index} has no identity"),
-                )
-            })?;
-            let arguments = if let Some(arguments) = buffer.arguments_complete {
-                arguments
-            } else if buffer.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                match serde_json::from_str(&buffer.arguments) {
-                    Ok(arguments) => arguments,
-                    Err(error) => {
-                        let original_arguments_digest =
-                            crate::host_v2_storage::sha256_prefixed(buffer.arguments.as_bytes());
-                        if proposal_only {
-                            if let Some((normalized, suffix, parsed)) =
-                                Self::deterministic_json_eof_completion(&buffer.arguments, &error)
-                            {
-                                let normalized_arguments_digest =
-                                    crate::host_v2_storage::sha256_prefixed(normalized.as_bytes());
-                                structured_calls.push(ProviderStructuredOutputCallV1 {
-                                    index,
-                                    call_id: call_id.clone(),
-                                    tool_name: name.clone(),
-                                    original_arguments_digest,
-                                    normalized_arguments_digest: Some(normalized_arguments_digest),
-                                    appended_suffix: Some(suffix),
-                                });
-                                normalized_tool_arguments.insert(index, normalized);
-                                parsed
-                            } else {
-                                let failure = Self::structured_output_failure(
-                                    native_completion.clone(),
-                                    vec![ProviderStructuredOutputCallV1 {
-                                        index,
-                                        call_id,
-                                        tool_name: name,
-                                        original_arguments_digest,
-                                        normalized_arguments_digest: None,
-                                        appended_suffix: None,
-                                    }],
-                                )?;
-                                return Err(ProviderNativeStreamErrorV1::structured(
-                                    format!(
-                                        "Provider tool call {index} arguments are invalid JSON: {error}"
-                                    ),
-                                    failure,
-                                    self.usage,
-                                ));
-                            }
-                        } else {
-                            let failure = Self::structured_output_failure(
-                                native_completion.clone(),
-                                vec![ProviderStructuredOutputCallV1 {
-                                    index,
-                                    call_id,
-                                    tool_name: name,
-                                    original_arguments_digest,
-                                    normalized_arguments_digest: None,
-                                    appended_suffix: None,
-                                }],
-                            )?;
-                            return Err(ProviderNativeStreamErrorV1::structured(
-                                format!(
-                                    "Provider tool call {index} arguments are invalid JSON: {error}"
-                                ),
-                                failure,
-                                self.usage,
-                            ));
-                        }
-                    }
-                }
+            let arguments = match call.complete_arguments {
+                Some(value) => value,
+                None if call.arguments.trim().is_empty() => json!({}),
+                None => serde_json::from_str(&call.arguments).map_err(|error| {
+                    ProviderStreamError::new(
+                        "provider_tool_call_arguments_invalid",
+                        format!("Provider 工具调用 {index} 参数不是有效 JSON：{error}"),
+                    )
+                })?,
+            };
+            if !arguments.is_object() {
+                return Err(ProviderStreamError::new(
+                    "provider_tool_call_arguments_invalid",
+                    format!("Provider 工具调用 {index} 参数必须是 JSON 对象。"),
+                ));
+            }
+            let id = match (call.id, request_id) {
+                (Some(id), _) => id,
+                (None, Some(request_id)) => format!("provider-tool:{request_id}:{index}"),
+                (None, None) => format!("probe-tool:{index}"),
             };
             tool_calls.push(LlmToolCall {
-                id: call_id,
+                id,
                 name: internal_tool_name(&name),
                 arguments,
             });
         }
-        if self.finish_reason.as_deref() == Some("tool_calls") && tool_calls.is_empty() {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_tool_calls_finish_without_calls",
-                "OpenAI-compatible finish_reason tool_calls contained no tool call",
-            ));
-        }
-        if self.finish_reason.as_deref() == Some("stop") && !tool_calls.is_empty() {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_stop_finish_with_tool_calls",
-                "OpenAI-compatible finish_reason stop conflicted with tool calls",
-            ));
-        }
-        let structured_output_recovery = if structured_calls.is_empty() {
-            None
-        } else {
-            let failure_digest = Self::structured_output_digest(&structured_calls)?;
-            Some(ProviderStructuredOutputRecoveryV1 {
-                schema_version: PROVIDER_STRUCTURED_OUTPUT_RECOVERY_SCHEMA_V1.to_string(),
-                disposition: "normalizedProposalControl".to_string(),
-                error_code: "provider_tool_call_arguments_invalid".to_string(),
-                failure_digest,
-                calls: structured_calls,
-            })
-        };
-        Ok(ProviderNativeStreamResultV1 {
+        Ok(ProviderStreamResult {
             output: LlmChatOutput {
                 content: self.content,
-                reasoning: Some(self.reasoning),
+                reasoning: (!self.reasoning.trim().is_empty()).then_some(self.reasoning),
                 tool_calls,
-                usage: self.usage,
             },
-            completion: ProviderNativeCompletionV1 {
+            completion: ProviderCompletion {
                 provider_kind: self.kind,
                 finish_reason: self.finish_reason,
+                usage: match (self.input_tokens, self.output_tokens) {
+                    (Some(input_tokens), Some(output_tokens)) => Some(match self.kind {
+                        ProviderStreamKind::Anthropic => anthropic_usage(
+                            input_tokens,
+                            output_tokens,
+                            self.cache_read_input_tokens,
+                            self.cache_creation_input_tokens,
+                        )?,
+                        ProviderStreamKind::OpenAiCompatible => {
+                            let cache = cache_usage_from_total(
+                                input_tokens,
+                                self.cache_read_input_tokens,
+                                self.cache_miss_input_tokens,
+                            )?;
+                            ProviderUsage {
+                                input_tokens,
+                                output_tokens,
+                                cache_read_input_tokens: cache.map(|value| value.0),
+                                cache_miss_input_tokens: cache.map(|value| value.1),
+                            }
+                        }
+                        ProviderStreamKind::Ollama => ProviderUsage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens: None,
+                            cache_miss_input_tokens: None,
+                        },
+                    }),
+                    _ => None,
+                },
             },
-            structured_output_recovery,
-            normalized_tool_arguments,
         })
     }
 
-    fn provider_native_completion_value(
-        kind: ProviderNativeStreamKindV1,
-        finish_reason: Option<&str>,
-    ) -> Value {
-        let mut value = json!({
-            "providerKind": kind.wire_name(),
-            "terminalSignal": kind.terminal_signal(),
-        });
-        if let Some(finish_reason) = finish_reason {
-            value["finishReason"] = json!(finish_reason);
-        }
-        value
-    }
-
-    fn structured_output_failure(
-        native_completion: Value,
-        calls: Vec<ProviderStructuredOutputCallV1>,
-    ) -> Result<ProviderStructuredOutputFailureV1, ProviderNativeStreamErrorV1> {
-        Ok(ProviderStructuredOutputFailureV1 {
-            schema_version: PROVIDER_STRUCTURED_OUTPUT_FAILURE_SCHEMA_V1.to_string(),
-            disposition: "repairableNoMutation".to_string(),
-            error_code: "provider_tool_call_arguments_invalid".to_string(),
-            failure_digest: Self::structured_output_digest(&calls)?,
-            native_completion,
-            calls,
-        })
-    }
-
-    fn structured_output_digest(
-        calls: &[ProviderStructuredOutputCallV1],
-    ) -> Result<String, ProviderNativeStreamErrorV1> {
-        let identities = calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "index": call.index,
-                    "toolName": call.tool_name,
-                    "originalArgumentsDigest": call.original_arguments_digest,
-                })
-            })
-            .collect::<Vec<_>>();
-        crate::host_v2_storage::stable_json_sha256(&json!({
-            "errorCode": "provider_tool_call_arguments_invalid",
-            "calls": identities,
-        }))
-        .map_err(|error| {
-            ProviderNativeStreamErrorV1::invalid(
-                "provider_structured_output_digest_failed",
-                error.message,
-            )
-        })
-    }
-
-    fn deterministic_json_eof_completion(
-        arguments: &str,
-        error: &serde_json::Error,
-    ) -> Option<(String, String, Value)> {
-        if !error.is_eof() || arguments.trim().is_empty() {
-            return None;
-        }
-        let mut expected_closers = Vec::new();
-        let mut in_string = false;
-        let mut escaped = false;
-        for character in arguments.chars() {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' {
-                    escaped = true;
-                } else if character == '"' {
-                    in_string = false;
-                }
-                continue;
-            }
-            match character {
-                '"' => in_string = true,
-                '{' => expected_closers.push('}'),
-                '[' => expected_closers.push(']'),
-                '}' | ']' if expected_closers.pop() != Some(character) => return None,
-                _ => {}
-            }
-        }
-        if in_string || escaped || expected_closers.is_empty() || expected_closers.len() > 32 {
-            return None;
-        }
-        let suffix = expected_closers.into_iter().rev().collect::<String>();
-        let normalized = format!("{arguments}{suffix}");
-        let parsed = serde_json::from_str::<Value>(&normalized).ok()?;
-        Some((normalized, suffix, parsed))
-    }
-
-    fn ingest_openai_payload(
+    fn ingest_openai(
         &mut self,
-        data: &str,
-    ) -> Result<Vec<ProviderNormalizedEmissionV1>, ProviderNativeStreamErrorV1> {
-        if data.trim() == "[DONE]" {
-            if self.finish_reason.is_none() {
-                return Err(ProviderNativeStreamErrorV1::invalid(
-                    "provider_stream_finish_reason_missing",
-                    "OpenAI-compatible [DONE] arrived before a valid finish_reason",
-                ));
-            }
+        payload: &str,
+    ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
+        if payload.trim() == "[DONE]" {
             self.source_done = true;
             return Ok(Vec::new());
         }
-        let value = parse_provider_json(data, "OpenAI-compatible")?;
+        let value = parse_json(payload)?;
         if let Some(error) = value.get("error") {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_stream_upstream_error",
-                format!("OpenAI-compatible stream returned an error: {error}"),
+            return Err(ProviderStreamError::new(
+                "provider_error",
+                error.to_string(),
             ));
+        }
+        if let Some(usage) = value.get("usage") {
+            set_token_count(
+                &mut self.input_tokens,
+                usage
+                    .get("prompt_tokens")
+                    .or_else(|| usage.get("input_tokens")),
+                "输入 token",
+            )?;
+            set_token_count(
+                &mut self.output_tokens,
+                usage
+                    .get("completion_tokens")
+                    .or_else(|| usage.get("output_tokens")),
+                "输出 token",
+            )?;
+            set_token_count(
+                &mut self.cache_read_input_tokens,
+                usage
+                    .get("prompt_cache_hit_tokens")
+                    .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+                    .or_else(|| usage.pointer("/input_tokens_details/cached_tokens")),
+                "缓存读取输入 token",
+            )?;
+            set_token_count(
+                &mut self.cache_miss_input_tokens,
+                usage.get("prompt_cache_miss_tokens"),
+                "缓存未命中输入 token",
+            )?;
         }
         let mut emissions = Vec::new();
-        if let Some(usage) = value.get("usage").filter(|value| !value.is_null()).cloned() {
-            self.usage = Some(usage.clone());
-            emissions.push(usage_emission(usage));
-        }
-        let choices = value
+        for choice in value
             .get("choices")
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProviderNativeStreamErrorV1::invalid(
-                    "provider_stream_schema_invalid",
-                    "OpenAI-compatible stream envelope requires choices[]",
-                )
-            })?;
-        if choices.len() > 1 {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_stream_multiple_choices_unsupported",
-                "Provider stream envelope may contain at most one assistant choice",
-            ));
-        }
-        for choice in choices {
-            let index = choice.get("index").and_then(Value::as_i64).ok_or_else(|| {
-                ProviderNativeStreamErrorV1::invalid(
-                    "provider_stream_schema_invalid",
-                    "OpenAI-compatible stream choice requires an explicit integer index",
-                )
-            })?;
-            if index != 0 {
-                return Err(ProviderNativeStreamErrorV1::invalid(
-                    "provider_stream_multiple_choices_unsupported",
-                    "Provider stream choice index must be zero",
-                ));
+            .into_iter()
+            .flatten()
+        {
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.finish_reason = Some(reason.to_owned());
             }
-            if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                if !matches!(finish_reason, "stop" | "tool_calls") {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_stream_finish_reason_invalid",
-                        format!(
-                            "OpenAI-compatible finish_reason `{finish_reason}` is not supported"
-                        ),
-                    ));
-                }
-                if self
-                    .finish_reason
-                    .as_deref()
-                    .is_some_and(|existing| existing != finish_reason)
-                {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_stream_finish_reason_conflict",
-                        "OpenAI-compatible stream changed its finish_reason",
-                    ));
-                }
-                self.finish_reason = Some(finish_reason.to_string());
+            let delta = choice.get("delta").unwrap_or(&Value::Null);
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                self.push_text(text, &mut emissions);
             }
-            let delta = choice
-                .get("delta")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    ProviderNativeStreamErrorV1::invalid(
-                        "provider_stream_schema_invalid",
-                        "OpenAI-compatible stream choice requires delta object",
-                    )
-                })?;
             if let Some(reasoning) = delta
                 .get("reasoning_content")
                 .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
             {
                 self.reasoning.push_str(reasoning);
-                emissions.push(reasoning_emission(reasoning));
             }
-            if let Some(content) = delta
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
-                self.content.push_str(content);
-                emissions.push(text_emission(content));
-            }
-            let mut envelope_tool_indices = BTreeSet::new();
             for call in delta
                 .get("tool_calls")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
-                let tool_index = call.get("index").and_then(Value::as_i64).ok_or_else(|| {
-                    ProviderNativeStreamErrorV1::invalid(
-                        "provider_stream_schema_invalid",
-                        "OpenAI-compatible tool call requires an explicit integer index",
-                    )
-                })?;
-                if !(0..32).contains(&tool_index) {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_index_invalid",
-                        "OpenAI-compatible tool-call index must be in 0..31",
-                    ));
+                let index = required_tool_call_index(call.get("index"), "OpenAI tool call")?;
+                let buffer = self.tool_calls.entry(index).or_default();
+                set_once(
+                    &mut buffer.id,
+                    call.get("id").and_then(Value::as_str),
+                    "工具调用 ID",
+                )?;
+                let function = call.get("function").unwrap_or(&Value::Null);
+                set_once(
+                    &mut buffer.name,
+                    function.get("name").and_then(Value::as_str),
+                    "工具名称",
+                )?;
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    buffer.arguments.push_str(arguments);
                 }
-                if !envelope_tool_indices.insert(tool_index) {
-                    return Err(ProviderNativeStreamErrorV1::invalid(
-                        "provider_tool_call_index_duplicate",
-                        "OpenAI-compatible stream envelope repeated a tool-call index",
-                    ));
-                }
-                self.validate_tool_index_first_occurrence(tool_index)?;
-                let buffer = self.tool_calls.entry(tool_index).or_default();
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    if buffer.id.as_deref().is_some_and(|existing| existing != id) {
-                        return Err(ProviderNativeStreamErrorV1::invalid(
-                            "provider_tool_call_identity_conflict",
-                            "Provider changed a tool-call identity within one response",
-                        ));
-                    }
-                    buffer.id = Some(id.to_string());
-                }
-                let function = call.get("function").and_then(Value::as_object);
-                if let Some(name) = function
-                    .and_then(|value| value.get("name"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                {
-                    if buffer
-                        .name
-                        .as_deref()
-                        .is_some_and(|existing| existing != name)
-                    {
-                        return Err(ProviderNativeStreamErrorV1::invalid(
-                            "provider_tool_call_name_conflict",
-                            "Provider changed a tool-call name within one response",
-                        ));
-                    }
-                    buffer.name = Some(name.to_string());
-                }
-                let arguments_delta = function
-                    .and_then(|value| value.get("arguments"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                buffer.arguments.push_str(arguments_delta);
-                emissions.push(tool_delta_emission(
-                    tool_index,
-                    buffer.id.as_deref(),
-                    buffer.name.as_deref(),
-                    arguments_delta,
-                ));
             }
         }
         Ok(emissions)
     }
 
-    fn ingest_anthropic_payload(
+    fn ingest_anthropic(
         &mut self,
-        data: &str,
-    ) -> Result<Vec<ProviderNormalizedEmissionV1>, ProviderNativeStreamErrorV1> {
-        let value = parse_provider_json(data, "Anthropic")?;
-        let event_type = value.get("type").and_then(Value::as_str).ok_or_else(|| {
-            ProviderNativeStreamErrorV1::invalid(
-                "provider_stream_schema_invalid",
-                "Anthropic stream envelope requires type",
-            )
-        })?;
+        payload: &str,
+    ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
+        let value = parse_json(payload)?;
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         let mut emissions = Vec::new();
         match event_type {
             "message_start" => {
-                if let Some(usage) = value
-                    .get("message")
-                    .and_then(|message| message.get("usage"))
-                    .cloned()
-                {
-                    self.usage = Some(usage.clone());
-                    emissions.push(usage_emission(usage));
-                }
+                set_token_count(
+                    &mut self.input_tokens,
+                    value.pointer("/message/usage/input_tokens"),
+                    "输入 token",
+                )?;
+                set_token_count(
+                    &mut self.cache_read_input_tokens,
+                    value.pointer("/message/usage/cache_read_input_tokens"),
+                    "缓存读取输入 token",
+                )?;
+                set_token_count(
+                    &mut self.cache_creation_input_tokens,
+                    value.pointer("/message/usage/cache_creation_input_tokens"),
+                    "缓存创建输入 token",
+                )?;
             }
             "content_block_start" => {
-                let index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
-                let block = value
-                    .get("content_block")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        ProviderNativeStreamErrorV1::invalid(
-                            "provider_stream_schema_invalid",
-                            "Anthropic content_block_start requires content_block",
-                        )
-                    })?;
+                let index =
+                    required_tool_call_index(value.get("index"), "Anthropic content block start")?;
+                let block = value.get("content_block").unwrap_or(&Value::Null);
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    self.validate_tool_index_first_occurrence(index)?;
                     let buffer = self.tool_calls.entry(index).or_default();
-                    if let Some(id) = block.get("id").and_then(Value::as_str) {
-                        if buffer.id.as_deref().is_some_and(|existing| existing != id) {
-                            return Err(ProviderNativeStreamErrorV1::invalid(
-                                "provider_tool_call_identity_conflict",
-                                "Provider changed a tool-call identity within one response",
-                            ));
-                        }
-                        buffer.id = Some(id.to_string());
-                    }
-                    if let Some(name) = block.get("name").and_then(Value::as_str) {
-                        if buffer
-                            .name
-                            .as_deref()
-                            .is_some_and(|existing| existing != name)
-                        {
-                            return Err(ProviderNativeStreamErrorV1::invalid(
-                                "provider_tool_call_name_conflict",
-                                "Provider changed a tool-call name within one response",
-                            ));
-                        }
-                        buffer.name = Some(name.to_string());
-                    }
+                    set_once(
+                        &mut buffer.id,
+                        block.get("id").and_then(Value::as_str),
+                        "工具调用 ID",
+                    )?;
+                    set_once(
+                        &mut buffer.name,
+                        block.get("name").and_then(Value::as_str),
+                        "工具名称",
+                    )?;
                     if let Some(input) = block.get("input").filter(|value| !value.is_null()) {
-                        buffer.arguments_complete = Some(input.clone());
+                        buffer.complete_arguments = Some(input.clone());
                     }
-                    emissions.push(tool_delta_emission(
-                        index,
-                        buffer.id.as_deref(),
-                        buffer.name.as_deref(),
-                        "",
-                    ));
                 }
             }
             "content_block_delta" => {
-                let index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
-                let delta = value
-                    .get("delta")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        ProviderNativeStreamErrorV1::invalid(
-                            "provider_stream_schema_invalid",
-                            "Anthropic content_block_delta requires delta",
-                        )
-                    })?;
-                match delta
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                {
-                    "thinking_delta" => {
-                        let reasoning = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !reasoning.is_empty() {
-                            self.reasoning.push_str(reasoning);
-                            emissions.push(reasoning_emission(reasoning));
+                let index =
+                    required_tool_call_index(value.get("index"), "Anthropic content block delta")?;
+                let delta = value.get("delta").unwrap_or(&Value::Null);
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            self.push_text(text, &mut emissions);
                         }
                     }
-                    "text_delta" => {
-                        let content = delta
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !content.is_empty() {
-                            self.content.push_str(content);
-                            emissions.push(text_emission(content));
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            self.reasoning.push_str(text);
                         }
                     }
-                    "input_json_delta" => {
-                        let arguments_delta = delta
-                            .get("partial_json")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        self.validate_tool_index_first_occurrence(index)?;
-                        let buffer = self.tool_calls.entry(index).or_default();
-                        if !arguments_delta.is_empty() {
-                            buffer.arguments_complete = None;
-                            buffer.arguments.push_str(arguments_delta);
+                    Some("input_json_delta") => {
+                        if let Some(text) = delta.get("partial_json").and_then(Value::as_str) {
+                            self.tool_calls
+                                .entry(index)
+                                .or_default()
+                                .arguments
+                                .push_str(text);
                         }
-                        emissions.push(tool_delta_emission(
-                            index,
-                            buffer.id.as_deref(),
-                            buffer.name.as_deref(),
-                            arguments_delta,
-                        ));
                     }
-                    "signature_delta" => {}
-                    other => {
-                        return Err(ProviderNativeStreamErrorV1::invalid(
-                            "provider_stream_anthropic_delta_unsupported",
-                            format!("Anthropic delta type `{other}` is not supported"),
-                        ))
-                    }
+                    _ => {}
                 }
             }
             "message_delta" => {
-                if let Some(usage) = value.get("usage").cloned() {
-                    self.usage = Some(usage.clone());
-                    emissions.push(usage_emission(usage));
-                }
+                self.finish_reason = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                set_token_count(
+                    &mut self.output_tokens,
+                    value.pointer("/usage/output_tokens"),
+                    "输出 token",
+                )?;
             }
-            "content_block_stop" | "ping" => {}
             "message_stop" => self.source_done = true,
             "error" => {
-                return Err(ProviderNativeStreamErrorV1::invalid(
-                    "provider_stream_upstream_error",
-                    format!("Anthropic stream returned an error: {value}"),
-                ))
+                return Err(ProviderStreamError::new(
+                    "provider_error",
+                    value.get("error").unwrap_or(&value).to_string(),
+                ));
             }
-            other => {
-                return Err(ProviderNativeStreamErrorV1::invalid(
-                    "provider_stream_anthropic_event_unsupported",
-                    format!("Anthropic stream event `{other}` is not supported"),
-                ))
-            }
+            _ => {}
         }
         Ok(emissions)
     }
 
-    fn ingest_ollama_payload(
+    fn ingest_ollama(
         &mut self,
-        data: &str,
-    ) -> Result<Vec<ProviderNormalizedEmissionV1>, ProviderNativeStreamErrorV1> {
-        let value = parse_provider_json(data, "Ollama")?;
+        payload: &str,
+    ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
+        let value = parse_json(payload)?;
         if let Some(error) = value.get("error") {
-            return Err(ProviderNativeStreamErrorV1::invalid(
-                "provider_stream_upstream_error",
-                format!("Ollama stream returned an error: {error}"),
+            return Err(ProviderStreamError::new(
+                "provider_error",
+                error.to_string(),
             ));
         }
         let mut emissions = Vec::new();
-        let mut message_reasoning_present = false;
-        if let Some(message) = value.get("message").and_then(Value::as_object) {
-            if let Some(reasoning) = message
-                .get("thinking")
-                .or_else(|| message.get("reasoning"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
-                message_reasoning_present = true;
-                self.reasoning.push_str(reasoning);
-                emissions.push(reasoning_emission(reasoning));
-            }
-            if let Some(content) = message
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
-                self.content.push_str(content);
-                emissions.push(text_emission(content));
-            }
-            for (ordinal, call) in message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                let index = i64::try_from(ordinal).unwrap_or(i64::MAX);
-                let function =
-                    call.get("function")
-                        .and_then(Value::as_object)
-                        .ok_or_else(|| {
-                            ProviderNativeStreamErrorV1::invalid(
-                                "provider_stream_schema_invalid",
-                                "Ollama tool call requires function object",
-                            )
-                        })?;
-                self.validate_tool_index_first_occurrence(index)?;
-                let buffer = self.tool_calls.entry(index).or_default();
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    if buffer.id.as_deref().is_some_and(|existing| existing != id) {
-                        return Err(ProviderNativeStreamErrorV1::invalid(
-                            "provider_tool_call_identity_conflict",
-                            "Provider changed a tool-call identity within one response",
-                        ));
-                    }
-                    buffer.id = Some(id.to_string());
-                } else if buffer.id.is_none() {
-                    buffer.id = Some(format!("tool-call-{index}"));
-                }
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    if buffer
-                        .name
-                        .as_deref()
-                        .is_some_and(|existing| existing != name)
-                    {
-                        return Err(ProviderNativeStreamErrorV1::invalid(
-                            "provider_tool_call_name_conflict",
-                            "Provider changed a tool-call name within one response",
-                        ));
-                    }
-                    buffer.name = Some(name.to_string());
-                }
-                let arguments = function
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                match buffer.arguments_complete.as_ref() {
-                    Some(existing) if existing == &arguments => continue,
-                    Some(_) => {
-                        return Err(ProviderNativeStreamErrorV1::invalid(
-                            "provider_tool_call_arguments_conflict",
-                            "Provider changed complete tool-call arguments within one response",
-                        ))
-                    }
-                    None => buffer.arguments_complete = Some(arguments.clone()),
-                }
-                emissions.push(tool_delta_emission(
-                    index,
-                    buffer.id.as_deref(),
-                    buffer.name.as_deref(),
-                    &serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string()),
-                ));
-            }
+        let message = value.get("message").unwrap_or(&Value::Null);
+        if let Some(text) = message.get("content").and_then(Value::as_str) {
+            self.push_text(text, &mut emissions);
         }
-        if !message_reasoning_present {
-            if let Some(reasoning) = value
-                .get("thinking")
-                .or_else(|| value.get("reasoning"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
-                self.reasoning.push_str(reasoning);
-                emissions.push(reasoning_emission(reasoning));
-            }
+        if let Some(reasoning) = message.get("thinking").and_then(Value::as_str) {
+            self.reasoning.push_str(reasoning);
         }
-        let usage = ollama_usage(&value);
-        if !usage.as_object().is_none_or(serde_json::Map::is_empty) {
-            self.usage = Some(usage.clone());
-            emissions.push(usage_emission(usage));
+        for (index, call) in message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let function = call.get("function").unwrap_or(call);
+            let buffer = self.tool_calls.entry(index as i64).or_default();
+            set_once(
+                &mut buffer.name,
+                function.get("name").and_then(Value::as_str),
+                "工具名称",
+            )?;
+            if let Some(arguments) = function.get("arguments") {
+                buffer.complete_arguments = Some(arguments.clone());
+            }
         }
         if value.get("done").and_then(Value::as_bool) == Some(true) {
+            set_token_count(
+                &mut self.input_tokens,
+                value.get("prompt_eval_count"),
+                "输入 token",
+            )?;
+            set_token_count(
+                &mut self.output_tokens,
+                value.get("eval_count"),
+                "输出 token",
+            )?;
             self.source_done = true;
+            self.finish_reason = value
+                .get("done_reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
         }
         Ok(emissions)
     }
+
+    fn push_text(&mut self, text: &str, emissions: &mut Vec<ProviderEmission>) {
+        if text.is_empty() {
+            return;
+        }
+        self.content.push_str(text);
+        emissions.push(ProviderEmission {
+            event: json!({ "type": "text_delta", "content": text }),
+        });
+    }
 }
 
-fn parse_provider_json(data: &str, provider: &str) -> Result<Value, ProviderNativeStreamErrorV1> {
-    serde_json::from_str(data).map_err(|error| {
-        ProviderNativeStreamErrorV1::invalid(
+fn cache_usage_from_total(
+    input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_miss_input_tokens: Option<u64>,
+) -> Result<Option<(u64, u64)>, ProviderStreamError> {
+    let result = match (cache_read_input_tokens, cache_miss_input_tokens) {
+        (None, None) => return Ok(None),
+        (Some(read), None) if read <= input_tokens => (read, input_tokens - read),
+        (None, Some(miss)) if miss <= input_tokens => (input_tokens - miss, miss),
+        (Some(read), Some(miss))
+            if read
+                .checked_add(miss)
+                .is_some_and(|sum| sum <= input_tokens) =>
+        {
+            (read, miss)
+        }
+        _ => {
+            return Err(ProviderStreamError::new(
+                "provider_usage_invalid",
+                "Provider 缓存 token 计数超过输入 token 总量。",
+            ));
+        }
+    };
+    Ok(Some(result))
+}
+
+fn anthropic_usage(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+) -> Result<ProviderUsage, ProviderStreamError> {
+    let Some(cache_read_input_tokens) = cache_read_input_tokens else {
+        return Ok(ProviderUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
+        });
+    };
+    let Some(cache_creation_input_tokens) = cache_creation_input_tokens else {
+        return Ok(ProviderUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
+        });
+    };
+    let cache_miss_input_tokens = input_tokens
+        .checked_add(cache_creation_input_tokens)
+        .ok_or_else(|| {
+            ProviderStreamError::new("provider_usage_invalid", "Provider 输入 token 溢出。")
+        })?;
+    let total_input_tokens = cache_miss_input_tokens
+        .checked_add(cache_read_input_tokens)
+        .ok_or_else(|| {
+            ProviderStreamError::new("provider_usage_invalid", "Provider 输入 token 溢出。")
+        })?;
+    Ok(ProviderUsage {
+        input_tokens: total_input_tokens,
+        output_tokens,
+        cache_read_input_tokens: Some(cache_read_input_tokens),
+        cache_miss_input_tokens: Some(cache_miss_input_tokens),
+    })
+}
+
+fn parse_json(payload: &str) -> Result<Value, ProviderStreamError> {
+    serde_json::from_str(payload).map_err(|error| {
+        ProviderStreamError::new(
             "provider_stream_json_invalid",
-            format!("{provider} stream envelope is invalid JSON: {error}"),
+            format!("Provider 流事件不是有效 JSON：{error}"),
         )
     })
 }
 
-fn reasoning_emission(content: &str) -> ProviderNormalizedEmissionV1 {
-    ProviderNormalizedEmissionV1 {
-        trace_event: json!({ "type": "reasoning_delta", "content": content }),
-        public_event: None,
-    }
+fn required_tool_call_index(
+    value: Option<&Value>,
+    context: &str,
+) -> Result<i64, ProviderStreamError> {
+    value
+        .and_then(Value::as_i64)
+        .filter(|index| *index >= 0)
+        .ok_or_else(|| {
+            ProviderStreamError::new(
+                "provider_tool_call_index_invalid",
+                format!("{context} 缺少非负整数 index。"),
+            )
+        })
 }
 
-fn text_emission(content: &str) -> ProviderNormalizedEmissionV1 {
-    ProviderNormalizedEmissionV1 {
-        trace_event: json!({ "type": "text_delta", "content": content }),
-        public_event: Some(ProviderPublicStreamEventV1 {
-            event: "provider_delta",
-            data: json!({
-                "type": "provider_delta",
-                "chunk": { "type": "delta", "content": content }
-            }),
-        }),
-    }
-}
-
-fn tool_delta_emission(
-    index: i64,
-    id: Option<&str>,
-    name: Option<&str>,
-    arguments_delta: &str,
-) -> ProviderNormalizedEmissionV1 {
-    let tool_call_delta = json!({
-        "id": id,
-        "index": index,
-        "name": name,
-        "argumentsDelta": arguments_delta,
-    });
-    ProviderNormalizedEmissionV1 {
-        trace_event: json!({
-            "type": "tool_call_delta",
-            "toolCallDelta": tool_call_delta,
-        }),
-        public_event: Some(ProviderPublicStreamEventV1 {
-            event: "provider_tool_call_delta",
-            data: json!({
-                "type": "provider_tool_call_delta",
-                "chunk": {
-                    "type": "tool_call",
-                    "index": index,
-                    "callId": id,
-                    "toolCallDelta": tool_call_delta,
-                }
-            }),
-        }),
-    }
-}
-
-fn usage_emission(usage: Value) -> ProviderNormalizedEmissionV1 {
-    ProviderNormalizedEmissionV1 {
-        trace_event: json!({ "type": "usage", "usage": usage }),
-        public_event: Some(ProviderPublicStreamEventV1 {
-            event: "provider_usage",
-            data: json!({
-                "type": "provider_usage",
-                "usage": usage,
-            }),
-        }),
-    }
-}
-
-fn ollama_usage(value: &Value) -> Value {
-    let mut usage = serde_json::Map::new();
-    for field in [
-        "prompt_eval_count",
-        "eval_count",
-        "total_duration",
-        "load_duration",
-        "prompt_eval_duration",
-        "eval_duration",
-    ] {
-        if let Some(item) = value.get(field) {
-            usage.insert(field.to_string(), item.clone());
-        }
-    }
-    Value::Object(usage)
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct SseDataParser {
-    buffer: String,
-}
-
-#[cfg(test)]
-impl SseDataParser {
-    pub(crate) fn push(&mut self, chunk: &str) -> Vec<String> {
-        self.buffer.push_str(chunk);
-        self.drain_complete_events()
-    }
-
-    pub(crate) fn finish(&mut self) -> Vec<String> {
-        let mut events = self.drain_complete_events();
-        if !self.buffer.trim().is_empty() {
-            events.extend(parse_sse_event(&self.buffer));
-            self.buffer.clear();
-        }
-        events
-    }
-
-    fn drain_complete_events(&mut self) -> Vec<String> {
-        let mut events = Vec::new();
-        while let Some(index) = self.buffer.find("\n\n") {
-            let raw = self.buffer[..index].to_string();
-            self.buffer = self.buffer[index + 2..].to_string();
-            events.extend(parse_sse_event(&raw));
-        }
-        events
-    }
-}
-
-#[cfg(test)]
-fn parse_sse_event(raw: &str) -> Vec<String> {
-    let mut data_lines = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start().to_string());
-        }
-    }
-    if data_lines.is_empty() {
-        Vec::new()
-    } else {
-        vec![data_lines.join("\n")]
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Default)]
-struct ToolCallDeltaBuffer {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct OpenAiCompatibleStreamAccumulator {
-    content: String,
-    reasoning: String,
-    tool_calls: BTreeMap<i64, ToolCallDeltaBuffer>,
-    pub(crate) usage: Option<Value>,
-    pub(crate) done_emitted: bool,
-    source_envelope_seq: u64,
-}
-
-#[cfg(test)]
-impl OpenAiCompatibleStreamAccumulator {
-    fn next_source_envelope_seq(&mut self) -> u64 {
-        self.source_envelope_seq = self.source_envelope_seq.saturating_add(1);
-        self.source_envelope_seq
-    }
-
-    #[cfg(test)]
-    fn output(&self) -> LlmChatOutput {
-        let tool_calls = self
-            .tool_calls
-            .iter()
-            .filter_map(|(index, buffer)| {
-                let name = buffer.name.clone()?;
-                let arguments = if buffer.arguments.trim().is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(&buffer.arguments)
-                        .unwrap_or_else(|_| json!({ "rawArguments": buffer.arguments }))
-                };
-                Some(LlmToolCall {
-                    id: buffer
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| format!("tool-call-{index}")),
-                    name: internal_tool_name(&name),
-                    arguments,
-                })
-            })
-            .collect::<Vec<_>>();
-        LlmChatOutput {
-            content: self.content.clone(),
-            reasoning: (!self.reasoning.is_empty()).then(|| self.reasoning.clone()),
-            tool_calls,
-            usage: self.usage.clone(),
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn parse_openai_compatible_sse_text(text: &str) -> LlmChatOutput {
-    let mut parser = SseDataParser::default();
-    let mut accumulator = OpenAiCompatibleStreamAccumulator::default();
-    for data in parser.push(text).into_iter().chain(parser.finish()) {
-        let _ = openai_stream_events_from_data(&mut accumulator, &data);
-    }
-    accumulator.output()
-}
-
-#[cfg(test)]
-pub(crate) fn openai_stream_events_from_data(
-    accumulator: &mut OpenAiCompatibleStreamAccumulator,
-    data: &str,
-) -> Vec<String> {
-    openai_stream_events_from_data_inner(accumulator, data, None)
-}
-
-#[cfg(test)]
-fn openai_stream_events_from_data_inner(
-    accumulator: &mut OpenAiCompatibleStreamAccumulator,
-    data: &str,
-    request_id: Option<&str>,
-) -> Vec<String> {
-    if data.trim() == "[DONE]" {
-        let source_envelope_seq = accumulator.next_source_envelope_seq();
-        accumulator.done_emitted = true;
-        return vec![provider_sse_json_event(
-            "provider_done",
-            json!({
-                "type": "provider_done",
-                "providerSource": {
-                    "schemaVersion": "deepcode.provider.source-envelope.v1",
-                    "sequence": source_envelope_seq,
-                    "encoding": "sse-marker",
-                },
-                "rawProvider": "[DONE]",
-                "chunk": {
-                    "type": "done",
-                    "usage": accumulator.usage,
-                },
-                "usage": accumulator.usage,
-            }),
-            request_id,
-        )];
-    }
-    let value = match serde_json::from_str::<Value>(data) {
-        Ok(value) => value,
-        Err(error) => {
-            let source_envelope_seq = accumulator.next_source_envelope_seq();
-            return vec![provider_sse_json_event(
-                "provider_error",
-                json!({
-                    "type": "provider_error",
-                    "error": error.to_string(),
-                    "providerSource": {
-                        "schemaVersion": "deepcode.provider.source-envelope.v1",
-                        "sequence": source_envelope_seq,
-                        "encoding": "invalid-json",
-                    },
-                    "rawProvider": data,
-                }),
-                request_id,
-            )];
-        }
+fn set_once(
+    slot: &mut Option<String>,
+    value: Option<&str>,
+    label: &str,
+) -> Result<(), ProviderStreamError> {
+    let Some(value) = value else {
+        return Ok(());
     };
-    openai_stream_events_from_value(accumulator, value, request_id)
-}
-
-#[cfg(test)]
-fn openai_stream_events_from_value(
-    accumulator: &mut OpenAiCompatibleStreamAccumulator,
-    value: Value,
-    request_id: Option<&str>,
-) -> Vec<String> {
-    let source_envelope_seq = accumulator.next_source_envelope_seq();
-    let mut events = vec![provider_sse_json_event(
-        "provider_metadata",
-        json!({
-            "type": "provider_metadata",
-            "providerSource": {
-                "schemaVersion": "deepcode.provider.source-envelope.v1",
-                "sequence": source_envelope_seq,
-                "encoding": "json",
-            },
-            "rawProvider": value.clone(),
-        }),
-        request_id,
-    )];
-    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()).cloned() {
-        accumulator.usage = Some(usage.clone());
-        events.push(provider_sse_json_event(
-            "provider_usage",
-            json!({
-                "type": "provider_usage",
-                "providerSourceSeq": source_envelope_seq,
-                "usage": usage,
-                "chunk": {
-                    "type": "done",
-                    "usage": usage,
-                },
-            }),
-            request_id,
+    if slot.as_deref().is_some_and(|existing| existing != value) {
+        return Err(ProviderStreamError::new(
+            "provider_tool_call_identity_conflict",
+            format!("Provider 在同一响应中改变了{label}。"),
         ));
     }
-    let choices = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for choice in choices {
-        let index = choice.get("index").and_then(Value::as_i64).unwrap_or(0);
-        let finish_reason = choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
-        if let Some(reasoning) = delta
-            .get("reasoning_content")
-            .or_else(|| delta.get("reasoning"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            accumulator.reasoning.push_str(reasoning);
-            events.push(provider_sse_json_event(
-                "provider_reasoning_delta",
-                json!({
-                    "type": "provider_reasoning_delta",
-                    "providerSourceSeq": source_envelope_seq,
-                    "chunk": {
-                        "type": "reasoning_delta",
-                        "content": reasoning,
-                        "index": index,
-                        "finishReason": finish_reason,
-                    },
-                }),
-                request_id,
-            ));
-        }
-        if let Some(content) = delta
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            accumulator.content.push_str(content);
-            events.push(provider_sse_json_event(
-                "provider_delta",
-                json!({
-                    "type": "provider_delta",
-                    "providerSourceSeq": source_envelope_seq,
-                    "chunk": {
-                        "type": "delta",
-                        "content": content,
-                        "index": index,
-                        "finishReason": finish_reason,
-                    },
-                }),
-                request_id,
-            ));
-        }
-        for tool_call in delta
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-        {
-            let tool_index = tool_call
-                .get("index")
-                .and_then(Value::as_i64)
-                .unwrap_or(index);
-            let buffer = accumulator.tool_calls.entry(tool_index).or_default();
-            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
-                buffer.id = Some(id.to_string());
-            }
-            let function = tool_call
-                .get("function")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            if let Some(name) = function
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
-                buffer.name = Some(name.to_string());
-            }
-            let arguments_delta = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if !arguments_delta.is_empty() {
-                buffer.arguments.push_str(&arguments_delta);
-            }
-            events.push(provider_sse_json_event(
-                "provider_tool_call_delta",
-                json!({
-                    "type": "provider_tool_call_delta",
-                    "providerSourceSeq": source_envelope_seq,
-                    "chunk": {
-                        "type": "tool_call",
-                        "index": tool_index,
-                        "callId": buffer.id.clone(),
-                        "finishReason": finish_reason,
-                        "toolCallDelta": {
-                            "id": buffer.id.clone(),
-                            "index": tool_index,
-                            "name": buffer.name.clone(),
-                            "argumentsDelta": arguments_delta,
-                        },
-                    },
-                }),
-                request_id,
-            ));
-        }
+    if slot.is_none() {
+        *slot = Some(value.to_owned());
     }
-    events
+    Ok(())
 }
 
-#[cfg(test)]
-fn provider_sse_json_event(event: &str, mut value: Value, request_id: Option<&str>) -> String {
-    if let (Some(request_id), Some(record)) = (request_id, value.as_object_mut()) {
-        record.insert("requestId".to_string(), json!(request_id));
+fn set_token_count(
+    slot: &mut Option<u64>,
+    value: Option<&Value>,
+    label: &str,
+) -> Result<(), ProviderStreamError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.as_u64().ok_or_else(|| {
+        ProviderStreamError::new(
+            "provider_usage_invalid",
+            format!("Provider {label}计数不是非负整数。"),
+        )
+    })?;
+    if slot.is_some_and(|existing| existing != value) {
+        return Err(ProviderStreamError::new(
+            "provider_usage_conflict",
+            format!("Provider 在同一响应中改变了{label}计数。"),
+        ));
     }
-    sse_json_event(event, value)
+    *slot = Some(value);
+    Ok(())
 }
 
 pub(crate) fn sse_json_event(event: &str, value: Value) -> String {
-    let data = serde_json::to_string(&value).unwrap_or_else(|_| {
-        "{\"type\":\"provider_error\",\"error\":\"failed to serialize stream event\"}".to_string()
-    });
-    format!("event: {event}\ndata: {data}\n\n")
-}
-
-#[cfg(test)]
-pub(crate) fn llm_output_payload(output: LlmChatOutput) -> Value {
-    let usage = output.usage.clone();
-    let mut chunks = Vec::new();
-    if let Some(reasoning) = output.reasoning.as_ref().filter(|value| !value.is_empty()) {
-        chunks.push(json!({ "type": "reasoning_delta", "content": reasoning }));
-    }
-    if !output.content.is_empty() {
-        chunks.push(json!({ "type": "delta", "content": output.content }));
-    }
-    for call in &output.tool_calls {
-        chunks.push(json!({
-            "type": "tool_call",
-            "toolCall": {
-                "id": call.id,
-                "name": call.name,
-                "arguments": call.arguments
-            }
-        }));
-    }
-    chunks.push(json!({ "type": "done" }));
-    let mut payload = json!({
-        "chunks": chunks,
-        "assistantMessage": {
-            "role": "assistant",
-            "content": output.content,
-            "reasoningContent": output.reasoning,
-            "toolCalls": output.tool_calls.into_iter().map(|call| json!({
-                "id": call.id,
-                "name": call.name,
-                "arguments": call.arguments
-            })).collect::<Vec<_>>()
-        }
-    });
-    if let Some(usage) = usage {
-        payload["usage"] = usage;
-    }
-    payload
+    format!("event: {event}\ndata: {value}\n\n")
 }
 
 pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefinition> {
@@ -1420,12 +643,12 @@ pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefin
         .into_iter()
         .filter_map(|value| {
             Some(LlmToolDefinition {
-                name: value.get("name").and_then(Value::as_str)?.to_string(),
+                name: value.get("name")?.as_str()?.to_owned(),
                 description: value
                     .get("description")
                     .and_then(Value::as_str)
-                    .unwrap_or("DeepCode tool")
-                    .to_string(),
+                    .unwrap_or_default()
+                    .to_owned(),
                 input_schema: value
                     .get("inputSchema")
                     .cloned()
@@ -1433,4 +656,217 @@ pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefin
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_text_does_not_require_reasoning() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        parser
+            .ingest_payload(br#"{"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}"#)
+            .unwrap();
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(result.output.content, "OK");
+        assert!(result.output.reasoning.is_none());
+    }
+
+    #[test]
+    fn openai_usage_is_preserved_as_provider_fact() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        parser
+            .ingest_payload(br#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#)
+            .unwrap();
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 12,
+                output_tokens: 5,
+                cache_read_input_tokens: None,
+                cache_miss_input_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_usage_is_preserved_as_provider_fact() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
+        parser
+            .ingest_payload(br#"{"type":"message_start","message":{"usage":{"input_tokens":21}}}"#)
+            .unwrap();
+        parser
+            .ingest_payload(
+                br#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}"#,
+            )
+            .unwrap();
+        parser
+            .ingest_payload(br#"{"type":"message_stop"}"#)
+            .unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 21,
+                output_tokens: 8,
+                cache_read_input_tokens: None,
+                cache_miss_input_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn ollama_usage_is_preserved_as_provider_fact() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Ollama);
+        parser
+            .ingest_payload(
+                br#"{"message":{"content":"OK"},"done":true,"prompt_eval_count":9,"eval_count":3}"#,
+            )
+            .unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 9,
+                output_tokens: 3,
+                cache_read_input_tokens: None,
+                cache_miss_input_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_without_native_tool_ids_gets_request_scoped_call_identity() {
+        fn call_id(request_id: &str) -> String {
+            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Ollama);
+            parser
+                .ingest_payload(
+                    br#"{"message":{"tool_calls":[{"function":{"name":"fs__list","arguments":{"path":"."}}}]},"done":true,"prompt_eval_count":1,"eval_count":1}"#,
+                )
+                .unwrap();
+            parser
+                .finalize_for_request(request_id)
+                .unwrap()
+                .output
+                .tool_calls[0]
+                .id
+                .clone()
+        }
+
+        assert_eq!(call_id("request-a"), "provider-tool:request-a:0");
+        assert_eq!(call_id("request-b"), "provider-tool:request-b:0");
+        assert_ne!(call_id("request-a"), call_id("request-b"));
+    }
+
+    #[test]
+    fn deepseek_cache_usage_is_preserved_as_provider_fact() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        parser
+            .ingest_payload(
+                br#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_cache_hit_tokens":15,"prompt_cache_miss_tokens":5}}"#,
+            )
+            .unwrap();
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 20,
+                output_tokens: 4,
+                cache_read_input_tokens: Some(15),
+                cache_miss_input_tokens: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn openai_cached_tokens_derives_miss_from_same_usage_object() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        parser
+            .ingest_payload(
+                br#"{"choices":[],"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":18}}}"#,
+            )
+            .unwrap();
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 30,
+                output_tokens: 6,
+                cache_read_input_tokens: Some(18),
+                cache_miss_input_tokens: Some(12),
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_cache_components_form_total_and_miss_usage() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
+        parser
+            .ingest_payload(
+                br#"{"type":"message_start","message":{"usage":{"input_tokens":4,"cache_read_input_tokens":10,"cache_creation_input_tokens":6}}}"#,
+            )
+            .unwrap();
+        parser
+            .ingest_payload(
+                br#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            )
+            .unwrap();
+        parser
+            .ingest_payload(br#"{"type":"message_stop"}"#)
+            .unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 20,
+                output_tokens: 2,
+                cache_read_input_tokens: Some(10),
+                cache_miss_input_tokens: Some(10),
+            })
+        );
+    }
+
+    #[test]
+    fn openai_tool_call_is_decoded_to_internal_name() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        parser
+            .ingest_payload(
+                br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs__read","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(result.output.tool_calls[0].name, "fs.read");
+        assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn openai_tool_call_without_index_is_rejected_instead_of_merged_into_zero() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        let error = parser
+            .ingest_payload(
+                br#"{"choices":[{"delta":{"tool_calls":[{"id":"call-1","function":{"name":"fs__read","arguments":"{}"}}]}}]}"#,
+            )
+            .expect_err("missing index rejected");
+
+        assert_eq!(error.code, "provider_tool_call_index_invalid");
+    }
+
+    #[test]
+    fn anthropic_content_block_without_index_is_rejected() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
+        let error = parser
+            .ingest_payload(
+                br#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#,
+            )
+            .expect_err("missing index rejected");
+
+        assert_eq!(error.code, "provider_tool_call_index_invalid");
+    }
 }

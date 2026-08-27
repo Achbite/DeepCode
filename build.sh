@@ -49,9 +49,7 @@ LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
-KERNEL_ABI_VERSION="deepcode.kernel.abi.v3"
-TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
-SESSION_BRIDGE_NAME="hostBridgeV2.js"
+SESSION_BRIDGE_NAME="sessionServiceBridge.js"
 
 fs_type_of() {
   stat -f -c %T "$1" 2>/dev/null || true
@@ -697,26 +695,24 @@ stage_hash() {
     tracked_files build.sh scripts/cargo-with-fallback.sh
     case "$stage" in
       gui)
-        tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui \
+        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime-v2 \
+          userspace/protocol userspace/session-core userspace/gui \
           | grep -Ev '(^|/)(dist|node_modules)/' || true
         ;;
       deepcode-gui)
-        tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui shells/deepcode-gui \
+        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime-v2 \
+          userspace/protocol userspace/session-core userspace/gui shells/deepcode-gui \
           | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules)/' || true
         ;;
       kernel)
-        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi \
-          crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
-          crates/deepcode-kernel-config \
-          crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
+        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime-v2 crates/deepcode-kernel-abi \
+          crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
           crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-host-web \
           shells/cli shells/tui
         ;;
       daemon)
-        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi \
-          crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
-          crates/deepcode-kernel-config \
-          crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
+        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime-v2 crates/deepcode-kernel-abi \
+          crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
           crates/deepcode-kernel-daemon crates/deepcode-host-web
         ;;
       cli)
@@ -995,20 +991,168 @@ build_deepcode_gui_tauri() {
   show_sccache_stats
 }
 
-prepare_distribution_tree() {
+copy_distribution_default_if_missing() {
+  local src="$1"
+  local dst="$2"
+  [ -f "$dst" ] && return 0
+  if [ ! -f "$src" ]; then
+    echo "==[build][error]== portable config default missing: $src" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$dst")"
+  install -m 644 "$src" "$dst"
+}
+
+prepare_distribution_config_root() {
   local dist_dir="$1"
   mkdir -p \
-    "$dist_dir/config/global/prompts" \
-    "$dist_dir/config/global/skills" \
-    "$dist_dir/config/global/ruler" \
     "$dist_dir/config/user/local/settings" \
     "$dist_dir/config/user/local/secrets" \
-    "$dist_dir/sessions" \
-    "$dist_dir/conversation-archives" \
-    "$dist_dir/kernel" \
-    "$dist_dir/packs" \
-    "$dist_dir/web" \
-    "$dist_dir/web-deepcode-gui"
+    "$dist_dir/runtime/local-agent-v2" \
+    "$dist_dir/sessions"
+  copy_distribution_default_if_missing \
+    "$ROOT_DIR/config/defaults/user-settings.json" \
+    "$dist_dir/config/user/local/settings/user-settings.json"
+  copy_distribution_default_if_missing \
+    "$ROOT_DIR/config/defaults/llm-profiles.json" \
+    "$dist_dir/config/user/local/settings/llm-profiles.json"
+}
+
+distribution_node_source() {
+  local platform="$1"
+  if [ "$platform" = "win64" ]; then
+    printf '%s\n' "${DEEPCODE_WINDOWS_NODE_BIN:-/opt/deepcode-node-win64/node.exe}"
+  else
+    if [ -n "${DEEPCODE_LINUX_NODE_BIN:-}" ]; then
+      printf '%s\n' "$DEEPCODE_LINUX_NODE_BIN"
+    else
+      command -v node 2>/dev/null || true
+    fi
+  fi
+}
+
+copy_distribution_session_runtime() {
+  local dist_dir="$1"
+  local platform="$2"
+  local session_dist="$ROOT_DIR/userspace/session-core/dist"
+  local protocol_dist="$ROOT_DIR/userspace/protocol/dist"
+  local session_dst="$dist_dir/session-core"
+  local protocol_dst="$dist_dir/node_modules/@deepcode/protocol"
+  local node_src
+  local node_dst
+
+  require_package_file "$session_dist/$SESSION_BRIDGE_NAME" \
+    "run pnpm --filter @deepcode/session-core build first" || exit 1
+  require_package_dir "$protocol_dist" \
+    "run pnpm --filter @deepcode/protocol build first" || exit 1
+  verify_protocol_runtime "$protocol_dist" "source protocol runtime" || exit 1
+
+  rm -rf "$session_dst" "$dist_dir/node_modules" "$dist_dir/node"
+  mkdir -p "$session_dst/dist" "$protocol_dst/dist" "$dist_dir/node/bin"
+  cp -R "$session_dist/." "$session_dst/dist/"
+  cp -R "$protocol_dist/." "$protocol_dst/dist/"
+  cp "$ROOT_DIR/userspace/session-core/package.json" "$session_dst/package.json"
+  cp "$ROOT_DIR/userspace/protocol/package.json" "$protocol_dst/package.json"
+  printf 'import "./dist/%s";\n' "$SESSION_BRIDGE_NAME" > "$session_dst/$SESSION_BRIDGE_NAME"
+  chmod 644 "$session_dst/$SESSION_BRIDGE_NAME"
+  verify_protocol_runtime "$protocol_dst/dist" "packaged $platform protocol runtime" || exit 1
+
+  node_src="$(distribution_node_source "$platform")"
+  if [ ! -f "$node_src" ]; then
+    echo "==[build][error]== packaged $platform Node runtime source not found: ${node_src:-<empty>}" >&2
+    exit 1
+  fi
+  if [ "$platform" = "win64" ]; then
+    node_dst="$dist_dir/node/bin/node.exe"
+    install -m 644 "$node_src" "$node_dst"
+  else
+    node_dst="$dist_dir/node/bin/node"
+    install -m 755 "$node_src" "$node_dst"
+    local node_major
+    node_major="$("$node_dst" -p "process.versions.node.split('.')[0]" 2>/dev/null || printf '0')"
+    if [ "$node_major" -lt 20 ] 2>/dev/null; then
+      echo "==[build][error]== packaged Linux Node runtime must be 20+: $("$node_dst" --version 2>/dev/null || printf unknown)" >&2
+      exit 1
+    fi
+  fi
+}
+
+runtime_sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{ print $1 }'
+  else
+    shasum -a 256 | awk '{ print $1 }'
+  fi
+}
+
+distribution_source_fingerprint() {
+  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    {
+      git -C "$ROOT_DIR" rev-parse HEAD
+      git -C "$ROOT_DIR" diff --binary --no-ext-diff HEAD --
+      git -C "$ROOT_DIR" ls-files --others --exclude-standard -z \
+        | while IFS= read -r -d '' path; do
+            printf 'untracked=%s\n' "$path"
+            [ -f "$ROOT_DIR/$path" ] && runtime_sha256 "$ROOT_DIR/$path"
+          done
+    } | runtime_sha256_stream
+    return
+  fi
+  find "$ROOT_DIR" \
+    \( -type d \( -name .git -o -name node_modules -o -name target -o -name bin -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
+    \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -print \) \
+    | LC_ALL=C sort \
+    | runtime_sha256_stream
+}
+
+PACKAGE_BUILD_COMMIT=""
+PACKAGE_BUILD_TIME_UTC=""
+PACKAGE_SOURCE_DIRTY=""
+PACKAGE_SOURCE_STATUS_HASH=""
+PACKAGE_SOURCE_FINGERPRINT=""
+PACKAGE_PRODUCT_VERSION=""
+
+prepare_distribution_build_identity() {
+  [ -z "$PACKAGE_BUILD_COMMIT" ] || return 0
+  PACKAGE_BUILD_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf unknown)"
+  PACKAGE_BUILD_TIME_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  local status
+  status="$(git -C "$ROOT_DIR" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+  if [ -n "$status" ]; then
+    PACKAGE_SOURCE_DIRTY=true
+  else
+    PACKAGE_SOURCE_DIRTY=false
+  fi
+  PACKAGE_SOURCE_STATUS_HASH="$(printf '%s' "$status" | runtime_sha256_stream)"
+  PACKAGE_SOURCE_FINGERPRINT="$(distribution_source_fingerprint)"
+  PACKAGE_PRODUCT_VERSION="$(awk -F '"' '/"version"[[:space:]]*:/ { print $4; exit }' "$ROOT_DIR/package.json")"
+}
+
+write_distribution_build_info() {
+  local dist_dir="$1"
+  local product="$2"
+  prepare_distribution_build_identity
+  cat > "$dist_dir/build-info.json" <<JSON
+{
+  "buildCommit": "$PACKAGE_BUILD_COMMIT",
+  "buildTimeUtc": "$PACKAGE_BUILD_TIME_UTC",
+  "sourceDirty": $PACKAGE_SOURCE_DIRTY,
+  "sourceStatusHash": "$PACKAGE_SOURCE_STATUS_HASH",
+  "sourceFingerprint": "$PACKAGE_SOURCE_FINGERPRINT",
+  "sessionBridge": "$SESSION_BRIDGE_NAME",
+  "product": "$product",
+  "productVersion": "$PACKAGE_PRODUCT_VERSION"
+}
+JSON
+}
+
+prepare_distribution_tree() {
+  local dist_dir="$1"
+  local platform="$2"
+  prepare_distribution_config_root "$dist_dir"
+  mkdir -p "$dist_dir/web" "$dist_dir/web-deepcode-gui"
+  copy_distribution_session_runtime "$dist_dir" "$platform"
+  write_distribution_build_info "$dist_dir" "$platform"
 
   if [ -d "$CLIENT_DIR/dist" ]; then
     cp -r "$CLIENT_DIR/dist/." "$dist_dir/web/"
@@ -1071,6 +1215,25 @@ validate_package_inputs() {
   local missing=0
   require_package_dir "$CLIENT_DIR/dist" "run ./build.sh --stage gui first" || missing=1
   require_package_dir "$CLIENT_DIR/dist-deepcode-gui" "run ./build.sh --stage deepcode-gui first" || missing=1
+  require_package_file "$ROOT_DIR/userspace/session-core/dist/$SESSION_BRIDGE_NAME" \
+    "run pnpm --filter @deepcode/session-core build first" || missing=1
+  require_package_file "$ROOT_DIR/userspace/session-core/package.json" \
+    "Session runtime package metadata is missing" || missing=1
+  require_package_dir "$ROOT_DIR/userspace/protocol/dist" \
+    "run pnpm --filter @deepcode/protocol build first" || missing=1
+  require_package_file "$ROOT_DIR/userspace/protocol/package.json" \
+    "protocol runtime package metadata is missing" || missing=1
+  require_package_file "$ROOT_DIR/config/defaults/user-settings.json" \
+    "portable user settings default is missing" || missing=1
+  require_package_file "$ROOT_DIR/config/defaults/llm-profiles.json" \
+    "portable LLM Profile default is missing" || missing=1
+  local linux_node_source windows_node_source
+  linux_node_source="$(distribution_node_source linux-x64)"
+  windows_node_source="$(distribution_node_source win64)"
+  require_package_file "$linux_node_source" \
+    "Linux Node 20+ runtime is required for the Session service" || missing=1
+  require_package_file "$windows_node_source" \
+    "Windows node.exe runtime is required for the Session service" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run ./build.sh --stage kernel first" || missing=1
@@ -1112,17 +1275,27 @@ verify_runtime_executable() {
   echo "==[build][verify-package-runtime]== ok $label: $path"
 }
 
-verify_protocol_v2_runtime() {
+verify_runtime_dir() {
+  local path="$1"
+  local label="$2"
+  if [ ! -d "$path" ]; then
+    echo "==[build][verify-package-runtime][error]== missing $label: $path" >&2
+    return 1
+  fi
+  echo "==[build][verify-package-runtime]== ok $label: $path"
+}
+
+verify_protocol_runtime() {
   local dist_dir="$1"
   local label="$2"
   local required
   local failed=0
-  for required in index.js tools.js kernelAbiV2.js; do
+  for required in index.js localAgent.js tools.js; do
     verify_runtime_file "$dist_dir/$required" "$label $required" || failed=1
   done
   if [ -d "$dist_dir" ] && find "$dist_dir" -maxdepth 1 -type f \
-    \( -name 'kernel.*' -o -name 'kernelAbiV1.*' \) -print -quit | grep -q .; then
-    echo "==[build][verify-package-runtime][error]== $label contains a retired Kernel ABI module" >&2
+    \( -name 'agent.*' -o -name 'kernelAbiV1.*' -o -name 'kernelAbiV2.*' \) -print -quit | grep -q .; then
+    echo "==[build][verify-package-runtime][error]== $label contains a retired Agent protocol module" >&2
     failed=1
   fi
   return "$failed"
@@ -1144,12 +1317,11 @@ verify_llm_profiles_current() {
 const fs = require('node:fs');
 
 const path = process.argv[2];
-const rootFields = new Set(['profiles', 'defaultProfileId', 'storePath']);
+const rootFields = new Set(['profiles', 'defaultProfileId']);
 const profileFields = new Set([
   'id',
   'name',
   'kind',
-  'reasoningTransport',
   'providerFlavor',
   'baseUrl',
   'model',
@@ -1161,12 +1333,6 @@ const profileFields = new Set([
   'secretRef',
   'enabled',
 ]);
-const transportByKind = new Map([
-  ['openaiCompatible', 'openaiPlaintext'],
-  ['anthropic', 'anthropicPlaintext'],
-  ['ollama', 'ollamaPlaintext'],
-]);
-
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -1205,7 +1371,7 @@ try {
     rootKeys.length !== rootFields.size
     || rootKeys.some((field) => !rootFields.has(field))
   ) {
-    reject('root must contain only profiles, defaultProfileId, and storePath');
+    reject('root must contain only profiles and defaultProfileId');
   }
   if (!Array.isArray(config.profiles)) reject('profiles must be an array');
 
@@ -1225,9 +1391,8 @@ try {
     if (typeof profile.enabled !== 'boolean') {
       reject(`profiles[${index}].enabled must be a boolean`);
     }
-    const expectedTransport = transportByKind.get(profile.kind);
-    if (expectedTransport === undefined || profile.reasoningTransport !== expectedTransport) {
-      reject(`profiles[${index}] has an incompatible kind/reasoningTransport pair`);
+    if (!['openaiCompatible', 'anthropic', 'ollama'].includes(profile.kind)) {
+      reject(`profiles[${index}].kind is unsupported`);
     }
     if (
       'providerFlavor' in profile
@@ -1282,9 +1447,6 @@ try {
   ) {
     reject('defaultProfileId must be null or reference an enabled profile by exact id');
   }
-  if (config.storePath !== null && typeof config.storePath !== 'string') {
-    reject('storePath must be null or a string');
-  }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
@@ -1322,6 +1484,33 @@ build_info_string_field() {
   awk -F '"' -v key="\"$field\"" 'index($0, key) > 0 { print $4; exit }' "$path"
 }
 
+verify_distribution_build_identity() {
+  local dist_dir="$1"
+  local product="$2"
+  local build_info="$dist_dir/build-info.json"
+  local field value
+  local failed=0
+  verify_runtime_file "$build_info" "$product build-info" || return 1
+  for field in buildCommit buildTimeUtc sourceStatusHash sourceFingerprint productVersion; do
+    value="$(build_info_string_field "$build_info" "$field")"
+    if [ -z "$value" ]; then
+      echo "==[build][verify-package-runtime][error]== $product build-info has no $field" >&2
+      failed=1
+    fi
+  done
+  value="$(build_info_string_field "$build_info" sessionBridge)"
+  if [ "$value" != "$SESSION_BRIDGE_NAME" ]; then
+    echo "==[build][verify-package-runtime][error]== $product build-info sessionBridge=$value" >&2
+    failed=1
+  fi
+  value="$(build_info_string_field "$build_info" product)"
+  if [ "$value" != "$product" ]; then
+    echo "==[build][verify-package-runtime][error]== $product build-info product=$value" >&2
+    failed=1
+  fi
+  return "$failed"
+}
+
 verify_macos_app_identity() {
   local app_dir="$1"
   local product="$2"
@@ -1340,7 +1529,7 @@ verify_macos_app_identity() {
     echo "==[build][verify-package-runtime][error]== macOS shared kernel and $product bundled kernel differ" >&2
     failed=1
   fi
-  for field in buildCommit sourceFingerprint kernelAbiVersion toolRegistryVersion sessionBridge; do
+  for field in buildCommit sourceFingerprint sessionBridge; do
     root_value="$(build_info_string_field "$root_build_info" "$field")"
     app_value="$(build_info_string_field "$app_build_info" "$field")"
     if [ -z "$root_value" ] || [ "$root_value" != "$app_value" ]; then
@@ -1348,16 +1537,6 @@ verify_macos_app_identity() {
       failed=1
     fi
   done
-  root_value="$(build_info_string_field "$root_build_info" kernelAbiVersion)"
-  if [ "$root_value" != "$KERNEL_ABI_VERSION" ]; then
-    echo "==[build][verify-package-runtime][error]== macOS build-info kernelAbiVersion=$root_value" >&2
-    failed=1
-  fi
-  root_value="$(build_info_string_field "$root_build_info" toolRegistryVersion)"
-  if [ "$root_value" != "$TOOL_REGISTRY_VERSION" ]; then
-    echo "==[build][verify-package-runtime][error]== macOS build-info toolRegistryVersion=$root_value" >&2
-    failed=1
-  fi
   root_value="$(build_info_string_field "$root_build_info" sessionBridge)"
   if [ "$root_value" != "$SESSION_BRIDGE_NAME" ]; then
     echo "==[build][verify-package-runtime][error]== macOS build-info sessionBridge=$root_value" >&2
@@ -1382,6 +1561,18 @@ verify_linux_package_runtime() {
   verify_runtime_executable "$LINUX_DIR/deepcode-host-web" "linux private Host proxy" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-cli" "linux cli" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-tui" "linux tui" || missing=1
+  verify_runtime_file "$LINUX_DIR/session-core/$SESSION_BRIDGE_NAME" "linux Session bridge" || missing=1
+  verify_protocol_runtime \
+    "$LINUX_DIR/node_modules/@deepcode/protocol/dist" \
+    "linux protocol runtime" || missing=1
+  verify_runtime_executable "$LINUX_DIR/node/bin/node" "linux packaged node" || missing=1
+  verify_runtime_dir "$LINUX_DIR/runtime/local-agent-v2" "linux active v2 Session root" || missing=1
+  verify_runtime_dir "$LINUX_DIR/sessions" "linux legacy read-only history root" || missing=1
+  verify_llm_profiles_current \
+    "$LINUX_DIR/config/user/local/settings/llm-profiles.json" \
+    "$LINUX_DIR/node/bin/node" \
+    "linux LLM Profile store" || missing=1
+  verify_distribution_build_identity "$LINUX_DIR" "linux-x64" || missing=1
   verify_frontend_package_assets "$LINUX_DIR/web" "linux editor web" || missing=1
   verify_frontend_package_assets "$LINUX_DIR/web-deepcode-gui" "linux DeepCode-GUI web" || missing=1
   return "$missing"
@@ -1389,6 +1580,7 @@ verify_linux_package_runtime() {
 
 verify_windows_package_runtime() {
   local missing=0
+  local validation_node=""
   [ -d "$WIN_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check win64 package"
   verify_runtime_file "$WIN_DIR/deepcode-kernel.exe" "windows kernel" || missing=1
@@ -1398,6 +1590,23 @@ verify_windows_package_runtime() {
   verify_runtime_file "$WIN_DIR/DeepCode.exe" "windows editor shell" || missing=1
   verify_runtime_file "$WIN_DIR/DeepCode-GUI.exe" "windows DeepCode-GUI shell" || missing=1
   verify_runtime_file "$WIN_DIR/WebView2Loader.dll" "windows WebView2 loader" || missing=1
+  verify_runtime_file "$WIN_DIR/session-core/$SESSION_BRIDGE_NAME" "windows Session bridge" || missing=1
+  verify_protocol_runtime \
+    "$WIN_DIR/node_modules/@deepcode/protocol/dist" \
+    "windows protocol runtime" || missing=1
+  verify_runtime_file "$WIN_DIR/node/bin/node.exe" "windows packaged node" || missing=1
+  verify_runtime_dir "$WIN_DIR/runtime/local-agent-v2" "windows active v2 Session root" || missing=1
+  verify_runtime_dir "$WIN_DIR/sessions" "windows legacy read-only history root" || missing=1
+  if [ -x "$LINUX_DIR/node/bin/node" ]; then
+    validation_node="$LINUX_DIR/node/bin/node"
+  elif command -v node >/dev/null 2>&1; then
+    validation_node="$(command -v node)"
+  fi
+  verify_llm_profiles_current \
+    "$WIN_DIR/config/user/local/settings/llm-profiles.json" \
+    "$validation_node" \
+    "windows LLM Profile store" || missing=1
+  verify_distribution_build_identity "$WIN_DIR" "win64" || missing=1
   verify_frontend_package_assets "$WIN_DIR/web" "windows editor web" || missing=1
   verify_frontend_package_assets "$WIN_DIR/web-deepcode-gui" "windows DeepCode-GUI web" || missing=1
   return "$missing"
@@ -1415,8 +1624,8 @@ verify_macos_package_runtime() {
   verify_runtime_executable "$macos_dir/libexec/DeepCode-CLI" "macOS CLI host" || missing=1
   verify_runtime_executable "$macos_dir/libexec/DeepCode-TUI" "macOS TUI host" || missing=1
   verify_runtime_file "$macos_dir/build-info.json" "macOS shared build-info" || missing=1
-  verify_runtime_file "$macos_dir/session-core/$SESSION_BRIDGE_NAME" "macOS Session v2 bridge" || missing=1
-  verify_protocol_v2_runtime \
+  verify_runtime_file "$macos_dir/session-core/$SESSION_BRIDGE_NAME" "macOS Session bridge" || missing=1
+  verify_protocol_runtime \
     "$macos_dir/node_modules/@deepcode/protocol/dist" \
     "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
@@ -1499,19 +1708,17 @@ DeepCode Unified Distribution ($platform)
 =========================================
 
 This folder is one DeepCode host distribution. GUI, CLI, and TUI entries share
-the same Rust Kernel binary, private desktop Host proxy, bundled config directory,
-and packs directory.
+the same Rust Kernel binary, private desktop Host proxy, bundled Session runtime,
+and configuration directory.
 Editor assets live in web/. DeepCode-GUI assets live in web-deepcode-gui/.
-User session composition lives in the TS session-core package; all sensitive
-workspace, process, skill, and context operations must enter the Kernel through
-syscalls.
+The single Agent Loop and projection reducer live in the TS session-core package;
+all tool effects enter the Rust Kernel through its local execution port.
 
 Writable package-local data is preserved across package refreshes:
-  config/user/local/settings/     User settings, LLM profiles, workflow config.
+  config/user/local/settings/     User settings and LLM profiles.
   config/user/local/secrets/      Local secret references. Do not share.
-  sessions/                       Session projection and transcript cache.
-  conversation-archives/          Conversation archive exports and debug packages.
-  kernel/                         Kernel ledger and runtime records.
+  runtime/local-agent-v2/         Active v2 Catalog, Session journal, and ToolRecord stores.
+  sessions/                       Legacy v1 history retained read-only.
 
 Packaged Tauri desktop shells set DEEPCODE_CONFIG_DIR to this package root.
 Direct CLI/daemon runs use the OS config root unless DEEPCODE_CONFIG_DIR is set.
@@ -1534,8 +1741,8 @@ Windows GUI runtime:
 Optional desktop shell:
   Tauri thin shell source lives in shells/tauri and shells/deepcode-gui. Each
   shell embeds its matching React dist and owns the same-dir Kernel Daemon plus
-  private Host proxy process tree. It does not contain Agent runtime. Windows
-  distribution includes DeepCode.exe and DeepCode-GUI.exe. The desktop shell
+  private Host proxy process tree. The Windows distribution includes
+  DeepCode.exe and DeepCode-GUI.exe. The desktop shell
   chooses available localhost ports by default; set DEEPCODE_PORT to force the
   proxy port to a fixed value such as 31245.
 
@@ -1554,11 +1761,11 @@ clear_package_generated_dir() {
 clean_package_generated_outputs() {
   local dist_dir="$1"
   local platform="$2"
-  echo "==[build][package]== clean $platform generated outputs; preserve config/sessions/conversation-archives/kernel"
+  echo "==[build][package]== clean $platform generated outputs; preserve config/runtime/local-agent-v2/sessions"
 
   clear_package_generated_dir "$dist_dir/web"
   clear_package_generated_dir "$dist_dir/web-deepcode-gui"
-  clear_package_generated_dir "$dist_dir/packs"
+  rm -rf "$dist_dir/session-core" "$dist_dir/node_modules" "$dist_dir/node"
 
   local files=(
     "$dist_dir/README.txt"
@@ -1591,8 +1798,8 @@ package_distribution() {
   clean_package_generated_outputs "$LINUX_DIR" "linux-x64"
   clean_package_generated_outputs "$WIN_DIR" "win64"
 
-  prepare_distribution_tree "$LINUX_DIR"
-  prepare_distribution_tree "$WIN_DIR"
+  prepare_distribution_tree "$LINUX_DIR" "linux-x64"
+  prepare_distribution_tree "$WIN_DIR" "win64"
 
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
     "run ./build.sh --stage kernel first"

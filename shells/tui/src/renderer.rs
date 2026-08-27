@@ -1,591 +1,557 @@
-use crate::{
-    app::TuiApp,
-    model::{CardKind, CardModel, CurrentWorkModel},
+use crate::app::TuiApp;
+use deepcode_kernel_client::{
+    ActivityProjection, NarrativeProjection, PendingPlanProjection, ProjectionMessage,
+    SessionProjection,
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Position, Rect},
-    prelude::{Alignment, Frame},
+    layout::{Constraint, Direction, Layout, Rect},
+    prelude::Frame,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-#[derive(Clone)]
-pub struct Theme {
-    pub accent: Color,
-    pub success: Color,
-    pub warning: Color,
-    pub danger: Color,
-    pub dim: Color,
-    pub border: Color,
-    pub user_bg: Color,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            accent: Color::Cyan,
-            success: Color::Green,
-            warning: Color::Yellow,
-            danger: Color::Red,
-            dim: Color::DarkGray,
-            border: Color::Rgb(210, 214, 220),
-            user_bg: Color::Rgb(235, 238, 242),
-        }
-    }
-}
-
 #[derive(Clone, Default)]
-pub struct Renderer {
-    theme: Theme,
-}
+pub struct Renderer;
 
 impl Renderer {
     pub fn draw(&self, frame: &mut Frame<'_>, app: &TuiApp) {
-        let area = frame.area();
-        let composer_height = if app.input().chars().count() > usize::from(area.width / 2) {
-            5
-        } else {
-            4
-        };
-        let vertical = Layout::default()
+        let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(8),
-                Constraint::Length(composer_height),
+                Constraint::Length(4),
                 Constraint::Length(1),
             ])
-            .split(area);
-
-        self.draw_header(frame, vertical[0]);
-        self.draw_timeline(frame, vertical[1], app);
-        self.draw_composer(frame, vertical[2], app.input());
-        self.draw_footer(frame, vertical[3], app.status());
+            .split(frame.area());
+        self.draw_header(frame, rows[0], app);
+        if app.resource_preview().is_some() {
+            self.draw_resource(frame, rows[1], app);
+        } else if rows[1].width >= 88 {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(42), Constraint::Length(32)])
+                .split(rows[1]);
+            self.draw_projection(frame, columns[0], app);
+            self.draw_todo(frame, columns[1], app);
+        } else {
+            let content = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(6), Constraint::Length(8)])
+                .split(rows[1]);
+            self.draw_projection(frame, content[0], app);
+            self.draw_todo(frame, content[1], app);
+        }
+        self.draw_input(frame, rows[2], app);
+        frame.render_widget(
+            Paragraph::new(app.status()).style(Style::default().fg(Color::DarkGray)),
+            rows[3],
+        );
     }
 
     pub fn render_plain(&self, app: &TuiApp) -> String {
-        let mut output = String::new();
-        output.push_str("DeepCode TUI · daemon Session Runtime host shell\n");
+        let mut output = String::from("DeepCode TUI · shared SessionProjection\n");
         output.push_str("────────────────────────────────────────\n");
-        if app.cards().is_empty() {
-            for line in cover_plain_lines(app) {
-                output.push_str(&line);
-                output.push('\n');
+        if let Some(projection) = app.projection() {
+            output.push_str(&format!(
+                "session={} revision={}\n",
+                projection.session_id, projection.revision
+            ));
+            for binding in &projection.session_directory_indexes {
+                output.push_str(&format!(
+                    "目录索引 {} ({})\n",
+                    binding.display_name, binding.workspace_id
+                ));
             }
-            output.push('\n');
+            for item in timeline_items(projection) {
+                match item {
+                    TimelineItem::Message(message) => {
+                        output.push_str(&format!("{}: {}\n", message.role, message.content));
+                        if !message.attachments.is_empty() {
+                            output.push_str(&format!(
+                                "  附件：{}\n",
+                                message
+                                    .attachments
+                                    .iter()
+                                    .map(|attachment| attachment.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                    }
+                    TimelineItem::Narrative(narrative) => {
+                        output.push_str(&format!("{}\n", narrative.content));
+                    }
+                    TimelineItem::Tool(activity) => {
+                        render_tool_plain(&mut output, activity);
+                    }
+                }
+            }
+            if let Some(draft) = projection.assistant_draft.as_ref() {
+                output.push_str(&draft.content);
+                output.push_str("▋\n");
+            }
+            if let Some(plan) = projection.pending_plan.as_ref() {
+                render_plan_plain(&mut output, plan);
+            }
+            if let Some(interaction) = projection.pending_interaction.as_ref() {
+                output.push_str(&format!("需要你回答：{}\n", interaction.prompt));
+                if let Some(options) = interaction.options.as_ref() {
+                    for (index, option) in options.iter().enumerate() {
+                        output.push_str(&format!("  {}. {}\n", index + 1, option.label));
+                    }
+                }
+            }
+            if let Some(approval) = projection.pending_approval.as_ref() {
+                output.push_str(&format!("需要你批准：{}\n", approval.preview.summary));
+                for target in &approval.preview.logical_targets {
+                    output.push_str(&format!("  - {target}\n"));
+                }
+                output.push_str("输入 1/允许 或 2/拒绝。\n");
+            }
+            for activity in projection
+                .activities
+                .iter()
+                .filter(|activity| activity.kind != "tool")
+            {
+                output.push_str(&format!(
+                    "{} [{}]: {}\n",
+                    activity.kind, activity.status, activity.label
+                ));
+            }
+            render_todo_plain(&mut output, projection);
+            output.push_str(&format!("缓存命中 {}\n", cache_hit_label(projection)));
+            if let Some(error) = projection.terminal_error.as_ref() {
+                output.push_str(&format!("{}: {}\n", error.code, error.message));
+            }
         } else {
-            for card in app.cards() {
-                output.push_str(&self.render_plain_card(card));
-            }
-        }
-        if let Some(current_work) = app.current_work() {
-            output.push_str(&self.render_plain_current_work(current_work));
+            output.push_str("Session 尚未初始化。\n");
         }
         output.push_str("────────────────────────────────────────\n");
-        output.push_str("输入消息，或使用 /help /workspace /sessions /status /quit\n");
+        output.push_str(app.status());
+        output.push('\n');
         output
     }
 
-    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "DeepCode",
-                    Style::default()
-                        .fg(self.theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" TUI"),
-                Span::styled("  ·  ", Style::default().fg(self.theme.dim)),
-                Span::styled("Agent Session", Style::default().fg(Color::Gray)),
+    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let projection = app.projection();
+        let session = projection
+            .map(|projection| projection.session_id.as_str())
+            .unwrap_or("-");
+        let cache = projection
+            .map(cache_hit_label)
+            .unwrap_or_else(|| "--%".to_string());
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        "DeepCode",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" TUI · 本地编码 Agent"),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "Session {session} · indexes {} · cache {cache} · one Loop / one projection",
+                        projection
+                            .map(|value| value.session_directory_indexes.len())
+                            .unwrap_or(0)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
             ]),
-            Line::from(vec![Span::styled(
-                "KernelClient Host Shell · shared daemon Session Runtime",
-                Style::default().fg(self.theme.dim),
-            )]),
-        ]);
-        frame.render_widget(header, area);
+            area,
+        );
     }
 
-    fn draw_timeline(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(20),
-                Constraint::Length(2),
-            ])
-            .split(area);
-        let area = columns[1];
-
-        let cards = app.cards();
-        let current_work = app.current_work();
-        if cards.is_empty() && current_work.is_none() {
-            let cover = Paragraph::new(self.cover_lines(app))
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true });
-            frame.render_widget(cover, area);
-            return;
-        }
-
-        let (timeline_area, current_work_area) = if let Some(current_work) = current_work {
-            let work_height = current_work_height(current_work, area.height);
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(work_height)])
-                .split(area);
-            (rows[0], Some(rows[1]))
-        } else {
-            (area, None)
-        };
-
-        let visible_cards = usize::from(timeline_area.height.saturating_sub(1)).max(1);
-        let content_width = usize::from(timeline_area.width.saturating_sub(4));
-        let items = cards
-            .iter()
-            .rev()
-            .take(visible_cards)
-            .rev()
-            .map(|card| ListItem::new(self.card_lines(card, content_width)))
-            .collect::<Vec<_>>();
-        let list = List::new(items).block(Block::default().borders(Borders::NONE));
-        frame.render_widget(list, timeline_area);
-        if let (Some(current_work), Some(current_work_area)) = (current_work, current_work_area) {
-            self.draw_current_work(frame, current_work_area, current_work);
-        }
-    }
-
-    fn draw_current_work(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        current_work: &CurrentWorkModel,
-    ) {
+    fn draw_todo(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let mut lines = Vec::new();
-        if let Some(activity) = &current_work.activity {
-            lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(self.theme.accent)),
-                Span::styled(activity.clone(), Style::default().fg(Color::White)),
-            ]));
-        }
-        if let Some(wait) = &current_work.wait {
+        if let Some(todo) = app
+            .projection()
+            .and_then(|projection| projection.todo_list.as_ref())
+        {
+            if todo.items.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "暂无任务",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for item in &todo.items {
+                    let (marker, color) = match item.status.as_str() {
+                        "completed" => ("✓", Color::Green),
+                        "inProgress" => ("●", Color::Cyan),
+                        _ => ("○", Color::DarkGray),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker} "), Style::default().fg(color)),
+                        Span::raw(item.label.as_str()),
+                    ]));
+                }
+            }
+        } else {
             lines.push(Line::from(Span::styled(
-                wait.clone(),
-                Style::default().fg(self.theme.warning),
+                "本对话暂无任务",
+                Style::default().fg(Color::DarkGray),
             )));
         }
-        for segment in &current_work.segments {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if segment.expanded { "▾ " } else { "▸ " },
-                    Style::default().fg(self.theme.dim),
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(" Todo ")),
+            area,
+        );
+    }
+
+    fn draw_resource(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let Some(resource) = app.resource_preview() else {
+            return;
+        };
+        frame.render_widget(
+            Paragraph::new(resource.content.as_str())
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {} · read only · /close ", resource.logical_path)),
                 ),
-                Span::styled(
-                    segment.title.clone(),
-                    Style::default()
-                        .fg(if segment.attention_unresolved {
-                            self.theme.warning
+            area,
+        );
+    }
+
+    fn draw_projection(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let mut lines = Vec::new();
+        if let Some(projection) = app.projection() {
+            for item in timeline_items(projection) {
+                match item {
+                    TimelineItem::Message(message) => {
+                        let color = if message.role == "user" {
+                            Color::Blue
+                        } else if message.role == "assistant" {
+                            Color::White
                         } else {
-                            self.theme.success
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", segment.summary),
-                    Style::default().fg(self.theme.dim),
-                ),
-            ]));
-            if let Some(attention) = &segment.attention {
+                            Color::DarkGray
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("{}: {}", message.role, message.content),
+                            Style::default().fg(color),
+                        )));
+                        if !message.attachments.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "  附件：{}",
+                                    message
+                                        .attachments
+                                        .iter()
+                                        .map(|attachment| attachment.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
+                    TimelineItem::Narrative(narrative) => {
+                        lines.push(Line::from(Span::styled(
+                            narrative.content.as_str(),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    TimelineItem::Tool(activity) => {
+                        push_tool_lines(&mut lines, activity);
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+            if let Some(draft) = projection.assistant_draft.as_ref() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {attention}"),
-                    Style::default().fg(if segment.attention_unresolved {
-                        self.theme.warning
+                    format!("{}▋", draft.content),
+                    Style::default().fg(Color::White),
+                )));
+                lines.push(Line::from(""));
+            }
+            if let Some(plan) = projection.pending_plan.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    "Plan",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(plan.prompt.as_str()));
+                for (index, option) in plan.options.iter().enumerate() {
+                    lines.push(Line::from(format!("{}. {}", index + 1, option.label)));
+                    if let Some(description) = option.description.as_deref() {
+                        lines.push(Line::from(Span::styled(
+                            format!("   {description}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    for operation in &option.operations_display {
+                        lines.push(Line::from(Span::styled(
+                            format!("   - {operation}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+                lines.push(Line::from(
+                    "输入编号选择；其他文本用于调整；Esc 或 /ignore 明确忽略。",
+                ));
+                lines.push(Line::from(""));
+            }
+            if let Some(interaction) = projection.pending_interaction.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("需要你回答：{}", interaction.prompt),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if let Some(options) = interaction.options.as_ref() {
+                    for (index, option) in options.iter().enumerate() {
+                        lines.push(Line::from(format!("  {}. {}", index + 1, option.label)));
+                    }
+                }
+            }
+            if let Some(approval) = projection.pending_approval.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("需要你批准：{}", approval.preview.summary),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for target in &approval.preview.logical_targets {
+                    lines.push(Line::from(format!("  - {target}")));
+                }
+                lines.push(Line::from("输入 1/允许 或 2/拒绝。"));
+                lines.push(Line::from(""));
+            }
+            for activity in projection
+                .activities
+                .iter()
+                .filter(|activity| activity.kind != "tool")
+            {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} [{}] · {}",
+                        activity.kind, activity.status, activity.label
+                    ),
+                    Style::default().fg(if activity.status == "completed" {
+                        Color::Green
+                    } else if matches!(activity.status.as_str(), "failed" | "indeterminate") {
+                        Color::Red
                     } else {
-                        self.theme.dim
+                        Color::Yellow
                     }),
                 )));
             }
-            for operation in &segment.operations {
-                let detail = operation
-                    .detail
-                    .as_deref()
-                    .map(|detail| format!(" · {detail}"))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled("  └ ", Style::default().fg(self.theme.dim)),
-                    Span::styled(operation.title.clone(), Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!(" · {}{detail}", operation.status),
-                        Style::default().fg(self.theme.dim),
-                    ),
-                ]));
-            }
         }
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "等待共享投影更新",
-                Style::default().fg(self.theme.dim),
+                "输入一条消息开始本地编码任务。",
+                Style::default().fg(Color::DarkGray),
             )));
         }
-        let panel = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(self.theme.dim))
-                .title(" Current Work "),
-        );
-        frame.render_widget(panel, area);
-    }
-
-    fn cover_lines(&self, app: &TuiApp) -> Vec<Line<'static>> {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "          +----------------------+",
-                Style::default().fg(self.theme.accent),
-            )),
-            Line::from(vec![
-                Span::styled("          | ", Style::default().fg(self.theme.accent)),
-                Span::styled(
-                    "D C",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+        let visible = usize::from(area.height.saturating_sub(2));
+        let start = lines.len().saturating_sub(visible);
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>())
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Conversation "),
                 ),
-                Span::styled("  01  ", Style::default().fg(self.theme.dim)),
-                Span::styled("KERNEL", Style::default().fg(self.theme.warning)),
-                Span::styled("      |", Style::default().fg(self.theme.accent)),
-            ]),
-            Line::from(vec![
-                Span::styled("          | ", Style::default().fg(self.theme.accent)),
-                Span::styled("TERM", Style::default().fg(self.theme.success)),
-                Span::styled(" -> ", Style::default().fg(self.theme.dim)),
-                Span::styled("AGENT", Style::default().fg(self.theme.accent)),
-                Span::styled("        |", Style::default().fg(self.theme.accent)),
-            ]),
-            Line::from(Span::styled(
-                "          +----------------------+",
-                Style::default().fg(self.theme.accent),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "DeepCode",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "TUI host shell over the shared daemon Session Runtime",
-                Style::default().fg(self.theme.dim),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                app.workspace_status(),
-                Style::default().fg(self.theme.success),
-            )),
-            Line::from(Span::styled(
-                format!("session: {}", app.current_session_label()),
-                Style::default().fg(self.theme.dim),
-            )),
-            Line::from(Span::styled(
-                app.runtime_status().to_string(),
-                Style::default().fg(self.theme.dim),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Type a message to start. Use /workspace, /sessions, /help, /quit.",
-                Style::default().fg(Color::Gray),
-            )),
-        ]
-    }
-
-    fn draw_composer(&self, frame: &mut Frame<'_>, area: Rect, input: &str) {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(18),
-                Constraint::Percentage(64),
-                Constraint::Percentage(18),
-            ])
-            .split(area);
-        let content = if input.is_empty() {
-            Line::from(Span::styled(
-                "询问 DeepCode Agent...",
-                Style::default().fg(self.theme.dim),
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled("> ", Style::default().fg(self.theme.accent)),
-                Span::raw(input.to_string()),
-            ])
-        };
-        let composer_area = columns[1];
-        let composer = Paragraph::new(content).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(self.border_style())
-                .title(" 消息 "),
+            area,
         );
-        frame.render_widget(composer, composer_area);
-        frame.set_cursor_position(composer_cursor_position(composer_area, input));
     }
 
-    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, status: &str) {
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled(status.to_string(), Style::default().fg(self.theme.dim)),
-            Span::raw("  "),
-            Span::styled("Enter", Style::default().fg(self.theme.accent)),
-            Span::raw(" 发送 · "),
-            Span::styled("Esc", Style::default().fg(self.theme.accent)),
-            Span::raw(" 清空输入 · "),
-            Span::styled("^C", Style::default().fg(self.theme.danger)),
-            Span::raw(" 退出"),
-        ]));
-        frame.render_widget(footer, area);
-    }
-
-    fn card_lines(&self, card: &CardModel, width: usize) -> Vec<Line<'static>> {
-        if matches!(card.kind, CardKind::User) {
-            return self.user_card_lines(card, width);
-        }
-
-        let mut header = vec![
-            Span::styled(
-                format!("{} ", icon(card)),
-                Style::default().fg(self.card_color(card)),
-            ),
-            Span::styled(
-                label(card),
-                Style::default()
-                    .fg(self.card_color(card))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if card.title != label(card) {
-            header.push(Span::styled("  ", Style::default().fg(self.theme.dim)));
-            header.push(Span::styled(
-                card.title.clone(),
-                Style::default().fg(self.theme.dim),
-            ));
-        }
-        let mut lines = vec![Line::from(header)];
-
-        let body = if card.body.trim().is_empty() {
-            "(empty)".to_string()
-        } else {
-            card.body.clone()
-        };
-        for source_line in body.lines() {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    source_line.to_string(),
-                    Style::default().fg(self.body_color(card)),
+    fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        frame.render_widget(
+            Paragraph::new(app.input())
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if app.has_pending_plan() {
+                            " Plan response "
+                        } else if app
+                            .projection()
+                            .is_some_and(|projection| projection.pending_approval.is_some())
+                        {
+                            " Approval (1 allow / 2 deny) "
+                        } else {
+                            " Message "
+                        }),
                 ),
-            ]));
-        }
-        lines.push(Line::from(""));
-        lines
-    }
-
-    fn user_card_lines(&self, card: &CardModel, width: usize) -> Vec<Line<'static>> {
-        let max_width = width.saturating_sub(8).clamp(12, 72);
-        let mut lines = Vec::new();
-        for source_line in card.body.lines() {
-            let text = compact_line(source_line, max_width);
-            lines.push(
-                Line::from(Span::styled(
-                    format!(" {text} "),
-                    Style::default().fg(Color::Black).bg(self.theme.user_bg),
-                ))
-                .alignment(Alignment::Right),
-            );
-        }
-        if lines.is_empty() {
-            lines.push(
-                Line::from(Span::styled(
-                    " (empty) ",
-                    Style::default().fg(Color::Black).bg(self.theme.user_bg),
-                ))
-                .alignment(Alignment::Right),
-            );
-        }
-        lines.push(Line::from(""));
-        lines
-    }
-
-    fn render_plain_card(&self, card: &CardModel) -> String {
-        let mut out = if card.title == label(card) {
-            format!("{} {}\n", icon(card), label(card))
-        } else {
-            format!("{} {} · {}\n", icon(card), label(card), card.title)
-        };
-        if card.body.is_empty() {
-            out.push_str("  (empty)\n");
-        } else {
-            for line in card.body.lines() {
-                out.push_str(&format!("  {line}\n"));
-            }
-        }
-        out.push('\n');
-        out
-    }
-
-    fn render_plain_current_work(&self, current_work: &CurrentWorkModel) -> String {
-        let mut out = String::from("Current Work\n");
-        if let Some(activity) = &current_work.activity {
-            out.push_str(&format!("  {activity}\n"));
-        }
-        if let Some(wait) = &current_work.wait {
-            out.push_str(&format!("  {wait}\n"));
-        }
-        for segment in &current_work.segments {
-            out.push_str(&format!("  {} · {}\n", segment.title, segment.summary));
-            if let Some(attention) = &segment.attention {
-                out.push_str(&format!("    {attention}\n"));
-            }
-            for operation in &segment.operations {
-                out.push_str(&format!("    {} · {}", operation.title, operation.status));
-                if let Some(detail) = &operation.detail {
-                    out.push_str(&format!(" · {detail}"));
-                }
-                out.push('\n');
-            }
-        }
-        out.push('\n');
-        out
-    }
-
-    fn card_color(&self, card: &CardModel) -> Color {
-        match card.kind {
-            CardKind::User => self.theme.accent,
-            CardKind::Assistant => Color::White,
-            CardKind::CommandHelp => self.theme.accent,
-            CardKind::Notice => self.theme.success,
-            CardKind::Permission => self.theme.warning,
-            CardKind::Plan => self.theme.accent,
-            CardKind::Review => self.theme.success,
-            CardKind::Error => self.theme.danger,
-            CardKind::Final => self.theme.success,
-            CardKind::AuditStatus => self.theme.warning,
-        }
-    }
-
-    fn body_color(&self, card: &CardModel) -> Color {
-        match card.kind {
-            CardKind::Error => self.theme.danger,
-            CardKind::Notice | CardKind::AuditStatus => Color::Gray,
-            _ => Color::White,
-        }
-    }
-
-    fn border_style(&self) -> Style {
-        Style::default().fg(self.theme.border)
+            area,
+        );
+        let width = area.width.saturating_sub(2).max(1);
+        let offset = app.input().chars().count() as u16;
+        frame.set_cursor_position((area.x + 1 + offset % width, area.y + 1 + offset / width));
     }
 }
 
-fn icon(card: &CardModel) -> &'static str {
-    match card.kind {
-        CardKind::User => "›",
-        CardKind::Assistant | CardKind::Final => "◆",
-        CardKind::CommandHelp => "?",
-        CardKind::Notice => "•",
-        CardKind::Permission => "!",
-        CardKind::Plan => "◇",
-        CardKind::Review => "✓",
-        CardKind::Error => "×",
-        CardKind::AuditStatus => "◌",
+enum TimelineItem<'a> {
+    Message(&'a ProjectionMessage),
+    Narrative(&'a NarrativeProjection),
+    Tool(&'a ActivityProjection),
+}
+
+impl TimelineItem<'_> {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Message(value) => value.sequence,
+            Self::Narrative(value) => value.sequence,
+            Self::Tool(value) => value.sequence,
+        }
     }
 }
 
-fn label(card: &CardModel) -> &'static str {
-    match card.kind {
-        CardKind::User => "你",
-        CardKind::Assistant => "DeepCode",
-        CardKind::CommandHelp => "命令",
-        CardKind::Notice => "提示",
-        CardKind::Permission => "权限",
-        CardKind::Plan => "计划",
-        CardKind::Review => "审查",
-        CardKind::Error => "错误",
-        CardKind::Final => "DeepCode",
-        CardKind::AuditStatus => "审计",
-    }
-}
-
-fn current_work_height(current_work: &CurrentWorkModel, available_height: u16) -> u16 {
-    let expanded_operation_count = current_work
-        .segments
+fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
+    let tool_count = projection
+        .activities
         .iter()
-        .map(|segment| segment.operations.len())
-        .sum::<usize>();
-    let attention_count = current_work
-        .segments
-        .iter()
-        .filter(|segment| segment.attention.is_some())
+        .filter(|activity| activity.kind == "tool")
         .count();
-    let desired = 2usize
-        + usize::from(current_work.activity.is_some())
-        + usize::from(current_work.wait.is_some())
-        + current_work.segments.len()
-        + attention_count
-        + expanded_operation_count;
-    let maximum = available_height.saturating_sub(3).clamp(3, 14);
-    u16::try_from(desired).unwrap_or(u16::MAX).clamp(3, maximum)
+    let mut items =
+        Vec::with_capacity(projection.messages.len() + projection.narratives.len() + tool_count);
+    items.extend(projection.messages.iter().map(TimelineItem::Message));
+    items.extend(projection.narratives.iter().map(TimelineItem::Narrative));
+    items.extend(
+        projection
+            .activities
+            .iter()
+            .filter(|activity| activity.kind == "tool")
+            .map(TimelineItem::Tool),
+    );
+    items.sort_by_key(TimelineItem::sequence);
+    items
 }
 
-fn composer_cursor_position(area: Rect, input: &str) -> Position {
-    let inner_width = area.width.saturating_sub(2).max(1);
-    let inner_height = area.height.saturating_sub(2).max(1);
-    let offset = if input.is_empty() {
-        0
-    } else {
-        2 + terminal_text_width(input)
+fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
+    let operation = activity
+        .tool
+        .as_ref()
+        .map(|tool| tool.operation.as_str())
+        .unwrap_or(activity.label.as_str());
+    let color = activity_color(&activity.status);
+    lines.push(Line::from(Span::styled(
+        format!("🔧 {operation} [{}]", activity.status),
+        Style::default().fg(color),
+    )));
+    if let Some(tool) = activity.tool.as_ref() {
+        for resource in &tool.resources {
+            let detail = match (
+                resource.kind.as_str(),
+                resource.workspace_id.as_deref(),
+                resource.logical_path.as_deref(),
+                resource.uri.as_deref(),
+            ) {
+                ("workspacePath", Some(workspace_id), Some(logical_path), _) => format!(
+                    "  {} · /open {} {}",
+                    resource.label, workspace_id, logical_path
+                ),
+                ("url", _, _, Some(uri)) => format!("  {} · {uri}", resource.label),
+                _ => format!("  {}", resource.label),
+            };
+            lines.push(Line::from(Span::styled(
+                detail,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+}
+
+fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
+    let operation = activity
+        .tool
+        .as_ref()
+        .map(|tool| tool.operation.as_str())
+        .unwrap_or(activity.label.as_str());
+    output.push_str(&format!("工具 {operation} [{}]\n", activity.status));
+    if let Some(tool) = activity.tool.as_ref() {
+        for resource in &tool.resources {
+            match (
+                resource.kind.as_str(),
+                resource.workspace_id.as_deref(),
+                resource.logical_path.as_deref(),
+                resource.uri.as_deref(),
+            ) {
+                ("workspacePath", Some(workspace_id), Some(logical_path), _) => {
+                    output.push_str(&format!(
+                        "  {} · /open {} {}\n",
+                        resource.label, workspace_id, logical_path
+                    ))
+                }
+                ("url", _, _, Some(uri)) => {
+                    output.push_str(&format!("  {} · {uri}\n", resource.label));
+                }
+                _ => output.push_str(&format!("  {}\n", resource.label)),
+            }
+        }
+    }
+}
+
+fn render_todo_plain(output: &mut String, projection: &SessionProjection) {
+    let Some(todo) = projection.todo_list.as_ref() else {
+        return;
     };
-    let line = (offset / inner_width).min(inner_height.saturating_sub(1));
-    let column = if line == inner_height.saturating_sub(1) && offset / inner_width > line {
-        inner_width.saturating_sub(1)
+    output.push_str("Todo\n");
+    if todo.items.is_empty() {
+        output.push_str("  （空）\n");
+        return;
+    }
+    for item in &todo.items {
+        let marker = match item.status.as_str() {
+            "completed" => "[x]",
+            "inProgress" => "[>]",
+            _ => "[ ]",
+        };
+        output.push_str(&format!("  {marker} {}\n", item.label));
+    }
+}
+
+fn activity_color(status: &str) -> Color {
+    if status == "completed" {
+        Color::Green
+    } else if matches!(status, "failed" | "denied" | "indeterminate") {
+        Color::Red
     } else {
-        offset % inner_width
+        Color::Yellow
+    }
+}
+
+fn cache_hit_label(projection: &SessionProjection) -> String {
+    let usage = &projection.token_usage;
+    if usage.cache_reported_call_count == 0 {
+        return "--%".to_string();
+    }
+    let Some(total) = usage
+        .cache_read_input_tokens
+        .checked_add(usage.cache_miss_input_tokens)
+        .filter(|total| *total > 0)
+    else {
+        return "--%".to_string();
     };
-    Position::new(
-        area.x.saturating_add(1).saturating_add(column),
-        area.y.saturating_add(1).saturating_add(line),
+    format!(
+        "{:.0}%",
+        usage.cache_read_input_tokens as f64 * 100.0 / total as f64
     )
 }
 
-fn terminal_text_width(value: &str) -> u16 {
-    value
-        .chars()
-        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
-        .sum()
-}
-
-fn cover_plain_lines(app: &TuiApp) -> Vec<String> {
-    vec![
-        "          +----------------------+".to_string(),
-        "          | D C  01  KERNEL      |".to_string(),
-        "          | TERM -> AGENT        |".to_string(),
-        "          +----------------------+".to_string(),
-        "DeepCode".to_string(),
-        "TUI host shell over the shared daemon Session Runtime".to_string(),
-        app.workspace_status(),
-        format!("session: {}", app.current_session_label()),
-        app.runtime_status().to_string(),
-        "Type a message to start. Use /workspace, /sessions, /help, /quit.".to_string(),
-    ]
-}
-
-fn compact_line(input: &str, max_width: usize) -> String {
-    let mut out = String::new();
-    for (index, ch) in input.chars().enumerate() {
-        if index >= max_width {
-            out.push('…');
-            return out;
+fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
+    output.push_str("Plan\n");
+    output.push_str(&plan.prompt);
+    output.push('\n');
+    for (index, option) in plan.options.iter().enumerate() {
+        output.push_str(&format!("{}. {}\n", index + 1, option.label));
+        if let Some(description) = option.description.as_deref() {
+            output.push_str(&format!("   {description}\n"));
         }
-        out.push(ch);
+        for operation in &option.operations_display {
+            output.push_str(&format!("   - {operation}\n"));
+        }
     }
-    out
+    output.push_str("输入编号选择；其他非空文本用于调整；/ignore 明确忽略。\n");
 }

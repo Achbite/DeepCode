@@ -1,5 +1,4 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
-use deepcode_kernel_policy::WorkspaceBoundary;
 use deepcode_kernel_tools::file_content::{
     lightweight_file_classification, read_text_file_for_llm,
 };
@@ -49,33 +48,6 @@ impl SecretProvider for EmptySecretProvider {
     }
 }
 
-struct SnapshotSecretProvider {
-    values: BTreeMap<String, String>,
-}
-
-impl SecretProvider for SnapshotSecretProvider {
-    fn resolve(&self, secret_ref: &str) -> Option<String> {
-        self.values.get(secret_ref).cloned()
-    }
-}
-
-pub(crate) fn snapshot_executor_secrets(
-    config: &KernelExecutorConfig,
-    secret_provider: &dyn SecretProvider,
-) -> Arc<dyn SecretProvider> {
-    let secret_ref = config.web_search_auth_secret_ref.as_str();
-    let values = (!secret_ref.trim().is_empty())
-        .then(|| {
-            secret_provider
-                .resolve(secret_ref)
-                .map(|value| (secret_ref.to_owned(), value))
-        })
-        .flatten()
-        .into_iter()
-        .collect();
-    Arc::new(SnapshotSecretProvider { values })
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelToolInvocation {
@@ -87,6 +59,8 @@ pub struct KernelToolInvocation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelToolExecutionContext {
     pub workspace_root: Option<String>,
+    pub workspace_id: Option<String>,
+    pub private_resolved_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,7 +126,7 @@ pub fn builtin_executors(
     secret_provider: Arc<dyn SecretProvider>,
 ) -> Vec<(&'static str, Box<dyn KernelToolExecutor>)> {
     let executors = registry
-        .kernel_internal_ready_executor_bindings()
+        .executor_bindings()
         .map(|(tool_id, binding)| {
             (
                 tool_id,
@@ -164,21 +138,29 @@ pub fn builtin_executors(
     executors
 }
 
-pub(crate) fn runtime_unavailable_tool_ids(
-    registry: &KernelToolRegistry,
+pub fn resolved_network_target(
+    tool_id: &str,
+    input: &Value,
     config: &KernelExecutorConfig,
-    secret_provider: &dyn SecretProvider,
-) -> Vec<deepcode_kernel_abi::ToolIdV2> {
-    let web_search_id =
-        deepcode_kernel_abi::ToolIdV2::parse("web.search").expect("compiled ToolId is valid");
-    match registry.descriptor_v2(&web_search_id) {
-        Some(descriptor)
-            if descriptor.availability == deepcode_kernel_abi::ToolAvailabilityV2::Ready
-                && !web::web_search_runtime_is_ready(config, secret_provider) =>
-        {
-            vec![web_search_id]
+) -> KernelResult<Option<String>> {
+    match tool_id {
+        "web.search" => {
+            let query = get_string(input, "query").unwrap_or_default();
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .clamp(1, 10);
+            let target = web::web_search_target_url(config, &query, limit)?;
+            web::validate_http_url(&target)?;
+            Ok(Some(target))
         }
-        _ => Vec::new(),
+        "web.fetch" => {
+            let target = get_string(input, "url").unwrap_or_default();
+            web::validate_http_url(&target)?;
+            Ok(Some(target))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -215,27 +197,20 @@ fn assert_executor_bindings_match_tool_registry(
         .iter()
         .map(|(tool_id, _)| *tool_id)
         .collect::<Vec<_>>();
-    let inventory = registry
-        .tool_inventory_v2()
-        .expect("compiled Kernel tool inventory must be valid");
-    for descriptor in inventory.tools {
+    for descriptor in registry.descriptors() {
         let binding_count = binding_ids
             .iter()
-            .filter(|tool_id| **tool_id == descriptor.tool_id.as_str())
+            .filter(|tool_id| **tool_id == descriptor.name)
             .count();
-        let expected =
-            usize::from(descriptor.availability == deepcode_kernel_abi::ToolAvailabilityV2::Ready);
         assert_eq!(
-            binding_count, expected,
-            "Kernel tool {} has {binding_count} executor binding(s); expected {expected}",
-            descriptor.tool_id
+            binding_count, 1,
+            "Kernel tool {} must have exactly one executor binding",
+            descriptor.name
         );
     }
     for tool_id in binding_ids {
-        let tool_id_v2 =
-            deepcode_kernel_abi::ToolIdV2::parse(tool_id).expect("registered tool id is valid");
         assert!(
-            registry.descriptor_v2(&tool_id_v2).is_some(),
+            registry.descriptor(tool_id).is_some(),
             "runtime executor {tool_id} has no canonical ToolRegistration"
         );
     }
@@ -247,11 +222,9 @@ mod filesystem;
 mod search;
 pub(crate) mod web;
 
-pub(crate) use document::invoke_document_read_complete;
 use document::DocumentReadExecutor;
 use filesystem::*;
 use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
-pub(crate) use web::invoke_web_fetch_complete;
 use web::*;
 
 fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
@@ -278,53 +251,6 @@ struct TextPatchResult {
     updated: String,
     match_kind: String,
     changed_ranges: Value,
-}
-
-pub(crate) fn plan_v2_text_edit(
-    original: &str,
-    matcher: &deepcode_kernel_tools::kernel_internal::KernelEditMatcher,
-    replacement: &str,
-) -> KernelResult<(Value, String)> {
-    use deepcode_kernel_tools::kernel_internal::{KernelEditMatcher, KernelFileDigestPrecondition};
-    let match_value = match matcher {
-        KernelEditMatcher::ExactBlock { text } => {
-            serde_json::json!({"kind":"exactBlock","text":text})
-        }
-        KernelEditMatcher::ContextBlock {
-            before,
-            target,
-            after,
-        } => serde_json::json!({
-            "kind":"contextBlock",
-            "before":before,
-            "target":target,
-            "after":after
-        }),
-        KernelEditMatcher::LineRange {
-            start_line,
-            end_line,
-            precondition,
-        } => {
-            let mut value = serde_json::json!({
-                "kind":"lineRange",
-                "startLine":start_line,
-                "endLine":end_line
-            });
-            match precondition {
-                KernelFileDigestPrecondition::ExpectedFileDigest { .. } => {
-                    value["expectedFileHash"] =
-                        Value::String(deepcode_kernel_tools::hash_bytes(original.as_bytes()));
-                }
-                KernelFileDigestPrecondition::ExpectedBeforeBlock { text } => {
-                    value["expectedBeforeBlock"] = Value::String(text.clone());
-                }
-            }
-            value
-        }
-    };
-    let patch_spec = serde_json::json!({"match":match_value});
-    let patch = apply_text_patch(original, replacement, &patch_spec)?;
-    Ok((patch_spec, patch.updated))
 }
 
 fn apply_text_patch(
@@ -621,12 +547,27 @@ fn workspace_root(context: &KernelToolExecutionContext) -> KernelResult<PathBuf>
         .ok_or(KernelError::MissingWorkspaceBinding)
 }
 
-fn resolve_workspace_read_path(root: &Path, relative_path: &str) -> KernelResult<PathBuf> {
-    WorkspaceBoundary::new(root.to_path_buf()).resolve_read(relative_path)
+fn workspace_id(context: &KernelToolExecutionContext) -> KernelResult<&str> {
+    context
+        .workspace_id
+        .as_deref()
+        .ok_or(KernelError::MissingWorkspaceBinding)
 }
 
-fn resolve_workspace_mutation_path(root: &Path, relative_path: &str) -> KernelResult<PathBuf> {
-    WorkspaceBoundary::new(root.to_path_buf()).resolve_mutation(relative_path)
+fn prepared_workspace_target(context: &KernelToolExecutionContext) -> KernelResult<PathBuf> {
+    if context.private_resolved_targets.len() != 1 {
+        return Err(KernelError::InvalidCommand(
+            "workspace executor requires exactly one PreparedEffect target".to_string(),
+        ));
+    }
+    let root = workspace_root(context)?;
+    let target = PathBuf::from(&context.private_resolved_targets[0]);
+    if !target.is_absolute() || !target.starts_with(&root) {
+        return Err(KernelError::PermissionDenied(
+            "PreparedEffect target is outside the canonical workspace root".to_string(),
+        ));
+    }
+    Ok(target)
 }
 
 fn get_string(value: &Value, key: &str) -> Option<String> {

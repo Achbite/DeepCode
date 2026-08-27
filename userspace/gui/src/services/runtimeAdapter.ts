@@ -1,65 +1,5 @@
-/**
- * GUI Host 到 Rust Kernel Web Host 的用户态调用层。
- *
- * 阶段 5.7 后不再维护 Tauri / Node 多后端分支。GUI 只作为 UI 层，
- * 通过 HTTP API 访问 Rust Kernel Web Host；跨 Host 共享的会话拼装
- * 由 daemon shared Session Runtime 承载，GUI 不直接编排 provider / Kernel loop。
- */
-import type {
-  AgentProjectListResult,
-  AgentProjectResult,
-  AgentSessionListResult,
-  AgentSessionResult,
-  ApiResponse,
-  ArchiveAgentSessionRequest,
-  BrowsePathResult,
-  BrowserRuntimeStatusResult,
-  CodeGrepInput,
-  CodeGrepResult,
-  CreateAgentProjectRequest,
-  CreateAgentSessionRequest,
-  CreateUserAttachmentGrantRequestV1,
-  CreateTerminalSessionRequest,
-  FileReadResult,
-  FileTreeNode,
-  GetUserSettingsResult,
-  GitDiffResult,
-  GitStatusResult,
-  HealthStatus,
-  InitialLocations,
-  ListAgentSessionsRequest,
-  LlmProbeRequest,
-  LlmProbeResult,
-  LlmProfilesResult,
-  OpenBrowserPreviewRequest,
-  OpenWorkspaceResult,
-  PatchLlmProfilesRequest,
-  PatchUserSettingsRequest,
-  PatchUserSettingsResult,
-  PatchWorkspaceSettingsResult,
-  RenameAgentSessionRequest,
-  RebindAgentProjectRequest,
-  SaveWorkspaceFileRequest,
-  SaveWorkspaceFileResult,
-  SetBrowserInspectModeRequest,
-  ShellEnvironmentStatus,
-  KernelHostSkillCatalogResult,
-  TerminalCapability,
-  TerminalEventsResult,
-  TerminalInputRequest,
-  TerminalResizeRequest,
-  TerminalSession,
-  TerminalSessionsResult,
-  TerminalWarmupStatus,
-  UpdateAgentProjectRequest,
-  UpdateAgentSessionRequest,
-  UserAttachmentGrantResultV1,
-  WorkspaceState,
-} from '@deepcode/protocol';
+import type { ApiResponse, HealthStatus } from '@deepcode/protocol';
 import * as api from './apiClient';
-import { activeT } from '../i18n';
-
-export type RuntimeType = 'web';
 
 type TauriCoreApi = {
   invoke?: <T = unknown>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -67,16 +7,14 @@ type TauriCoreApi = {
 
 declare global {
   interface Window {
-    __TAURI__?: {
-      core?: TauriCoreApi;
-    };
+    __TAURI__?: { core?: TauriCoreApi };
   }
 }
 
 export const APP_CLOSE_REQUEST_EVENT = 'deepcode:app-close-request';
 
 export interface RuntimeStatus {
-  runtime: RuntimeType;
+  runtime: 'web';
   version: string;
   platform: string;
   arch?: string;
@@ -95,18 +33,7 @@ export interface HostStartupStatusV1 {
   attemptId: string;
   mode: 'managed' | 'connectOnly';
   phase: 'idle' | 'starting' | 'ready' | 'external' | 'blocked' | 'failed' | 'stopped';
-  stage:
-    | 'permissionPreflight'
-    | 'startAdmission'
-    | 'binaryResolution'
-    | 'daemonSpawn'
-    | 'daemonIdentity'
-    | 'daemonRecovery'
-    | 'proxySpawn'
-    | 'proxyIdentity'
-    | 'proxyHealth'
-    | 'ready'
-    | 'connectOnly';
+  stage: string;
   code: string;
   reasonCode?: string;
   message: string;
@@ -116,75 +43,36 @@ export interface HostStartupStatusV1 {
   updatedAt: string;
 }
 
-export function healthVersion(health?: HealthStatus): string {
-  return health?.version || health?.buildCommit || 'unknown';
-}
-
-export function getRuntimeType(): RuntimeType {
-  return 'web';
-}
-
-export async function getRuntimeStatus(): Promise<RuntimeStatus> {
-  try {
-    const health = await api.getHealth();
-    return {
-      runtime: 'web',
-      version: health.ok ? healthVersion(health.data) : 'unknown',
-      platform: navigator.platform,
-    };
-  } catch {
-    return {
-      runtime: 'web',
-      version: 'unknown',
-      platform: navigator.platform,
-    };
-  }
-}
-
-type WindowCommandName = 'minimize' | 'toggleMaximize' | 'close';
-
-const TAURI_WINDOW_COMMANDS: Record<WindowCommandName, string> = {
-  minimize: 'deepcode_window_minimize',
-  toggleMaximize: 'deepcode_window_toggle_maximize',
-  close: 'deepcode_window_close',
-};
-
-function getTauriInvoke(): TauriCoreApi['invoke'] | null {
+function tauriInvoke(): TauriCoreApi['invoke'] | null {
   return window.__TAURI__?.core?.invoke ?? null;
 }
 
-function warnWindowCommand(commandName: string, err: unknown): void {
-  console.warn(`[window] ${commandName} failed.`, err);
-}
-
-async function runWindowCommand(
-  commandName: WindowCommandName,
-  fallback?: () => void | Promise<void>
+async function windowCommand(
+  command: 'minimize' | 'toggleMaximize' | 'close',
+  fallback?: () => void,
 ): Promise<void> {
-  const invoke = getTauriInvoke();
+  const invoke = tauriInvoke();
   if (invoke) {
     try {
-      await invoke(TAURI_WINDOW_COMMANDS[commandName]);
-    } catch (err) {
-      warnWindowCommand(commandName, err);
+      await invoke({
+        minimize: 'deepcode_window_minimize',
+        toggleMaximize: 'deepcode_window_toggle_maximize',
+        close: 'deepcode_window_close',
+      }[command]);
+    } catch (error) {
+      console.warn(`[window] ${command} failed`, error);
     }
     return;
   }
-
-  if (!fallback) return;
-  try {
-    await fallback();
-  } catch (err) {
-    warnWindowCommand(commandName, err);
-  }
+  fallback?.();
 }
 
 export async function minimizeAppWindow(): Promise<void> {
-  await runWindowCommand('minimize');
+  await windowCommand('minimize');
 }
 
 export async function toggleMaximizeAppWindow(): Promise<void> {
-  await runWindowCommand('toggleMaximize');
+  await windowCommand('toggleMaximize');
 }
 
 export function requestCloseAppWindow(): void {
@@ -192,474 +80,101 @@ export function requestCloseAppWindow(): void {
 }
 
 export async function closeAppWindow(): Promise<void> {
-  await runWindowCommand('close', () => {
-    window.close();
-  });
+  await windowCommand('close', () => window.close());
+}
+
+export function healthVersion(health?: HealthStatus): string {
+  return health?.version || health?.buildCommit || 'unknown';
+}
+
+export async function getRuntimeStatus(): Promise<RuntimeStatus> {
+  const health = await api.getHealth();
+  return {
+    runtime: 'web',
+    version: health.ok ? healthVersion(health.data) : 'unknown',
+    platform: navigator.platform,
+  };
 }
 
 export async function startKernelAfterPermission(): Promise<ApiResponse<KernelStartResult>> {
-  const invoke = getTauriInvoke();
+  const invoke = tauriInvoke();
   if (!invoke) {
     return {
       ok: false,
       error: 'kernel_start_unavailable',
-      message: 'Kernel retry is only available in the desktop shell.',
+      message: '仅桌面壳可以重新启动本地 Daemon。',
     };
   }
   try {
-    const result = await invoke<KernelStartResult>('deepcode_start_kernel_after_permission');
-    return { ok: true, data: result };
-  } catch (err) {
-    return {
-      ok: false,
-      error: 'kernel_start_failed',
-      message: err instanceof Error ? err.message : String(err),
-    };
+    return { ok: true, data: await invoke<KernelStartResult>('deepcode_start_kernel_after_permission') };
+  } catch (error) {
+    return { ok: false, error: 'kernel_start_failed', message: String(error) };
   }
 }
 
 export async function getHostStartupStatus(): Promise<ApiResponse<HostStartupStatusV1>> {
-  const invoke = getTauriInvoke();
+  const invoke = tauriInvoke();
   if (!invoke) {
     return {
       ok: false,
       error: 'host_startup_status_unavailable',
-      message: 'Host startup status is only available in the desktop shell.',
+      message: '仅桌面壳提供启动状态。',
     };
   }
   try {
-    const result = await invoke<HostStartupStatusV1>('deepcode_host_startup_status');
-    return { ok: true, data: result };
-  } catch (err) {
-    return {
-      ok: false,
-      error: 'host_startup_status_failed',
-      message: err instanceof Error ? err.message : String(err),
-    };
+    return { ok: true, data: await invoke<HostStartupStatusV1>('deepcode_host_startup_status') };
+  } catch (error) {
+    return { ok: false, error: 'host_startup_status_failed', message: String(error) };
   }
 }
 
 export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | null>> {
-  if (document.documentElement.dataset.product !== 'deepcode-gui') {
-    return { ok: true, data: null };
-  }
-  const invoke = getTauriInvoke();
-  if (!invoke) {
-    const result = await api.getDefaultWorkspacePath();
-    if (result.ok && result.data) {
-      return { ok: true, data: result.data.path };
+  if (document.documentElement.dataset.product === 'deepcode-gui') {
+    const invoke = tauriInvoke();
+    if (invoke) {
+      try {
+        return { ok: true, data: await invoke<string | null>('deepcode_default_workspace_path') };
+      } catch (error) {
+        return { ok: false, error: 'default_workspace_failed', message: String(error) };
+      }
     }
-    return { ok: true, data: null };
   }
-  try {
-    const path = await invoke<string | null>('deepcode_default_workspace_path');
-    return { ok: true, data: path ?? null };
-  } catch (err) {
-    return {
-      ok: false,
-      error: 'default_workspace_failed',
-      message: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
-export function getHealth(): Promise<ApiResponse<HealthStatus>> {
-  return api.getHealth();
-}
-
-export function getCurrentWorkspace(): Promise<ApiResponse<WorkspaceState>> {
-  return api.getCurrentWorkspace();
-}
-
-export function openWorkspace(path: string): Promise<ApiResponse<OpenWorkspaceResult>> {
-  return api.openWorkspace(path);
-}
-
-export function saveWorkspaceFile(
-  request: SaveWorkspaceFileRequest
-): Promise<ApiResponse<SaveWorkspaceFileResult>> {
-  return api.saveWorkspaceFile(request);
-}
-
-export function patchWorkspaceSettings(
-  settings: Record<string, unknown>
-): Promise<ApiResponse<PatchWorkspaceSettingsResult>> {
-  return api.patchWorkspaceSettings(settings);
-}
-
-export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
-  return api.getInitialLocations();
-}
-
-export function browsePath(absolutePath?: string): Promise<ApiResponse<BrowsePathResult>> {
-  return api.browsePath(absolutePath);
-}
-
-export function createUserAttachmentGrant(
-  request: CreateUserAttachmentGrantRequestV1
-): Promise<ApiResponse<UserAttachmentGrantResultV1>> {
-  return api.createUserAttachmentGrant(request);
-}
-
-export function revokeUserAttachmentGrant(
-  attachmentId: string
-): Promise<ApiResponse<api.UserAttachmentRevocationResultV1>> {
-  return api.revokeUserAttachmentGrant(attachmentId);
-}
-
-export function scanSkillMount(
-  path: string
-): Promise<ApiResponse<api.SkillMountScanResult>> {
-  return api.scanSkillMount(path);
-}
-
-export async function pickWorkspacePath(): Promise<ApiResponse<string>> {
-  return {
-    ok: false,
-    error: 'not_supported',
-    message: activeT('runtime.workspacePickerUnsupported'),
-  };
-}
-
-export function getFileTree(
-  folderId?: string,
-  relativePath?: string
-): Promise<ApiResponse<FileTreeNode[]>> {
-  return api.getFileTree(folderId, relativePath);
-}
-
-export function readFile(
-  filePath: string,
-  folderId?: string
-): Promise<ApiResponse<FileReadResult>> {
-  return api.readFile(filePath, folderId);
-}
-
-export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {
-  return api.getShellEnvironment();
-}
-
-export function getTerminalCapabilities(): Promise<ApiResponse<TerminalCapability>> {
-  return api.getTerminalCapabilities();
-}
-
-export function getTerminalWarmupStatus(): Promise<ApiResponse<TerminalWarmupStatus>> {
-  return api.getTerminalWarmupStatus();
-}
-
-export function warmupTerminalRuntime(): Promise<ApiResponse<TerminalWarmupStatus>> {
-  return api.warmupTerminalRuntime();
-}
-
-export function listTerminalSessions(): Promise<ApiResponse<TerminalSessionsResult>> {
-  return api.listTerminalSessions();
-}
-
-export function createTerminalSession(
-  request: CreateTerminalSessionRequest
-): Promise<ApiResponse<TerminalSession>> {
-  return api.createTerminalSession(request);
-}
-
-export function sendTerminalInput(
-  sessionId: string,
-  request: TerminalInputRequest
-): Promise<ApiResponse<TerminalSession>> {
-  return api.sendTerminalInput(sessionId, request);
-}
-
-export function resizeTerminalSession(
-  sessionId: string,
-  request: TerminalResizeRequest
-): Promise<ApiResponse<TerminalSession>> {
-  return api.resizeTerminalSession(sessionId, request);
-}
-
-export function updateTerminalSession(
-  sessionId: string,
-  request: Partial<Pick<TerminalSession, 'name' | 'order'>>
-): Promise<ApiResponse<TerminalSession>> {
-  return api.updateTerminalSession(sessionId, request);
-}
-
-export function restartTerminalSession(
-  sessionId: string
-): Promise<ApiResponse<TerminalSession>> {
-  return api.restartTerminalSession(sessionId);
-}
-
-export function deleteTerminalSession(
-  sessionId: string
-): Promise<ApiResponse<TerminalSession>> {
-  return api.deleteTerminalSession(sessionId);
-}
-
-export function getTerminalEvents(
-  sessionId?: string,
-  after?: number
-): Promise<ApiResponse<TerminalEventsResult>> {
-  return api.getTerminalEvents(sessionId, after);
-}
-
-export function getUserSettings(): Promise<ApiResponse<GetUserSettingsResult>> {
-  return api.getUserSettings();
-}
-
-export function patchUserSettings(
-  patches: PatchUserSettingsRequest['patches']
-): Promise<ApiResponse<PatchUserSettingsResult>> {
-  return api.patchUserSettings(patches);
-}
-
-export function getLlmProfiles(): Promise<ApiResponse<LlmProfilesResult>> {
-  return api.getLlmProfiles();
-}
-
-export function patchLlmProfiles(
-  request: PatchLlmProfilesRequest
-): Promise<ApiResponse<LlmProfilesResult>> {
-  return api.patchLlmProfiles(request);
-}
-
-export function probeLlmProfile(
-  request: LlmProbeRequest
-): Promise<ApiResponse<LlmProbeResult>> {
-  return api.probeLlmProfile(request);
-}
-
-export function codeSearch(request: CodeGrepInput): Promise<ApiResponse<CodeGrepResult>> {
-  return api.codeSearch(request);
-}
-
-export function createAgentSession(
-  request: CreateAgentSessionRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.createAgentSession(request);
-}
-
-export function listAgentSessions(
-  request: ListAgentSessionsRequest = {}
-): Promise<ApiResponse<AgentSessionListResult>> {
-  return api.listAgentSessions(request);
-}
-
-export function getCurrentAgentSession(
-  request: ListAgentSessionsRequest = {}
-): Promise<ApiResponse<AgentSessionResult | null>> {
-  return api.getCurrentAgentSession(request);
-}
-
-export function activateAgentSession(
-  sessionId: string,
-  signal?: AbortSignal
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.activateAgentSession(sessionId, signal);
-}
-
-export function renameAgentSession(
-  sessionId: string,
-  request: RenameAgentSessionRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.renameAgentSession(sessionId, request);
-}
-
-export function updateAgentSession(
-  sessionId: string,
-  request: UpdateAgentSessionRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.updateAgentSession(sessionId, request);
-}
-
-export function listAgentProjects(): Promise<ApiResponse<AgentProjectListResult>> {
-  return api.listAgentProjects();
-}
-
-export function createAgentProject(
-  request: CreateAgentProjectRequest
-): Promise<ApiResponse<AgentProjectResult>> {
-  return api.createAgentProject(request);
-}
-
-export function updateAgentProject(
-  projectId: string,
-  request: UpdateAgentProjectRequest
-): Promise<ApiResponse<AgentProjectResult>> {
-  return api.updateAgentProject(projectId, request);
-}
-
-export function rebindAgentProject(
-  projectId: string,
-  request: RebindAgentProjectRequest
-): Promise<ApiResponse<AgentProjectResult>> {
-  return api.rebindAgentProject(projectId, request);
-}
-
-export function deleteAgentProject(
-  projectId: string
-): Promise<ApiResponse<AgentProjectListResult>> {
-  return api.deleteAgentProject(projectId);
-}
-
-export function archiveAgentSession(
-  sessionId: string,
-  request: ArchiveAgentSessionRequest = { archived: true }
-): Promise<ApiResponse<AgentSessionListResult>> {
-  return api.archiveAgentSession(sessionId, request);
-}
-
-export function deleteAgentSession(
-  sessionId: string
-): Promise<ApiResponse<AgentSessionListResult>> {
-  return api.deleteAgentSession(sessionId);
-}
-
-export function getAgentTimeline(
-  sessionId: string,
-  signal?: AbortSignal
-) {
-  return api.getAgentTimeline(sessionId, signal);
-}
-
-export function streamAgentTimeline(
-  sessionId: string,
-  onEvent: Parameters<typeof api.streamAgentTimeline>[1],
-  cursor?: Parameters<typeof api.streamAgentTimeline>[2],
-  signal?: AbortSignal
-): Promise<void> {
-  return api.streamAgentTimeline(sessionId, onEvent, cursor, signal);
-}
-
-export function startAgentRun(
-  sessionId: string,
-  request: api.StartAgentRunRequest
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.startAgentRun(sessionId, request);
-}
-
-export function getAgentComposer(
-  request: { projectId?: string; sessionId?: string } = {},
-  signal?: AbortSignal
-): Promise<ApiResponse<api.AgentComposerProjectionV1>> {
-  return api.getAgentComposer(request, signal);
-}
-
-export function streamAgentComposer(
-  request: { projectId?: string; sessionId?: string },
-  onEvent: Parameters<typeof api.streamAgentComposer>[1],
-  signal?: AbortSignal
-): Promise<void> {
-  return api.streamAgentComposer(request, onEvent, signal);
-}
-
-export function startConversationDraftRun(
-  request: api.StartConversationDraftRunRequest
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.startConversationDraftRun(request);
-}
-
-export function mintPrivateAnalysisLease(
-  sessionId: string,
-  callerRequestId: string
-) {
-  return api.mintPrivateAnalysisLease(sessionId, callerRequestId);
-}
-
-export function getPrivateAnalysis(
-  sessionId: string,
-  capability: string,
-  request: { afterCursor?: string; limit?: number } = {},
-  signal?: AbortSignal
-) {
-  return api.getPrivateAnalysis(sessionId, capability, request, signal);
-}
-
-export function revokePrivateAnalysisLease(
-  sessionId: string,
-  capability: string
-) {
-  return api.revokePrivateAnalysisLease(sessionId, capability);
-}
-
-export function getAgentRun(
-  sessionId: string,
-  runId: string,
-  signal?: AbortSignal
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.getAgentRun(sessionId, runId, signal);
-}
-
-export function cancelAgentRunById(
-  sessionId: string,
-  runId: string,
-  callerRequestId: string,
-  conversationTarget: api.AgentConversationTargetV1
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.cancelAgentRunById(
-    sessionId,
-    runId,
-    callerRequestId,
-    conversationTarget
-  );
-}
-
-export function cancelCurrentAgentRun(
-  sessionId: string,
-  callerRequestId: string,
-  conversationTarget: api.AgentConversationTargetV1
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.cancelCurrentAgentRun(
-    sessionId,
-    callerRequestId,
-    conversationTarget
-  );
-}
-
-export function submitAgentRunGuidance(
-  sessionId: string,
-  runId: string,
-  request: api.AgentRunGuidanceRequest
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.submitAgentRunGuidance(sessionId, runId, request);
-}
-
-export function submitCurrentAgentRunGuidance(
-  sessionId: string,
-  request: api.AgentRunGuidanceRequest
-): Promise<ApiResponse<api.AgentRunResult>> {
-  return api.submitCurrentAgentRunGuidance(sessionId, request);
-}
-
-export function getHostSkills(): Promise<ApiResponse<KernelHostSkillCatalogResult>> {
-  return api.getHostSkills();
-}
-
-export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
-  return api.getGitStatus();
-}
-
-export function getGitDiff(
-  path?: string,
-  staged?: boolean
-): Promise<ApiResponse<GitDiffResult>> {
-  return api.getGitDiff(path, staged);
-}
-
-export function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return api.getBrowserRuntimeStatus();
-}
-
-export function openBrowserPreview(
-  request: OpenBrowserPreviewRequest
-): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return api.openBrowserPreview(request);
-}
-
-export function reloadBrowserPreview(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return api.reloadBrowserPreview();
-}
-
-export function setBrowserInspectMode(
-  request: SetBrowserInspectModeRequest
-): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return api.setBrowserInspectMode(request);
-}
+  const response = await api.getDefaultWorkspacePath();
+  return response.ok
+    ? { ok: true, data: response.data?.path ?? null }
+    : { ok: false, error: response.error, message: response.message };
+}
+
+export const getHealth = api.getHealth;
+export const getCurrentWorkspace = api.getCurrentWorkspace;
+export const openWorkspace = api.openWorkspace;
+export const saveWorkspaceFile = api.saveWorkspaceFile;
+export const patchWorkspaceSettings = api.patchWorkspaceSettings;
+export const getInitialLocations = api.getInitialLocations;
+export const browsePath = api.browsePath;
+export const getFileTree = api.getFileTree;
+export const readFile = api.readFile;
+export const codeSearch = api.codeSearch;
+export const getGitStatus = api.getGitStatus;
+export const getGitDiff = api.getGitDiff;
+export const getUserSettings = api.getUserSettings;
+export const patchUserSettings = api.patchUserSettings;
+export const getLlmProfiles = api.getLlmProfiles;
+export const patchLlmProfiles = api.patchLlmProfiles;
+export const probeLlmProfile = api.probeLlmProfile;
+export const getShellEnvironment = api.getShellEnvironment;
+export const getTerminalCapabilities = api.getTerminalCapabilities;
+export const getTerminalWarmupStatus = api.getTerminalWarmupStatus;
+export const warmupTerminalRuntime = api.warmupTerminalRuntime;
+export const listTerminalSessions = api.listTerminalSessions;
+export const createTerminalSession = api.createTerminalSession;
+export const sendTerminalInput = api.sendTerminalInput;
+export const resizeTerminalSession = api.resizeTerminalSession;
+export const updateTerminalSession = api.updateTerminalSession;
+export const restartTerminalSession = api.restartTerminalSession;
+export const deleteTerminalSession = api.deleteTerminalSession;
+export const getTerminalEvents = api.getTerminalEvents;
+export const getBrowserRuntimeStatus = api.getBrowserRuntimeStatus;
+export const openBrowserPreview = api.openBrowserPreview;
+export const reloadBrowserPreview = api.reloadBrowserPreview;
+export const setBrowserInspectMode = api.setBrowserInspectMode;

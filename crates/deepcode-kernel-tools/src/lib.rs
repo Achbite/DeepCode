@@ -5,18 +5,15 @@ pub mod file_content;
 mod invocation_adapter;
 mod invocation_types;
 mod registrations;
+mod types;
 
-pub use catalog::{CanonicalToolInvocationV2, KernelToolRegistry, KernelToolRegistryErrorV2};
-pub use deepcode_kernel_abi::{
-    ToolAvailabilityV2, ToolContextBundleV2, ToolContextRefV2, ToolContextVersionV2,
-    ToolDescriptorV2, ToolIdV2, ToolInventoryV2,
-};
+pub use catalog::{CanonicalToolInvocation, KernelToolCatalogError, KernelToolRegistry};
+pub use types::{ToolDescriptor, ToolEffectClass, ToolEffectScope};
 
 /// Kernel-private, cross-crate adapter types.
 ///
-/// Agent-facing callers use `ToolIdV2` plus raw JSON arguments through
-/// `KernelToolRegistry`; this module exists only because the Rust runtime and
-/// executor crates need a typed boundary after canonicalization.
+/// Agent-facing callers use tool names plus raw JSON arguments through
+/// `KernelToolRegistry`; this module is only the typed executor boundary.
 #[doc(hidden)]
 pub mod kernel_internal {
     pub use crate::invocation_adapter::{
@@ -24,16 +21,12 @@ pub mod kernel_internal {
         validate_canonical_invocation, InvocationNormalizationError,
     };
     pub use crate::invocation_types::{
-        kernel_tool_output_digest, measure_kernel_output_payload, KernelCanonicalInvocation,
-        KernelDeleteTarget, KernelDocumentPages, KernelEditMatcher, KernelFileDigestPrecondition,
-        KernelGitDiffScope, KernelLineRange, KernelNetworkPublicTarget, KernelOutputTruncation,
-        KernelPathEntry, KernelPathEntrySize, KernelSearchMatch, KernelSearchStrategy,
-        KernelTextMediaType, KernelToolKind, KernelToolOutput, KernelToolOutputPayload,
-        KernelWebSearchItem, KernelWorkspaceObjectKind, MAX_CANONICAL_INVOCATION_BYTES,
+        KernelCanonicalInvocation, KernelDeleteTarget, KernelDocumentPages, KernelEditMatcher,
+        KernelFileDigestPrecondition, KernelLineRange, KernelSearchStrategy, KernelToolKind,
+        MAX_CANONICAL_INVOCATION_BYTES,
     };
-    pub use crate::registrations::{
-        KernelAdmissionMetadata, KernelExecutionAdapter, KernelExecutorBinding,
-    };
+    pub use crate::registrations::KernelExecutorBinding;
+    pub use crate::types::Platform;
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {

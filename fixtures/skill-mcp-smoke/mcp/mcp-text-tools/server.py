@@ -14,6 +14,8 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     request_id = request.get("id")
+    if request_id is None:
+        continue
     if method == "initialize":
         emit(
             {
@@ -26,6 +28,26 @@ for line in sys.stdin:
                         "version": "1",
                     },
                     "capabilities": {"tools": {}},
+                },
+            }
+        )
+    elif method == "tools/list":
+        emit(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "text.reverse",
+                            "description": "Reverse text",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"text": {"type": "string"}},
+                                "required": ["text"],
+                            },
+                        }
+                    ]
                 },
             }
         )

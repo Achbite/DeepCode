@@ -61,16 +61,10 @@ Options:
 Preserved by default:
   bin/linux-x64/config
   bin/linux-x64/sessions
-  bin/linux-x64/conversation-archives
-  bin/linux-x64/kernel
   bin/win64/config
   bin/win64/sessions
-  bin/win64/conversation-archives
-  bin/win64/kernel
   bin/macos-arm64/config
   bin/macos-arm64/sessions
-  bin/macos-arm64/conversation-archives
-  bin/macos-arm64/kernel
 
 Examples:
   scripts/clean-caches.sh
@@ -139,12 +133,11 @@ clear_directory_contents() {
 clean_portable_package_outputs() {
   local package_dir="$1"
   local platform="$2"
-  log "remove $platform package product outputs; preserve config/sessions/conversation-archives/kernel"
+  log "remove $platform package product outputs; preserve config/sessions"
 
   local generated_dirs=(
     "$package_dir/web"
     "$package_dir/web-deepcode-gui"
-    "$package_dir/packs"
     "$package_dir/libexec"
   )
 
@@ -281,7 +274,7 @@ clean_macos_package_outputs() {
     fail_if_macos_package_running
   fi
 
-  log "remove macOS package product outputs; preserve config/sessions/conversation-archives/kernel"
+  log "remove macOS package product outputs; preserve config/sessions"
   local macos_dir="$ROOT_DIR/bin/macos-arm64"
   local paths=(
     "$macos_dir/DeepCode.app"

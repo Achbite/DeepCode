@@ -12,8 +12,6 @@ import {
   buildFileTabId,
 } from '../../state/editorStore';
 import { useSettingsStore } from '../../state/settingsStore';
-import { useAgentSessionStore } from '../../state/agentSessionStore';
-import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -29,7 +27,7 @@ type HydrationPhase = 'shell' | 'primary' | 'idle';
 const FileTree = lazy(() => import('../../components/file-tree/FileTree'));
 const CodeEditor = lazy(() => import('../../components/editor/CodeEditor'));
 const TerminalPlaceholder = lazy(() => import('../../components/terminal/TerminalPlaceholder'));
-const AgentPanelPlaceholder = lazy(() => import('../../components/agent-panel/AgentPanelPlaceholder'));
+const LocalAgentPanel = lazy(() => import('../../components/local-agent/LocalAgentPanel'));
 const SettingsCenter = lazy(() => import('../../components/settings-center/SettingsCenter'));
 const InternalBrowserPanel = lazy(() => import('../../components/internal-browser/InternalBrowserPanel'));
 const WorkspaceOpenDialog = lazy(() => import('../../components/workspace-open-dialog/WorkspaceOpenDialog'));
@@ -103,11 +101,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
   const settingsTitle = t(language, 'settings.title');
-  const agentSession = useAgentSessionStore((state) => state.session);
-  const agentTimeline = useAgentSessionStore((state) => state.timeline);
-  const refreshActiveSessionContext = useAgentSessionStore(
-    (state) => state.refreshActiveSessionContext
-  );
 
   const activeTab = tabs.find((tab) => {
     const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
@@ -130,8 +123,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   const [editorMode, setEditorMode] = useState<InternalBrowserMode>('code');
   const [hydrationPhase, setHydrationPhase] = useState<HydrationPhase>('shell');
-  const [memoryOpen, setMemoryOpen] = useState(false);
-  const [memoryRefreshing, setMemoryRefreshing] = useState(false);
 
   const canLoadPrimary = hydrationPhase !== 'shell';
   const canLoadIdle = hydrationPhase === 'idle';
@@ -412,7 +403,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       <aside className="agent-panel panel">
         {canLoadPrimary ? (
           <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.agent')} />}>
-            <AgentPanelPlaceholder />
+            <LocalAgentPanel />
           </Suspense>
         ) : (
           <PanelFallback label={t(language, 'workbench.loading.agent')} />
@@ -440,15 +431,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <span>UTF-8</span>
         </div>
         <div className="status-bar__group">
-          <button
-            className="status-bar__context-button"
-            type="button"
-            disabled={!agentSession}
-            title={t(language, 'memoryV2.open')}
-            onClick={() => setMemoryOpen(true)}
-          >
-            {t(language, 'memoryV2.open')}
-          </button>
           <span>API {apiStatus}</span>
           <span>WS {wsStatus}</span>
         </div>
@@ -493,33 +475,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <WorkspaceOpenDialog />
           <CodeWorkspaceChoiceDialog />
         </Suspense>
-      )}
-      {memoryOpen && (
-        <div
-          className="agent-memory-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={t(language, 'memoryV2.title')}
-          onMouseDown={() => setMemoryOpen(false)}
-        >
-          <div className="agent-memory-sheet" onMouseDown={(event) => event.stopPropagation()}>
-            <AgentMemoryViewer
-              language={language}
-              timeline={agentTimeline}
-              sessionId={agentSession?.id}
-              refreshing={memoryRefreshing}
-              onRefresh={async () => {
-                setMemoryRefreshing(true);
-                try {
-                  await refreshActiveSessionContext();
-                } finally {
-                  setMemoryRefreshing(false);
-                }
-              }}
-              onClose={() => setMemoryOpen(false)}
-            />
-          </div>
-        </div>
       )}
     </div>
   );

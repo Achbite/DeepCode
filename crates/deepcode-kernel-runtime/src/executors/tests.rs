@@ -27,6 +27,29 @@ impl Drop for TempWorkspace {
 fn context(root: &Path) -> KernelToolExecutionContext {
     KernelToolExecutionContext {
         workspace_root: Some(root.to_string_lossy().to_string()),
+        workspace_id: Some("workspace:test".to_string()),
+        private_resolved_targets: Vec::new(),
+    }
+}
+
+fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionContext {
+    let canonical_root = root.canonicalize().expect("canonical test workspace");
+    KernelToolExecutionContext {
+        workspace_root: Some(canonical_root.to_string_lossy().to_string()),
+        workspace_id: Some("workspace:test".to_string()),
+        private_resolved_targets: vec![canonical_root
+            .join(relative_path)
+            .to_string_lossy()
+            .to_string()],
+    }
+}
+
+fn context_with_resolved_target(root: &Path, target: &Path) -> KernelToolExecutionContext {
+    let canonical_root = root.canonicalize().expect("canonical test workspace");
+    KernelToolExecutionContext {
+        workspace_root: Some(canonical_root.to_string_lossy().to_string()),
+        workspace_id: Some("workspace:test".to_string()),
+        private_resolved_targets: vec![target.to_string_lossy().to_string()],
     }
 }
 
@@ -125,42 +148,6 @@ fn atomic_create_sets_executable_mode_and_atomic_write_preserves_it() {
 }
 
 #[test]
-fn disabled_v2_tools_have_no_runtime_executor_binding() {
-    let tool_registry = KernelToolRegistry::default();
-    let registry = KernelExecutorRegistry::from_executors(builtin_executors(
-        &tool_registry,
-        KernelExecutorConfig::default(),
-        Arc::new(EmptySecretProvider),
-    ));
-    let executable = registry
-        .tool_ids()
-        .collect::<std::collections::BTreeSet<_>>();
-
-    for disabled in [
-        "fs.rename",
-        "git.commit",
-        "git.diff",
-        "git.stage",
-        "git.status",
-        "git.unstage",
-    ] {
-        assert!(!executable.contains(disabled));
-        let error = registry
-            .invoke(
-                disabled,
-                KernelToolInvocation {
-                    id: format!("disabled-{disabled}"),
-                    tool_id: disabled.to_owned(),
-                    input: serde_json::json!({}),
-                },
-                context(Path::new(".")),
-            )
-            .expect_err("Disabled tools must not have executable bindings");
-        assert!(format!("{error}").contains("no executable binding"));
-    }
-}
-
-#[test]
 fn executor_registry_rejects_invocation_identity_mismatch() {
     let tool_registry = KernelToolRegistry::default();
     let registry = KernelExecutorRegistry::from_executors(builtin_executors(
@@ -182,8 +169,42 @@ fn executor_registry_rejects_invocation_identity_mismatch() {
     assert!(format!("{error}").contains("does not match invocation tool"));
 }
 
+#[cfg(unix)]
 #[test]
-fn ready_v2_tools_have_exactly_one_runtime_binding() {
+fn executor_uses_the_prepared_target_without_resolving_the_logical_path_again() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = TempWorkspace::new("prepared-target");
+    let first = workspace.0.join("first.txt");
+    let second = workspace.0.join("second.txt");
+    let alias = workspace.0.join("selected.txt");
+    fs::write(&first, "first\n").unwrap();
+    fs::write(&second, "second\n").unwrap();
+    symlink(&first, &alias).unwrap();
+    let prepared = crate::workspace_boundary::WorkspaceBoundary::new(workspace.0.clone())
+        .resolve_read("selected.txt")
+        .expect("prepare canonical target");
+
+    fs::remove_file(&alias).unwrap();
+    symlink(&second, &alias).unwrap();
+
+    let result = FsReadExecutor
+        .invoke(
+            KernelToolInvocation {
+                id: "prepared-target-test".to_string(),
+                tool_id: "fs.read".to_string(),
+                input: serde_json::json!({ "path": "selected.txt" }),
+            },
+            context_with_resolved_target(&workspace.0, &prepared),
+        )
+        .expect("executor consumes the PreparedEffect target");
+    assert_eq!(result.output["content"], "first\n");
+    assert_eq!(result.output["workspaceId"], "workspace:test");
+    assert!(result.output.get("folderId").is_none());
+}
+
+#[test]
+fn catalog_tools_have_exactly_one_runtime_binding() {
     let registry = KernelToolRegistry::default();
     let executors = builtin_executors(
         &registry,
@@ -200,36 +221,26 @@ fn ready_v2_tools_have_exactly_one_runtime_binding() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(binding_ids.len(), unique_binding_ids.len());
 
-    let inventory = registry
-        .tool_inventory_v2()
-        .expect("compiled v2 inventory must validate");
-    for descriptor in inventory.tools {
+    for descriptor in registry.descriptors() {
         let binding_count = binding_ids
             .iter()
-            .filter(|tool_id| tool_id.as_str() == descriptor.tool_id.as_str())
+            .filter(|tool_id| tool_id.as_str() == descriptor.name)
             .count();
-        let expected =
-            usize::from(descriptor.availability == deepcode_kernel_abi::ToolAvailabilityV2::Ready);
         assert_eq!(
-            binding_count, expected,
-            "v2 tool {} has {binding_count} runtime binding(s); expected {expected}",
-            descriptor.tool_id
+            binding_count, 1,
+            "tool {} has {binding_count} runtime binding(s)",
+            descriptor.name
         );
     }
 }
 
 #[test]
-fn web_urls_reject_credentials_and_metadata_endpoints() {
+fn web_urls_reject_embedded_credentials() {
     assert!(format!(
         "{}",
         validate_http_url("https://user:secret@example.invalid").unwrap_err()
     )
     .contains("credential-bearing"));
-    assert!(format!(
-        "{}",
-        validate_http_url("http://169.254.169.254/latest/meta-data").unwrap_err()
-    )
-    .contains("metadata"));
 }
 
 #[test]
@@ -274,10 +285,7 @@ fn controlled_http_backend_returns_untrusted_evidence() {
             tool_id: "web.search".to_string(),
             input: serde_json::json!({
                 "query": "generic",
-                "limit": 1,
-                "kernelReviewedTarget": crate::network_policy::review_http_target(
-                    &format!("{search_url}/?q=generic&limit=1")
-                ).expect("review temporary search endpoint")
+                "limit": 1
             }),
         },
         context(Path::new(".")),
@@ -294,9 +302,7 @@ fn controlled_http_backend_returns_untrusted_evidence() {
                 id: "web-fetch-test".to_string(),
                 tool_id: "web.fetch".to_string(),
                 input: serde_json::json!({
-                    "url": fetch_url,
-                    "kernelReviewedTarget": crate::network_policy::review_http_target(&fetch_url)
-                        .expect("review temporary fetch endpoint")
+                    "url": fetch_url
                 }),
             },
             context(Path::new(".")),
@@ -305,47 +311,6 @@ fn controlled_http_backend_returns_untrusted_evidence() {
     fetch_server.join().expect("fetch endpoint exits");
     assert_eq!(fetch.output["untrustedEvidence"], true);
     assert_eq!(fetch.output["content"], "temporary evidence");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn controlled_http_backend_is_safe_inside_tokio_runtime() {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind temporary endpoint");
-    let address = listener.local_addr().expect("temporary endpoint address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept temporary request");
-        let mut request = [0_u8; 2048];
-        let _ = stream.read(&mut request);
-        let body = "runtime-safe evidence";
-        write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("write temporary response");
-    });
-
-    let result = WebFetchExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "web-fetch-runtime-test".to_string(),
-                tool_id: "web.fetch".to_string(),
-                input: serde_json::json!({
-                    "url": format!("http://{address}"),
-                    "kernelReviewedTarget": crate::network_policy::review_http_target(
-                        &format!("http://{address}")
-                    ).expect("review temporary runtime endpoint")
-                }),
-            },
-            context(Path::new(".")),
-        )
-        .expect("web fetch succeeds from a Tokio runtime context");
-
-    server.join().expect("temporary endpoint exits");
-    assert_eq!(result.output["untrustedEvidence"], true);
-    assert_eq!(result.output["content"], "runtime-safe evidence");
 }
 
 #[test]
@@ -360,7 +325,7 @@ fn document_read_extracts_text_from_generated_pdf() {
                 tool_id: "document.read".to_string(),
                 input: serde_json::json!({ "path": "sample.pdf", "startPage": 1, "endPage": 1 }),
             },
-            context(&workspace.0),
+            context_with_target(&workspace.0, "sample.pdf"),
         )
         .expect("generated PDF is readable");
     assert!(result.output["text"]

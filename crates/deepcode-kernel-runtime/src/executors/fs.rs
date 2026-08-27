@@ -17,7 +17,7 @@ impl KernelToolExecutor for FsListExecutor {
     ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let relative = get_string(&invocation.input, "path").unwrap_or_else(|| ".".to_string());
-        let target = resolve_workspace_read_path(&root, &relative)?;
+        let target = prepared_workspace_target(&context)?;
         let depth = invocation
             .input
             .get("depth")
@@ -32,7 +32,7 @@ impl KernelToolExecutor for FsListExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&relative),
                 "nodes": list_nodes(&target, &root, depth, include_hidden)?
             }),
@@ -46,9 +46,8 @@ impl KernelToolExecutor for FsReadExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
-        let target = resolve_workspace_read_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
         }
@@ -85,7 +84,7 @@ impl KernelToolExecutor for FsReadExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
                 "content": content,
                 "sizeBytes": content.len(),
@@ -106,10 +105,8 @@ impl KernelToolExecutor for FsCreateExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
-        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
-        let target = resolve_workspace_mutation_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         if target.exists() {
             return Err(KernelError::InvalidCommand(format!(
                 "fs.create target already exists: {path}"
@@ -135,7 +132,7 @@ impl KernelToolExecutor for FsCreateExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
                 "created": true,
                 "sizeBytes": content.len(),
@@ -153,10 +150,8 @@ impl KernelToolExecutor for FsWriteExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
-        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
-        let target = resolve_workspace_mutation_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!(
                 "fs.write requires an existing file: {path}"
@@ -168,7 +163,7 @@ impl KernelToolExecutor for FsWriteExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
                 "saved": true,
                 "sizeBytes": content.len(),
@@ -186,10 +181,8 @@ impl KernelToolExecutor for FsEditExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
-        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
-        let target = resolve_workspace_mutation_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
         }
@@ -212,7 +205,7 @@ impl KernelToolExecutor for FsEditExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
                 "patched": true,
                 "oldContentHash": deepcode_kernel_tools::hash_bytes(original.as_bytes()),
@@ -234,7 +227,6 @@ impl KernelToolExecutor for FsDeleteExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         let target_kind =
             get_string(&invocation.input, "targetKind").unwrap_or_else(|| "file".to_string());
@@ -247,8 +239,7 @@ impl KernelToolExecutor for FsDeleteExecutor {
             .get("recursive")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
-        let target = resolve_workspace_mutation_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         if target.is_dir() {
             if target_kind != "directory" {
                 return Err(KernelError::PermissionDenied(
@@ -265,7 +256,7 @@ impl KernelToolExecutor for FsDeleteExecutor {
             return Ok(ok(
                 invocation.id,
                 serde_json::json!({
-                    "folderId": "wf-0",
+                    "workspaceId": workspace_id(&context)?,
                     "path": normalize_relative_path(&path),
                     "deleted": true,
                     "kind": "directory",
@@ -283,7 +274,7 @@ impl KernelToolExecutor for FsDeleteExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
                 "deleted": true,
                 "kind": "file"
@@ -298,10 +289,8 @@ impl KernelToolExecutor for FsEnsureDirectoryExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = required_string(&invocation.input, "path")?;
-        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
-        let target = resolve_workspace_mutation_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         if target.exists() && !target.is_dir() {
             return Err(KernelError::InvalidCommand(format!(
                 "fs.ensure_directory target exists and is not a directory: {path}"
@@ -312,6 +301,7 @@ impl KernelToolExecutor for FsEnsureDirectoryExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
                 "ensured": true
             }),
@@ -325,9 +315,8 @@ impl KernelToolExecutor for FsDiffExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
-        let target = resolve_workspace_read_path(&root, &path)?;
+        let target = prepared_workspace_target(&context)?;
         let old_content = read_text_file_for_llm(&target)
             .map_err(|skip| {
                 KernelError::InvalidCommand(format!(
@@ -344,6 +333,7 @@ impl KernelToolExecutor for FsDiffExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
+                "workspaceId": workspace_id(&context)?,
                 "path": path,
                 "diff": unified_diff(&path, &old_content, &new_content),
                 "changedRanges": changed_ranges,
