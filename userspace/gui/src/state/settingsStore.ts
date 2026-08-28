@@ -19,6 +19,7 @@ import {
   normalizeGuiAccentColor,
   normalizeGuiThemePreference,
 } from '../theme/deepcodeGuiTheme';
+import { activeT, settingText } from '../i18n';
 
 export type SettingSource = 'default' | 'user' | 'workspace';
 
@@ -43,6 +44,13 @@ export interface SettingDefinition {
   options?: Array<{ label: string; value: string }>;
   catalog?: SettingCatalogEntry;
 }
+
+type SettingDefinitionSchema = Omit<
+  SettingDefinition,
+  'label' | 'description' | 'options' | 'catalog'
+> & {
+  options?: string[];
+};
 
 export interface EditorEffectiveOptions {
   tabSize: number;
@@ -77,269 +85,228 @@ interface SettingsActions {
 
 type SettingsStore = SettingsStateData & SettingsActions;
 
-export const SETTING_DEFINITIONS: SettingDefinition[] = [
+const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
   {
     key: 'workbench.language',
-    label: 'Display Language',
-    description: 'Choose the UI language. Language packs are loaded from local i18n files; reload the workbench after changing this value.',
     group: 'workbench',
     control: 'select',
     options: [
-      { label: 'Simplified Chinese', value: 'zh-CN' },
-      { label: 'English', value: 'en-US' },
+      'zh-CN',
+      'en-US',
     ],
   },
   {
     key: 'workbench.colorTheme',
-    label: 'Color Theme',
-    description: 'Workbench color theme.',
     group: 'workbench',
     control: 'select',
     options: [
-      { label: 'Dark', value: 'vs-dark' },
-      { label: 'Light', value: 'vs-light' },
+      'vs-dark',
+      'vs-light',
     ],
   },
   {
     key: 'workbench.styleTokenOverrides',
-    label: 'Style Token Overrides',
-    description: 'Reserved JSON style-token override map for future custom themes.',
     group: 'workbench',
     control: 'text',
   },
   {
     key: 'gui.colorTheme',
-    label: 'DeepCode-GUI Theme',
-    description: 'Theme used by the lightweight DeepCode-GUI shell. It does not affect the editor workbench theme.',
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'System', value: 'system' },
-      { label: 'Light', value: 'light' },
-      { label: 'Dark', value: 'dark' },
+      'system',
+      'light',
+      'dark',
     ],
   },
   {
     key: 'gui.accentColor',
-    label: 'DeepCode-GUI Accent Color',
-    description: 'Accent color used by interactive controls in the DeepCode-GUI shell.',
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'Blue', value: 'blue' },
-      { label: 'Purple', value: 'purple' },
-      { label: 'Green', value: 'green' },
+      'blue',
+      'purple',
+      'green',
     ],
   },
   {
     key: 'gui.navigationDensity',
-    label: 'Navigation Density',
-    description: 'Spacing used by the DeepCode-GUI navigation shell.',
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'Comfortable', value: 'comfortable' },
-      { label: 'Compact', value: 'compact' },
+      'comfortable',
+      'compact',
     ],
   },
   {
     key: 'gui.showContextRail',
-    label: 'Show Context Rail',
-    description: 'Show the projection-only Todo and artifact rail in DeepCode-GUI.',
     group: 'gui',
     control: 'boolean',
   },
   {
     key: 'editor.tabSize',
-    label: 'Tab Size',
-    description: 'Editor indentation width.',
     group: 'editor',
     control: 'number',
   },
   {
     key: 'editor.insertSpaces',
-    label: 'Insert Spaces',
-    description: 'Insert spaces when pressing Tab.',
     group: 'editor',
     control: 'boolean',
   },
   {
     key: 'editor.wordWrap',
-    label: 'Word Wrap',
-    description: 'Editor line wrapping strategy.',
     group: 'editor',
     control: 'select',
     options: [
-      { label: 'Off', value: 'off' },
-      { label: 'On', value: 'on' },
-      { label: 'Word Wrap Column', value: 'wordWrapColumn' },
-      { label: 'Bounded', value: 'bounded' },
+      'off',
+      'on',
+      'wordWrapColumn',
+      'bounded',
     ],
   },
   {
     key: 'editor.fontSize',
-    label: 'Font Size',
-    description: 'Editor font size.',
     group: 'editor',
     control: 'number',
   },
   {
     key: 'editor.fontFamily',
-    label: 'Font Family',
-    description: 'Editor font family.',
     group: 'editor',
     control: 'text',
   },
   {
     key: 'editor.renderWhitespace',
-    label: 'Render Whitespace',
-    description: 'Whitespace rendering strategy.',
     group: 'editor',
     control: 'select',
     options: [
-      { label: 'None', value: 'none' },
-      { label: 'Boundary', value: 'boundary' },
-      { label: 'Selection', value: 'selection' },
-      { label: 'Trailing', value: 'trailing' },
-      { label: 'All', value: 'all' },
+      'none',
+      'boundary',
+      'selection',
+      'trailing',
+      'all',
     ],
   },
   {
     key: 'files.autoSave',
-    label: 'Auto Save',
-    description: 'File auto-save strategy.',
     group: 'files',
     control: 'select',
     options: [
-      { label: 'Off', value: 'off' },
-      { label: 'After Delay', value: 'afterDelay' },
+      'off',
+      'afterDelay',
     ],
   },
   {
     key: 'files.autoSaveDelay',
-    label: 'Auto Save Delay',
-    description: 'Auto-save delay in milliseconds.',
     group: 'files',
     control: 'number',
   },
   {
     key: 'files.hotExit',
-    label: 'Hot Exit',
-    description: 'Keep unsaved editor state across reload or restart.',
     group: 'files',
     control: 'boolean',
   },
   {
     key: 'keyboard.enableBasicShortcuts',
-    label: 'Basic Shortcuts',
-    description: 'Enable basic shortcuts such as Ctrl+S, Ctrl+Shift+S, Ctrl+A and Ctrl+,.',
     group: 'keyboard',
     control: 'boolean',
   },
   {
     key: 'explorer.confirmDelete',
-    label: 'Confirm Delete',
-    description: 'Ask for confirmation before deleting resources.',
     group: 'explorer',
     control: 'boolean',
   },
   {
     key: 'terminal.integrated.defaultProfile.windows',
-    label: 'Windows Terminal Profile',
-    description: 'Default packaged Windows shell. WSL keeps Agent commands Unix-compatible.',
     group: 'terminal',
     control: 'select',
     options: [
-      { label: 'WSL', value: 'wsl' },
-      { label: 'PowerShell', value: 'powershell' },
-      { label: 'Command Prompt', value: 'cmd' },
+      'wsl',
+      'powershell',
+      'cmd',
     ],
   },
   {
     key: 'terminal.integrated.prewarm',
-    label: 'Terminal Prewarm',
-    description: 'Warm terminal runtime after startup to reduce first terminal latency.',
     group: 'terminal',
     control: 'select',
     options: [
-      { label: 'After Startup', value: 'afterStartup' },
-      { label: 'Off', value: 'off' },
+      'afterStartup',
+      'off',
     ],
   },
   {
     key: 'terminal.integrated.spawnTimeoutMs',
-    label: 'Terminal Spawn Timeout',
-    description: 'Terminal background spawn timeout in milliseconds.',
     group: 'terminal',
     control: 'number',
   },
   {
     key: 'agent.systemPrompt',
-    label: 'System Prompt',
-    description: 'Additional user-authored instructions shared by every DeepCode UI shell.',
     group: 'agent',
     control: 'textarea',
   },
   {
     key: 'agent.permissions.networkRead',
-    label: 'Network Read',
-    description: 'Default Kernel decision for public network read tools.',
     group: 'agent',
     control: 'select',
-    options: permissionPolicyOptions(),
+    options: permissionPolicyOptionValues(),
   },
   {
     key: 'agent.permissions.external',
-    label: 'External Plugin Tools',
-    description: 'Default Kernel decision for tool effects contributed by external plugins.',
     group: 'agent',
     control: 'select',
-    options: permissionPolicyOptions(),
+    options: permissionPolicyOptionValues(),
   },
   {
     key: 'agent.web.search.endpointTemplate',
-    label: 'Web Search Endpoint Template',
-    description: 'HTTP endpoint template containing {query} and optional {limit}.',
     group: 'agent',
     control: 'text',
   },
   {
     key: 'agent.web.search.authHeaderName',
-    label: 'Web Search Auth Header',
-    description: 'Header name used with the configured search SecretRef.',
     group: 'agent',
     control: 'text',
   },
   {
     key: 'agent.web.search.authSecretRef',
-    label: 'Web Search Auth Secret',
-    description: 'Secret reference used for the configured search endpoint.',
     group: 'agent',
     control: 'text',
   },
   {
     key: 'skills.mounts',
-    label: 'Project Skill Mounts',
-    description: 'JSON array of additional Skill mount definitions available to Agent runs.',
     group: 'skills',
     control: 'text',
   },
   {
     key: 'mcp.servers',
-    label: 'Project MCP Servers',
-    description: 'JSON array of MCP service definitions available to Agent runs.',
     group: 'mcp',
     control: 'text',
   },
 ];
 
-function permissionPolicyOptions(): Array<{ label: string; value: string }> {
-  return [
-    { label: 'Allow', value: 'allow' },
-    { label: 'Ask every time', value: 'ask' },
-    { label: 'Deny', value: 'deny' },
-  ];
+function permissionPolicyOptionValues(): string[] {
+  return ['allow', 'ask', 'deny'];
 }
+
+function settingDefinitionFromSchema(schema: SettingDefinitionSchema): SettingDefinition {
+  const text = settingText('en-US', schema.key);
+  if (!text?.label || !text.description) {
+    throw new Error(`setting_i18n_text_missing:${schema.key}`);
+  }
+  const options = schema.options?.map((value) => {
+    const label = text.options?.[value];
+    if (!label) throw new Error(`setting_i18n_option_missing:${schema.key}:${value}`);
+    return { label, value };
+  });
+  return {
+    ...schema,
+    label: text.label,
+    description: text.description,
+    options,
+  };
+}
+
+export const SETTING_DEFINITIONS: SettingDefinition[] =
+  SETTING_DEFINITION_SCHEMAS.map(settingDefinitionFromSchema);
 
 const SETTING_DEFINITION_BY_KEY = new Map(SETTING_DEFINITIONS.map((definition) => [definition.key, definition]));
 
@@ -462,7 +429,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       if (!result.ok || !result.data) {
         set({
           loading: false,
-          errorMessage: result.message ?? 'Failed to load user settings.',
+          errorMessage: result.message ?? activeT('settings.error.loadUser'),
         });
         return;
       }
@@ -500,7 +467,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       const normalized = normalizeSettingValue(key, value);
       const result = await patchUserSettings({ [key]: normalized });
       if (!result.ok || !result.data) {
-        set({ errorMessage: result.message ?? `Failed to save setting: ${key}` });
+        set({
+          errorMessage: result.message ?? activeT('settings.error.saveUser', { key }),
+        });
         return;
       }
       const overriddenKeys = Array.from(
@@ -523,7 +492,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
 
     patchWorkspaceSetting: async (key, value) => {
       if (!WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) {
-        set({ errorMessage: `Workspace setting is not allowed to override protected key: ${key}` });
+        set({ errorMessage: activeT('settings.error.protectedWorkspaceKey', { key }) });
         return;
       }
       const normalized = normalizeSettingValue(key, value);
@@ -531,7 +500,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         [`deepcode.${key}`]: normalized,
       });
       if (!result.ok || !result.data) {
-        set({ errorMessage: result.message ?? `Failed to save workspace setting: ${key}` });
+        set({
+          errorMessage: result.message ?? activeT('settings.error.saveWorkspace', { key }),
+        });
         return;
       }
       const next = buildEffectiveSettings(
@@ -550,7 +521,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     resetUserSetting: async (key) => {
       const result = await patchUserSettings({ [key]: null });
       if (!result.ok || !result.data) {
-        set({ errorMessage: result.message ?? `Failed to reset setting: ${key}` });
+        set({
+          errorMessage: result.message ?? activeT('settings.error.resetUser', { key }),
+        });
         return;
       }
       const overriddenKeys = get().overriddenKeys.filter((k) => k !== key);

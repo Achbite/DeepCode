@@ -55,10 +55,15 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         contextUsage.contextWindowTokens,
       )
     : null;
-  const contextLabel = contextPercent === null ? 'N/A' : `${Math.round(contextPercent)}%`;
+  const contextLabel = contextPercent === null
+    ? t(language, 'common.notAvailable')
+    : `${Math.round(contextPercent)}%`;
   const contextTitle = contextUsage
-    ? `${formatTokens(contextUsage.inputTokens + contextUsage.outputTokens, language)} / ${formatTokens(contextUsage.contextWindowTokens, language)} Token`
-    : 'N/A';
+    ? t(language, 'agent.context.windowUsage', {
+        used: formatTokens(contextUsage.inputTokens + contextUsage.outputTokens, language),
+        capacity: formatTokens(contextUsage.contextWindowTokens, language),
+      })
+    : t(language, 'common.notAvailable');
   const contextReceipt = useMemo(() => {
     if (contextUsage) {
       for (let index = contextCompositions.length - 1; index >= 0; index -= 1) {
@@ -125,14 +130,14 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         <section
           className="deepcode-session-model__context-popover"
           role="dialog"
-          aria-label={language === 'zh-CN' ? '上下文窗口' : 'Context window'}
+          aria-label={t(language, 'agent.context.window')}
         >
           <header>
-            <strong>{language === 'zh-CN' ? '上下文窗口' : 'Context window'}</strong>
+            <strong>{t(language, 'agent.context.window')}</strong>
           </header>
           <div className="deepcode-session-model__context-body">
             <div className="deepcode-session-model__context-total">
-              <span>{language === 'zh-CN' ? '已用上下文' : 'Context used'}</span>
+              <span>{t(language, 'agent.context.used')}</span>
               <strong>{contextTitle}</strong>
               <span>{contextLabel}</span>
             </div>
@@ -151,7 +156,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
               <div
                 className="deepcode-session-model__composition-bar"
                 role="group"
-                aria-label={language === 'zh-CN' ? '上下文用量构成' : 'Context usage composition'}
+                aria-label={t(language, 'agent.context.composition')}
               >
                 {capacityMetrics.map((metric) => (
                   <button
@@ -168,7 +173,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
               </div>
             ) : (
               <div className="deepcode-session-model__composition-bar deepcode-session-model__composition-bar--unknown">
-                N/A
+                {t(language, 'common.notAvailable')}
               </div>
             )}
 
@@ -185,8 +190,10 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
 
             <div className="deepcode-session-model__cache">
               <div className="deepcode-session-model__cache-head">
-                <strong>{language === 'zh-CN' ? '输入缓存' : 'Input cache'}</strong>
-                <span>{cache ? `${formatPercent(cache.hitPercent)}%` : 'N/A'}</span>
+                <strong>{t(language, 'agent.context.inputCache')}</strong>
+                <span>{cache
+                  ? `${formatPercent(cache.hitPercent)}%`
+                  : t(language, 'common.notAvailable')}</span>
               </div>
               {cache ? (
                 <>
@@ -199,12 +206,14 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
                     <span />
                   </div>
                   <div className="deepcode-session-model__cache-legend">
-                    <span>{language === 'zh-CN' ? '命中' : 'Hit'} {formatTokens(cache.hitTokens, language)}</span>
-                    <span>{language === 'zh-CN' ? '未命中' : 'Miss'} {formatTokens(cache.missTokens, language)}</span>
+                    <span>{t(language, 'agent.context.cacheHit')} {formatTokens(cache.hitTokens, language)}</span>
+                    <span>{t(language, 'agent.context.cacheMiss')} {formatTokens(cache.missTokens, language)}</span>
                   </div>
                 </>
               ) : (
-                <div className="deepcode-session-model__cache-empty">N/A</div>
+                <div className="deepcode-session-model__cache-empty">
+                  {t(language, 'common.notAvailable')}
+                </div>
               )}
             </div>
 
@@ -225,7 +234,11 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
                       <span>{metricValue(section, language)}</span>
                     </button>
                   ))
-                : <div className="deepcode-session-model__context-sections-empty">N/A</div>}
+                : (
+                    <div className="deepcode-session-model__context-sections-empty">
+                      {t(language, 'common.notAvailable')}
+                    </div>
+                  )}
             </div>
           </div>
         </section>
@@ -264,9 +277,11 @@ function buildCapacityMetrics(
   usage: ContextUsageProjection | null,
   language: UiLanguage,
 ): ContextDisplayMetric[] {
-  const labels = language === 'zh-CN'
-    ? { input: 'Provider 输入', output: 'Provider 输出', free: '空闲' }
-    : { input: 'Provider input', output: 'Provider output', free: 'Free' };
+  const labels = {
+    input: t(language, 'agent.context.capacity.input'),
+    output: t(language, 'agent.context.capacity.output'),
+    free: t(language, 'agent.context.capacity.free'),
+  };
   if (!usage) {
     return [
       { key: 'input', label: labels.input, tokens: null, percent: null },
@@ -321,23 +336,18 @@ function contextPartitionLabel(
   kind: ContextCompositionPartitionKind,
   language: UiLanguage,
 ): string {
-  const labels: Record<ContextCompositionPartitionKind, readonly [string, string]> = {
-    instructions: ['系统与会话指令', 'System and session instructions'],
-    workspaceBindings: ['目录索引', 'Directory indexes'],
-    sessionControls: ['Session 控制接口', 'Session controls'],
-    journalMessages: ['对话消息', 'Conversation messages'],
-    contextProviders: ['上下文提供项', 'Context providers'],
-    messageAttachments: ['消息附件', 'Message attachments'],
-    tools: ['工具目录', 'Tool catalog'],
-  };
-  return labels[kind][language === 'zh-CN' ? 0 : 1];
+  return t(language, `agent.context.partition.${kind}`);
 }
 
 function metricValue(metric: ContextDisplayMetric, language: UiLanguage): string {
-  if (metric.tokens === null) return 'N/A Token';
+  if (metric.tokens === null) return t(language, 'agent.context.tokensUnavailable');
   const percent = metric.percent === null ? '' : ` · ${formatPercent(metric.percent)}%`;
   const estimate = metric.estimated ? '≈' : '';
-  return `${estimate}${formatTokens(metric.tokens, language)} Token${percent}`;
+  return t(language, 'agent.context.tokenMetric', {
+    estimate,
+    tokens: formatTokens(metric.tokens, language),
+    percent,
+  });
 }
 
 function metricAriaLabel(metric: ContextDisplayMetric, language: UiLanguage): string {
@@ -348,17 +358,21 @@ function cacheAriaLabel(
   cache: InputCacheMetric,
   language: UiLanguage,
 ): string {
-  return language === 'zh-CN'
-    ? `输入 ${formatTokens(cache.inputTokens, language)} Token，缓存命中 ${formatTokens(cache.hitTokens, language)} Token，未命中 ${formatTokens(cache.missTokens, language)} Token`
-    : `${formatTokens(cache.inputTokens, language)} input tokens, ${formatTokens(cache.hitTokens, language)} cache-hit tokens, and ${formatTokens(cache.missTokens, language)} cache-miss tokens`;
+  return t(language, 'agent.context.cacheAria', {
+    input: formatTokens(cache.inputTokens, language),
+    hit: formatTokens(cache.hitTokens, language),
+    miss: formatTokens(cache.missTokens, language),
+  });
 }
 
 function formatItemCount(value: number, language: UiLanguage): string {
-  return language === 'zh-CN' ? `${value} 项` : `${value} item${value === 1 ? '' : 's'}`;
+  return t(language, 'agent.context.itemCount', {
+    count: value.toLocaleString(language),
+  });
 }
 
 function formatTokens(value: number, language: UiLanguage): string {
-  return value.toLocaleString(language === 'zh-CN' ? 'zh-CN' : 'en-US');
+  return value.toLocaleString(language);
 }
 
 function formatPercent(value: number): string {

@@ -29,14 +29,14 @@ DeepCode has no parallel Requirement, Plan, or Review workflow engine. Ordinary 
 
 ## Interfaces
 
-| Interface | Best for | Entry |
-| --- | --- | --- |
+| Interface       | Best for                                                   | Entry                                                |
+| --------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
 | DeepCode Editor | Files, editor, terminal, Git panel, and Agent conversation | `DeepCode.app`, `DeepCode.exe`, or the Linux GUI |
-| DeepCode-GUI | A focused local Agent conversation | `DeepCode-GUI.app` or `DeepCode-GUI.exe` |
-| CLI | One-shot tasks, scripts, and terminal workflows | `DeepCode-CLI.command` or `deepcode-cli` |
-| TUI | Continuous interactive terminal conversations | `DeepCode-TUI.command` or `deepcode-tui` |
+| DeepCode-GUI    | A focused local Agent conversation                         | `DeepCode-GUI.app` or `DeepCode-GUI.exe`         |
+| CLI             | One-shot tasks, scripts, and terminal workflows            | `DeepCode-CLI.command` or `deepcode-cli`         |
+| TUI             | Continuous interactive terminal conversations              | `DeepCode-TUI.command` or `deepcode-tui`         |
 
-For day-to-day development, use the full DeepCode Editor GUI when you want the file tree, editor, terminal, Git, and Agent workflow in one place. Use the TUI for terminal-first development. The CLI remains available for one-shot operations, automation, and diagnostics.
+For day-to-day development, use the full DeepCode GUI when you want the file tree, editor, terminal, Git, and Agent workflow in one place. Use the TUI for terminal-first development. The CLI remains available for one-shot operations, automation, and diagnostics.
 
 All interfaces read the same model profiles, Session journal, Kernel records, and projection when they use the same configuration root.
 
@@ -71,14 +71,30 @@ make package-macos-clean
 
 The macOS package is intended for local use and is ad-hoc signed. It is not a Developer ID signed or notarized DMG.
 
+The macOS package service uses the request directory inside this repository and publishes only to this repository's `bin/macos-arm64/`. Its receipt reports the worker root, output directory, and log. The packaging transaction still verifies that source content did not change before publication.
+
 ## Linux and Windows packages
 
-Portable builds use the project container. On Windows, run from WSL:
+Portable builds use the single `deepcode-dev` container. The recommended host entrypoint for a complete build is:
+
+```bash
+make build
+```
+
+For an interactive development shell (enter WSL first on Windows):
 
 ```bash
 make shell
 bash ./build.sh
 ```
+
+Every entrypoint reevaluates `Dockerfile.dev` through Docker's build cache. If the source mount, image, or port changed, the tooling recreates only the fixed `deepcode-dev` container and preserves dependency/build caches. Branch-specific containers and `DEEPCODE_WORKTREE_ID` are no longer part of the development model. To recreate only the container, run:
+
+```bash
+make reset-dev
+```
+
+`rust-toolchain.toml` pins development and packaging to Rust 1.88.0. The Cargo workspace declares Rust 1.86 as its minimum, matching the actual requirement of the current lockfile.
 
 Artifacts are written to:
 

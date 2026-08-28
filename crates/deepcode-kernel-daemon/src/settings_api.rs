@@ -150,21 +150,16 @@ pub(crate) async fn llm_profiles_patch(
 
     let (profiles_path, secrets_path, old_secret_store) = {
         let gui = state.gui.lock().expect("gui state lock");
-        let old_secret_store = match read_json_file(&gui.paths.llm_secrets_path) {
-            Some(value @ Value::Object(_)) => value,
-            Some(_) => {
+        let old_secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path) {
+            Ok(Some(value)) if llm_secret_store_is_current(&value) => value,
+            Ok(Some(_)) => {
                 return ApiResponse::error(
                     "llm_secret_store_invalid",
-                    "本地 LLM secret 文件不是 JSON 对象。",
+                    "本地 LLM secret 文件不是当前字符串映射格式。",
                 )
             }
-            None if gui.paths.llm_secrets_path.exists() => {
-                return ApiResponse::error(
-                    "llm_secret_store_unreadable",
-                    "本地 LLM secret 文件无法读取。",
-                )
-            }
-            None => json!({}),
+            Err(error) => return ApiResponse::error("llm_secret_store_unreadable", error),
+            Ok(None) => json!({}),
         };
         (
             gui.paths.llm_profiles_path.clone(),
@@ -316,7 +311,7 @@ pub(crate) fn default_user_settings() -> Value {
     })
 }
 
-fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
     if let Some(object) = settings.as_object() {
         for key in object
             .keys()
@@ -349,6 +344,15 @@ fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
             if !matches!(value, "allow" | "ask" | "deny") {
                 return Err(format!("{key} 必须是 allow、ask 或 deny。"));
             }
+        }
+    }
+    for key in [
+        "agent.web.search.endpointTemplate",
+        "agent.web.search.authHeaderName",
+        "agent.web.search.authSecretRef",
+    ] {
+        if settings.get(key).is_some_and(|value| !value.is_string()) {
+            return Err(format!("{key} 必须是字符串。"));
         }
     }
     Ok(())

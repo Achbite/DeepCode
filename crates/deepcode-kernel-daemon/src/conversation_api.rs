@@ -6,13 +6,10 @@ use crate::conversation_catalog::{
 use crate::host_inspection::HostInspectionExecutor;
 use crate::prelude::*;
 use crate::{ApiResponse, AppState, SessionServiceError, SessionServiceProcess};
-use axum::body::Body;
-use bytes::Bytes;
 use deepcode_kernel_abi::{HostInspectionOutput, HostInspectionQuery};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::path::Path as StdPath;
 
 #[derive(Debug, Deserialize)]
@@ -45,12 +42,6 @@ pub(crate) struct UpdateConversationSessionRequest {
     title: Option<String>,
     /// Missing keeps the current classification; JSON null moves to the independent list.
     project_id: Option<Option<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProjectionStreamQuery {
-    from_revision: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -812,57 +803,6 @@ pub(crate) async fn conversation_projection_get(
         Ok(value) => ApiResponse::ok(value),
         Err(error) => session_service_error(error),
     }
-}
-
-pub(crate) async fn conversation_projection_stream(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Query(query): Query<ProjectionStreamQuery>,
-) -> Response {
-    let service = state.session_service;
-    let mut revision = query.from_revision.unwrap_or(0);
-    let stream = async_stream::stream! {
-        loop {
-            let service = service.clone();
-            let session_id = session_id.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                service.request("snapshot", json!({ "sessionId": session_id }))
-            }).await;
-            match result {
-                Ok(Ok(projection)) => {
-                    let current = projection.get("revision").and_then(Value::as_u64).unwrap_or(0);
-                    if current > revision {
-                        revision = current;
-                        let frame = format!("event: projection\ndata: {projection}\n\n");
-                        yield Ok::<Bytes, Infallible>(Bytes::from(frame));
-                    }
-                }
-                Ok(Err(error)) => {
-                    let frame = format!(
-                        "event: error\ndata: {}\n\n",
-                        json!({ "code": error.code, "message": error.message }),
-                    );
-                    yield Ok::<Bytes, Infallible>(Bytes::from(frame));
-                    break;
-                }
-                Err(error) => {
-                    let frame = format!(
-                        "event: error\ndata: {}\n\n",
-                        json!({ "code": "session_service_join_failed", "message": error.to_string() }),
-                    );
-                    yield Ok::<Bytes, Infallible>(Bytes::from(frame));
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .expect("projection stream response is valid")
 }
 
 async fn request_service(

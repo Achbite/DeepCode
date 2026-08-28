@@ -198,62 +198,69 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
             <div>
               <div className="settings-field__title-row">
                 <span className="settings-field__label">
-                  {language === 'zh-CN' ? '当前会话总用量' : 'Current session totals'}
+                  {t(language, 'settings.gui.usage.title')}
                 </span>
               </div>
               <div className="settings-field__description">
-                {language === 'zh-CN'
-                  ? '只读显示 Session 共享投影中的 Provider 用量与缓存事实。'
-                  : 'Read-only Provider usage and cache facts from the shared Session projection.'}
+                {t(language, 'settings.gui.usage.description')}
               </div>
             </div>
           </div>
           <div className="settings-token-usage">
             <UsageStat
-              label={language === 'zh-CN' ? 'Provider 调用' : 'Provider calls'}
-              value={tokenUsage ? formatCount(tokenUsage.providerCallCount) : 'N/A'}
+              label={t(language, 'settings.gui.usage.providerCalls')}
+              value={tokenUsage
+                ? formatCount(tokenUsage.providerCallCount, language)
+                : t(language, 'common.notAvailable')}
             />
             <UsageStat
-              label={language === 'zh-CN' ? '输入 Token' : 'Input tokens'}
-              value={tokenUsage ? formatCount(tokenUsage.inputTokens) : 'N/A'}
+              label={t(language, 'settings.gui.usage.inputTokens')}
+              value={tokenUsage
+                ? formatCount(tokenUsage.inputTokens, language)
+                : t(language, 'common.notAvailable')}
             />
             <UsageStat
-              label={language === 'zh-CN' ? '输出 Token' : 'Output tokens'}
-              value={tokenUsage ? formatCount(tokenUsage.outputTokens) : 'N/A'}
+              label={t(language, 'settings.gui.usage.outputTokens')}
+              value={tokenUsage
+                ? formatCount(tokenUsage.outputTokens, language)
+                : t(language, 'common.notAvailable')}
             />
             <UsageStat
-              label={language === 'zh-CN' ? '总缓存命中率' : 'Total cache hit rate'}
-              value={cacheHitRate(aggregateCache)}
+              label={t(language, 'settings.gui.usage.totalCacheHitRate')}
+              value={cacheHitRate(aggregateCache, language)}
             />
             <UsageStat
-              label={language === 'zh-CN' ? '缓存读取 Token' : 'Cache-read tokens'}
-              value={aggregateCache ? formatCount(aggregateCache.hitTokens) : 'N/A'}
+              label={t(language, 'settings.gui.usage.cacheReadTokens')}
+              value={aggregateCache
+                ? formatCount(aggregateCache.hitTokens, language)
+                : t(language, 'common.notAvailable')}
             />
             <UsageStat
-              label={language === 'zh-CN' ? '缓存未命中 Token' : 'Cache-miss tokens'}
-              value={aggregateCache ? formatCount(aggregateCache.missTokens) : 'N/A'}
+              label={t(language, 'settings.gui.usage.cacheMissTokens')}
+              value={aggregateCache
+                ? formatCount(aggregateCache.missTokens, language)
+                : t(language, 'common.notAvailable')}
             />
           </div>
           <p className="settings-token-usage__note">
-            {language === 'zh-CN'
-              ? `Provider 缓存字段报告 ${tokenUsage?.cacheReportedCallCount ?? 0}/${tokenUsage?.providerCallCount ?? 0} 次；仅全部调用均报告时，按缓存读取输入 / 输入 Token 显示精确命中率。`
-              : `Provider cache fields reported for ${tokenUsage?.cacheReportedCallCount ?? 0}/${tokenUsage?.providerCallCount ?? 0} calls; an exact hit rate is shown only when every call reports it, using cache-read input divided by input tokens.`}
+            {t(language, 'settings.gui.usage.cacheCoverage', {
+              reported: tokenUsage?.cacheReportedCallCount ?? 0,
+              total: tokenUsage?.providerCallCount ?? 0,
+            })}
           </p>
           <div className="settings-token-rounds">
             <div className="settings-token-rounds__heading">
               <div>
-                <strong>{language === 'zh-CN' ? 'Provider 缓存命中历史' : 'Provider cache hit history'}</strong>
+                <strong>{t(language, 'settings.gui.usage.historyTitle')}</strong>
                 <span>
-                  {language === 'zh-CN'
-                    ? '从新到旧排列；每页 10 条。每条汇总当前会话该轮内全部 Provider 调用。'
-                    : 'Newest first, 10 per page. Each row aggregates every Provider call in that round for the current session.'}
+                  {t(language, 'settings.gui.usage.historyDescription')}
                 </span>
               </div>
               <span>{tokenUsageHistory.length}</span>
             </div>
             {visibleUsageRounds.length === 0 ? (
               <div className="settings-token-rounds__empty">
-                {language === 'zh-CN' ? '当前对话还没有用量记录。' : 'No usage rounds for this conversation yet.'}
+                {t(language, 'settings.gui.usage.historyEmpty')}
               </div>
             ) : (
               <div className="settings-token-requests settings-token-requests--rounds">
@@ -273,13 +280,13 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
                   type="button"
                   disabled={effectiveUsagePage === 0}
                   onClick={() => setUsagePage((page) => Math.max(0, page - 1))}
-                >{language === 'zh-CN' ? '上一页' : 'Previous'}</button>
+                >{t(language, 'settings.common.previous')}</button>
                 <span>{effectiveUsagePage + 1} / {usagePageCount}</span>
                 <button
                   type="button"
                   disabled={effectiveUsagePage + 1 >= usagePageCount}
                   onClick={() => setUsagePage((page) => Math.min(usagePageCount - 1, page + 1))}
-                >{language === 'zh-CN' ? '下一页' : 'Next'}</button>
+                >{t(language, 'settings.common.next')}</button>
               </div>
             )}
           </div>
@@ -316,18 +323,18 @@ const UsageRound: React.FC<{
           <strong title={round.title}>{round.title}</strong>
         </div>
         <div className="settings-token-request__total">
-          {formatCount(round.inputTokens + round.outputTokens)}
+          {formatCount(round.inputTokens + round.outputTokens, language)}
         </div>
       </div>
       <div className="settings-token-request__meta">
         <span>{formatRoundTime(round.startedAt)}</span>
         <span>
-          {language === 'zh-CN'
-            ? `${round.providerCallCount} 次 Provider 调用`
-            : `${round.providerCallCount} Provider call(s)`}
+          {t(language, 'settings.gui.usage.roundProviderCalls', {
+            count: formatCount(round.providerCallCount, language),
+          })}
         </span>
         <span>{roundOutcome(round, language)}</span>
-        <span>{language === 'zh-CN' ? '缓存命中' : 'Cache hit'} {cacheHitRate(cache)}</span>
+        <span>{t(language, 'settings.gui.usage.cacheHit')} {cacheHitRate(cache, language)}</span>
       </div>
       <div
         className="settings-token-request__track"
@@ -341,25 +348,25 @@ const UsageRound: React.FC<{
         </div>
       </div>
       <div className="settings-token-request__legend">
-        <span>{language === 'zh-CN' ? '输入' : 'Input'} {formatCount(round.inputTokens)}</span>
-        <span>{language === 'zh-CN' ? '输出' : 'Output'} {formatCount(round.outputTokens)}</span>
+        <span>{t(language, 'settings.gui.usage.input')} {formatCount(round.inputTokens, language)}</span>
+        <span>{t(language, 'settings.gui.usage.output')} {formatCount(round.outputTokens, language)}</span>
         <span>
-          {language === 'zh-CN' ? '缓存读取' : 'Cache read'} {cache
-            ? formatCount(cache.hitTokens)
-            : 'N/A'}
+          {t(language, 'settings.gui.usage.cacheRead')} {cache
+            ? formatCount(cache.hitTokens, language)
+            : t(language, 'common.notAvailable')}
         </span>
         <span>
-          {language === 'zh-CN' ? '缓存未命中' : 'Cache miss'} {cache
-            ? formatCount(cache.missTokens)
-            : 'N/A'}
+          {t(language, 'settings.gui.usage.cacheMiss')} {cache
+            ? formatCount(cache.missTokens, language)
+            : t(language, 'common.notAvailable')}
         </span>
       </div>
     </div>
   );
 };
 
-function cacheHitRate(cache: InputCacheMetric | null): string {
-  if (!cache) return 'N/A';
+function cacheHitRate(cache: InputCacheMetric | null, language: UiLanguage): string {
+  if (!cache) return t(language, 'common.notAvailable');
   return `${Math.round(cache.hitPercent)}%`;
 }
 
@@ -369,17 +376,19 @@ function inputCacheAriaLabel(
   language: UiLanguage,
 ): string {
   if (!cache) {
-    return language === 'zh-CN'
-      ? `输入 ${formatCount(inputTokens)} Token；缓存用量未知`
-      : `${formatCount(inputTokens)} input tokens; cache usage unknown`;
+    return t(language, 'settings.gui.usage.cacheUnknownAria', {
+      input: formatCount(inputTokens, language),
+    });
   }
-  return language === 'zh-CN'
-    ? `输入 ${formatCount(cache.inputTokens)} Token；缓存读取 ${formatCount(cache.hitTokens)}；缓存未命中 ${formatCount(cache.missTokens)}`
-    : `${formatCount(cache.inputTokens)} input tokens; ${formatCount(cache.hitTokens)} cache-read and ${formatCount(cache.missTokens)} cache-miss tokens`;
+  return t(language, 'settings.gui.usage.cacheAria', {
+    input: formatCount(cache.inputTokens, language),
+    hit: formatCount(cache.hitTokens, language),
+    miss: formatCount(cache.missTokens, language),
+  });
 }
 
-function formatCount(value: number): string {
-  return new Intl.NumberFormat().format(value);
+function formatCount(value: number, language: UiLanguage): string {
+  return new Intl.NumberFormat(language).format(value);
 }
 
 function formatRoundTime(value: string): string {
@@ -395,14 +404,7 @@ function formatRoundTime(value: string): string {
 }
 
 function roundOutcome(round: TokenUsageRoundProjection, language: UiLanguage): string {
-  if (!round.outcome) return language === 'zh-CN' ? '进行中' : 'Running';
-  const labels = {
-    completed: ['已完成', 'Completed'],
-    failed: ['失败', 'Failed'],
-    cancelled: ['已取消', 'Cancelled'],
-    indeterminate: ['结果待确认', 'Indeterminate'],
-  } as const;
-  return labels[round.outcome][language === 'zh-CN' ? 0 : 1];
+  return t(language, `settings.gui.usage.outcome.${round.outcome ?? 'running'}`);
 }
 
 export default GuiAppearanceSettings;

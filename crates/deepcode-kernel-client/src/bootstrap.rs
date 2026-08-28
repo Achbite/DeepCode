@@ -2,7 +2,7 @@ use super::*;
 use deepcode_kernel_abi::{
     HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_INSTANCE_ID_ENV,
     HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_HEADER, HOST_SHELL_TOKEN_PREFIX,
-    HOST_TOKEN_ENTROPY_BYTES, KERNEL_DAEMON_SERVICE,
+    HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS, HOST_TOKEN_ENTROPY_BYTES, KERNEL_DAEMON_SERVICE,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 const KERNEL_LISTENER_STARTUP_WAIT: Duration = Duration::from_secs(6);
 const KERNEL_STARTUP_PROBE_INTERVAL: Duration = Duration::from_millis(75);
 const KERNEL_OWNED_SHUTDOWN_CONNECT_WAIT: Duration = Duration::from_millis(500);
-const KERNEL_OWNED_SHUTDOWN_IO_WAIT: Duration = Duration::from_secs(10);
+const KERNEL_OWNED_SHUTDOWN_IO_WAIT: Duration =
+    Duration::from_millis(HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS);
 const KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS: usize = 200;
 
 #[cfg(unix)]

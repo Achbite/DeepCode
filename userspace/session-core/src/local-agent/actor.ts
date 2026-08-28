@@ -6,15 +6,10 @@ import type {
   InteractionProjection,
   NewSessionEvent,
   PlanAuthority,
-  ProjectionUpdate,
   SessionEvent,
   SessionProjection,
 } from '@deepcode/protocol';
-import {
-  COMMAND_REPLY_VERSION,
-  PROJECTION_UPDATE_VERSION,
-  SESSION_EVENT_VERSION,
-} from '@deepcode/protocol';
+import { COMMAND_REPLY_VERSION, SESSION_EVENT_VERSION } from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
 import {
   loopSnapshot,
@@ -25,11 +20,8 @@ import {
 } from './loop.js';
 import { projectSession, reduceSession } from './reducer.js';
 
-export type SessionActorUpdate = ProjectionUpdate;
-
 export interface SessionActorOptions {
   profileId?: string;
-  onUpdate?(update: SessionActorUpdate): void;
   nextId?(kind: string): string;
 }
 
@@ -46,7 +38,6 @@ export class SessionActor {
   readonly #journal: CommandJournalPort;
   readonly #composition: AgentComposition;
   readonly #profileId?: string;
-  readonly #onUpdate?: (update: SessionActorUpdate) => void;
   readonly #nextId: (kind: string) => string;
   #mailbox = Promise.resolve();
   #active?: ActiveRun;
@@ -64,7 +55,6 @@ export class SessionActor {
     this.#journal = journal;
     this.#composition = composition;
     this.#profileId = options.profileId;
-    this.#onUpdate = options.onUpdate;
     this.#nextId = options.nextId ?? defaultIdFactory(sessionId);
   }
 
@@ -166,7 +156,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -199,7 +188,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -275,7 +263,6 @@ export class SessionActor {
       ],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     this.startLoop({ type: 'start', runId });
     return reply;
   }
@@ -314,7 +301,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -371,7 +357,6 @@ export class SessionActor {
       },
     ];
     const reply = await this.#journal.commitCommand(command, events, acceptedReply(command));
-    await this.publishSnapshot();
     this.startLoop({ type: 'resume', runId: command.runId });
     return reply;
   }
@@ -412,7 +397,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     this.startLoop({ type: 'resume', runId: command.runId });
     return reply;
   }
@@ -489,7 +473,6 @@ export class SessionActor {
       );
     }
     const reply = await this.#journal.commitCommand(command, events, acceptedReply(command));
-    await this.publishSnapshot();
     this.startLoop({
       type: 'resume',
       runId: command.runId,
@@ -526,7 +509,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -620,15 +602,7 @@ export class SessionActor {
             throw error;
           }
           for (const event of committed) await this.observe(event);
-          const next = await this.loadSnapshot();
-          this.#onUpdate?.({
-            schemaVersion: PROJECTION_UPDATE_VERSION,
-            type: 'snapshot',
-            sessionId: this.sessionId,
-            revision: next.state.revision,
-            projection: projectSession(next.state, this.#assistantDraft),
-          });
-          return next;
+          return await this.loadSnapshot();
         },
         updateAssistantDraft: (draft) => {
           if (draft && draft.runId !== command.runId) {
@@ -636,14 +610,6 @@ export class SessionActor {
           }
           this.#assistantDraft = draft ? { ...draft } : null;
           if (!this.#projectionState) throw new Error('session_projection_state_missing');
-          const projection = projectSession(this.#projectionState, this.#assistantDraft);
-          this.#onUpdate?.({
-            schemaVersion: PROJECTION_UPDATE_VERSION,
-            type: 'snapshot',
-            sessionId: this.sessionId,
-            revision: projection.revision,
-            projection,
-          });
         },
         nextId: this.#nextId,
       },
@@ -660,17 +626,6 @@ export class SessionActor {
     const snapshot = loopSnapshot(this.sessionId, events);
     this.#projectionState = snapshot.state;
     return snapshot;
-  }
-
-  private async publishSnapshot(): Promise<void> {
-    const snapshot = await this.loadSnapshot();
-    this.#onUpdate?.({
-      schemaVersion: PROJECTION_UPDATE_VERSION,
-      type: 'snapshot',
-      sessionId: this.sessionId,
-      revision: snapshot.state.revision,
-      projection: projectSession(snapshot.state, this.#assistantDraft),
-    });
   }
 
   private async observe(event: SessionEvent): Promise<void> {

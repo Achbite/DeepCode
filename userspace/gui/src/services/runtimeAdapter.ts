@@ -1,4 +1,5 @@
 import type { ApiResponse, HealthStatus } from '@deepcode/protocol';
+import { activeT } from '../i18n';
 import * as api from './apiClient';
 
 type TauriCoreApi = {
@@ -102,7 +103,7 @@ export async function startKernelAfterPermission(): Promise<ApiResponse<KernelSt
     return {
       ok: false,
       error: 'kernel_start_unavailable',
-      message: '仅桌面壳可以重新启动本地 Daemon。',
+      message: activeT('runtime.kernelStart.desktopOnly'),
     };
   }
   try {
@@ -118,7 +119,7 @@ export async function getHostStartupStatus(): Promise<ApiResponse<HostStartupSta
     return {
       ok: false,
       error: 'host_startup_status_unavailable',
-      message: '仅桌面壳提供启动状态。',
+      message: activeT('runtime.hostStartupStatus.desktopOnly'),
     };
   }
   try {

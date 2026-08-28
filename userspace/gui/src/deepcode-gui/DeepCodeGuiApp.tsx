@@ -4,7 +4,7 @@ import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useLocalAgentStore } from '../state/localAgentStore';
-import { normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
+import { normalizeUiLanguage, setActiveUiLanguage, t, type UiLanguage } from '../i18n';
 import {
   normalizeGuiAccentColor,
   normalizeGuiThemePreference,
@@ -51,16 +51,54 @@ function isEditableTarget(target: EventTarget | null): boolean {
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
-function startupStatusMessage(status: {
-  message: string;
-  code: string;
-  reasonCode?: string;
-  diagnosticRef?: string;
-}): string {
+const HOST_STARTUP_MESSAGE_KEYS: Readonly<Record<string, string>> = {
+  host_startup_idle: 'deepcodeGui.hostStartup.idle',
+  host_startup_status_unavailable: 'deepcodeGui.hostStartup.statusUnavailable',
+  host_startup_permission_blocked: 'deepcodeGui.hostStartup.permissionBlocked',
+  host_startup_external: 'deepcodeGui.hostStartup.external',
+  host_startup_starting: 'deepcodeGui.hostStartup.starting',
+  host_startup_ready: 'deepcodeGui.hostStartup.ready',
+  host_startup_port_in_use: 'deepcodeGui.hostStartup.portInUse',
+  host_startup_lock_unavailable: 'deepcodeGui.hostStartup.lockUnavailable',
+  host_startup_resolving_binaries: 'deepcodeGui.hostStartup.resolvingBinaries',
+  host_startup_executable_directory_unavailable:
+    'deepcodeGui.hostStartup.executableDirectoryUnavailable',
+  host_startup_daemon_binary_missing: 'deepcodeGui.hostStartup.daemonBinaryMissing',
+  host_startup_proxy_binary_missing: 'deepcodeGui.hostStartup.proxyBinaryMissing',
+  host_startup_spawning_daemon: 'deepcodeGui.hostStartup.spawningDaemon',
+  host_startup_daemon_spawn_failed: 'deepcodeGui.hostStartup.daemonSpawnFailed',
+  host_startup_daemon_log_capture_failed: 'deepcodeGui.hostStartup.daemonLogCaptureFailed',
+  host_startup_waiting_daemon_identity: 'deepcodeGui.hostStartup.waitingDaemonIdentity',
+  host_startup_daemon_identity_failed: 'deepcodeGui.hostStartup.daemonIdentityFailed',
+  host_startup_waiting_daemon_recovery: 'deepcodeGui.hostStartup.waitingDaemonRecovery',
+  host_startup_daemon_recovery_failed: 'deepcodeGui.hostStartup.daemonRecoveryFailed',
+  host_startup_spawning_proxy: 'deepcodeGui.hostStartup.spawningProxy',
+  host_startup_proxy_spawn_failed: 'deepcodeGui.hostStartup.proxySpawnFailed',
+  host_startup_proxy_log_capture_failed: 'deepcodeGui.hostStartup.proxyLogCaptureFailed',
+  host_startup_waiting_proxy_identity: 'deepcodeGui.hostStartup.waitingProxyIdentity',
+  host_startup_proxy_identity_failed: 'deepcodeGui.hostStartup.proxyIdentityFailed',
+  host_startup_waiting_proxy_health: 'deepcodeGui.hostStartup.waitingProxyHealth',
+  host_startup_process_exited: 'deepcodeGui.hostStartup.processExited',
+  host_startup_process_status_failed: 'deepcodeGui.hostStartup.processStatusFailed',
+  host_startup_health_timeout: 'deepcodeGui.hostStartup.healthTimeout',
+};
+
+function startupStatusMessage(
+  language: UiLanguage,
+  status: {
+    code: string;
+    reasonCode?: string;
+    diagnosticRef?: string;
+  },
+): string {
+  const messageKey = HOST_STARTUP_MESSAGE_KEYS[status.code];
+  const message = messageKey
+    ? t(language, messageKey)
+    : t(language, 'deepcodeGui.hostStartup.unknown', { code: status.code });
   const details = [status.code, status.reasonCode, status.diagnosticRef].filter(Boolean);
   return details.length > 0
-    ? `${status.message} (${details.join(' · ')})`
-    : status.message;
+    ? `${message} (${details.join(' · ')})`
+    : message;
 }
 
 const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> }> = ({ language }) => (
@@ -121,7 +159,7 @@ const DeepCodeGuiApp: React.FC = () => {
     if (start.data?.blocked || startupStatus?.phase === 'failed') {
       setApiStatus('error');
       const message = startupStatus
-        ? startupStatusMessage(startupStatus)
+        ? startupStatusMessage(language, startupStatus)
         : start.data?.message || t(language, 'deepcodeGui.kernelStart.failed');
       setErrorMessage(message);
       setKernelStartMessage(message);
@@ -142,7 +180,7 @@ const DeepCodeGuiApp: React.FC = () => {
     }
 
     const message = startupStatus
-      ? startupStatusMessage(startupStatus)
+      ? startupStatusMessage(language, startupStatus)
       : start.data?.message || t(language, 'deepcodeGui.kernelStart.waitingHealth');
     setApiStatus('error');
     setErrorMessage(message);
@@ -212,7 +250,7 @@ const DeepCodeGuiApp: React.FC = () => {
         const startup = await getHostStartupStatus();
         if (cancelled) return;
         if (startup.ok && startup.data) {
-          const message = startupStatusMessage(startup.data);
+          const message = startupStatusMessage(language, startup.data);
           setKernelStartMessage(message);
           if (startup.data.phase === 'starting' || startup.data.phase === 'idle') {
             setApiStatus('checking');

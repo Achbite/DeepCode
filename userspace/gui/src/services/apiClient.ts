@@ -153,7 +153,10 @@ async function inspectHost<T>(query: KernelHostInspectionQuery): Promise<ApiResp
     return {
       ok: false,
       error: 'host_inspection_kind_mismatch',
-      message: `Host 返回了 ${output.kind}，但请求的是 ${query.kind}。`,
+      message: activeT('api.hostInspectionKindMismatch', {
+        actual: output.kind,
+        expected: query.kind,
+      }),
     };
   }
   return { ...response, data: output.data as T };

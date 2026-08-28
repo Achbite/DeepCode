@@ -692,6 +692,29 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
     if needs_call {
         validate_id("callId", required_string(event, "callId")?)?;
     }
+    if matches!(
+        event_type,
+        "interaction.requested"
+            | "plan.intent.requested"
+            | "todo.updated"
+            | "tool.requested"
+            | "session.control.rejected"
+    ) {
+        let payload = event.get("payload").expect("validated payload");
+        let provider_call_id = required_string(payload, "providerCallId")?;
+        validate_id("providerCallId", provider_call_id)?;
+        let logical_call_id = match event_type {
+            "interaction.requested" => required_string(payload, "interactionId")?,
+            "plan.intent.requested" => required_string(payload, "planId")?,
+            _ => required_string(event, "callId")?,
+        };
+        if provider_call_id == logical_call_id {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Session LogicalCallId 不能复用 providerCallId。",
+            ));
+        }
+    }
     match event_type {
         "session.directory-index.attached" => {
             let payload = event.get("payload").expect("validated payload");
@@ -729,7 +752,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         }
         "todo.updated" => {
             let payload = event.get("payload").expect("validated payload");
-            exact_object(payload, &["items"], &[])?;
+            exact_object(payload, &["providerCallId", "items"], &[])?;
             let items = payload
                 .get("items")
                 .and_then(Value::as_array)
@@ -780,7 +803,11 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         }
         "session.control.rejected" => {
             let payload = event.get("payload").expect("validated payload");
-            exact_object(payload, &["toolName", "input", "error"], &[])?;
+            exact_object(
+                payload,
+                &["providerCallId", "toolName", "input", "error"],
+                &[],
+            )?;
             if !matches!(
                 required_string(payload, "toolName")?,
                 "interaction.request" | "plan.intent" | "todo.update"
@@ -1569,6 +1596,7 @@ mod tests {
                 "sessionId":"session:test",
                 "runId":"run:test",
                 "payload":{
+                    "providerCallId":"provider-call:plan-test",
                     "planId":"plan:test",
                     "prompt":"选择",
                     "options":[{"optionId":"option:test","label":"写入","operations":[{
@@ -1621,7 +1649,7 @@ mod tests {
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo-before-run",
-                "payload":{"items":[{
+                "payload":{"providerCallId":"provider-call:todo-before-run","items":[{
                     "todoId":"todo:one",
                     "label":"Inspect",
                     "status":"pending"
@@ -1655,7 +1683,7 @@ mod tests {
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo",
-                "payload":{"items":[{
+                "payload":{"providerCallId":"provider-call:todo","items":[{
                     "todoId":"todo:one",
                     "label":"Inspect",
                     "status":"inProgress"
@@ -1668,7 +1696,7 @@ mod tests {
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo",
-                "payload":{"items":[]}
+                "payload":{"providerCallId":"provider-call:todo","items":[]}
             }))
             .expect_err("todo call identity is immutable");
         assert_eq!(duplicate_todo.code, "todo_call_duplicate");
@@ -1756,7 +1784,7 @@ mod tests {
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo-after-settlement",
-                "payload":{"items":[]}
+                "payload":{"providerCallId":"provider-call:todo-after-settlement","items":[]}
             }))
             .expect_err("settled runs reject Todo updates");
         assert_eq!(todo_after_settlement.code, "session_event_run_not_active");
@@ -1978,6 +2006,36 @@ mod tests {
             "source": "gui"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn provider_call_identity_is_required_and_distinct_from_logical_call_identity() {
+        let event = json!({
+            "type": "tool.requested",
+            "sessionId": "session:identity",
+            "runId": "run:identity",
+            "callId": "call:logical",
+            "payload": {
+                "providerCallId": "provider-call:native",
+                "attemptId": "attempt:one",
+                "toolName": "fs.read",
+                "input": {"workspaceId": "workspace:one", "path": "README.md"}
+            }
+        });
+        validate_new_event(&event, false).expect("accept separated call identities");
+
+        let mut missing = event.clone();
+        missing["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("providerCallId");
+        assert!(validate_new_event(&missing, false).is_err());
+
+        let mut reused = event;
+        reused["payload"]["providerCallId"] = json!("call:logical");
+        let error = validate_new_event(&reused, false).expect_err("identity reuse must fail");
+        assert_eq!(error.code, "session_event_invalid");
+        assert!(error.message.contains("不能复用"));
     }
 
     #[test]

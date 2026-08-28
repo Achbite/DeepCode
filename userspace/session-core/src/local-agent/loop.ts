@@ -78,7 +78,7 @@ export interface ProviderRunTransientState {
 
 type ProviderTurnCommon = {
   contextUsage?: ProviderTokenUsage & { providerRequestId: string };
-  todo?: { callId: string; items: TodoItem[] };
+  todo?: { callId: string; providerCallId: string; items: TodoItem[] };
 };
 
 interface PreparedProviderRequest {
@@ -91,19 +91,31 @@ type ProviderTurn =
   | {
       kind: 'interaction';
       interactionId: string;
+      providerCallId: string;
       request: ModelInteractionRequest;
       narrative?: string;
     } & ProviderTurnCommon
-  | ({ kind: 'plan'; intent: PlanIntent; narrative?: string } & ProviderTurnCommon)
+  | ({
+      kind: 'plan';
+      intent: PlanIntent;
+      providerCallId: string;
+      narrative?: string;
+    } & ProviderTurnCommon)
   | ({
       kind: 'tools';
-      calls: Array<{ callId: string; name: string; input: Record<string, unknown> }>;
+      calls: Array<{
+        callId: string;
+        providerCallId: string;
+        name: string;
+        input: Record<string, unknown>;
+      }>;
       narrative?: string;
     } & ProviderTurnCommon)
   | ({
       kind: 'controlRejected';
       rejection: {
         callId: string;
+        providerCallId: string;
         toolName: string;
         input: Record<string, unknown>;
         error: LocalAgentError;
@@ -249,7 +261,10 @@ export async function runAgentLoop(
           sessionId: snapshot.state.sessionId,
           runId,
           callId: turn.todo.callId,
-          payload: { items: turn.todo.items.map((item) => ({ ...item })) },
+          payload: {
+            providerCallId: turn.todo.providerCallId,
+            items: turn.todo.items.map((item) => ({ ...item })),
+          },
         });
       }
 
@@ -261,7 +276,11 @@ export async function runAgentLoop(
               type: 'interaction.requested',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: { interactionId: turn.interactionId, ...turn.request },
+              payload: {
+                interactionId: turn.interactionId,
+                providerCallId: turn.providerCallId,
+                ...turn.request,
+              },
             },
             {
               type: 'run.waiting',
@@ -295,7 +314,7 @@ export async function runAgentLoop(
               type: 'plan.intent.requested',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: clonePlan(turn.intent),
+              payload: { ...clonePlan(turn.intent), providerCallId: turn.providerCallId },
             },
             {
               type: 'run.waiting',
@@ -343,6 +362,7 @@ export async function runAgentLoop(
               runId,
               callId: call.callId,
               payload: {
+                providerCallId: call.providerCallId,
                 attemptId: deps.nextId('attempt'),
                 toolName: call.name,
                 input: call.input,
@@ -359,6 +379,7 @@ export async function runAgentLoop(
             runId,
             callId: turn.rejection.callId,
             payload: {
+              providerCallId: turn.rejection.providerCallId,
               toolName: turn.rejection.toolName,
               input: { ...turn.rejection.input },
               error: { ...turn.rejection.error },
@@ -592,7 +613,7 @@ async function consumeProvider(
     reasoningContent?: string;
   } | undefined;
   const providerCalls: Array<{
-    callId: string;
+    providerCallId: string;
     name: string;
     input: Record<string, unknown>;
   }> = [];
@@ -626,7 +647,11 @@ async function consumeProvider(
         completeMessage = event.data;
         break;
       case 'tool.call':
-        providerCalls.push(event.data);
+        providerCalls.push({
+          providerCallId: event.data.callId,
+          name: event.data.name,
+          input: event.data.input,
+        });
         break;
       case 'completed':
         contextUsage = decodeContextUsage(event.data);
@@ -678,13 +703,13 @@ async function consumeProvider(
   const seenCalls = new Set<string>();
   const declaredTools = new Set(request.tools.map((tool) => tool.name));
   for (const call of providerCalls) {
-    if (!call.callId || seenCalls.has(call.callId)) {
+    if (!call.providerCallId || seenCalls.has(call.providerCallId)) {
       throw new LoopFailure(
         'provider_tool_call_duplicate',
         'Provider 工具调用标识为空或重复。',
       );
     }
-    seenCalls.add(call.callId);
+    seenCalls.add(call.providerCallId);
     if (request.responseConstraint !== 'answerOnly' && !declaredTools.has(call.name)) {
       throw new LoopFailure(
         'provider_tool_not_declared',
@@ -692,19 +717,36 @@ async function consumeProvider(
       );
     }
   }
+  const logicalCallIds = new Set<string>();
+  const calls = providerCalls.map((call) => {
+    const callId = deps.nextId('call');
+    if (!callId || callId === call.providerCallId || logicalCallIds.has(callId)) {
+      throw new LoopFailure(
+        'logical_call_identity_invalid',
+        'Session 必须为每个 Provider call 生成非空、唯一且不复用原生值的 LogicalCallId。',
+      );
+    }
+    logicalCallIds.add(callId);
+    return {
+      callId,
+      providerCallId: call.providerCallId,
+      name: call.name,
+      input: call.input,
+    };
+  });
   recordProviderTurnState(
     deps.providerRunState,
     runId,
-    providerCalls.map((call) => call.callId),
+    calls.map((call) => call.callId),
     completeMessage?.reasoningContent,
   );
 
-  const controlCalls: SessionControlCall[] = [];
-  const kernelCalls: typeof providerCalls = [];
-  for (const call of providerCalls) {
+  const controlCalls: Array<SessionControlCall & { providerCallId: string }> = [];
+  const kernelCalls: typeof calls = [];
+  for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
-      if (control) controlCalls.push(control);
+      if (control) controlCalls.push({ ...control, providerCallId: call.providerCallId });
       else kernelCalls.push(call);
     } catch (error) {
       if (!(error instanceof SessionControlError)) throw error;
@@ -712,6 +754,7 @@ async function consumeProvider(
         kind: 'controlRejected',
         rejection: {
           callId: call.callId,
+          providerCallId: call.providerCallId,
           toolName: call.name,
           input: { ...call.input },
           error: { code: error.code, message: error.message },
@@ -725,7 +768,8 @@ async function consumeProvider(
     (control) => control.kind === 'interaction' || control.kind === 'plan',
   );
   const todoControls = controlCalls.filter(
-    (control): control is Extract<SessionControlCall, { kind: 'todo' }> => control.kind === 'todo',
+    (control): control is Extract<SessionControlCall, { kind: 'todo' }>
+      & { providerCallId: string } => control.kind === 'todo',
   );
   if (
     blockingControls.length > 1
@@ -739,7 +783,13 @@ async function consumeProvider(
   }
 
   const todo = todoControls[0]
-    ? { todo: { callId: todoControls[0].callId, items: todoControls[0].items } }
+    ? {
+        todo: {
+          callId: todoControls[0].callId,
+          providerCallId: todoControls[0].providerCallId,
+          items: todoControls[0].items,
+        },
+      }
     : {};
   const common = { ...usage, ...todo };
   const control = blockingControls[0];
@@ -747,6 +797,7 @@ async function consumeProvider(
     return {
       kind: 'interaction',
       interactionId: control.interactionId,
+      providerCallId: control.providerCallId,
       request: control.request,
       ...(narrative ? { narrative } : {}),
       ...common,
@@ -756,6 +807,7 @@ async function consumeProvider(
     return {
       kind: 'plan',
       intent: control.intent,
+      providerCallId: control.providerCallId,
       ...(narrative ? { narrative } : {}),
       ...common,
     };

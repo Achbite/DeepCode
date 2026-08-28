@@ -178,7 +178,7 @@ test('Profile 与 workspace creation snapshot 写入 Journal 并用于恢复', a
   const recoveredInputs = [];
   const recovered = serviceWith(journal, recoveredInputs);
   const projection = await recovered.snapshot('session:profile');
-  assert.equal(projection.display.title, '新对话');
+  assert.equal(projection.display.creationTitle, '新对话');
   assert.deepEqual(projection.workspaceBindings, [binding]);
   assert.deepEqual(recoveredInputs[0], created[0]);
   await recovered.dispose();
@@ -378,8 +378,13 @@ test('typed turn 叙述、模型主动介入和上下文计数进入共享投影
       assert.ok(request.messages.some((item) => item.role === 'user' && item.content === 'cargo'));
       const interactionTurn = request.messages.find((item) => (
         item.role === 'assistant'
-        && item.toolCalls?.some((call) => call.callId === 'interaction:build-entry')
+        && item.toolCalls?.some((call) => call.name === 'interaction.request')
       ));
+      const interactionCall = interactionTurn?.toolCalls?.find(
+        (call) => call.name === 'interaction.request',
+      );
+      assert.ok(interactionCall);
+      assert.notEqual(interactionCall.callId, 'interaction:build-entry');
       assert.equal(
         interactionTurn?.reasoningContent,
         'private provider reasoning for the tool continuation',
@@ -431,6 +436,10 @@ test('typed turn 叙述、模型主动介入和上下文计数进入共享投影
   ]);
   assert.equal(completed.messages.at(-1).content, '采用 **Cargo** 作为构建入口。');
   assert.deepEqual(requests.map((item) => item.profileId), ['profile:flash', 'profile:pro']);
+  const interactionRequested = (await readEvents(journal, 'session:structured'))
+    .find((event) => event.type === 'interaction.requested');
+  assert.equal(interactionRequested.payload.providerCallId, 'interaction:build-entry');
+  assert.notEqual(interactionRequested.payload.interactionId, 'interaction:build-entry');
   assert.doesNotMatch(
     JSON.stringify(await readEvents(journal, 'session:structured')),
     /private provider reasoning/u,
@@ -438,10 +447,9 @@ test('typed turn 叙述、模型主动介入和上下文计数进入共享投影
   await actor.dispose();
 });
 
-test('当前 turn 的累计 assistant draft 进入共享投影但不写入 Journal', async () => {
+test('当前 turn 的累计 assistant draft 可从共享 snapshot 拉取且不写入 Journal', async () => {
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:streaming');
-  const updates = [];
   let release;
   const paused = new Promise((resolve) => { release = resolve; });
   const actor = actorWith(journal, 'session:streaming', {
@@ -453,16 +461,11 @@ test('当前 turn 的累计 assistant draft 进入共享投影但不写入 Journ
       yield providerEvent(request.requestId, 'text.delta', { text: '\n\n检查完成。' });
       yield providerEvent(request.requestId, 'completed', {});
     },
-  }, undefined, [], 'streaming', (update) => updates.push(update));
+  }, undefined, [], 'streaming');
   await actor.submit(message('session:streaming', 'command:start', '检查项目入口'));
   const running = await waitFor(actor, (p) => p.assistantDraft?.content === '正在检查项目入口。');
   assert.equal(running.narratives.length, 0);
   assert.equal(running.messages.length, 1);
-  assert.ok(updates.some((update) => (
-    update.type === 'snapshot'
-    && update.projection.assistantDraft?.content === '正在检查项目入口。'
-  )));
-  assert.ok(updates.every((update) => update.type === 'snapshot' && !('event' in update)));
   assert.equal((await readEvents(journal, 'session:streaming')).some((event) => (
     event.type === 'assistant.chunk'
   )), false);
@@ -722,8 +725,13 @@ test('首个非法 Session control 持久拒绝与用量，并在同一 run 给 
         });
         return;
       }
+      const controlCall = request.messages
+        .find((entry) => entry.role === 'assistant' && entry.toolCalls?.length)
+        ?.toolCalls.find((call) => call.name === 'plan.intent');
+      assert.ok(controlCall);
+      assert.notEqual(controlCall.callId, 'plan:invalid:first');
       const rejection = request.messages.find(
-        (entry) => entry.role === 'tool' && entry.toolCallId === 'plan:invalid:first',
+        (entry) => entry.role === 'tool' && entry.toolCallId === controlCall.callId,
       );
       assert.deepEqual(JSON.parse(rejection.content), {
         accepted: false,
@@ -752,6 +760,8 @@ test('首个非法 Session control 持久拒绝与用量，并在同一 run 给 
   const rejections = (await readEvents(journal, 'session:control-invalid'))
     .filter((event) => event.type === 'session.control.rejected');
   assert.equal(rejections.length, 1);
+  assert.equal(rejections[0].payload.providerCallId, 'plan:invalid:first');
+  assert.notEqual(rejections[0].callId, 'plan:invalid:first');
   assert.equal(rejections[0].payload.error.code, 'session_control_plan_operations_invalid');
   await actor.dispose();
 });
@@ -856,7 +866,14 @@ test('非 workspace effect 通过独立 approval 事实采集决定并沿同一 
   ))).status, 'accepted');
   const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
   assert.equal(completed.pendingApproval, null);
-  assert.equal(completed.activities.find((item) => item.callId === 'call:external')?.status, 'completed');
+  const externalRequest = (await readEvents(journal, 'session:external'))
+    .find((event) => event.type === 'tool.requested');
+  assert.equal(externalRequest.payload.providerCallId, 'call:external');
+  assert.notEqual(externalRequest.callId, 'call:external');
+  assert.equal(
+    completed.activities.find((item) => item.callId === externalRequest.callId)?.status,
+    'completed',
+  );
   assert.equal(executions.length, 2);
   await actor.dispose();
 });
@@ -939,7 +956,14 @@ test('Plan 选择生成同 session/run/workspace 的精确 authority', async () 
   const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
   assert.equal(completed.pendingPlan, null);
   assert.equal(executions.length, 1);
-  assert.equal(completed.activities.find((item) => item.callId === 'call:write')?.status, 'completed');
+  const writeRequest = (await readEvents(journal, 'session:plan-select'))
+    .find((event) => event.type === 'tool.requested');
+  assert.equal(writeRequest.payload.providerCallId, 'call:write');
+  assert.notEqual(writeRequest.callId, 'call:write');
+  assert.equal(
+    completed.activities.find((item) => item.callId === writeRequest.callId)?.status,
+    'completed',
+  );
   await actor.dispose();
 });
 
@@ -1020,6 +1044,64 @@ test('Plan 忽略关闭 mutation authority，并强制同一 Loop 只接受最�
     .find((event) => event.type === 'plan.intent.resolved');
   assert.equal(resolved.payload.response.kind, 'ignore');
   assert.equal(resolved.payload.authorities, undefined);
+  await actor.dispose();
+});
+
+test('Provider 跨 turn 复用原生 callId 时 Session 生成独立 LogicalCallId', async () => {
+  const journal = new InMemoryCommandJournal();
+  await createSession(journal, 'session:logical-call', [binding]);
+  const readTool = {
+    name: 'fs.read',
+    description: '读取工作区文件',
+    inputSchema: { type: 'object' },
+    possibleEffects: [],
+    availability: 'callable',
+  };
+  const executedCallIds = [];
+  const kernel = {
+    async listTools() { return [readTool]; },
+    async execute(request) {
+      executedCallIds.push(request.callId);
+      return executionReply(request, {
+        decision: 'allow', source: 'workspaceRead', workspaceId: 'workspace:test',
+      }, String(request.input.path));
+    },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  };
+  let turn = 0;
+  const actor = actorWith(journal, 'session:logical-call', {
+    async *stream(request) {
+      turn += 1;
+      if (turn <= 2) {
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:reused',
+          name: 'fs.read',
+          input: { workspaceId: 'workspace:test', path: `file-${turn}.txt` },
+        });
+      } else {
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:logical-call',
+          content: '两个读取调用均已完成。',
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  }, kernel, [readTool], 'logical-call');
+
+  await actor.submit(message('session:logical-call', 'command:start', '连续读取两个文件'));
+  const completed = await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  assert.equal(completed.terminalError, null);
+  const requests = (await readEvents(journal, 'session:logical-call'))
+    .filter((event) => event.type === 'tool.requested');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map((event) => event.payload.providerCallId), [
+    'provider:reused',
+    'provider:reused',
+  ]);
+  assert.equal(new Set(requests.map((event) => event.callId)).size, 2);
+  assert.ok(requests.every((event) => event.callId !== event.payload.providerCallId));
+  assert.deepEqual(executedCallIds, requests.map((event) => event.callId));
   await actor.dispose();
 });
 
@@ -1158,7 +1240,12 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
     cacheReportedCallCount: 1,
     outcome: 'completed',
   }]);
-  const activity = completed.activities.find((item) => item.callId === 'call:read');
+  const requested = (await readEvents(journal, 'session:projection-facts'))
+    .find((event) => (
+      event.type === 'tool.requested' && event.payload.providerCallId === 'call:read'
+    ));
+  assert.notEqual(requested.callId, 'call:read');
+  const activity = completed.activities.find((item) => item.callId === requested.callId);
   assert.equal(activity.status, 'completed');
   assert.deepEqual(activity.tool, {
     operation: 'fs.read',
@@ -1169,8 +1256,6 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
       logicalPath: 'README.md',
     }],
   });
-  const requested = (await readEvents(journal, 'session:projection-facts'))
-    .find((event) => event.type === 'tool.requested' && event.callId === 'call:read');
   assert.equal(activity.sequence, requested.sequence);
 
   await actor.submit(message(
@@ -1242,13 +1327,12 @@ function actorWith(
   kernel,
   tools = [],
   prefix = 'test',
-  onUpdate,
 ) {
   return new SessionActor(
     sessionId,
     journal,
     composition(providerPort, kernel ?? emptyKernel(), tools),
-    { nextId: idFactory(prefix), ...(onUpdate ? { onUpdate } : {}) },
+    { nextId: idFactory(prefix) },
   );
 }
 

@@ -32,7 +32,8 @@ done
 run_static() {
   printf '[test] 分层与 R0 资产\n'
   python3 -I -S ./scripts/tests/architecture.py
-  bash -n ./test.sh ./build.sh ./scripts/branch-flow.sh ./scripts/check-architecture.sh ./scripts/package-macos.sh
+  python3 -I -S ./scripts/tests/development_tooling.py
+  bash -n ./test.sh ./build.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/check-architecture.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh
   bash ./scripts/check-architecture.sh
   git diff --check
 }

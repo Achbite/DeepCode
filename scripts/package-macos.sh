@@ -6,7 +6,8 @@
 # the default Linux/Windows development path.
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$ROOT_DIR/scripts/source-identity.sh"
 PRODUCT_VERSION="$(
   awk -F '"' '/^[[:space:]]*"version"[[:space:]]*:/ { print $4; exit }' "$ROOT_DIR/package.json"
 )"
@@ -18,19 +19,8 @@ fi
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 BUILD_COMMIT="${DEEPCODE_BUILD_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')}"
 BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-SOURCE_STATUS_HASH="$(
-  git -C "$ROOT_DIR" status --porcelain=v1 2>/dev/null \
-    | shasum -a 256 2>/dev/null \
-    | awk '{ print $1 }'
-)"
-SOURCE_STATUS_HASH="${SOURCE_STATUS_HASH:-unknown}"
-if git -C "$ROOT_DIR" diff --quiet --ignore-submodules -- 2>/dev/null \
-  && git -C "$ROOT_DIR" diff --cached --quiet --ignore-submodules -- 2>/dev/null \
-  && [ -z "$(git -C "$ROOT_DIR" ls-files --others --exclude-standard 2>/dev/null)" ]; then
-  SOURCE_DIRTY=0
-else
-  SOURCE_DIRTY=1
-fi
+SOURCE_STATUS_HASH="$(deepcode_source_status_hash "$ROOT_DIR")"
+SOURCE_DIRTY="$(deepcode_source_dirty "$ROOT_DIR")"
 REQUESTED_PRODUCTS_RAW="${DEEPCODE_MACOS_PRODUCTS:-DeepCode-GUI,DeepCode}"
 declare -a REQUESTED_PRODUCTS=()
 PRODUCT=""
@@ -123,7 +113,12 @@ parse_requested_products
 expand_requested_products_with_published_apps
 configure_product "${REQUESTED_PRODUCTS[0]}"
 CARGO_TARGET_ROOT="${DEEPCODE_MACOS_CARGO_TARGET_DIR:-$ROOT_DIR/target/macos-arm64}"
-RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-1.84.0}"
+CANONICAL_RUST_TOOLCHAIN="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' "$ROOT_DIR/rust-toolchain.toml")"
+if [ -z "$CANONICAL_RUST_TOOLCHAIN" ]; then
+  printf '==[macos-package][error]== missing Rust channel in %s/rust-toolchain.toml\n' "$ROOT_DIR" >&2
+  exit 2
+fi
+RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-$CANONICAL_RUST_TOOLCHAIN}"
 NODE_MAJOR="${DEEPCODE_MACOS_NODE_MAJOR:-22}"
 NODE_HOME="${DEEPCODE_MACOS_NODE_HOME:-$HOME/.local/deepcode-node}"
 PNPM_VERSION="${DEEPCODE_MACOS_PNPM_VERSION:-9.15.9}"
@@ -210,33 +205,11 @@ fail() {
   exit 1
 }
 
-source_fingerprint() {
-  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    {
-      git -C "$ROOT_DIR" rev-parse HEAD
-      git -C "$ROOT_DIR" diff --binary --no-ext-diff HEAD --
-      git -C "$ROOT_DIR" ls-files --others --exclude-standard \
-        | while IFS= read -r path; do
-            printf 'untracked=%s\n' "$path"
-            [ -f "$ROOT_DIR/$path" ] && shasum -a 256 "$ROOT_DIR/$path"
-          done
-    } | shasum -a 256 | awk '{ print $1 }'
-    return
-  fi
-
-  find "$ROOT_DIR" \
-    \( -type d \( -name .git -o -name node_modules -o -name target -o -name bin -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
-    \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -exec shasum -a 256 {} + \) \
-    | LC_ALL=C sort \
-    | shasum -a 256 \
-    | awk '{ print $1 }'
-}
-
-SOURCE_FINGERPRINT="$(source_fingerprint)"
+SOURCE_FINGERPRINT="$(deepcode_source_fingerprint "$ROOT_DIR")"
 
 verify_source_fingerprint_unchanged() {
   local current
-  current="$(source_fingerprint)"
+  current="$(deepcode_source_fingerprint "$ROOT_DIR")"
   [ "$current" = "$SOURCE_FINGERPRINT" ] \
     || fail "source changed during package transaction; refusing to publish a mixed product set"
 }
@@ -475,23 +448,53 @@ CURL_WRAPPER
   command -v pnpm >/dev/null 2>&1 || fail "pnpm not found and could not be bootstrapped from node/corepack/npm."
 }
 
+rustup_has_toolchain() {
+  local installed
+  while read -r installed _; do
+    case "$installed" in
+      "$RUST_TOOLCHAIN"|"$RUST_TOOLCHAIN"-*) return 0 ;;
+    esac
+  done < <(rustup toolchain list 2>/dev/null)
+  return 1
+}
+
+rustc_meets_required_version() {
+  local actual required actual_major actual_minor required_major required_minor
+  actual="$(rustc --version 2>/dev/null | awk '{ print $2; exit }')"
+  required="${CANONICAL_RUST_TOOLCHAIN%%-*}"
+  IFS=. read -r actual_major actual_minor _ <<<"$actual"
+  IFS=. read -r required_major required_minor _ <<<"$required"
+  [[ "$actual_major" =~ ^[0-9]+$ && "$actual_minor" =~ ^[0-9]+$ \
+    && "$required_major" =~ ^[0-9]+$ && "$required_minor" =~ ^[0-9]+$ ]] || return 1
+  [ "$actual_major" -gt "$required_major" ] \
+    || { [ "$actual_major" -eq "$required_major" ] && [ "$actual_minor" -ge "$required_minor" ]; }
+}
+
 ensure_rust() {
-  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
-    return
+  if command -v rustup >/dev/null 2>&1; then
+    if ! rustup_has_toolchain; then
+      [ "$BOOTSTRAP" = "1" ] \
+        || fail "Rust toolchain $RUST_TOOLCHAIN is not installed. Set DEEPCODE_MACOS_BOOTSTRAP=1 to install it."
+      log "install Rust toolchain $RUST_TOOLCHAIN from rust-toolchain.toml"
+      rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+    fi
+    export RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN"
+  elif ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+    [ "$BOOTSTRAP" = "1" ] \
+      || fail "cargo/rustc not found. Set DEEPCODE_MACOS_BOOTSTRAP=1 to allow user-level rustup install."
+    log "Rust toolchain not found; installing rustup toolchain $RUST_TOOLCHAIN into the user profile"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --default-toolchain "$RUST_TOOLCHAIN"
+    # shellcheck disable=SC1091
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+    export RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN"
   fi
 
-  if [ "$BOOTSTRAP" != "1" ]; then
-    fail "cargo/rustc not found. Set DEEPCODE_MACOS_BOOTSTRAP=1 to allow user-level rustup install."
-  fi
-
-  log "Rust toolchain not found; installing rustup toolchain $RUST_TOOLCHAIN into the user profile"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --no-modify-path --default-toolchain "$RUST_TOOLCHAIN"
-  # shellcheck disable=SC1091
-  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-
-  command -v cargo >/dev/null 2>&1 || fail "cargo still not found after rustup install."
-  command -v rustc >/dev/null 2>&1 || fail "rustc still not found after rustup install."
+  command -v cargo >/dev/null 2>&1 || fail "cargo still not found after Rust toolchain setup."
+  command -v rustc >/dev/null 2>&1 || fail "rustc still not found after Rust toolchain setup."
+  rustc_meets_required_version \
+    || fail "Rust $(rustc --version 2>/dev/null || printf unknown) is below the project minimum $CANONICAL_RUST_TOOLCHAIN."
+  log "Rust toolchain ready: $(rustc --version); $(cargo --version)"
 }
 
 cargo_cache_ready() {

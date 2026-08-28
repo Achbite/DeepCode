@@ -386,11 +386,7 @@ async fn proxy_api(
     {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
-    let request = if method == Method::GET && uri.path().ends_with("/stream") {
-        request
-    } else {
-        request.timeout(Duration::from_secs(60))
-    };
+    let request = request.timeout(Duration::from_secs(60));
     match request.send().await {
         Ok(response) => proxy_response(response).await,
         Err(error) => {
@@ -463,7 +459,6 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "conversation", "sessions", _, "directory-indexes"])
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
-        | ("GET", ["api", "conversation", "sessions", _, "projection", "stream"])
         | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
         _ => false,
     }
@@ -601,6 +596,10 @@ mod tests {
         assert!(!host_proxy_path_allowed(
             "DELETE",
             "/api/conversation/sessions/session%3Aone/projection"
+        ));
+        assert!(!host_proxy_path_allowed(
+            "GET",
+            "/api/conversation/sessions/session%3Aone/projection/stream"
         ));
         assert!(!host_proxy_path_allowed(
             "GET",

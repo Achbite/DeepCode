@@ -344,9 +344,8 @@ function isWorkspaceBindings(value: unknown): boolean {
 }
 
 function isSessionDisplay(value: unknown): boolean {
-  return isExactRecord(value, ['title'], ['projectId'])
-    && typeof value.title === 'string'
-    && (value.projectId === undefined || isIdentifier(value.projectId));
+  return isExactRecord(value, ['creationTitle'])
+    && typeof value.creationTitle === 'string';
 }
 
 function isProjectionMessage(value: unknown): boolean {

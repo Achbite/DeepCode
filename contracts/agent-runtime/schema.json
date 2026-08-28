@@ -61,6 +61,7 @@
           "properties": {
             "role": { "const": "assistant" },
             "content": { "type": "string" },
+            "reasoningContent": { "type": "string", "minLength": 1 },
             "toolCalls": {
               "type": "array",
               "minItems": 1,
@@ -69,6 +70,7 @@
           },
           "anyOf": [
             { "properties": { "content": { "type": "string", "minLength": 1 } } },
+            { "required": ["reasoningContent"] },
             { "required": ["toolCalls"] }
           ]
         },
@@ -148,8 +150,13 @@
               "required": ["messageId", "content"],
               "properties": {
                 "messageId": { "$ref": "#/$defs/Id" },
-                "content": { "type": "string", "minLength": 1 }
-              }
+                "content": { "type": "string" },
+                "reasoningContent": { "type": "string", "minLength": 1 }
+              },
+              "anyOf": [
+                { "properties": { "content": { "type": "string", "minLength": 1 } } },
+                { "required": ["reasoningContent"] }
+              ]
             }
           }
         },
@@ -639,6 +646,53 @@
           ]
         },
         "payload": { "$ref": "#/$defs/JsonObject" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "interaction.requested", "plan.intent.requested", "todo.updated",
+                  "tool.requested", "session.control.rejected"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": ["runId"],
+            "properties": {
+              "payload": {
+                "required": ["providerCallId"],
+                "properties": { "providerCallId": { "$ref": "#/$defs/Id" } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": { "enum": ["todo.updated", "tool.requested", "session.control.rejected"] }
+            }
+          },
+          "then": { "required": ["callId"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "interaction.requested" } } },
+          "then": { "properties": { "payload": { "required": ["interactionId"] } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "plan.intent.requested" } } },
+          "then": { "properties": { "payload": { "required": ["planId"] } } }
+        }
+      ]
+    },
+    "SessionDisplayProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["creationTitle"],
+      "properties": {
+        "creationTitle": { "type": "string", "minLength": 1 }
       }
     },
     "SessionProjection": {
@@ -655,7 +709,7 @@
         "schemaVersion": { "const": "deepcode.session-projection" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "revision": { "type": "integer", "minimum": 0 },
-        "display": { "$ref": "#/$defs/JsonObject" },
+        "display": { "$ref": "#/$defs/SessionDisplayProjection" },
         "workspaceBindings": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceBinding" } },
         "sessionDirectoryIndexes": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceBinding" } },
         "messages": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },

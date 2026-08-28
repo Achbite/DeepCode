@@ -50,7 +50,7 @@ fn packaged_build_info() -> Option<Value> {
         exe_dir.join("..").join("build-info.json"),
     ]
     .into_iter()
-    .find_map(|path| read_json_file(&path))
+    .find_map(|path| read_best_effort_json_file(&path))
 }
 
 pub(crate) async fn api_route_not_found(

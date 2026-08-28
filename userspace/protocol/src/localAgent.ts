@@ -3,7 +3,6 @@ export const CONVERSATION_COMMAND_VERSION = 'deepcode.command' as const;
 export const COMMAND_REPLY_VERSION = 'deepcode.command-reply' as const;
 export const SESSION_EVENT_VERSION = 'deepcode.session-event' as const;
 export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection' as const;
-export const PROJECTION_UPDATE_VERSION = 'deepcode.projection-update' as const;
 export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
 export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
@@ -422,7 +421,7 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'interaction.requested';
       runId: string;
-      payload: ModelInteractionRequest & { interactionId: string };
+      payload: ModelInteractionRequest & { interactionId: string; providerCallId: string };
     })
   | (SessionEventBase & {
       type: 'interaction.resolved';
@@ -432,7 +431,7 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'plan.intent.requested';
       runId: string;
-      payload: PlanIntent;
+      payload: PlanIntent & { providerCallId: string };
     })
   | (SessionEventBase & {
       type: 'plan.intent.resolved';
@@ -448,13 +447,18 @@ export type SessionEvent =
       type: 'todo.updated';
       runId: string;
       callId: string;
-      payload: { items: TodoItem[] };
+      payload: { providerCallId: string; items: TodoItem[] };
     })
   | (SessionEventBase & {
       type: 'tool.requested';
       runId: string;
       callId: string;
-      payload: { attemptId: string; toolName: string; input: JsonObject };
+      payload: {
+        providerCallId: string;
+        attemptId: string;
+        toolName: string;
+        input: JsonObject;
+      };
     })
   | (SessionEventBase & {
       type: 'approval.requested';
@@ -484,6 +488,7 @@ export type SessionEvent =
       runId: string;
       callId: string;
       payload: {
+        providerCallId: string;
         toolName: string;
         input: JsonObject;
         error: LocalAgentError;
@@ -634,8 +639,7 @@ export interface ArtifactProjection {
 }
 
 export interface SessionDisplayProjection {
-  title: string;
-  projectId?: string;
+  creationTitle: string;
 }
 
 export interface SessionProjection {
@@ -664,18 +668,9 @@ export interface SessionProjection {
   terminalError: LocalAgentError | null;
 }
 
-export type ProjectionUpdate = {
-  schemaVersion: typeof PROJECTION_UPDATE_VERSION;
-  type: 'snapshot';
-  sessionId: string;
-  revision: number;
-  projection: SessionProjection;
-};
-
 export interface ConversationPort {
   submit(command: ConversationCommand): Promise<CommandReply>;
   snapshot(sessionId: string): Promise<SessionProjection>;
-  subscribe(sessionId: string, fromRevision: number): AsyncIterable<ProjectionUpdate>;
 }
 
 export interface ModelMessage {

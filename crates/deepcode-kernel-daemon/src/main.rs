@@ -1,5 +1,6 @@
 mod api_response;
 mod browser_api;
+mod config_root_lease;
 mod conversation_api;
 mod conversation_catalog;
 mod host_connection;
@@ -29,6 +30,7 @@ use crate::prelude::*;
 
 pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
+pub(crate) use config_root_lease::*;
 pub(crate) use conversation_api::*;
 pub(crate) use host_connection::*;
 pub(crate) use host_services::*;
@@ -58,17 +60,18 @@ async fn main() {
         "DeepCode 本地 daemon 只监听 loopback"
     );
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .unwrap_or_else(|error| panic!("无法绑定 DeepCode 本地 daemon：{error}"));
-    let gui_state = GuiState::new();
-    let (executor_config, secrets) = runtime_tool_configuration(&gui_state);
+    let gui_state = GuiState::open().expect("打开当前配置根");
+    let (executor_config, secrets) =
+        runtime_tool_configuration(&gui_state).expect("加载当前工具运行配置");
     let session_store_path = gui_state.paths.session_store_path.clone();
     let tool_record_store_path = gui_state.paths.tool_record_store_path.clone();
     let plugin_config =
         crate::local_agent_plugins::local_agent_plugin_config(&gui_state.user_settings)
             .expect("加载本地 Agent 插件配置");
     let user_settings = gui_state.user_settings.clone();
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|error| panic!("无法绑定 DeepCode 本地 daemon：{error}"));
     let gui = Arc::new(Mutex::new(gui_state));
     let workspace_resolver = Arc::new(crate::local_agent_kernel::HostWorkspaceResolver::new(
         gui.clone(),
@@ -133,13 +136,26 @@ impl deepcode_kernel_runtime::executors::SecretProvider for DaemonSecretProvider
 
 pub(crate) fn runtime_tool_configuration(
     gui: &GuiState,
-) -> (
-    deepcode_kernel_runtime::executors::KernelExecutorConfig,
-    DaemonSecretProvider,
-) {
+) -> Result<
+    (
+        deepcode_kernel_runtime::executors::KernelExecutorConfig,
+        DaemonSecretProvider,
+    ),
+    String,
+> {
     let settings = &gui.user_settings;
-    let setting = |key: &str| settings.get(key).and_then(Value::as_str).unwrap_or("");
-    let secret_store = read_json_file(&gui.paths.llm_secrets_path).unwrap_or_else(|| json!({}));
+    let setting = |key: &str| -> Result<&str, String> {
+        match settings.get(key) {
+            Some(Value::String(value)) => Ok(value),
+            Some(_) => Err(format!("{key} 必须是字符串。")),
+            None => Ok(""),
+        }
+    };
+    let secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path)? {
+        Some(value) if llm_secret_store_is_current(&value) => value,
+        Some(_) => return Err("本地 LLM secret 文件不是当前字符串映射格式。".to_string()),
+        None => json!({}),
+    };
     let secret_values = secret_store
         .as_object()
         .cloned()
@@ -147,14 +163,14 @@ pub(crate) fn runtime_tool_configuration(
         .into_iter()
         .filter_map(|(key, value)| value.as_str().map(|secret| (key, secret.to_string())))
         .collect();
-    (
+    Ok((
         deepcode_kernel_runtime::executors::KernelExecutorConfig {
-            web_search_endpoint_template: setting("agent.web.search.endpointTemplate").to_string(),
-            web_search_auth_header_name: setting("agent.web.search.authHeaderName").to_string(),
-            web_search_auth_secret_ref: setting("agent.web.search.authSecretRef").to_string(),
+            web_search_endpoint_template: setting("agent.web.search.endpointTemplate")?.to_string(),
+            web_search_auth_header_name: setting("agent.web.search.authHeaderName")?.to_string(),
+            web_search_auth_secret_ref: setting("agent.web.search.authSecretRef")?.to_string(),
         },
         DaemonSecretProvider {
             values: secret_values,
         },
-    )
+    ))
 }

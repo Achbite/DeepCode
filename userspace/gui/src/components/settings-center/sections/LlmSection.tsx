@@ -19,20 +19,9 @@ import {
 import { useSettingsStore } from '../../../state/settingsStore';
 import { normalizeUiLanguage, t } from '../../../i18n';
 
-const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
-  { value: 'openaiCompatible', label: 'OpenAI Compatible' },
-  { value: 'anthropic', label: 'Anthropic' },
-  { value: 'ollama', label: 'Ollama' },
-];
+const PROVIDERS: LlmProviderKind[] = ['openaiCompatible', 'anthropic', 'ollama'];
 
-const PROVIDER_FLAVORS: Array<{
-  value: LlmProviderFlavor;
-  label: string;
-}> = [
-  { value: 'openai', label: 'OpenAI' },
-  { value: 'deepseek', label: 'DeepSeek' },
-  { value: 'zhipu', label: 'Zhipu' },
-];
+const PROVIDER_FLAVORS: LlmProviderFlavor[] = ['openai', 'deepseek', 'zhipu'];
 
 const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
 const DEFAULT_REPLACEMENT_PROFILE_ID = 'deepseek-v4-pro-openai';
@@ -44,11 +33,11 @@ type ProfileCommonPatch = Partial<
 >;
 
 const PROFILE_PRESETS: Array<{
-  label: string;
+  labelKey: string;
   profile: NewProfile;
 }> = [
   {
-    label: 'DeepSeek Flash',
+    labelKey: 'settings.llm.preset.deepseekFlash',
     profile: {
       name: 'DeepSeek V4 Flash',
       kind: 'openaiCompatible',
@@ -64,7 +53,7 @@ const PROFILE_PRESETS: Array<{
     },
   },
   {
-    label: 'DeepSeek Pro',
+    labelKey: 'settings.llm.preset.deepseekPro',
     profile: {
       name: 'DeepSeek V4 Pro',
       kind: 'openaiCompatible',
@@ -80,7 +69,7 @@ const PROFILE_PRESETS: Array<{
     },
   },
   {
-    label: 'DeepSeek Anthropic',
+    labelKey: 'settings.llm.preset.deepseekAnthropic',
     profile: {
       name: 'DeepSeek V4 Flash (Anthropic)',
       kind: 'anthropic',
@@ -248,11 +237,9 @@ const LlmSection: React.FC = () => {
       : undefined;
     if (replacementProfileMissingApiKey) {
       setMessageTone('error');
-      setMessage(
-        language === 'zh-CN'
-          ? `当前 schema 的恢复不会自动关联旧密钥；请为已启用的 Profile“${replacementProfileMissingApiKey.name}”重新输入 API Key。`
-          : `Current-schema recovery does not automatically reconnect old secrets. Re-enter the API key for enabled profile "${replacementProfileMissingApiKey.name}".`
-      );
+      setMessage(t(language, 'settings.llm.reenterRecoveredApiKey', {
+        name: replacementProfileMissingApiKey.name,
+      }));
       setLoading(false);
       return;
     }
@@ -284,7 +271,9 @@ const LlmSection: React.FC = () => {
       setProbeState((prev) => ({
         ...prev,
         [profileId]: result.data!.ok
-          ? `OK ${result.data!.latencyMs ?? 0}ms`
+          ? t(language, 'settings.llm.probeSucceeded', {
+              latency: result.data!.latencyMs ?? 0,
+            })
           : result.data!.error ?? t(language, 'settings.llm.probeFailed'),
       }));
     } else {
@@ -329,11 +318,11 @@ const LlmSection: React.FC = () => {
           {PROFILE_PRESETS.map((preset) => (
             <button
               className="settings-action-button"
-              key={preset.label}
+              key={preset.labelKey}
               onClick={() => addProfile(preset.profile)}
               disabled={loading}
             >
-              {preset.label}
+              {t(language, preset.labelKey)}
             </button>
           ))}
           <button
@@ -394,8 +383,8 @@ const LlmSection: React.FC = () => {
                   )}
                 >
                   {PROVIDERS.map((provider) => (
-                    <option key={provider.value} value={provider.value}>
-                      {provider.label}
+                    <option key={provider} value={provider}>
+                      {t(language, `settings.llm.providerKind.${provider}`)}
                     </option>
                   ))}
                 </select>
@@ -414,7 +403,7 @@ const LlmSection: React.FC = () => {
 
               <div className="llm-profile__grid">
                 <label>
-                  <span>Provider flavor</span>
+                  <span>{t(language, 'settings.llm.providerFlavor')}</span>
                   <select
                     className="settings-field__select"
                     value={profile.providerFlavor}
@@ -423,8 +412,8 @@ const LlmSection: React.FC = () => {
                     })}
                   >
                     {PROVIDER_FLAVORS.map((flavor) => (
-                      <option key={flavor.value} value={flavor.value}>
-                        {flavor.label}
+                      <option key={flavor} value={flavor}>
+                        {t(language, `settings.llm.providerFlavor.${flavor}`)}
                       </option>
                     ))}
                   </select>

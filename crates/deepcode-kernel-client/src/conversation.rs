@@ -458,10 +458,9 @@ fn invalid_context_items(items: &[ContextCompositionItem]) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionDisplayProjection {
-    pub title: String,
-    pub project_id: Option<String>,
+    pub creation_title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -993,7 +992,7 @@ mod tests {
             "schemaVersion": SESSION_PROJECTION_VERSION,
             "sessionId": "session:test",
             "revision": 8,
-            "display": { "title": "测试" },
+            "display": { "creationTitle": "测试" },
             "workspaceBindings": [{
                 "workspaceId": "workspace:test",
                 "displayName": "Test"
@@ -1203,5 +1202,9 @@ mod tests {
         let mut value = projection_value();
         value["futureFact"] = json!(true);
         assert!(serde_json::from_value::<SessionProjection>(value).is_err());
+
+        let mut display = projection_value();
+        display["display"]["title"] = json!("第二标题");
+        assert!(serde_json::from_value::<SessionProjection>(display).is_err());
     }
 }

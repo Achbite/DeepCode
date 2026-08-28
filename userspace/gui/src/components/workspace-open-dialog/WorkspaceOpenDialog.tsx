@@ -216,7 +216,7 @@ const WorkspaceOpenDialog: React.FC = () => {
                 type="button"
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {location.kind === 'home' ? 'HOME' : location.kind === 'drive' ? 'DISK' : 'WS'}
+                  {t(language, `workspaceDialog.locationKind.${location.kind}`)}
                 </span>
                 <span>{location.label}</span>
               </button>
@@ -253,10 +253,10 @@ const WorkspaceOpenDialog: React.FC = () => {
                     >
                       <span className="ws-open-dialog__entry-icon">
                         {entry.type === 'directory'
-                          ? 'DIR'
+                          ? t(language, 'workspaceDialog.entryKind.directory')
                           : entry.isCodeWorkspace
-                            ? 'WS'
-                            : 'FILE'}
+                            ? t(language, 'workspaceDialog.entryKind.workspace')
+                            : t(language, 'workspaceDialog.entryKind.file')}
                       </span>
                       <span className="ws-open-dialog__entry-name">{entry.name}</span>
                       {entry.isCodeWorkspace && (

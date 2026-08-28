@@ -6,7 +6,7 @@
 # while the macOS host performs the actual scripts/package-macos.sh build.
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SERVICE_DIR="${DEEPCODE_MACOS_PACKAGE_SERVICE_DIR:-$ROOT_DIR/.build-cache/macos-package-service}"
 REQUEST_DIR="$SERVICE_DIR/requests"
 STATUS_DIR="$SERVICE_DIR/status"
@@ -35,7 +35,7 @@ Commands:
   run     Run the package worker in the foreground.
   stop    Stop the background worker.
   status  Report whether the worker process is alive.
-  submit  Queue one product-set transaction. This command can run inside Docker. GUI dist refresh and releasing old app bundles are the defaults.
+  submit  Queue one product-set transaction in this repository. This command can run inside Docker. GUI dist refresh and releasing old app bundles are the defaults.
 USAGE
 }
 
@@ -97,6 +97,12 @@ service_pid() {
   tr -d '[:space:]' <"$PID_FILE"
 }
 
+service_status_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, $2)); exit }' \
+    "$SERVICE_STATUS_FILE" 2>/dev/null
+}
+
 ensure_macos_host() {
   [ "$(uname -s)" = "Darwin" ] || fail "macOS package service must run on the macOS host."
 }
@@ -115,9 +121,11 @@ status_cmd() {
     esac
   done
 
-  local pid heartbeat_epoch now age stalled_path
+  local pid heartbeat_epoch now age stalled_path worker_root output_root
   pid="$(service_pid 2>/dev/null || true)"
-  heartbeat_epoch="$(awk -F= '$1 == "updated_at_epoch" { print $2; exit }' "$SERVICE_STATUS_FILE" 2>/dev/null || true)"
+  heartbeat_epoch="$(service_status_value updated_at_epoch || true)"
+  worker_root="$(service_status_value worker_root || true)"
+  output_root="$(service_status_value output_root || true)"
   now="$(date +%s)"
   if [ -n "$heartbeat_epoch" ]; then
     age=$((now - heartbeat_epoch))
@@ -125,18 +133,18 @@ status_cmd() {
     age=$((STALE_SECONDS + 1))
   fi
   if [ "$age" -gt "$STALE_SECONDS" ]; then
-    [ "$quiet" = "1" ] || log "stopped stale_heartbeat_age=${age}s pid=${pid:-unknown} dir=$SERVICE_DIR"
+    [ "$quiet" = "1" ] || log "stopped stale_heartbeat_age=${age}s pid=${pid:-unknown} root=${worker_root:-unknown} output=${output_root:-unknown} dir=$SERVICE_DIR"
     return 1
   fi
   stalled_path="$(stalled_request_path "$now" 2>/dev/null || true)"
   if [ -n "$stalled_path" ]; then
-    [ "$quiet" = "1" ] || log "unhealthy unclaimed_request=$(basename "$stalled_path") heartbeat_age=${age}s dir=$SERVICE_DIR"
+    [ "$quiet" = "1" ] || log "unhealthy unclaimed_request=$(basename "$stalled_path") heartbeat_age=${age}s root=${worker_root:-unknown} output=${output_root:-unknown} dir=$SERVICE_DIR"
     return 1
   fi
   if is_pid_alive "$pid"; then
-    [ "$quiet" = "1" ] || log "running pid=$pid heartbeat_age=${age}s dir=$SERVICE_DIR"
+    [ "$quiet" = "1" ] || log "running pid=$pid heartbeat_age=${age}s root=${worker_root:-unknown} output=${output_root:-unknown} dir=$SERVICE_DIR"
   else
-    [ "$quiet" = "1" ] || log "running heartbeat_age=${age}s dir=$SERVICE_DIR"
+    [ "$quiet" = "1" ] || log "running heartbeat_age=${age}s root=${worker_root:-unknown} output=${output_root:-unknown} dir=$SERVICE_DIR"
   fi
   return 0
 }
@@ -175,7 +183,7 @@ start_cmd() {
   while true; do
     pid="$(service_pid 2>/dev/null || true)"
     if is_pid_alive "$pid"; then
-      log "started pid=$pid screen=$SCREEN_SESSION log=$SERVICE_LOG"
+      log "started pid=$pid screen=$SCREEN_SESSION root=$ROOT_DIR output=$ROOT_DIR/bin/macos-arm64 log=$SERVICE_LOG"
       return 0
     fi
     [ "$(date +%s)" -lt "$deadline" ] || break
@@ -223,6 +231,8 @@ write_service_heartbeat() {
   {
     printf 'pid=%s\n' "$$"
     printf 'state=running\n'
+    printf 'worker_root=%s\n' "$ROOT_DIR"
+    printf 'output_root=%s\n' "$ROOT_DIR/bin/macos-arm64"
     printf 'updated_at_epoch=%s\n' "$(date +%s)"
     printf 'updated_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$SERVICE_STATUS_FILE.tmp"
@@ -305,8 +315,8 @@ process_request() {
 
   set +e
   {
-    printf '==[macos-package-service]== request=%s products=%s clean=%s refresh_gui_dist=%s kill_running=%s started_at=%s\n' \
-      "$request_id" "$products" "$clean" "$refresh" "$kill_running" "$started_at"
+    printf '==[macos-package-service]== request=%s products=%s clean=%s refresh_gui_dist=%s kill_running=%s root=%s output=%s started_at=%s\n' \
+      "$request_id" "$products" "$clean" "$refresh" "$kill_running" "$ROOT_DIR" "$ROOT_DIR/bin/macos-arm64" "$started_at"
     cd "$ROOT_DIR"
     env \
       DEEPCODE_MACOS_PRODUCTS="$products" \
@@ -327,6 +337,8 @@ process_request() {
 
   finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   if [ "$exit_code" -eq 0 ]; then
+    printf '==[macos-package-service]== receipt root=%s output=%s\n' \
+      "$ROOT_DIR" "$ROOT_DIR/bin/macos-arm64" >>"$log_path"
     printf '==[macos-package-service]== request=%s finished_at=%s state=done\n' "$request_id" "$finished_at" >>"$log_path"
     write_service_heartbeat
     write_status "$request_id" "done" "$log_path"
@@ -376,7 +388,7 @@ run_cmd() {
   printf '%s\n' "$$" >"$PID_FILE"
   recover_claimed_requests
   write_service_heartbeat
-  log "run loop pid=$$ dir=$SERVICE_DIR"
+  log "run loop pid=$$ root=$ROOT_DIR output=$ROOT_DIR/bin/macos-arm64 dir=$SERVICE_DIR"
 
   while true; do
     write_service_heartbeat
@@ -449,7 +461,7 @@ submit_cmd() {
     ''|*[!0-9]*) fail "invalid timeout seconds: $timeout_seconds" ;;
   esac
 
-  local request_id request_tmp request_path status_path deadline state log_path now last_state
+  local request_id request_tmp request_path status_path deadline state log_path now last_state worker_root output_root
   request_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
   request_tmp="$REQUEST_DIR/$request_id.request.tmp"
   request_path="$REQUEST_DIR/$request_id.request"
@@ -464,7 +476,9 @@ submit_cmd() {
   } >"$request_tmp"
   write_status "$request_id" "queued" "$log_path"
   mv "$request_tmp" "$request_path"
-  log "queued request=$request_id products=$products kill_running=$kill_running"
+  worker_root="$(service_status_value worker_root || true)"
+  output_root="$(service_status_value output_root || true)"
+  log "queued request=$request_id products=$products kill_running=$kill_running worker_root=${worker_root:-unknown} output=${output_root:-unknown}"
 
   if [ "$wait" != "1" ]; then
     return 0
@@ -482,7 +496,9 @@ submit_cmd() {
       fi
       case "$state" in
         done)
-          log "request=$request_id done log=$log_path"
+          worker_root="$(service_status_value worker_root || true)"
+          output_root="$(service_status_value output_root || true)"
+          log "request=$request_id done worker_root=${worker_root:-unknown} output=${output_root:-unknown} log=$log_path"
           return 0
           ;;
         failed)
