@@ -7,6 +7,7 @@ import type {
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useLocalAgentStore } from '../../state/localAgentStore';
+import { completeInputCacheMetric } from '../../utils/providerUsage';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar from './DeepCodeSidebar';
 import DeepCodeTaskPanel from './DeepCodeTaskPanel';
@@ -655,26 +656,31 @@ function cacheHitSummary(
   language: UiLanguage,
 ): { label: string; title: string } {
   const usage = projection?.tokenUsage;
-  const total = usage
-    ? usage.cacheReadInputTokens + usage.cacheMissInputTokens
-    : 0;
-  const known = Boolean(usage && usage.cacheReportedCallCount > 0 && total > 0);
-  const percent = known
-    ? Math.round((usage!.cacheReadInputTokens / total) * 100)
-    : null;
+  const cache = completeInputCacheMetric(usage);
+  const percent = cache ? formatCachePercent(cache.hitPercent) : 'N/A';
+  const providerCallCount = usage?.providerCallCount ?? 0;
   return language === 'zh-CN'
     ? {
-        label: `缓存命中 ${percent === null ? 'N/A' : `${percent}%`}`,
-        title: usage
-          ? `Provider 调用 ${usage.providerCallCount} 次；${usage.cacheReportedCallCount} 次报告缓存用量；读取 ${usage.cacheReadInputTokens}，未命中 ${usage.cacheMissInputTokens}`
-          : '当前对话尚无 Provider 用量。',
+        label: `总缓存命中 ${cache ? `${percent}%` : 'N/A'}`,
+        title: cache
+          ? `当前会话累计：${providerCallCount} 次 Provider 调用；输入 ${cache.inputTokens} Token；缓存读取 ${cache.hitTokens}；缓存未命中 ${cache.missTokens}。总命中率按全会话缓存读取输入 / 全会话输入 Token 计算。`
+          : usage
+            ? `当前会话有 ${usage.providerCallCount} 次 Provider 调用，缓存字段报告 ${usage.cacheReportedCallCount}/${usage.providerCallCount} 次，无法给出完整会话的精确总缓存命中率。`
+            : '当前会话尚无 Provider 用量。',
       }
     : {
-        label: `Cache hit ${percent === null ? 'N/A' : `${percent}%`}`,
-        title: usage
-          ? `${usage.providerCallCount} provider calls; ${usage.cacheReportedCallCount} reported cache usage; ${usage.cacheReadInputTokens} read and ${usage.cacheMissInputTokens} missed`
-          : 'No provider usage for this conversation yet.',
+        label: `Total cache hit ${cache ? `${percent}%` : 'N/A'}`,
+        title: cache
+          ? `Current session total: ${providerCallCount} Provider calls, ${cache.inputTokens} input tokens, ${cache.hitTokens} cache-read tokens, and ${cache.missTokens} cache-miss tokens. The total hit rate is session cache-read input divided by session input tokens.`
+          : usage
+            ? `The current session has ${usage.providerCallCount} Provider calls, with cache fields reported for ${usage.cacheReportedCallCount}/${usage.providerCallCount}; an exact total cache hit rate is unavailable.`
+            : 'No Provider usage for the current session yet.',
       };
+}
+
+function formatCachePercent(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
 }
 
 function positioned<T>(

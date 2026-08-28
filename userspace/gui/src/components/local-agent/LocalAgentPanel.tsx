@@ -604,7 +604,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           }}
         >
           {pendingPlan && (
-            <div className="local-agent__decision local-agent__decision--plan">
+            <div className="local-agent__decision">
               <div className="local-agent__decision-heading">
                 <strong>{pendingPlan.prompt}</strong>
                 <span>
@@ -657,38 +657,52 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             </div>
           )}
           {pendingInteraction && (
-            <div className="local-agent__decision local-agent__decision--interaction">
-              <strong>{zh ? '需要你的决定' : 'Your input is needed'}</strong>
-              <p>{pendingInteraction.prompt}</p>
+            <div className="local-agent__decision">
+              <div className="local-agent__decision-heading">
+                <strong>{pendingInteraction.prompt}</strong>
+                <span>{zh ? '需要你的决定' : 'Your input is needed'}</span>
+              </div>
               {pendingInteraction.options && pendingInteraction.options.length > 0 && (
-                <div className="local-agent__decision-options">
+                <ol>
                   {pendingInteraction.options.map((option, index) => (
-                    <button
-                      type="button"
-                      key={option.id}
-                      disabled={submitting}
-                      title={option.description}
-                      onClick={() => setDraft(option.label)}
-                    >
-                      {index + 1}. {option.label}
-                    </button>
+                    <li key={option.id}>
+                      <button
+                        type="button"
+                        disabled={submitting}
+                        onClick={() => {
+                          setDraft(option.label);
+                          textareaRef.current?.focus();
+                        }}
+                      >
+                        <span className="local-agent__plan-option-marker" aria-hidden="true">{index + 1}</span>
+                        <span>
+                          <b>{option.label}</b>
+                          {option.description && <small>{option.description}</small>}
+                        </span>
+                        <span className="local-agent__plan-option-confirm" aria-hidden="true">
+                          <DeepCodeShellIcon name="chevronRight" />
+                        </span>
+                      </button>
+                    </li>
                   ))}
-                </div>
+                </ol>
               )}
             </div>
           )}
           {pendingApproval && (
-            <div className="local-agent__decision local-agent__decision--approval">
-              <strong>{zh ? '需要你批准此操作' : 'This action needs your approval'}</strong>
-              <p>{pendingApproval.preview.summary}</p>
+            <div className="local-agent__decision">
+              <div className="local-agent__decision-heading">
+                <strong>{pendingApproval.preview.summary}</strong>
+                <span>{zh ? '需要你批准此操作' : 'This action needs your approval'}</span>
+              </div>
               {pendingApproval.preview.logicalTargets.length > 0 && (
-                <ul>
+                <ul className="local-agent__decision-targets">
                   {pendingApproval.preview.logicalTargets.map((target) => (
                     <li key={target}>{target}</li>
                   ))}
                 </ul>
               )}
-              <div className="local-agent__approval-actions">
+              <div className="local-agent__decision-actions">
                 <button
                   type="button"
                   disabled={submitting}
@@ -999,22 +1013,30 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   zh,
   onOpenWorkspaceResource,
 }) => {
-  const [expanded, setExpanded] = useState(() => activities.some((activity) => (
-    !isTerminalActivity(activity.status)
-  )));
+  const terminal = activities.every((activity) => isTerminalActivity(activity.status));
+  const userControlled = useRef(false);
+  const [expanded, setExpanded] = useState(() => !terminal);
   const hasFailure = activities.some((activity) => (
     ['failed', 'denied', 'indeterminate'].includes(activity.status)
   ));
   const groupStatus = toolGroupStatus(activities);
+
+  useEffect(() => {
+    if (!userControlled.current) setExpanded(!terminal);
+  }, [terminal]);
+
   return (
     <article className={`local-agent__tool-group${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
       <button
         type="button"
         className="local-agent__tool-group-summary"
         aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
+        onClick={() => {
+          userControlled.current = true;
+          setExpanded((current) => !current);
+        }}
       >
-        <span className="local-agent__tool-activity-icon">
+        <span className="local-agent__tool-group-icon">
           <DeepCodeShellIcon name="tool" />
         </span>
         <strong>{toolGroupSummary(activities, zh)}</strong>

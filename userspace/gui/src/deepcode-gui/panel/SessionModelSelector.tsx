@@ -6,6 +6,7 @@ import type {
   LlmProviderProfile,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
+import { inputCacheMetric, type InputCacheMetric } from '../../utils/providerUsage';
 
 interface SessionModelSelectorProps {
   language: UiLanguage;
@@ -81,7 +82,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const activeMetric = [...capacityMetrics, ...requestSections]
     .find((metric) => metric.key === activeContextKey)
     ?? capacityMetrics[0];
-  const cache = buildCacheMetric(contextUsage);
+  const cache = inputCacheMetric(contextUsage);
   const hasContextFacts = Boolean(contextUsage || contextReceipt);
 
   useEffect(() => {
@@ -185,21 +186,21 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
             <div className="deepcode-session-model__cache">
               <div className="deepcode-session-model__cache-head">
                 <strong>{language === 'zh-CN' ? '输入缓存' : 'Input cache'}</strong>
-                <span>{cache.percent === null ? 'N/A' : `${formatPercent(cache.percent)}%`}</span>
+                <span>{cache ? `${formatPercent(cache.hitPercent)}%` : 'N/A'}</span>
               </div>
-              {cache.percent !== null ? (
+              {cache ? (
                 <>
                   <div
                     className="deepcode-session-model__cache-track"
                     role="img"
                     aria-label={cacheAriaLabel(cache, language)}
                   >
-                    <span style={{ width: `${cache.percent}%` }} />
+                    <span style={{ width: `${cache.hitPercent}%` }} />
                     <span />
                   </div>
                   <div className="deepcode-session-model__cache-legend">
-                    <span>{language === 'zh-CN' ? '命中' : 'Hit'} {formatTokens(cache.hit!, language)}</span>
-                    <span>{language === 'zh-CN' ? '未命中' : 'Miss'} {formatTokens(cache.miss!, language)}</span>
+                    <span>{language === 'zh-CN' ? '命中' : 'Hit'} {formatTokens(cache.hitTokens, language)}</span>
+                    <span>{language === 'zh-CN' ? '未命中' : 'Miss'} {formatTokens(cache.missTokens, language)}</span>
                   </div>
                 </>
               ) : (
@@ -316,19 +317,6 @@ function buildRequestSections(
   }));
 }
 
-function buildCacheMetric(usage: ContextUsageProjection | null): {
-  hit: number | null;
-  miss: number | null;
-  percent: number | null;
-} {
-  const hit = usage?.cacheReadInputTokens;
-  const miss = usage?.cacheMissInputTokens;
-  if (hit === undefined || miss === undefined || hit + miss === 0) {
-    return { hit: null, miss: null, percent: null };
-  }
-  return { hit, miss, percent: percentOf(hit, hit + miss) };
-}
-
 function contextPartitionLabel(
   kind: ContextCompositionPartitionKind,
   language: UiLanguage,
@@ -357,13 +345,12 @@ function metricAriaLabel(metric: ContextDisplayMetric, language: UiLanguage): st
 }
 
 function cacheAriaLabel(
-  cache: { hit: number | null; miss: number | null; percent: number | null },
+  cache: InputCacheMetric,
   language: UiLanguage,
 ): string {
-  if (cache.hit === null || cache.miss === null || cache.percent === null) return 'N/A';
   return language === 'zh-CN'
-    ? `缓存命中 ${formatTokens(cache.hit, language)} Token，未命中 ${formatTokens(cache.miss, language)} Token`
-    : `Cache hit ${formatTokens(cache.hit, language)} tokens and miss ${formatTokens(cache.miss, language)} tokens`;
+    ? `输入 ${formatTokens(cache.inputTokens, language)} Token，缓存命中 ${formatTokens(cache.hitTokens, language)} Token，未命中 ${formatTokens(cache.missTokens, language)} Token`
+    : `${formatTokens(cache.inputTokens, language)} input tokens, ${formatTokens(cache.hitTokens, language)} cache-hit tokens, and ${formatTokens(cache.missTokens, language)} cache-miss tokens`;
 }
 
 function formatItemCount(value: number, language: UiLanguage): string {

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import type { TokenUsageProjection, TokenUsageRoundProjection } from '@deepcode/protocol';
+import type { TokenUsageRoundProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import {
   useSettingsStore,
@@ -15,6 +15,10 @@ import {
   type GuiThemePreference,
 } from '../../theme/deepcodeGuiTheme';
 import { useLocalAgentStore } from '../../state/localAgentStore';
+import {
+  completeInputCacheMetric,
+  type InputCacheMetric,
+} from '../../utils/providerUsage';
 
 interface GuiAppearanceSettingsProps {
   definitions: SettingDefinition[];
@@ -106,6 +110,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
     () => tokenUsageHistory.slice(effectiveUsagePage * 10, effectiveUsagePage * 10 + 10),
     [effectiveUsagePage, tokenUsageHistory],
   );
+  const aggregateCache = completeInputCacheMetric(tokenUsage);
 
   useEffect(() => {
     setUsagePage(0);
@@ -193,7 +198,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
             <div>
               <div className="settings-field__title-row">
                 <span className="settings-field__label">
-                  {language === 'zh-CN' ? '本对话用量' : 'Current conversation usage'}
+                  {language === 'zh-CN' ? '当前会话总用量' : 'Current session totals'}
                 </span>
               </div>
               <div className="settings-field__description">
@@ -217,35 +222,31 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
               value={tokenUsage ? formatCount(tokenUsage.outputTokens) : 'N/A'}
             />
             <UsageStat
-              label={language === 'zh-CN' ? '缓存命中率' : 'Cache hit rate'}
-              value={cacheHitRate(tokenUsage)}
+              label={language === 'zh-CN' ? '总缓存命中率' : 'Total cache hit rate'}
+              value={cacheHitRate(aggregateCache)}
             />
             <UsageStat
               label={language === 'zh-CN' ? '缓存读取 Token' : 'Cache-read tokens'}
-              value={tokenUsage?.cacheReportedCallCount
-                ? formatCount(tokenUsage.cacheReadInputTokens)
-                : 'N/A'}
+              value={aggregateCache ? formatCount(aggregateCache.hitTokens) : 'N/A'}
             />
             <UsageStat
               label={language === 'zh-CN' ? '缓存未命中 Token' : 'Cache-miss tokens'}
-              value={tokenUsage?.cacheReportedCallCount
-                ? formatCount(tokenUsage.cacheMissInputTokens)
-                : 'N/A'}
+              value={aggregateCache ? formatCount(aggregateCache.missTokens) : 'N/A'}
             />
           </div>
           <p className="settings-token-usage__note">
             {language === 'zh-CN'
-              ? `已由 Provider 明确报告缓存字段 ${tokenUsage?.cacheReportedCallCount ?? 0} 次；未报告时保持未知。`
-              : `Provider explicitly reported cache fields ${tokenUsage?.cacheReportedCallCount ?? 0} time(s); missing data remains unknown.`}
+              ? `Provider 缓存字段报告 ${tokenUsage?.cacheReportedCallCount ?? 0}/${tokenUsage?.providerCallCount ?? 0} 次；仅全部调用均报告时，按缓存读取输入 / 输入 Token 显示精确命中率。`
+              : `Provider cache fields reported for ${tokenUsage?.cacheReportedCallCount ?? 0}/${tokenUsage?.providerCallCount ?? 0} calls; an exact hit rate is shown only when every call reports it, using cache-read input divided by input tokens.`}
           </p>
           <div className="settings-token-rounds">
             <div className="settings-token-rounds__heading">
               <div>
-                <strong>{language === 'zh-CN' ? '每轮对话调用' : 'Conversation calls by round'}</strong>
+                <strong>{language === 'zh-CN' ? 'Provider 缓存命中历史' : 'Provider cache hit history'}</strong>
                 <span>
                   {language === 'zh-CN'
-                    ? '从新到旧排列；每页 10 条。每条汇总该轮内全部 Provider 调用。'
-                    : 'Newest first, 10 per page. Each row aggregates every Provider call in that round.'}
+                    ? '从新到旧排列；每页 10 条。每条汇总当前会话该轮内全部 Provider 调用。'
+                    : 'Newest first, 10 per page. Each row aggregates every Provider call in that round for the current session.'}
                 </span>
               </div>
               <span>{tokenUsageHistory.length}</span>
@@ -301,12 +302,12 @@ const UsageRound: React.FC<{
   ordinal: number;
   language: UiLanguage;
 }> = ({ round, ordinal, language }) => {
-  const total = Math.max(round.inputTokens + round.outputTokens, 1);
-  const cacheKnown = round.cacheReportedCallCount > 0;
-  const cacheWidth = cacheKnown ? (round.cacheReadInputTokens / total) * 100 : 0;
-  const missWidth = cacheKnown ? (round.cacheMissInputTokens / total) * 100 : 0;
-  const inputWidth = cacheKnown ? 0 : (round.inputTokens / total) * 100;
-  const outputWidth = (round.outputTokens / total) * 100;
+  const cache = completeInputCacheMetric(round);
+  const cacheWidth = cache ? cache.hitPercent : 0;
+  const missWidth = cache ? (cache.missTokens / cache.inputTokens) * 100 : 0;
+  const inputWidth = cache
+    ? Math.max(0, 100 - cacheWidth - missWidth)
+    : round.inputTokens > 0 ? 100 : 0;
   return (
     <div className="settings-token-request">
       <div className="settings-token-request__header">
@@ -326,27 +327,30 @@ const UsageRound: React.FC<{
             : `${round.providerCallCount} Provider call(s)`}
         </span>
         <span>{roundOutcome(round, language)}</span>
-        <span>{language === 'zh-CN' ? '缓存命中' : 'Cache hit'} {cacheHitRate(round)}</span>
+        <span>{language === 'zh-CN' ? '缓存命中' : 'Cache hit'} {cacheHitRate(cache)}</span>
       </div>
-      <div className="settings-token-request__track" aria-hidden="true">
+      <div
+        className="settings-token-request__track"
+        role="img"
+        aria-label={inputCacheAriaLabel(round.inputTokens, cache, language)}
+      >
         <div className="settings-token-request__total-bar" style={{ width: '100%' }}>
           <span className="settings-token-request__segment settings-token-request__segment--cache" style={{ width: `${cacheWidth}%` }} />
           <span className="settings-token-request__segment settings-token-request__segment--miss" style={{ width: `${missWidth}%` }} />
           <span className="settings-token-request__segment settings-token-request__segment--input" style={{ width: `${inputWidth}%` }} />
-          <span className="settings-token-request__segment settings-token-request__segment--completion" style={{ width: `${outputWidth}%` }} />
         </div>
       </div>
       <div className="settings-token-request__legend">
         <span>{language === 'zh-CN' ? '输入' : 'Input'} {formatCount(round.inputTokens)}</span>
         <span>{language === 'zh-CN' ? '输出' : 'Output'} {formatCount(round.outputTokens)}</span>
         <span>
-          {language === 'zh-CN' ? '缓存读取' : 'Cache read'} {cacheKnown
-            ? formatCount(round.cacheReadInputTokens)
+          {language === 'zh-CN' ? '缓存读取' : 'Cache read'} {cache
+            ? formatCount(cache.hitTokens)
             : 'N/A'}
         </span>
         <span>
-          {language === 'zh-CN' ? '缓存未命中' : 'Cache miss'} {cacheKnown
-            ? formatCount(round.cacheMissInputTokens)
+          {language === 'zh-CN' ? '缓存未命中' : 'Cache miss'} {cache
+            ? formatCount(cache.missTokens)
             : 'N/A'}
         </span>
       </div>
@@ -354,11 +358,24 @@ const UsageRound: React.FC<{
   );
 };
 
-function cacheHitRate(tokenUsage: TokenUsageProjection | null): string {
-  if (!tokenUsage || tokenUsage.cacheReportedCallCount === 0) return 'N/A';
-  const total = tokenUsage.cacheReadInputTokens + tokenUsage.cacheMissInputTokens;
-  if (total === 0) return 'N/A';
-  return `${Math.round((tokenUsage.cacheReadInputTokens / total) * 100)}%`;
+function cacheHitRate(cache: InputCacheMetric | null): string {
+  if (!cache) return 'N/A';
+  return `${Math.round(cache.hitPercent)}%`;
+}
+
+function inputCacheAriaLabel(
+  inputTokens: number,
+  cache: InputCacheMetric | null,
+  language: UiLanguage,
+): string {
+  if (!cache) {
+    return language === 'zh-CN'
+      ? `输入 ${formatCount(inputTokens)} Token；缓存用量未知`
+      : `${formatCount(inputTokens)} input tokens; cache usage unknown`;
+  }
+  return language === 'zh-CN'
+    ? `输入 ${formatCount(cache.inputTokens)} Token；缓存读取 ${formatCount(cache.hitTokens)}；缓存未命中 ${formatCount(cache.missTokens)}`
+    : `${formatCount(cache.inputTokens)} input tokens; ${formatCount(cache.hitTokens)} cache-read and ${formatCount(cache.missTokens)} cache-miss tokens`;
 }
 
 function formatCount(value: number): string {

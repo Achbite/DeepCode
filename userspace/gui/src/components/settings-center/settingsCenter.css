@@ -827,10 +827,6 @@
   background: #f97316;
 }
 
-.settings-token-request__segment--completion {
-  background: #8b5cf6;
-}
-
 .settings-token-request__segment--input {
   background: var(--dc-accent);
 }
