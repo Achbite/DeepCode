@@ -155,7 +155,7 @@ help:
 	@echo "进入容器后可手动执行："
 	@echo "  bash ./build.sh   编译并输出统一分发目录到 bin/"
 	@echo "  bash ./test.sh --list  查看测试 profile 与 suite 注册"
-	@echo "  bash ./test.sh    运行默认 required 测试门禁（宿主机不会降级为静态成功）"
+	@echo "  bash ./test.sh    运行默认 required 验证（宿主机不会降级为静态成功）"
 	@echo "  bash ./test.sh --profile static  显式运行宿主机安全静态检查"
 
 docker-info:

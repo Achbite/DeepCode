@@ -36,6 +36,8 @@ DeepCode has no parallel Requirement, Plan, or Review workflow engine. Ordinary 
 | CLI | One-shot tasks, scripts, and terminal workflows | `DeepCode-CLI.command` or `deepcode-cli` |
 | TUI | Continuous interactive terminal conversations | `DeepCode-TUI.command` or `deepcode-tui` |
 
+For day-to-day development, use the full DeepCode Editor GUI when you want the file tree, editor, terminal, Git, and Agent workflow in one place. Use the TUI for terminal-first development. The CLI remains available for one-shot operations, automation, and diagnostics.
+
 All interfaces read the same model profiles, Session journal, Kernel records, and projection when they use the same configuration root.
 
 ## macOS quick start
@@ -230,8 +232,6 @@ bash ./test.sh full
 ```
 
 `static` checks layering and repository structure. `required` runs Rust/TypeScript builds and unit tests. `full` additionally exercises a local Provider, tool decisions, cancellation, command replay, and restart recovery end to end.
-
-Contributor branch and pull-request workflow is documented in Chinese at [docs/git-branch-flow.md](docs/git-branch-flow.md).
 
 ## Notices and license
 
