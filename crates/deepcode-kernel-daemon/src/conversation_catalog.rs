@@ -1,10 +1,8 @@
 use crate::prelude::*;
 use rusqlite::{params, Connection};
 
-const CATALOG_SCHEMA: &str = include_str!("../../../contracts/agent-runtime-v2/catalog.sql");
-const CATALOG_V2_TO_V3: &str =
-    include_str!("../../../contracts/agent-runtime-v2/catalog-v2-to-v3.sql");
-const CATALOG_VERSION: u32 = 3;
+const CATALOG_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/catalog.sql");
+const CATALOG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -37,7 +35,6 @@ pub(crate) struct ConversationSessionRecord {
     pub(crate) workspace_bindings: Vec<WorkspaceBindingDisplayRecord>,
     pub(crate) project_id: Option<String>,
     pub(crate) profile_id: Option<String>,
-    pub(crate) entry_kind: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -53,28 +50,25 @@ impl ConversationCatalog {
     pub(crate) fn load(path: &FsPath) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|error| format!("创建 v2 Catalog Store 目录失败：{error}"))?;
+                .map_err(|error| format!("创建 Catalog Store 目录失败：{error}"))?;
         }
         let existed = path.exists();
-        let connection = Connection::open(path)
-            .map_err(|error| format!("打开 v2 Catalog Store 失败：{error}"))?;
+        let connection =
+            Connection::open(path).map_err(|error| format!("打开 Catalog Store 失败：{error}"))?;
         connection
             .busy_timeout(Duration::from_secs(5))
-            .map_err(|error| format!("配置 v2 Catalog Store 超时失败：{error}"))?;
+            .map_err(|error| format!("配置 Catalog Store 超时失败：{error}"))?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
-            .map_err(|error| format!("配置 v2 Catalog Store 失败：{error}"))?;
+            .map_err(|error| format!("配置 Catalog Store 失败：{error}"))?;
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(|error| format!("读取 v2 Catalog Store 版本失败：{error}"))?;
+            .map_err(|error| format!("读取 Catalog Store 版本失败：{error}"))?;
         match version {
-            0 if !existed || sqlite_is_empty(&connection)? => connection
-                .execute_batch(CATALOG_SCHEMA)
-                .map_err(|error| format!("创建 v2 Catalog Store 失败：{error}"))?,
-            2 => {
+            0 if !existed || sqlite_is_empty(&connection)? => {
                 connection
-                    .execute_batch(CATALOG_V2_TO_V3)
-                    .map_err(|error| format!("Catalog Store schema 2→3 迁移失败：{error}"))?;
+                    .execute_batch(CATALOG_SCHEMA)
+                    .map_err(|error| format!("创建 Catalog Store 失败：{error}"))?;
                 verify_version(&connection)?;
             }
             CATALOG_VERSION => verify_tables(&connection)?,
@@ -89,8 +83,8 @@ impl ConversationCatalog {
 
     pub(crate) fn persist(&self, path: &FsPath) -> Result<(), String> {
         self.validate()?;
-        let mut connection = Connection::open(path)
-            .map_err(|error| format!("打开 v2 Catalog Store 失败：{error}"))?;
+        let mut connection =
+            Connection::open(path).map_err(|error| format!("打开 Catalog Store 失败：{error}"))?;
         verify_version(&connection)?;
         let transaction = connection
             .transaction()
@@ -102,7 +96,7 @@ impl ConversationCatalog {
                  DELETE FROM projects;
                  DELETE FROM workspaces;",
             )
-            .map_err(|error| format!("清空 Catalog v2 事务视图失败：{error}"))?;
+            .map_err(|error| format!("清空 Catalog 事务视图失败：{error}"))?;
         for workspace in &self.workspaces {
             transaction
                 .execute(
@@ -146,14 +140,13 @@ impl ConversationCatalog {
             transaction
                 .execute(
                     "INSERT INTO session_catalog(
-                         session_id, title, project_id, entry_kind, workspace_bindings_json,
+                         session_id, title, project_id, workspace_bindings_json,
                          profile_id, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         session.id,
                         session.title,
                         session.project_id,
-                        session.entry_kind,
                         bindings,
                         session.profile_id,
                         session.created_at,
@@ -164,7 +157,7 @@ impl ConversationCatalog {
         }
         transaction
             .commit()
-            .map_err(|error| format!("提交 Catalog v2 事务失败：{error}"))
+            .map_err(|error| format!("提交 Catalog 事务失败：{error}"))
     }
 
     pub(crate) fn public_value(&self) -> Value {
@@ -185,7 +178,6 @@ impl ConversationCatalog {
                     "id": session.id,
                     "title": session.title,
                     "workspaceBindings": session.workspace_bindings,
-                    "entryKind": session.entry_kind,
                     "createdAt": session.created_at,
                     "updatedAt": session.updated_at,
                 });
@@ -460,7 +452,7 @@ impl ConversationCatalog {
         {
             let mut statement = connection
                 .prepare(
-                    "SELECT session_id, title, project_id, entry_kind,
+                    "SELECT session_id, title, project_id,
                             workspace_bindings_json, profile_id, created_at, updated_at
                      FROM session_catalog",
                 )
@@ -472,29 +464,19 @@ impl ConversationCatalog {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
                     ))
                 })
                 .map_err(|error| format!("读取 session catalog 失败：{error}"))?;
             for row in rows {
-                let (
-                    id,
-                    title,
-                    project_id,
-                    entry_kind,
-                    bindings,
-                    profile_id,
-                    created_at,
-                    updated_at,
-                ) = row.map_err(|error| format!("解码 session catalog 失败：{error}"))?;
+                let (id, title, project_id, bindings, profile_id, created_at, updated_at) =
+                    row.map_err(|error| format!("解码 session catalog 失败：{error}"))?;
                 catalog.sessions.push(ConversationSessionRecord {
                     id,
                     title,
                     project_id,
-                    entry_kind,
                     workspace_bindings: serde_json::from_str(&bindings)
                         .map_err(|error| format!("Session binding display 已损坏：{error}"))?,
                     profile_id,
@@ -547,12 +529,6 @@ impl ConversationCatalog {
                 .is_some_and(|id| !project_ids.contains(id))
             {
                 return Err(format!("会话 {} 引用了不存在的项目。", session.id));
-            }
-            if session.entry_kind != "activeV2" {
-                return Err(format!(
-                    "会话 {} 不是 activeV2；只读旧历史不能写入活跃 Catalog。",
-                    session.id
-                ));
             }
             let mut bindings = std::collections::HashSet::new();
             for binding in &session.workspace_bindings {
@@ -695,7 +671,6 @@ mod tests {
             }],
             project_id: None,
             profile_id: None,
-            entry_kind: "activeV2".to_string(),
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
         });
@@ -722,7 +697,6 @@ mod tests {
             workspace_bindings: Vec::new(),
             project_id: None,
             profile_id: None,
-            entry_kind: "activeV2".to_string(),
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
         });
@@ -734,69 +708,23 @@ mod tests {
     }
 
     #[test]
-    fn active_catalog_rejects_history_only_entries() {
-        let mut catalog = ConversationCatalog::default();
-        catalog.insert_session(ConversationSessionRecord {
-            id: "session:history".to_string(),
-            title: "只读历史".to_string(),
-            workspace_bindings: Vec::new(),
-            project_id: None,
-            profile_id: None,
-            entry_kind: "historyOnly".to_string(),
-            created_at: "now".to_string(),
-            updated_at: "now".to_string(),
-        });
-
-        let error = catalog
-            .validate()
-            .expect_err("history-only entries must not enter the active catalog");
-        assert!(error.contains("不能写入活跃 Catalog"));
-    }
-
-    #[test]
-    fn schema_two_migration_preserves_active_sessions_and_tightens_entry_kind() {
+    fn noncurrent_catalog_store_is_rejected() {
         let path = std::env::temp_dir().join(format!(
-            "deepcode-catalog-migration-{}-{}.sqlite3",
+            "deepcode-catalog-outdated-{}-{}.sqlite3",
             std::process::id(),
             crate::now_millis()
         ));
-        let connection = Connection::open(&path).expect("create schema two catalog");
-        connection
-            .execute_batch(
-                &CATALOG_SCHEMA
-                    .replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;")
-                    .replace(
-                        "CHECK(entry_kind = 'activeV2')",
-                        "CHECK(entry_kind IN ('activeV2', 'historyOnly'))",
-                    ),
-            )
-            .expect("create schema two catalog");
-        connection
-            .execute(
-                "INSERT INTO session_catalog(
-                    session_id, title, entry_kind, workspace_bindings_json, created_at, updated_at
-                 ) VALUES (?1, ?2, 'activeV2', '[]', ?3, ?3)",
-                params!["session:active", "Active", "now"],
-            )
-            .expect("insert active session");
-        drop(connection);
+        let outdated_schema =
+            CATALOG_SCHEMA.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;");
+        Connection::open(&path)
+            .expect("open outdated catalog")
+            .execute_batch(&outdated_schema)
+            .expect("create outdated catalog");
 
-        let catalog = ConversationCatalog::load(&path).expect("migrate schema two catalog");
-        assert!(catalog.session("session:active").is_some());
+        let error =
+            ConversationCatalog::load(&path).expect_err("outdated catalog must be rejected");
+        assert!(error.contains("schema 2"));
 
-        let connection = Connection::open(&path).expect("reopen migrated catalog");
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("read schema version");
-        assert_eq!(version, CATALOG_VERSION);
-        let rejected = connection.execute(
-            "INSERT INTO session_catalog(
-                session_id, title, entry_kind, workspace_bindings_json, created_at, updated_at
-             ) VALUES (?1, ?2, 'historyOnly', '[]', ?3, ?3)",
-            params!["session:history", "History", "now"],
-        );
-        assert!(rejected.is_err());
-        drop(connection);
-        std::fs::remove_file(path).expect("remove migrated catalog fixture");
+        std::fs::remove_file(path).expect("remove outdated catalog fixture");
     }
 }

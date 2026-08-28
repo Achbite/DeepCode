@@ -28,6 +28,10 @@ test('GUI 壳设置与共享 Agent 设置使用不同目录边界', () => {
   ]) {
     assert.deepEqual(shared.get(key)?.shellSurface, ['editor', 'gui', 'cli', 'tui']);
   }
-  assert.equal('agent.permissions.workspaceRead' in DEFAULT_USER_SETTINGS, false);
-  assert.equal('agent.permissions.workspaceWrite' in DEFAULT_USER_SETTINGS, false);
+  assert.deepEqual(
+    Object.keys(DEFAULT_USER_SETTINGS)
+      .filter((key) => key.startsWith('agent.permissions.'))
+      .sort(),
+    ['agent.permissions.external', 'agent.permissions.networkRead'],
+  );
 });

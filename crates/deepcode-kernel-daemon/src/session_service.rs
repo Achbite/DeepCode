@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: &str = "deepcode.local-agent.v2";
+const PROTOCOL_VERSION: &str = "deepcode.local-agent";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_RECEIPT_BYTES: usize = 16 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);

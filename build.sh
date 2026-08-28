@@ -177,7 +177,7 @@ Environment:
                                       Timeout for macOS package service requests.
   DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
                                       Comma/space separated macOS app set for package-macos.
-  --clean-cache                     Clean macOS package build artifacts without deleting config/sessions/archives/kernel data.
+  --clean-cache                     Clean macOS package build artifacts without deleting current config/runtime data.
   --no-kill-running                 Do not stop processes occupying the target macOS .app bundle before packaging.
 USAGE
 }
@@ -695,23 +695,23 @@ stage_hash() {
     tracked_files build.sh scripts/cargo-with-fallback.sh
     case "$stage" in
       gui)
-        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime-v2 \
+        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime \
           userspace/protocol userspace/session-core userspace/gui \
           | grep -Ev '(^|/)(dist|node_modules)/' || true
         ;;
       deepcode-gui)
-        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime-v2 \
+        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime \
           userspace/protocol userspace/session-core userspace/gui shells/deepcode-gui \
           | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules)/' || true
         ;;
       kernel)
-        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime-v2 crates/deepcode-kernel-abi \
+        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
           crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-host-web \
           shells/cli shells/tui
         ;;
       daemon)
-        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime-v2 crates/deepcode-kernel-abi \
+        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
           crates/deepcode-kernel-daemon crates/deepcode-host-web
         ;;
@@ -1008,8 +1008,7 @@ prepare_distribution_config_root() {
   mkdir -p \
     "$dist_dir/config/user/local/settings" \
     "$dist_dir/config/user/local/secrets" \
-    "$dist_dir/runtime/local-agent-v2" \
-    "$dist_dir/sessions"
+    "$dist_dir/runtime/agent-runtime"
   copy_distribution_default_if_missing \
     "$ROOT_DIR/config/defaults/user-settings.json" \
     "$dist_dir/config/user/local/settings/user-settings.json"
@@ -1566,8 +1565,7 @@ verify_linux_package_runtime() {
     "$LINUX_DIR/node_modules/@deepcode/protocol/dist" \
     "linux protocol runtime" || missing=1
   verify_runtime_executable "$LINUX_DIR/node/bin/node" "linux packaged node" || missing=1
-  verify_runtime_dir "$LINUX_DIR/runtime/local-agent-v2" "linux active v2 Session root" || missing=1
-  verify_runtime_dir "$LINUX_DIR/sessions" "linux legacy read-only history root" || missing=1
+  verify_runtime_dir "$LINUX_DIR/runtime/agent-runtime" "linux Agent Runtime root" || missing=1
   verify_llm_profiles_current \
     "$LINUX_DIR/config/user/local/settings/llm-profiles.json" \
     "$LINUX_DIR/node/bin/node" \
@@ -1595,8 +1593,7 @@ verify_windows_package_runtime() {
     "$WIN_DIR/node_modules/@deepcode/protocol/dist" \
     "windows protocol runtime" || missing=1
   verify_runtime_file "$WIN_DIR/node/bin/node.exe" "windows packaged node" || missing=1
-  verify_runtime_dir "$WIN_DIR/runtime/local-agent-v2" "windows active v2 Session root" || missing=1
-  verify_runtime_dir "$WIN_DIR/sessions" "windows legacy read-only history root" || missing=1
+  verify_runtime_dir "$WIN_DIR/runtime/agent-runtime" "windows Agent Runtime root" || missing=1
   if [ -x "$LINUX_DIR/node/bin/node" ]; then
     validation_node="$LINUX_DIR/node/bin/node"
   elif command -v node >/dev/null 2>&1; then
@@ -1717,8 +1714,7 @@ all tool effects enter the Rust Kernel through its local execution port.
 Writable package-local data is preserved across package refreshes:
   config/user/local/settings/     User settings and LLM profiles.
   config/user/local/secrets/      Local secret references. Do not share.
-  runtime/local-agent-v2/         Active v2 Catalog, Session journal, and ToolRecord stores.
-  sessions/                       Legacy v1 history retained read-only.
+  runtime/agent-runtime/         Catalog, Session journal, and ToolRecord stores.
 
 Packaged Tauri desktop shells set DEEPCODE_CONFIG_DIR to this package root.
 Direct CLI/daemon runs use the OS config root unless DEEPCODE_CONFIG_DIR is set.
@@ -1761,7 +1757,7 @@ clear_package_generated_dir() {
 clean_package_generated_outputs() {
   local dist_dir="$1"
   local platform="$2"
-  echo "==[build][package]== clean $platform generated outputs; preserve config/runtime/local-agent-v2/sessions"
+  echo "==[build][package]== clean $platform generated outputs; preserve config/runtime/agent-runtime"
 
   clear_package_generated_dir "$dist_dir/web"
   clear_package_generated_dir "$dist_dir/web-deepcode-gui"

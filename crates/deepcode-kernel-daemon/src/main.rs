@@ -2,7 +2,6 @@ mod api_response;
 mod browser_api;
 mod conversation_api;
 mod conversation_catalog;
-mod conversation_history;
 mod host_connection;
 mod host_inspection;
 mod host_services;
@@ -31,7 +30,6 @@ use crate::prelude::*;
 pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
 pub(crate) use conversation_api::*;
-pub(crate) use conversation_history::*;
 pub(crate) use host_connection::*;
 pub(crate) use host_services::*;
 pub(crate) use host_shutdown::*;
@@ -64,9 +62,6 @@ async fn main() {
         .await
         .unwrap_or_else(|error| panic!("无法绑定 DeepCode 本地 daemon：{error}"));
     let gui_state = GuiState::new();
-    let conversation_history = Arc::new(ConversationHistoryReader::new(
-        gui_state.paths.legacy_session_store_path.clone(),
-    ));
     let (executor_config, secrets) = runtime_tool_configuration(&gui_state);
     let session_store_path = gui_state.paths.session_store_path.clone();
     let tool_record_store_path = gui_state.paths.tool_record_store_path.clone();
@@ -106,7 +101,6 @@ async fn main() {
         local_agent,
         session_service,
         host_connection,
-        conversation_history,
         gui,
         host_services: HostServices::new(),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),

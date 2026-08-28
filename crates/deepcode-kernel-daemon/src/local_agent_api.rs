@@ -367,7 +367,7 @@ pub(crate) async fn local_agent_provider_stream(
             )
         }
     };
-    if body.protocol_version != "deepcode.local-agent.v2" {
+    if body.protocol_version != "deepcode.local-agent" {
         return local_provider_error(
             &body.request_id,
             "provider_request_version_invalid",
@@ -564,7 +564,7 @@ fn kernel_error(error: LocalAgentKernelError) -> Json<ApiResponse> {
 
 fn local_provider_error(request_id: &str, code: &str, message: &str) -> Response {
     let event = json!({
-        "schemaVersion": "deepcode.provider-event.v2",
+        "schemaVersion": "deepcode.provider-event",
         "requestId": request_id,
         "type": "failed",
         "data": { "code": code, "message": message },

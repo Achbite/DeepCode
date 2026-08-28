@@ -122,12 +122,10 @@ cd bin/linux-x64
 8. 对话中仍可切换模型，新的 profile 从后续 Provider turn 起生效。
 9. 消息、Plan、activities、产物、上下文用量和 run 状态都来自同一份共享投影。
 10. 已提交的 Assistant 回答可以复制、赞、踩或清除反馈。赞踩是本地 Session 持久事实，重启后可恢复，不会由 GUI 私存，也不会发送给 Provider。
-11. 点击输入框中的上下文球可以查看当前 Provider 请求实际采用的上下文分类；设置页显示累计用量，以及按新到旧排列的逐轮 Token 消耗（每页 10 条）。一轮包含的多次 Provider 调用由 Session 汇总，GUI 不重新计算。schema 4 升级前的历史用量会保留在统计中，但不会伪造当时不存在的请求构成。
+11. 点击输入框中的上下文球可以查看当前 Provider 请求的上下文分区。分区条目数和估算取 Session，缓存命中/未命中取 Provider；缺失显示 `N/A`，GUI/TUI 不自行归因或重算。设置页显示由 Session 汇总、按新到旧排列的逐轮 Token 消耗（每页 10 条）。
 12. 复杂任务由 LLM 通过结构化 `todo.update` 明确提交 Todo；右侧任务面板只消费该共享投影，不把工具调用或 GUI 推断伪装成任务。工具调用仍与叙述按 Session 时间线交错显示在主对话区。
 
-删除 active-v2 Session 会同时删除对话 Catalog 条目及其完整 active archive：Session events、command replay、binding 关系和 Kernel ToolRecord。活动 run 必须先停止。Hard cut 保留的只读旧历史不会通过 v2 执行路径删除。
-
-旧历史若存在，由 Host 的独立只读适配器合并到会话列表，并明确标记为“旧版只读历史”。它不写入 active-v2 Catalog，不能继续对话、切换模型、写入反馈或调用 active-v2 删除命令；GUI 仍允许复制其中的 Assistant 文本。该入口只恢复旧归档原本拥有的事实，不执行双读、双写或旧 schema 迁移。
+删除 Session 会同时删除对话 Catalog 条目及其完整归档：Session events、command replay、binding 关系和 Kernel ToolRecord。活动 run 必须先停止。
 
 ## CLI
 
@@ -184,17 +182,16 @@ Plan 等待时输入 `1..N` 选择选项，其他非空文本作为调整反馈�
 config/user/local/settings/llm-profiles.json  模型 profiles
 config/user/local/settings/user-settings.json 用户设置
 config/user/local/secrets/                    本地密钥
-runtime/local-agent-v2/catalog.sqlite3        Host 私有 project/workspace catalog
-runtime/local-agent-v2/session.sqlite3        Session journal 与命令回放
-runtime/local-agent-v2/tool-record.sqlite3    Kernel 工具结果记录
-sessions/                                     旧数据只读历史（存在时）
+runtime/agent-runtime/catalog.sqlite3        Host 私有 project/workspace catalog
+runtime/agent-runtime/session.sqlite3        Session journal 与命令回放
+runtime/agent-runtime/tool-record.sqlite3    Kernel 工具结果记录
 logs/                                         launcher 或 Kernel 日志（产生时）
 ```
 
 设置 `DEEPCODE_CONFIG_DIR` 可指定其他配置根。需要多个入口共享 Session 时，应让它们使用同一配置根。
-打包目录中的 `session-core/` 保存 Session Runtime 代码，不是对话归档。active-v2 对话历史位于 `runtime/local-agent-v2/session.sqlite3`；`sessions/` 只保存 hard cut 后原样保留的旧版只读历史。
+打包目录中的 `session-core/` 保存 Session Runtime 代码，不是对话归档。对话历史位于 `runtime/agent-runtime/session.sqlite3`。
 
-`contracts/agent-runtime-v2/` 中的 `catalog.sql`、`session.sql` 与 `tool-record.sql` 是三个事实 owner 的当前建库合同；同目录的 `*-to-*.sql` 只负责从精确旧版本单向迁移到下一版本，不是另一套运行路径。完整版本链见 [contracts/agent-runtime-v2/README.md](contracts/agent-runtime-v2/README.md)。
+`contracts/agent-runtime/` 中的 `catalog.sql`、`session.sql` 与 `tool-record.sql` 是三个事实 owner 的当前建库合同。Runtime 只打开这一精确 schema，其他数据库版本直接拒绝；不存在迁移链或历史入口。详见 [contracts/agent-runtime/README.md](contracts/agent-runtime/README.md)。
 
 ## 常见问题
 

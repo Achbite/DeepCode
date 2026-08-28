@@ -885,12 +885,6 @@
   font-size: var(--dc-font-micro);
 }
 
-.deepcode-gui-session-context-menu__readonly {
-  padding: 8px 9px;
-  color: var(--dc-faint);
-  font-size: var(--dc-font-caption);
-}
-
 .deepcode-gui-session-context-menu__danger {
   color: var(--dc-danger) !important;
 }
@@ -1104,12 +1098,6 @@
 
 .deepcode-session-model__context > span {
   position: relative;
-}
-
-.deepcode-session-model__history-label {
-  color: var(--dc-faint);
-  font-size: var(--dc-font-caption);
-  white-space: nowrap;
 }
 
 .deepcode-session-model__context-popover {

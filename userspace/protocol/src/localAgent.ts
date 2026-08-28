@@ -1,12 +1,12 @@
-export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent.v2' as const;
-export const CONVERSATION_COMMAND_VERSION = 'deepcode.command.v2' as const;
-export const COMMAND_REPLY_VERSION = 'deepcode.command-reply.v2' as const;
-export const SESSION_EVENT_VERSION = 'deepcode.session-event.v2' as const;
-export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v2' as const;
-export const PROJECTION_UPDATE_VERSION = 'deepcode.projection-update.v2' as const;
-export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event.v2' as const;
-export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request.v2' as const;
-export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply.v2' as const;
+export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
+export const CONVERSATION_COMMAND_VERSION = 'deepcode.command' as const;
+export const COMMAND_REPLY_VERSION = 'deepcode.command-reply' as const;
+export const SESSION_EVENT_VERSION = 'deepcode.session-event' as const;
+export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection' as const;
+export const PROJECTION_UPDATE_VERSION = 'deepcode.projection-update' as const;
+export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
+export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
+export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
 export const SESSION_CONTROL_PLAN_INTENT = 'plan.intent' as const;
 export const SESSION_CONTROL_TODO_UPDATE = 'todo.update' as const;
@@ -43,7 +43,6 @@ export interface ConversationSessionSummary {
   title: string;
   projectId?: string;
   profileId?: string;
-  entryKind: 'activeV2' | 'historyOnly';
   workspaceBindings: WorkspaceBindingDisplay[];
   createdAt: string;
   updatedAt: string;
@@ -258,7 +257,7 @@ export interface TokenUsageRoundProjection extends TokenUsageProjection {
   outcome?: RunSettlement['outcome'];
 }
 
-export type ContextCompositionCategoryKind =
+export type ContextCompositionPartitionKind =
   | 'instructions'
   | 'workspaceBindings'
   | 'sessionControls'
@@ -272,14 +271,8 @@ export interface ContextCompositionItem {
   label: string;
 }
 
-export interface ContextCompositionCategory {
-  kind: ContextCompositionCategoryKind;
-  itemCount: number;
-  items: ContextCompositionItem[];
-}
-
 export type ContextCompositionMessageKind = Exclude<
-  ContextCompositionCategoryKind,
+  ContextCompositionPartitionKind,
   'messageAttachments' | 'tools'
 >;
 
@@ -311,7 +304,7 @@ export interface ContextCompositionMessage {
 }
 
 export interface ContextCompositionPartitionReceipt {
-  kind: ContextCompositionCategoryKind;
+  kind: ContextCompositionPartitionKind;
   itemCount: number;
   requestShapeUnits: number;
 }
@@ -328,8 +321,7 @@ export interface ContextCompositionReceipt {
   messages: ContextCompositionMessage[];
   workspaceBindings: ContextCompositionItem[];
   tools: ContextCompositionItem[];
-  /** Absent on immutable receipts written before Session partition estimation existed. */
-  partitions?: ContextCompositionPartitionReceipt[];
+  partitions: ContextCompositionPartitionReceipt[];
 }
 
 interface ContextCompositionProjectionBase {
@@ -340,23 +332,12 @@ interface ContextCompositionProjectionBase {
   createdAt: string;
 }
 
-export type ContextCompositionProjection = ContextCompositionProjectionBase & (
-  | {
-      messages: ContextCompositionMessage[];
-      workspaceBindings: ContextCompositionItem[];
-      tools: ContextCompositionItem[];
-      partitions?: ContextCompositionPartitionProjection[];
-      categories?: never;
-    }
-  /** schema-5 早期只记录分类摘要；旧不可变回执不会伪造已丢失的请求结构。 */
-  | {
-      categories: ContextCompositionCategory[];
-      messages?: never;
-      workspaceBindings?: never;
-      tools?: never;
-      partitions?: never;
-    }
-);
+export interface ContextCompositionProjection extends ContextCompositionProjectionBase {
+  messages: ContextCompositionMessage[];
+  workspaceBindings: ContextCompositionItem[];
+  tools: ContextCompositionItem[];
+  partitions: ContextCompositionPartitionProjection[];
+}
 
 export type TodoStatus = 'pending' | 'inProgress' | 'completed';
 
@@ -655,7 +636,6 @@ export interface ArtifactProjection {
 export interface SessionDisplayProjection {
   title: string;
   projectId?: string;
-  entryKind: 'activeV2' | 'historyOnly';
 }
 
 export interface SessionProjection {

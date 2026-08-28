@@ -18,7 +18,7 @@ pub use conversation::{
     message_command, message_command_with_profile, plan_feedback_command, plan_ignore_command,
     plan_select_command, profile_selection_command, ActivityProjection, ApprovalProjection,
     ArtifactProjection, AssistantDraftProjection, AttachConversationDirectoryIndexRequest,
-    CommandReply, ContextCompositionCategory, ContextCompositionItem, ContextCompositionMessage,
+    CommandReply, ContextCompositionItem, ContextCompositionMessage,
     ContextCompositionMessageBlock, ContextCompositionPartitionProjection,
     ContextCompositionProjection, ContextUsageProjection, ConversationError,
     ConversationResourceReadRequest, ConversationResourceReadResult,

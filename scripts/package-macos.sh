@@ -160,8 +160,7 @@ Environment:
 
 Clean keeps package-local user data:
   bin/macos-arm64/config
-  bin/macos-arm64/runtime/local-agent-v2
-  bin/macos-arm64/sessions
+  bin/macos-arm64/runtime/agent-runtime
 USAGE
 }
 
@@ -345,7 +344,7 @@ clean_product_package_cache() {
 
 clean_shared_package_cache() {
   log "clean shared macOS package build artifacts"
-  log "preserve package-local user data: config/, runtime/local-agent-v2/, sessions/"
+  log "preserve package-local user data: config/, runtime/agent-runtime/"
   rm -rf "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node" "$LIBEXEC_DIR"
   rm -f \
     "$BIN_DIR/deepcode-kernel" \
@@ -866,8 +865,7 @@ prepare_portable_config_root() {
   mkdir -p \
     "$BIN_DIR/config/user/local/settings" \
     "$BIN_DIR/config/user/local/secrets" \
-    "$BIN_DIR/runtime/local-agent-v2" \
-    "$BIN_DIR/sessions"
+    "$BIN_DIR/runtime/agent-runtime"
 
   copy_file_if_missing \
     "$ROOT_DIR/config/defaults/user-settings.json" \
@@ -886,8 +884,7 @@ $APP_NAME.app or package launcher scripts.
 Writable runtime data:
   config/user/local/settings/     User settings and Provider profiles.
   config/user/local/secrets/      Local secret references. Do not share.
-  runtime/local-agent-v2/         Active v2 Catalog, Session journal, and ToolRecord stores.
-  sessions/                       Legacy v1 history retained read-only; not used for new runs.
+  runtime/agent-runtime/         Catalog, Session journal, and ToolRecord stores.
 
 Set DEEPCODE_CONFIG_DIR to override this package-local root.
 README
@@ -1089,11 +1086,10 @@ write_readme() {
   Set DEEPCODE_NODE or DEEPCODE_SESSION_BRIDGE only when overriding that packaged
   daemon runtime. DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls the daemon session
   run hard timeout; default 600000 ms, 0 disables it.
-	  By default, this local package stores active writable data under:
+	  By default, this local package stores writable data under:
 	    config/user/local/settings/
 	    config/user/local/secrets/
-	    runtime/local-agent-v2/
-	  sessions/ is retained as legacy v1 read-only history and is not used by new runs."
+	    runtime/agent-runtime/"
 
   app_entries=""
   gui_section=""
@@ -1141,8 +1137,7 @@ $app_entries
   libexec/$TUI_EXEC_NAME    Internal Darwin arm64 Ratatui/Crossterm TUI host.
 $asset_entries
   config/                  Package-local writable user config root.
-  runtime/local-agent-v2/  Active v2 Catalog, Session journal, and ToolRecord stores.
-  sessions/                Legacy v1 history retained read-only.
+  runtime/agent-runtime/  Catalog, Session journal, and ToolRecord stores.
 
 Notes:
 $notes

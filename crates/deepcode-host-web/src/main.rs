@@ -437,7 +437,6 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "llm", "probe"])
         | ("GET", ["api", "conversation", "catalog"])
         | ("GET", ["api", "conversation", "catalog", "manage"])
-        | ("GET", ["api", "conversation", "history"])
         | ("POST", ["api", "conversation", "projects"])
         | ("POST", ["api", "conversation", "sessions"])
         | ("GET", ["api", "runtime", "shell"])
@@ -464,7 +463,6 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "conversation", "sessions", _, "directory-indexes"])
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
-        | ("GET", ["api", "conversation", "history", _, "projection"])
         | ("GET", ["api", "conversation", "sessions", _, "projection", "stream"])
         | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
         _ => false,
@@ -552,11 +550,6 @@ mod tests {
     #[test]
     fn conversation_catalog_routes_are_exposed_to_the_gui_shell() {
         assert!(host_proxy_path_allowed("GET", "/api/conversation/catalog"));
-        assert!(host_proxy_path_allowed("GET", "/api/conversation/history"));
-        assert!(host_proxy_path_allowed(
-            "GET",
-            "/api/conversation/history/session%3Aold/projection"
-        ));
         assert!(host_proxy_path_allowed(
             "GET",
             "/api/conversation/catalog/manage"

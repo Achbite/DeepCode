@@ -1,15 +1,14 @@
-# DeepCode 本地 Agent 架构 v2 Hard Cut 合同
+# DeepCode 本地 Agent 架构 Hard Cut 合同
 
-状态：**LOCKED——作为 P1–P8 的唯一实施合同**
+状态：**LOCKED——当前运行合同**
 
-合同 ID：**deepcode.local-agent-hard-cut.v2**
+合同 ID：**deepcode.local-agent-hard-cut**
 
 适用范围：DeepCode 本地编码 Agent 的 Kernel / Runtime、Session /
 Orchestration、Host composition、CLI、TUI、GUI，以及它们共享的投影与插件边界。
 
-本文是本轮唯一规范性架构合同。用户已完成文本复核并明确回复 **LOCKED**；本文从
-该回复起成为 P1–P8 的实施合同。它描述已经确认的目标语义，不把当前代码、现有 v1
-schema、store 或运行态误写为已满足本合同。
+本文是本地 Agent 当前唯一规范性架构合同。用户已完成文本复核并明确回复
+**LOCKED**；源码、制品与运行事实仍需分别验证，不能由合同文本替代。
 
 ---
 
@@ -26,7 +25,7 @@ DeepCode 是本地优先的 coding Agent 框架，不是云端 Agent 平台，�
 4. 让 CLI、TUI、GUI 只消费同一份共享投影，不在 UI 壳内建立第二事实源。
 5. 用 Host 私有 workspace catalog 和 Session creation snapshot 表达项目与工作目录。
 6. 用结构化 Plan intent 为 workspace mutation 提供精确、短生命周期的授权。
-7. 以显式 v2 hard cut 清除旧数据、旧权限和旧执行路径对新运行时的影响。
+7. 只保留当前运行时合同，不提供数据库迁移、历史入口或字段兼容路径。
 8. 保留轻量、可替换的插件组合方式，为 Skill、MCP 和后续 contribution 类型提供
    统一入口，但不提前实现复杂插件管理平台。
 
@@ -42,7 +41,7 @@ DeepCode 是本地优先的 coding Agent 框架，不是云端 Agent 平台，�
 - 为未来公开服务预置的 DDoS、证书轮换、复杂密钥托管或灾备体系。
 - Kernel 与 Session 的新独立进程拓扑；第一版保留当前 Rust / Node 物理边界。
 - 插件热更新、generation graph、shadow runtime 或多版本同时激活。
-- v1 与 v2 双读、双写、兼容 alias、字段猜测或 first-root fallback。
+- 数据库迁移、双读、双写、兼容 alias、字段猜测或 first-root fallback。
 - 强制 Review、Finalize、FinalAnswer 的第二套 Provider 回合。
 - 为所有 run 强制经过 Plan；只读任务和直接回答可以不产生 Plan。
 - executor.started、run.settling、assistant.chunk 或为 UI 动画额外制造的 canonical
@@ -55,7 +54,7 @@ DeepCode 是本地优先的 coding Agent 框架，不是云端 Agent 平台，�
 
 ## 3. Hard-cut 不变量
 
-v2 实现必须同时满足以下不变量：
+当前实现必须同时满足以下不变量：
 
 1. **唯一 Loop**：只有 Session 内的 runAgentLoop 决定下一次 Provider 调用、
    工具调用、等待用户或终止 run。
@@ -84,8 +83,8 @@ v2 实现必须同时满足以下不变量：
     全局 allow 或自然语言 Plan。
 11. **终态唯一**：每个 run 恰有一个 run.settled；completed、failed、cancelled、
     indeterminate 不互相折叠。
-12. **v2 单路径**：新 catalog、Session store 和 tool-record root 是 v2 唯一执行
-    数据源；旧数据只能走只读历史入口。
+12. **当前单路径**：`runtime/agent-runtime/` 下的 catalog、Session store 和
+    tool-record store 是唯一执行数据源；其他数据库版本拒绝打开，不提供历史入口。
 13. **命令幂等**：同一 sessionId + commandId 的完全相同命令重放原结果；同 ID
     不同内容是冲突，不追加新事件。
 14. **调用身份稳定**：callId 表示逻辑调用，attemptId 表示一次执行尝试；旧 attempt
@@ -373,7 +372,7 @@ SessionProjection 的 transient 字段发布：
 复制是 Shell 私有操作，不写入 Session。赞、踩和清除反馈则通过共享
 `message.feedback.set(messageId, feedback)` 命令提交；Session 只允许目标为已提交的
 assistant message，并把结果持久化为 `message.feedback.updated`。反馈只保存在本地
-active-v2 Session journal，恢复与命令回放使用同一 reducer；GUI、CLI、TUI 都只能消费
+当前 Session journal，恢复与命令回放使用同一 reducer；GUI、CLI、TUI 都只能消费
 消息 projection 的 `feedback` 字段，不能各自保存第二份状态，也不能把反馈发送给
 Provider。删除 Session 时，该反馈随完整 Session archive 一同删除。
 
@@ -381,7 +380,7 @@ Provider。删除 Session 时，该反馈随完整 Session archive 一同删除�
 
 ### 8.1 最小 canonical event vocabulary
 
-v2 journal 允许以下事件：
+当前 journal 允许以下事件：
 
     session.created
     input.accepted
@@ -501,12 +500,9 @@ Kernel 可调用工具、workspace bindings、context providers、journal messag
 Provider Token。对应 `context.updated.inputTokens` 到达后，Session reducer 使用最大余数法
 一次性分配七项 `estimatedInputTokens`，并标记 `tokenSource=sessionEstimated`；七项估算值
 必须精确合计为该次 Provider 输入总量。Shell 只消费这些投影事实，并统一以 `≈` 显示；
-旧回执没有该估算事实时显示 `N/A`，GUI/TUI 不自行分词、归因或重算。
-
-schema 5 早期已经持久化的分类摘要继续作为不可变只读历史原样恢复。新追加的
-`context.composed` 只接受上述结构字段；结构字段缺失、部分存在、与旧分类摘要混合，均在
-append/reducer/consumer 边界明确拒绝。旧摘要不能反推出当时已经丢失的消息顺序、role、
-tool call/result 关联或独立请求通道。
+分区没有 Session estimate 时显示 `N/A`，GUI/TUI 不自行分词、归因或重算。
+`context.composed` 只接受完整的当前结构字段，缺失或部分结构在
+append/reducer/consumer 边界明确拒绝。
 
 `context.updated` 的 `inputTokens`、`outputTokens` 与 `contextWindowTokens` 表达该次
 Provider turn 的上下文用量。Provider 明确报告缓存事实时，同一事件还必须同时包含
@@ -750,8 +746,6 @@ Loop，让 LLM 产生新 Plan 或 answer；不得自动发起逐调用 ask。
 
 workspace mutation 第一版明确不接受：
 
-- agent.permissions.workspaceWrite = allow。
-- agent.permissions.workspaceWrite = ask。
 - approval.resolve 的逐调用 allow。
 - Project binding 本身。
 - workspace read binding。
@@ -981,8 +975,8 @@ Shell 私有设置包括：
 按 run 汇总的逐轮 Token 用量。它们不是用户设置，也不由 GUI 重新计算；上下文构成弹层
 同样只消费 `context.composed` 回执，不显示未进入该次请求的候选内容。
 
-workspaceId -> canonicalRoot 是 Host 私有 catalog 事实，不是普通“设置”。旧
-workspaceWrite=allow|ask 不在 v2 设置面中提供，也不映射为 v2 authority。
+workspaceId -> canonicalRoot 是 Host 私有 catalog 事实，不是普通“设置”。Workspace
+mutation authority 只能来自当前 run 的闭合 Plan，不由设置页生成。
 
 ## 14. 插件体系
 
@@ -1017,18 +1011,17 @@ Session 每次 Provider turn 使用 immutable AgentDeps：
 - 第一版不实现 HMR、generation、shadow activation 或复杂 manifest graph。
 - 插件不能绕过 WorkspaceResolver、PreparedEffect、Plan coverage 或 Kernel record。
 
-## 15. v2 Store Root 与历史数据 hard cut
+## 15. 当前 Store Root 与持久化 hard cut
 
-### 15.1 新 root
+### 15.1 Runtime root
 
-v2 使用一个由 Host 选择、进程私有管理的全新 RuntimeStoreRootV2，包含三个独立
-事实域：
+Host 选择并私有管理 `runtime/agent-runtime/`，其中包含三个独立事实域：
 
 1. **Catalog store**
    - workspaces：workspaceId、private canonicalRoot、createdAt。
    - projects：projectId、display metadata。
    - project_workspace_bindings：Project 的新 Session 模板。
-   - session_catalog：只保存 active-v2 Session 的 Project 归类与执行入口元数据；旧历史由独立只读 adapter 提供，不写入此表。
+   - session_catalog：只保存当前 Session 的 Project 归类与执行入口元数据。
 2. **Session store**
    - sessions：sessionId 与 creation metadata。
    - session_events：连续 append-only journal。
@@ -1046,68 +1039,23 @@ v2 使用一个由 Host 选择、进程私有管理的全新 RuntimeStoreRootV2�
 SQLite 第一版继续使用 rollback journal mode 和 synchronous=FULL。schema 只表达
 运行所需的表、约束和索引，不保留自哈希 manifest 或巨量测试向量。
 
-`todo.updated` 加入后，active-v2 Session store 从 schema 2 单向升级到 schema 3；
-directory-index events 与 run workspace snapshot 加入后再单向升级到 schema 4；
-`message.feedback.updated` 与 `context.composed` 加入后单向升级到 schema 5；
-`session.control.rejected` 加入后再单向升级到 schema 6。schema 3
-既有 `run.started` 由 creation binding 确定性补齐 `workspaceBindings`，不读取其他 root，
-不推断后续目录索引；schema 4→5 与 schema 5→6 都只扩展闭合事件词汇，不改写既有
-payload。schema 6 的新结构回执可以携带分区 shape facts；该字段保持 optional，使 schema 5
-已有不可变 `context.composed` 原样恢复且不伪造估算。
-ToolRecord store 从 schema 2 单向升级到 schema 3，仅移除阻止 Session aggregate purge 的
-delete trigger；普通 Kernel API 仍没有任意删除入口。
+三个建库合同的 `user_version` 都是当前物理 namespace 的版本 1。文件不存在或数据库为空
+时执行当前建库合同；版本精确匹配时验证必需表后打开；其他版本一律拒绝。Runtime 不执行
+迁移 SQL，不扫描其他 root，不接受 alias，也不从其他 store 推断版本。
 
-Catalog store 从 schema 2 单向升级到 schema 3，重建 `session_catalog` 并把
-`entry_kind` 收紧为唯一合法值 `activeV2`。迁移逐行复制现有记录；若旧表中混入
-`historyOnly`，CHECK 会使整个事务失败并保留原库，不静默删除或把旧历史转成可执行
-Session。只读旧历史继续由 Host history adapter 从旧 root 投影。
+Catalog 不含会话类型或历史入口字段。Session journal 只接受当前事件词汇与当前请求回执
+结构。普通 Kernel API 没有任意删除 ToolRecord 的入口。
 
-schema 4 既有 `context.updated` 没有当时尚不存在的 `providerRequestId`。schema 4→5
-迁移不得伪造 `context.composed`、请求身份或上下文分类；recovery reducer 只把这类原样
-保留的旧事件恢复为累计与逐轮 Token 历史，不投影 `contextUsage` 或上下文构成。schema 5/6
-新追加的 `context.updated` 仍必须带同 run 已持久化回执的 `providerRequestId`，否则在
-append/reducer 边界明确拒绝。
-
-显式删除 active-v2 Session 时，Host 先拒绝活动 run，再使用 SQLite attached database
+显式删除 Session 时，Host 先拒绝活动 run，再使用 SQLite attached database
 事务同时删除 Session store 与 ToolRecord store 中相同 sessionId 的归档事实；任一删除
 失败则整个归档事务回滚。Catalog 条目先删除并可在归档事务失败时恢复。执行路径只读写
-当前 schema，不双读、不双写、不保留 alias。这些都不会读取或迁移 hard cut 之前的旧
-历史 root。
+当前 schema，不双读、不双写、不保留 alias。
 
-### 15.2 旧数据
+### 15.2 当前单路径边界
 
-旧 catalog、Session store、tool record 和配置：
-
-- 原样保留，不原地改写。
-- 只允许通过 history-only adapter 读取。
-- 不进入 v2 ConversationPort、KernelPort 或 Provider context。
-- 旧 Session 不能继续执行、批准 pending call 或恢复旧 run。
-- 若 UI 展示旧会话，必须明确标记为只读历史，composer 不可提交。
-- 创建可执行 v2 Session 必须走新的显式创建流程，不自动复制旧 authority。
-
-### 15.3 显式失效
-
-hard cut 后以下旧事实对 v2 一律无效：
-
-- pending approval / authority。
-- workspaceAuthorityId 旧绑定。
-- agent.permissions.workspaceWrite = allow。
-- agent.permissions.workspaceWrite = ask。
-- 旧 Session 的 first workspace root。
-- 旧 projection cache。
-- 旧 Host / Bridge continuation。
-
-v2 不：
-
-- 双读旧新 store。
-- 双写旧新 store。
-- 通过 alias 接受 v1 字段。
-- 在新字段缺失时读取旧字段。
-- 在 workspaceId 缺失时选第一个 root。
-- 把旧 setting 转换成 PlanAuthority。
-
-旧历史 reader 与 v2 execution adapter 必须是两个显式入口；history reader 不实现
-任何 mutation 或 continuation command。
+Runtime 不扫描 `sessions/` 或其他数据库根，不暴露 history reader，不把非当前数据库投影
+到 ConversationPort。缺少 workspaceId 时不选择第一个 root，任何旧权限字段也不能转换成
+PlanAuthority。无效输入在所属边界拒绝，不能通过 UI、projection 或 adapter 生成替代事实。
 
 ## 16. 物理拓扑
 
@@ -1122,108 +1070,7 @@ v2 不：
 本 cut 不创建新的 standalone Kernel 进程，也不把 Kernel 合并进 Node。只有在唯一
 Loop 落地后，才能基于真实测量比较 IPC 延迟、故障隔离和打包成本。
 
-## 17. 从当前实现到 v2 的职责替换
-
-| 当前区域 | v2 目标 |
-| --- | --- |
-| SessionKernelLoopV2 与 providerTurns.ts 的有效部分 | 一个小型 runAgentLoop + 一个串行 SessionActor |
-| SessionKernelHostRunnerV2 | 薄的 open / submit / cancel / query facade，或删除 |
-| SessionKernelProductionBridgeV2 | 通用 mailbox / IPC adapter |
-| Rust drive_agent_kernel_until_boundary_v2 | transport、wake、cancel、supervision、cleanup；无业务 continuation switch |
-| Review / Finalize / FinalAnswer | 删除终态 authority 和第二次 Provider answer pass |
-| Host operation settlement | transport ack / error，不推进会话 |
-| Session / Host timeline stores | 一个 Session journal + 可重建 reducer |
-| 现有 Rust tool catalog / executor | 保留能力，置于 v2 KernelPort 与 PreparedEffect 后 |
-| workspaceRoot / workspaceAuthorityId | Host private workspaceId mapping + Session snapshot |
-| workspaceWrite allow / ask | 结构化 PlanAuthority |
-| GUI / TUI / CLI 私有状态 | 共享 SessionProjection |
-
-开发期间可以在测试中直接实例化 v2 组件，但产品运行入口在 cutover 前仍只使用旧
-路径；切换时一次性改为 v2，并删除旧可达路径。不得以“过渡”为由发布双运行时。
-
-## 18. 依赖顺序 P1–P8
-
-以下阶段按已锁定合同开始。它们是同一 hard cut 的依赖顺序，不是八套可并存架构。
-
-### P1 — v2 composition 与空 store root
-
-- 建立 v2 composition root、稳定端口和全新 RuntimeStoreRootV2。
-- 建立 Catalog / Session / ToolRecord 三个 owner 的空 schema。
-- 不读取或写入 v1 root。
-
-### P2 — Catalog、workspace identity 与 Session creation
-
-- 实现 private workspaceId -> canonicalRoot。
-- 实现 Project binding 模板、独立 Session 和 immutable creation snapshot。
-- 实现 -C / --workspace 显式绑定；无参数不使用 cwd。
-- 实现普通 view 隐藏路径、管理 view 显示路径。
-- 实现 Project 的有序多目录模板；从文件夹创建项目时只登记第一个目录索引。
-
-### P3 — journal、command 与共享 reducer
-
-- 实现 append-only journal、command idempotency、recovery reducer。
-- 实现 SessionProjection、activities 和当前 run 的 transient assistantDraft。
-- 不加入 executor.started / run.settling。
-- 实现 Session directory-index attach / detach 事件、当前有效目录投影与
-  `run.started.workspaceBindings` 冻结快照。
-
-### P4 — 唯一 Session Loop 与模型输出
-
-- 实现 runAgentLoop、narrative、answer、interaction.request。
-- 实现 plan.intent / plan.respond 的 canonical 生命周期。
-- 实现共享 pendingPlan 响应语义，以及 GUI 卡片、TUI / CLI 编号或自由文本输入、
-  ignore 和 answer-only continuation 的等价适配。
-- 删除 Session 侧重复 continuation。
-
-### P5 — Kernel PreparedEffect 与 Plan coverage
-
-- 将内建 workspace mutation 映射到闭合 PlanOperation。
-- 用同一 PreparedEffect 做 coverage、execution、record。
-- 实现 workspace read 默认 allow、mutation 无 Plan 直接拒绝。
-- 实现 callId + attemptId 和 readRecord。
-
-### P6 — 插件 contributions
-
-- 把 instructions、context、tools、Provider、Memory、Skill、MCP 组合为
-  immutable AgentDeps。
-- 不加入 HMR、generation 或 PluginAdminPort 的模型可调用入口。
-
-### P7 — Shell 收敛与原子 cutover
-
-- CLI 首先消费 v2 ConversationPort / SessionProjection。
-- TUI、GUI 改为同一投影消费者。
-- GUI 落实同一 composer 的 Plan 卡、模型切换和中间 narrative；TUI / CLI 对同一
-  pendingPlan 落实编号选择、自由文本反馈和显式 ignore 输入。
-- 产品入口一次性切到 v2；删除旧可达 authority、continuation、store fallback 和
-  私有 reducer。
-- GUI 文件夹选择、CLI / TUI attach / detach 都提交同一 ConversationPort command；
-  普通页面不显示 canonicalRoot。
-
-### P8 — 真实运行验收与打包
-
-- 运行真实 CLI coding task，再验证 TUI / GUI 共享投影。
-- 验证 Project / workspace / Plan / PreparedEffect / recovery / cancellation。
-- 验证 failed / indeterminate CLI 非零退出。
-- 验证 old history 只读且不能进入执行。
-- 打包 CLI、TUI、GUI，并回收本次启动的进程、端口和临时资源。
-
-## 19. 验证与验收矩阵
-
-### 19.1 已完成的 R0 文本复核
-
-R0 已完成以下合同检查：
-
-- 检查本文内部无第二 Loop、第二 reducer 或第二 workspace mutation authority。
-- 检查 D4–D7 的每项已确认语义均有唯一落点。
-- 检查 Plan 选项、自由输入、忽略按钮、Esc 和 answer-only 分支无 ghost pending
-  state。
-- 检查 Project classification 与 Session binding snapshot 没有混用。
-- 检查 v1 机器合同未被当作 v2 已实现事实。
-
-原 v1 schema、store 和代码不作为本版通过证据。它们由 P1–P5 按 v2 合同原子替换，
-不得形成一半 v1、一半 v2 的可执行合同。
-
-### 19.2 实施后的合同验证
+## 17. 验证与验收矩阵
 
 至少覆盖：
 
@@ -1258,28 +1105,27 @@ R0 已完成以下合同检查：
   选择对应 optionId，其他非空文本产生 feedback，显示编号不进入 journal。
 - 旧 planId 下输入的编号不能被重新解释为新 Plan 的同序号 option。
 - 恢复进程从 journal + readRecord 重建相同 projection，不重复 effect。
-- v1 old pending / workspaceWrite setting / first-root fallback 全部不可达。
 - CLI、TUI、GUI 消费同一 projection contract。
 - Daemon / Host 不包含 Agent continuation switch。
 - 所有验收资源在成功、失败、取消和超时后均由 owner 回收。
 
-局部单测、schema 解析和 UI 截图只能证明对应局部路径，不替代 P8 真实运行验收。
+局部单测、schema 解析和 UI 截图只能证明对应局部路径，不替代真实运行验收。
 
-## 20. R0 决策映射
+## 18. 决策映射
 
 | 决策 | 本合同中的落点 |
 | --- | --- |
 | R0-SCOPE-1 | Kernel PreparedEffect + 精确 authority coverage |
 | R0-JOURNAL-1 | 单一连续 Session journal |
-| R0-SQLITE-1 | v2 三 owner store、rollback journal、FULL synchronous |
+| R0-SQLITE-1 | 当前三 owner store、rollback journal、FULL synchronous |
 | R0-COMMAND-1 | sessionId + commandId exact replay / conflict |
 | R0-EPOCH-1A | callId + attemptId |
-| R0-ABI-1A | v2 端口消息显式 schemaVersion |
+| R0-ABI-1A | 当前端口消息显式 schemaVersion |
 | R0-FACTREAD-1A | KernelPort.readRecord(callId) |
 | R0-ADD-D4 / A1-min | LLM-only 文本、fact-derived activities、无新增两事件、CLI 非零失败 |
 | R0-ADD-D5 / B1 | Host 私有 workspace map、Project 模板、Session snapshot、隐藏路径 |
 | R0-ADD-D6 / C1 | PlanOperation、exact targets、run-scoped authority、同一 PreparedEffect |
-| R0-ADD-D7 / A1+B1+C1 | v2 新 root、旧历史只读、旧 authority 失效、无兼容路径 |
+| R0-ADD-D7 / A1+B1+C1 | 当前 root、非当前数据库拒绝、无历史或兼容路径 |
 | R0-ADD-D8 / C1-PI | typed Provider turn 正文、结构化 blocking control、废止 JSONL 正文 |
 | R0-ADD-D9 / A1-transient | Session 私有 draft、共享投影、GUI 可丢弃缓冲表现状态 |
 | R0-ADD-D10 / K1-min | Provider cache usage、Session 累计 tokenUsage、未知不归零 |
@@ -1296,10 +1142,10 @@ R0-FRAME-1、R0-STREAM-1A 与 R0-MANIFEST-1 的现实需求由选定 IPC 库的�
 stream 生命周期、构建 manifest 和实现测试承担；它们不建立第二套运行时事实、自哈希
 合同包或巨量审计材料。
 
-## 21. 实施门禁
+## 19. 实施门禁
 
-本合同已 LOCKED，由当前主 Agent 按 P1–P8 实施。LOCKED 只授权本合同范围内的本地
-实现与验证，不自动授权 commit、push、PR、发布或破坏旧历史数据。
+本合同已 LOCKED。LOCKED 只授权合同范围内的本地实现与验证，不自动授权 commit、
+push、PR 或发布。
 
 若实际代码暴露本文未裁决的公共 ABI、事实 owner、持久化、权限或验收取舍，则停在
 可恢复边界并提交精确的新裁决点，不用兼容、fallback 或 UI 文案绕过。没有新取舍时，

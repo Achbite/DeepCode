@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = FULL;
-PRAGMA user_version = 3;
+PRAGMA user_version = 1;
 
 CREATE TABLE IF NOT EXISTS tool_records (
     record_id TEXT PRIMARY KEY NOT NULL CHECK(length(record_id) > 0),

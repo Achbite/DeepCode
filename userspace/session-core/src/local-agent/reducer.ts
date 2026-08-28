@@ -2,7 +2,6 @@ import type {
   ActivityProjection,
   AssistantDraftProjection,
   ArtifactProjection,
-  ContextCompositionCategory,
   PendingPlanProjection,
   SessionEvent,
   SessionProjection,
@@ -38,7 +37,7 @@ export function emptySessionState(sessionId: string): SessionState {
   return {
     sessionId,
     revision: 0,
-    display: { title: '新对话', entryKind: 'activeV2' },
+    display: { title: '新对话' },
     creationWorkspaceBindings: [],
     sessionDirectoryIndexes: [],
     workspaceBindings: [],
@@ -104,7 +103,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
 
   switch (event.type) {
     case 'session.created':
-      next.display = { title: event.payload.displayTitle, entryKind: 'activeV2' };
+      next.display = { title: event.payload.displayTitle };
       next.creationWorkspaceBindings = event.payload.workspaceBindings.map((binding) => ({ ...binding }));
       next.sessionDirectoryIndexes = [];
       next.workspaceBindings = effectiveWorkspaceBindings(next);
@@ -333,84 +332,43 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       if (next.contextCompositions.some((receipt) => (
         receipt.providerRequestId === event.payload.providerRequestId
       ))) throw new Error('provider_request_receipt_duplicate');
-      {
-        const legacyCategories = (
-          event.payload as typeof event.payload & { categories?: ContextCompositionCategory[] }
-        ).categories;
-        const structuralParts = [
-          event.payload.messages,
-          event.payload.workspaceBindings,
-          event.payload.tools,
-        ];
-        const presentCount = structuralParts.filter(Array.isArray).length;
-        if (presentCount !== 0 && presentCount !== structuralParts.length) {
-          throw new Error('provider_request_receipt_structure_incomplete');
-        }
-        const hasStructure = presentCount === structuralParts.length;
-        const hasLegacySummary = Array.isArray(legacyCategories);
-        if (hasStructure === hasLegacySummary) {
-          throw new Error('provider_request_receipt_shape_invalid');
-        }
-        const base = {
-          runId: event.runId,
-          providerRequestId: event.payload.providerRequestId,
-          responseConstraint: event.payload.responseConstraint,
-          sequence: event.sequence,
-          createdAt: event.occurredAt,
-        };
-        if (hasStructure) {
-          if (event.payload.partitions) validateContextPartitions(event.payload.partitions);
-          next.contextCompositions.push({
-            ...base,
-            messages: event.payload.messages.map((message) => ({
-              ...message,
-              blocks: message.blocks.map((block) => ({ ...block })),
-              attachments: message.attachments.map((attachment) => ({ ...attachment })),
-            })),
-            workspaceBindings: event.payload.workspaceBindings.map((binding) => ({ ...binding })),
-            tools: event.payload.tools.map((tool) => ({ ...tool })),
-            ...(event.payload.partitions
-              ? { partitions: event.payload.partitions.map((partition) => ({ ...partition })) }
-              : {}),
-          });
-        } else {
-          if (!legacyCategories) throw new Error('provider_request_receipt_shape_invalid');
-          next.contextCompositions.push({
-            ...base,
-            categories: legacyCategories.map((category) => ({
-              ...category,
-              items: category.items.map((item) => ({ ...item })),
-            })),
-          });
-        }
-      }
+      validateContextPartitions(event.payload.partitions);
+      next.contextCompositions.push({
+        runId: event.runId,
+        providerRequestId: event.payload.providerRequestId,
+        responseConstraint: event.payload.responseConstraint,
+        messages: event.payload.messages.map((message) => ({
+          ...message,
+          blocks: message.blocks.map((block) => ({ ...block })),
+          attachments: message.attachments.map((attachment) => ({ ...attachment })),
+        })),
+        workspaceBindings: event.payload.workspaceBindings.map((binding) => ({ ...binding })),
+        tools: event.payload.tools.map((tool) => ({ ...tool })),
+        partitions: event.payload.partitions.map((partition) => ({ ...partition })),
+        sequence: event.sequence,
+        createdAt: event.occurredAt,
+      });
       break;
     case 'context.updated': {
       assertRunningRun(next, event.runId, 'provider_usage_run_not_active');
       const providerRequestId = event.payload.providerRequestId;
-      if (typeof providerRequestId === 'string' && providerRequestId.length > 0) {
-        const receiptIndex = next.contextCompositions.findIndex((receipt) => (
-          receipt.runId === event.runId
-          && receipt.providerRequestId === providerRequestId
-        ));
-        if (receiptIndex < 0) throw new Error('provider_request_receipt_missing');
-        const receipt = next.contextCompositions[receiptIndex];
-        if (receipt.messages && receipt.partitions) {
-          next.contextCompositions[receiptIndex] = {
-            ...receipt,
-            partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
-          };
-        }
-        next.contextUsage = {
-          ...event.payload,
-          providerRequestId,
-          runId: event.runId,
-          sequence: event.sequence,
-          updatedAt: event.occurredAt,
-        };
-      }
-      // Schema 4 history predates request receipts. Its token facts remain usable,
-      // but recovery must not invent a provider request identity or composition.
+      const receiptIndex = next.contextCompositions.findIndex((receipt) => (
+        receipt.runId === event.runId
+        && receipt.providerRequestId === providerRequestId
+      ));
+      if (receiptIndex < 0) throw new Error('provider_request_receipt_missing');
+      const receipt = next.contextCompositions[receiptIndex];
+      next.contextCompositions[receiptIndex] = {
+        ...receipt,
+        partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
+      };
+      next.contextUsage = {
+        ...event.payload,
+        providerRequestId,
+        runId: event.runId,
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
       next.tokenUsage = {
         providerCallCount: addTokenCount(next.tokenUsage.providerCallCount, 1),
         inputTokens: addTokenCount(next.tokenUsage.inputTokens, event.payload.inputTokens),
@@ -623,27 +581,16 @@ function cloneTodoList(todoList: SessionProjection['todoList']): SessionProjecti
 function cloneContextComposition(
   receipt: SessionProjection['contextCompositions'][number],
 ): SessionProjection['contextCompositions'][number] {
-  if (receipt.messages) {
-    return {
-      ...receipt,
-      messages: receipt.messages.map((message) => ({
-        ...message,
-        blocks: message.blocks.map((block) => ({ ...block })),
-        attachments: message.attachments.map((attachment) => ({ ...attachment })),
-      })),
-      workspaceBindings: receipt.workspaceBindings.map((binding) => ({ ...binding })),
-      tools: receipt.tools.map((tool) => ({ ...tool })),
-      ...(receipt.partitions
-        ? { partitions: receipt.partitions.map((partition) => ({ ...partition })) }
-        : {}),
-    };
-  }
   return {
     ...receipt,
-    categories: receipt.categories.map((category) => ({
-      ...category,
-      items: category.items.map((item) => ({ ...item })),
+    messages: receipt.messages.map((message) => ({
+      ...message,
+      blocks: message.blocks.map((block) => ({ ...block })),
+      attachments: message.attachments.map((attachment) => ({ ...attachment })),
     })),
+    workspaceBindings: receipt.workspaceBindings.map((binding) => ({ ...binding })),
+    tools: receipt.tools.map((tool) => ({ ...tool })),
+    partitions: receipt.partitions.map((partition) => ({ ...partition })),
   };
 }
 
@@ -658,7 +605,7 @@ const CONTEXT_PARTITION_ORDER = [
 ] as const;
 
 function validateContextPartitions(
-  partitions: NonNullable<Extract<SessionEvent, { type: 'context.composed' }>['payload']['partitions']>,
+  partitions: Extract<SessionEvent, { type: 'context.composed' }>['payload']['partitions'],
 ): void {
   if (
     partitions.length !== CONTEXT_PARTITION_ORDER.length

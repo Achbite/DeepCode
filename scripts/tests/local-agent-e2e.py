@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证 v2 Catalog、Session、Plan、Kernel 与三个 UI 壳的真实本地链路。"""
+"""验证当前 Catalog、Session、Plan、Kernel 与三个 UI 壳的真实本地链路。"""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ SESSION_BRIDGE = runtime_path(
     ROOT / "userspace" / "session-core" / "dist" / "sessionServiceBridge.js",
 )
 HOST_TOKEN_HEADER = "x-deepcode-host-shell-token"
-COMMAND_VERSION = "deepcode.command.v2"
+COMMAND_VERSION = "deepcode.command"
 EXPECTED_CONTENT = "created once\n"
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 MARKERS = ("EXECUTE", "FEEDBACK", "IGNORE", "CANCEL", "FAIL", "TODO")
@@ -203,7 +203,7 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
         if marker == "FAIL":
             self._send_tool_call(
                 "正在提交一个字段非法的 Plan 以验证失败边界。",
-                "plan:invalid",
+                f"plan:invalid:{ordinal}",
                 "plan__intent",
                 {"prompt": "这个 Plan 缺少可用选项。", "options": []},
             )
@@ -664,7 +664,7 @@ def projection(daemon: OwnedDaemon, session_id: str) -> dict[str, Any]:
         token=daemon.token,
     )
     require(isinstance(value, dict), "SessionProjection 不是对象")
-    require(value.get("schemaVersion") == "deepcode.session-projection.v2", "投影版本不是 v2")
+    require(value.get("schemaVersion") == "deepcode.session-projection", "投影协议不是当前值")
     require(value.get("sessionId") == session_id, "SessionProjection identity 漂移")
     return value
 
@@ -1140,7 +1140,11 @@ def assert_shells_read_shared_projection(
 
     tui = run_tui(daemon, session_id, smoke=True)
     require(tui.returncode == 0, f"TUI 读取共享投影失败：{tui.stderr}")
-    require("DeepCode TUI · shared SessionProjection" in tui.stdout, "TUI 未走共享投影")
+    require(
+        tui.stdout.startswith("DeepCode TUI\n")
+        and f"session={session_id} revision={expected_revision}" in tui.stdout,
+        "TUI 未从当前共享投影渲染精确 Session 身份",
+    )
     require(
         f"session={session_id} revision={expected_revision}" in tui.stdout,
         "TUI 没有读取预期 SessionProjection revision",
@@ -1276,17 +1280,17 @@ def inspect_sqlite(
     execute_workspace_id: str,
     expected_todo_workspace_id: str,
 ) -> None:
-    runtime_root = config_root / "runtime" / "local-agent-v2"
+    runtime_root = config_root / "runtime" / "agent-runtime"
     catalog_path = runtime_root / "catalog.sqlite3"
     session_path = runtime_root / "session.sqlite3"
     record_path = runtime_root / "tool-record.sqlite3"
     expected_versions = {
-        catalog_path: 3,
-        session_path: 6,
-        record_path: 3,
+        catalog_path: 1,
+        session_path: 1,
+        record_path: 1,
     }
     for path, expected_version in expected_versions.items():
-        require(path.is_file(), f"v2 Store 未落盘：{path.name}")
+        require(path.is_file(), f"当前 Store 未落盘：{path.name}")
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             require(
@@ -1309,7 +1313,7 @@ def inspect_sqlite(
                 "payload": json.loads(encoded),
             }
             by_session.setdefault(session_id, []).append(event)
-        require(set(by_session) == set(expected_runs), "Session Store 出现意外 active Session")
+        require(set(by_session) == set(expected_runs), "Session Store 出现意外 Session")
         for session_id, events in by_session.items():
             require(
                 [event["sequence"] for event in events] == list(range(1, len(events) + 1)),
@@ -1529,14 +1533,25 @@ def inspect_sqlite(
         session_ids = {
             row[0] for row in connection.execute("SELECT session_id FROM session_catalog")
         }
-        require(session_ids == set(expected_runs), "Catalog 和 Session Store active Session 不一致")
-        entries = connection.execute(
-            "SELECT DISTINCT entry_kind FROM session_catalog"
-        ).fetchall()
-        require(entries == [("activeV2",)], "新执行路径包含非 activeV2 条目")
+        require(session_ids == set(expected_runs), "Catalog 和 Session Store 的 Session 不一致")
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(session_catalog)")
+        }
+        require(
+            columns == {
+                "session_id",
+                "title",
+                "project_id",
+                "workspace_bindings_json",
+                "profile_id",
+                "created_at",
+                "updated_at",
+            },
+            f"Catalog Session 列不符合当前合同：{sorted(columns)}",
+        )
 
 
-def write_configuration(config_root: Path, provider_url: str) -> tuple[Path, Path]:
+def write_configuration(config_root: Path, provider_url: str) -> None:
     settings = config_root / "config" / "user" / "local" / "settings"
     settings.mkdir(parents=True)
     profile = {
@@ -1570,22 +1585,13 @@ def write_configuration(config_root: Path, provider_url: str) -> tuple[Path, Pat
         json.dumps(profile, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    legacy_settings = {
+    user_settings = {
         "gui.colorTheme": "light",
-        "agent.permissions.workspaceRead": "deny",
-        "agent.permissions.workspaceWrite": "allow",
     }
     (settings / "user-settings.json").write_text(
-        json.dumps(legacy_settings, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(user_settings, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    legacy_root = config_root / "sessions"
-    legacy_root.mkdir()
-    legacy_session = legacy_root / "agent-runtime-v1.sqlite3"
-    legacy_tool = legacy_root / "kernel-tool-records-v1.sqlite3"
-    legacy_session.write_bytes(b"legacy-session-history-must-remain-byte-identical\n")
-    legacy_tool.write_bytes(b"legacy-tool-history-must-remain-byte-identical\n")
-    return legacy_session, legacy_tool
 
 
 def main() -> None:
@@ -1596,7 +1602,7 @@ def main() -> None:
     daemon_one: OwnedDaemon | None = None
     daemon_two: OwnedDaemon | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="deepcode-local-agent-v2-e2e-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="deepcode-agent-runtime-e2e-") as temporary:
             root = Path(temporary)
             config_root = root / "config-root"
             primary = root / "primary-workspace"
@@ -1606,9 +1612,7 @@ def main() -> None:
             secondary.mkdir()
             provider_state.forbid_roots([primary, secondary])
             provider_url = f"http://127.0.0.1:{provider_server.server_port}/v1"
-            legacy_session, legacy_tool = write_configuration(config_root, provider_url)
-            legacy_session_bytes = legacy_session.read_bytes()
-            legacy_tool_bytes = legacy_tool.read_bytes()
+            write_configuration(config_root, provider_url)
 
             daemon_one = OwnedDaemon(config_root)
             daemon_one.start()
@@ -1618,12 +1622,8 @@ def main() -> None:
                 token=daemon_one.token,
             )
             require(
-                "agent.permissions.workspaceRead" not in settings,
-                "旧 workspaceRead 设置仍生效",
-            )
-            require(
-                "agent.permissions.workspaceWrite" not in settings,
-                "旧 workspaceWrite 设置仍生效",
+                settings.get("settings", {}).get("gui.colorTheme") == "light",
+                "当前用户设置没有进入 Host 投影",
             )
             exercise_catalog(daemon_one, primary, secondary)
 
@@ -1645,7 +1645,7 @@ def main() -> None:
             require(provider_state.count("FEEDBACK") == 2, "FEEDBACK Provider 调用数错误")
             require(provider_state.count("IGNORE") == 2, "IGNORE Provider 调用数错误")
             require(provider_state.count("CANCEL") == 1, "CANCEL Provider 调用数错误")
-            require(provider_state.count("FAIL") == 1, "FAIL Provider 调用数错误")
+            require(provider_state.count("FAIL") == 2, "FAIL Provider 调用数错误")
             require(provider_state.count("TODO") == 3, "TODO Provider 调用数错误")
             require(
                 provider_state.models("EXECUTE") == [
@@ -1677,9 +1677,6 @@ def main() -> None:
                 workspace_id,
                 todo_workspace_id,
             )
-            require(legacy_session.read_bytes() == legacy_session_bytes, "旧 Session Store 被改写")
-            require(legacy_tool.read_bytes() == legacy_tool_bytes, "旧 ToolRecord Store 被改写")
-
             daemon_two = OwnedDaemon(config_root)
             daemon_two.start()
             recovered = projection(daemon_two, execute_session)
@@ -1722,11 +1719,9 @@ def main() -> None:
                 workspace_id,
                 todo_workspace_id,
             )
-            require(legacy_session.read_bytes() == legacy_session_bytes, "重启读取了旧 Session Store")
-            require(legacy_tool.read_bytes() == legacy_tool_bytes, "重启读取了旧 ToolRecord Store")
             print(
                 "[local-agent-e2e] PASS "
-                "v2-plan/todo/catalog/snapshot/replay/restart/cli/tui/failure"
+                "plan/todo/catalog/snapshot/replay/restart/cli/tui/failure"
             )
     finally:
         provider_state.release_cancel.set()

@@ -248,7 +248,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
     throw new Error('provider_event_invalid');
   }
   if (
-    value.schemaVersion !== 'deepcode.provider-event.v2'
+    value.schemaVersion !== 'deepcode.provider-event'
     || !isNonEmptyText(value.requestId)
     || !isRecord(value.data)
   ) throw new Error('provider_event_invalid');

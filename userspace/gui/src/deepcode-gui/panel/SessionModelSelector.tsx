@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  ContextCompositionCategoryKind,
+  ContextCompositionPartitionKind,
   ContextCompositionProjection,
   ContextUsageProjection,
   LlmProviderProfile,
@@ -14,11 +14,10 @@ interface SessionModelSelectorProps {
   contextUsage: ContextUsageProjection | null;
   contextCompositions: readonly ContextCompositionProjection[];
   busy?: boolean;
-  readOnly?: boolean;
   onProfileChange: (profileId: string) => void | Promise<void>;
 }
 
-type ContextFocusKey = 'input' | 'output' | 'free' | ContextCompositionCategoryKind;
+type ContextFocusKey = 'input' | 'output' | 'free' | ContextCompositionPartitionKind;
 
 interface ContextDisplayMetric {
   key: ContextFocusKey;
@@ -29,16 +28,6 @@ interface ContextDisplayMetric {
   estimated?: boolean;
 }
 
-const CONTEXT_SECTION_ORDER: readonly ContextCompositionCategoryKind[] = [
-  'instructions',
-  'sessionControls',
-  'tools',
-  'workspaceBindings',
-  'contextProviders',
-  'journalMessages',
-  'messageAttachments',
-];
-
 const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   language,
   profiles,
@@ -46,7 +35,6 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   contextUsage,
   contextCompositions,
   busy = false,
-  readOnly = false,
   onProfileChange,
 }) => {
   const [contextOpen, setContextOpen] = useState(false);
@@ -241,12 +229,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           </div>
         </section>
       )}
-      {readOnly ? (
-        <span className="deepcode-session-model__history-label">
-          {language === 'zh-CN' ? '旧版只读历史' : 'Legacy read-only history'}
-        </span>
-      ) : (
-        <label className="deepcode-session-model__selector" title={title}>
+      <label className="deepcode-session-model__selector" title={title}>
           <span className="deepcode-session-model__label">
             {t(language, 'agent.profile.selector')}
           </span>
@@ -271,8 +254,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
               </option>
             ))}
           </select>
-        </label>
-      )}
+      </label>
     </div>
   );
 };
@@ -322,37 +304,15 @@ function buildRequestSections(
   language: UiLanguage,
 ): ContextDisplayMetric[] {
   if (!receipt) return [];
-  if (receipt.partitions) {
-    return receipt.partitions.map((partition) => ({
-      key: partition.kind,
-      label: contextCategoryLabel(partition.kind, language),
-      tokens: partition.tokenSource === 'sessionEstimated'
-        ? partition.estimatedInputTokens ?? null
-        : null,
-      percent: null,
-      itemCount: partition.itemCount,
-      estimated: partition.tokenSource === 'sessionEstimated',
-    }));
-  }
-  const counts = Object.fromEntries(
-    CONTEXT_SECTION_ORDER.map((kind) => [kind, 0]),
-  ) as Record<ContextCompositionCategoryKind, number>;
-  if (receipt.messages) {
-    for (const message of receipt.messages) {
-      counts[message.contributionKind] += 1;
-      counts.messageAttachments += message.attachments.length;
-    }
-    counts.workspaceBindings += receipt.workspaceBindings.length;
-    counts.tools += receipt.tools.length;
-  } else {
-    for (const category of receipt.categories) counts[category.kind] += category.itemCount;
-  }
-  return CONTEXT_SECTION_ORDER.map((kind) => ({
-    key: kind,
-    label: contextCategoryLabel(kind, language),
-    tokens: null,
+  return receipt.partitions.map((partition) => ({
+    key: partition.kind,
+    label: contextPartitionLabel(partition.kind, language),
+    tokens: partition.tokenSource === 'sessionEstimated'
+      ? partition.estimatedInputTokens ?? null
+      : null,
     percent: null,
-    itemCount: counts[kind],
+    itemCount: partition.itemCount,
+    estimated: partition.tokenSource === 'sessionEstimated',
   }));
 }
 
@@ -369,11 +329,11 @@ function buildCacheMetric(usage: ContextUsageProjection | null): {
   return { hit, miss, percent: percentOf(hit, hit + miss) };
 }
 
-function contextCategoryLabel(
-  kind: ContextCompositionCategoryKind,
+function contextPartitionLabel(
+  kind: ContextCompositionPartitionKind,
   language: UiLanguage,
 ): string {
-  const labels: Record<ContextCompositionCategoryKind, readonly [string, string]> = {
+  const labels: Record<ContextCompositionPartitionKind, readonly [string, string]> = {
     instructions: ['系统与会话指令', 'System and session instructions'],
     workspaceBindings: ['目录索引', 'Directory indexes'],
     sessionControls: ['Session 控制接口', 'Session controls'],

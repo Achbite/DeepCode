@@ -120,12 +120,10 @@ For providers that require a reasoning field to be echoed across a tool continua
 8. The model selector remains available during the conversation and changes subsequent Provider turns.
 9. Messages, Plan state, activities, artifacts, context usage, and run status all come from the shared projection.
 10. A committed Assistant answer can be copied, rated up or down, or have its rating cleared. Ratings are durable local Session facts, recover after restart, are not stored by the GUI, and are not sent to the Provider.
-11. Click the context ball in the composer to inspect the categories actually used by the current Provider request. Settings shows aggregate usage and per-round token consumption newest first, 10 rows per page. Session aggregates every Provider call in a round; the GUI does not recompute it. Usage retained from pre-upgrade schema 4 remains in the statistics, but no request composition is invented for those historical calls.
+11. Click the context ball in the composer to inspect the current Provider request partitions. Per-partition item counts and estimates come from Session; cache hit and miss counts come from Provider usage. Missing facts display `N/A`, and GUI/TUI do not attribute or recompute them. Settings shows Session-aggregated per-round token consumption newest first, 10 rows per page.
 12. For complex work, the LLM explicitly submits Todo state through the structured `todo.update` control call. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
 
-Deleting an active-v2 Session deletes the conversation catalog entry and its complete active archive: Session events, command replay rows, binding relations, and Kernel tool records. An active run must be stopped first. Read-only legacy history is preserved by the hard cut and cannot be deleted through the v2 execution path.
-
-When legacy history exists, a separate Host read-only adapter merges it into the conversation list and labels it as legacy read-only history. It is not persisted in the active-v2 Catalog and cannot continue a conversation, change its model, write feedback, or invoke the active-v2 delete command; the GUI may still copy Assistant text. This path restores only facts present in the original archive and does not introduce dual reads, dual writes, or legacy-schema migration.
+Deleting a Session deletes the conversation catalog entry and its complete archive: Session events, command replay rows, binding relations, and Kernel tool records. An active run must be stopped first.
 
 ## CLI
 
@@ -182,17 +180,16 @@ The default configuration root contains:
 config/user/local/settings/llm-profiles.json  Model profiles
 config/user/local/settings/user-settings.json User settings
 config/user/local/secrets/                    Local secrets
-runtime/local-agent-v2/catalog.sqlite3        Host-private project/workspace catalog
-runtime/local-agent-v2/session.sqlite3        Session journal and command replay
-runtime/local-agent-v2/tool-record.sqlite3    Kernel tool-result records
-sessions/                                     Read-only legacy history, when present
+runtime/agent-runtime/catalog.sqlite3        Host-private project/workspace catalog
+runtime/agent-runtime/session.sqlite3        Session journal and command replay
+runtime/agent-runtime/tool-record.sqlite3    Kernel tool-result records
 logs/                                         Launcher or Kernel logs when emitted
 ```
 
 Set `DEEPCODE_CONFIG_DIR` to select another root. Interfaces must use the same root to share Sessions.
-The packaged `session-core/` directory contains Session Runtime code, not conversation archives. Active-v2 conversation history lives in `runtime/local-agent-v2/session.sqlite3`; `sessions/` is only the preserved legacy history root.
+The packaged `session-core/` directory contains Session Runtime code, not conversation archives. Conversation history lives in `runtime/agent-runtime/session.sqlite3`.
 
-Within `contracts/agent-runtime-v2/`, `catalog.sql`, `session.sql`, and `tool-record.sql` are the current creation contracts for the three fact owners. The `*-to-*.sql` files are exact one-way migrations from one known schema version to the next, not alternate runtime paths. See [contracts/agent-runtime-v2/README.md](contracts/agent-runtime-v2/README.md) for the full version chain.
+Within `contracts/agent-runtime/`, `catalog.sql`, `session.sql`, and `tool-record.sql` are the current creation contracts for the three fact owners. Runtime opens only this exact schema and rejects other database versions; there is no migration or alternate history path. See [contracts/agent-runtime/README.md](contracts/agent-runtime/README.md).
 
 ## Troubleshooting
 

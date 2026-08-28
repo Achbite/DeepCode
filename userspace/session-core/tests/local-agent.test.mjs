@@ -80,12 +80,27 @@ test('累计 token 用量超过安全整数边界时拒绝生成不精确投影'
     runId: 'run:usage-overflow',
     providerRequestId: 'provider-request:usage-overflow',
     responseConstraint: 'normal',
-    categories: [],
+    messages: [],
+    workspaceBindings: [],
+    tools: [],
+    partitions: [
+      ['instructions', 1],
+      ['sessionControls', 0],
+      ['tools', 0],
+      ['workspaceBindings', 0],
+      ['contextProviders', 0],
+      ['journalMessages', 0],
+      ['messageAttachments', 0],
+    ].map(([kind, requestShapeUnits]) => ({
+      kind,
+      itemCount: 0,
+      requestShapeUnits,
+    })),
     sequence: 1,
     createdAt: '2026-08-25T00:00:00.000Z',
   });
   assert.throws(() => reduceSession(state, {
-    schemaVersion: 'deepcode.session-event.v2',
+    schemaVersion: 'deepcode.session-event',
     eventId: 'event:usage-overflow',
     sessionId: 'session:usage-overflow',
     sequence: 1,
@@ -122,7 +137,7 @@ test('Provider 用量没有对应请求回执时拒绝进入共享投影', () =>
     cacheReportedCallCount: 0,
   };
   assert.throws(() => reduceSession(state, {
-    schemaVersion: 'deepcode.session-event.v2',
+    schemaVersion: 'deepcode.session-event',
     eventId: 'event:usage-without-receipt',
     sessionId: 'session:usage-without-receipt',
     sequence: 1,
@@ -136,94 +151,6 @@ test('Provider 用量没有对应请求回执时拒绝进入共享投影', () =>
       contextWindowTokens: 100,
     },
   }), /provider_request_receipt_missing/);
-});
-
-test('schema 5 分类摘要只按旧事实恢复，不伪造新的 Provider 请求结构', () => {
-  const state = emptySessionState('session:legacy-context');
-  state.run = {
-    runId: 'run:legacy-context',
-    status: 'running',
-    workspaceBindings: [],
-  };
-  const restored = reduceSession(state, {
-    schemaVersion: 'deepcode.session-event.v2',
-    eventId: 'event:legacy-context',
-    sessionId: 'session:legacy-context',
-    sequence: 1,
-    occurredAt: '2026-08-25T00:00:00.000Z',
-    type: 'context.composed',
-    runId: 'run:legacy-context',
-    payload: {
-      providerRequestId: 'provider-request:legacy-context',
-      responseConstraint: 'normal',
-      categories: [{
-        kind: 'journalMessages',
-        itemCount: 1,
-        items: [{ itemId: 'message:legacy-context', label: '用户消息' }],
-      }],
-    },
-  });
-  const receipt = restored.contextCompositions.at(-1);
-  assert.deepEqual(receipt.categories, [{
-    kind: 'journalMessages',
-    itemCount: 1,
-    items: [{ itemId: 'message:legacy-context', label: '用户消息' }],
-  }]);
-  assert.equal('messages' in receipt, false);
-  assert.equal('workspaceBindings' in receipt, false);
-  assert.equal('tools' in receipt, false);
-});
-
-test('schema 4 历史用量在不伪造请求回执的前提下恢复为逐轮统计', () => {
-  const state = emptySessionState('session:legacy-usage');
-  state.revision = 1;
-  state.run = {
-    runId: 'run:legacy-usage',
-    status: 'running',
-    workspaceBindings: [],
-  };
-  state.tokenUsageHistory['run:legacy-usage'] = {
-    runId: 'run:legacy-usage',
-    inputMessageId: 'message:legacy-usage',
-    title: '历史用量',
-    sequence: 1,
-    startedAt: '2026-08-24T00:00:00.000Z',
-    providerCallCount: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheMissInputTokens: 0,
-    cacheReportedCallCount: 0,
-  };
-  const recovered = reduceSession(state, {
-    schemaVersion: 'deepcode.session-event.v2',
-    eventId: 'event:legacy-usage',
-    sessionId: 'session:legacy-usage',
-    sequence: 2,
-    occurredAt: '2026-08-24T00:00:01.000Z',
-    type: 'context.updated',
-    runId: 'run:legacy-usage',
-    payload: {
-      inputTokens: 100,
-      outputTokens: 20,
-      contextWindowTokens: 1_000,
-      cacheReadInputTokens: 70,
-      cacheMissInputTokens: 30,
-    },
-  });
-  const projection = projectSession(recovered);
-  assert.equal(projection.contextUsage, null);
-  assert.equal(projection.contextCompositions.length, 0);
-  assert.deepEqual(projection.tokenUsage, {
-    providerCallCount: 1,
-    inputTokens: 100,
-    outputTokens: 20,
-    cacheReadInputTokens: 70,
-    cacheMissInputTokens: 30,
-    cacheReportedCallCount: 1,
-  });
-  assert.equal(projection.tokenUsageHistory[0].inputTokens, 100);
-  assert.equal(projection.tokenUsageHistory[0].outputTokens, 20);
 });
 
 test('Profile 与 workspace creation snapshot 写入 Journal 并用于恢复', async () => {
@@ -296,7 +223,7 @@ test('对话目录索引进入 Journal，当前 run 冻结目录集合且变更�
   });
 
   assert.equal((await actor.submit({
-    schemaVersion: 'deepcode.command.v2',
+    schemaVersion: 'deepcode.command',
     type: 'session.directory-index.attach',
     commandId: 'command:attach-extra',
     sessionId,
@@ -309,7 +236,7 @@ test('对话目录索引进入 Journal，当前 run 冻结目录集合且变更�
   assert.deepEqual((await actor.snapshot()).run.workspaceBindings, [binding, extra]);
 
   assert.equal((await actor.submit({
-    schemaVersion: 'deepcode.command.v2',
+    schemaVersion: 'deepcode.command',
     type: 'session.directory-index.attach',
     commandId: 'command:attach-later',
     sessionId,
@@ -326,7 +253,7 @@ test('对话目录索引进入 Journal，当前 run 冻结目录集合且变更�
   assert.deepEqual(requests[1], [binding, extra, later]);
 
   assert.equal((await actor.submit({
-    schemaVersion: 'deepcode.command.v2',
+    schemaVersion: 'deepcode.command',
     type: 'session.directory-index.detach',
     commandId: 'command:detach-extra',
     sessionId,
@@ -562,7 +489,7 @@ test('回答反馈作为 Session durable fact 写入 Journal、支持回放和�
   await actor.submit(message(sessionId, 'command:feedback-run', '请回答'));
   await waitFor(actor, (projection) => projection.run?.status === 'completed');
   const feedbackCommand = {
-    schemaVersion: 'deepcode.command.v2',
+    schemaVersion: 'deepcode.command',
     type: 'message.feedback.set',
     commandId: 'command:feedback-up',
     sessionId,
@@ -623,7 +550,6 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
   assert.equal(eventsBeforeProvider.some((event) => event.type === 'context.updated'), false);
   const receipt = completed.contextCompositions.at(-1);
   assert.equal(receipt.providerRequestId, completed.contextUsage.providerRequestId);
-  assert.equal('categories' in receipt, false);
   assert.deepEqual(receipt.messages.map((entry) => ({
     messageIndex: entry.messageIndex,
     role: entry.role,
@@ -876,7 +802,7 @@ test('非 workspace effect 通过独立 approval 事实采集决定并沿同一 
       executions.push(request);
       if (executions.length === 1) {
         return {
-          schemaVersion: 'deepcode.kernel-reply.v2',
+          schemaVersion: 'deepcode.kernel-reply',
           type: 'tool.execution',
           requestId: request.requestId,
           callId: request.callId,
@@ -1286,7 +1212,7 @@ test('取消命令先持久化，再中止活动 Provider 流并收敛为 cancel
   await started;
   const running = await waitFor(actor, (p) => p.run?.status === 'running');
   const command = {
-    schemaVersion: 'deepcode.command.v2',
+    schemaVersion: 'deepcode.command',
     type: 'run.cancel',
     commandId: 'command:cancel',
     sessionId: 'session:cancel',
@@ -1350,7 +1276,7 @@ function emptyKernel() {
 
 function cancelNotFound(callId, attemptId) {
   return {
-    schemaVersion: 'deepcode.kernel-reply.v2',
+    schemaVersion: 'deepcode.kernel-reply',
     type: 'tool.cancelled',
     requestId: 'cancel:unused',
     callId,
@@ -1361,7 +1287,7 @@ function cancelNotFound(callId, attemptId) {
 
 function executionReply(request, authority, logicalTarget = 'example') {
   return {
-    schemaVersion: 'deepcode.kernel-reply.v2',
+    schemaVersion: 'deepcode.kernel-reply',
     type: 'tool.execution',
     requestId: request.requestId,
     callId: request.callId,
@@ -1395,12 +1321,12 @@ function executionReply(request, authority, logicalTarget = 'example') {
 }
 
 function providerEvent(requestId, type, data) {
-  return { schemaVersion: 'deepcode.provider-event.v2', requestId, type, data };
+  return { schemaVersion: 'deepcode.provider-event', requestId, type, data };
 }
 
 function message(sessionId, commandId, text, profileId, attachments) {
   return {
-    schemaVersion: 'deepcode.command.v2',
+    schemaVersion: 'deepcode.command',
     type: 'message.submit',
     commandId,
     sessionId,
@@ -1412,28 +1338,28 @@ function message(sessionId, commandId, text, profileId, attachments) {
 
 function profile(sessionId, commandId, runId, profileId) {
   return {
-    schemaVersion: 'deepcode.command.v2', type: 'run.profile.select',
+    schemaVersion: 'deepcode.command', type: 'run.profile.select',
     commandId, sessionId, runId, profileId,
   };
 }
 
 function interaction(sessionId, commandId, runId, interactionId, response) {
   return {
-    schemaVersion: 'deepcode.command.v2', type: 'interaction.respond',
+    schemaVersion: 'deepcode.command', type: 'interaction.respond',
     commandId, sessionId, runId, interactionId, response,
   };
 }
 
 function approval(sessionId, commandId, runId, callId, approvalId, decision) {
   return {
-    schemaVersion: 'deepcode.command.v2', type: 'approval.respond',
+    schemaVersion: 'deepcode.command', type: 'approval.respond',
     commandId, sessionId, runId, callId, approvalId, decision,
   };
 }
 
 function planResponse(sessionId, commandId, runId, planId, response) {
   return {
-    schemaVersion: 'deepcode.command.v2', type: 'plan.respond',
+    schemaVersion: 'deepcode.command', type: 'plan.respond',
     commandId, sessionId, runId, planId, response,
   };
 }

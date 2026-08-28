@@ -936,7 +936,7 @@ fn provider_event(request_id: &str, event_type: &str, data: Value) -> String {
     sse_json_event(
         "provider_event",
         json!({
-            "schemaVersion": "deepcode.provider-event.v2",
+            "schemaVersion": "deepcode.provider-event",
             "requestId": request_id,
             "type": event_type,
             "data": data,

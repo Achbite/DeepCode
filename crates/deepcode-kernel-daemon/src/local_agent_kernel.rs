@@ -15,13 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const KERNEL_REQUEST_VERSION: &str = "deepcode.kernel-request.v2";
-const KERNEL_REPLY_VERSION: &str = "deepcode.kernel-reply.v2";
-const TOOL_RECORD_SCHEMA: &str =
-    include_str!("../../../contracts/agent-runtime-v2/tool-record.sql");
-const TOOL_RECORD_V2_TO_V3: &str =
-    include_str!("../../../contracts/agent-runtime-v2/tool-record-v2-to-v3.sql");
-const TOOL_RECORD_STORE_VERSION: u32 = 3;
+const KERNEL_REQUEST_VERSION: &str = "deepcode.kernel-request";
+const KERNEL_REPLY_VERSION: &str = "deepcode.kernel-reply";
+const TOOL_RECORD_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/tool-record.sql");
+const TOOL_RECORD_STORE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalAgentKernelError {
@@ -856,23 +853,13 @@ impl LocalToolRecordStore {
                 LocalAgentKernelError::new("tool_record_store_version_failed", error.to_string())
             })?;
         match version {
-            0 if !existed || sqlite_is_empty(&connection)? => connection
-                .execute_batch(TOOL_RECORD_SCHEMA)
-                .map_err(|error| {
+            0 if !existed || sqlite_is_empty(&connection)? => {
+                connection.execute_batch(TOOL_RECORD_SCHEMA).map_err(|error| {
                     LocalAgentKernelError::new(
                         "tool_record_schema_failed",
-                        format!("创建 ToolRecord v2 schema 失败：{error}"),
+                        format!("创建 ToolRecord schema 失败：{error}"),
                     )
-                })?,
-            2 => {
-                connection
-                    .execute_batch(TOOL_RECORD_V2_TO_V3)
-                    .map_err(|error| {
-                        LocalAgentKernelError::new(
-                            "tool_record_store_v2_to_v3_failed",
-                            error.to_string(),
-                        )
-                    })?;
+                })?;
                 verify_tool_record_store(&connection)?;
                 verify_tool_record_store_version(&connection)?;
             }
@@ -883,9 +870,7 @@ impl LocalToolRecordStore {
             other => {
                 return Err(LocalAgentKernelError::new(
                     "tool_record_store_version_unsupported",
-                    format!(
-                        "ToolRecord Store 版本 {other} 不是当前 active-v2 store；hard cut 只接受 schema 2 的单向升级或 schema 3。"
-                    ),
+                    format!("ToolRecord Store schema {other} 不受支持；当前只接受 schema {TOOL_RECORD_STORE_VERSION}。"),
                 ))
             }
         }
@@ -1370,8 +1355,10 @@ fn verify_tool_record_store_version(connection: &Connection) -> Result<(), Local
         })?;
     if version != TOOL_RECORD_STORE_VERSION {
         return Err(LocalAgentKernelError::new(
-            "tool_record_store_migration_incomplete",
-            format!("ToolRecord Store schema 迁移后版本仍为 {version}。"),
+            "tool_record_store_version_mismatch",
+            format!(
+                "ToolRecord Store schema {version} 不是当前 schema {TOOL_RECORD_STORE_VERSION}。"
+            ),
         ));
     }
     Ok(())
@@ -1394,44 +1381,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_record_store_v2_migrates_to_session_purge_capable_v3() {
+    fn noncurrent_tool_record_store_is_rejected() {
         let path = std::env::temp_dir().join(format!(
-            "deepcode-tool-record-v2-{}.sqlite3",
+            "deepcode-tool-record-outdated-{}.sqlite3",
             random_id("test").unwrap().replace(':', "-")
         ));
-        let v2_schema = format!(
-            "{}\n{}",
-            TOOL_RECORD_SCHEMA.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;"),
-            "CREATE TRIGGER tool_records_are_not_deleted
-             BEFORE DELETE ON tool_records BEGIN
-                 SELECT RAISE(ABORT, 'tool records are immutable');
-             END;"
-        );
-        {
-            let connection = Connection::open(&path).expect("open v2 tool store");
-            connection
-                .execute_batch(&v2_schema)
-                .expect("create v2 schema");
-        }
-        let store = LocalToolRecordStore::open(&path).expect("migrate tool store");
-        let connection = store.connection.lock().expect("lock tool store");
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("read tool store version");
-        assert_eq!(version, TOOL_RECORD_STORE_VERSION);
-        let delete_trigger_present: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM sqlite_schema
-                     WHERE type='trigger' AND name='tool_records_are_not_deleted'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read deletion trigger");
-        assert!(!delete_trigger_present);
-        drop(connection);
-        drop(store);
+        let outdated_schema =
+            TOOL_RECORD_SCHEMA.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;");
+        Connection::open(&path)
+            .expect("open outdated tool store")
+            .execute_batch(&outdated_schema)
+            .expect("create outdated tool store");
+
+        let error = match LocalToolRecordStore::open(&path) {
+            Ok(_) => panic!("noncurrent store must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "tool_record_store_version_unsupported");
+        assert!(error.message.contains("schema 2"));
+
         let _ = std::fs::remove_file(path);
     }
 

@@ -223,7 +223,7 @@ fn fs_delete_requires_the_closed_target_kind_and_deletes_the_exact_tree() {
                 },
                 context_with_target(&workspace.0, "build/cache"),
             )
-            .expect_err("missing or legacy delete targetKind must fail closed");
+            .expect_err("missing or unsupported delete targetKind must fail closed");
         assert!(directory.is_dir());
     }
 

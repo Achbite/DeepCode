@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-pub const CONVERSATION_COMMAND_VERSION: &str = "deepcode.command.v2";
-pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v2";
+pub const CONVERSATION_COMMAND_VERSION: &str = "deepcode.command";
+pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -66,9 +66,6 @@ impl SessionProjection {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SESSION_PROJECTION_VERSION || self.session_id.is_empty() {
             return Err("shared Session projection identity is invalid".to_string());
-        }
-        if !matches!(self.display.entry_kind.as_str(), "activeV2" | "historyOnly") {
-            return Err("shared Session projection entry kind is invalid".to_string());
         }
         let mut workspace_ids = HashSet::new();
         if self.workspace_bindings.iter().any(|binding| {
@@ -348,22 +345,10 @@ impl SessionProjection {
 }
 
 fn invalid_context_composition_shape(receipt: &ContextCompositionProjection) -> bool {
-    match (
-        receipt.categories.as_deref(),
-        receipt.messages.as_deref(),
-        receipt.workspace_bindings.as_deref(),
-        receipt.tools.as_deref(),
-        receipt.partitions.as_deref(),
-    ) {
-        (Some(categories), None, None, None, None) => invalid_legacy_context_categories(categories),
-        (None, Some(messages), Some(workspace_bindings), Some(tools), partitions) => {
-            invalid_context_messages(messages)
-                || invalid_context_items(workspace_bindings)
-                || invalid_context_items(tools)
-                || partitions.is_some_and(invalid_context_partitions)
-        }
-        _ => true,
-    }
+    invalid_context_messages(&receipt.messages)
+        || invalid_context_items(&receipt.workspace_bindings)
+        || invalid_context_items(&receipt.tools)
+        || invalid_context_partitions(&receipt.partitions)
 }
 
 fn invalid_context_partitions(partitions: &[ContextCompositionPartitionProjection]) -> bool {
@@ -395,25 +380,6 @@ fn invalid_context_partitions(partitions: &[ContextCompositionPartitionProjectio
                 .token_source
                 .as_deref()
                 .is_some_and(|source| source != "sessionEstimated")
-    })
-}
-
-fn invalid_legacy_context_categories(categories: &[ContextCompositionCategory]) -> bool {
-    let mut category_kinds = HashSet::new();
-    categories.iter().any(|category| {
-        !matches!(
-            category.kind.as_str(),
-            "instructions"
-                | "workspaceBindings"
-                | "sessionControls"
-                | "journalMessages"
-                | "contextProviders"
-                | "messageAttachments"
-                | "tools"
-        ) || !category_kinds.insert(category.kind.as_str())
-            || category.item_count == 0
-            || category.item_count as usize != category.items.len()
-            || invalid_context_items(&category.items)
     })
 }
 
@@ -496,7 +462,6 @@ fn invalid_context_items(items: &[ContextCompositionItem]) -> bool {
 pub struct SessionDisplayProjection {
     pub title: String,
     pub project_id: Option<String>,
-    pub entry_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -673,11 +638,10 @@ pub struct ContextCompositionProjection {
     pub provider_request_id: String,
     pub run_id: String,
     pub response_constraint: String,
-    pub categories: Option<Vec<ContextCompositionCategory>>,
-    pub messages: Option<Vec<ContextCompositionMessage>>,
-    pub workspace_bindings: Option<Vec<ContextCompositionItem>>,
-    pub tools: Option<Vec<ContextCompositionItem>>,
-    pub partitions: Option<Vec<ContextCompositionPartitionProjection>>,
+    pub messages: Vec<ContextCompositionMessage>,
+    pub workspace_bindings: Vec<ContextCompositionItem>,
+    pub tools: Vec<ContextCompositionItem>,
+    pub partitions: Vec<ContextCompositionPartitionProjection>,
     pub sequence: u64,
     pub created_at: String,
 }
@@ -727,14 +691,6 @@ pub enum ContextCompositionMessageBlock {
         block_index: u64,
         result_for_call_id: String,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ContextCompositionCategory {
-    pub kind: String,
-    pub item_count: u64,
-    pub items: Vec<ContextCompositionItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1037,7 +993,7 @@ mod tests {
             "schemaVersion": SESSION_PROJECTION_VERSION,
             "sessionId": "session:test",
             "revision": 8,
-            "display": { "title": "测试", "entryKind": "activeV2" },
+            "display": { "title": "测试" },
             "workspaceBindings": [{
                 "workspaceId": "workspace:test",
                 "displayName": "Test"
@@ -1202,47 +1158,17 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_context_summary_without_fabricating_request_structure() {
-        let mut value = projection_value();
-        let receipt = value["contextCompositions"][0]
-            .as_object_mut()
-            .expect("receipt object");
-        receipt.remove("messages");
-        receipt.remove("workspaceBindings");
-        receipt.remove("tools");
-        receipt.remove("partitions");
-        receipt.insert(
-            "categories".to_string(),
-            json!([{
-                "kind": "instructions",
-                "itemCount": 1,
-                "items": [{
-                    "itemId": "instruction:agent",
-                    "label": "deepcode.coding-agent"
-                }]
-            }]),
-        );
-        let projection: SessionProjection =
-            serde_json::from_value(value).expect("legacy summary decodes");
-        assert_eq!(projection.validate(), Ok(()));
-    }
-
-    #[test]
-    fn rejects_mixed_or_partial_context_receipt_shapes() {
+    fn rejects_removed_or_partial_context_receipt_shapes() {
         let mut mixed = projection_value();
-        mixed["contextCompositions"][0]["categories"] = json!([]);
-        let projection: SessionProjection =
-            serde_json::from_value(mixed).expect("mixed receipt decodes");
-        assert!(projection.validate().is_err());
+        mixed["contextCompositions"][0]["unknownField"] = json!([]);
+        assert!(serde_json::from_value::<SessionProjection>(mixed).is_err());
 
         let mut partial = projection_value();
         partial["contextCompositions"][0]
             .as_object_mut()
             .expect("receipt object")
             .remove("tools");
-        let projection: SessionProjection =
-            serde_json::from_value(partial).expect("partial receipt decodes");
-        assert!(projection.validate().is_err());
+        assert!(serde_json::from_value::<SessionProjection>(partial).is_err());
     }
 
     #[test]

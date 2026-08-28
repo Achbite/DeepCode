@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DeepCode 本地 Agent v2 hard cut 的小型分层与合同资产检查。"""
+"""DeepCode 当前 Agent Runtime 的小型分层与合同资产检查。"""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def read(relative: str) -> str:
 
 
 def check_runtime_contracts() -> None:
-    contract_root = ROOT / "contracts" / "agent-runtime-v2"
+    contract_root = ROOT / "contracts" / "agent-runtime"
     files = sorted(
         path.relative_to(contract_root).as_posix()
         for path in contract_root.rglob("*")
@@ -37,38 +37,37 @@ def check_runtime_contracts() -> None:
     require(
         files == [
             "README.md",
-            "catalog-v2-to-v3.sql",
             "catalog.sql",
             "schema.json",
-            "session-v2-to-v3.sql",
-            "session-v3-to-v4.sql",
-            "session-v4-to-v5.sql",
-            "session-v5-to-v6.sql",
             "session.sql",
-            "tool-record-v2-to-v3.sql",
             "tool-record.sql",
         ],
-        f"v2 合同目录不是精确十一文件：{files}",
+        f"当前合同目录不是精确五文件：{files}",
     )
-    contract_readme = read("contracts/agent-runtime-v2/README.md")
+    contract_readme = read("contracts/agent-runtime/README.md")
     for boundary in (
-        "Catalog:    2 -> catalog-v2-to-v3.sql -> 3",
-        "Session:    2 -> session-v2-to-v3.sql -> 3",
-        "3 -> session-v3-to-v4.sql -> 4",
-        "4 -> session-v4-to-v5.sql -> 5",
-        "5 -> session-v5-to-v6.sql -> 6",
-        "ToolRecord: 2 -> tool-record-v2-to-v3.sql -> 3",
-        "不是冗余建库脚本",
+        "`user_version` 精确等于当前版本时",
+        "其他版本一律拒绝",
+        "不存在只读历史入口",
     ):
-        require(boundary in contract_readme, f"v2 合同说明缺少版本链边界：{boundary}")
+        require(boundary in contract_readme, f"当前合同说明缺少 hard-cut 边界：{boundary}")
     require(
-        not (ROOT / "contracts" / "agent-runtime-v1").exists(),
-        "v1 执行合同目录仍然存在",
+        not list(contract_root.glob("*-to-*.sql")),
+        "当前合同目录仍包含迁移 SQL",
+    )
+    contract_directories = sorted(
+        path.name
+        for path in (ROOT / "contracts").iterdir()
+        if path.is_dir() and path.name.startswith("agent-runtime")
+    )
+    require(
+        contract_directories == ["agent-runtime"],
+        f"Agent Runtime 合同目录不唯一：{contract_directories}",
     )
     try:
-        schema = json.loads(read("contracts/agent-runtime-v2/schema.json"))
+        schema = json.loads(read("contracts/agent-runtime/schema.json"))
         require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "schema.json draft 不正确")
-        require(schema.get("$id", "").endswith("/agent-runtime-v2/schema.json"), "schema.json id 不是 v2")
+        require(schema.get("$id", "").endswith("/agent-runtime/schema.json"), "schema.json id 不是当前路径")
         require("$defs" in schema, "schema.json 缺少边界定义")
     except json.JSONDecodeError as error:
         ISSUES.append(f"schema.json 不是有效 JSON：{error}")
@@ -76,18 +75,18 @@ def check_runtime_contracts() -> None:
     sql_contracts = {
         "catalog.sql": (
             {"workspaces", "projects", "project_workspace_bindings", "session_catalog"},
-            3,
+            1,
         ),
         "session.sql": (
             {"sessions", "session_workspace_bindings", "session_events", "session_commands"},
-            6,
+            1,
         ),
-        "tool-record.sql": ({"tool_records"}, 3),
+        "tool-record.sql": ({"tool_records"}, 1),
     }
     for filename, (expected_tables, expected_version) in sql_contracts.items():
         connection = sqlite3.connect(":memory:")
         try:
-            connection.executescript(read(f"contracts/agent-runtime-v2/{filename}"))
+            connection.executescript(read(f"contracts/agent-runtime/{filename}"))
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             require(version == expected_version, f"{filename} user_version 不是 {expected_version}")
             tables = {
@@ -98,150 +97,31 @@ def check_runtime_contracts() -> None:
             }
             require(expected_tables <= tables, f"{filename} 缺少表：{sorted(expected_tables - tables)}")
             if filename == "catalog.sql":
-                with connection:
-                    try:
-                        connection.execute(
-                            "INSERT INTO session_catalog("
-                            "session_id, title, entry_kind, workspace_bindings_json, created_at, updated_at"
-                            ") VALUES (?, ?, ?, ?, ?, ?)",
-                            ("session:history", "只读历史", "historyOnly", "[]", "now", "now"),
-                        )
-                    except sqlite3.IntegrityError:
-                        pass
-                    else:
-                        ISSUES.append("活跃 Catalog 仍允许持久化 historyOnly")
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(session_catalog)")
+                }
+                require(
+                    columns == {
+                        "session_id",
+                        "title",
+                        "project_id",
+                        "workspace_bindings_json",
+                        "profile_id",
+                        "created_at",
+                        "updated_at",
+                    },
+                    f"Catalog Session 列不符合当前合同：{sorted(columns)}",
+                )
+                connection.execute(
+                    "INSERT INTO session_catalog("
+                    "session_id, title, workspace_bindings_json, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    ("session:current", "当前会话", "[]", "now", "now"),
+                )
         except sqlite3.Error as error:
             ISSUES.append(f"{filename} 无法创建新数据库：{error}")
         finally:
             connection.close()
-
-    connection = sqlite3.connect(":memory:")
-    try:
-        current_schema = read("contracts/agent-runtime-v2/catalog.sql")
-        v2_schema = current_schema.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;")
-        v2_schema = v2_schema.replace(
-            "CHECK(entry_kind = 'activeV2')",
-            "CHECK(entry_kind IN ('activeV2', 'historyOnly'))",
-        )
-        connection.executescript(v2_schema)
-        connection.execute(
-            "INSERT INTO session_catalog("
-            "session_id, title, entry_kind, workspace_bindings_json, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?)",
-            ("session:active", "Active", "activeV2", "[]", "now", "now"),
-        )
-        connection.commit()
-        connection.executescript(read("contracts/agent-runtime-v2/catalog-v2-to-v3.sql"))
-        require(connection.execute("PRAGMA user_version").fetchone()[0] == 3, "Catalog schema 2 未迁移到 3")
-        require(
-            connection.execute("SELECT COUNT(*) FROM session_catalog").fetchone()[0] == 1,
-            "Catalog schema 2→3 没有保留 active-v2 Session",
-        )
-        try:
-            connection.execute(
-                "INSERT INTO session_catalog("
-                "session_id, title, entry_kind, workspace_bindings_json, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?)",
-                ("session:history", "History", "historyOnly", "[]", "now", "now"),
-            )
-        except sqlite3.IntegrityError:
-            pass
-        else:
-            ISSUES.append("Catalog schema 2→3 后仍允许写入 historyOnly")
-    except sqlite3.Error as error:
-        ISSUES.append(f"Catalog schema 2→3 迁移失败：{error}")
-    finally:
-        connection.close()
-
-    connection = sqlite3.connect(":memory:")
-    try:
-        current_schema = read("contracts/agent-runtime-v2/session.sql")
-        v2_schema = current_schema.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 2;")
-        v2_schema = v2_schema.replace("        'session.directory-index.attached',\n", "")
-        v2_schema = v2_schema.replace("        'session.directory-index.detached',\n", "")
-        v2_schema = v2_schema.replace("        'todo.updated',\n", "")
-        v2_schema = v2_schema.replace("        'message.feedback.updated',\n", "")
-        v2_schema = v2_schema.replace("        'context.composed',\n", "")
-        v2_schema = v2_schema.replace("        'session.control.rejected',\n", "")
-        connection.executescript(v2_schema)
-        connection.execute(
-            "INSERT INTO sessions(session_id, display_title, created_at) VALUES (?, ?, ?)",
-            ("session:migrate", "迁移", "2026-08-25T00:00:00Z"),
-        )
-        connection.execute(
-            "INSERT INTO session_events("
-            "session_id, sequence, event_id, event_type, payload_json, occurred_at"
-            ") VALUES (?, 1, ?, 'session.created', ?, ?)",
-            (
-                "session:migrate",
-                "event:migrate",
-                '{"displayTitle":"迁移","workspaceBindings":[]}',
-                "2026-08-25T00:00:00Z",
-            ),
-        )
-        connection.commit()
-        connection.executescript(read("contracts/agent-runtime-v2/session-v2-to-v3.sql"))
-        require(connection.execute("PRAGMA user_version").fetchone()[0] == 3, "Session schema 2 未迁移到 3")
-        require(
-            connection.execute("SELECT COUNT(*) FROM session_events").fetchone()[0] == 1,
-            "Session schema 迁移没有保留既有事件",
-        )
-        connection.execute(
-            "INSERT INTO session_events("
-            "session_id, sequence, event_id, event_type, run_id, call_id, payload_json, occurred_at"
-            ") VALUES (?, 2, ?, 'todo.updated', ?, ?, ?, ?)",
-            (
-                "session:migrate",
-                "event:todo",
-                "run:migrate",
-                "call:todo",
-                '{"items":[]}',
-                "2026-08-25T00:00:01Z",
-            ),
-        )
-        connection.executescript(read("contracts/agent-runtime-v2/session-v3-to-v4.sql"))
-        require(connection.execute("PRAGMA user_version").fetchone()[0] == 4, "Session schema 3 未迁移到 4")
-        connection.executescript(read("contracts/agent-runtime-v2/session-v4-to-v5.sql"))
-        require(connection.execute("PRAGMA user_version").fetchone()[0] == 5, "Session schema 4 未迁移到 5")
-        connection.executescript(read("contracts/agent-runtime-v2/session-v5-to-v6.sql"))
-        require(connection.execute("PRAGMA user_version").fetchone()[0] == 6, "Session schema 5 未迁移到 6")
-        connection.execute(
-            "INSERT INTO session_events("
-            "session_id, sequence, event_id, event_type, payload_json, occurred_at"
-            ") VALUES (?, 3, ?, 'message.feedback.updated', ?, ?)",
-            (
-                "session:migrate",
-                "event:feedback",
-                '{"commandId":"command:feedback","messageId":"message:answer","feedback":"up"}',
-                "2026-08-25T00:00:02Z",
-            ),
-        )
-    except sqlite3.Error as error:
-        ISSUES.append(f"Session schema 2 -> 3 -> 4 -> 5 -> 6 迁移失败：{error}")
-    finally:
-        connection.close()
-
-    connection = sqlite3.connect(":memory:")
-    try:
-        current_schema = read("contracts/agent-runtime-v2/tool-record.sql")
-        v2_schema = current_schema.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;")
-        v2_schema += """
-CREATE TRIGGER tool_records_are_not_deleted
-BEFORE DELETE ON tool_records BEGIN
-    SELECT RAISE(ABORT, 'tool records are immutable');
-END;
-"""
-        connection.executescript(v2_schema)
-        connection.executescript(read("contracts/agent-runtime-v2/tool-record-v2-to-v3.sql"))
-        require(connection.execute("PRAGMA user_version").fetchone()[0] == 3, "ToolRecord schema 2 未迁移到 3")
-        trigger_count = connection.execute(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name='tool_records_are_not_deleted'"
-        ).fetchone()[0]
-        require(trigger_count == 0, "ToolRecord schema 3 仍阻止显式 Session aggregate purge")
-    except sqlite3.Error as error:
-        ISSUES.append(f"ToolRecord schema 2 -> 3 迁移失败：{error}")
-    finally:
-        connection.close()
 
 
 def check_current_path() -> None:
@@ -278,27 +158,6 @@ def check_current_path() -> None:
             f"Session bridge 闭合命令解码器缺少：{command_type}",
         )
 
-    daemon_sources = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (ROOT / "crates/deepcode-kernel-daemon/src").glob("*.rs")
-    )
-    for retired in (
-        "drive_agent_kernel_until_boundary_v2",
-        "SessionKernelLoopV2",
-        "FinalAnswer",
-        "HostRunBrokerV2",
-    ):
-        require(retired not in daemon_sources and retired not in loop, f"仍可达旧语义路径：{retired}")
-
-    for retired_path in (
-        "crates/deepcode-kernel-ledger",
-        "crates/deepcode-kernel-policy",
-        "crates/deepcode-kernel-skills",
-        "userspace/session-core/src/kernel-v2",
-        "fixtures/kernel-session-v2",
-    ):
-        require(not (ROOT / retired_path).exists(), f"仍保留旧实现目录：{retired_path}")
-
     gui_panel = read("userspace/gui/src/components/local-agent/LocalAgentPanel.tsx")
     gui_styles = read("userspace/gui/src/components/local-agent/localAgentPanel.css")
     model_selector = read("userspace/gui/src/deepcode-gui/panel/SessionModelSelector.tsx")
@@ -332,7 +191,7 @@ def main() -> int:
         for issue in ISSUES:
             print(f"[FAIL] {issue}", file=sys.stderr)
         return 1
-    print("[PASS] 本地 Agent v2 分层与合同资产")
+    print("[PASS] 本地 Agent 分层与当前合同资产")
     return 0
 
 

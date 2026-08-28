@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://deepcode.local/contracts/agent-runtime-v2/schema.json",
-  "title": "DeepCode local agent runtime v2",
+  "$id": "https://deepcode.local/contracts/agent-runtime/schema.json",
+  "title": "DeepCode local agent runtime",
   "oneOf": [
     { "$ref": "#/$defs/ConversationCommand" },
     { "$ref": "#/$defs/SessionEvent" },
@@ -102,7 +102,7 @@
         "workspaceBindings", "messages", "tools"
       ],
       "properties": {
-        "protocolVersion": { "const": "deepcode.local-agent.v2" },
+        "protocolVersion": { "const": "deepcode.local-agent" },
         "requestId": { "$ref": "#/$defs/Id" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "runId": { "$ref": "#/$defs/Id" },
@@ -123,7 +123,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "requestId", "type", "data"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.provider-event.v2" },
+            "schemaVersion": { "const": "deepcode.provider-event" },
             "requestId": { "$ref": "#/$defs/Id" },
             "type": { "const": "text.delta" },
             "data": {
@@ -139,7 +139,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "requestId", "type", "data"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.provider-event.v2" },
+            "schemaVersion": { "const": "deepcode.provider-event" },
             "requestId": { "$ref": "#/$defs/Id" },
             "type": { "const": "assistant.message" },
             "data": {
@@ -158,7 +158,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "requestId", "type", "data"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.provider-event.v2" },
+            "schemaVersion": { "const": "deepcode.provider-event" },
             "requestId": { "$ref": "#/$defs/Id" },
             "type": { "const": "tool.call" },
             "data": {
@@ -178,7 +178,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "requestId", "type", "data"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.provider-event.v2" },
+            "schemaVersion": { "const": "deepcode.provider-event" },
             "requestId": { "$ref": "#/$defs/Id" },
             "type": { "const": "completed" },
             "data": { "$ref": "#/$defs/JsonObject" }
@@ -189,7 +189,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "requestId", "type", "data"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.provider-event.v2" },
+            "schemaVersion": { "const": "deepcode.provider-event" },
             "requestId": { "$ref": "#/$defs/Id" },
             "type": { "const": "failed" },
             "data": { "$ref": "#/$defs/LocalAgentError" }
@@ -279,25 +279,6 @@
         "label": { "type": "string", "minLength": 1 }
       }
     },
-    "ContextCompositionCategory": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "itemCount", "items"],
-      "properties": {
-        "kind": {
-          "enum": [
-            "instructions", "workspaceBindings", "sessionControls", "journalMessages",
-            "contextProviders", "messageAttachments", "tools"
-          ]
-        },
-        "itemCount": { "type": "integer", "minimum": 1 },
-        "items": {
-          "type": "array",
-          "minItems": 1,
-          "items": { "$ref": "#/$defs/ContextCompositionItem" }
-        }
-      }
-    },
     "ContextCompositionPartition": {
       "type": "object",
       "additionalProperties": false,
@@ -385,34 +366,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "providerRequestId", "runId", "responseConstraint",
-        "sequence", "createdAt"
-      ],
-      "oneOf": [
-        {
-          "required": ["messages", "workspaceBindings", "tools"],
-          "not": { "required": ["categories"] }
-        },
-        {
-          "required": ["categories"],
-          "not": {
-            "anyOf": [
-              { "required": ["messages"] },
-              { "required": ["workspaceBindings"] },
-              { "required": ["tools"] },
-              { "required": ["partitions"] }
-            ]
-          }
-        }
+        "providerRequestId", "runId", "responseConstraint", "messages",
+        "workspaceBindings", "tools", "partitions", "sequence", "createdAt"
       ],
       "properties": {
         "providerRequestId": { "$ref": "#/$defs/Id" },
         "runId": { "$ref": "#/$defs/Id" },
         "responseConstraint": { "enum": ["normal", "answerOnly"] },
-        "categories": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/ContextCompositionCategory" }
-        },
         "messages": {
           "type": "array",
           "items": { "$ref": "#/$defs/ContextCompositionMessage" }
@@ -493,7 +453,7 @@
       "type": "object",
       "required": ["schemaVersion", "type", "commandId", "sessionId"],
       "properties": {
-        "schemaVersion": { "const": "deepcode.command.v2" },
+        "schemaVersion": { "const": "deepcode.command" },
         "type": { "type": "string" },
         "commandId": { "$ref": "#/$defs/Id" },
         "sessionId": { "$ref": "#/$defs/Id" }
@@ -506,7 +466,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "workspaceBinding"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "session.directory-index.attach" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -518,7 +478,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "workspaceId"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "session.directory-index.detach" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -533,7 +493,7 @@
               "additionalProperties": false,
               "required": ["schemaVersion", "type", "commandId", "sessionId", "text"],
               "properties": {
-                "schemaVersion": { "const": "deepcode.command.v2" },
+                "schemaVersion": { "const": "deepcode.command" },
                 "type": { "const": "message.submit" },
                 "commandId": { "$ref": "#/$defs/Id" },
                 "sessionId": { "$ref": "#/$defs/Id" },
@@ -549,7 +509,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "messageId", "feedback"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "message.feedback.set" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -562,7 +522,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "profileId"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "run.profile.select" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -575,7 +535,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "runId"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "run.cancel" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -587,7 +547,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "interactionId", "response"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "interaction.respond" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -601,7 +561,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "callId", "approvalId", "decision"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "approval.respond" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -616,7 +576,7 @@
           "additionalProperties": false,
           "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "planId", "response"],
           "properties": {
-            "schemaVersion": { "const": "deepcode.command.v2" },
+            "schemaVersion": { "const": "deepcode.command" },
             "type": { "const": "plan.respond" },
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
@@ -660,7 +620,7 @@
       "additionalProperties": false,
       "required": ["schemaVersion", "eventId", "sessionId", "sequence", "occurredAt", "type", "payload"],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-event.v2" },
+        "schemaVersion": { "const": "deepcode.session-event" },
         "eventId": { "$ref": "#/$defs/Id" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "sequence": { "type": "integer", "minimum": 1 },
@@ -692,7 +652,7 @@
         "run", "activities", "artifacts", "terminalError"
       ],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-projection.v2" },
+        "schemaVersion": { "const": "deepcode.session-projection" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "revision": { "type": "integer", "minimum": 0 },
         "display": { "$ref": "#/$defs/JsonObject" },
@@ -765,7 +725,7 @@
         "toolName", "input", "workspaceBindings"
       ],
       "properties": {
-        "schemaVersion": { "const": "deepcode.kernel-request.v2" },
+        "schemaVersion": { "const": "deepcode.kernel-request" },
         "type": { "const": "tool.execute" },
         "requestId": { "$ref": "#/$defs/Id" },
         "sessionId": { "$ref": "#/$defs/Id" },

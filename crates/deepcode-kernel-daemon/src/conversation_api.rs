@@ -74,28 +74,6 @@ pub(crate) async fn conversation_catalog_get(State(state): State<AppState>) -> J
     ApiResponse::ok(gui.conversation_catalog.public_value())
 }
 
-pub(crate) async fn conversation_history_catalog_get(
-    State(state): State<AppState>,
-) -> Json<ApiResponse> {
-    match state.conversation_history.catalog_value() {
-        Ok(value) => ApiResponse::ok(value),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn conversation_history_projection_get(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Json<ApiResponse> {
-    if !valid_id(&session_id) {
-        return ApiResponse::error("conversation_session_identity_invalid", "对话身份无效。");
-    }
-    match state.conversation_history.projection_value(&session_id) {
-        Ok(value) => ApiResponse::ok(value),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
 pub(crate) async fn conversation_resource_read(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -133,14 +111,8 @@ pub(crate) async fn conversation_resource_read(
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
             return ApiResponse::error("conversation_catalog_unavailable", error);
         }
-        let Some(session) = gui.conversation_catalog.session(&session_id) else {
+        if gui.conversation_catalog.session(&session_id).is_none() {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
-        };
-        if session.entry_kind != "activeV2" {
-            return ApiResponse::error(
-                "conversation_history_read_only",
-                "历史对话不进入当前资源读取路径。",
-            );
         }
         let Some(workspace) = gui.conversation_catalog.workspace(&body.workspace_id) else {
             return ApiResponse::error("conversation_workspace_not_found", "工作目录不存在。");
@@ -188,14 +160,8 @@ pub(crate) async fn conversation_directory_index_attach(
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
             return ApiResponse::error("conversation_catalog_unavailable", error);
         }
-        let Some(session) = gui.conversation_catalog.session(&session_id) else {
+        if gui.conversation_catalog.session(&session_id).is_none() {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
-        };
-        if session.entry_kind != "activeV2" {
-            return ApiResponse::error(
-                "conversation_history_read_only",
-                "历史对话不进入当前目录索引执行路径。",
-            );
         }
         let previous = gui.conversation_catalog.clone();
         let workspace_ids = match register_roots(
@@ -246,7 +212,7 @@ pub(crate) async fn conversation_directory_index_attach(
         "submit",
         json!({
             "command": {
-                "schemaVersion": "deepcode.command.v2",
+                "schemaVersion": "deepcode.command",
                 "type": "session.directory-index.attach",
                 "commandId": command_id,
                 "sessionId": session_id,
@@ -329,7 +295,7 @@ pub(crate) async fn conversation_directory_index_detach(
         "submit",
         json!({
             "command": {
-                "schemaVersion": "deepcode.command.v2",
+                "schemaVersion": "deepcode.command",
                 "type": "session.directory-index.detach",
                 "commandId": command_id,
                 "sessionId": session_id,
@@ -611,7 +577,6 @@ pub(crate) async fn conversation_session_create(
                     workspace_bindings: bindings.clone(),
                     project_id: body.project_id.clone(),
                     profile_id: Some(profile_id.clone()),
-                    entry_kind: "activeV2".to_string(),
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 });
@@ -693,15 +658,9 @@ pub(crate) async fn conversation_session_delete(
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
             return ApiResponse::error("conversation_catalog_unavailable", error);
         }
-        let Some(session) = gui.conversation_catalog.session(&session_id) else {
+        let Some(_) = gui.conversation_catalog.session(&session_id) else {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         };
-        if session.entry_kind == "historyOnly" {
-            return ApiResponse::error(
-                "conversation_history_read_only",
-                "旧版对话仅作为原样历史保留，不能从 v2 执行路径修改或删除。",
-            );
-        }
     }
     let snapshot = match request_service(
         state.session_service.clone(),
@@ -735,12 +694,6 @@ pub(crate) async fn conversation_session_delete(
         let Some(deleted) = gui.conversation_catalog.session(&session_id).cloned() else {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         };
-        if deleted.entry_kind == "historyOnly" {
-            return ApiResponse::error(
-                "conversation_history_read_only",
-                "旧版对话仅作为原样历史保留，不能从 v2 执行路径修改或删除。",
-            );
-        }
         if !gui.conversation_catalog.delete_session(&session_id) {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         }
@@ -1002,15 +955,9 @@ fn validate_directory_index_attach_command(
     session_id: &str,
     command: &Value,
 ) -> Result<(), (&'static str, String)> {
-    let session = catalog
+    catalog
         .session(session_id)
         .ok_or(("conversation_session_not_found", "对话不存在。".to_string()))?;
-    if session.entry_kind != "activeV2" {
-        return Err((
-            "conversation_history_read_only",
-            "历史对话不进入当前目录索引执行路径。".to_string(),
-        ));
-    }
     let binding = command
         .get("workspaceBinding")
         .and_then(Value::as_object)
@@ -1131,7 +1078,6 @@ mod tests {
                 workspace_bindings: Vec::new(),
                 project_id: None,
                 profile_id: Some("profile:test".to_string()),
-                entry_kind: "activeV2".to_string(),
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
             }],

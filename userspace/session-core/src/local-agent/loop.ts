@@ -434,26 +434,26 @@ async function buildProviderRequest(
       await provider.provide({ sessionId: snapshot.state.sessionId, events: snapshot.events })
     ).map<ContextMessageContribution>((message, index) => ({
       contributionId: `context-provider:${provider.id}:${index}`,
-      category: 'contextProviders',
+      contributionKind: 'contextProviders',
       label: provider.id,
       message: cloneModelMessage(message),
     }))))
   ).flat();
   const instructions = deps.composition.instructions.map<ContextMessageContribution>((instruction) => ({
     contributionId: `instruction:${instruction.id}`,
-    category: 'instructions',
+    contributionKind: 'instructions',
     label: instruction.id,
     message: { role: 'system', content: instruction.text },
   }));
   instructions.push({
     contributionId: 'session:controls',
-    category: 'sessionControls',
+    contributionKind: 'sessionControls',
     label: 'Session control contract',
     message: { role: 'system', content: SESSION_CONTROL_INSTRUCTIONS },
   });
   instructions.push({
     contributionId: 'session:workspace-bindings',
-    category: 'workspaceBindings',
+    contributionKind: 'workspaceBindings',
     label: '当前运行的目录索引',
     message: {
       role: 'system',
@@ -465,7 +465,7 @@ async function buildProviderRequest(
   if (answerOnly) {
     instructions.push({
       contributionId: 'session:answer-only',
-      category: 'instructions',
+      contributionKind: 'instructions',
       label: 'Answer-only continuation',
       message: {
         role: 'system',
@@ -799,14 +799,14 @@ function messagesFromJournal(
     if (event.type === 'message.committed') {
       messages.push({
         contributionId: `message:${event.payload.messageId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: event.payload.role === 'user' ? '用户消息' : 'Assistant 消息',
         message: { role: event.payload.role, content: messageContentForModel(event.payload) },
       });
     } else if (event.type === 'narrative.committed') {
       messages.push({
         contributionId: `narrative:${event.payload.narrativeId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: '运行叙述',
         message: { role: 'assistant', content: event.payload.content },
       });
@@ -824,7 +824,7 @@ function messagesFromJournal(
     } else if (event.type === 'interaction.resolved') {
       messages.push({
         contributionId: `interaction-result:${event.payload.interactionId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: '用户交互答复',
         message: {
           role: 'tool',
@@ -844,7 +844,7 @@ function messagesFromJournal(
     } else if (event.type === 'plan.intent.resolved') {
       messages.push({
         contributionId: `plan-result:${event.payload.planId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: '用户 Plan 答复',
         message: {
           role: 'tool',
@@ -860,7 +860,7 @@ function messagesFromJournal(
       });
       messages.push({
         contributionId: `todo-result:${event.callId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: 'Todo 更新结果',
         message: {
           role: 'tool',
@@ -876,7 +876,7 @@ function messagesFromJournal(
       });
       messages.push({
         contributionId: `session-control-rejection:${event.callId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: 'Session control 拒绝结果',
         message: {
           role: 'tool',
@@ -893,7 +893,7 @@ function messagesFromJournal(
     } else if (event.type === 'tool.completed') {
       messages.push({
         contributionId: `tool-result:${event.callId}`,
-        category: 'journalMessages',
+        contributionKind: 'journalMessages',
         label: `${event.payload.record.preparedEffect.operation} 结果`,
         message: {
           role: 'tool',
@@ -989,7 +989,7 @@ function attachToolCall(
   }
   messages.push({
     contributionId: `tool-call:${call.callId}`,
-    category: 'journalMessages',
+    contributionKind: 'journalMessages',
     label: call.name,
     message: { role: 'assistant', content: '', toolCalls: [call] },
   });
@@ -1025,7 +1025,7 @@ function buildContextCompositionReceipt(
   const messages = selected.map((item, messageIndex) => ({
     messageIndex,
     contributionId: item.contributionId,
-    contributionKind: item.category,
+    contributionKind: item.contributionKind,
     label: item.label,
     role: item.message.role,
     blocks: contextCompositionBlocks(item.message),
@@ -1089,10 +1089,10 @@ function buildContextCompositionPartitions(
     if (attachments.length > 0) {
       add('messageAttachments', attachments.length, attachmentUnits);
     }
-    if (contribution.category === 'workspaceBindings') {
+    if (contribution.contributionKind === 'workspaceBindings') {
       add('workspaceBindings', workspaceBindings.length, messageUnits - attachmentUnits);
     } else {
-      add(contribution.category, 1, messageUnits - attachmentUnits);
+      add(contribution.contributionKind, 1, messageUnits - attachmentUnits);
     }
   }
   add('sessionControls', controlTools.length, sumShapeUnits(controlTools));
@@ -1153,10 +1153,10 @@ function assertContextContributions(
         'Memory provider 返回了空或重复的上下文贡献标识。',
       );
     }
-    if (!CONTEXT_MESSAGE_KINDS.includes(contribution.category)) {
+    if (!CONTEXT_MESSAGE_KINDS.includes(contribution.contributionKind)) {
       throw new LoopFailure(
-        'context_contribution_category_invalid',
-        `Memory provider 返回了未知的上下文贡献分类：${contribution.category}`,
+        'context_contribution_kind_invalid',
+        `Memory provider 返回了未知的上下文贡献类型：${contribution.contributionKind}`,
       );
     }
     if (!contribution.label || !contribution.message) {

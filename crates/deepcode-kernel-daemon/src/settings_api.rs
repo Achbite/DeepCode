@@ -18,14 +18,6 @@ pub(crate) async fn user_settings_patch(
     let Some(patch_object) = patches.as_object() else {
         return ApiResponse::error("invalid_user_settings", "设置补丁必须是 JSON 对象。");
     };
-    if patch_object.contains_key("agent.permissions.workspaceRead")
-        || patch_object.contains_key("agent.permissions.workspaceWrite")
-    {
-        return ApiResponse::error(
-            "workspace_permission_setting_removed",
-            "v2 中工作区读取由 Session binding 决定，写入只接受结构化 Plan；旧 workspaceRead/workspaceWrite 设置已失效。",
-        );
-    }
     let (next_settings, settings_path) = {
         let gui = state.gui.lock().expect("gui state lock");
         let mut next = gui.user_settings.clone();
@@ -325,6 +317,19 @@ pub(crate) fn default_user_settings() -> Value {
 }
 
 fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+    if let Some(object) = settings.as_object() {
+        for key in object
+            .keys()
+            .filter(|key| key.starts_with("agent.permissions."))
+        {
+            if !matches!(
+                key.as_str(),
+                "agent.permissions.networkRead" | "agent.permissions.external"
+            ) {
+                return Err(format!("{key} 不是当前 Agent Runtime 权限设置。"));
+            }
+        }
+    }
     if let Some(prompt) = settings.get("agent.systemPrompt") {
         let prompt = prompt
             .as_str()
@@ -347,13 +352,6 @@ fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn remove_legacy_workspace_permission_settings(settings: &mut Value) {
-    if let Some(object) = settings.as_object_mut() {
-        object.remove("agent.permissions.workspaceRead");
-        object.remove("agent.permissions.workspaceWrite");
-    }
 }
 
 pub(crate) fn default_llm_profiles() -> Value {

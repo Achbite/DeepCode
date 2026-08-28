@@ -3,19 +3,11 @@ use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const SESSION_STORE_SCHEMA: &str = include_str!("../../../contracts/agent-runtime-v2/session.sql");
-const SESSION_STORE_V2_TO_V3: &str =
-    include_str!("../../../contracts/agent-runtime-v2/session-v2-to-v3.sql");
-const SESSION_STORE_V3_TO_V4: &str =
-    include_str!("../../../contracts/agent-runtime-v2/session-v3-to-v4.sql");
-const SESSION_STORE_V4_TO_V5: &str =
-    include_str!("../../../contracts/agent-runtime-v2/session-v4-to-v5.sql");
-const SESSION_STORE_V5_TO_V6: &str =
-    include_str!("../../../contracts/agent-runtime-v2/session-v5-to-v6.sql");
-const SESSION_STORE_VERSION: u32 = 6;
-const EVENT_VERSION: &str = "deepcode.session-event.v2";
-const COMMAND_VERSION: &str = "deepcode.command.v2";
-const REPLY_VERSION: &str = "deepcode.command-reply.v2";
+const SESSION_STORE_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/session.sql");
+const SESSION_STORE_VERSION: u32 = 1;
+const EVENT_VERSION: &str = "deepcode.session-event";
+const COMMAND_VERSION: &str = "deepcode.command";
+const REPLY_VERSION: &str = "deepcode.command-reply";
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalAgentStoreError {
@@ -59,52 +51,10 @@ impl LocalAgentJournal {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(sql_error("session_store_version_read_failed"))?;
         match version {
-            0 if !existed || sqlite_is_empty(&connection)? => connection
-                .execute_batch(SESSION_STORE_SCHEMA)
-                .map_err(sql_error("session_store_schema_create_failed"))?,
-            2 => {
+            0 if !existed || sqlite_is_empty(&connection)? => {
                 connection
-                    .execute_batch(SESSION_STORE_V2_TO_V3)
-                    .map_err(sql_error("session_store_v2_to_v3_failed"))?;
-                connection
-                    .execute_batch(SESSION_STORE_V3_TO_V4)
-                    .map_err(sql_error("session_store_v3_to_v4_failed"))?;
-                connection
-                    .execute_batch(SESSION_STORE_V4_TO_V5)
-                    .map_err(sql_error("session_store_v4_to_v5_failed"))?;
-                connection
-                    .execute_batch(SESSION_STORE_V5_TO_V6)
-                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
-                verify_session_store(&connection)?;
-                verify_session_store_version(&connection)?;
-            }
-            3 => {
-                connection
-                    .execute_batch(SESSION_STORE_V3_TO_V4)
-                    .map_err(sql_error("session_store_v3_to_v4_failed"))?;
-                connection
-                    .execute_batch(SESSION_STORE_V4_TO_V5)
-                    .map_err(sql_error("session_store_v4_to_v5_failed"))?;
-                connection
-                    .execute_batch(SESSION_STORE_V5_TO_V6)
-                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
-                verify_session_store(&connection)?;
-                verify_session_store_version(&connection)?;
-            }
-            4 => {
-                connection
-                    .execute_batch(SESSION_STORE_V4_TO_V5)
-                    .map_err(sql_error("session_store_v4_to_v5_failed"))?;
-                connection
-                    .execute_batch(SESSION_STORE_V5_TO_V6)
-                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
-                verify_session_store(&connection)?;
-                verify_session_store_version(&connection)?;
-            }
-            5 => {
-                connection
-                    .execute_batch(SESSION_STORE_V5_TO_V6)
-                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
+                    .execute_batch(SESSION_STORE_SCHEMA)
+                    .map_err(sql_error("session_store_schema_create_failed"))?;
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
             }
@@ -115,7 +65,7 @@ impl LocalAgentJournal {
             other => {
                 return Err(LocalAgentStoreError::new(
                     "session_store_version_unsupported",
-                    format!("Session Store 版本 {other} 不是当前 active-v2 store；hard cut 只接受 schema 2/3/4/5 的单向升级或 schema 6。"),
+                    format!("Session Store schema {other} 不受支持；当前只接受 schema {SESSION_STORE_VERSION}。"),
                 ))
             }
         }
@@ -708,7 +658,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
     if !allowed.contains(&event_type) || event_type == "session.created" && !allow_creation {
         return Err(LocalAgentStoreError::new(
             "session_event_type_invalid",
-            format!("v2 不接受事件：{event_type}"),
+            format!("当前 Session 合同不接受事件：{event_type}"),
         ));
     }
     let needs_run = !matches!(
@@ -861,8 +811,9 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                     "messages",
                     "workspaceBindings",
                     "tools",
+                    "partitions",
                 ],
-                &["partitions"],
+                &[],
             )?;
             validate_id(
                 "providerRequestId",
@@ -885,9 +836,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 "workspaceBindings",
             )?;
             validate_context_items(payload.get("tools").expect("validated tools"), "tools")?;
-            if let Some(partitions) = payload.get("partitions") {
-                validate_context_partitions(partitions)?;
-            }
+            validate_context_partitions(payload.get("partitions").expect("validated partitions"))?;
         }
         "context.updated" => {
             let payload = event.get("payload").expect("validated payload");
@@ -1115,7 +1064,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
     if object.get("schemaVersion").and_then(Value::as_str) != Some(COMMAND_VERSION) {
         return Err(LocalAgentStoreError::new(
             "session_command_version_invalid",
-            "只接受 deepcode.command.v2。",
+            "只接受 deepcode.command。",
         ));
     }
     validate_id("sessionId", required_string(command, "sessionId")?)?;
@@ -1136,7 +1085,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
     {
         return Err(LocalAgentStoreError::new(
             "session_command_type_invalid",
-            format!("v2 不接受命令：{command_type}"),
+            format!("当前 Session 合同不接受命令：{command_type}"),
         ));
     }
     if command_type == "message.feedback.set" {
@@ -1403,7 +1352,7 @@ fn validate_reply(reply: &Value) -> Result<(), LocalAgentStoreError> {
     if reply.get("schemaVersion").and_then(Value::as_str) != Some(REPLY_VERSION) {
         return Err(LocalAgentStoreError::new(
             "session_reply_version_invalid",
-            "只接受 deepcode.command-reply.v2。",
+            "只接受 deepcode.command-reply。",
         ));
     }
     let status = required_string(reply, "status")?;
@@ -1499,8 +1448,8 @@ fn verify_session_store_version(connection: &Connection) -> Result<(), LocalAgen
         .map_err(sql_error("session_store_version_read_failed"))?;
     if version != SESSION_STORE_VERSION {
         return Err(LocalAgentStoreError::new(
-            "session_store_version_migration_incomplete",
-            format!("Session Store schema 迁移后版本仍为 {version}。"),
+            "session_store_version_mismatch",
+            format!("Session Store schema {version} 不是当前 schema {SESSION_STORE_VERSION}。"),
         ));
     }
     Ok(())
@@ -1599,12 +1548,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_v2_journal_has_immutable_binding_snapshot_and_plan_events() {
+    fn fresh_journal_has_immutable_binding_snapshot_and_plan_events() {
         let path = std::env::temp_dir().join(format!(
-            "deepcode-session-v2-{}.sqlite3",
+            "deepcode-session-current-{}.sqlite3",
             random_id("test").unwrap().replace(':', "-")
         ));
-        let journal = LocalAgentJournal::open(&path).expect("open v2 journal");
+        let journal = LocalAgentJournal::open(&path).expect("open current journal");
         let created = journal
             .create_session(
                 "session:test",
@@ -1633,376 +1582,25 @@ mod tests {
     }
 
     #[test]
-    fn active_v2_store_migrates_once_and_preserves_events() {
+    fn noncurrent_session_store_is_rejected() {
         let path = std::env::temp_dir().join(format!(
-            "deepcode-session-v2-migrate-{}.sqlite3",
+            "deepcode-session-outdated-{}.sqlite3",
             random_id("test").unwrap().replace(':', "-")
         ));
-        let v2_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 2;")
-            .replace("        'session.directory-index.attached',\n", "")
-            .replace("        'session.directory-index.detached',\n", "")
-            .replace("        'todo.updated',\n", "")
-            .replace("        'message.feedback.updated',\n", "")
-            .replace("        'context.composed',\n", "")
-            .replace("        'session.control.rejected',\n", "");
-        {
-            let connection = Connection::open(&path).expect("open schema-2 store");
-            connection
-                .execute_batch(&v2_schema)
-                .expect("create schema-2 store");
-            connection.execute(
-                "INSERT INTO sessions(session_id, display_title, created_at) VALUES (?1, ?2, ?3)",
-                params!["session:migrate", "迁移", "2026-08-25T00:00:00Z"],
-            ).expect("insert session");
-            connection
-                .execute(
-                    "INSERT INTO session_events(
-                    session_id, sequence, event_id, event_type, payload_json, occurred_at
-                 ) VALUES (?1, 1, ?2, 'session.created', ?3, ?4)",
-                    params![
-                        "session:migrate",
-                        "event:migrate",
-                        r#"{"displayTitle":"迁移","workspaceBindings":[]}"#,
-                        "2026-08-25T00:00:00Z",
-                    ],
-                )
-                .expect("insert event");
-        }
-
-        let journal = LocalAgentJournal::open(&path).expect("migrate schema-2 store");
-        let events = journal
-            .read_events("session:migrate", 0)
-            .expect("read migrated events");
-        assert_eq!(events.len(), 1);
-        journal
-            .append(&json!({
-                "type":"run.started",
-                "sessionId":"session:migrate",
-                "runId":"run:migrate",
-                "payload":{
-                    "inputMessageId":"message:migrate",
-                    "workspaceBindings":[]
-                }
-            }))
-            .expect("start migrated run");
-        let todo = journal
-            .append(&json!({
-                "type":"todo.updated",
-                "sessionId":"session:migrate",
-                "runId":"run:migrate",
-                "callId":"call:todo",
-                "payload":{"items":[{"todoId":"todo:1","label":"检查","status":"pending"}]}
-            }))
-            .expect("append todo after migration");
-        assert_eq!(todo["type"], "todo.updated");
-        let connection = Connection::open(&path).expect("reopen migrated store");
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SESSION_STORE_VERSION);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn schema_three_run_snapshot_migrates_from_creation_bindings() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-v3-migrate-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let v3_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 3;")
-            .replace("        'session.directory-index.attached',\n", "")
-            .replace("        'session.directory-index.detached',\n", "")
-            .replace("        'message.feedback.updated',\n", "")
-            .replace("        'context.composed',\n", "")
-            .replace("        'session.control.rejected',\n", "");
-        {
-            let connection = Connection::open(&path).expect("open schema-3 store");
-            connection
-                .execute_batch(&v3_schema)
-                .expect("create schema-3 store");
-            connection
-                .execute(
-                    "INSERT INTO sessions(session_id, display_title, created_at)
-                     VALUES (?1, ?2, ?3)",
-                    params!["session:migrate-v3", "迁移 v3", "2026-08-25T00:00:00Z"],
-                )
-                .expect("insert session");
-            connection
-                .execute(
-                    "INSERT INTO session_workspace_bindings(
-                         session_id, position, workspace_id, display_name
-                     ) VALUES (?1, 0, ?2, ?3)",
-                    params!["session:migrate-v3", "workspace:creation", "Creation"],
-                )
-                .expect("insert creation binding");
-            connection
-                .execute(
-                    "INSERT INTO session_events(
-                         session_id, sequence, event_id, event_type, payload_json, occurred_at
-                     ) VALUES (?1, 1, ?2, 'session.created', ?3, ?4)",
-                    params![
-                        "session:migrate-v3",
-                        "event:created-v3",
-                        r#"{"displayTitle":"迁移 v3","workspaceBindings":[{"workspaceId":"workspace:creation","displayName":"Creation"}]}"#,
-                        "2026-08-25T00:00:00Z",
-                    ],
-                )
-                .expect("insert creation event");
-            connection
-                .execute(
-                    "INSERT INTO session_events(
-                         session_id, sequence, event_id, event_type, run_id,
-                         payload_json, occurred_at
-                     ) VALUES (?1, 2, ?2, 'run.started', ?3, ?4, ?5)",
-                    params![
-                        "session:migrate-v3",
-                        "event:run-v3",
-                        "run:migrate-v3",
-                        r#"{"inputMessageId":"message:migrate-v3"}"#,
-                        "2026-08-25T00:00:01Z",
-                    ],
-                )
-                .expect("insert run event");
-        }
-
-        let journal = LocalAgentJournal::open(&path).expect("migrate schema-3 store");
-        let events = journal
-            .read_events("session:migrate-v3", 0)
-            .expect("read migrated events");
-        assert_eq!(
-            events[1].pointer("/payload/workspaceBindings"),
-            Some(&json!([{
-                "workspaceId":"workspace:creation",
-                "displayName":"Creation"
-            }]))
-        );
-        assert_eq!(
-            journal
-                .run_workspace_binding_ids("session:migrate-v3", "run:migrate-v3")
-                .expect("read frozen run roots"),
-            vec!["workspace:creation".to_string()]
-        );
-        let connection = Connection::open(&path).expect("reopen migrated store");
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SESSION_STORE_VERSION);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn schema_four_store_migrates_to_feedback_and_request_receipt_vocabulary() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-v4-migrate-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let v4_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 4;")
-            .replace("        'message.feedback.updated',\n", "")
-            .replace("        'context.composed',\n", "")
-            .replace("        'session.control.rejected',\n", "");
-        {
-            let connection = Connection::open(&path).expect("open schema-4 store");
-            connection
-                .execute_batch(&v4_schema)
-                .expect("create schema-4 store");
-            connection
-                .execute(
-                    "INSERT INTO sessions(session_id, display_title, created_at)
-                     VALUES (?1, ?2, ?3)",
-                    params!["session:migrate-v4", "迁移 v4", "2026-08-25T00:00:00Z"],
-                )
-                .expect("insert schema-4 session");
-            connection
-                .execute(
-                    "INSERT INTO session_events(
-                        session_id, sequence, event_id, event_type, run_id, payload_json, occurred_at
-                     ) VALUES (?1, 1, ?2, 'context.updated', ?3, ?4, ?5)",
-                    params![
-                        "session:migrate-v4",
-                        "event:legacy-context-v4",
-                        "run:legacy-context-v4",
-                        r#"{"inputTokens":100,"outputTokens":20,"contextWindowTokens":1000,"cacheReadInputTokens":70,"cacheMissInputTokens":30}"#,
-                        "2026-08-25T00:00:01Z"
-                    ],
-                )
-                .expect("insert schema-4 context usage without request receipt");
-        }
-
-        let journal = LocalAgentJournal::open(&path).expect("migrate schema-4 store");
-        journal
-            .append_batch(&[
-                json!({
-                    "type":"message.feedback.updated",
-                    "sessionId":"session:migrate-v4",
-                    "payload":{
-                        "commandId":"command:feedback-v4",
-                        "messageId":"message:answer-v4",
-                        "feedback":"down"
-                    }
-                }),
-                json!({
-                    "type":"run.started",
-                    "sessionId":"session:migrate-v4",
-                    "runId":"run:receipt-v4",
-                    "payload":{
-                        "inputMessageId":"message:receipt-v4",
-                        "workspaceBindings":[]
-                    }
-                }),
-                json!({
-                    "type":"context.composed",
-                    "sessionId":"session:migrate-v4",
-                    "runId":"run:receipt-v4",
-                    "payload":{
-                        "providerRequestId":"provider-request:v4",
-                        "responseConstraint":"normal",
-                        "messages":[],
-                        "workspaceBindings":[],
-                        "tools":[{"itemId":"fs.list","label":"fs.list"}]
-                    }
-                }),
-            ])
-            .expect("append current vocabulary after migration");
-        let connection = Connection::open(&path).expect("reopen migrated store");
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SESSION_STORE_VERSION);
-        let legacy_payload: Value = connection
-            .query_row(
-                "SELECT payload_json FROM session_events
-                 WHERE event_id = 'event:legacy-context-v4'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|payload| serde_json::from_str(&payload).expect("decode legacy context payload"))
-            .expect("read preserved schema-4 context usage");
-        assert!(legacy_payload.get("providerRequestId").is_none());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn schema_five_store_migrates_to_control_rejection_vocabulary() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-v5-migrate-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let v5_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 5;")
-            .replace("        'session.control.rejected',\n", "");
-        {
-            let connection = Connection::open(&path).expect("open schema-5 store");
-            connection
-                .execute_batch(&v5_schema)
-                .expect("create schema-5 store");
-        }
-
-        let journal = LocalAgentJournal::open(&path).expect("migrate schema-5 store");
-        journal
-            .create_session("session:migrate-v5", "迁移 v5", &json!([]), None)
-            .expect("create migrated session");
-        journal
-            .append(&json!({
-                "type":"run.started",
-                "sessionId":"session:migrate-v5",
-                "runId":"run:migrate-v5",
-                "payload":{
-                    "inputMessageId":"message:migrate-v5",
-                    "workspaceBindings":[]
-                }
-            }))
-            .expect("start migrated run");
-        let rejection = journal
-            .append(&json!({
-                "type":"session.control.rejected",
-                "sessionId":"session:migrate-v5",
-                "runId":"run:migrate-v5",
-                "callId":"plan:invalid",
-                "payload":{
-                    "toolName":"plan.intent",
-                    "input":{
-                        "prompt":"请选择。",
-                        "options":[{"optionId":"write","label":"写入","operations":[]}]
-                    },
-                    "error":{
-                        "code":"session_control_plan_operations_invalid",
-                        "message":"每个 Plan option 必须包含至少一个闭合 operation。"
-                    }
-                }
-            }))
-            .expect("append schema-6 control rejection after migration");
-        assert_eq!(rejection["type"], "session.control.rejected");
-        let connection = Connection::open(&path).expect("reopen migrated store");
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SESSION_STORE_VERSION);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn schema_five_legacy_context_summary_is_read_only_history() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-v5-legacy-context-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).expect("open current store");
-        journal
-            .create_session("session:legacy-context", "Legacy context", &json!([]), None)
-            .expect("create legacy context session");
-        journal
-            .append(&json!({
-                "type":"run.started",
-                "sessionId":"session:legacy-context",
-                "runId":"run:legacy-context",
-                "payload":{
-                    "inputMessageId":"message:legacy-context",
-                    "workspaceBindings":[]
-                }
-            }))
-            .expect("start legacy context run");
-        let legacy_payload = json!({
-            "providerRequestId":"provider-request:legacy-context",
-            "responseConstraint":"normal",
-            "categories":[{
-                "kind":"journalMessages",
-                "itemCount":1,
-                "items":[{"itemId":"message:legacy-context","label":"用户消息"}]
-            }]
-        });
+        let outdated_schema =
+            SESSION_STORE_SCHEMA.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;");
         Connection::open(&path)
-            .expect("open legacy context store")
-            .execute(
-                "INSERT INTO session_events(
-                     session_id, sequence, event_id, event_type, run_id,
-                     payload_json, occurred_at
-                 ) VALUES (?1, 3, ?2, 'context.composed', ?3, ?4, ?5)",
-                params![
-                    "session:legacy-context",
-                    "event:legacy-context",
-                    "run:legacy-context",
-                    serde_json::to_string(&legacy_payload).expect("encode legacy context"),
-                    "2026-08-25T00:00:02Z",
-                ],
-            )
-            .expect("insert immutable legacy context receipt");
+            .expect("open outdated store")
+            .execute_batch(&outdated_schema)
+            .expect("create outdated store");
 
-        let events = journal
-            .read_events("session:legacy-context", 0)
-            .expect("read legacy context history");
-        assert_eq!(events[2]["payload"], legacy_payload);
-        assert!(events[2]["payload"].get("messages").is_none());
-        assert!(journal
-            .append(&json!({
-                "type":"context.composed",
-                "sessionId":"session:legacy-context",
-                "runId":"run:legacy-context",
-                "payload":legacy_payload
-            }))
-            .is_err());
+        let error = match LocalAgentJournal::open(&path) {
+            Ok(_) => panic!("noncurrent store must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "session_store_version_unsupported");
+        assert!(error.message.contains("schema 2"));
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -2103,7 +1701,16 @@ mod tests {
                     "responseConstraint":"normal",
                     "messages":[],
                     "workspaceBindings":[],
-                    "tools":[]
+                    "tools":[],
+                    "partitions":[
+                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"messageAttachments","itemCount":0,"requestShapeUnits":0}
+                    ]
                 }
             }))
             .expect("record provider request receipt");
@@ -2209,7 +1816,7 @@ mod tests {
             let connection = Connection::open(&tool_path).expect("open tool store");
             connection
                 .execute_batch(include_str!(
-                    "../../../contracts/agent-runtime-v2/tool-record.sql"
+                    "../../../contracts/agent-runtime/tool-record.sql"
                 ))
                 .expect("create tool store");
             connection
@@ -2277,7 +1884,7 @@ mod tests {
             let connection = Connection::open(&tool_path).expect("open tool store");
             connection
                 .execute_batch(include_str!(
-                    "../../../contracts/agent-runtime-v2/tool-record.sql"
+                    "../../../contracts/agent-runtime/tool-record.sql"
                 ))
                 .expect("create tool store");
             connection
@@ -2439,9 +2046,9 @@ mod tests {
                 "sessionId": "session:receipt",
                 "runId": "run:receipt",
                 "payload": {
-                    "providerRequestId": "provider-request:legacy-summary",
+                    "providerRequestId": "provider-request:unknown-field",
                     "responseConstraint": "normal",
-                    "categories": []
+                    "unknownField": []
                 }
             }),
             false,

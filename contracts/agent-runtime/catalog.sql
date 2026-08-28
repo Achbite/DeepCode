@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = FULL;
-PRAGMA user_version = 3;
+PRAGMA user_version = 1;
 
 CREATE TABLE IF NOT EXISTS workspaces (
     workspace_id TEXT PRIMARY KEY NOT NULL CHECK(length(workspace_id) > 0),
@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS session_catalog (
     session_id TEXT PRIMARY KEY NOT NULL CHECK(length(session_id) > 0),
     title TEXT NOT NULL CHECK(length(title) > 0),
     project_id TEXT REFERENCES projects(project_id) ON DELETE SET NULL,
-    entry_kind TEXT NOT NULL CHECK(entry_kind = 'activeV2'),
     workspace_bindings_json TEXT NOT NULL CHECK(json_valid(workspace_bindings_json)),
     profile_id TEXT,
     created_at TEXT NOT NULL CHECK(length(created_at) > 0),

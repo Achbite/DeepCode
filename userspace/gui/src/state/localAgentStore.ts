@@ -20,15 +20,13 @@ import {
   deleteConversationSession as deleteSessionRequest,
   getConversationCatalog,
   getConversationCatalogManagement,
-  getConversationHistoryCatalog,
-  getConversationHistoryProjection,
   getLocalAgentProjection,
   submitLocalAgentCommand,
   updateConversationProject as updateProjectRequest,
   updateConversationSession as updateSessionRequest,
 } from '../services/localAgentApi';
 
-const SESSION_STORAGE_KEY = 'deepcode.local-agent.active-session.v2';
+const SESSION_STORAGE_KEY = 'deepcode.local-agent.active-session';
 const EMPTY_CATALOG: ConversationCatalog = { projects: [], sessions: [] };
 
 interface LocalAgentState {
@@ -105,8 +103,8 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     initialization = (async () => {
       set({ loading: true, error: null });
       try {
-        const [catalogResult, profileResult] = await Promise.all([
-          loadCombinedCatalog(),
+        const [catalog, profileResult] = await Promise.all([
+          getConversationCatalog(),
           getLlmProfiles(),
         ]);
         if (currentGeneration !== generation) return;
@@ -118,19 +116,19 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           profileResult.data?.defaultProfileId,
         );
         const remembered = readRememberedSession();
-        const candidate = catalogResult.catalog.sessions.find((session) => session.id === remembered);
+        const candidate = catalog.sessions.find((session) => session.id === remembered);
         let projection: SessionProjection | null = null;
         let projectionError: string | null = null;
         if (candidate) {
           try {
-            projection = await loadProjection(candidate);
+            projection = await getLocalAgentProjection(candidate.id);
           } catch (error) {
             projectionError = errorMessage(error);
           }
         }
         if (currentGeneration !== generation) return;
         set({
-          catalog: catalogResult.catalog,
+          catalog,
           profiles,
           defaultProfileId,
           selectedProfileId: projection?.run?.profileId
@@ -141,7 +139,6 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           draftProjectId: null,
           loading: false,
           error: projectionError
-            ?? catalogResult.historyError
             ?? (profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable')),
         });
       } catch (error) {
@@ -159,8 +156,8 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   refreshCatalog: async () => {
     try {
-      const result = await loadCombinedCatalog();
-      set({ catalog: result.catalog, error: result.historyError });
+      const catalog = await getConversationCatalog();
+      set({ catalog, error: null });
     } catch (error) {
       set({ error: errorMessage(error) });
     }
@@ -190,7 +187,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     const currentGeneration = ++generation;
     set({ loading: true, error: null, sessionId: null, projection: null, draftProjectId: null });
     try {
-      const projection = await loadProjection(summary);
+      const projection = await getLocalAgentProjection(sessionId);
       if (currentGeneration !== generation) return;
       rememberSession(sessionId);
       set({
@@ -207,7 +204,6 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   },
 
   selectProfile: async (profileId) => {
-    assertActiveProjection(get());
     if (!get().profiles.some((profile) => profile.id === profileId && profile.enabled)) return;
     const previous = get().selectedProfileId;
     set({ selectedProfileId: profileId, error: null });
@@ -232,9 +228,8 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   },
 
   refresh: async () => {
-    const { sessionId, refreshing, projection } = get();
+    const { sessionId, refreshing } = get();
     if (!sessionId || refreshing) return;
-    if (projection?.display.entryKind === 'historyOnly') return;
     set({ refreshing: true });
     try {
       const projection = await getLocalAgentProjection(sessionId);
@@ -257,9 +252,6 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     const trimmed = text.trim();
     if (!trimmed) throw new Error('message_empty');
     const { projection } = get();
-    if (projection?.display.entryKind === 'historyOnly') {
-      throw new Error('conversation_history_read_only');
-    }
     if (projection?.pendingPlan) {
       throw new Error('plan_response_requires_explicit_command');
     }
@@ -316,7 +308,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   setMessageFeedback: async (messageId, feedback) => {
     const state = get();
-    const sessionId = requiredActiveSession(state);
+    const sessionId = requiredSession(state);
     const target = state.projection?.messages.find((message) => message.messageId === messageId);
     if (!target || target.role !== 'assistant') throw new Error('message_feedback_target_invalid');
     return await submitExisting(set, get, {
@@ -330,7 +322,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   },
 
   attachSessionDirectory: async (canonicalRoot) => {
-    const sessionId = requiredActiveSession(get());
+    const sessionId = requiredSession(get());
     set({ catalogBusy: true, error: null });
     try {
       const projection = await attachConversationDirectoryIndex(sessionId, canonicalRoot);
@@ -345,7 +337,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   },
 
   detachSessionDirectory: async (workspaceId) => {
-    const sessionId = requiredActiveSession(get());
+    const sessionId = requiredSession(get());
     set({ catalogBusy: true, error: null });
     try {
       const projection = await detachConversationDirectoryIndex(sessionId, workspaceId);
@@ -361,7 +353,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   respondInteraction: async (response) => {
     const state = get();
-    const sessionId = requiredActiveSession(state);
+    const sessionId = requiredSession(state);
     const interaction = state.projection?.pendingInteraction;
     if (!interaction || !response.trim()) throw new Error('interaction_response_missing');
     return await submitExisting(set, get, {
@@ -377,7 +369,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   respondApproval: async (decision) => {
     const state = get();
-    const sessionId = requiredActiveSession(state);
+    const sessionId = requiredSession(state);
     const approval = state.projection?.pendingApproval;
     if (!approval) throw new Error('approval_response_missing');
     return await submitExisting(set, get, {
@@ -398,7 +390,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   cancelRun: async () => {
     const state = get();
-    const sessionId = requiredActiveSession(state);
+    const sessionId = requiredSession(state);
     const runId = state.projection?.run?.runId;
     if (!runId) throw new Error('conversation_run_missing');
     return await submitExisting(set, get, {
@@ -463,12 +455,12 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   },
 
   updateSession: async (sessionId, input) => {
-    assertActiveSummary(get().catalog, sessionId);
+    requiredSummary(get().catalog, sessionId);
     await mutateCatalog(set, async () => await updateSessionRequest(sessionId, input));
   },
 
   deleteSession: async (sessionId) => {
-    const summary = assertActiveSummary(get().catalog, sessionId);
+    const summary = requiredSummary(get().catalog, sessionId);
     const projectId = summary.projectId;
     await mutateCatalog(set, async () => await deleteSessionRequest(sessionId));
     if (get().sessionId === sessionId) get().startNewSession(projectId ?? null);
@@ -483,7 +475,7 @@ async function submitPlanResponse(
   response: PlanResponse,
 ): Promise<CommandReply> {
   const state = get();
-  const sessionId = requiredActiveSession(state);
+  const sessionId = requiredSession(state);
   const plan = state.projection?.pendingPlan;
   if (!plan) throw new Error('plan_response_missing');
   return await submitExisting(set, get, {
@@ -523,7 +515,7 @@ async function mutateCatalog(
   set({ catalogBusy: true, error: null });
   try {
     const activeCatalog = await operation();
-    set((state) => ({ catalog: mergeCatalogs(activeCatalog, historyCatalogFrom(state.catalog)) }));
+    set({ catalog: activeCatalog });
   } catch (error) {
     set({ error: errorMessage(error) });
     throw error;
@@ -554,86 +546,10 @@ function requiredSession(state: LocalAgentState): string {
   return state.sessionId;
 }
 
-function requiredActiveSession(state: LocalAgentState): string {
-  const sessionId = requiredSession(state);
-  assertActiveProjection(state);
-  return sessionId;
-}
-
-function assertActiveProjection(state: LocalAgentState): void {
-  if (state.projection?.display.entryKind === 'historyOnly') {
-    throw new Error('conversation_history_read_only');
-  }
-}
-
-function assertActiveSummary(catalog: ConversationCatalog, sessionId: string) {
+function requiredSummary(catalog: ConversationCatalog, sessionId: string) {
   const summary = catalog.sessions.find((session) => session.id === sessionId);
   if (!summary) throw new Error('conversation_session_not_found');
-  if (summary.entryKind !== 'activeV2') throw new Error('conversation_history_read_only');
   return summary;
-}
-
-async function loadProjection(
-  summary: ConversationCatalog['sessions'][number],
-): Promise<SessionProjection> {
-  return summary.entryKind === 'historyOnly'
-    ? await getConversationHistoryProjection(summary.id)
-    : await getLocalAgentProjection(summary.id);
-}
-
-async function loadCombinedCatalog(): Promise<{
-  catalog: ConversationCatalog;
-  historyError: string | null;
-}> {
-  const historyPromise = getConversationHistoryCatalog().then(
-    (catalog) => ({ catalog, error: null as string | null }),
-    (error: unknown) => ({ catalog: EMPTY_CATALOG, error: errorMessage(error) }),
-  );
-  const [activeCatalog, historyResult] = await Promise.all([
-    getConversationCatalog(),
-    historyPromise,
-  ]);
-  return {
-    catalog: mergeCatalogs(activeCatalog, historyResult.catalog),
-    historyError: historyResult.error,
-  };
-}
-
-function historyCatalogFrom(catalog: ConversationCatalog): ConversationCatalog {
-  return {
-    projects: [],
-    sessions: catalog.sessions.filter((session) => session.entryKind === 'historyOnly'),
-  };
-}
-
-function mergeCatalogs(
-  activeCatalog: ConversationCatalog,
-  historyCatalog: ConversationCatalog,
-): ConversationCatalog {
-  if (historyCatalog.projects.length > 0
-    || activeCatalog.sessions.some((session) => session.entryKind !== 'activeV2')
-    || historyCatalog.sessions.some((session) => session.entryKind !== 'historyOnly')) {
-    throw new Error('conversation_catalog_partition_invalid');
-  }
-  const ids = new Set(activeCatalog.sessions.map((session) => session.id));
-  if (historyCatalog.sessions.some((session) => ids.has(session.id))) {
-    throw new Error('conversation_catalog_identity_collision');
-  }
-  return {
-    projects: activeCatalog.projects,
-    sessions: [...activeCatalog.sessions, ...historyCatalog.sessions].sort((left, right) => (
-      compareTimestamp(right.updatedAt, left.updatedAt) || right.id.localeCompare(left.id)
-    )),
-  };
-}
-
-function compareTimestamp(left: string, right: string): number {
-  const leftNumber = Number(left);
-  const rightNumber = Number(right);
-  if (Number.isSafeInteger(leftNumber) && Number.isSafeInteger(rightNumber)) {
-    return leftNumber - rightNumber;
-  }
-  return left.localeCompare(right);
 }
 
 function enabledProfileId(

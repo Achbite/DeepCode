@@ -80,14 +80,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/conversation/catalog", get(conversation_catalog_get))
         .route(
-            "/api/conversation/history",
-            get(conversation_history_catalog_get),
-        )
-        .route(
-            "/api/conversation/history/:session_id/projection",
-            get(conversation_history_projection_get),
-        )
-        .route(
             "/api/conversation/catalog/manage",
             get(conversation_catalog_management_get),
         )

@@ -12,7 +12,7 @@ interface KernelHostTarget {
 }
 
 interface KernelHostBootstrap {
-  schemaVersion: 'deepcode.host-ui-bootstrap.v1';
+  schemaVersion: 'deepcode.host-ui-bootstrap';
   host: string;
   port: string;
   uiToken: string;
@@ -43,7 +43,7 @@ function consumeTrustedBootstrap(): KernelHostTarget | null {
   );
   if (
     !boot ||
-    boot.schemaVersion !== 'deepcode.host-ui-bootstrap.v1' ||
+    boot.schemaVersion !== 'deepcode.host-ui-bootstrap' ||
     !trustedDesktopOrigin
   ) {
     return null;

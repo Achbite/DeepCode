@@ -16,7 +16,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "session": if session_ready { "ready" } else { "unavailable" },
         "buildCommit": build_commit(),
         "buildInfo": build_info,
-        "protocolVersion": "deepcode.local-agent.v2",
+        "protocolVersion": "deepcode.local-agent",
         "workspace": workspace
     }))
 }

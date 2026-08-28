@@ -57,15 +57,6 @@ export async function getConversationCatalog(
   ));
 }
 
-export async function getConversationHistoryCatalog(
-  signal?: AbortSignal,
-): Promise<ConversationCatalog> {
-  return decodeCatalog(await request<unknown>(
-    `${API_BASE}/conversation/history`,
-    { signal },
-  ));
-}
-
 export async function getConversationCatalogManagement(
   signal?: AbortSignal,
 ): Promise<ConversationCatalogManagement> {
@@ -172,17 +163,6 @@ export async function getLocalAgentProjection(
 ): Promise<SessionProjection> {
   const projection = await request<unknown>(
     `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/projection`,
-    { signal },
-  );
-  return decodeProjection(projection);
-}
-
-export async function getConversationHistoryProjection(
-  sessionId: string,
-  signal?: AbortSignal,
-): Promise<SessionProjection> {
-  const projection = await request<unknown>(
-    `${API_BASE}/conversation/history/${encodeURIComponent(sessionId)}/projection`,
     { signal },
   );
   return decodeProjection(projection);
@@ -321,14 +301,17 @@ function decodeCatalog(value: unknown): ConversationCatalog {
   }
   for (const session of value.sessions) {
     if (
-      !isRecord(session)
+      !isExactRecord(
+        session,
+        ['id', 'title', 'workspaceBindings', 'createdAt', 'updatedAt'],
+        ['projectId', 'profileId'],
+      )
       || typeof session.id !== 'string'
       || typeof session.title !== 'string'
       || typeof session.createdAt !== 'string'
       || typeof session.updatedAt !== 'string'
       || (session.projectId !== undefined && typeof session.projectId !== 'string')
       || (session.profileId !== undefined && typeof session.profileId !== 'string')
-      || !['activeV2', 'historyOnly'].includes(String(session.entryKind))
       || !isWorkspaceBindings(session.workspaceBindings)
     ) throw new Error('conversation_catalog_invalid');
   }
@@ -361,9 +344,8 @@ function isWorkspaceBindings(value: unknown): boolean {
 }
 
 function isSessionDisplay(value: unknown): boolean {
-  return isExactRecord(value, ['title', 'entryKind'], ['projectId'])
+  return isExactRecord(value, ['title'], ['projectId'])
     && typeof value.title === 'string'
-    && ['activeV2', 'historyOnly'].includes(String(value.entryKind))
     && (value.projectId === undefined || isIdentifier(value.projectId));
 }
 
@@ -539,28 +521,19 @@ function isContextComposition(value: unknown): boolean {
     'providerRequestId',
     'responseConstraint',
     'runId',
+    'messages',
+    'workspaceBindings',
+    'tools',
+    'partitions',
     'sequence',
     'createdAt',
-  ], ['categories', 'messages', 'workspaceBindings', 'tools', 'partitions'])
+  ])
     && isIdentifier(value.providerRequestId)
     && ['normal', 'answerOnly'].includes(String(value.responseConstraint))
     && isIdentifier(value.runId)
     && isNaturalNumber(value.sequence)
     && isNonEmptyText(value.createdAt)
-    && contextCompositionShapeIsValid(value);
-}
-
-function contextCompositionShapeIsValid(value: Record<string, unknown>): boolean {
-  const fields = [value.messages, value.workspaceBindings, value.tools];
-  const present = fields.filter((field) => field !== undefined).length;
-  if (present !== 0 && present !== fields.length) return false;
-  const hasStructure = present === fields.length;
-  const hasLegacySummary = value.categories !== undefined;
-  if (hasStructure === hasLegacySummary) return false;
-  if (hasLegacySummary) {
-    return value.partitions === undefined && isArrayOf(value.categories, isContextCategory);
-  }
-  return Array.isArray(value.messages)
+    && Array.isArray(value.messages)
     && value.messages.every((message, index) => isContextMessage(message, index))
     && isArrayOf(value.workspaceBindings, isContextItem)
     && isArrayOf(value.tools, isContextItem)
@@ -578,7 +551,6 @@ const CONTEXT_PARTITION_ORDER = [
 ] as const;
 
 function contextPartitionsAreValid(value: unknown): boolean {
-  if (value === undefined) return true;
   if (
     !Array.isArray(value)
     || value.length !== CONTEXT_PARTITION_ORDER.length
@@ -652,23 +624,6 @@ function isContextMessageBlock(value: unknown, blockIndex: number): boolean {
       && isIdentifier(value.resultForCallId);
   }
   return false;
-}
-
-function isContextCategory(value: unknown): boolean {
-  const kinds = [
-    'instructions',
-    'workspaceBindings',
-    'sessionControls',
-    'journalMessages',
-    'contextProviders',
-    'messageAttachments',
-    'tools',
-  ];
-  return isExactRecord(value, ['kind', 'itemCount', 'items'])
-    && kinds.includes(String(value.kind))
-    && isNaturalNumber(value.itemCount)
-    && isArrayOf(value.items, isContextItem)
-    && value.itemCount === value.items.length;
 }
 
 function isContextItem(value: unknown): boolean {

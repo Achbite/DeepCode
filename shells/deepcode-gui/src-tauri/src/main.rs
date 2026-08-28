@@ -44,7 +44,7 @@ struct HostProcessGroup {
     children: Mutex<Option<OwnedHostChildren>>,
 }
 
-const HOST_STARTUP_STATUS_SCHEMA_V1: &str = "deepcode.host-shell.startup-status.v1";
+const HOST_STARTUP_STATUS_SCHEMA: &str = "deepcode.host-shell.startup-status";
 const HOST_STARTUP_LOG_LIMIT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Serialize)]
@@ -75,7 +75,7 @@ impl HostStartupStatusStore {
     fn new() -> Self {
         Self {
             status: Mutex::new(HostStartupStatusV1 {
-                schema_version: HOST_STARTUP_STATUS_SCHEMA_V1,
+                schema_version: HOST_STARTUP_STATUS_SCHEMA,
                 revision: 0,
                 attempt_id: "not-started".to_string(),
                 mode: startup_mode(),
@@ -97,7 +97,7 @@ impl HostStartupStatusStore {
             .lock()
             .map(|status| status.clone())
             .unwrap_or_else(|_| HostStartupStatusV1 {
-                schema_version: HOST_STARTUP_STATUS_SCHEMA_V1,
+                schema_version: HOST_STARTUP_STATUS_SCHEMA,
                 revision: 0,
                 attempt_id: "unavailable".to_string(),
                 mode: startup_mode(),
@@ -136,7 +136,7 @@ impl HostStartupStatusStore {
         diagnostic_ref: Option<String>,
     ) -> HostStartupStatusV1 {
         self.replace(HostStartupStatusV1 {
-            schema_version: HOST_STARTUP_STATUS_SCHEMA_V1,
+            schema_version: HOST_STARTUP_STATUS_SCHEMA,
             revision: 0,
             attempt_id: attempt_id.to_string(),
             mode: startup_mode(),
@@ -524,7 +524,7 @@ fn create_main_window(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
     let initialization_script = format!(
-        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap.v1',host:'{}',port:'{}',uiToken:'{}'}}),writable:false,configurable:true}});",
+        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap',host:'{}',port:'{}',uiToken:'{}'}}),writable:false,configurable:true}});",
         target.host,
         target.port,
         host_tokens.ui_token()

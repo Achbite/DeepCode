@@ -1,5 +1,5 @@
 import type {
-  ContextCompositionCategoryKind,
+  ContextCompositionPartitionKind,
   KernelPort,
   ModelMessage,
   ProviderPort,
@@ -9,7 +9,7 @@ import type {
 
 export interface ContextMessageContribution {
   contributionId: string;
-  category: Exclude<ContextCompositionCategoryKind, 'messageAttachments' | 'tools'>;
+  contributionKind: Exclude<ContextCompositionPartitionKind, 'messageAttachments' | 'tools'>;
   label: string;
   message: ModelMessage;
 }

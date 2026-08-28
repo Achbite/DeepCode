@@ -1026,11 +1026,6 @@
   -webkit-text-fill-color: var(--dc-faint);
 }
 
-.local-agent--history .local-agent__composer textarea:disabled {
-  cursor: default;
-  opacity: 1;
-}
-
 .local-agent__resource-overlay {
   position: absolute;
   z-index: 20;

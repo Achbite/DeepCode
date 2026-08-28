@@ -108,8 +108,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const pendingInteraction = projection?.pendingInteraction ?? null;
   const pendingApproval = projection?.pendingApproval ?? null;
   const pendingPlan = projection?.pendingPlan ?? null;
-  const readOnlyHistory = activeSummary?.entryKind === 'historyOnly'
-    || projection?.display.entryKind === 'historyOnly';
   const activeRun = projection?.run && ['running', 'waiting'].includes(projection.run.status)
     ? projection.run
     : null;
@@ -217,7 +215,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   }, [pendingPlan?.planId]);
 
   const submitDraft = async () => {
-    if (readOnlyHistory) return;
     const text = draft.trim();
     const numericPlanOption = pendingPlan && /^\d+$/u.test(text)
       ? pendingPlan.options[Number.parseInt(text, 10) - 1]
@@ -254,7 +251,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   };
 
   const selectOrConfirmPlanOption = async (optionId: string) => {
-    if (!pendingPlan || submitting || readOnlyHistory) return;
+    if (!pendingPlan || submitting) return;
     if (selectedPlanOptionId !== optionId) {
       setSelectedPlanOptionId(optionId);
       textareaRef.current?.focus();
@@ -274,7 +271,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   };
 
   const submitIgnorePlan = async () => {
-    if (!pendingPlan || submitting || readOnlyHistory) return;
+    if (!pendingPlan || submitting) return;
     setDraft('');
     try {
       await ignorePlan();
@@ -285,7 +282,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   };
 
   const selectAttachments = async (files: FileList | null) => {
-    if (!files?.length || pendingPlan || pendingInteraction || pendingApproval || readOnlyHistory) return;
+    if (!files?.length || pendingPlan || pendingInteraction || pendingApproval) return;
     try {
       const remaining = 8 - attachments.length;
       if (remaining <= 0 || files.length > remaining) {
@@ -324,7 +321,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   };
 
   const selectDirectoryIndex = async (absolutePath: string) => {
-    if (readOnlyHistory) return;
     setFolderDialogOpen(false);
     setAttachmentMenuOpen(false);
     setAttachmentError(null);
@@ -375,14 +371,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     }
   };
 
-  const canCancel = !readOnlyHistory && Boolean(
+  const canCancel = Boolean(
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
   const hasSelectedPlanOption = Boolean(pendingPlan?.options.some((option) => (
     option.optionId === selectedPlanOptionId
   )));
   const canSend = Boolean(draft.trim() || hasSelectedPlanOption)
-    && !readOnlyHistory
     && !submitting
     && !catalogBusy
     && !pendingApproval
@@ -414,15 +409,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   };
 
   return (
-    <section className={`local-agent local-agent--${mode}${hasConversationContent ? '' : ' local-agent--empty'}${readOnlyHistory ? ' local-agent--history' : ''}`}>
+    <section className={`local-agent local-agent--${mode}${hasConversationContent ? '' : ' local-agent--empty'}`}>
       <header className="local-agent__header">
         <div className="local-agent__heading">
           <span className="local-agent__heading-mark"><DeepCodeShellIcon name="session" /></span>
           <div>
             <strong>{title}</strong>
-            <span>{readOnlyHistory
-              ? (zh ? '旧版只读历史' : 'Legacy read-only history')
-              : activeProject?.title ?? (zh ? '独立对话' : 'Independent chat')}</span>
+            <span>{activeProject?.title ?? (zh ? '独立对话' : 'Independent chat')}</span>
           </div>
         </div>
         <div className="local-agent__header-actions">
@@ -517,9 +510,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   >
                     <DeepCodeShellIcon name="copy" />
                   </button>
-                  {!readOnlyHistory && (
-                    <>
-                      <button
+                  <button
                         type="button"
                         className={item.value.feedback === 'up' ? 'is-selected' : ''}
                         aria-pressed={item.value.feedback === 'up'}
@@ -532,8 +523,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         )}
                       >
                         <DeepCodeShellIcon name="thumbUp" />
-                      </button>
-                      <button
+                  </button>
+                  <button
                         type="button"
                         className={item.value.feedback === 'down' ? 'is-selected' : ''}
                         aria-pressed={item.value.feedback === 'down'}
@@ -546,9 +537,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         )}
                       >
                         <DeepCodeShellIcon name="thumbDown" />
-                      </button>
-                    </>
-                  )}
+                  </button>
                 </div>
               )}
             </article>
@@ -717,11 +706,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           <textarea
             ref={textareaRef}
             value={draft}
-            disabled={readOnlyHistory || loading || profiles.length === 0 || Boolean(pendingApproval)}
+            disabled={loading || profiles.length === 0 || Boolean(pendingApproval)}
             rows={pendingPlan || pendingInteraction || pendingApproval ? 2 : 3}
-            placeholder={readOnlyHistory
-              ? (zh ? '此会话来自旧版归档，仅供浏览。' : 'This conversation is legacy history and is read only.')
-              : pendingPlan
+            placeholder={pendingPlan
               ? (zh ? '输入选项编号，或直接说明如何调整计划…' : 'Enter an option number, or describe revisions…')
               : pendingInteraction
                 ? (zh ? '输入你的回应…' : 'Enter your response…')
@@ -805,7 +792,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   aria-label={zh ? '附加文件或目录' : 'Attach files or folders'}
                   title={zh ? '附加文件或目录' : 'Attach files or folders'}
                   aria-expanded={attachmentMenuOpen}
-                  disabled={Boolean(readOnlyHistory || pendingPlan || pendingInteraction || pendingApproval || catalogBusy)}
+                  disabled={Boolean(pendingPlan || pendingInteraction || pendingApproval || catalogBusy)}
                   onClick={() => {
                     setAttachmentMenuOpen((open) => !open);
                     setPermissionMenuOpen(false);
@@ -854,7 +841,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   </div>
                 )}
               </div>
-              {!readOnlyHistory && <div ref={permissionControlRef} className="local-agent__permission-control">
+              <div ref={permissionControlRef} className="local-agent__permission-control">
                 <button
                   type="button"
                   className="local-agent__permission-summary"
@@ -892,7 +879,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     )}
                   </div>
                 )}
-              </div>}
+              </div>
             </div>
             <div className="local-agent__composer-actions">
               {pendingPlan && (
@@ -911,8 +898,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 selectedProfileId={selectedProfileId}
                 contextUsage={projection?.contextUsage ?? null}
                 contextCompositions={projection?.contextCompositions ?? []}
-                busy={loading || readOnlyHistory}
-                readOnly={readOnlyHistory}
+                busy={loading}
                 onProfileChange={selectProfile}
               />
               <button
@@ -941,9 +927,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           </div>
         </div>
         <div className="local-agent__composer-hint">
-          {readOnlyHistory
-            ? (zh ? '旧版会话归档 · 只读' : 'Legacy conversation archive · Read only')
-            : zh ? 'Enter 发送 · Shift+Enter 换行' : 'Enter to send · Shift+Enter for a new line'}
+          {zh ? 'Enter 发送 · Shift+Enter 换行' : 'Enter to send · Shift+Enter for a new line'}
         </div>
       </footer>
       {resourcePreview && (

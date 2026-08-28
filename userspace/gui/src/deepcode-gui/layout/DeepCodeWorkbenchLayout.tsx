@@ -328,12 +328,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <div className="deepcode-gui-session-context-menu__title">
             {sessionMenu.value.title || t(language, 'agent.session.newTitle')}
           </div>
-          {sessionMenu.value.entryKind === 'historyOnly' ? (
-            <div className="deepcode-gui-session-context-menu__readonly">
-              {language === 'zh-CN' ? '旧版归档，只读浏览' : 'Legacy archive, read only'}
-            </div>
-          ) : (
-            <>
+          <>
               <button
                 type="button"
                 role="menuitem"
@@ -392,8 +387,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   {language === 'zh-CN' ? '移出项目' : 'Move out of project'}
                 </button>
               )}
-            </>
-          )}
+          </>
           <button
             type="button"
             role="menuitem"

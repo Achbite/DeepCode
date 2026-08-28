@@ -28,7 +28,7 @@ export interface KernelStartResult {
 }
 
 export interface HostStartupStatusV1 {
-  schemaVersion: 'deepcode.host-shell.startup-status.v1';
+  schemaVersion: 'deepcode.host-shell.startup-status';
   revision: number;
   attemptId: string;
   mode: 'managed' | 'connectOnly';

@@ -604,52 +604,16 @@ struct ContextPartitionMetric {
 fn context_partition_metrics(
     receipt: &ContextCompositionProjection,
 ) -> [ContextPartitionMetric; 7] {
-    if let Some(partitions) = receipt.partitions.as_ref() {
-        let mut metrics = [ContextPartitionMetric::default(); 7];
-        for partition in partitions {
-            if let Some(index) = partition_index(&partition.kind) {
-                metrics[index] = ContextPartitionMetric {
-                    item_count: partition.item_count,
-                    estimated_input_tokens: (partition.token_source.as_deref()
-                        == Some("sessionEstimated"))
-                    .then_some(partition.estimated_input_tokens)
-                    .flatten(),
-                };
-            }
-        }
-        return metrics;
-    }
     let mut metrics = [ContextPartitionMetric::default(); 7];
-    if let Some(messages) = receipt.messages.as_ref() {
-        for message in messages {
-            if let Some(index) = partition_index(&message.contribution_kind) {
-                metrics[index].item_count = metrics[index].item_count.saturating_add(1);
-            }
-            metrics[6].item_count = metrics[6]
-                .item_count
-                .saturating_add(message.attachments.len() as u64);
-        }
-        metrics[2].item_count = metrics[2].item_count.saturating_add(
-            receipt
-                .tools
-                .as_ref()
-                .map(|items| items.len() as u64)
-                .unwrap_or_default(),
-        );
-        metrics[3].item_count = metrics[3].item_count.saturating_add(
-            receipt
-                .workspace_bindings
-                .as_ref()
-                .map(|items| items.len() as u64)
-                .unwrap_or_default(),
-        );
-    } else if let Some(categories) = receipt.categories.as_ref() {
-        for category in categories {
-            if let Some(index) = partition_index(&category.kind) {
-                metrics[index].item_count = metrics[index]
-                    .item_count
-                    .saturating_add(category.item_count);
-            }
+    for partition in &receipt.partitions {
+        if let Some(index) = partition_index(&partition.kind) {
+            metrics[index] = ContextPartitionMetric {
+                item_count: partition.item_count,
+                estimated_input_tokens: (partition.token_source.as_deref()
+                    == Some("sessionEstimated"))
+                .then_some(partition.estimated_input_tokens)
+                .flatten(),
+            };
         }
     }
     metrics
@@ -919,9 +883,7 @@ fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepcode_kernel_client::{
-        ContextCompositionItem, ContextCompositionMessage, ContextCompositionPartitionProjection,
-    };
+    use deepcode_kernel_client::ContextCompositionPartitionProjection;
 
     #[test]
     fn context_partition_metrics_follow_session_projection_without_shell_estimates() {
@@ -929,33 +891,22 @@ mod tests {
             provider_request_id: "provider-request:test".to_string(),
             run_id: "run:test".to_string(),
             response_constraint: "normal".to_string(),
-            categories: None,
-            messages: Some(vec![
-                ContextCompositionMessage {
-                    message_index: 0,
-                    contribution_id: "session:instructions".to_string(),
-                    contribution_kind: "instructions".to_string(),
-                    label: "instructions".to_string(),
-                    role: "system".to_string(),
-                    blocks: Vec::new(),
-                    attachments: Vec::new(),
-                },
-                ContextCompositionMessage {
-                    message_index: 1,
-                    contribution_id: "message:user".to_string(),
-                    contribution_kind: "journalMessages".to_string(),
-                    label: "user".to_string(),
-                    role: "user".to_string(),
-                    blocks: Vec::new(),
-                    attachments: vec![
-                        context_item("attachment:one"),
-                        context_item("attachment:two"),
-                    ],
-                },
-            ]),
-            workspace_bindings: Some(vec![context_item("workspace:test")]),
-            tools: Some(vec![context_item("fs.read"), context_item("code.grep")]),
-            partitions: None,
+            messages: Vec::new(),
+            workspace_bindings: Vec::new(),
+            tools: Vec::new(),
+            partitions: CONTEXT_PARTITIONS
+                .iter()
+                .zip([1, 0, 2, 1, 0, 1, 2])
+                .map(
+                    |((kind, _), item_count)| ContextCompositionPartitionProjection {
+                        kind: (*kind).to_string(),
+                        item_count,
+                        request_shape_units: item_count,
+                        estimated_input_tokens: None,
+                        token_source: None,
+                    },
+                )
+                .collect(),
             sequence: 1,
             created_at: "2026-08-27T00:00:00Z".to_string(),
         };
@@ -995,23 +946,20 @@ mod tests {
             provider_request_id: "provider-request:test".to_string(),
             run_id: "run:test".to_string(),
             response_constraint: "normal".to_string(),
-            categories: None,
-            messages: Some(Vec::new()),
-            workspace_bindings: Some(Vec::new()),
-            tools: Some(Vec::new()),
-            partitions: Some(
-                CONTEXT_PARTITIONS
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (kind, _))| ContextCompositionPartitionProjection {
-                        kind: (*kind).to_string(),
-                        item_count: index as u64,
-                        request_shape_units: index as u64 + 1,
-                        estimated_input_tokens: Some(index as u64 + 10),
-                        token_source: Some("sessionEstimated".to_string()),
-                    })
-                    .collect(),
-            ),
+            messages: Vec::new(),
+            workspace_bindings: Vec::new(),
+            tools: Vec::new(),
+            partitions: CONTEXT_PARTITIONS
+                .iter()
+                .enumerate()
+                .map(|(index, (kind, _))| ContextCompositionPartitionProjection {
+                    kind: (*kind).to_string(),
+                    item_count: index as u64,
+                    request_shape_units: index as u64 + 1,
+                    estimated_input_tokens: Some(index as u64 + 10),
+                    token_source: Some("sessionEstimated".to_string()),
+                })
+                .collect(),
             sequence: 1,
             created_at: "2026-08-27T00:00:00Z".to_string(),
         };
@@ -1019,7 +967,7 @@ mod tests {
         assert_eq!(metrics[2].estimated_input_tokens, Some(12));
         assert_eq!(partition_token_label(metrics[2]), "≈12 Token");
 
-        receipt.partitions.as_mut().unwrap()[2].token_source = None;
+        receipt.partitions[2].token_source = None;
         assert_eq!(
             context_partition_metrics(&receipt)[2].estimated_input_tokens,
             None,
@@ -1031,12 +979,5 @@ mod tests {
         let widths = segment_widths(36_000, 4_000, 24_000, 40);
         assert_eq!(widths.0 + widths.1 + widths.2, 40);
         assert_eq!(format_number(64_000), "64,000");
-    }
-
-    fn context_item(id: &str) -> ContextCompositionItem {
-        ContextCompositionItem {
-            item_id: id.to_string(),
-            label: id.to_string(),
-        }
     }
 }
