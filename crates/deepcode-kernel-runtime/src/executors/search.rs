@@ -11,7 +11,7 @@ impl KernelToolExecutor for FsGlobExecutor {
     ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let relative = get_string(&invocation.input, "path").unwrap_or_else(|| ".".to_string());
-        let target = resolve_workspace_read_path(&root, &relative)?;
+        let target = prepared_workspace_target(&context)?;
         if !target.is_dir() {
             return Err(KernelError::InvalidCommand(format!(
                 "fs.glob path is not a directory: {relative}"
@@ -39,6 +39,7 @@ impl KernelToolExecutor for FsGlobExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
+                "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&relative),
                 "pattern": pattern,
                 "matches": matches,
@@ -67,7 +68,7 @@ impl KernelToolExecutor for CodeGrepExecutor {
         let strategy =
             get_string(&invocation.input, "strategy").unwrap_or_else(|| "literal".to_string());
         let relative = get_string(&invocation.input, "path").unwrap_or_else(|| ".".to_string());
-        let target = resolve_workspace_read_path(&root, &relative)?;
+        let target = prepared_workspace_target(&context)?;
         if !target.is_dir() {
             return Err(KernelError::InvalidCommand(format!(
                 "code.grep path is not a directory: {relative}"
@@ -99,7 +100,7 @@ impl KernelToolExecutor for CodeGrepExecutor {
         Ok(ok(
             invocation.id,
             serde_json::json!({
-                "folderId": "wf-0",
+                "workspaceId": workspace_id(&context)?,
                 "query": query,
                 "path": normalize_relative_path(&relative),
                 "strategy": strategy,

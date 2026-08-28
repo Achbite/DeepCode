@@ -71,18 +71,3 @@ export function settingText(language: UiLanguage, key: string): SettingText | un
   const pack = PACKS[language] ?? PACKS[DEFAULT_LANGUAGE];
   return pack.settings?.[key];
 }
-
-export function resolveDiagnosticText(
-  payload: Record<string, unknown> | undefined,
-  language: UiLanguage,
-): string | undefined {
-  if (!payload) return undefined;
-  const code = typeof payload.diagnosticCode === 'string' ? payload.diagnosticCode : undefined;
-  const content = typeof payload.content === 'string' ? payload.content : undefined;
-  if (!code || code === 'generic') return content;
-  const params = (typeof payload.diagnosticParams === 'object' && payload.diagnosticParams !== null)
-    ? payload.diagnosticParams as Record<string, string | number>
-    : undefined;
-  const translated = t(language, `diagnostic.${code}`, params);
-  return translated === `diagnostic.${code}` ? content : translated;
-}

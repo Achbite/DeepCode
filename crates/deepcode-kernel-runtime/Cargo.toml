@@ -5,20 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "DeepCode headless Kernel admission, gate, execution, resource, and fact runtime."
+description = "DeepCode local Kernel tool executors."
 
 [dependencies]
 deepcode-kernel-abi.workspace = true
-deepcode-kernel-ledger.workspace = true
-deepcode-kernel-policy.workspace = true
 deepcode-kernel-tools.workspace = true
-getrandom = "0.3"
 pdf-extract.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

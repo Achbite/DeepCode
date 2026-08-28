@@ -1,13 +1,12 @@
-# Skill / MCP Smoke Fixtures
+# Skill / MCP 冒烟资产
 
-These fixtures validate the stage 11/12 Skill and MCP certification path.
+该目录只提供小型本地测试输入，用于验证当前插件组合路径：
 
-They are component test assets, not installable Skill packs:
+- `skills/text-echo-declarative` 和 `skills/text-transform-brokered` 的 `SKILL.md`
+  会作为 Session instruction contribution 加载；Skill 文本本身不授予工具权限。
+- `mcp/mcp-text-tools/server.py` 是行分隔 JSON-RPC 的本地 stdio MCP Server，
+  提供 `text.reverse` 工具；MCP 进程由 Kernel 插件适配器持有并在退出时回收。
+- MCP 工具与内置工具使用同一个 Kernel 请求、授权、执行记录和恢复读取路径。
+- `plugin/text-tools.plugin.json` 等旧描述文件仅作为历史 fixture 输入，不参与当前运行时组合。
 
-- `skills/text-echo-declarative` is a safe declarative text Skill fixture.
-- `skills/text-transform-brokered` is a brokered script Skill fixture for hash, scanner, trust, and broker policy checks.
-- `mcp/mcp-text-tools` is a descriptor-only MCP fixture. It does not start a real MCP server.
-- `plugin/text-tools.plugin.json` is a PluginBundle schema fixture. Plugin enable does not grant Skill or MCP capability.
-
-Current automated coverage lives in `deepcode-kernel-skills` tests and is executed through `test.sh`.
-Future GUI/TUI certification cards can load the same fixture files for manual review flows.
+这些资产不形成第二套合同，也不作为发布清单或自审计包。

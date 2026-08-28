@@ -119,7 +119,7 @@ function isCodeWorkspaceFile(path: string): boolean {
   return /\.code-workspace$/i.test(path);
 }
 
-const DRAFTS_STORAGE_KEY = 'deepcode.editor.drafts.v1';
+const DRAFTS_STORAGE_KEY = 'deepcode.editor.drafts';
 
 interface StoredDraft {
   folderId: string;

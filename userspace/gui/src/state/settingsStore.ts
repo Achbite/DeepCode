@@ -2,7 +2,6 @@ import { create } from 'zustand';
 import { useMemo } from 'react';
 import {
   DEFAULT_USER_SETTINGS,
-  agentConfigurableSettingsIndex,
   agentSettingsIndex,
   shellPreferenceSettingsIndex,
   workspaceOverridableSettingsIndex,
@@ -23,7 +22,7 @@ import {
 
 export type SettingSource = 'default' | 'user' | 'workspace';
 
-export type SettingControlType = 'boolean' | 'number' | 'text' | 'select';
+export type SettingControlType = 'boolean' | 'number' | 'text' | 'textarea' | 'select';
 
 export interface SettingDefinition {
   key: string;
@@ -39,8 +38,7 @@ export interface SettingDefinition {
     | 'agent'
     | 'gui'
     | 'skills'
-    | 'mcp'
-    | 'ruler';
+    | 'mcp';
   control: SettingControlType;
   options?: Array<{ label: string; value: string }>;
   catalog?: SettingCatalogEntry;
@@ -56,18 +54,6 @@ export interface EditorEffectiveOptions {
   theme: string;
 }
 
-export interface ConfigAuditNotice {
-  kind?: string;
-  configKind?: string;
-  changedKeys?: string[];
-  source?: string;
-  storePath?: string;
-  oldHash?: string;
-  newHash?: string;
-  message?: string;
-  auditError?: string;
-}
-
 interface SettingsStateData {
   userSettings: UserSettings;
   workspaceSettings: Record<string, unknown>;
@@ -76,8 +62,8 @@ interface SettingsStateData {
   overriddenKeys: string[];
   storePath: string | null;
   loading: boolean;
+  restartRequired: boolean;
   errorMessage: string | null;
-  lastConfigAudit: ConfigAuditNotice | null;
 }
 
 interface SettingsActions {
@@ -122,16 +108,6 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     control: 'text',
   },
   {
-    key: 'workbench.previewEditor',
-    label: 'Preview Editor',
-    description: 'External editor used when opening changed files from Agent UI.',
-    group: 'workbench',
-    control: 'select',
-    options: [
-      { label: 'VS Code', value: 'vscode' },
-    ],
-  },
-  {
     key: 'gui.colorTheme',
     label: 'DeepCode-GUI Theme',
     description: 'Theme used by the lightweight DeepCode-GUI shell. It does not affect the editor workbench theme.',
@@ -156,27 +132,20 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
-    key: 'gui.timelineDensity',
-    label: 'GUI Timeline Density',
-    description: 'Timeline density for the lightweight conversational GUI shell.',
+    key: 'gui.navigationDensity',
+    label: 'Navigation Density',
+    description: 'Spacing used by the DeepCode-GUI navigation shell.',
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'Normal', value: 'normal' },
+      { label: 'Comfortable', value: 'comfortable' },
       { label: 'Compact', value: 'compact' },
     ],
   },
   {
-    key: 'gui.typewriterAnimation',
-    label: 'GUI Typewriter Animation',
-    description: 'Animate model narration, thinking, and final answers in the DeepCode-GUI timeline.',
-    group: 'gui',
-    control: 'boolean',
-  },
-  {
-    key: 'gui.collapseCompletedThinking',
-    label: 'Collapse Completed Thinking',
-    description: 'Collapse completed thinking blocks in the DeepCode-GUI after the run settles.',
+    key: 'gui.showContextRail',
+    label: 'Show Context Rail',
+    description: 'Show the projection-only Todo and artifact rail in DeepCode-GUI.',
     group: 'gui',
     control: 'boolean',
   },
@@ -305,48 +274,24 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     control: 'number',
   },
   {
-    key: 'agent.permissions.workspaceRead',
-    label: 'Workspace Read',
-    description: 'Permission policy for workspace read tools.',
+    key: 'agent.systemPrompt',
+    label: 'System Prompt',
+    description: 'Additional user-authored instructions shared by every DeepCode UI shell.',
+    group: 'agent',
+    control: 'textarea',
+  },
+  {
+    key: 'agent.permissions.networkRead',
+    label: 'Network Read',
+    description: 'Default Kernel decision for public network read tools.',
     group: 'agent',
     control: 'select',
     options: permissionPolicyOptions(),
   },
   {
-    key: 'agent.permissions.autoApprovePlans',
-    label: 'Auto-approve Plans',
-    description: 'Allow Kernel capability issuance only for persisted plans covered by an active Host trust lease.',
-    group: 'agent',
-    control: 'boolean',
-  },
-  {
-    key: 'agent.permissions.workspaceWrite',
-    label: 'Workspace Write',
-    description: 'Permission policy for workspace mutations.',
-    group: 'agent',
-    control: 'select',
-    options: permissionPolicyOptions(),
-  },
-  {
-    key: 'agent.permissions.webRead',
-    label: 'Public Web Read',
-    description: 'Permission policy for public read-only web evidence.',
-    group: 'agent',
-    control: 'select',
-    options: permissionPolicyOptions(),
-  },
-  {
-    key: 'agent.permissions.privateWebRead',
-    label: 'Private Web Read',
-    description: 'Permission policy for private-network read-only web evidence.',
-    group: 'agent',
-    control: 'select',
-    options: permissionPolicyOptions(),
-  },
-  {
-    key: 'agent.permissions.gitWrite',
-    label: 'Git Write',
-    description: 'Permission policy for Git stage, unstage, and commit work units.',
+    key: 'agent.permissions.external',
+    label: 'External Plugin Tools',
+    description: 'Default Kernel decision for tool effects contributed by external plugins.',
     group: 'agent',
     control: 'select',
     options: permissionPolicyOptions(),
@@ -386,14 +331,15 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     group: 'mcp',
     control: 'text',
   },
-  {
-    key: 'ruler.rules',
-    label: 'Project Ruler Rules',
-    description: 'JSON array of Ruler rules or project-level additions used by Agent prompt assembly.',
-    group: 'ruler',
-    control: 'text',
-  },
 ];
+
+function permissionPolicyOptions(): Array<{ label: string; value: string }> {
+  return [
+    { label: 'Allow', value: 'allow' },
+    { label: 'Ask every time', value: 'ask' },
+    { label: 'Deny', value: 'deny' },
+  ];
+}
 
 const SETTING_DEFINITION_BY_KEY = new Map(SETTING_DEFINITIONS.map((definition) => [definition.key, definition]));
 
@@ -409,23 +355,11 @@ export function workspaceSettingDefinitions(): SettingDefinition[] {
   return definitionsForCatalog(workspaceOverridableSettingsIndex());
 }
 
-export function agentConfigurableSettingDefinitions(): SettingDefinition[] {
-  return definitionsForCatalog(agentConfigurableSettingsIndex());
-}
-
 function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): SettingDefinition[] {
   return entries.flatMap((entry) => {
     const definition = SETTING_DEFINITION_BY_KEY.get(entry.key);
     return definition ? [{ ...definition, catalog: entry }] : [];
   });
-}
-
-function permissionPolicyOptions(): NonNullable<SettingDefinition['options']> {
-  return [
-    { label: 'Deny', value: 'deny' },
-    { label: 'Ask', value: 'ask' },
-    { label: 'Allow', value: 'allow' },
-  ];
 }
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
@@ -507,11 +441,6 @@ function buildEffectiveSettings(
   return { effectiveSettings, sources };
 }
 
-function configAuditNotice(value: unknown): ConfigAuditNotice | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  return value as ConfigAuditNotice;
-}
-
 export const useSettingsStore = create<SettingsStore>((set, get) => {
   const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
 
@@ -523,8 +452,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     overriddenKeys: [],
     storePath: null,
     loading: false,
+    restartRequired: false,
     errorMessage: null,
-    lastConfigAudit: null,
 
     loadUserSettings: async () => {
       if (get().loading) return;
@@ -549,6 +478,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
         loading: false,
+        restartRequired: false,
         errorMessage: null,
       });
     },
@@ -586,8 +516,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         overriddenKeys,
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
+        restartRequired: get().restartRequired || Boolean(result.data.restartRequired),
         errorMessage: null,
-        lastConfigAudit: configAuditNotice(result.data.configAudit),
       });
     },
 
@@ -634,8 +564,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         overriddenKeys,
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
+        restartRequired: get().restartRequired || Boolean(result.data.restartRequired),
         errorMessage: null,
-        lastConfigAudit: configAuditNotice(result.data.configAudit),
       });
     },
 

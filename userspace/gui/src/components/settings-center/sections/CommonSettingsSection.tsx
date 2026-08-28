@@ -1,7 +1,6 @@
 import React, { useMemo } from 'react';
 import SettingsField from '../SettingsField';
 import {
-  agentSettingDefinitions,
   shellPreferenceSettingDefinitions,
   useSettingsStore,
   type SettingDefinition,
@@ -30,10 +29,9 @@ const GROUP_TITLE_KEYS: Record<string, string> = {
   gui: 'settings.group.gui',
   skills: 'settings.group.skills',
   mcp: 'settings.group.mcp',
-  ruler: 'settings.group.ruler',
 };
 
-const GROUP_ORDER = ['workbench', 'editor', 'files', 'keyboard', 'explorer', 'terminal', 'gui', 'agent', 'skills', 'mcp', 'ruler'];
+const GROUP_ORDER = ['workbench', 'editor', 'files', 'keyboard', 'explorer', 'terminal', 'gui', 'agent', 'skills', 'mcp'];
 
 function groupTitle(group: string, language: UiLanguage): string {
   const key = GROUP_TITLE_KEYS[group];
@@ -58,14 +56,12 @@ function matchesQuery(
 }
 
 function definitionsForSurface(surface: SettingsSurface): SettingDefinition[] {
-  const agentDefinitions = agentSettingDefinitions().filter((definition) => definition.key.startsWith('agent.'));
   const guiSharedWorkbenchDefinitions = surface === 'gui'
     ? shellPreferenceSettingDefinitions('editor').filter((definition) => definition.key === 'workbench.language')
     : [];
   return [
     ...guiSharedWorkbenchDefinitions,
     ...shellPreferenceSettingDefinitions(surface),
-    ...agentDefinitions,
   ];
 }
 
@@ -137,7 +133,9 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
             </tr>
             <tr>
               <td>{t(language, 'settings.runtime.userSettingsFile')}</td>
-              <td>{storePath ?? t(language, 'settings.runtime.notLoaded')}</td>
+              <td>{storePath
+                ? t(language, 'settings.runtime.loaded')
+                : t(language, 'settings.runtime.notLoaded')}</td>
             </tr>
           </tbody>
         </table>

@@ -1,38 +1,13 @@
-use crate::kernel_v2_transport::{
-    kernel_v2_commands, kernel_v2_user_decisions, KERNEL_V2_COMMANDS_PATH,
-    KERNEL_V2_USER_DECISIONS_PATH,
-};
 use crate::prelude::*;
 use crate::*;
-use deepcode_kernel_abi::v2_command::MAX_COMMAND_BYTES_V2;
-use deepcode_kernel_abi::MAX_USER_DECISION_BYTES_V2;
+use axum::routing::delete;
 
 pub(crate) fn build_app(state: AppState) -> Router {
-    let host_shell_authority = state.host_shell_authority.clone();
+    let host_connection = state.host_connection.clone();
     Router::new()
-        .route("/api/host/identity", get(host_identity_v2))
+        .route("/api/host/identity", get(host_identity))
         .route("/api/health", get(health))
-        .route("/api/host/shutdown", post(host_shutdown_v2))
-        .route(
-            KERNEL_V2_COMMANDS_PATH,
-            post(kernel_v2_commands).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES_V2)),
-        )
-        .route(
-            KERNEL_V2_USER_DECISIONS_PATH,
-            post(kernel_v2_user_decisions).layer(DefaultBodyLimit::max(MAX_USER_DECISION_BYTES_V2)),
-        )
-        .route(
-            "/api/session-store/:session_id/session-runs/:run_id",
-            get(session_run_store_get)
-                .post(session_run_store_append)
-                .layer(DefaultBodyLimit::max(
-                    SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,
-                )),
-        )
-        .route(
-            "/api/session-store/:session_id/session-runs/:run_id/records/:record_id",
-            get(session_run_store_record_get),
-        )
+        .route("/api/host/shutdown", post(host_shutdown))
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
         .route("/api/workspaces/open", post(workspace_open))
@@ -43,16 +18,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
-        .route(
-            "/api/host/user-attachments",
-            post(user_attachment_grant_create_v1),
-        )
-        .route(
-            "/api/host/user-attachments/:attachment_id",
-            delete(user_attachment_grant_revoke_v1),
-        )
         .route("/api/host/inspect", post(host_inspect))
-        .route("/api/host/skills/scan-mount", post(skill_mount_scan))
         .route(
             "/api/user-settings",
             get(user_settings_get).patch(user_settings_patch),
@@ -63,28 +29,95 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/llm/probe", post(llm_probe))
         .route(
-            "/api/host/provider-traces/:session_id",
-            get(provider_trace_metadata_list),
+            "/api/local-agent/journal/sessions",
+            post(local_agent_session_create),
         )
         .route(
-            "/api/host/provider-cache-telemetry/:session_id",
-            get(provider_cache_telemetry_page),
+            "/api/local-agent/journal/sessions/:session_id",
+            delete(local_agent_session_delete),
         )
         .route(
-            "/api/host/provider-traces/:session_id/:provider_turn_id/export-capability",
-            post(provider_trace_export_capability_mint),
+            "/api/local-agent/journal/events",
+            post(local_agent_event_append),
         )
         .route(
-            "/api/host/provider-traces/:session_id/:provider_turn_id/export",
-            post(provider_trace_export).layer(DefaultBodyLimit::max(16 * 1024)),
+            "/api/local-agent/journal/events/batch",
+            post(local_agent_events_append_batch),
         )
         .route(
-            "/api/llm/chat/stream",
-            post(llm_chat_stream).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+            "/api/local-agent/journal/commands",
+            post(local_agent_command_commit),
         )
         .route(
-            "/api/llm/cache/predecessors/:provider_turn_id",
-            get(provider_cache_predecessor),
+            "/api/local-agent/journal/sessions/:session_id/events",
+            get(local_agent_events_read),
+        )
+        .route(
+            "/api/local-agent/journal/sessions/:session_id/commands/:command_id",
+            get(local_agent_command_read),
+        )
+        .route("/api/local-agent/kernel/tools", get(local_agent_tools))
+        .route(
+            "/api/local-agent/kernel/execute",
+            post(local_agent_tool_execute),
+        )
+        .route(
+            "/api/local-agent/kernel/cancel",
+            post(local_agent_tool_cancel),
+        )
+        .route(
+            "/api/local-agent/kernel/records/:call_id",
+            get(local_agent_tool_record),
+        )
+        .route(
+            "/api/local-agent/provider/stream",
+            post(local_agent_provider_stream)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/conversation/sessions",
+            post(conversation_session_create),
+        )
+        .route("/api/conversation/catalog", get(conversation_catalog_get))
+        .route(
+            "/api/conversation/catalog/manage",
+            get(conversation_catalog_management_get),
+        )
+        .route(
+            "/api/conversation/projects",
+            post(conversation_project_create),
+        )
+        .route(
+            "/api/conversation/projects/:project_id",
+            patch(conversation_project_update).delete(conversation_project_delete),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id",
+            patch(conversation_session_update).delete(conversation_session_delete),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/commands",
+            post(conversation_command_submit),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/directory-indexes",
+            post(conversation_directory_index_attach),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/directory-indexes/:workspace_id",
+            delete(conversation_directory_index_detach),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/projection",
+            get(conversation_projection_get),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/projection/stream",
+            get(conversation_projection_stream),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/read",
+            post(conversation_resource_read),
         )
         .route("/api/runtime/shell", get(runtime_shell))
         .route("/api/terminal/capabilities", get(terminal_capabilities))
@@ -113,121 +146,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
             patch(terminal_update).delete(terminal_delete),
         )
         .route("/api/terminal/events", get(terminal_events))
-        .route(
-            "/api/agent/sessions",
-            get(agent_sessions_list).post(agent_session_create),
-        )
-        .route(
-            "/api/agent/projects",
-            get(agent_projects_list).post(agent_project_create),
-        )
-        .route(
-            "/api/agent/projects/:project_id",
-            get(agent_project_get)
-                .patch(agent_project_update)
-                .delete(agent_project_delete),
-        )
-        .route(
-            "/api/agent/projects/:project_id/rebind",
-            post(agent_project_rebind),
-        )
-        .route("/api/agent/composer", get(agent_composer_projection_v1))
-        .route(
-            "/api/agent/composer/stream",
-            get(agent_composer_projection_stream_v1),
-        )
-        .route(
-            "/api/agent/conversation-drafts/runs",
-            post(agent_conversation_draft_run_start),
-        )
-        .route("/api/agent/sessions/current", get(agent_session_current))
-        .route(
-            "/api/agent/sessions/:session_id/activate",
-            post(agent_session_activate),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/archive",
-            post(agent_session_archive),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs",
-            post(agent_session_run_start),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/active-run",
-            get(agent_session_active_run),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/current/cancel",
-            post(agent_session_current_run_cancel),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/current/guidance",
-            post(agent_session_current_run_guidance),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projections",
-            post(session_kernel_v2_projection_append).layer(DefaultBodyLimit::max(
-                SESSION_KERNEL_PRIVATE_BODY_LIMIT_BYTES,
-            )),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/prior-events",
-            get(session_kernel_v2_prior_events_page),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/:run_id",
-            get(agent_session_run_get),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/:run_id/cancel",
-            post(agent_session_run_cancel),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/:run_id/guidance",
-            post(agent_session_run_guidance),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/runs/:run_id/authority/revoke",
-            post(agent_session_run_authority_revoke),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/timeline",
-            get(agent_session_timeline),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/timeline/stream",
-            get(agent_session_timeline_stream),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/private-analysis/lease",
-            post(private_analysis_lease_mint_v1).delete(private_analysis_lease_revoke_v1),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/private-analysis",
-            get(private_analysis_page_v1),
-        )
-        .route(
-            "/api/agent/sessions/:session_id",
-            get(agent_session_get)
-                .patch(agent_session_rename)
-                .delete(agent_session_delete),
-        )
-        .route("/api/host/skills", get(host_skills))
         .route("/api/browser/runtime-status", get(browser_status))
         .route("/api/browser/open", post(browser_open))
         .route("/api/browser/reload", post(browser_reload))
         .route("/api/browser/inspect-mode", post(browser_inspect_mode))
         .route("/api/*path", any(api_route_not_found))
-        .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::startup_readiness_v2::host_startup_readiness_gate,
-        ))
+        .with_state(state)
         .layer(localhost_cors_layer())
         .layer(axum::middleware::from_fn_with_state(
-            host_shell_authority,
-            trusted_host_admission_gate,
+            host_connection,
+            trusted_host_connection_gate,
         ))
         .layer(axum::middleware::from_fn(trusted_local_origin_gate))
 }

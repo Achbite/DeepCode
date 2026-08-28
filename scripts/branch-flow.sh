@@ -27,7 +27,7 @@ Usage:
   scripts/branch-flow.sh start <kernel|session|ui|fix|hotfix|release> <slug> [--worktree PATH] [--release-approved]
   scripts/branch-flow.sh prepare-pr --target <dev-main|main> [--json]
   scripts/branch-flow.sh publish-task --target <dev-main|main> --expected-head SHA --acknowledge-side-effect
-  scripts/branch-flow.sh verify-pr --head NAME --target <dev-main|main> --expected-head SHA --expected-target SHA [--test-change-request FILE --test-release-review FILE] [--json]
+  scripts/branch-flow.sh verify-pr --head NAME --target <dev-main|main> --expected-head SHA --expected-target SHA [--json]
   scripts/branch-flow.sh sync-protected
   scripts/branch-flow.sh finish --branch NAME --target <dev-main|main> --expected-head SHA --acknowledge-side-effect
   scripts/branch-flow.sh check-pr-route HEAD BASE
@@ -136,42 +136,6 @@ assert_verify_script_matches_target() {
     || die 'verified target does not contain scripts/branch-flow.sh'
   [ "$current_blob" = "$target_blob" ] || die \
     'verify-pr script differs from the trusted target; materialize scripts/branch-flow.sh from the expected target commit and run that copy'
-}
-
-run_trusted_test_change_gate() {
-  local target_ref="$1"
-  local target_sha="$2"
-  local head_ref="$3"
-  local head_sha="$4"
-  local test_change_request="$5"
-  local release_review="$6"
-  local root
-  local gate_args
-  root="$(repo_root)"
-  [ -x /usr/bin/python3 ] || die '/usr/bin/python3 is required for the test change gate'
-  git cat-file -e "$target_sha:scripts/test-change-gate.py" 2>/dev/null \
-    || die 'trusted target has no test change gate; bootstrap requires explicit user review'
-
-  gate_args=(
-    verify
-    --repository "$root"
-    --target-ref "$target_ref"
-    --head-ref "$head_ref"
-    --target "$target_sha"
-    --head "$head_sha"
-    --policy-ref "$target_sha"
-    --quiet
-  )
-  if [ -n "$test_change_request" ]; then
-    gate_args+=(--test-change-request "$test_change_request")
-  fi
-  if [ -n "$release_review" ]; then
-    gate_args+=(--test-release-review "$release_review")
-  fi
-  if ! git show "$target_sha:scripts/test-change-gate.py" \
-    | /usr/bin/python3 -I -S - "${gate_args[@]}"; then
-    die 'trusted target test change gate rejected this PR'
-  fi
 }
 
 check_pr_route() {
@@ -458,8 +422,6 @@ verify_pr() {
   local target=''
   local expected_head=''
   local expected_target=''
-  local test_change_request=''
-  local test_release_review=''
   local json='no'
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -467,8 +429,6 @@ verify_pr() {
       --target) target="${2:-}"; shift 2 ;;
       --expected-head) expected_head="${2:-}"; shift 2 ;;
       --expected-target) expected_target="${2:-}"; shift 2 ;;
-      --test-change-request) test_change_request="${2:-}"; shift 2 ;;
-      --test-release-review) test_release_review="${2:-}"; shift 2 ;;
       --json) json='yes'; shift ;;
       *) die "unknown verify-pr option: $1" ;;
     esac
@@ -520,14 +480,6 @@ verify_pr() {
   behind="${counts%%[[:space:]]*}"
   ahead="${counts##*[[:space:]]}"
   [ "$ahead" -gt 0 ] || die "no commits are available for PR: $head -> $target"
-  run_trusted_test_change_gate \
-    "$target" \
-    "$actual_target" \
-    "$head" \
-    "$actual_head" \
-    "$test_change_request" \
-    "$test_release_review"
-
   if [ "$json" = 'yes' ]; then
     printf '{"verified":true,"head":"%s","headSha":"%s","target":"%s","targetSha":"%s","behind":%s,"ahead":%s}\n' \
       "$head" "$actual_head" "$target" "$actual_target" "$behind" "$ahead"

@@ -1,7 +1,5 @@
-use crate::invocation_types::{
-    KernelCanonicalInvocation, KernelDeleteTarget, KernelGitDiffScope, KernelToolKind,
-};
-use deepcode_kernel_abi::v2::{PlatformV2, V2ValidationError};
+use crate::invocation_types::{KernelCanonicalInvocation, KernelDeleteTarget, KernelToolKind};
+use crate::types::{Platform, ToolValidationError};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -13,7 +11,7 @@ pub enum InvocationNormalizationError {
     #[error("canonical invocation for `{tool_id}` contains an implicit or non-normalized value")]
     NotCanonical { tool_id: &'static str },
     #[error(transparent)]
-    Validation(#[from] V2ValidationError),
+    Validation(#[from] ToolValidationError),
 }
 
 fn invalid_arguments(tool_id: &'static str) -> InvocationNormalizationError {
@@ -48,10 +46,6 @@ pub fn canonicalize_invocation(
             materialize("maxResults", json!(200));
         }
         Tool::FsCreate => materialize("executable", json!(false)),
-        Tool::GitDiff => {
-            materialize("scope", json!({"kind":"repository","data":{}}));
-            materialize("staged", json!(false));
-        }
         Tool::WebSearch => materialize("limit", json!(5)),
         Tool::WebFetch => materialize("maxBytes", json!(98_304)),
         _ => {}
@@ -94,13 +88,6 @@ fn normalize_invocation(
             *include = normalize_string_set(std::mem::take(include))?;
             *exclude = normalize_string_set(std::mem::take(exclude))?;
         }
-        KernelCanonicalInvocation::FsRename {
-            source_path,
-            destination_path,
-        } => {
-            *source_path = normalize_workspace_path(source_path, false)?;
-            *destination_path = normalize_workspace_path(destination_path, false)?;
-        }
         KernelCanonicalInvocation::FsDelete(target) => {
             let path = match target {
                 KernelDeleteTarget::File { path } | KernelDeleteTarget::DirectoryTree { path } => {
@@ -108,16 +95,6 @@ fn normalize_invocation(
                 }
             };
             *path = normalize_workspace_path(path, false)?;
-        }
-        KernelCanonicalInvocation::GitDiff {
-            scope: KernelGitDiffScope::Paths { paths },
-            ..
-        } => {
-            *paths = normalize_path_set(std::mem::take(paths))?;
-        }
-        KernelCanonicalInvocation::GitStage { paths }
-        | KernelCanonicalInvocation::GitUnstage { paths } => {
-            *paths = normalize_path_set(std::mem::take(paths))?;
         }
         _ => {}
     }
@@ -240,10 +217,7 @@ fn canonicalize_delete_arguments(arguments: &Value) -> Result<Value, InvocationN
         .ok_or_else(|| invalid_arguments(tool_id))?;
     match target_kind {
         "file" if fields.len() == 2 => Ok(json!({"kind":"file","data":{"path":path}})),
-        "directory"
-            if fields.len() == 3
-                && fields.get("recursive").and_then(Value::as_bool) == Some(true) =>
-        {
+        "directoryTree" if fields.len() == 2 => {
             Ok(json!({"kind":"directoryTree","data":{"path":path}}))
         }
         _ => Err(invalid_arguments(tool_id)),
@@ -287,19 +261,19 @@ pub fn normalize_workspace_path(
 /// The caller must first obtain the value from the platform filesystem
 /// resolver; this helper only materializes separators and NFC.
 pub fn normalize_canonical_platform_path(
-    platform: PlatformV2,
+    platform: Platform,
     value: &str,
 ) -> Result<String, InvocationNormalizationError> {
     if value.is_empty() || value.contains('\0') {
         return Err(invalid_arguments("canonical-platform-path"));
     }
     let materialized = match platform {
-        PlatformV2::Windows => value.replace('\\', "/"),
-        PlatformV2::Macos | PlatformV2::Linux => value.to_owned(),
+        Platform::Windows => value.replace('\\', "/"),
+        Platform::Macos | Platform::Linux => value.to_owned(),
     };
     let prefix_len = match platform {
-        PlatformV2::Macos | PlatformV2::Linux if materialized.starts_with('/') => 1,
-        PlatformV2::Windows
+        Platform::Macos | Platform::Linux if materialized.starts_with('/') => 1,
+        Platform::Windows
             if materialized.as_bytes().get(1) == Some(&b':')
                 && materialized.as_bytes().get(2) == Some(&b'/')
                 && materialized
@@ -309,7 +283,7 @@ pub fn normalize_canonical_platform_path(
         {
             3
         }
-        PlatformV2::Windows if materialized.starts_with("//") => 2,
+        Platform::Windows if materialized.starts_with("//") => 2,
         _ => return Err(invalid_arguments("canonical-platform-path")),
     };
     let mut components = Vec::new();
@@ -330,19 +304,6 @@ pub fn normalize_canonical_platform_path(
     } else {
         format!("{prefix}/{}", components.join("/"))
     };
-    Ok(normalized)
-}
-
-fn normalize_path_set(paths: Vec<String>) -> Result<Vec<String>, InvocationNormalizationError> {
-    if paths.is_empty() || paths.len() > 256 {
-        return Err(invalid_arguments("workspace-path-list"));
-    }
-    let mut normalized = paths
-        .iter()
-        .map(|path| normalize_workspace_path(path, false))
-        .collect::<Result<Vec<_>, _>>()?;
-    normalized.sort();
-    normalized.dedup();
     Ok(normalized)
 }
 

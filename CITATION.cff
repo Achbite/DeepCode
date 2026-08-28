@@ -7,7 +7,7 @@ authors:
 year: 2026
 license: MIT
 repository-code: "https://github.com/Achbite/DeepCode"
-abstract: "DeepCode is a local-first AI coding workbench experiment focused on Kernel/session architecture, tool execution, permission audit, context compression, and multi-shell packaging."
+abstract: "DeepCode is a local-first coding-agent framework focused on a single Session Agent Loop, controlled Kernel tool effects, durable local records, plugin-shaped composition, and shared projections across multiple shells."
 keywords:
   - ai-coding-agent
   - kernel-session-architecture

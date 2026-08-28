@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libssl-dev \
         libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf \
         gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
-        iputils-ping netcat-openbsd jq xz-utils sccache
+        iputils-ping netcat-openbsd jq xz-utils unzip sccache
 
 # ---- 2. Node.js 22 LTS ----
 # Use the official binary tarball instead of NodeSource apt, so the build is
@@ -56,8 +56,16 @@ RUN set -eux; \
     curl -fsSL "${DEEPCODE_NODE_DIST_BASE}/v${DEEPCODE_NODE_VERSION}/${node_pkg}" -o "/tmp/${node_pkg}"; \
     tar -xJf "/tmp/${node_pkg}" -C /usr/local --strip-components=1; \
     rm -f "/tmp/${node_pkg}"; \
+    win_node_pkg="node-v${DEEPCODE_NODE_VERSION}-win-x64.zip"; \
+    curl -fsSL "${DEEPCODE_NODE_DIST_BASE}/v${DEEPCODE_NODE_VERSION}/${win_node_pkg}" -o "/tmp/${win_node_pkg}"; \
+    rm -rf /tmp/deepcode-node-win64 /opt/deepcode-node-win64; \
+    mkdir -p /tmp/deepcode-node-win64 /opt/deepcode-node-win64; \
+    unzip -q "/tmp/${win_node_pkg}" -d /tmp/deepcode-node-win64; \
+    install -m 644 "/tmp/deepcode-node-win64/node-v${DEEPCODE_NODE_VERSION}-win-x64/node.exe" /opt/deepcode-node-win64/node.exe; \
+    rm -rf "/tmp/${win_node_pkg}" /tmp/deepcode-node-win64; \
     node --version; \
-    npm --version
+    npm --version; \
+    test -f /opt/deepcode-node-win64/node.exe
 
 # ---- 3. pnpm ----
 # 通过 corepack 启用，避免全局 npm install 污染；registry 可覆盖以适配不同网络。

@@ -1,0 +1,775 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deepcode.local/contracts/agent-runtime/schema.json",
+  "title": "DeepCode local agent runtime",
+  "oneOf": [
+    { "$ref": "#/$defs/ConversationCommand" },
+    { "$ref": "#/$defs/SessionEvent" },
+    { "$ref": "#/$defs/SessionProjection" },
+    { "$ref": "#/$defs/ProviderRequest" },
+    { "$ref": "#/$defs/ProviderEvent" },
+    { "$ref": "#/$defs/ToolExecutionRequest" },
+    { "$ref": "#/$defs/ToolExecutionRecord" }
+  ],
+  "$defs": {
+    "Id": { "type": "string", "minLength": 1 },
+    "Timestamp": { "type": "string", "minLength": 1 },
+    "JsonObject": { "type": "object" },
+    "WorkspaceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspaceId", "displayName"],
+      "properties": {
+        "workspaceId": { "$ref": "#/$defs/Id" },
+        "displayName": { "$ref": "#/$defs/Id" }
+      }
+    },
+    "LocalAgentError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/Id" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ModelToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callId", "name", "input"],
+      "properties": {
+        "callId": { "$ref": "#/$defs/Id" },
+        "name": { "$ref": "#/$defs/Id" },
+        "input": { "$ref": "#/$defs/JsonObject" }
+      }
+    },
+    "ModelMessage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "content"],
+          "properties": {
+            "role": { "enum": ["system", "user"] },
+            "content": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "content"],
+          "properties": {
+            "role": { "const": "assistant" },
+            "content": { "type": "string" },
+            "toolCalls": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/ModelToolCall" }
+            }
+          },
+          "anyOf": [
+            { "properties": { "content": { "type": "string", "minLength": 1 } } },
+            { "required": ["toolCalls"] }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "content", "toolCallId"],
+          "properties": {
+            "role": { "const": "tool" },
+            "content": { "type": "string" },
+            "toolCallId": { "$ref": "#/$defs/Id" }
+          }
+        }
+      ]
+    },
+    "ProviderToolDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "description", "inputSchema"],
+      "properties": {
+        "name": { "$ref": "#/$defs/Id" },
+        "description": { "type": "string", "minLength": 1 },
+        "inputSchema": { "$ref": "#/$defs/JsonObject" }
+      }
+    },
+    "ProviderRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocolVersion", "requestId", "sessionId", "runId", "responseConstraint",
+        "workspaceBindings", "messages", "tools"
+      ],
+      "properties": {
+        "protocolVersion": { "const": "deepcode.local-agent" },
+        "requestId": { "$ref": "#/$defs/Id" },
+        "sessionId": { "$ref": "#/$defs/Id" },
+        "runId": { "$ref": "#/$defs/Id" },
+        "profileId": { "$ref": "#/$defs/Id" },
+        "responseConstraint": { "enum": ["normal", "answerOnly"] },
+        "workspaceBindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WorkspaceBinding" }
+        },
+        "messages": { "type": "array", "items": { "$ref": "#/$defs/ModelMessage" } },
+        "tools": { "type": "array", "items": { "$ref": "#/$defs/ProviderToolDefinition" } }
+      }
+    },
+    "ProviderEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "text.delta" },
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["text"],
+              "properties": { "text": { "type": "string", "minLength": 1 } }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "assistant.message" },
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["messageId", "content"],
+              "properties": {
+                "messageId": { "$ref": "#/$defs/Id" },
+                "content": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "tool.call" },
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["callId", "name", "input"],
+              "properties": {
+                "callId": { "$ref": "#/$defs/Id" },
+                "name": { "$ref": "#/$defs/Id" },
+                "input": { "$ref": "#/$defs/JsonObject" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "completed" },
+            "data": { "$ref": "#/$defs/JsonObject" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "failed" },
+            "data": { "$ref": "#/$defs/LocalAgentError" }
+          }
+        }
+      ]
+    },
+    "TodoItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["todoId", "label", "status"],
+      "properties": {
+        "todoId": { "$ref": "#/$defs/Id" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "status": { "enum": ["pending", "inProgress", "completed"] }
+      }
+    },
+    "ContextUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerRequestId", "runId", "sequence", "updatedAt",
+        "inputTokens", "outputTokens", "contextWindowTokens"
+      ],
+      "properties": {
+        "providerRequestId": { "$ref": "#/$defs/Id" },
+        "runId": { "$ref": "#/$defs/Id" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "updatedAt": { "$ref": "#/$defs/Timestamp" },
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "contextWindowTokens": { "type": "integer", "minimum": 1 },
+        "cacheReadInputTokens": { "type": "integer", "minimum": 0 },
+        "cacheMissInputTokens": { "type": "integer", "minimum": 0 }
+      },
+      "dependentRequired": {
+        "cacheReadInputTokens": ["cacheMissInputTokens"],
+        "cacheMissInputTokens": ["cacheReadInputTokens"]
+      }
+    },
+    "TokenUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerCallCount", "inputTokens", "outputTokens", "cacheReadInputTokens",
+        "cacheMissInputTokens", "cacheReportedCallCount"
+      ],
+      "properties": {
+        "providerCallCount": { "type": "integer", "minimum": 0 },
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "cacheReadInputTokens": { "type": "integer", "minimum": 0 },
+        "cacheMissInputTokens": { "type": "integer", "minimum": 0 },
+        "cacheReportedCallCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "TokenUsageRound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runId", "inputMessageId", "title", "sequence", "startedAt",
+        "providerCallCount", "inputTokens", "outputTokens", "cacheReadInputTokens",
+        "cacheMissInputTokens", "cacheReportedCallCount"
+      ],
+      "properties": {
+        "runId": { "$ref": "#/$defs/Id" },
+        "inputMessageId": { "$ref": "#/$defs/Id" },
+        "title": { "type": "string", "minLength": 1 },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "startedAt": { "$ref": "#/$defs/Timestamp" },
+        "completedAt": { "$ref": "#/$defs/Timestamp" },
+        "outcome": { "enum": ["completed", "failed", "cancelled", "indeterminate"] },
+        "providerCallCount": { "type": "integer", "minimum": 0 },
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "cacheReadInputTokens": { "type": "integer", "minimum": 0 },
+        "cacheMissInputTokens": { "type": "integer", "minimum": 0 },
+        "cacheReportedCallCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ContextCompositionItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["itemId", "label"],
+      "properties": {
+        "itemId": { "$ref": "#/$defs/Id" },
+        "label": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ContextCompositionPartition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "itemCount", "requestShapeUnits"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "instructions", "sessionControls", "tools", "workspaceBindings",
+            "contextProviders", "journalMessages", "messageAttachments"
+          ]
+        },
+        "itemCount": { "type": "integer", "minimum": 0 },
+        "requestShapeUnits": { "type": "integer", "minimum": 0 },
+        "estimatedInputTokens": { "type": "integer", "minimum": 0 },
+        "tokenSource": { "const": "sessionEstimated" }
+      },
+      "dependentRequired": {
+        "estimatedInputTokens": ["tokenSource"],
+        "tokenSource": ["estimatedInputTokens"]
+      }
+    },
+    "ContextCompositionMessageBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["blockIndex", "kind"],
+          "properties": {
+            "blockIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "enum": ["text", "reasoning"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["blockIndex", "kind", "callId", "toolName"],
+          "properties": {
+            "blockIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "toolCall" },
+            "callId": { "$ref": "#/$defs/Id" },
+            "toolName": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["blockIndex", "kind", "resultForCallId"],
+          "properties": {
+            "blockIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "toolResult" },
+            "resultForCallId": { "$ref": "#/$defs/Id" }
+          }
+        }
+      ]
+    },
+    "ContextCompositionMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageIndex", "contributionId", "contributionKind", "label", "role",
+        "blocks", "attachments"
+      ],
+      "properties": {
+        "messageIndex": { "type": "integer", "minimum": 0 },
+        "contributionId": { "$ref": "#/$defs/Id" },
+        "contributionKind": {
+          "enum": [
+            "instructions", "workspaceBindings", "sessionControls", "journalMessages",
+            "contextProviders"
+          ]
+        },
+        "label": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["system", "user", "assistant", "tool"] },
+        "blocks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionMessageBlock" }
+        },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionItem" }
+        }
+      }
+    },
+    "ContextComposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerRequestId", "runId", "responseConstraint", "messages",
+        "workspaceBindings", "tools", "partitions", "sequence", "createdAt"
+      ],
+      "properties": {
+        "providerRequestId": { "$ref": "#/$defs/Id" },
+        "runId": { "$ref": "#/$defs/Id" },
+        "responseConstraint": { "enum": ["normal", "answerOnly"] },
+        "messages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionMessage" }
+        },
+        "workspaceBindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionItem" }
+        },
+        "tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionItem" }
+        },
+        "partitions": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": { "$ref": "#/$defs/ContextCompositionPartition" }
+        },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "createdAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PlanOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspaceId", "operation", "target"],
+      "properties": {
+        "workspaceId": { "$ref": "#/$defs/Id" },
+        "operation": {
+          "enum": ["fs.create", "fs.write", "fs.edit", "fs.delete", "fs.ensure_directory"]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\).+$"
+        },
+        "targetKind": { "enum": ["file", "directoryTree"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "fs.delete" } } },
+          "then": { "required": ["targetKind"] },
+          "else": { "not": { "required": ["targetKind"] } }
+        }
+      ]
+    },
+    "PlanOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["optionId", "label", "operations"],
+      "properties": {
+        "optionId": { "$ref": "#/$defs/Id" },
+        "label": { "$ref": "#/$defs/Id" },
+        "description": { "type": "string" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/PlanOperation" }
+        }
+      }
+    },
+    "PlanIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planId", "prompt", "options"],
+      "properties": {
+        "planId": { "$ref": "#/$defs/Id" },
+        "prompt": { "$ref": "#/$defs/Id" },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/PlanOption" }
+        }
+      }
+    },
+    "CommandBase": {
+      "type": "object",
+      "required": ["schemaVersion", "type", "commandId", "sessionId"],
+      "properties": {
+        "schemaVersion": { "const": "deepcode.command" },
+        "type": { "type": "string" },
+        "commandId": { "$ref": "#/$defs/Id" },
+        "sessionId": { "$ref": "#/$defs/Id" }
+      }
+    },
+    "ConversationCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "workspaceBinding"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "session.directory-index.attach" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "workspaceBinding": { "$ref": "#/$defs/WorkspaceBinding" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "workspaceId"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "session.directory-index.detach" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "workspaceId": { "$ref": "#/$defs/Id" }
+          }
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/CommandBase" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["schemaVersion", "type", "commandId", "sessionId", "text"],
+              "properties": {
+                "schemaVersion": { "const": "deepcode.command" },
+                "type": { "const": "message.submit" },
+                "commandId": { "$ref": "#/$defs/Id" },
+                "sessionId": { "$ref": "#/$defs/Id" },
+                "text": { "type": "string", "minLength": 1 },
+                "profileId": { "$ref": "#/$defs/Id" },
+                "attachments": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } }
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "messageId", "feedback"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "message.feedback.set" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "messageId": { "$ref": "#/$defs/Id" },
+            "feedback": { "type": ["string", "null"], "enum": ["up", "down", null] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "profileId"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "run.profile.select" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "runId": { "$ref": "#/$defs/Id" },
+            "profileId": { "$ref": "#/$defs/Id" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "run.cancel" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "runId": { "$ref": "#/$defs/Id" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "interactionId", "response"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "interaction.respond" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "runId": { "$ref": "#/$defs/Id" },
+            "interactionId": { "$ref": "#/$defs/Id" },
+            "response": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "callId", "approvalId", "decision"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "approval.respond" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "runId": { "$ref": "#/$defs/Id" },
+            "callId": { "$ref": "#/$defs/Id" },
+            "approvalId": { "$ref": "#/$defs/Id" },
+            "decision": { "enum": ["allow", "deny"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "planId", "response"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command" },
+            "type": { "const": "plan.respond" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "runId": { "$ref": "#/$defs/Id" },
+            "planId": { "$ref": "#/$defs/Id" },
+            "response": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind", "optionId"],
+                  "properties": {
+                    "kind": { "const": "select" },
+                    "optionId": { "$ref": "#/$defs/Id" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind", "text"],
+                  "properties": {
+                    "kind": { "const": "feedback" },
+                    "text": { "type": "string", "minLength": 1 },
+                    "optionId": { "$ref": "#/$defs/Id" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind"],
+                  "properties": { "kind": { "const": "ignore" } }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "SessionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "eventId", "sessionId", "sequence", "occurredAt", "type", "payload"],
+      "properties": {
+        "schemaVersion": { "const": "deepcode.session-event" },
+        "eventId": { "$ref": "#/$defs/Id" },
+        "sessionId": { "$ref": "#/$defs/Id" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "occurredAt": { "$ref": "#/$defs/Timestamp" },
+        "runId": { "$ref": "#/$defs/Id" },
+        "callId": { "$ref": "#/$defs/Id" },
+        "type": {
+          "enum": [
+            "session.created", "session.directory-index.attached", "session.directory-index.detached",
+            "input.accepted", "run.started", "run.profile.selected",
+            "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested",
+            "interaction.resolved", "plan.intent.requested", "plan.intent.resolved",
+            "todo.updated", "tool.requested", "approval.requested", "approval.resolved", "tool.completed",
+            "session.control.rejected",
+            "context.composed", "context.updated", "run.waiting", "run.settled"
+          ]
+        },
+        "payload": { "$ref": "#/$defs/JsonObject" }
+      }
+    },
+    "SessionProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "sessionId", "revision", "display", "workspaceBindings",
+        "sessionDirectoryIndexes", "messages",
+        "narratives", "assistantDraft", "pendingInteraction", "pendingApproval", "pendingPlan",
+        "todoList", "contextUsage", "contextCompositions", "tokenUsage", "tokenUsageHistory",
+        "run", "activities", "artifacts", "terminalError"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "deepcode.session-projection" },
+        "sessionId": { "$ref": "#/$defs/Id" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "display": { "$ref": "#/$defs/JsonObject" },
+        "workspaceBindings": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceBinding" } },
+        "sessionDirectoryIndexes": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceBinding" } },
+        "messages": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
+        "narratives": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
+        "assistantDraft": { "type": ["object", "null"] },
+        "pendingInteraction": { "type": ["object", "null"] },
+        "pendingApproval": { "type": ["object", "null"] },
+        "pendingPlan": { "type": ["object", "null"] },
+        "todoList": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["runId", "items", "sequence", "updatedAt"],
+              "properties": {
+                "runId": { "$ref": "#/$defs/Id" },
+                "items": { "type": "array", "maxItems": 12, "items": { "$ref": "#/$defs/TodoItem" } },
+                "sequence": { "type": "integer", "minimum": 1 },
+                "updatedAt": { "$ref": "#/$defs/Timestamp" }
+              }
+            }
+          ]
+        },
+        "contextUsage": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/ContextUsage" }]
+        },
+        "contextCompositions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextComposition" }
+        },
+        "tokenUsage": { "$ref": "#/$defs/TokenUsage" },
+        "tokenUsageHistory": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TokenUsageRound" }
+        },
+        "run": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/RunProjection" }]
+        },
+        "activities": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
+        "artifacts": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
+        "terminalError": { "type": ["object", "null"] }
+      }
+    },
+    "RunProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "status", "workspaceBindings"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/Id" },
+        "profileId": { "$ref": "#/$defs/Id" },
+        "waitingReason": { "enum": ["approval", "userInput", "plan"] },
+        "workspaceBindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WorkspaceBinding" }
+        },
+        "status": {
+          "enum": ["running", "waiting", "completed", "failed", "cancelled", "indeterminate"]
+        }
+      }
+    },
+    "ToolExecutionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "type", "requestId", "sessionId", "runId", "callId", "attemptId",
+        "toolName", "input", "workspaceBindings"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "deepcode.kernel-request" },
+        "type": { "const": "tool.execute" },
+        "requestId": { "$ref": "#/$defs/Id" },
+        "sessionId": { "$ref": "#/$defs/Id" },
+        "runId": { "$ref": "#/$defs/Id" },
+        "callId": { "$ref": "#/$defs/Id" },
+        "attemptId": { "$ref": "#/$defs/Id" },
+        "toolName": { "$ref": "#/$defs/Id" },
+        "input": { "$ref": "#/$defs/JsonObject" },
+        "workspaceBindings": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "planAuthorities": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
+        "nonWorkspaceAuthority": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authorityId", "decision"],
+          "properties": {
+            "authorityId": { "$ref": "#/$defs/Id" },
+            "decision": { "enum": ["allow", "deny"] }
+          }
+        }
+      }
+    },
+    "ToolExecutionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recordId", "sessionId", "runId", "callId", "attemptId", "toolName", "input", "preparedEffect",
+        "authority", "outcome", "startedAt", "completedAt"
+      ],
+      "properties": {
+        "recordId": { "$ref": "#/$defs/Id" },
+        "sessionId": { "$ref": "#/$defs/Id" },
+        "runId": { "$ref": "#/$defs/Id" },
+        "callId": { "$ref": "#/$defs/Id" },
+        "attemptId": { "$ref": "#/$defs/Id" },
+        "toolName": { "$ref": "#/$defs/Id" },
+        "input": { "$ref": "#/$defs/JsonObject" },
+        "preparedEffect": { "$ref": "#/$defs/JsonObject" },
+        "authority": { "$ref": "#/$defs/JsonObject" },
+        "outcome": { "enum": ["completed", "denied", "failed", "cancelled", "indeterminate"] },
+        "output": {},
+        "error": { "$ref": "#/$defs/JsonObject" },
+        "startedAt": { "$ref": "#/$defs/Timestamp" },
+        "completedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    }
+  }
+}
