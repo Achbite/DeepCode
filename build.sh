@@ -666,6 +666,29 @@ run_with_cargo_fallback_shim() {
   CARGO="$cargo_wrapper" PATH="$cargo_wrapper_dir:$PATH" "$@"
 }
 
+validate_tauri_locked_graph() {
+  local manifest_path="$1"
+  local stage_name="$2"
+  local output_file
+  output_file="$(mktemp "$TMPDIR/deepcode-tauri-lock.XXXXXX")"
+
+  echo "==[build][toolchain]== validate $stage_name locked dependency graph"
+  if cargo_with_fallback metadata \
+    --locked \
+    --manifest-path "$manifest_path" \
+    --format-version 1 \
+    >"$output_file" 2>&1; then
+    rm -f "$output_file"
+    return 0
+  fi
+
+  cat "$output_file" >&2
+  rm -f "$output_file"
+  echo "==[build][error]== $stage_name Cargo.lock preflight failed: $manifest_path" >&2
+  echo "==[build][error]== Keep the committed lockfile compatible with the repository Rust baseline; build.sh does not rewrite dependency locks." >&2
+  return 1
+}
+
 tracked_files() {
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git ls-files --cached --others --exclude-standard -- "$@"
@@ -1879,6 +1902,18 @@ LAUNCHER
     echo "==[build][opt]== Linux Tauri shell build skipped; set DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 to enable"
   fi
 }
+
+if [ "$run_tauri" = "1" ] || { [ "$run_package" = "1" ] && [ "$BUILD_LINUX_TAURI_SHELL" = "1" ]; }; then
+  validate_tauri_locked_graph \
+    "$ROOT_DIR/shells/tauri/src-tauri/Cargo.toml" \
+    "tauri"
+fi
+
+if [ "$run_deepcode_gui_tauri" = "1" ]; then
+  validate_tauri_locked_graph \
+    "$ROOT_DIR/shells/deepcode-gui/src-tauri/Cargo.toml" \
+    "deepcode-gui-tauri"
+fi
 
 if [ "$run_deps" = "1" ]; then
   run_pnpm_install
