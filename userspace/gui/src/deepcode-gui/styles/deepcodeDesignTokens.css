@@ -1,7 +1,7 @@
 :root[data-product='deepcode-gui'] {
   /* Registered light palette. Applied tokens below are the only rendering surface. */
   --dc-theme-light-background: #f4f4f6;
-  --dc-theme-light-sidebar: #f0f0f2;
+  --dc-theme-light-sidebar: #f9fafb;
   --dc-theme-light-surface: #ffffff;
   --dc-theme-light-surface-subtle: #f7f7f8;
   --dc-theme-light-surface-raised: #ffffff;

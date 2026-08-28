@@ -77,6 +77,18 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
       );
     }
 
+    if (definition.control === 'textarea') {
+      return (
+        <textarea
+          className="settings-field__input settings-field__textarea"
+          value={String(value ?? '')}
+          disabled={disabled}
+          rows={6}
+          onChange={(event) => onChange(definition.key, event.target.value)}
+        />
+      );
+    }
+
     return (
       <input
         className="settings-field__input"

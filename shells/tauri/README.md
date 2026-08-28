@@ -1,30 +1,19 @@
-# DeepCode Tauri Thin Shell
+# DeepCode Tauri 薄壳
 
-This package is a desktop window shell for the DeepCode Rust Kernel Web Host.
-
-It intentionally does not contain Agent runtime, tool execution, workflow
-logic, permission evaluation, session truth, or provider logic. The shell embeds
-the full React GUI for immediate first paint, starts or connects to the same-dir
-Kernel Host in the background, and delegates all product behavior to the
-three-layer runtime:
+这个包只负责 DeepCode Editor 的本地桌面窗口、进程托管和传输装配。它内嵌 React 资源，启动同目录的 Kernel Daemon 与 Host proxy，并把用户操作转发到三层运行时：
 
 ```text
-Tauri Shell -> Kernel Host URL -> TS Session Layer projection -> Rust Kernel
+Tauri 壳
+  -> Host proxy
+  -> TypeScript Session（唯一 Agent Loop 与 SessionProjection）
+  -> Rust Kernel（工具副作用与结果记录）
 ```
 
-Development command:
+Tauri 壳不拥有 Agent Loop、Provider 逻辑、工具执行、Session journal 或任务终态，也不会从 UI 内容推断这些事实。
 
-```bash
-pnpm --filter @deepcode/tauri-shell tauri:dev
-```
+## 开发运行
 
-Packaged build command:
-
-```bash
-bash ./build.sh
-```
-
-Direct Tauri development still expects the GUI dist to exist first:
+先构建 Editor Web 资源，再启动 Tauri：
 
 ```bash
 pnpm --filter @deepcode/client build
@@ -34,24 +23,26 @@ cp -r userspace/gui/dist/. shells/tauri/dist/
 pnpm --filter @deepcode/tauri-shell tauri:dev
 ```
 
-Packaged Windows distribution layout:
+## 打包
+
+```bash
+bash ./build.sh
+```
+
+Windows 便携包的核心布局：
 
 ```text
 bin/win64/
   DeepCode.exe
   WebView2Loader.dll
+  deepcode-host-web.exe
   deepcode-kernel.exe
+  session-core/
   web/
   config/
-  packs/
+  sessions/
 ```
 
-`DeepCode.exe` starts `deepcode-kernel.exe` unless `DEEPCODE_SHELL_CONNECT_ONLY=1`
-is set. It prefers `127.0.0.1:31245` when free and falls back to an available
-localhost port only when needed. The selected target is written into the GUI URL
-hash so bundled React code can talk to the background Kernel Host without a
-blocking boot-page redirect.
+`DeepCode.exe` 默认启动并持有同目录的本地进程树；设置 `DEEPCODE_SHELL_CONNECT_ONLY=1` 时只连接已有实例。壳优先使用 `127.0.0.1:31245`，端口被占用时选择其他本地端口，并把目标与本地 Host token 交给内嵌页面。
 
-Keep `WebView2Loader.dll` next to `DeepCode.exe`; it is copied from the Windows
-Tauri build output by `build.sh`. The target Windows system is still expected to
-have the Microsoft Edge WebView2 Evergreen Runtime installed.
+`WebView2Loader.dll` 必须与 `DeepCode.exe` 保持在同一目录。目标 Windows 系统仍需安装 Microsoft Edge WebView2 Evergreen Runtime。

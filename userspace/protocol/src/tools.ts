@@ -1,7 +1,4 @@
-/**
- * Host inspection DTOs. Agent-facing tool identity, schema, availability, and
- * context are defined exclusively by kernelAbiV2 ToolInventory/ToolContext.
- */
+/** UI 发起的只读 Host 检查 DTO；Agent 工具使用 localAgent.ts 中的 KernelPort。 */
 import type { FileReadResult, FileTreeNode } from './files.js';
 import type { BrowsePathResult } from './workspace.js';
 
@@ -13,18 +10,6 @@ export interface CodeGrepInput {
   exclude?: string[];
   contextLines?: number;
   maxResults?: number;
-}
-
-export interface GitDiffInput {
-  path?: string;
-  staged?: boolean;
-}
-
-/** Raw Provider function-call frame; Session maps name to v2 ToolId. */
-export interface ToolCall {
-  id: string;
-  name: string;
-  arguments: unknown;
 }
 
 export interface CodeGrepMatch {
@@ -75,10 +60,7 @@ export interface GitDiffResult {
   truncated: boolean;
 }
 
-/**
- * Host-only inspection contract. These queries are never exposed as Kernel
- * agent tools and cannot create a capability lease or an execution fact.
- */
+/** Host 壳层检查接口，不参与 Agent Loop 或工具执行记录。 */
 export type KernelHostInspectionQuery =
   | { kind: 'browse'; path?: string }
   | { kind: 'list'; folderId?: string; path: string; depth: number }
@@ -108,48 +90,4 @@ export type KernelHostInspectionOutput =
 export interface KernelHostInspectionResult {
   source: 'hostProjection';
   output: KernelHostInspectionOutput;
-}
-
-export type KernelHostSkillRiskLevel = 'low' | 'medium' | 'high' | 'critical';
-
-export type KernelHostSkillEffect =
-  | 'readsWorkspace'
-  | 'writesWorkspace'
-  | 'createsWorkspace'
-  | 'deletesWorkspace'
-  | 'readsGit'
-  | 'runsProcess'
-  | 'usesNetwork'
-  | 'readsSecret'
-  | 'modifiesGit'
-  | 'pushesGit'
-  | 'controlsBrowser'
-  | 'modifiesKernel'
-  | 'modifiesConfig';
-
-export type KernelHostSkillSource =
-  | { kind: 'localPack'; packId: string }
-  | { kind: 'externalProcess'; program: string; argv: string[] }
-  | { kind: 'externalConnector'; connectorId: string };
-
-export interface KernelHostSkillDescriptor {
-  id: string;
-  version: string;
-  titleKey?: string;
-  descriptionKey?: string;
-  inputSchema: unknown;
-  outputSchema: unknown;
-  requiredCapabilities: string[];
-  allowedPhases: string[];
-  riskLevel: KernelHostSkillRiskLevel;
-  effects: KernelHostSkillEffect[];
-  source: KernelHostSkillSource;
-  adapterKind: 'declarative' | 'externalProcess' | 'mcp';
-  activationStatus: 'dormant' | 'registered';
-  requestedModelVisible: boolean;
-}
-
-export interface KernelHostSkillCatalogResult {
-  source: 'hostManagement';
-  skills: KernelHostSkillDescriptor[];
 }

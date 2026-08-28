@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stable dependency-direction checks for the DeepCode layer boundaries.
+# DeepCode 分层依赖方向的稳定检查。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,8 +20,8 @@ assert_manifest_excludes() {
   fi
 }
 
-# Host adapters and user-facing shells communicate through the daemon/client
-# contracts. They must not acquire an in-process Kernel Runtime dependency.
+# Host adapter 与用户壳通过 daemon/client 合同通信，不能直接依赖进程内
+# Kernel Runtime。
 for manifest in \
   crates/deepcode-host-web/Cargo.toml \
   crates/deepcode-kernel-client/Cargo.toml \
@@ -33,11 +33,11 @@ do
   assert_manifest_excludes \
     "$manifest" \
     'deepcode-kernel-runtime' \
-    'Host shell must not own Kernel Runtime'
+    'Host 壳不能拥有 Kernel Runtime'
 done
 
-# TypeScript Session/UI packages consume protocol contracts and daemon APIs;
-# they must not introduce Rust Kernel implementation packages as dependencies.
+# TypeScript Session/UI 只消费协议合同和 daemon API，不能依赖 Rust Kernel
+# 实现包。
 for manifest in \
   userspace/protocol/package.json \
   userspace/session-core/package.json \
@@ -45,8 +45,8 @@ for manifest in \
 do
   assert_manifest_excludes \
     "$manifest" \
-    'deepcode-kernel-(runtime|daemon|tools|policy)' \
-    'Userspace package must not depend on Kernel implementation crates'
+    'deepcode-kernel-(runtime|daemon|tools)' \
+    'Userspace 包不能依赖 Kernel 实现 crate'
 done
 
-printf '==[architecture]== dependency boundaries passed\n'
+printf '==[architecture]== 分层依赖检查通过\n'

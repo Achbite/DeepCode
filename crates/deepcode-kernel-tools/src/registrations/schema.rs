@@ -37,7 +37,11 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
         KernelToolKind::FsList => serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "minLength": 1 },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional normalized workspace-relative directory. Omit it for the workspace root; if explicitly provided for the root, use '.' and never an empty string."
+                },
                 "depth": { "type": "integer", "minimum": 1, "maximum": 16 },
                 "includeHidden": { "type": "boolean" }
             },
@@ -48,7 +52,11 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             "required": ["pattern"],
             "properties": {
                 "pattern": { "type": "string", "minLength": 1 },
-                "path": { "type": "string", "minLength": 1 },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional normalized workspace-relative directory. Omit it for the workspace root; if explicitly provided for the root, use '.' and never an empty string."
+                },
                 "maxResults": { "type": "integer", "minimum": 1, "maximum": 5000 }
             },
             "additionalProperties": false
@@ -76,11 +84,10 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                 },
                 {
                     "type": "object",
-                    "required": ["path", "targetKind", "recursive"],
+                    "required": ["path", "targetKind"],
                     "properties": {
                         "path": { "type": "string", "minLength": 1 },
-                        "targetKind": { "const": "directory" },
-                        "recursive": { "const": true }
+                        "targetKind": { "const": "directoryTree" }
                     },
                     "additionalProperties": false
                 }
@@ -101,7 +108,11 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                     "maxItems": 256,
                     "items": { "type": "string", "minLength": 1 }
                 },
-                "path": { "type": "string", "minLength": 1 },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional normalized workspace-relative directory. Omit it for the workspace root; if explicitly provided for the root, use '.' and never an empty string."
+                },
                 "strategy": { "type": "string", "enum": ["literal", "regex"] },
                 "contextLines": { "type": "integer", "minimum": 0, "maximum": 5 },
                 "maxResults": { "type": "integer", "minimum": 1, "maximum": 500 }
@@ -243,15 +254,6 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
             },
             "additionalProperties": false
         }),
-        KernelToolKind::FsRename => serde_json::json!({
-            "type": "object",
-            "required": ["path", "destinationPath"],
-            "properties": {
-                "path": { "type": "string" },
-                "destinationPath": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
         KernelToolKind::DocumentRead => serde_json::json!({
             "type": "object",
             "oneOf": [
@@ -282,33 +284,6 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                     "additionalProperties": false
                 }
             ]
-        }),
-        KernelToolKind::GitStatus => {
-            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
-        }
-        KernelToolKind::GitDiff => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "staged": { "type": "boolean" }
-            },
-            "additionalProperties": false
-        }),
-        KernelToolKind::GitStage | KernelToolKind::GitUnstage => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "paths": { "type": "array", "items": { "type": "string" } }
-            },
-            "additionalProperties": false
-        }),
-        KernelToolKind::GitCommit => serde_json::json!({
-            "type": "object",
-            "required": ["message"],
-            "properties": {
-                "message": { "type": "string" }
-            },
-            "additionalProperties": false
         }),
         KernelToolKind::WebSearch => serde_json::json!({
             "type": "object",

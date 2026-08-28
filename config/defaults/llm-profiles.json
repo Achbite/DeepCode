@@ -1,0 +1,33 @@
+{
+  "profiles": [
+    {
+      "id": "deepseek-v4-flash-openai",
+      "name": "DeepSeek V4 Flash",
+      "kind": "openaiCompatible",
+      "providerFlavor": "deepseek",
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-v4-flash",
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 384000,
+      "temperature": 0.2,
+      "reasoningEffort": "high",
+      "thinking": "enabled",
+      "enabled": true
+    },
+    {
+      "id": "deepseek-v4-pro-openai",
+      "name": "DeepSeek V4 Pro",
+      "kind": "openaiCompatible",
+      "providerFlavor": "deepseek",
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-v4-pro",
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 384000,
+      "temperature": 0.2,
+      "reasoningEffort": "max",
+      "thinking": "enabled",
+      "enabled": true
+    }
+  ],
+  "defaultProfileId": "deepseek-v4-pro-openai"
+}

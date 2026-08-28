@@ -2,38 +2,22 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
-    let startup_readiness = state.startup_readiness_v2.status();
-    let ready = startup_readiness.ready;
-    let (status, kernel) = match startup_readiness.phase {
-        crate::startup_readiness_v2::HostStartupReadinessPhaseV2::Ready => ("ok", "ready"),
-        crate::startup_readiness_v2::HostStartupReadinessPhaseV2::Recovering => {
-            ("recovering", "recovering")
-        }
-        crate::startup_readiness_v2::HostStartupReadinessPhaseV2::Failed => {
-            ("failed", "unavailable")
-        }
-    };
     let workspace = current_workspace(&state.host_services.workspace)
         .ok()
         .and_then(|workspace| serde_json::to_value(workspace).ok())
         .unwrap_or(Value::Null);
     let build_info = packaged_build_info().unwrap_or(Value::Null);
+    let session_ready = state.session_service.is_ready();
     ApiResponse::ok(json!({
         "service": "deepcode-kernel-daemon",
-        "ok": ready,
-        "status": status,
-        "kernel": kernel,
+        "ok": session_ready,
+        "status": if session_ready { "ok" } else { "degraded" },
+        "kernel": "ready",
+        "session": if session_ready { "ready" } else { "unavailable" },
         "buildCommit": build_commit(),
         "buildInfo": build_info,
-        "kernelAbiVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
-        "protocolVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
-        "workspace": workspace,
-        "hostWorkspaceRegistry": format!("{:?}", state.host_services.workspace.readiness()).to_ascii_lowercase(),
-        "hostActiveRunBrokerV2": state.host_services.active_runs_v2.status(),
-        "hostKernelStartupRecoveryV2": state.kernel_session_v2.startup_recovery_status(),
-        "hostStartupReadinessV2": startup_readiness,
-        "sessionKernelProjectionV2": state.host_services.projection_v2.status(),
-        "audit": state.host_services.audit.status()
+        "protocolVersion": "deepcode.local-agent",
+        "workspace": workspace
     }))
 }
 

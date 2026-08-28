@@ -91,9 +91,15 @@
 }
 
 .settings-nav-item--active {
-  background: var(--accent, #0a84ff);
+  background: color-mix(in srgb, var(--accent, #0a84ff) 82%, #000000);
   color: #ffffff;
   box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.3));
+}
+
+.settings-nav-item--active:hover,
+.settings-nav-item--active:focus-visible {
+  background: color-mix(in srgb, var(--accent, #0a84ff) 82%, #000000);
+  color: #ffffff;
 }
 
 .settings-nav-item__icon {
@@ -182,6 +188,16 @@
   padding: 11px 14px;
   font-size: 12px;
   line-height: 1.55;
+}
+
+.settings-restart-notice {
+  margin: -6px 0 18px;
+  padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--warn, #a66308) 30%, transparent);
+  border-radius: var(--radius-md, 6px);
+  background: color-mix(in srgb, var(--warn, #a66308) 9%, transparent);
+  color: var(--warn, #a66308);
+  font-size: 12px;
 }
 
 .settings-placeholder-card {
@@ -430,6 +446,126 @@
   background: var(--accent-soft, rgba(10, 132, 255, 0.15));
   color: var(--accent, #0a84ff);
   font-weight: 650;
+}
+
+.settings-accent-option[aria-pressed='true']:hover,
+.settings-accent-option[aria-pressed='true']:focus-visible {
+  border-color: var(--accent, #0a84ff);
+  background: var(--accent-soft, rgba(10, 132, 255, 0.15));
+  color: var(--accent, #0a84ff);
+}
+
+.settings-token-usage {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.settings-token-usage__item {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 11px 12px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--dc-radius-inner);
+  background: var(--dc-surface-subtle);
+}
+
+.settings-token-usage__item span {
+  overflow: hidden;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-token-usage__item strong {
+  color: var(--dc-foreground-strong);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-token-usage__note {
+  margin: 10px 0 0;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-token-rounds {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
+.settings-token-rounds__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-token-rounds__heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-token-rounds__heading strong {
+  color: var(--dc-foreground-strong);
+  font-size: 13px;
+}
+
+.settings-token-rounds__heading span,
+.settings-token-rounds__empty {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-token-rounds__heading > span {
+  min-width: 28px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--dc-surface-subtle);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-token-rounds__empty {
+  padding: 16px;
+  border: 1px dashed var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--dc-radius-inner);
+  text-align: center;
+}
+
+.settings-token-requests--rounds {
+  padding: 0;
+}
+
+.settings-token-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+}
+
+.settings-token-pagination button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: 7px;
+  background: var(--dc-surface-subtle);
+  color: var(--dc-foreground);
+  cursor: pointer;
+}
+
+.settings-token-pagination button:disabled {
+  cursor: default;
+  opacity: 0.45;
 }
 
 .settings-accent-swatch {
@@ -691,8 +827,8 @@
   background: #f97316;
 }
 
-.settings-token-request__segment--completion {
-  background: #8b5cf6;
+.settings-token-request__segment--input {
+  background: var(--dc-accent);
 }
 
 .settings-field {
@@ -790,6 +926,14 @@
   width: 230px;
   min-height: 30px;
   padding: 5px 9px;
+}
+
+.settings-field__textarea {
+  width: min(420px, 100%);
+  min-height: 118px;
+  padding: 9px 10px;
+  resize: vertical;
+  line-height: 1.5;
 }
 
 .settings-field__input:focus,
@@ -1280,7 +1424,8 @@
   }
 
   .settings-field__input,
-  .settings-field__select {
+  .settings-field__select,
+  .settings-field__textarea {
     width: 100%;
   }
 

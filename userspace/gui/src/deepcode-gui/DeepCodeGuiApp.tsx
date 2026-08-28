@@ -3,6 +3,7 @@ import useAppStatusStore from '../state/appStatusStore';
 import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
+import { useLocalAgentStore } from '../state/localAgentStore';
 import { normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
 import {
   normalizeGuiAccentColor,
@@ -21,7 +22,6 @@ import {
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
 import './styles/deepcodeDesignTokens.css';
-import './styles/deepcodeShell.css';
 
 const DeepCodeWorkbenchLayout = lazy(() => import('./layout/DeepCodeWorkbenchLayout'));
 
@@ -163,6 +163,7 @@ const DeepCodeGuiApp: React.FC = () => {
     connectedReloadDoneRef.current = true;
     void loadWorkspace();
     void loadUserSettings();
+    void useLocalAgentStore.getState().initialize();
   }, [apiStatus, loadUserSettings, loadWorkspace]);
 
   useEffect(() => {

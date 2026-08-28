@@ -1,70 +1,73 @@
 import React from 'react';
-import type {
-  AgentTimelineResourcePresentation,
-  AgentTimelineTaskOutcome,
-  AgentTimelineTaskProgress,
-} from '@deepcode/protocol';
+import type { SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-
-export interface DeepCodeTaskItem {
-  id: string;
-  blockId: string;
-  title: string;
-  summary: string;
-  progress: AgentTimelineTaskProgress;
-  outcome: AgentTimelineTaskOutcome | null;
-  targetRefs: string[];
-  resourcePresentation: AgentTimelineResourcePresentation[];
-}
 
 interface DeepCodeTaskPanelProps {
   language: UiLanguage;
-  items: DeepCodeTaskItem[];
+  projection: SessionProjection | null;
 }
 
-function structuredTargetLabel(item: DeepCodeTaskItem): string {
-  const labels = item.resourcePresentation.flatMap((resource) => {
-    const label = resource.kind === 'workspacePath'
-      ? resource.workspaceRelativePath ?? resource.label
-      : resource.label;
-    const normalized = label.trim();
-    return normalized ? [normalized] : [];
-  });
-  return [...new Set(labels)].join(' · ');
-}
-
-const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, items }) => (
-  <aside className="deepcode-gui-context-panel">
-    <section className="deepcode-gui-task-list-card">
-      <div className="deepcode-gui-task-list-card__title">{t(language, 'deepcodeGui.tasks.title')}</div>
-      {items.length === 0 ? (
-        <div className="deepcode-gui-task-list-card__empty">{t(language, 'deepcodeGui.tasks.empty')}</div>
-      ) : (
-        <div className="deepcode-gui-task-list">
-          {items.map((item) => {
-            const targetLabel = structuredTargetLabel(item);
-            const statusSummary = item.summary
-              || t(language, `deepcodeGui.tasks.progress.${item.progress}`);
-            return (
-              <div
-                key={JSON.stringify([item.id, item.targetRefs])}
-                className={`deepcode-gui-task-item deepcode-gui-task-item--${item.progress}`}
-              >
-                <span className="deepcode-gui-task-item__dot" />
-                <div>
-                  <div className="deepcode-gui-task-item__title">{item.title}</div>
-                  {targetLabel && (
-                    <div className="deepcode-gui-task-item__summary">{targetLabel}</div>
-                  )}
-                </div>
-                <strong>{statusSummary}</strong>
-              </div>
-            );
-          })}
+const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, projection }) => {
+  const artifacts = projection?.artifacts ?? [];
+  const todos = projection?.todoList?.items ?? [];
+  return (
+    <aside className="deepcode-gui-context-panel">
+      <section className="deepcode-gui-task-list-card">
+        <div className="deepcode-gui-task-list-card__title">
+          {t(language, 'deepcodeGui.tasks.title')}
         </div>
-      )}
-    </section>
-  </aside>
-);
+        {todos.length === 0 ? (
+          <div className="deepcode-gui-task-list-card__empty">
+            {t(language, 'deepcodeGui.tasks.empty')}
+          </div>
+        ) : (
+          <div className="deepcode-gui-task-list">
+            {todos.map((todo) => (
+              <div
+                className={`deepcode-gui-task-item deepcode-gui-task-item--${todo.status === 'inProgress' ? 'active' : todo.status}`}
+                key={todo.todoId}
+              >
+                <span className="deepcode-gui-task-item__dot" aria-hidden="true" />
+                <div>
+                  <div className="deepcode-gui-task-item__title">{todo.label}</div>
+                </div>
+                <strong>{todoStatus(todo.status, language)}</strong>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="deepcode-gui-task-list-card deepcode-gui-output-card">
+        <div className="deepcode-gui-task-list-card__title">
+          {t(language, 'deepcodeGui.outputs.title')}
+        </div>
+        {artifacts.length === 0 ? (
+          <div className="deepcode-gui-task-list-card__empty">
+            {t(language, 'deepcodeGui.outputs.empty')}
+          </div>
+        ) : artifacts.map((artifact) => (
+          <div
+            className="deepcode-gui-output-item"
+            key={artifact.artifactId}
+            title={artifact.logicalPath ?? artifact.uri ?? ''}
+          >
+            <strong>{artifact.label}</strong>
+            <span>{artifact.logicalPath ?? artifact.uri ?? ''}</span>
+          </div>
+        ))}
+      </section>
+    </aside>
+  );
+};
+
+function todoStatus(status: 'pending' | 'inProgress' | 'completed', language: UiLanguage): string {
+  const labels = {
+    pending: ['待处理', 'Pending'],
+    inProgress: ['进行中', 'In progress'],
+    completed: ['完成', 'Done'],
+  } as const;
+  return labels[status][language === 'zh-CN' ? 0 : 1];
+}
 
 export default DeepCodeTaskPanel;
