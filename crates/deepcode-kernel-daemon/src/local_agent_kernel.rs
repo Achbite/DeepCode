@@ -5,7 +5,9 @@ use deepcode_kernel_runtime::executors::{
     KernelToolExecutionContext, KernelToolInvocation, SecretProvider,
 };
 use deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary;
-use deepcode_kernel_tools::{KernelToolRegistry, ToolEffectClass, ToolEffectScope};
+use deepcode_kernel_tools::{
+    KernelToolRegistry, ToolAvailability, ToolEffectClass, ToolEffectScope,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -221,13 +223,16 @@ impl LocalAgentKernel {
                     ToolEffectScope::WorkspaceRead | ToolEffectScope::WorkspaceWrite => {
                         schema_requiring_workspace_id(tool.input_schema.clone())
                     }
-                    ToolEffectScope::NetworkRead => tool.input_schema.clone(),
+                    ToolEffectScope::NetworkRead | ToolEffectScope::Process => {
+                        tool.input_schema.clone()
+                    }
                 };
                 json!({
                     "name": tool.name,
                     "description": tool.description,
                     "inputSchema": input_schema,
                     "possibleEffects": possible_effects(tool.effect_class, tool.effect_scope),
+                    "availability": tool.availability,
                 })
             })
             .collect::<Vec<_>>();
@@ -237,6 +242,7 @@ impl LocalAgentKernel {
                 "description": tool.description,
                 "inputSchema": tool.input_schema,
                 "possibleEffects": ["external"],
+                "availability": "callable",
             })
         }));
         Ok(Value::Array(tools))
@@ -472,12 +478,18 @@ impl LocalAgentKernel {
             .ok_or_else(|| {
                 LocalAgentKernelError::new("tool_not_found", "Kernel 工具目录中不存在该工具。")
             })?;
+        if descriptor.availability == ToolAvailability::Blocked {
+            return Err(LocalAgentKernelError::new(
+                "tool_blocked",
+                format!("Kernel 工具 {} 当前被阻止，不能执行。", request.tool_name),
+            ));
+        }
         let mut tool_input = request.input.clone();
         let workspace_id = match descriptor.effect_scope {
             ToolEffectScope::WorkspaceRead | ToolEffectScope::WorkspaceWrite => {
                 Some(take_workspace_id(&mut tool_input)?)
             }
-            ToolEffectScope::NetworkRead => {
+            ToolEffectScope::NetworkRead | ToolEffectScope::Process => {
                 if tool_input.get("workspaceId").is_some() {
                     return Err(LocalAgentKernelError::new(
                         "tool_input_invalid",
@@ -535,7 +547,9 @@ impl LocalAgentKernel {
                 let resolve_target = |target: &str| match descriptor.effect_scope {
                     ToolEffectScope::WorkspaceRead => boundary.resolve_read(target),
                     ToolEffectScope::WorkspaceWrite => boundary.resolve_mutation(target),
-                    ToolEffectScope::NetworkRead => unreachable!("workspace target scope"),
+                    ToolEffectScope::NetworkRead | ToolEffectScope::Process => {
+                        unreachable!("workspace target scope")
+                    }
                 };
                 let private = logical_targets
                     .iter()
@@ -557,11 +571,7 @@ impl LocalAgentKernel {
         let delete_target_kind = if request.tool_name == "fs.delete" {
             match arguments.get("targetKind").and_then(Value::as_str) {
                 Some("file") => Some("file".to_string()),
-                Some("directory")
-                    if arguments.get("recursive").and_then(Value::as_bool) == Some(true) =>
-                {
-                    Some("directoryTree".to_string())
-                }
+                Some("directoryTree") => Some("directoryTree".to_string()),
                 _ => {
                     return Err(LocalAgentKernelError::new(
                         "tool_input_invalid",
@@ -577,6 +587,7 @@ impl LocalAgentKernel {
                 ToolEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
                 ToolEffectScope::WorkspaceWrite => PreparedEffectScope::WorkspaceMutation,
                 ToolEffectScope::NetworkRead => PreparedEffectScope::Network,
+                ToolEffectScope::Process => unreachable!("blocked process tool checked above"),
             },
             workspace_id,
             operation: request.tool_name.clone(),
@@ -1164,6 +1175,7 @@ fn permission_setting_id(scope: PreparedEffectScope) -> &'static str {
 fn possible_effects(class: ToolEffectClass, scope: ToolEffectScope) -> Vec<&'static str> {
     match (class, scope) {
         (_, ToolEffectScope::NetworkRead) => vec!["network"],
+        (_, ToolEffectScope::Process) => vec!["process"],
         (ToolEffectClass::Read, ToolEffectScope::WorkspaceRead) => vec!["workspaceRead"],
         (ToolEffectClass::Mutation, ToolEffectScope::WorkspaceWrite) => {
             vec!["workspaceMutation"]

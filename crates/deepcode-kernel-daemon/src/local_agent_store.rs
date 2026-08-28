@@ -10,7 +10,9 @@ const SESSION_STORE_V3_TO_V4: &str =
     include_str!("../../../contracts/agent-runtime-v2/session-v3-to-v4.sql");
 const SESSION_STORE_V4_TO_V5: &str =
     include_str!("../../../contracts/agent-runtime-v2/session-v4-to-v5.sql");
-const SESSION_STORE_VERSION: u32 = 5;
+const SESSION_STORE_V5_TO_V6: &str =
+    include_str!("../../../contracts/agent-runtime-v2/session-v5-to-v6.sql");
+const SESSION_STORE_VERSION: u32 = 6;
 const EVENT_VERSION: &str = "deepcode.session-event.v2";
 const COMMAND_VERSION: &str = "deepcode.command.v2";
 const REPLY_VERSION: &str = "deepcode.command-reply.v2";
@@ -70,6 +72,9 @@ impl LocalAgentJournal {
                 connection
                     .execute_batch(SESSION_STORE_V4_TO_V5)
                     .map_err(sql_error("session_store_v4_to_v5_failed"))?;
+                connection
+                    .execute_batch(SESSION_STORE_V5_TO_V6)
+                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
             }
@@ -80,6 +85,9 @@ impl LocalAgentJournal {
                 connection
                     .execute_batch(SESSION_STORE_V4_TO_V5)
                     .map_err(sql_error("session_store_v4_to_v5_failed"))?;
+                connection
+                    .execute_batch(SESSION_STORE_V5_TO_V6)
+                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
             }
@@ -87,6 +95,16 @@ impl LocalAgentJournal {
                 connection
                     .execute_batch(SESSION_STORE_V4_TO_V5)
                     .map_err(sql_error("session_store_v4_to_v5_failed"))?;
+                connection
+                    .execute_batch(SESSION_STORE_V5_TO_V6)
+                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
+                verify_session_store(&connection)?;
+                verify_session_store_version(&connection)?;
+            }
+            5 => {
+                connection
+                    .execute_batch(SESSION_STORE_V5_TO_V6)
+                    .map_err(sql_error("session_store_v5_to_v6_failed"))?;
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
             }
@@ -97,7 +115,7 @@ impl LocalAgentJournal {
             other => {
                 return Err(LocalAgentStoreError::new(
                     "session_store_version_unsupported",
-                    format!("Session Store 版本 {other} 不是当前 active-v2 store；hard cut 只接受 schema 2/3/4 的单向升级或 schema 5。"),
+                    format!("Session Store 版本 {other} 不是当前 active-v2 store；hard cut 只接受 schema 2/3/4/5 的单向升级或 schema 6。"),
                 ))
             }
         }
@@ -681,6 +699,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         "approval.requested",
         "approval.resolved",
         "tool.completed",
+        "session.control.rejected",
         "context.composed",
         "context.updated",
         "run.waiting",
@@ -708,6 +727,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             | "approval.requested"
             | "approval.resolved"
             | "tool.completed"
+            | "session.control.rejected"
     );
     if needs_run {
         validate_id("runId", required_string(event, "runId")?)?;
@@ -808,12 +828,41 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 }
             }
         }
+        "session.control.rejected" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["toolName", "input", "error"], &[])?;
+            if !matches!(
+                required_string(payload, "toolName")?,
+                "interaction.request" | "plan.intent" | "todo.update"
+            ) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "session.control.rejected toolName 不是 Session control。",
+                ));
+            }
+            if !payload.get("input").is_some_and(Value::is_object) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "session.control.rejected input 必须是对象。",
+                ));
+            }
+            let error = payload.get("error").expect("validated error");
+            exact_object(error, &["code", "message"], &[])?;
+            required_string(error, "code")?;
+            required_string(error, "message")?;
+        }
         "context.composed" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
                 payload,
-                &["providerRequestId", "responseConstraint", "categories"],
-                &[],
+                &[
+                    "providerRequestId",
+                    "responseConstraint",
+                    "messages",
+                    "workspaceBindings",
+                    "tools",
+                ],
+                &["partitions"],
             )?;
             validate_id(
                 "providerRequestId",
@@ -828,7 +877,17 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                     "context.composed responseConstraint 无效。",
                 ));
             }
-            validate_context_categories(payload.get("categories").expect("validated categories"))?;
+            validate_context_messages(payload.get("messages").expect("validated messages"))?;
+            validate_context_items(
+                payload
+                    .get("workspaceBindings")
+                    .expect("validated workspace bindings"),
+                "workspaceBindings",
+            )?;
+            validate_context_items(payload.get("tools").expect("validated tools"), "tools")?;
+            if let Some(partitions) = payload.get("partitions") {
+                validate_context_partitions(partitions)?;
+            }
         }
         "context.updated" => {
             let payload = event.get("payload").expect("validated payload");
@@ -897,7 +956,7 @@ fn validate_event_facts(
     let session_id = required_string(event, "sessionId")?;
     if matches!(
         event_type,
-        "todo.updated" | "context.composed" | "context.updated"
+        "todo.updated" | "session.control.rejected" | "context.composed" | "context.updated"
     ) {
         let run_id = required_string(event, "runId")?;
         let run_started: bool = transaction
@@ -944,6 +1003,36 @@ fn validate_event_facts(
                 return Err(LocalAgentStoreError::new(
                     "todo_call_duplicate",
                     "todo.update callId 已经写入当前 Session。",
+                ));
+            }
+        }
+        "session.control.rejected" => {
+            let call_id = required_string(event, "callId")?;
+            let run_id = required_string(event, "runId")?;
+            let duplicate: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND call_id=?2
+                           AND event_type='session.control.rejected'
+                     )",
+                    params![session_id, call_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            let prior_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE session_id=?1 AND run_id=?2
+                       AND event_type='session.control.rejected'",
+                    params![session_id, run_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if duplicate || prior_count >= 2 {
+                return Err(LocalAgentStoreError::new(
+                    "session_control_rejection_invalid",
+                    "Session control 拒绝回执重复或超过同一 run 的一次纠正机会。",
                 ));
             }
         }
@@ -1079,51 +1168,233 @@ fn validate_feedback(value: &Value) -> Result<(), LocalAgentStoreError> {
     ))
 }
 
-fn validate_context_categories(value: &Value) -> Result<(), LocalAgentStoreError> {
-    let categories = value.as_array().ok_or_else(|| {
-        LocalAgentStoreError::new("session_event_invalid", "context categories 必须是数组。")
+fn validate_context_messages(value: &Value) -> Result<(), LocalAgentStoreError> {
+    let messages = value.as_array().ok_or_else(|| {
+        LocalAgentStoreError::new("session_event_invalid", "context messages 必须是数组。")
     })?;
-    let mut kinds = std::collections::HashSet::new();
-    for category in categories {
-        exact_object(category, &["kind", "itemCount", "items"], &[])?;
-        let kind = required_string(category, "kind")?;
+    let mut contribution_ids = std::collections::HashSet::new();
+    let mut call_ids = std::collections::HashSet::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        exact_object(
+            message,
+            &[
+                "messageIndex",
+                "contributionId",
+                "contributionKind",
+                "label",
+                "role",
+                "blocks",
+                "attachments",
+            ],
+            &[],
+        )?;
+        if required_u64(message, "messageIndex")? != message_index as u64 {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "context messageIndex 必须与 Provider request 消息顺序一致。",
+            ));
+        }
+        let contribution_id = required_string(message, "contributionId")?;
+        validate_id("contributionId", contribution_id)?;
+        if !contribution_ids.insert(contribution_id) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "context contributionId 不能重复。",
+            ));
+        }
         if ![
             "instructions",
             "workspaceBindings",
             "sessionControls",
             "journalMessages",
             "contextProviders",
-            "messageAttachments",
-            "tools",
         ]
-        .contains(&kind)
-            || !kinds.insert(kind)
+        .contains(&required_string(message, "contributionKind")?)
         {
             return Err(LocalAgentStoreError::new(
                 "session_event_invalid",
-                "context category 未声明或重复。",
+                "context contributionKind 无效。",
             ));
         }
-        let items = category
-            .get("items")
+        required_string(message, "label")?;
+        let role = required_string(message, "role")?;
+        if !["system", "user", "assistant", "tool"].contains(&role) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "context message role 无效。",
+            ));
+        }
+        let blocks = message
+            .get("blocks")
             .and_then(Value::as_array)
             .ok_or_else(|| {
                 LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "context category items 必须是数组。",
+                    "context message blocks 必须是数组。",
                 )
             })?;
-        if items.is_empty() || required_u64(category, "itemCount")? != items.len() as u64 {
+        let mut result_count = 0usize;
+        for (block_index, block) in blocks.iter().enumerate() {
+            if required_u64(block, "blockIndex")? != block_index as u64 {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "context blockIndex 必须连续并保持消息内顺序。",
+                ));
+            }
+            match required_string(block, "kind")? {
+                "text" => {
+                    exact_object(block, &["blockIndex", "kind"], &[])?;
+                    if role == "tool" {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "tool message 只能投影 toolResult block。",
+                        ));
+                    }
+                }
+                "reasoning" => {
+                    exact_object(block, &["blockIndex", "kind"], &[])?;
+                    if role != "assistant" {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "reasoning block 只能属于 assistant message。",
+                        ));
+                    }
+                }
+                "toolCall" => {
+                    exact_object(block, &["blockIndex", "kind", "callId", "toolName"], &[])?;
+                    if role != "assistant" {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "toolCall block 只能属于 assistant message。",
+                        ));
+                    }
+                    let call_id = required_string(block, "callId")?;
+                    validate_id("callId", call_id)?;
+                    if !call_ids.insert(call_id) {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "context tool callId 不能重复。",
+                        ));
+                    }
+                    required_string(block, "toolName")?;
+                }
+                "toolResult" => {
+                    exact_object(block, &["blockIndex", "kind", "resultForCallId"], &[])?;
+                    if role != "tool" {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "toolResult block 只能属于 tool message。",
+                        ));
+                    }
+                    let result_for_call_id = required_string(block, "resultForCallId")?;
+                    validate_id("resultForCallId", result_for_call_id)?;
+                    if !call_ids.contains(result_for_call_id) {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "context toolResult 缺少此前同请求中的 toolCall。",
+                        ));
+                    }
+                    result_count += 1;
+                }
+                _ => {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "context message block kind 无效。",
+                    ))
+                }
+            }
+        }
+        if role == "tool" && (blocks.len() != 1 || result_count != 1) {
             return Err(LocalAgentStoreError::new(
                 "session_event_invalid",
-                "context category 必须非空且 itemCount 与 items 一致。",
+                "tool message 必须且只能包含一个 toolResult block。",
             ));
         }
-        for item in items {
-            exact_object(item, &["itemId", "label"], &[])?;
-            validate_id("itemId", required_string(item, "itemId")?)?;
-            required_string(item, "label")?;
+        validate_context_items(
+            message.get("attachments").expect("validated attachments"),
+            "attachments",
+        )?;
+        if role != "user"
+            && message
+                .get("attachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| !attachments.is_empty())
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "context attachments 只能属于 user message。",
+            ));
         }
+    }
+    Ok(())
+}
+
+fn validate_context_items(value: &Value, field: &str) -> Result<(), LocalAgentStoreError> {
+    let items = value.as_array().ok_or_else(|| {
+        LocalAgentStoreError::new(
+            "session_event_invalid",
+            format!("context {field} 必须是数组。"),
+        )
+    })?;
+    let mut item_ids = std::collections::HashSet::new();
+    for item in items {
+        exact_object(item, &["itemId", "label"], &[])?;
+        let item_id = required_string(item, "itemId")?;
+        validate_id("itemId", item_id)?;
+        if !item_ids.insert(item_id) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                format!("context {field} itemId 不能重复。"),
+            ));
+        }
+        required_string(item, "label")?;
+    }
+    Ok(())
+}
+
+fn validate_context_partitions(value: &Value) -> Result<(), LocalAgentStoreError> {
+    const ORDER: [&str; 7] = [
+        "instructions",
+        "sessionControls",
+        "tools",
+        "workspaceBindings",
+        "contextProviders",
+        "journalMessages",
+        "messageAttachments",
+    ];
+    let partitions = value.as_array().ok_or_else(|| {
+        LocalAgentStoreError::new("session_event_invalid", "context partitions 必须是数组。")
+    })?;
+    if partitions.len() != ORDER.len() {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "context partitions 必须包含七个固定顺序分区。",
+        ));
+    }
+    let mut total_shape_units = 0_u64;
+    for (index, partition) in partitions.iter().enumerate() {
+        exact_object(partition, &["kind", "itemCount", "requestShapeUnits"], &[])?;
+        if required_string(partition, "kind")? != ORDER[index] {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "context partitions 顺序或 kind 无效。",
+            ));
+        }
+        required_u64(partition, "itemCount")?;
+        total_shape_units = total_shape_units
+            .checked_add(required_u64(partition, "requestShapeUnits")?)
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "context partition requestShapeUnits 溢出。",
+                )
+            })?;
+    }
+    if total_shape_units == 0 {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "context partition requestShapeUnits 不能全部为零。",
+        ));
     }
     Ok(())
 }
@@ -1368,12 +1639,13 @@ mod tests {
             random_id("test").unwrap().replace(':', "-")
         ));
         let v2_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 5;", "PRAGMA user_version = 2;")
+            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 2;")
             .replace("        'session.directory-index.attached',\n", "")
             .replace("        'session.directory-index.detached',\n", "")
             .replace("        'todo.updated',\n", "")
             .replace("        'message.feedback.updated',\n", "")
-            .replace("        'context.composed',\n", "");
+            .replace("        'context.composed',\n", "")
+            .replace("        'session.control.rejected',\n", "");
         {
             let connection = Connection::open(&path).expect("open schema-2 store");
             connection
@@ -1439,11 +1711,12 @@ mod tests {
             random_id("test").unwrap().replace(':', "-")
         ));
         let v3_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 5;", "PRAGMA user_version = 3;")
+            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 3;")
             .replace("        'session.directory-index.attached',\n", "")
             .replace("        'session.directory-index.detached',\n", "")
             .replace("        'message.feedback.updated',\n", "")
-            .replace("        'context.composed',\n", "");
+            .replace("        'context.composed',\n", "")
+            .replace("        'session.control.rejected',\n", "");
         {
             let connection = Connection::open(&path).expect("open schema-3 store");
             connection
@@ -1526,9 +1799,10 @@ mod tests {
             random_id("test").unwrap().replace(':', "-")
         ));
         let v4_schema = SESSION_STORE_SCHEMA
-            .replace("PRAGMA user_version = 5;", "PRAGMA user_version = 4;")
+            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 4;")
             .replace("        'message.feedback.updated',\n", "")
-            .replace("        'context.composed',\n", "");
+            .replace("        'context.composed',\n", "")
+            .replace("        'session.control.rejected',\n", "");
         {
             let connection = Connection::open(&path).expect("open schema-4 store");
             connection
@@ -1585,15 +1859,13 @@ mod tests {
                     "payload":{
                         "providerRequestId":"provider-request:v4",
                         "responseConstraint":"normal",
-                        "categories":[{
-                            "kind":"tools",
-                            "itemCount":1,
-                            "items":[{"itemId":"fs.list","label":"fs.list"}]
-                        }]
+                        "messages":[],
+                        "workspaceBindings":[],
+                        "tools":[{"itemId":"fs.list","label":"fs.list"}]
                     }
                 }),
             ])
-            .expect("append schema-5 vocabulary after migration");
+            .expect("append current vocabulary after migration");
         let connection = Connection::open(&path).expect("reopen migrated store");
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1609,6 +1881,128 @@ mod tests {
             .map(|payload| serde_json::from_str(&payload).expect("decode legacy context payload"))
             .expect("read preserved schema-4 context usage");
         assert!(legacy_payload.get("providerRequestId").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_five_store_migrates_to_control_rejection_vocabulary() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-v5-migrate-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let v5_schema = SESSION_STORE_SCHEMA
+            .replace("PRAGMA user_version = 6;", "PRAGMA user_version = 5;")
+            .replace("        'session.control.rejected',\n", "");
+        {
+            let connection = Connection::open(&path).expect("open schema-5 store");
+            connection
+                .execute_batch(&v5_schema)
+                .expect("create schema-5 store");
+        }
+
+        let journal = LocalAgentJournal::open(&path).expect("migrate schema-5 store");
+        journal
+            .create_session("session:migrate-v5", "迁移 v5", &json!([]), None)
+            .expect("create migrated session");
+        journal
+            .append(&json!({
+                "type":"run.started",
+                "sessionId":"session:migrate-v5",
+                "runId":"run:migrate-v5",
+                "payload":{
+                    "inputMessageId":"message:migrate-v5",
+                    "workspaceBindings":[]
+                }
+            }))
+            .expect("start migrated run");
+        let rejection = journal
+            .append(&json!({
+                "type":"session.control.rejected",
+                "sessionId":"session:migrate-v5",
+                "runId":"run:migrate-v5",
+                "callId":"plan:invalid",
+                "payload":{
+                    "toolName":"plan.intent",
+                    "input":{
+                        "prompt":"请选择。",
+                        "options":[{"optionId":"write","label":"写入","operations":[]}]
+                    },
+                    "error":{
+                        "code":"session_control_plan_operations_invalid",
+                        "message":"每个 Plan option 必须包含至少一个闭合 operation。"
+                    }
+                }
+            }))
+            .expect("append schema-6 control rejection after migration");
+        assert_eq!(rejection["type"], "session.control.rejected");
+        let connection = Connection::open(&path).expect("reopen migrated store");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SESSION_STORE_VERSION);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_five_legacy_context_summary_is_read_only_history() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-v5-legacy-context-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let journal = LocalAgentJournal::open(&path).expect("open current store");
+        journal
+            .create_session("session:legacy-context", "Legacy context", &json!([]), None)
+            .expect("create legacy context session");
+        journal
+            .append(&json!({
+                "type":"run.started",
+                "sessionId":"session:legacy-context",
+                "runId":"run:legacy-context",
+                "payload":{
+                    "inputMessageId":"message:legacy-context",
+                    "workspaceBindings":[]
+                }
+            }))
+            .expect("start legacy context run");
+        let legacy_payload = json!({
+            "providerRequestId":"provider-request:legacy-context",
+            "responseConstraint":"normal",
+            "categories":[{
+                "kind":"journalMessages",
+                "itemCount":1,
+                "items":[{"itemId":"message:legacy-context","label":"用户消息"}]
+            }]
+        });
+        Connection::open(&path)
+            .expect("open legacy context store")
+            .execute(
+                "INSERT INTO session_events(
+                     session_id, sequence, event_id, event_type, run_id,
+                     payload_json, occurred_at
+                 ) VALUES (?1, 3, ?2, 'context.composed', ?3, ?4, ?5)",
+                params![
+                    "session:legacy-context",
+                    "event:legacy-context",
+                    "run:legacy-context",
+                    serde_json::to_string(&legacy_payload).expect("encode legacy context"),
+                    "2026-08-25T00:00:02Z",
+                ],
+            )
+            .expect("insert immutable legacy context receipt");
+
+        let events = journal
+            .read_events("session:legacy-context", 0)
+            .expect("read legacy context history");
+        assert_eq!(events[2]["payload"], legacy_payload);
+        assert!(events[2]["payload"].get("messages").is_none());
+        assert!(journal
+            .append(&json!({
+                "type":"context.composed",
+                "sessionId":"session:legacy-context",
+                "runId":"run:legacy-context",
+                "payload":legacy_payload
+            }))
+            .is_err());
         let _ = std::fs::remove_file(path);
     }
 
@@ -1707,7 +2101,9 @@ mod tests {
                 "payload":{
                     "providerRequestId":"provider-request:facts",
                     "responseConstraint":"normal",
-                    "categories":[]
+                    "messages":[],
+                    "workspaceBindings":[],
+                    "tools":[]
                 }
             }))
             .expect("record provider request receipt");
@@ -1987,16 +2383,70 @@ mod tests {
                 "payload": {
                     "providerRequestId": "provider-request:one",
                     "responseConstraint": "normal",
-                    "categories": [{
-                        "kind": "journalMessages",
-                        "itemCount": 1,
-                        "items": [{"itemId": "message:one", "label": "用户消息"}]
-                    }]
+                    "messages": [{
+                        "messageIndex": 0,
+                        "contributionId": "message:one",
+                        "contributionKind": "journalMessages",
+                        "label": "用户消息",
+                        "role": "user",
+                        "blocks": [{"blockIndex": 0, "kind": "text"}],
+                        "attachments": []
+                    }],
+                    "workspaceBindings": [],
+                    "tools": [],
+                    "partitions": [
+                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"journalMessages","itemCount":1,"requestShapeUnits":1},
+                        {"kind":"messageAttachments","itemCount":0,"requestShapeUnits":0}
+                    ]
                 }
             }),
             false,
         )
         .expect("accept request receipt");
+        assert!(validate_new_event(
+            &json!({
+                "type": "context.composed",
+                "sessionId": "session:receipt",
+                "runId": "run:receipt",
+                "payload": {
+                    "providerRequestId": "provider-request:bad-partitions",
+                    "responseConstraint": "normal",
+                    "messages": [],
+                    "workspaceBindings": [],
+                    "tools": [],
+                    "partitions": [
+                        {"kind":"tools","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"messageAttachments","itemCount":0,"requestShapeUnits":0}
+                    ]
+                }
+            }),
+            false,
+        )
+        .is_err());
+        assert!(validate_new_event(
+            &json!({
+                "type": "context.composed",
+                "sessionId": "session:receipt",
+                "runId": "run:receipt",
+                "payload": {
+                    "providerRequestId": "provider-request:legacy-summary",
+                    "responseConstraint": "normal",
+                    "categories": []
+                }
+            }),
+            false,
+        )
+        .is_err());
         validate_new_event(
             &json!({
                 "type": "context.updated",
@@ -2023,11 +2473,12 @@ mod tests {
                 "payload": {
                     "providerRequestId": "provider-request:bad-count",
                     "responseConstraint": "normal",
-                    "categories": [{
-                        "kind": "tools",
-                        "itemCount": 2,
-                        "items": [{"itemId": "fs.list", "label": "fs.list"}]
-                    }]
+                    "messages": [],
+                    "workspaceBindings": [],
+                    "tools": [
+                        {"itemId": "fs.list", "label": "fs.list"},
+                        {"itemId": "fs.list", "label": "fs.list again"}
+                    ]
                 }
             }),
             false,

@@ -228,27 +228,25 @@ impl KernelToolExecutor for FsDeleteExecutor {
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
         let path = get_string(&invocation.input, "path").unwrap_or_default();
-        let target_kind =
-            get_string(&invocation.input, "targetKind").unwrap_or_else(|| "file".to_string());
+        let target_kind = get_string(&invocation.input, "targetKind").ok_or_else(|| {
+            KernelError::InvalidCommand(
+                "fs.delete requires targetKind=file or directoryTree".to_string(),
+            )
+        })?;
         let target_kind = match target_kind.trim() {
-            "directory" => "directory",
-            _ => "file",
+            "file" => "file",
+            "directoryTree" => "directoryTree",
+            _ => {
+                return Err(KernelError::InvalidCommand(
+                    "fs.delete requires targetKind=file or directoryTree".to_string(),
+                ))
+            }
         };
-        let recursive = invocation
-            .input
-            .get("recursive")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let target = prepared_workspace_target(&context)?;
         if target.is_dir() {
-            if target_kind != "directory" {
+            if target_kind != "directoryTree" {
                 return Err(KernelError::PermissionDenied(
-                    "fs.delete directory target requires targetKind=directory".to_string(),
-                ));
-            }
-            if !recursive {
-                return Err(KernelError::PermissionDenied(
-                    "fs.delete directory target requires recursive=true".to_string(),
+                    "fs.delete directory target requires targetKind=directoryTree".to_string(),
                 ));
             }
             fs::remove_dir_all(&target)
@@ -259,14 +257,14 @@ impl KernelToolExecutor for FsDeleteExecutor {
                     "workspaceId": workspace_id(&context)?,
                     "path": normalize_relative_path(&path),
                     "deleted": true,
-                    "kind": "directory",
-                    "recursive": recursive
+                    "kind": "directoryTree"
                 }),
             ));
         }
-        if target_kind == "directory" {
+        if target_kind == "directoryTree" {
             return Err(KernelError::PermissionDenied(
-                "fs.delete targetKind=directory requires an existing directory target".to_string(),
+                "fs.delete targetKind=directoryTree requires an existing directory target"
+                    .to_string(),
             ));
         }
         fs::remove_file(&target)

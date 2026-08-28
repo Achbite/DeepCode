@@ -228,6 +228,6 @@ fn print_help() {
 只有显式 -C/--workspace 会给新 Session 创建 workspace binding。
 Plan 可输入 1..N 或调整文本；Esc 明确忽略当前 Plan，空输入、EOF 与 Ctrl-C 不会忽略。
 普通文本、/attach <path>、/detach <workspace-id>、/ignore、/model <profile>、/cancel 都通过 ConversationPort。
-TUI 只渲染共享 SessionProjection，不拥有独立状态机或工具事实。"#,
+上下文视图：/context。"#,
     );
 }

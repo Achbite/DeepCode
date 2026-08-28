@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = FULL;
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY NOT NULL CHECK(length(session_id) > 0),
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS session_events (
         'approval.requested',
         'approval.resolved',
         'tool.completed',
+        'session.control.rejected',
         'context.composed',
         'context.updated',
         'run.waiting',

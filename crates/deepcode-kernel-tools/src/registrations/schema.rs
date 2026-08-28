@@ -84,11 +84,10 @@ pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value 
                 },
                 {
                     "type": "object",
-                    "required": ["path", "targetKind", "recursive"],
+                    "required": ["path", "targetKind"],
                     "properties": {
                         "path": { "type": "string", "minLength": 1 },
-                        "targetKind": { "const": "directory" },
-                        "recursive": { "const": true }
+                        "targetKind": { "const": "directoryTree" }
                     },
                     "additionalProperties": false
                 }

@@ -1118,8 +1118,8 @@
   bottom: 38px;
   z-index: 16;
   display: grid;
-  width: min(360px, calc(100vw - 36px));
-  max-height: min(480px, calc(100vh - 160px));
+  width: min(410px, calc(100vw - 36px));
+  max-height: min(560px, calc(100vh - 140px));
   overflow: hidden;
   border: 1px solid var(--dc-border-strong);
   border-radius: 13px;
@@ -1131,8 +1131,6 @@
 .deepcode-session-model__context-popover > header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
   padding: 11px 13px;
   border-bottom: 1px solid var(--dc-border);
 }
@@ -1142,61 +1140,283 @@
   font-size: var(--dc-font-label);
 }
 
-.deepcode-session-model__context-popover > header span {
+.deepcode-session-model__context-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 13px 13px;
+}
+
+.deepcode-session-model__context-total {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  color: var(--dc-muted);
+  font-size: var(--dc-font-caption);
+}
+
+.deepcode-session-model__context-total strong {
+  overflow: hidden;
+  color: var(--dc-foreground-strong);
+  font-size: var(--dc-font-caption);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-session-model__context-total > span:last-child {
+  color: var(--dc-success);
+  font-variant-numeric: tabular-nums;
+}
+
+.deepcode-session-model__usage-track {
+  height: 4px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--dc-border);
+}
+
+.deepcode-session-model__usage-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--dc-success);
+}
+
+.deepcode-session-model__composition-bar {
+  display: flex;
+  height: 27px;
+  gap: 2px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--dc-border);
+}
+
+.deepcode-session-model__composition-bar--unknown {
+  align-items: center;
+  justify-content: center;
   color: var(--dc-faint);
   font-size: var(--dc-font-micro);
 }
 
-.deepcode-session-model__context-groups {
-  min-height: 0;
-  overflow: auto;
-  padding: 5px 12px 9px;
+.deepcode-session-model__composition-bar > button {
+  min-width: 3px;
+  height: 100%;
+  flex-grow: 0;
+  flex-shrink: 1;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+  opacity: 0.45;
 }
 
-.deepcode-session-model__context-group {
+.deepcode-session-model__composition-bar > button.is-active {
+  opacity: 1;
+}
+
+.deepcode-session-model__composition-bar > button[data-context-key='input'],
+.deepcode-session-model__context-detail > span[data-context-key='input'] {
+  background: var(--dc-success);
+}
+
+.deepcode-session-model__composition-bar > button[data-context-key='output'],
+.deepcode-session-model__context-detail > span[data-context-key='output'] {
+  background: var(--dc-warning);
+}
+
+.deepcode-session-model__composition-bar > button[data-context-key='free'],
+.deepcode-session-model__context-detail > span[data-context-key='free'] {
+  background-color: var(--dc-surface-subtle);
+  background-image: repeating-linear-gradient(
+    135deg,
+    transparent 0,
+    transparent 5px,
+    var(--dc-border-strong) 5px,
+    var(--dc-border-strong) 6px
+  );
+}
+
+.deepcode-session-model__context-detail {
   display: grid;
-  gap: 4px;
-  padding: 8px 1px;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
   border-bottom: 1px solid var(--dc-border);
 }
 
-.deepcode-session-model__context-group:last-child {
-  border-bottom: 0;
+.deepcode-session-model__context-detail > span:first-child,
+.deepcode-session-model__context-sections > button > span:first-child {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
 }
 
-.deepcode-session-model__context-group > div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+.deepcode-session-model__context-detail > div {
+  min-width: 0;
 }
 
-.deepcode-session-model__context-group > div strong {
+.deepcode-session-model__context-detail strong,
+.deepcode-session-model__context-detail small {
+  display: block;
+}
+
+.deepcode-session-model__context-detail strong {
   color: var(--dc-foreground);
   font-size: var(--dc-font-caption);
   font-weight: var(--dc-weight-medium);
 }
 
-.deepcode-session-model__context-group > div span {
+.deepcode-session-model__context-detail small,
+.deepcode-session-model__context-detail > span:last-child {
   color: var(--dc-faint);
   font-size: var(--dc-font-micro);
   font-variant-numeric: tabular-nums;
 }
 
-.deepcode-session-model__context-group ul {
-  display: grid;
-  gap: 2px;
-  margin: 0;
-  padding: 0;
-  color: var(--dc-muted);
-  font-size: var(--dc-font-micro);
-  list-style: none;
+.deepcode-session-model__context-detail > span:last-child {
+  white-space: nowrap;
 }
 
-.deepcode-session-model__context-group li {
+.deepcode-session-model__cache {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--dc-border);
+}
+
+.deepcode-session-model__cache-head,
+.deepcode-session-model__cache-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.deepcode-session-model__cache-head strong {
+  color: var(--dc-foreground);
+  font-size: var(--dc-font-caption);
+  font-weight: var(--dc-weight-medium);
+}
+
+.deepcode-session-model__cache-head span,
+.deepcode-session-model__cache-legend,
+.deepcode-session-model__cache-empty {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.deepcode-session-model__cache-track {
+  display: flex;
+  height: 7px;
+  gap: 2px;
+  margin-top: 7px;
   overflow: hidden;
+  border-radius: 999px;
+  background: var(--dc-border);
+}
+
+.deepcode-session-model__cache-track > span:first-child {
+  flex: 0 0 auto;
+  background: var(--dc-success);
+}
+
+.deepcode-session-model__cache-track > span:last-child {
+  flex: 1;
+  background: var(--dc-warning);
+}
+
+.deepcode-session-model__cache-legend {
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+
+.deepcode-session-model__cache-empty {
+  padding-top: 6px;
+}
+
+.deepcode-session-model__context-sections {
+  display: grid;
+}
+
+.deepcode-session-model__context-sections > button {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 6px 4px;
+  border: 0;
+  border-bottom: 1px solid var(--dc-border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--dc-foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.deepcode-session-model__context-sections > button:last-child {
+  border-bottom: 0;
+}
+
+.deepcode-session-model__context-sections > button.is-active {
+  background: var(--dc-surface-active);
+}
+
+.deepcode-session-model__context-sections > button strong {
+  overflow: hidden;
+  font-size: var(--dc-font-caption);
+  font-weight: var(--dc-weight-medium);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.deepcode-session-model__context-sections > button small,
+.deepcode-session-model__context-sections > button > span:last-child,
+.deepcode-session-model__context-sections-empty {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.deepcode-session-model__context-sections-empty {
+  padding: 12px 0 2px;
+}
+
+.deepcode-session-model__context-detail > span[data-context-key='instructions'],
+.deepcode-session-model__context-sections > button[data-context-key='instructions'] > span:first-child {
+  background: var(--dc-muted);
+}
+
+.deepcode-session-model__context-detail > span[data-context-key='tools'],
+.deepcode-session-model__context-sections > button[data-context-key='tools'] > span:first-child {
+  background: var(--dc-warning);
+}
+
+.deepcode-session-model__context-detail > span[data-context-key='workspaceBindings'],
+.deepcode-session-model__context-sections > button[data-context-key='workspaceBindings'] > span:first-child {
+  background: var(--dc-accent);
+}
+
+.deepcode-session-model__context-detail > span[data-context-key='sessionControls'],
+.deepcode-session-model__context-sections > button[data-context-key='sessionControls'] > span:first-child {
+  background: var(--dc-faint);
+}
+
+.deepcode-session-model__context-detail > span[data-context-key='contextProviders'],
+.deepcode-session-model__context-sections > button[data-context-key='contextProviders'] > span:first-child,
+.deepcode-session-model__context-detail > span[data-context-key='journalMessages'],
+.deepcode-session-model__context-sections > button[data-context-key='journalMessages'] > span:first-child {
+  background: var(--dc-success);
+}
+
+.deepcode-session-model__context-detail > span[data-context-key='messageAttachments'],
+.deepcode-session-model__context-sections > button[data-context-key='messageAttachments'] > span:first-child {
+  background: var(--dc-warning);
 }
 
 .deepcode-session-model__selector {

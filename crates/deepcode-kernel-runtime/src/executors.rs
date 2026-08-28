@@ -4,6 +4,7 @@ use deepcode_kernel_tools::file_content::{
 };
 use deepcode_kernel_tools::kernel_internal::KernelExecutorBinding;
 use deepcode_kernel_tools::KernelToolRegistry;
+use deepcode_kernel_tools::ToolAvailability;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -202,11 +203,18 @@ fn assert_executor_bindings_match_tool_registry(
             .iter()
             .filter(|tool_id| **tool_id == descriptor.name)
             .count();
-        assert_eq!(
-            binding_count, 1,
-            "Kernel tool {} must have exactly one executor binding",
-            descriptor.name
-        );
+        match descriptor.availability {
+            ToolAvailability::Callable => assert_eq!(
+                binding_count, 1,
+                "callable Kernel tool {} must have exactly one executor binding",
+                descriptor.name
+            ),
+            ToolAvailability::Blocked => assert_eq!(
+                binding_count, 0,
+                "blocked Kernel tool {} must not have an executor binding",
+                descriptor.name
+            ),
+        }
     }
     for tool_id in binding_ids {
         assert!(

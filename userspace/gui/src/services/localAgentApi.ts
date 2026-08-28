@@ -538,17 +538,120 @@ function isContextComposition(value: unknown): boolean {
   return isExactRecord(value, [
     'providerRequestId',
     'responseConstraint',
-    'categories',
     'runId',
     'sequence',
     'createdAt',
-  ])
+  ], ['categories', 'messages', 'workspaceBindings', 'tools', 'partitions'])
     && isIdentifier(value.providerRequestId)
     && ['normal', 'answerOnly'].includes(String(value.responseConstraint))
     && isIdentifier(value.runId)
     && isNaturalNumber(value.sequence)
     && isNonEmptyText(value.createdAt)
-    && isArrayOf(value.categories, isContextCategory);
+    && contextCompositionShapeIsValid(value);
+}
+
+function contextCompositionShapeIsValid(value: Record<string, unknown>): boolean {
+  const fields = [value.messages, value.workspaceBindings, value.tools];
+  const present = fields.filter((field) => field !== undefined).length;
+  if (present !== 0 && present !== fields.length) return false;
+  const hasStructure = present === fields.length;
+  const hasLegacySummary = value.categories !== undefined;
+  if (hasStructure === hasLegacySummary) return false;
+  if (hasLegacySummary) {
+    return value.partitions === undefined && isArrayOf(value.categories, isContextCategory);
+  }
+  return Array.isArray(value.messages)
+    && value.messages.every((message, index) => isContextMessage(message, index))
+    && isArrayOf(value.workspaceBindings, isContextItem)
+    && isArrayOf(value.tools, isContextItem)
+    && contextPartitionsAreValid(value.partitions);
+}
+
+const CONTEXT_PARTITION_ORDER = [
+  'instructions',
+  'sessionControls',
+  'tools',
+  'workspaceBindings',
+  'contextProviders',
+  'journalMessages',
+  'messageAttachments',
+] as const;
+
+function contextPartitionsAreValid(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (
+    !Array.isArray(value)
+    || value.length !== CONTEXT_PARTITION_ORDER.length
+    || value.some((partition, index) => !isContextPartition(
+      partition,
+      CONTEXT_PARTITION_ORDER[index],
+    ))
+    || value.every((partition) => partition.requestShapeUnits === 0)
+  ) return false;
+  const first = value[0] as Record<string, unknown>;
+  const hasEstimates = first.estimatedInputTokens !== undefined;
+  return value.every((partition) => (
+    (partition as Record<string, unknown>).estimatedInputTokens !== undefined
+  ) === hasEstimates);
+}
+
+function isContextPartition(value: unknown, kind: string): boolean {
+  if (!isExactRecord(
+    value,
+    ['kind', 'itemCount', 'requestShapeUnits'],
+    ['estimatedInputTokens', 'tokenSource'],
+  )) return false;
+  const hasEstimate = value.estimatedInputTokens !== undefined;
+  return value.kind === kind
+    && isNaturalNumber(value.itemCount)
+    && isNaturalNumber(value.requestShapeUnits)
+    && (hasEstimate
+      ? isNaturalNumber(value.estimatedInputTokens) && value.tokenSource === 'sessionEstimated'
+      : value.tokenSource === undefined);
+}
+
+function isContextMessage(value: unknown, messageIndex: number): boolean {
+  const kinds = [
+    'instructions',
+    'workspaceBindings',
+    'sessionControls',
+    'journalMessages',
+    'contextProviders',
+  ];
+  return isExactRecord(value, [
+    'messageIndex',
+    'contributionId',
+    'contributionKind',
+    'label',
+    'role',
+    'blocks',
+    'attachments',
+  ])
+    && value.messageIndex === messageIndex
+    && isIdentifier(value.contributionId)
+    && kinds.includes(String(value.contributionKind))
+    && isNonEmptyText(value.label)
+    && ['system', 'user', 'assistant', 'tool'].includes(String(value.role))
+    && Array.isArray(value.blocks)
+    && value.blocks.every((block, index) => isContextMessageBlock(block, index))
+    && isArrayOf(value.attachments, isContextItem);
+}
+
+function isContextMessageBlock(value: unknown, blockIndex: number): boolean {
+  if (!isRecord(value) || value.blockIndex !== blockIndex) return false;
+  if (value.kind === 'text' || value.kind === 'reasoning') {
+    return isExactRecord(value, ['blockIndex', 'kind']);
+  }
+  if (value.kind === 'toolCall') {
+    return isExactRecord(value, ['blockIndex', 'kind', 'callId', 'toolName'])
+      && isIdentifier(value.callId)
+      && isNonEmptyText(value.toolName);
+  }
+  if (value.kind === 'toolResult') {
+    return isExactRecord(value, ['blockIndex', 'kind', 'resultForCallId'])
+      && isIdentifier(value.resultForCallId);
+  }
+  return false;
 }
 
 function isContextCategory(value: unknown): boolean {

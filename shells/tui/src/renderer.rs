@@ -1,7 +1,7 @@
 use crate::app::TuiApp;
 use deepcode_kernel_client::{
-    ActivityProjection, NarrativeProjection, PendingPlanProjection, ProjectionMessage,
-    SessionProjection,
+    ActivityProjection, ContextCompositionProjection, ContextUsageProjection, NarrativeProjection,
+    PendingPlanProjection, ProjectionMessage, SessionProjection,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -26,7 +26,9 @@ impl Renderer {
             ])
             .split(frame.area());
         self.draw_header(frame, rows[0], app);
-        if app.resource_preview().is_some() {
+        if app.context_open() {
+            self.draw_context(frame, rows[1], app);
+        } else if app.resource_preview().is_some() {
             self.draw_resource(frame, rows[1], app);
         } else if rows[1].width >= 88 {
             let columns = Layout::default()
@@ -51,7 +53,7 @@ impl Renderer {
     }
 
     pub fn render_plain(&self, app: &TuiApp) -> String {
-        let mut output = String::from("DeepCode TUI · shared SessionProjection\n");
+        let mut output = String::from("DeepCode TUI\n");
         output.push_str("────────────────────────────────────────\n");
         if let Some(projection) = app.projection() {
             output.push_str(&format!(
@@ -63,6 +65,9 @@ impl Renderer {
                     "目录索引 {} ({})\n",
                     binding.display_name, binding.workspace_id
                 ));
+            }
+            if app.context_open() {
+                render_context_plain(&mut output, projection);
             }
             for item in timeline_items(projection) {
                 match item {
@@ -121,7 +126,9 @@ impl Renderer {
                 ));
             }
             render_todo_plain(&mut output, projection);
-            output.push_str(&format!("缓存命中 {}\n", cache_hit_label(projection)));
+            if !app.context_open() {
+                output.push_str(&format!("缓存命中 {}\n", cache_hit_label(projection)));
+            }
             if let Some(error) = projection.terminal_error.as_ref() {
                 output.push_str(&format!("{}: {}\n", error.code, error.message));
             }
@@ -155,7 +162,7 @@ impl Renderer {
                 ]),
                 Line::from(Span::styled(
                     format!(
-                        "Session {session} · indexes {} · cache {cache} · one Loop / one projection",
+                        "Session {session} · indexes {} · cache {cache}",
                         projection
                             .map(|value| value.session_directory_indexes.len())
                             .unwrap_or(0)
@@ -216,6 +223,20 @@ impl Renderer {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} · read only · /close ", resource.logical_path)),
+                ),
+            area,
+        );
+    }
+
+    fn draw_context(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let width = usize::from(area.width.saturating_sub(4)).max(1);
+        frame.render_widget(
+            Paragraph::new(context_lines(app.projection(), width))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Context · /context "),
                 ),
             area,
         );
@@ -392,6 +413,345 @@ impl Renderer {
     }
 }
 
+const CONTEXT_PARTITIONS: [(&str, &str); 7] = [
+    ("instructions", "系统与会话指令"),
+    ("sessionControls", "Session 控制接口"),
+    ("tools", "工具目录"),
+    ("workspaceBindings", "目录索引"),
+    ("contextProviders", "上下文提供项"),
+    ("journalMessages", "对话消息"),
+    ("messageAttachments", "消息附件"),
+];
+
+fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Vec<Line<'static>> {
+    let Some(projection) = projection else {
+        return vec![Line::from(Span::styled(
+            "Context N/A",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    };
+    let mut lines = Vec::new();
+    if let Some(usage) = projection.context_usage.as_ref() {
+        let used = usage.input_tokens.saturating_add(usage.output_tokens);
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Context ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{} / {} Token · {}",
+                format_number(used),
+                format_number(usage.context_window_tokens),
+                percent_label(used, usage.context_window_tokens),
+            )),
+        ]));
+        lines.push(context_usage_bar(usage, bar_width));
+        lines.push(context_usage_legend(usage));
+        lines.push(Line::from(""));
+        if let Some((hit, miss)) = context_cache_counts(usage) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Cache ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{} · hit {} · miss {}",
+                    percent_label(hit, hit.saturating_add(miss)),
+                    format_number(hit),
+                    format_number(miss),
+                )),
+            ]));
+            lines.push(cache_bar(hit, miss, bar_width));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Cache N/A",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Context N/A",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Cache N/A",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Request",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let Some(receipt) = current_context_receipt(projection) else {
+        lines.push(Line::from(Span::styled(
+            "N/A",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    };
+    let metrics = context_partition_metrics(receipt);
+    for ((_, label), metric) in CONTEXT_PARTITIONS.iter().zip(metrics) {
+        let token_label = partition_token_label(metric);
+        lines.push(Line::from(vec![
+            Span::styled("▪ ", Style::default().fg(partition_color(label))),
+            Span::raw(format!("{label} · {} 项 · ", metric.item_count)),
+            if metric.estimated_input_tokens.is_some() {
+                Span::raw(token_label)
+            } else {
+                Span::styled(token_label, Style::default().fg(Color::DarkGray))
+            },
+        ]));
+    }
+    lines
+}
+
+fn context_usage_bar(usage: &ContextUsageProjection, width: usize) -> Line<'static> {
+    let total = usage.context_window_tokens;
+    if total == 0 {
+        return Line::from(Span::styled("N/A", Style::default().fg(Color::DarkGray)));
+    }
+    let input = usage.input_tokens.min(total);
+    let output = usage.output_tokens.min(total.saturating_sub(input));
+    let free = total.saturating_sub(input.saturating_add(output));
+    let (input_width, output_width, free_width) = segment_widths(input, output, free, width);
+    Line::from(vec![
+        Span::styled("█".repeat(input_width), Style::default().fg(Color::Green)),
+        Span::styled("█".repeat(output_width), Style::default().fg(Color::Yellow)),
+        Span::styled("░".repeat(free_width), Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn context_usage_legend(usage: &ContextUsageProjection) -> Line<'static> {
+    let used = usage.input_tokens.saturating_add(usage.output_tokens);
+    let free = usage.context_window_tokens.saturating_sub(used);
+    Line::from(vec![
+        Span::styled("input ", Style::default().fg(Color::Green)),
+        Span::raw(format_number(usage.input_tokens)),
+        Span::styled(" · output ", Style::default().fg(Color::Yellow)),
+        Span::raw(format_number(usage.output_tokens)),
+        Span::styled(" · free ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format_number(free)),
+    ])
+}
+
+fn cache_bar(hit: u64, miss: u64, width: usize) -> Line<'static> {
+    let total = hit.saturating_add(miss);
+    if total == 0 {
+        return Line::from(Span::styled("N/A", Style::default().fg(Color::DarkGray)));
+    }
+    let hit_width = scaled_width(hit, total, width).min(width);
+    let miss_width = width.saturating_sub(hit_width);
+    Line::from(vec![
+        Span::styled("█".repeat(hit_width), Style::default().fg(Color::Green)),
+        Span::styled("█".repeat(miss_width), Style::default().fg(Color::Yellow)),
+    ])
+}
+
+fn segment_widths(input: u64, output: u64, free: u64, width: usize) -> (usize, usize, usize) {
+    let total = input.saturating_add(output).saturating_add(free);
+    if total == 0 {
+        return (0, 0, width);
+    }
+    let input_width = scaled_width(input, total, width).min(width);
+    let output_width = scaled_width(output, total, width).min(width.saturating_sub(input_width));
+    let free_width = width.saturating_sub(input_width.saturating_add(output_width));
+    (input_width, output_width, free_width)
+}
+
+fn scaled_width(value: u64, total: u64, width: usize) -> usize {
+    if total == 0 || width == 0 {
+        return 0;
+    }
+    let numerator = u128::from(value)
+        .saturating_mul(width as u128)
+        .saturating_add(u128::from(total / 2));
+    usize::try_from(numerator / u128::from(total)).unwrap_or(width)
+}
+
+fn context_cache_counts(usage: &ContextUsageProjection) -> Option<(u64, u64)> {
+    let hit = usage.cache_read_input_tokens?;
+    let miss = usage.cache_miss_input_tokens?;
+    (hit.saturating_add(miss) > 0).then_some((hit, miss))
+}
+
+fn current_context_receipt(
+    projection: &SessionProjection,
+) -> Option<&ContextCompositionProjection> {
+    if let Some(usage) = projection.context_usage.as_ref() {
+        return projection
+            .context_compositions
+            .iter()
+            .rev()
+            .find(|receipt| receipt.provider_request_id == usage.provider_request_id);
+    }
+    projection.context_compositions.last()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ContextPartitionMetric {
+    item_count: u64,
+    estimated_input_tokens: Option<u64>,
+}
+
+fn context_partition_metrics(
+    receipt: &ContextCompositionProjection,
+) -> [ContextPartitionMetric; 7] {
+    if let Some(partitions) = receipt.partitions.as_ref() {
+        let mut metrics = [ContextPartitionMetric::default(); 7];
+        for partition in partitions {
+            if let Some(index) = partition_index(&partition.kind) {
+                metrics[index] = ContextPartitionMetric {
+                    item_count: partition.item_count,
+                    estimated_input_tokens: (partition.token_source.as_deref()
+                        == Some("sessionEstimated"))
+                    .then_some(partition.estimated_input_tokens)
+                    .flatten(),
+                };
+            }
+        }
+        return metrics;
+    }
+    let mut metrics = [ContextPartitionMetric::default(); 7];
+    if let Some(messages) = receipt.messages.as_ref() {
+        for message in messages {
+            if let Some(index) = partition_index(&message.contribution_kind) {
+                metrics[index].item_count = metrics[index].item_count.saturating_add(1);
+            }
+            metrics[6].item_count = metrics[6]
+                .item_count
+                .saturating_add(message.attachments.len() as u64);
+        }
+        metrics[2].item_count = metrics[2].item_count.saturating_add(
+            receipt
+                .tools
+                .as_ref()
+                .map(|items| items.len() as u64)
+                .unwrap_or_default(),
+        );
+        metrics[3].item_count = metrics[3].item_count.saturating_add(
+            receipt
+                .workspace_bindings
+                .as_ref()
+                .map(|items| items.len() as u64)
+                .unwrap_or_default(),
+        );
+    } else if let Some(categories) = receipt.categories.as_ref() {
+        for category in categories {
+            if let Some(index) = partition_index(&category.kind) {
+                metrics[index].item_count = metrics[index]
+                    .item_count
+                    .saturating_add(category.item_count);
+            }
+        }
+    }
+    metrics
+}
+
+fn partition_token_label(metric: ContextPartitionMetric) -> String {
+    metric
+        .estimated_input_tokens
+        .map(|tokens| format!("≈{} Token", format_number(tokens)))
+        .unwrap_or_else(|| "N/A Token".to_string())
+}
+
+fn partition_index(kind: &str) -> Option<usize> {
+    CONTEXT_PARTITIONS
+        .iter()
+        .position(|(candidate, _)| *candidate == kind)
+}
+
+fn partition_color(label: &str) -> Color {
+    match label {
+        "工具目录" | "消息附件" => Color::Yellow,
+        "目录索引" => Color::Blue,
+        "上下文提供项" | "对话消息" => Color::Green,
+        _ => Color::DarkGray,
+    }
+}
+
+fn percent_label(value: u64, total: u64) -> String {
+    if total == 0 {
+        return "N/A".to_string();
+    }
+    format!("{:.1}%", value as f64 * 100.0 / total as f64)
+}
+
+fn format_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            output.push(',');
+        }
+        output.push(digit);
+    }
+    output
+}
+
+fn render_context_plain(output: &mut String, projection: &SessionProjection) {
+    if let Some(usage) = projection.context_usage.as_ref() {
+        let used = usage.input_tokens.saturating_add(usage.output_tokens);
+        output.push_str(&format!(
+            "Context {} / {} Token · {}\n",
+            format_number(used),
+            format_number(usage.context_window_tokens),
+            percent_label(used, usage.context_window_tokens),
+        ));
+        output.push_str(&plain_usage_bar(usage, 40));
+        output.push('\n');
+        if let Some((hit, miss)) = context_cache_counts(usage) {
+            output.push_str(&format!(
+                "Cache {} · hit {} · miss {}\n",
+                percent_label(hit, hit.saturating_add(miss)),
+                format_number(hit),
+                format_number(miss),
+            ));
+        } else {
+            output.push_str("Cache N/A\n");
+        }
+    } else {
+        output.push_str("Context N/A\nCache N/A\n");
+    }
+    output.push_str("Request\n");
+    if let Some(receipt) = current_context_receipt(projection) {
+        let metrics = context_partition_metrics(receipt);
+        for ((_, label), metric) in CONTEXT_PARTITIONS.iter().zip(metrics) {
+            output.push_str(&format!(
+                "  {label} · {} 项 · {}\n",
+                metric.item_count,
+                partition_token_label(metric),
+            ));
+        }
+    } else {
+        output.push_str("  N/A\n");
+    }
+}
+
+fn plain_usage_bar(usage: &ContextUsageProjection, width: usize) -> String {
+    let total = usage.context_window_tokens;
+    if total == 0 {
+        return "[N/A]".to_string();
+    }
+    let input = usage.input_tokens.min(total);
+    let output = usage.output_tokens.min(total.saturating_sub(input));
+    let free = total.saturating_sub(input.saturating_add(output));
+    let (input_width, output_width, free_width) = segment_widths(input, output, free, width);
+    format!(
+        "[{}{}{}]",
+        "I".repeat(input_width),
+        "O".repeat(output_width),
+        "·".repeat(free_width),
+    )
+}
+
 enum TimelineItem<'a> {
     Message(&'a ProjectionMessage),
     Narrative(&'a NarrativeProjection),
@@ -554,4 +914,129 @@ fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
         }
     }
     output.push_str("输入编号选择；其他非空文本用于调整；/ignore 明确忽略。\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deepcode_kernel_client::{
+        ContextCompositionItem, ContextCompositionMessage, ContextCompositionPartitionProjection,
+    };
+
+    #[test]
+    fn context_partition_metrics_follow_session_projection_without_shell_estimates() {
+        let receipt = ContextCompositionProjection {
+            provider_request_id: "provider-request:test".to_string(),
+            run_id: "run:test".to_string(),
+            response_constraint: "normal".to_string(),
+            categories: None,
+            messages: Some(vec![
+                ContextCompositionMessage {
+                    message_index: 0,
+                    contribution_id: "session:instructions".to_string(),
+                    contribution_kind: "instructions".to_string(),
+                    label: "instructions".to_string(),
+                    role: "system".to_string(),
+                    blocks: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                ContextCompositionMessage {
+                    message_index: 1,
+                    contribution_id: "message:user".to_string(),
+                    contribution_kind: "journalMessages".to_string(),
+                    label: "user".to_string(),
+                    role: "user".to_string(),
+                    blocks: Vec::new(),
+                    attachments: vec![
+                        context_item("attachment:one"),
+                        context_item("attachment:two"),
+                    ],
+                },
+            ]),
+            workspace_bindings: Some(vec![context_item("workspace:test")]),
+            tools: Some(vec![context_item("fs.read"), context_item("code.grep")]),
+            partitions: None,
+            sequence: 1,
+            created_at: "2026-08-27T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            context_partition_metrics(&receipt),
+            [
+                ContextPartitionMetric {
+                    item_count: 1,
+                    estimated_input_tokens: None
+                },
+                ContextPartitionMetric::default(),
+                ContextPartitionMetric {
+                    item_count: 2,
+                    estimated_input_tokens: None
+                },
+                ContextPartitionMetric {
+                    item_count: 1,
+                    estimated_input_tokens: None
+                },
+                ContextPartitionMetric::default(),
+                ContextPartitionMetric {
+                    item_count: 1,
+                    estimated_input_tokens: None
+                },
+                ContextPartitionMetric {
+                    item_count: 2,
+                    estimated_input_tokens: None
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn context_partition_metrics_render_only_session_owned_estimates() {
+        let mut receipt = ContextCompositionProjection {
+            provider_request_id: "provider-request:test".to_string(),
+            run_id: "run:test".to_string(),
+            response_constraint: "normal".to_string(),
+            categories: None,
+            messages: Some(Vec::new()),
+            workspace_bindings: Some(Vec::new()),
+            tools: Some(Vec::new()),
+            partitions: Some(
+                CONTEXT_PARTITIONS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (kind, _))| ContextCompositionPartitionProjection {
+                        kind: (*kind).to_string(),
+                        item_count: index as u64,
+                        request_shape_units: index as u64 + 1,
+                        estimated_input_tokens: Some(index as u64 + 10),
+                        token_source: Some("sessionEstimated".to_string()),
+                    })
+                    .collect(),
+            ),
+            sequence: 1,
+            created_at: "2026-08-27T00:00:00Z".to_string(),
+        };
+        let metrics = context_partition_metrics(&receipt);
+        assert_eq!(metrics[2].estimated_input_tokens, Some(12));
+        assert_eq!(partition_token_label(metrics[2]), "≈12 Token");
+
+        receipt.partitions.as_mut().unwrap()[2].token_source = None;
+        assert_eq!(
+            context_partition_metrics(&receipt)[2].estimated_input_tokens,
+            None,
+        );
+    }
+
+    #[test]
+    fn context_bar_widths_preserve_total_width() {
+        let widths = segment_widths(36_000, 4_000, 24_000, 40);
+        assert_eq!(widths.0 + widths.1 + widths.2, 40);
+        assert_eq!(format_number(64_000), "64,000");
+    }
+
+    fn context_item(id: &str) -> ContextCompositionItem {
+        ContextCompositionItem {
+            item_id: id.to_string(),
+            label: id.to_string(),
+        }
+    }
 }

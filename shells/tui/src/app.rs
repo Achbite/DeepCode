@@ -26,6 +26,7 @@ pub struct TuiApp {
     status: String,
     action_required: Option<String>,
     resource_preview: Option<ConversationResourceReadResult>,
+    context_open: bool,
 }
 
 impl TuiApp {
@@ -39,6 +40,7 @@ impl TuiApp {
             input: String::new(),
             action_required: None,
             resource_preview: None,
+            context_open: false,
         }
     }
 
@@ -105,13 +107,15 @@ impl TuiApp {
         match input {
             "/quit" | "/exit" => return false,
             "/help" => {
-                self.status = "/attach <path> /detach <workspace-id> /ignore /model <profile> /cancel /open <workspace-id> <logical-path> /close /show /clear /quit；Plan 可输入编号".to_string();
+                self.status = "/attach <path> /detach <workspace-id> /ignore /model <profile> /cancel /context /open <workspace-id> <logical-path> /close /show /clear /quit；Plan 可输入编号".to_string();
             }
             "/show" => self.status = self.projection_label(),
             "/clear" => self.status = "可见输入已清理；durable Session 未修改".to_string(),
+            "/context" => self.toggle_context(),
             "/close" => {
+                self.context_open = false;
                 self.resource_preview = None;
-                self.status = "已关闭只读资源预览。".to_string();
+                self.status = "已关闭辅助视图。".to_string();
             }
             "/ignore" => self.ignore_plan().await,
             "/cancel" => self.cancel_run().await,
@@ -251,6 +255,7 @@ impl TuiApp {
             .await
         {
             Ok(resource) => {
+                self.context_open = false;
                 self.status = format!(
                     "只读资源 {} · {} bytes",
                     resource.logical_path, resource.size_bytes
@@ -368,6 +373,10 @@ impl TuiApp {
         self.resource_preview.as_ref()
     }
 
+    pub fn context_open(&self) -> bool {
+        self.context_open
+    }
+
     pub fn input(&self) -> &str {
         &self.input
     }
@@ -434,6 +443,16 @@ impl TuiApp {
                 )
             })
             .unwrap_or_else(|| "Session 尚未初始化。".to_string())
+    }
+
+    fn toggle_context(&mut self) {
+        self.context_open = !self.context_open;
+        if self.context_open {
+            self.resource_preview = None;
+            self.status = "上下文视图已打开。".to_string();
+        } else {
+            self.status = "上下文视图已关闭。".to_string();
+        }
     }
 }
 

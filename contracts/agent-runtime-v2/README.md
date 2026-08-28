@@ -7,7 +7,7 @@
 | 事实 owner | 当前建库合同 | 当前 `user_version` | 负责内容 |
 | --- | --- | ---: | --- |
 | Host Catalog | `catalog.sql` | 3 | Project、Host 私有 workspace、项目目录索引模板、active-v2 Session 归类 |
-| Session | `session.sql` | 5 | Session creation snapshot、journal、命令回放、对话目录索引、Plan、Todo、反馈、请求回执与用量 |
+| Session | `session.sql` | 6 | Session creation snapshot、journal、命令回放、对话目录索引、Plan、Todo、control 拒绝、请求回执与用量 |
 | Kernel | `tool-record.sql` | 3 | Session 保留期间不可变的 ToolRecord |
 
 `schema.json` 是 UI、CLI、TUI、Host、Session 与 Kernel 之间的 v2 wire schema。SQL 只约束各自 store 的持久化边界，不能替代 wire schema，也不能跨 owner 推断另一层事实。
@@ -21,6 +21,7 @@ Catalog:    2 -> catalog-v2-to-v3.sql -> 3
 Session:    2 -> session-v2-to-v3.sql -> 3
             3 -> session-v3-to-v4.sql -> 4
             4 -> session-v4-to-v5.sql -> 5
+            5 -> session-v5-to-v6.sql -> 6
 ToolRecord: 2 -> tool-record-v2-to-v3.sql -> 3
 ```
 

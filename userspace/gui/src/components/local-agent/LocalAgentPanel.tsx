@@ -53,7 +53,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
-  const initialize = useLocalAgentStore((state) => state.initialize);
   const refresh = useLocalAgentStore((state) => state.refresh);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
@@ -152,10 +151,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       if (followingLatestRef.current) scrollToLatestNow('auto');
     }, 80);
   }, [scrollToLatestNow]);
-
-  useEffect(() => {
-    void initialize();
-  }, [initialize]);
 
   useEffect(() => {
     const id = window.setInterval(() => void refresh(), 500);

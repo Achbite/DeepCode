@@ -3,6 +3,7 @@ import useAppStatusStore from '../state/appStatusStore';
 import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
+import { useLocalAgentStore } from '../state/localAgentStore';
 import { normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
 import {
   normalizeGuiAccentColor,
@@ -162,6 +163,7 @@ const DeepCodeGuiApp: React.FC = () => {
     connectedReloadDoneRef.current = true;
     void loadWorkspace();
     void loadUserSettings();
+    void useLocalAgentStore.getState().initialize();
   }, [apiStatus, loadUserSettings, loadWorkspace]);
 
   useEffect(() => {

@@ -1,7 +1,6 @@
 import type {
   AssistantDraftProjection,
-  ContextCompositionCategory,
-  ContextCompositionCategoryKind,
+  ContextCompositionMessage,
   ContextCompositionReceipt,
   LocalAgentError,
   ModelInteractionRequest,
@@ -12,6 +11,7 @@ import type {
   ProviderTokenUsage,
   ProviderEvent,
   ProviderRequest,
+  ProviderToolDefinition,
   SessionEvent,
   TodoItem,
   ToolDescriptor,
@@ -98,6 +98,16 @@ type ProviderTurn =
   | ({
       kind: 'tools';
       calls: Array<{ callId: string; name: string; input: Record<string, unknown> }>;
+      narrative?: string;
+    } & ProviderTurnCommon)
+  | ({
+      kind: 'controlRejected';
+      rejection: {
+        callId: string;
+        toolName: string;
+        input: Record<string, unknown>;
+        error: LocalAgentError;
+      };
       narrative?: string;
     } & ProviderTurnCommon)
   | ({ kind: 'continue'; narrative?: string } & ProviderTurnCommon);
@@ -342,6 +352,37 @@ export async function runAgentLoop(
           await commit(events);
           break;
         }
+        case 'controlRejected': {
+          const rejectionEvent: NewSessionEvent = {
+            type: 'session.control.rejected',
+            sessionId: snapshot.state.sessionId,
+            runId,
+            callId: turn.rejection.callId,
+            payload: {
+              toolName: turn.rejection.toolName,
+              input: { ...turn.rejection.input },
+              error: { ...turn.rejection.error },
+            },
+          };
+          const priorRejections = snapshot.events.filter((event) => (
+            event.type === 'session.control.rejected' && event.runId === runId
+          )).length;
+          if (priorRejections === 0) {
+            await commit([...turnFacts, rejectionEvent]);
+            break;
+          }
+          await commit([
+            ...turnFacts,
+            rejectionEvent,
+            {
+              type: 'run.settled',
+              sessionId: snapshot.state.sessionId,
+              runId,
+              payload: { outcome: 'failed', error: { ...turn.rejection.error } },
+            },
+          ]);
+          return { status: 'settled', runId, outcome: 'failed' };
+        }
         case 'continue':
           await commit(turnFacts);
           break;
@@ -372,16 +413,16 @@ async function buildProviderRequest(
 ): Promise<PreparedProviderRequest> {
   const profileId = snapshot.state.run?.profileId ?? deps.defaultProfileId;
   const kernelTools = await deps.composition.kernel.listTools();
-  const composedTools = answerOnly ? [] : bindComposedTools(kernelTools, deps.composition.tools);
-  const controlTools = answerOnly ? [] : sessionControlToolDefinitions();
-  const providerTools = [
-    ...composedTools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-    })),
+  const composedTools = answerOnly
+    ? []
+    : bindCallableToolSnapshot(kernelTools, deps.composition.toolIds);
+  const controlTools = answerOnly
+    ? []
+    : sessionControlToolDefinitions().map(freezeProviderToolDefinition);
+  const providerTools = Object.freeze([
     ...controlTools,
-  ];
+    ...composedTools,
+  ]);
   assertUniqueProviderTools(providerTools.map((tool) => tool.name));
   const journalMessages = messagesFromJournal(
     snapshot.events,
@@ -405,6 +446,12 @@ async function buildProviderRequest(
     message: { role: 'system', content: instruction.text },
   }));
   instructions.push({
+    contributionId: 'session:controls',
+    category: 'sessionControls',
+    label: 'Session control contract',
+    message: { role: 'system', content: SESSION_CONTROL_INSTRUCTIONS },
+  });
+  instructions.push({
     contributionId: 'session:workspace-bindings',
     category: 'workspaceBindings',
     label: '当前运行的目录索引',
@@ -414,12 +461,6 @@ async function buildProviderRequest(
         runWorkspaceBindings(snapshot, runId),
       )}`,
     },
-  });
-  instructions.push({
-    contributionId: 'session:controls',
-    category: 'sessionControls',
-    label: 'Session control contract',
-    message: { role: 'system', content: SESSION_CONTROL_INSTRUCTIONS },
   });
   if (answerOnly) {
     instructions.push({
@@ -455,7 +496,8 @@ async function buildProviderRequest(
       requestId,
       answerOnly ? 'answerOnly' : 'normal',
       selected,
-      providerTools.map((tool) => tool.name),
+      composedTools,
+      controlTools,
       runWorkspaceBindings(snapshot, runId),
       snapshot.events,
     ),
@@ -478,20 +520,49 @@ function assertUniqueProviderTools(names: readonly string[]): void {
   }
 }
 
-function bindComposedTools(
+function bindCallableToolSnapshot(
   kernelTools: readonly ToolDescriptor[],
-  contributed: readonly ToolDescriptor[],
-): readonly ToolDescriptor[] {
+  contributedToolIds: readonly string[],
+): readonly ProviderToolDefinition[] {
   const kernelByName = new Map(kernelTools.map((tool) => [tool.name, tool]));
-  for (const tool of contributed) {
-    if (!kernelByName.has(tool.name)) {
+  const snapshot: ProviderToolDefinition[] = [];
+  for (const toolId of contributedToolIds) {
+    const tool = kernelByName.get(toolId);
+    if (!tool) {
       throw new LoopFailure(
         'plugin_tool_not_kernel_backed',
-        `插件工具 ${tool.name} 没有 Kernel 执行适配器。`,
+        `插件工具 ${toolId} 没有 Kernel 目录定义。`,
       );
     }
+    if (tool.availability === 'blocked') continue;
+    snapshot.push(freezeProviderToolDefinition(tool));
   }
-  return contributed;
+  snapshot.sort((left, right) => left.name.localeCompare(right.name, 'en'));
+  return Object.freeze(snapshot);
+}
+
+function freezeProviderToolDefinition(
+  tool: Pick<ProviderToolDefinition, 'name' | 'description' | 'inputSchema'>,
+): ProviderToolDefinition {
+  return Object.freeze({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: canonicalJsonObject(tool.inputSchema),
+  });
+}
+
+function canonicalJsonObject(value: Record<string, unknown>): Record<string, unknown> {
+  return canonicalJsonValue(value) as Record<string, unknown>;
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return Object.freeze(value.map(canonicalJsonValue));
+  if (!isRecord(value)) return value;
+  return Object.freeze(Object.fromEntries(
+    Object.keys(value)
+      .sort((left, right) => left.localeCompare(right, 'en'))
+      .map((key) => [key, canonicalJsonValue(value[key])]),
+  ));
 }
 
 function assertPlanWorkspaceBindings(intent: PlanIntent, bindings: readonly string[]): void {
@@ -603,10 +674,9 @@ async function consumeProvider(
   const usage = contextUsage
     ? { contextUsage: { ...contextUsage, providerRequestId: request.requestId } }
     : {};
+  const narrative = deltas.trim() ? deltas : undefined;
   const seenCalls = new Set<string>();
   const declaredTools = new Set(request.tools.map((tool) => tool.name));
-  const controlCalls: SessionControlCall[] = [];
-  const kernelCalls: typeof providerCalls = [];
   for (const call of providerCalls) {
     if (!call.callId || seenCalls.has(call.callId)) {
       throw new LoopFailure(
@@ -621,9 +691,35 @@ async function consumeProvider(
         `Provider 调用了当前 turn 未声明的工具：${call.name}`,
       );
     }
-    const control = decodeSessionControlCall(call.callId, call.name, call.input);
-    if (control) controlCalls.push(control);
-    else kernelCalls.push(call);
+  }
+  recordProviderTurnState(
+    deps.providerRunState,
+    runId,
+    providerCalls.map((call) => call.callId),
+    completeMessage?.reasoningContent,
+  );
+
+  const controlCalls: SessionControlCall[] = [];
+  const kernelCalls: typeof providerCalls = [];
+  for (const call of providerCalls) {
+    try {
+      const control = decodeSessionControlCall(call.callId, call.name, call.input);
+      if (control) controlCalls.push(control);
+      else kernelCalls.push(call);
+    } catch (error) {
+      if (!(error instanceof SessionControlError)) throw error;
+      return {
+        kind: 'controlRejected',
+        rejection: {
+          callId: call.callId,
+          toolName: call.name,
+          input: { ...call.input },
+          error: { code: error.code, message: error.message },
+        },
+        ...(narrative ? { narrative } : {}),
+        ...usage,
+      };
+    }
   }
   const blockingControls = controlCalls.filter(
     (control) => control.kind === 'interaction' || control.kind === 'plan',
@@ -642,14 +738,6 @@ async function consumeProvider(
     );
   }
 
-  recordProviderTurnState(
-    deps.providerRunState,
-    runId,
-    providerCalls.map((call) => call.callId),
-    completeMessage?.reasoningContent,
-  );
-
-  const narrative = deltas.trim() ? deltas : undefined;
   const todo = todoControls[0]
     ? { todo: { callId: todoControls[0].callId, items: todoControls[0].items } }
     : {};
@@ -780,6 +868,22 @@ function messagesFromJournal(
           content: JSON.stringify({ accepted: true }),
         },
       });
+    } else if (event.type === 'session.control.rejected') {
+      attachToolCall(messages, {
+        callId: event.callId,
+        name: event.payload.toolName,
+        input: event.payload.input,
+      });
+      messages.push({
+        contributionId: `session-control-rejection:${event.callId}`,
+        category: 'journalMessages',
+        label: 'Session control 拒绝结果',
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          content: JSON.stringify({ accepted: false, error: event.payload.error }),
+        },
+      });
     } else if (event.type === 'tool.requested') {
       attachToolCall(messages, {
         callId: event.callId,
@@ -860,7 +964,11 @@ function currentRunCallIds(events: readonly SessionEvent[], runId: string): Set<
     if (!('runId' in event) || event.runId !== runId) continue;
     if (event.type === 'interaction.requested') callIds.add(event.payload.interactionId);
     else if (event.type === 'plan.intent.requested') callIds.add(event.payload.planId);
-    else if (event.type === 'todo.updated' || event.type === 'tool.requested') {
+    else if (
+      event.type === 'todo.updated'
+      || event.type === 'tool.requested'
+      || event.type === 'session.control.rejected'
+    ) {
       callIds.add(event.callId);
     }
   }
@@ -887,65 +995,152 @@ function attachToolCall(
   });
 }
 
-const CONTEXT_CATEGORY_ORDER: readonly ContextCompositionCategoryKind[] = [
+function buildContextCompositionReceipt(
+  providerRequestId: string,
+  responseConstraint: ContextCompositionReceipt['responseConstraint'],
+  selected: readonly ContextMessageContribution[],
+  kernelTools: readonly ProviderToolDefinition[],
+  controlTools: readonly ProviderToolDefinition[],
+  workspaceBindings: readonly WorkspaceBindingDisplay[],
+  events: readonly SessionEvent[],
+): ContextCompositionReceipt {
+  const attachmentFactsByContributionId = new Map<string, Array<{
+    attachmentId: string;
+    name: string;
+    mediaType: string;
+    content: string;
+  }>>();
+  for (const event of events) {
+    if (event.type !== 'message.committed') continue;
+    const attachments = (event.payload.attachments ?? []).map((attachment) => ({ ...attachment }));
+    if (attachments.length > 0) {
+      attachmentFactsByContributionId.set(`message:${event.payload.messageId}`, attachments);
+    }
+  }
+  const workspaceBindingItems = workspaceBindings.map((binding) => ({
+    itemId: binding.workspaceId,
+    label: binding.displayName,
+  }));
+  const toolItems = kernelTools.map((tool) => ({ itemId: tool.name, label: tool.name }));
+  const messages = selected.map((item, messageIndex) => ({
+    messageIndex,
+    contributionId: item.contributionId,
+    contributionKind: item.category,
+    label: item.label,
+    role: item.message.role,
+    blocks: contextCompositionBlocks(item.message),
+    attachments: (attachmentFactsByContributionId.get(item.contributionId) ?? []).map((attachment) => ({
+      itemId: attachment.attachmentId,
+      label: attachment.name,
+    })),
+  }));
+  return {
+    providerRequestId,
+    responseConstraint,
+    messages,
+    workspaceBindings: workspaceBindingItems,
+    tools: toolItems,
+    partitions: buildContextCompositionPartitions(
+      selected,
+      kernelTools,
+      controlTools,
+      workspaceBindings,
+      attachmentFactsByContributionId,
+    ),
+  };
+}
+
+const CONTEXT_PARTITION_ORDER = [
+  'instructions',
+  'sessionControls',
+  'tools',
+  'workspaceBindings',
+  'contextProviders',
+  'journalMessages',
+  'messageAttachments',
+] as const;
+
+function buildContextCompositionPartitions(
+  selected: readonly ContextMessageContribution[],
+  kernelTools: readonly ProviderToolDefinition[],
+  controlTools: readonly ProviderToolDefinition[],
+  workspaceBindings: readonly WorkspaceBindingDisplay[],
+  attachmentFactsByContributionId: ReadonlyMap<string, readonly unknown[]>,
+): NonNullable<ContextCompositionReceipt['partitions']> {
+  const metrics = new Map(CONTEXT_PARTITION_ORDER.map((kind) => [kind, {
+    itemCount: 0,
+    requestShapeUnits: 0,
+  }]));
+  const add = (
+    kind: typeof CONTEXT_PARTITION_ORDER[number],
+    itemCount: number,
+    requestShapeUnits: number,
+  ): void => {
+    const metric = metrics.get(kind)!;
+    metric.itemCount += itemCount;
+    metric.requestShapeUnits += requestShapeUnits;
+  };
+  for (const contribution of selected) {
+    const messageUnits = jsonShapeUnits(contribution.message);
+    const attachments = attachmentFactsByContributionId.get(contribution.contributionId) ?? [];
+    const attachmentUnits = Math.min(messageUnits, attachments.length
+      ? jsonShapeUnits(attachments)
+      : 0);
+    if (attachments.length > 0) {
+      add('messageAttachments', attachments.length, attachmentUnits);
+    }
+    if (contribution.category === 'workspaceBindings') {
+      add('workspaceBindings', workspaceBindings.length, messageUnits - attachmentUnits);
+    } else {
+      add(contribution.category, 1, messageUnits - attachmentUnits);
+    }
+  }
+  add('sessionControls', controlTools.length, sumShapeUnits(controlTools));
+  add('tools', kernelTools.length, sumShapeUnits(kernelTools));
+  return CONTEXT_PARTITION_ORDER.map((kind) => ({ kind, ...metrics.get(kind)! }));
+}
+
+function sumShapeUnits(values: readonly unknown[]): number {
+  return values.reduce<number>((total, value) => total + jsonShapeUnits(value), 0);
+}
+
+function jsonShapeUnits(value: unknown): number {
+  const encoded = JSON.stringify(value);
+  return encoded ? new TextEncoder().encode(encoded).byteLength : 0;
+}
+
+function contextCompositionBlocks(message: ModelMessage): ContextCompositionMessage['blocks'] {
+  const blocks: ContextCompositionMessage['blocks'] = [];
+  const append = (
+    block:
+      | { kind: 'text' | 'reasoning' }
+      | { kind: 'toolCall'; callId: string; toolName: string }
+      | { kind: 'toolResult'; resultForCallId: string },
+  ): void => {
+    blocks.push({
+      ...block,
+      blockIndex: blocks.length,
+    } as ContextCompositionMessage['blocks'][number]);
+  };
+  if (message.role === 'tool' && message.toolCallId) {
+    append({ kind: 'toolResult', resultForCallId: message.toolCallId });
+    return blocks;
+  }
+  if (message.reasoningContent) append({ kind: 'reasoning' });
+  if (message.content) append({ kind: 'text' });
+  for (const call of message.toolCalls ?? []) {
+    append({ kind: 'toolCall', callId: call.callId, toolName: call.name });
+  }
+  return blocks;
+}
+
+const CONTEXT_MESSAGE_KINDS: readonly ContextCompositionMessage['contributionKind'][] = [
   'instructions',
   'workspaceBindings',
   'sessionControls',
   'journalMessages',
   'contextProviders',
-  'messageAttachments',
-  'tools',
 ];
-
-function buildContextCompositionReceipt(
-  providerRequestId: string,
-  responseConstraint: ContextCompositionReceipt['responseConstraint'],
-  selected: readonly ContextMessageContribution[],
-  toolNames: readonly string[],
-  workspaceBindings: readonly WorkspaceBindingDisplay[],
-  events: readonly SessionEvent[],
-): ContextCompositionReceipt {
-  const items = new Map<ContextCompositionCategoryKind, ContextCompositionCategory['items']>();
-  const append = (
-    kind: ContextCompositionCategoryKind,
-    itemId: string,
-    label: string,
-  ): void => {
-    const category = items.get(kind) ?? [];
-    category.push({ itemId, label });
-    items.set(kind, category);
-  };
-  const selectedIds = new Set(selected.map((item) => item.contributionId));
-  for (const item of selected) {
-    if (item.category === 'workspaceBindings') continue;
-    append(item.category, item.contributionId, item.label);
-  }
-  if (selectedIds.has('session:workspace-bindings')) {
-    for (const binding of workspaceBindings) {
-      append('workspaceBindings', binding.workspaceId, binding.displayName);
-    }
-  }
-  for (const event of events) {
-    if (
-      event.type !== 'message.committed'
-      || !selectedIds.has(`message:${event.payload.messageId}`)
-    ) continue;
-    for (const attachment of event.payload.attachments ?? []) {
-      append('messageAttachments', attachment.attachmentId, attachment.name);
-    }
-  }
-  for (const toolName of toolNames) append('tools', toolName, toolName);
-  return {
-    providerRequestId,
-    responseConstraint,
-    categories: CONTEXT_CATEGORY_ORDER.flatMap((kind) => {
-      const categoryItems = items.get(kind);
-      return categoryItems?.length
-        ? [{ kind, itemCount: categoryItems.length, items: categoryItems.map((item) => ({ ...item })) }]
-        : [];
-    }),
-  };
-}
 
 function assertContextContributions(
   contributions: readonly ContextMessageContribution[],
@@ -958,7 +1153,7 @@ function assertContextContributions(
         'Memory provider 返回了空或重复的上下文贡献标识。',
       );
     }
-    if (!CONTEXT_CATEGORY_ORDER.includes(contribution.category)) {
+    if (!CONTEXT_MESSAGE_KINDS.includes(contribution.category)) {
       throw new LoopFailure(
         'context_contribution_category_invalid',
         `Memory provider 返回了未知的上下文贡献分类：${contribution.category}`,

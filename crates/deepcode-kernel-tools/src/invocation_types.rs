@@ -415,8 +415,7 @@ impl KernelCanonicalInvocation {
             }),
             Self::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => json!({
                 "path": path,
-                "targetKind": "directory",
-                "recursive": true,
+                "targetKind": "directoryTree",
             }),
             Self::FsEnsureDirectory { path } => json!({ "path": path }),
             Self::DocumentRead { path, pages } => match pages {

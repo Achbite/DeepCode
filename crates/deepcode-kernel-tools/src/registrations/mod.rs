@@ -3,8 +3,8 @@ mod schema;
 use self::schema::provider_schema_for_tool;
 use crate::invocation_adapter::canonicalize_invocation;
 use crate::invocation_types::{KernelCanonicalInvocation, KernelToolKind};
-use crate::types::{ToolDescriptor, ToolEffectClass, ToolEffectScope};
-use serde_json::Value;
+use crate::types::{ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectScope};
+use serde_json::{json, Value};
 
 pub(crate) type KernelInvocationCanonicalizer =
     fn(Value) -> Result<KernelCanonicalInvocation, String>;
@@ -29,8 +29,8 @@ pub enum KernelExecutorBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct KernelToolRegistration {
     pub(crate) descriptor: ToolDescriptor,
-    pub(crate) executor_binding: KernelExecutorBinding,
-    pub(crate) canonicalize_invocation: KernelInvocationCanonicalizer,
+    pub(crate) executor_binding: Option<KernelExecutorBinding>,
+    pub(crate) canonicalize_invocation: Option<KernelInvocationCanonicalizer>,
     tool_id: &'static str,
 }
 
@@ -44,6 +44,15 @@ impl KernelToolRegistration {
 struct ToolSpec {
     tool: KernelToolKind,
     executor_binding: KernelExecutorBinding,
+    effect_class: ToolEffectClass,
+    effect_scope: ToolEffectScope,
+}
+
+#[derive(Clone, Copy)]
+struct BlockedToolSpec {
+    tool_id: &'static str,
+    description: &'static str,
+    input_schema: fn() -> Value,
     effect_class: ToolEffectClass,
     effect_scope: ToolEffectScope,
 }
@@ -66,9 +75,9 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
     use KernelExecutorBinding as Executor;
     use KernelToolKind as Tool;
     use ToolEffectClass::{Mutation, Read};
-    use ToolEffectScope::{NetworkRead, WorkspaceRead, WorkspaceWrite};
+    use ToolEffectScope::{NetworkRead, Process, WorkspaceRead, WorkspaceWrite};
 
-    [
+    let mut registrations = [
         tool(Tool::FsRead, Executor::FsRead, Read, WorkspaceRead),
         tool(Tool::FsList, Executor::FsList, Read, WorkspaceRead),
         tool(Tool::FsGlob, Executor::FsGlob, Read, WorkspaceRead),
@@ -90,12 +99,34 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             Read,
             WorkspaceRead,
         ),
-        tool(Tool::WebSearch, Executor::WebSearch, Read, NetworkRead),
-        tool(Tool::WebFetch, Executor::WebFetch, Read, NetworkRead),
     ]
     .into_iter()
     .map(register_tool)
-    .collect()
+    .collect::<Vec<_>>();
+    registrations.extend([
+        register_blocked_tool(BlockedToolSpec {
+            tool_id: Tool::WebSearch.as_str(),
+            description: tool_description(Tool::WebSearch),
+            input_schema: blocked_web_search_schema,
+            effect_class: Read,
+            effect_scope: NetworkRead,
+        }),
+        register_blocked_tool(BlockedToolSpec {
+            tool_id: Tool::WebFetch.as_str(),
+            description: tool_description(Tool::WebFetch),
+            input_schema: blocked_web_fetch_schema,
+            effect_class: Read,
+            effect_scope: NetworkRead,
+        }),
+        register_blocked_tool(BlockedToolSpec {
+            tool_id: "process.shell",
+            description: "Run a command through the configured local shell.",
+            input_schema: blocked_shell_schema,
+            effect_class: Mutation,
+            effect_scope: Process,
+        }),
+    ]);
+    registrations
 }
 
 fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
@@ -107,11 +138,47 @@ fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
             input_schema: provider_schema_for_tool(spec.tool),
             effect_class: spec.effect_class,
             effect_scope: spec.effect_scope,
+            availability: ToolAvailability::Callable,
         },
-        executor_binding: spec.executor_binding,
-        canonicalize_invocation: canonicalizer_for(spec.tool),
+        executor_binding: Some(spec.executor_binding),
+        canonicalize_invocation: Some(canonicalizer_for(spec.tool)),
         tool_id,
     }
+}
+
+fn register_blocked_tool(spec: BlockedToolSpec) -> KernelToolRegistration {
+    KernelToolRegistration {
+        descriptor: ToolDescriptor {
+            name: spec.tool_id.to_owned(),
+            description: spec.description.to_owned(),
+            input_schema: (spec.input_schema)(),
+            effect_class: spec.effect_class,
+            effect_scope: spec.effect_scope,
+            availability: ToolAvailability::Blocked,
+        },
+        executor_binding: None,
+        canonicalize_invocation: None,
+        tool_id: spec.tool_id,
+    }
+}
+
+fn blocked_web_search_schema() -> Value {
+    provider_schema_for_tool(KernelToolKind::WebSearch)
+}
+
+fn blocked_web_fetch_schema() -> Value {
+    provider_schema_for_tool(KernelToolKind::WebFetch)
+}
+
+fn blocked_shell_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+            "command": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+    })
 }
 
 macro_rules! invocation_canonicalizer {

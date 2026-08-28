@@ -17,12 +17,14 @@ const externalTool = {
   description: '执行外部 effect',
   inputSchema: { type: 'object' },
   possibleEffects: ['external'],
+  availability: 'callable',
 };
 const writeTool = {
   name: 'fs.write',
   description: '写入工作区文件',
   inputSchema: { type: 'object' },
   possibleEffects: ['workspaceMutation'],
+  availability: 'callable',
 };
 
 test('Todo label whitespace is rejected at the Session control boundary', () => {
@@ -134,6 +136,42 @@ test('Provider 用量没有对应请求回执时拒绝进入共享投影', () =>
       contextWindowTokens: 100,
     },
   }), /provider_request_receipt_missing/);
+});
+
+test('schema 5 分类摘要只按旧事实恢复，不伪造新的 Provider 请求结构', () => {
+  const state = emptySessionState('session:legacy-context');
+  state.run = {
+    runId: 'run:legacy-context',
+    status: 'running',
+    workspaceBindings: [],
+  };
+  const restored = reduceSession(state, {
+    schemaVersion: 'deepcode.session-event.v2',
+    eventId: 'event:legacy-context',
+    sessionId: 'session:legacy-context',
+    sequence: 1,
+    occurredAt: '2026-08-25T00:00:00.000Z',
+    type: 'context.composed',
+    runId: 'run:legacy-context',
+    payload: {
+      providerRequestId: 'provider-request:legacy-context',
+      responseConstraint: 'normal',
+      categories: [{
+        kind: 'journalMessages',
+        itemCount: 1,
+        items: [{ itemId: 'message:legacy-context', label: '用户消息' }],
+      }],
+    },
+  });
+  const receipt = restored.contextCompositions.at(-1);
+  assert.deepEqual(receipt.categories, [{
+    kind: 'journalMessages',
+    itemCount: 1,
+    items: [{ itemId: 'message:legacy-context', label: '用户消息' }],
+  }]);
+  assert.equal('messages' in receipt, false);
+  assert.equal('workspaceBindings' in receipt, false);
+  assert.equal('tools' in receipt, false);
 });
 
 test('schema 4 历史用量在不伪造请求回执的前提下恢复为逐轮统计', () => {
@@ -557,8 +595,10 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
   const sessionId = 'session:request-receipt';
   await createSession(journal, sessionId, [binding]);
   let eventsBeforeProvider = [];
+  let providerRequest = null;
   const actor = actorWith(journal, sessionId, {
     async *stream(request) {
+      providerRequest = request;
       eventsBeforeProvider = await readEvents(journal, sessionId);
       const receipt = eventsBeforeProvider.at(-1);
       assert.equal(receipt.type, 'context.composed');
@@ -583,13 +623,43 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
   assert.equal(eventsBeforeProvider.some((event) => event.type === 'context.updated'), false);
   const receipt = completed.contextCompositions.at(-1);
   assert.equal(receipt.providerRequestId, completed.contextUsage.providerRequestId);
-  assert.deepEqual(receipt.categories.map((category) => category.kind), [
-    'instructions',
-    'workspaceBindings',
-    'sessionControls',
-    'journalMessages',
-    'tools',
+  assert.equal('categories' in receipt, false);
+  assert.deepEqual(receipt.messages.map((entry) => ({
+    messageIndex: entry.messageIndex,
+    role: entry.role,
+  })), providerRequest.messages.map((entry, messageIndex) => ({
+    messageIndex,
+    role: entry.role,
+  })));
+  assert.deepEqual(receipt.workspaceBindings, providerRequest.workspaceBindings.map((entry) => ({
+    itemId: entry.workspaceId,
+    label: entry.displayName,
+  })));
+  assert.deepEqual(providerRequest.tools.map((entry) => entry.name), [
+    'interaction.request',
+    'plan.intent',
+    'todo.update',
   ]);
+  assert.deepEqual(receipt.tools, []);
+  assert.deepEqual(receipt.partitions.map((partition) => partition.kind), [
+    'instructions',
+    'sessionControls',
+    'tools',
+    'workspaceBindings',
+    'contextProviders',
+    'journalMessages',
+    'messageAttachments',
+  ]);
+  assert.equal(
+    receipt.partitions.reduce(
+      (total, partition) => total + partition.estimatedInputTokens,
+      0,
+    ),
+    completed.contextUsage.inputTokens,
+  );
+  assert.equal(receipt.partitions.every(
+    (partition) => partition.tokenSource === 'sessionEstimated',
+  ), true);
   assert.deepEqual(completed.tokenUsageHistory.map((round) => ({
     title: round.title,
     providerCallCount: round.providerCallCount,
@@ -607,6 +677,77 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
     cacheMissInputTokens: 10,
     outcome: 'completed',
   }]);
+  await actor.dispose();
+});
+
+test('Session 只按 Kernel 目录身份冻结 callable 工具快照，并排除 blocked 站位', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:kernel-tool-snapshot';
+  await createSession(journal, sessionId);
+  const tools = [
+    {
+      name: 'z.tool',
+      description: 'Z callable',
+      inputSchema: {
+        type: 'object',
+        properties: { z: { type: 'string' }, a: { type: 'number' } },
+      },
+      possibleEffects: [],
+      availability: 'callable',
+    },
+    {
+      name: 'process.shell',
+      description: 'Shell slot',
+      inputSchema: { type: 'object', properties: { command: { type: 'string' } } },
+      possibleEffects: ['process'],
+      availability: 'blocked',
+    },
+    {
+      name: 'a.tool',
+      description: 'A callable',
+      inputSchema: { required: ['value'], type: 'object' },
+      possibleEffects: [],
+      availability: 'callable',
+    },
+  ];
+  let capturedRequest;
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      capturedRequest = request;
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'message:tool-snapshot',
+        content: '工具快照已核对。',
+      });
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  }, {
+    async listTools() { return [tools[1], tools[0], tools[2]]; },
+    async execute() { throw new Error('unexpected_tool_execution'); },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  }, tools, 'tool-snapshot');
+  await actor.submit(message(sessionId, 'command:start', '核对工具快照'));
+  const completed = await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  assert.deepEqual(capturedRequest.tools.map((tool) => tool.name), [
+    'interaction.request',
+    'plan.intent',
+    'todo.update',
+    'a.tool',
+    'z.tool',
+  ]);
+  assert.deepEqual(Object.keys(
+    capturedRequest.tools.find((tool) => tool.name === 'z.tool').inputSchema.properties,
+  ), ['a', 'z']);
+  assert.equal(Object.isFrozen(capturedRequest.tools), true);
+  const zToolSnapshot = capturedRequest.tools.find((tool) => tool.name === 'z.tool');
+  assert.equal(Object.isFrozen(zToolSnapshot), true);
+  assert.equal(Object.isFrozen(zToolSnapshot.inputSchema), true);
+  assert.equal(Object.isFrozen(zToolSnapshot.inputSchema.properties), true);
+  assert.deepEqual(
+    completed.contextCompositions.at(-1).tools.map((tool) => tool.itemId),
+    ['a.tool', 'z.tool'],
+  );
+  assert.equal(capturedRequest.tools.some((tool) => tool.name === 'process.shell'), false);
   await actor.dispose();
 });
 
@@ -630,29 +771,98 @@ test('Provider 普通文本在无调用 turn 中直接成为 answer', async () =
   await actor.dispose();
 });
 
-test('Session control 字段非法时明确失败，不把普通文本回退为 answer', async () => {
+test('首个非法 Session control 持久拒绝与用量，并在同一 run 给 Provider 一次纠正机会', async () => {
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:control-invalid');
+  let turn = 0;
   const actor = actorWith(journal, 'session:control-invalid', {
     async *stream(request) {
+      turn += 1;
+      if (turn === 1) {
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:control-invalid',
+          content: '正在准备修改计划。',
+        });
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'plan:invalid:first',
+          name: 'plan.intent',
+          input: {
+            prompt: '请选择。',
+            options: [{ optionId: 'write', label: '写入', operations: [] }],
+          },
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 12, outputTokens: 3, contextWindowTokens: 1_000 },
+        });
+        return;
+      }
+      const rejection = request.messages.find(
+        (entry) => entry.role === 'tool' && entry.toolCallId === 'plan:invalid:first',
+      );
+      assert.deepEqual(JSON.parse(rejection.content), {
+        accepted: false,
+        error: {
+          code: 'session_control_plan_operations_invalid',
+          message: '每个 Plan option 必须包含至少一个闭合 operation。',
+        },
+      });
       yield providerEvent(request.requestId, 'assistant.message', {
-        messageId: 'message:control-invalid',
-        content: '正在请求用户确认。',
+        messageId: 'message:control-corrected',
+        content: '已确认当前不执行文件修改。',
       });
-      yield providerEvent(request.requestId, 'tool.call', {
-        callId: 'interaction:invalid',
-        name: 'interaction.request',
-        input: { kind: 'question', prompt: '请选择。', allowFreeform: false },
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { inputTokens: 18, outputTokens: 4, contextWindowTokens: 1_000 },
       });
-      yield providerEvent(request.requestId, 'completed', {});
     },
   });
   await actor.submit(message('session:control-invalid', 'command:start', '测试 control 边界'));
+  const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
+  assert.equal(completed.messages.at(-1).content, '已确认当前不执行文件修改。');
+  assert.equal(completed.narratives.at(-1).content, '正在准备修改计划。');
+  assert.equal(completed.tokenUsage.providerCallCount, 2);
+  assert.equal(completed.tokenUsage.inputTokens, 30);
+  assert.equal(completed.tokenUsage.outputTokens, 7);
+  assert.equal(completed.terminalError, null);
+  const rejections = (await readEvents(journal, 'session:control-invalid'))
+    .filter((event) => event.type === 'session.control.rejected');
+  assert.equal(rejections.length, 1);
+  assert.equal(rejections[0].payload.error.code, 'session_control_plan_operations_invalid');
+  await actor.dispose();
+});
+
+test('同一 run 第二个非法 Session control 先持久用量与拒绝，再以原错误终止', async () => {
+  const journal = new InMemoryCommandJournal();
+  await createSession(journal, 'session:control-invalid-twice');
+  let turn = 0;
+  const actor = actorWith(journal, 'session:control-invalid-twice', {
+    async *stream(request) {
+      turn += 1;
+      yield providerEvent(request.requestId, 'tool.call', {
+        callId: `plan:invalid:${turn}`,
+        name: 'plan.intent',
+        input: {
+          prompt: '请选择。',
+          options: [{ optionId: `write-${turn}`, label: '写入', operations: [] }],
+        },
+      });
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { inputTokens: 10 + turn, outputTokens: turn, contextWindowTokens: 1_000 },
+      });
+    },
+  });
+  await actor.submit(message(
+    'session:control-invalid-twice',
+    'command:start',
+    '测试重复 control 拒绝',
+  ));
   const failed = await waitFor(actor, (p) => p.run?.status === 'failed');
-  assert.equal(failed.messages.length, 1);
-  assert.equal(failed.narratives.length, 0);
-  assert.equal(failed.terminalError.code, 'session_control_interaction_unanswerable');
-  assert.equal(failed.assistantDraft, null);
+  assert.equal(failed.terminalError.code, 'session_control_plan_operations_invalid');
+  assert.equal(failed.tokenUsage.providerCallCount, 2);
+  assert.equal(failed.tokenUsage.inputTokens, 23);
+  assert.equal(failed.tokenUsage.outputTokens, 3);
+  const events = await readEvents(journal, 'session:control-invalid-twice');
+  assert.equal(events.filter((event) => event.type === 'context.updated').length, 2);
+  assert.equal(events.filter((event) => event.type === 'session.control.rejected').length, 2);
   await actor.dispose();
 });
 
@@ -895,6 +1105,7 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
     description: '读取工作区文件',
     inputSchema: { type: 'object' },
     possibleEffects: [],
+    availability: 'callable',
   };
   const kernel = {
     async listTools() { return [readTool]; },
@@ -1119,7 +1330,7 @@ function composition(providerPort, kernel = emptyKernel(), tools = []) {
   return {
     instructions: [{ id: 'core', text: '你是本地编码 Agent。' }],
     contextProviders: [],
-    tools,
+    toolIds: tools.map((tool) => tool.name),
     provider: providerPort,
     memory: { id: 'complete', select: ({ messages }) => messages },
     observers: [],

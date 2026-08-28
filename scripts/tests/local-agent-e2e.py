@@ -1282,7 +1282,7 @@ def inspect_sqlite(
     record_path = runtime_root / "tool-record.sqlite3"
     expected_versions = {
         catalog_path: 3,
-        session_path: 5,
+        session_path: 6,
         record_path: 3,
     }
     for path, expected_version in expected_versions.items():

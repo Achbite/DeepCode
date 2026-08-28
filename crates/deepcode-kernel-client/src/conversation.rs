@@ -202,7 +202,6 @@ impl SessionProjection {
         }
         let mut provider_request_ids = HashSet::new();
         if self.context_compositions.iter().any(|receipt| {
-            let mut category_kinds = HashSet::new();
             receipt.provider_request_id.is_empty()
                 || receipt.run_id.is_empty()
                 || receipt.sequence == 0
@@ -213,26 +212,7 @@ impl SessionProjection {
                     receipt.response_constraint.as_str(),
                     "normal" | "answerOnly"
                 )
-                || receipt.categories.iter().any(|category| {
-                    let mut item_ids = HashSet::new();
-                    !matches!(
-                        category.kind.as_str(),
-                        "instructions"
-                            | "workspaceBindings"
-                            | "sessionControls"
-                            | "journalMessages"
-                            | "contextProviders"
-                            | "messageAttachments"
-                            | "tools"
-                    ) || !category_kinds.insert(category.kind.as_str())
-                        || category.item_count == 0
-                        || category.item_count as usize != category.items.len()
-                        || category.items.iter().any(|item| {
-                            item.item_id.is_empty()
-                                || item.label.is_empty()
-                                || !item_ids.insert(item.item_id.as_str())
-                        })
-                })
+                || invalid_context_composition_shape(receipt)
         }) || self
             .context_compositions
             .windows(2)
@@ -365,6 +345,150 @@ impl SessionProjection {
             .find(|message| message.role == "assistant")
             .map(|message| message.content.as_str())
     }
+}
+
+fn invalid_context_composition_shape(receipt: &ContextCompositionProjection) -> bool {
+    match (
+        receipt.categories.as_deref(),
+        receipt.messages.as_deref(),
+        receipt.workspace_bindings.as_deref(),
+        receipt.tools.as_deref(),
+        receipt.partitions.as_deref(),
+    ) {
+        (Some(categories), None, None, None, None) => invalid_legacy_context_categories(categories),
+        (None, Some(messages), Some(workspace_bindings), Some(tools), partitions) => {
+            invalid_context_messages(messages)
+                || invalid_context_items(workspace_bindings)
+                || invalid_context_items(tools)
+                || partitions.is_some_and(invalid_context_partitions)
+        }
+        _ => true,
+    }
+}
+
+fn invalid_context_partitions(partitions: &[ContextCompositionPartitionProjection]) -> bool {
+    const ORDER: [&str; 7] = [
+        "instructions",
+        "sessionControls",
+        "tools",
+        "workspaceBindings",
+        "contextProviders",
+        "journalMessages",
+        "messageAttachments",
+    ];
+    if partitions.len() != ORDER.len()
+        || partitions
+            .iter()
+            .zip(ORDER)
+            .any(|(partition, kind)| partition.kind != kind)
+        || partitions
+            .iter()
+            .all(|partition| partition.request_shape_units == 0)
+    {
+        return true;
+    }
+    let has_estimates = partitions[0].estimated_input_tokens.is_some();
+    partitions.iter().any(|partition| {
+        partition.estimated_input_tokens.is_some() != has_estimates
+            || partition.token_source.is_some() != has_estimates
+            || partition
+                .token_source
+                .as_deref()
+                .is_some_and(|source| source != "sessionEstimated")
+    })
+}
+
+fn invalid_legacy_context_categories(categories: &[ContextCompositionCategory]) -> bool {
+    let mut category_kinds = HashSet::new();
+    categories.iter().any(|category| {
+        !matches!(
+            category.kind.as_str(),
+            "instructions"
+                | "workspaceBindings"
+                | "sessionControls"
+                | "journalMessages"
+                | "contextProviders"
+                | "messageAttachments"
+                | "tools"
+        ) || !category_kinds.insert(category.kind.as_str())
+            || category.item_count == 0
+            || category.item_count as usize != category.items.len()
+            || invalid_context_items(&category.items)
+    })
+}
+
+fn invalid_context_messages(messages: &[ContextCompositionMessage]) -> bool {
+    let mut contribution_ids = HashSet::new();
+    let mut call_ids = HashSet::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        if message.message_index != message_index as u64
+            || message.contribution_id.is_empty()
+            || !contribution_ids.insert(message.contribution_id.as_str())
+            || !matches!(
+                message.contribution_kind.as_str(),
+                "instructions"
+                    | "workspaceBindings"
+                    | "sessionControls"
+                    | "journalMessages"
+                    | "contextProviders"
+            )
+            || message.label.is_empty()
+            || !matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            )
+            || invalid_context_items(&message.attachments)
+            || message.role != "user" && !message.attachments.is_empty()
+        {
+            return true;
+        }
+        let mut result_count = 0usize;
+        for (block_index, block) in message.blocks.iter().enumerate() {
+            let invalid = match block {
+                ContextCompositionMessageBlock::Text {
+                    block_index: actual,
+                } => *actual != block_index as u64 || message.role == "tool",
+                ContextCompositionMessageBlock::Reasoning {
+                    block_index: actual,
+                } => *actual != block_index as u64 || message.role != "assistant",
+                ContextCompositionMessageBlock::ToolCall {
+                    block_index: actual,
+                    call_id,
+                    tool_name,
+                } => {
+                    *actual != block_index as u64
+                        || message.role != "assistant"
+                        || call_id.is_empty()
+                        || tool_name.is_empty()
+                        || !call_ids.insert(call_id.as_str())
+                }
+                ContextCompositionMessageBlock::ToolResult {
+                    block_index: actual,
+                    result_for_call_id,
+                } => {
+                    result_count += 1;
+                    *actual != block_index as u64
+                        || message.role != "tool"
+                        || result_for_call_id.is_empty()
+                        || !call_ids.contains(result_for_call_id.as_str())
+                }
+            };
+            if invalid {
+                return true;
+            }
+        }
+        if message.role == "tool" && (message.blocks.len() != 1 || result_count != 1) {
+            return true;
+        }
+    }
+    false
+}
+
+fn invalid_context_items(items: &[ContextCompositionItem]) -> bool {
+    let mut item_ids = HashSet::new();
+    items.iter().any(|item| {
+        item.item_id.is_empty() || item.label.is_empty() || !item_ids.insert(item.item_id.as_str())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -549,9 +673,60 @@ pub struct ContextCompositionProjection {
     pub provider_request_id: String,
     pub run_id: String,
     pub response_constraint: String,
-    pub categories: Vec<ContextCompositionCategory>,
+    pub categories: Option<Vec<ContextCompositionCategory>>,
+    pub messages: Option<Vec<ContextCompositionMessage>>,
+    pub workspace_bindings: Option<Vec<ContextCompositionItem>>,
+    pub tools: Option<Vec<ContextCompositionItem>>,
+    pub partitions: Option<Vec<ContextCompositionPartitionProjection>>,
     pub sequence: u64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextCompositionPartitionProjection {
+    pub kind: String,
+    pub item_count: u64,
+    pub request_shape_units: u64,
+    pub estimated_input_tokens: Option<u64>,
+    pub token_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextCompositionMessage {
+    pub message_index: u64,
+    pub contribution_id: String,
+    pub contribution_kind: String,
+    pub label: String,
+    pub role: String,
+    pub blocks: Vec<ContextCompositionMessageBlock>,
+    pub attachments: Vec<ContextCompositionItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ContextCompositionMessageBlock {
+    Text {
+        block_index: u64,
+    },
+    Reasoning {
+        block_index: u64,
+    },
+    ToolCall {
+        block_index: u64,
+        call_id: String,
+        tool_name: String,
+    },
+    ToolResult {
+        block_index: u64,
+        result_for_call_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -914,11 +1089,33 @@ mod tests {
                 "providerRequestId": "provider-request:test",
                 "runId": "run:test",
                 "responseConstraint": "normal",
-                "categories": [{
-                    "kind": "instructions",
-                    "itemCount": 1,
-                    "items": [{ "itemId": "instruction:agent", "label": "deepcode.coding-agent" }]
+                "messages": [{
+                    "messageIndex": 0,
+                    "contributionId": "instruction:agent",
+                    "contributionKind": "instructions",
+                    "label": "deepcode.coding-agent",
+                    "role": "system",
+                    "blocks": [{ "blockIndex": 0, "kind": "text" }],
+                    "attachments": []
                 }],
+                "workspaceBindings": [{ "itemId": "workspace:test", "label": "Test" }],
+                "tools": [{ "itemId": "fs.read", "label": "fs.read" }],
+                "partitions": [
+                    { "kind": "instructions", "itemCount": 1, "requestShapeUnits": 30,
+                      "estimatedInputTokens": 30, "tokenSource": "sessionEstimated" },
+                    { "kind": "sessionControls", "itemCount": 4, "requestShapeUnits": 20,
+                      "estimatedInputTokens": 20, "tokenSource": "sessionEstimated" },
+                    { "kind": "tools", "itemCount": 1, "requestShapeUnits": 10,
+                      "estimatedInputTokens": 10, "tokenSource": "sessionEstimated" },
+                    { "kind": "workspaceBindings", "itemCount": 1, "requestShapeUnits": 8,
+                      "estimatedInputTokens": 8, "tokenSource": "sessionEstimated" },
+                    { "kind": "contextProviders", "itemCount": 0, "requestShapeUnits": 0,
+                      "estimatedInputTokens": 0, "tokenSource": "sessionEstimated" },
+                    { "kind": "journalMessages", "itemCount": 1, "requestShapeUnits": 10,
+                      "estimatedInputTokens": 10, "tokenSource": "sessionEstimated" },
+                    { "kind": "messageAttachments", "itemCount": 0, "requestShapeUnits": 2,
+                      "estimatedInputTokens": 2, "tokenSource": "sessionEstimated" }
+                ],
                 "sequence": 4,
                 "createdAt": "2026-08-25T00:00:03.000Z"
             }],
@@ -1001,6 +1198,77 @@ mod tests {
         value["contextUsage"]["providerRequestId"] = json!("provider-request:other");
         let projection: SessionProjection =
             serde_json::from_value(value).expect("projection decodes");
+        assert!(projection.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_context_summary_without_fabricating_request_structure() {
+        let mut value = projection_value();
+        let receipt = value["contextCompositions"][0]
+            .as_object_mut()
+            .expect("receipt object");
+        receipt.remove("messages");
+        receipt.remove("workspaceBindings");
+        receipt.remove("tools");
+        receipt.remove("partitions");
+        receipt.insert(
+            "categories".to_string(),
+            json!([{
+                "kind": "instructions",
+                "itemCount": 1,
+                "items": [{
+                    "itemId": "instruction:agent",
+                    "label": "deepcode.coding-agent"
+                }]
+            }]),
+        );
+        let projection: SessionProjection =
+            serde_json::from_value(value).expect("legacy summary decodes");
+        assert_eq!(projection.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_mixed_or_partial_context_receipt_shapes() {
+        let mut mixed = projection_value();
+        mixed["contextCompositions"][0]["categories"] = json!([]);
+        let projection: SessionProjection =
+            serde_json::from_value(mixed).expect("mixed receipt decodes");
+        assert!(projection.validate().is_err());
+
+        let mut partial = projection_value();
+        partial["contextCompositions"][0]
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("tools");
+        let projection: SessionProjection =
+            serde_json::from_value(partial).expect("partial receipt decodes");
+        assert!(projection.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_context_message_order_that_differs_from_provider_request() {
+        let mut value = projection_value();
+        value["contextCompositions"][0]["messages"][0]["messageIndex"] = json!(1);
+        let projection: SessionProjection =
+            serde_json::from_value(value).expect("projection decodes");
+        assert!(projection.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_reordered_or_partially_estimated_context_partitions() {
+        let mut reordered = projection_value();
+        reordered["contextCompositions"][0]["partitions"][0]["kind"] = json!("tools");
+        let projection: SessionProjection =
+            serde_json::from_value(reordered).expect("reordered partitions decode");
+        assert!(projection.validate().is_err());
+
+        let mut partial = projection_value();
+        partial["contextCompositions"][0]["partitions"][1]
+            .as_object_mut()
+            .expect("partition object")
+            .remove("estimatedInputTokens");
+        let projection: SessionProjection =
+            serde_json::from_value(partial).expect("partial estimates decode");
         assert!(projection.validate().is_err());
     }
 

@@ -1,5 +1,5 @@
 use crate::registrations::{builtin_tool_registrations, KernelToolRegistration};
-use crate::types::ToolDescriptor;
+use crate::types::{ToolAvailability, ToolDescriptor};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum KernelToolCatalogError {
     #[error("tool `{0}` is not registered")]
     ToolNotRegistered(String),
+    #[error("tool `{0}` is blocked")]
+    ToolBlocked(String),
     #[error("tool `{tool_name}` arguments are invalid: {reason}")]
     InvalidArguments { tool_name: String, reason: String },
 }
@@ -49,8 +51,8 @@ impl KernelToolRegistry {
         }
         assert_eq!(
             registrations.len(),
-            13,
-            "Kernel catalog and executable tool set must remain identical"
+            14,
+            "Kernel catalog must contain the callable tools and blocked capability slots"
         );
         Self { registrations }
     }
@@ -72,9 +74,11 @@ impl KernelToolRegistry {
         &self,
     ) -> impl Iterator<Item = (&'static str, crate::kernel_internal::KernelExecutorBinding)> + '_
     {
-        self.registrations
-            .values()
-            .map(|registration| (registration.tool_id(), registration.executor_binding))
+        self.registrations.values().filter_map(|registration| {
+            registration
+                .executor_binding
+                .map(|binding| (registration.tool_id(), binding))
+        })
     }
 
     pub fn canonicalize(
@@ -86,13 +90,18 @@ impl KernelToolRegistry {
             .registrations
             .get(tool_name)
             .ok_or_else(|| KernelToolCatalogError::ToolNotRegistered(tool_name.to_owned()))?;
-        let invocation =
-            (registration.canonicalize_invocation)(raw_arguments).map_err(|reason| {
-                KernelToolCatalogError::InvalidArguments {
-                    tool_name: tool_name.to_owned(),
-                    reason,
-                }
-            })?;
+        if registration.descriptor.availability == ToolAvailability::Blocked {
+            return Err(KernelToolCatalogError::ToolBlocked(tool_name.to_owned()));
+        }
+        let canonicalize = registration
+            .canonicalize_invocation
+            .expect("callable Kernel tool must have a canonicalizer");
+        let invocation = canonicalize(raw_arguments).map_err(|reason| {
+            KernelToolCatalogError::InvalidArguments {
+                tool_name: tool_name.to_owned(),
+                reason,
+            }
+        })?;
         let arguments = invocation.executor_arguments();
         Ok(CanonicalToolInvocation {
             tool_name: tool_name.to_owned(),

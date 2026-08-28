@@ -245,9 +245,12 @@ SessionActor 保证一个 Session 同时只有一个状态推进者。runAgentLo
         7. turn 没有任何 tool.call 时，普通文本就是 answer；原子追加 assistant
            message.committed 与 run.settled(completed)。
         8. turn 闭合提交后清除 assistantDraft；恢复只依赖 journal，不恢复草稿。
-        9. Provider、typed turn、control 合同或不可恢复执行错误 -> 追加
-           run.settled(failed 或
-           indeterminate)。
+        9. 首个结构非法的 Session control -> 先提交该 turn 的 Provider 用量、narrative
+           与 session.control.rejected，再把同 callId 的结构化 tool error 送回同一 run，
+           只允许 Provider 纠正一次；第二个非法 Session control 仍先提交用量与拒绝事实，
+           然后以该原始 control error 追加 run.settled(failed)。
+       10. 其他 Provider、typed turn 合同或不可恢复执行错误 -> 追加
+           run.settled(failed 或 indeterminate)。
 
 Loop 不经过 Review、Finalize 或第二次 FinalAnswer Provider pass。answer 本身就是模型
 明确输出的终答。
@@ -289,10 +292,11 @@ control 冲突或空 answer 都是显式合同失败。
 都必须收到非负整数 index；缺失、负值或错误类型直接以
 `provider_tool_call_index_invalid` 失败，不能默认成 0 后把不同调用合并。
 
-Session 为 Provider 注册两个保留 control 工具：
+Session 为 Provider 注册三个保留 control 工具：
 
     interaction.request
     plan.intent
+    todo.update
 
 它们只能由 LLM 通过原生结构化 tool.call 调用。每个 control call 的 callId 分别成为
 interactionId 或 planId；同一 turn 最多一个 Session control，且不能同时调用 Kernel
@@ -316,6 +320,12 @@ Session 不可以：
 
 UI 可以根据 error code 显示本地化系统提示，但必须与 DeepCode 的模型消息在视觉和
 语义上区分。
+
+`session.control.rejected` 是 Session-owned 拒绝事实，不是 Kernel 工具请求，不产生
+PreparedEffect、ToolExecutionRecord、PlanAuthority 或 permission。Session 不 trim、补字段、
+补 operation、改变 control 类型或从自然语言修复参数；Provider 获得的是原 callId、原 input
+和严格 decoder 的原错误。每个 run 最多持久化两个该事件，第二个事件与失败 settlement
+同批闭合。
 
 ### 7.2 模型主动请求用户介入
 
@@ -478,14 +488,32 @@ workspace map 解析，并在同一 Shell 中只读展示。未知插件工具�
 ### 8.5 Provider 用量与缓存统计
 
 Session 每次调用 Provider 前，必须先持久化 `context.composed` 请求回执。回执与实际
-Provider request 使用同一个 `providerRequestId`，只记录本次请求实际采用的分类、条目
-标识与显示标签，不复制完整 Prompt、消息正文、secret 或绝对路径。Provider 调用只有在
-回执提交成功后才可开始；`context.updated` 必须引用一个同 run 中已有的
-`providerRequestId`，否则 reducer 拒绝该用量事实。
+Provider request 使用同一个 `providerRequestId`。新回执按实际请求顺序记录 messages 的
+贡献身份、类型、显示标签、role 与 block 结构，附件仅记录消息内显示身份；workspace
+bindings 与 tools 按 Provider request 的两个独立通道分别记录。回执不复制完整 Prompt、
+消息正文、工具参数、secret 或绝对路径，也不额外生成分类摘要形成第二套请求事实。
+Provider 调用只有在回执提交成功后才可开始；`context.updated` 必须引用一个同 run 中已有
+的 `providerRequestId`，否则 reducer 拒绝该用量事实。
+
+新回执同时按固定顺序记录七个 Session-owned 请求分区：系统与会话指令、Session 控制、
+Kernel 可调用工具、workspace bindings、context providers、journal messages、消息附件。
+每项只持久化 `itemCount` 与从该次不可变请求形状计算的 `requestShapeUnits`；它们不是
+Provider Token。对应 `context.updated.inputTokens` 到达后，Session reducer 使用最大余数法
+一次性分配七项 `estimatedInputTokens`，并标记 `tokenSource=sessionEstimated`；七项估算值
+必须精确合计为该次 Provider 输入总量。Shell 只消费这些投影事实，并统一以 `≈` 显示；
+旧回执没有该估算事实时显示 `N/A`，GUI/TUI 不自行分词、归因或重算。
+
+schema 5 早期已经持久化的分类摘要继续作为不可变只读历史原样恢复。新追加的
+`context.composed` 只接受上述结构字段；结构字段缺失、部分存在、与旧分类摘要混合，均在
+append/reducer/consumer 边界明确拒绝。旧摘要不能反推出当时已经丢失的消息顺序、role、
+tool call/result 关联或独立请求通道。
 
 `context.updated` 的 `inputTokens`、`outputTokens` 与 `contextWindowTokens` 表达该次
 Provider turn 的上下文用量。Provider 明确报告缓存事实时，同一事件还必须同时包含
 `cacheReadInputTokens` 与 `cacheMissInputTokens`；缺失任一字段均不是零值。
+
+分项 Token 只取上述 Session estimate；输入缓存命中、未命中与命中率只取 Provider
+明确报告的 cache fields，缺失即 `N/A`。Session estimate 不参与缓存归因。
 
 Session reducer 累加共享 `tokenUsage`：Provider 调用次数、输入/输出 token、缓存读取/
 未命中 token，以及真实报告缓存字段的调用次数。缓存命中率只在缓存读取与未命中总量
@@ -966,7 +994,7 @@ Session 每次 Provider turn 使用 immutable AgentDeps：
     AgentDeps {
       instructions
       contextContributions
-      tools
+      toolIds
       providerProfile
       memoryContributions
       skillContributions
@@ -976,7 +1004,13 @@ Session 每次 Provider turn 使用 immutable AgentDeps：
 第一版插件原则：
 
 - first-party builtin、Tool、Skill、MCP 共享来源、激活、调用谱系和生命周期准则。
-- Tool descriptor 由 Kernel catalog 提供；Provider 只看到当前可调用目录。
+- Tool descriptor、availability、canonical input schema 与执行绑定由 Kernel catalog 唯一
+  提供。Session 插件只选择 toolId；每个 Provider turn 解析这些 ID，排除 `blocked`，按名称
+  排序并冻结不可变 callable request snapshot。GUI/TUI 不合成 descriptor 或可用性。
+- `web.search`、`web.fetch` 与 `process.shell` 当前只作为 Kernel 目录站位，availability
+  固定为 `blocked`，没有 executor/canonicalizer，不进入 Provider request；绕过 Session
+  直接请求执行也必须由 Kernel 以 `tool_blocked` 拒绝。联网与 shell 的后续启用不由
+  permission 设置或 Shell 展示提前推断。
 - Skill 与 MCP 后续作为 contribution kind 接入，不建立平行 Agent Loop。
 - Agent 可以生成插件草稿或激活提案，但 Provider 工具目录不暴露 PluginAdminPort。
 - 写出文件不等于安装，登记不等于激活。
@@ -1014,9 +1048,12 @@ SQLite 第一版继续使用 rollback journal mode 和 synchronous=FULL。schema
 
 `todo.updated` 加入后，active-v2 Session store 从 schema 2 单向升级到 schema 3；
 directory-index events 与 run workspace snapshot 加入后再单向升级到 schema 4；
-`message.feedback.updated` 与 `context.composed` 加入后单向升级到 schema 5。schema 3
+`message.feedback.updated` 与 `context.composed` 加入后单向升级到 schema 5；
+`session.control.rejected` 加入后再单向升级到 schema 6。schema 3
 既有 `run.started` 由 creation binding 确定性补齐 `workspaceBindings`，不读取其他 root，
-不推断后续目录索引；schema 4→5 只扩展闭合事件词汇，不改写既有 payload。
+不推断后续目录索引；schema 4→5 与 schema 5→6 都只扩展闭合事件词汇，不改写既有
+payload。schema 6 的新结构回执可以携带分区 shape facts；该字段保持 optional，使 schema 5
+已有不可变 `context.composed` 原样恢复且不伪造估算。
 ToolRecord store 从 schema 2 单向升级到 schema 3，仅移除阻止 Session aggregate purge 的
 delete trigger；普通 Kernel API 仍没有任意删除入口。
 
@@ -1027,7 +1064,7 @@ Session。只读旧历史继续由 Host history adapter 从旧 root 投影。
 
 schema 4 既有 `context.updated` 没有当时尚不存在的 `providerRequestId`。schema 4→5
 迁移不得伪造 `context.composed`、请求身份或上下文分类；recovery reducer 只把这类原样
-保留的旧事件恢复为累计与逐轮 Token 历史，不投影 `contextUsage` 或上下文构成。schema 5
+保留的旧事件恢复为累计与逐轮 Token 历史，不投影 `contextUsage` 或上下文构成。schema 5/6
 新追加的 `context.updated` 仍必须带同 run 已持久化回执的 `providerRequestId`，否则在
 append/reducer 边界明确拒绝。
 
@@ -1251,6 +1288,9 @@ R0 已完成以下合同检查：
 | R0-ADD-D13 / S1-session-directory-index | 文件快照与目录索引分离、Session attach / detach、per-run 根目录冻结、完整归档删除 |
 | R0-ADD-D14 / F1-local-durable | assistant message 本地持久反馈、共享命令与投影、随 Session archive 删除 |
 | R0-ADD-D15 / C1-request-receipt | Provider 调用前持久请求构成回执、request identity 绑定用量与逐轮统计 |
+| T1 | Session-owned 七分区输入 Token 估算；Provider-owned 总量与缓存；Shell 缺失显示 N/A |
+| C1 | 同 run 首次 control 拒绝回送纠正，第二次在用量与拒绝落盘后失败，无修复或 authority |
+| R1 | Kernel-owned descriptor/availability/execution；Session toolId 选择与不可变 callable 快照 |
 
 R0-FRAME-1、R0-STREAM-1A 与 R0-MANIFEST-1 的现实需求由选定 IPC 库的正常 frame /
 stream 生命周期、构建 manifest 和实现测试承担；它们不建立第二套运行时事实、自哈希

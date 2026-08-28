@@ -2,6 +2,7 @@ import type {
   ActivityProjection,
   AssistantDraftProjection,
   ArtifactProjection,
+  ContextCompositionCategory,
   PendingPlanProjection,
   SessionEvent,
   SessionProjection,
@@ -324,31 +325,82 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next.artifacts[artifact.artifactId] = artifact;
       }
       break;
+    case 'session.control.rejected':
+      assertRunningRun(next, event.runId, 'session_control_rejection_run_not_active');
+      break;
     case 'context.composed':
       assertRunningRun(next, event.runId, 'provider_request_run_not_active');
       if (next.contextCompositions.some((receipt) => (
         receipt.providerRequestId === event.payload.providerRequestId
       ))) throw new Error('provider_request_receipt_duplicate');
-      next.contextCompositions.push({
-        runId: event.runId,
-        providerRequestId: event.payload.providerRequestId,
-        responseConstraint: event.payload.responseConstraint,
-        categories: event.payload.categories.map((category) => ({
-          ...category,
-          items: category.items.map((item) => ({ ...item })),
-        })),
-        sequence: event.sequence,
-        createdAt: event.occurredAt,
-      });
+      {
+        const legacyCategories = (
+          event.payload as typeof event.payload & { categories?: ContextCompositionCategory[] }
+        ).categories;
+        const structuralParts = [
+          event.payload.messages,
+          event.payload.workspaceBindings,
+          event.payload.tools,
+        ];
+        const presentCount = structuralParts.filter(Array.isArray).length;
+        if (presentCount !== 0 && presentCount !== structuralParts.length) {
+          throw new Error('provider_request_receipt_structure_incomplete');
+        }
+        const hasStructure = presentCount === structuralParts.length;
+        const hasLegacySummary = Array.isArray(legacyCategories);
+        if (hasStructure === hasLegacySummary) {
+          throw new Error('provider_request_receipt_shape_invalid');
+        }
+        const base = {
+          runId: event.runId,
+          providerRequestId: event.payload.providerRequestId,
+          responseConstraint: event.payload.responseConstraint,
+          sequence: event.sequence,
+          createdAt: event.occurredAt,
+        };
+        if (hasStructure) {
+          if (event.payload.partitions) validateContextPartitions(event.payload.partitions);
+          next.contextCompositions.push({
+            ...base,
+            messages: event.payload.messages.map((message) => ({
+              ...message,
+              blocks: message.blocks.map((block) => ({ ...block })),
+              attachments: message.attachments.map((attachment) => ({ ...attachment })),
+            })),
+            workspaceBindings: event.payload.workspaceBindings.map((binding) => ({ ...binding })),
+            tools: event.payload.tools.map((tool) => ({ ...tool })),
+            ...(event.payload.partitions
+              ? { partitions: event.payload.partitions.map((partition) => ({ ...partition })) }
+              : {}),
+          });
+        } else {
+          if (!legacyCategories) throw new Error('provider_request_receipt_shape_invalid');
+          next.contextCompositions.push({
+            ...base,
+            categories: legacyCategories.map((category) => ({
+              ...category,
+              items: category.items.map((item) => ({ ...item })),
+            })),
+          });
+        }
+      }
       break;
     case 'context.updated': {
       assertRunningRun(next, event.runId, 'provider_usage_run_not_active');
       const providerRequestId = event.payload.providerRequestId;
       if (typeof providerRequestId === 'string' && providerRequestId.length > 0) {
-        if (!next.contextCompositions.some((receipt) => (
+        const receiptIndex = next.contextCompositions.findIndex((receipt) => (
           receipt.runId === event.runId
           && receipt.providerRequestId === providerRequestId
-        ))) throw new Error('provider_request_receipt_missing');
+        ));
+        if (receiptIndex < 0) throw new Error('provider_request_receipt_missing');
+        const receipt = next.contextCompositions[receiptIndex];
+        if (receipt.messages && receipt.partitions) {
+          next.contextCompositions[receiptIndex] = {
+            ...receipt,
+            partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
+          };
+        }
         next.contextUsage = {
           ...event.payload,
           providerRequestId,
@@ -571,6 +623,21 @@ function cloneTodoList(todoList: SessionProjection['todoList']): SessionProjecti
 function cloneContextComposition(
   receipt: SessionProjection['contextCompositions'][number],
 ): SessionProjection['contextCompositions'][number] {
+  if (receipt.messages) {
+    return {
+      ...receipt,
+      messages: receipt.messages.map((message) => ({
+        ...message,
+        blocks: message.blocks.map((block) => ({ ...block })),
+        attachments: message.attachments.map((attachment) => ({ ...attachment })),
+      })),
+      workspaceBindings: receipt.workspaceBindings.map((binding) => ({ ...binding })),
+      tools: receipt.tools.map((tool) => ({ ...tool })),
+      ...(receipt.partitions
+        ? { partitions: receipt.partitions.map((partition) => ({ ...partition })) }
+        : {}),
+    };
+  }
   return {
     ...receipt,
     categories: receipt.categories.map((category) => ({
@@ -578,6 +645,68 @@ function cloneContextComposition(
       items: category.items.map((item) => ({ ...item })),
     })),
   };
+}
+
+const CONTEXT_PARTITION_ORDER = [
+  'instructions',
+  'sessionControls',
+  'tools',
+  'workspaceBindings',
+  'contextProviders',
+  'journalMessages',
+  'messageAttachments',
+] as const;
+
+function validateContextPartitions(
+  partitions: NonNullable<Extract<SessionEvent, { type: 'context.composed' }>['payload']['partitions']>,
+): void {
+  if (
+    partitions.length !== CONTEXT_PARTITION_ORDER.length
+    || partitions.some((partition, index) => (
+      partition.kind !== CONTEXT_PARTITION_ORDER[index]
+      || !Number.isSafeInteger(partition.itemCount)
+      || partition.itemCount < 0
+      || !Number.isSafeInteger(partition.requestShapeUnits)
+      || partition.requestShapeUnits < 0
+    ))
+    || partitions.every((partition) => partition.requestShapeUnits === 0)
+  ) throw new Error('context_partition_receipt_invalid');
+}
+
+function estimatePartitionTokens(
+  partitions: NonNullable<SessionProjection['contextCompositions'][number]['partitions']>,
+  inputTokens: number,
+): NonNullable<SessionProjection['contextCompositions'][number]['partitions']> {
+  validateContextPartitions(partitions);
+  const totalUnits = partitions.reduce(
+    (total, partition) => total + BigInt(partition.requestShapeUnits),
+    0n,
+  );
+  const totalTokens = BigInt(inputTokens);
+  const allocated = partitions.map((partition, index) => {
+    const weighted = totalTokens * BigInt(partition.requestShapeUnits);
+    return {
+      index,
+      tokens: weighted / totalUnits,
+      remainder: weighted % totalUnits,
+    };
+  });
+  let remaining = totalTokens - allocated.reduce((total, item) => total + item.tokens, 0n);
+  for (const item of [...allocated].sort((left, right) => {
+    if (left.remainder === right.remainder) return left.index - right.index;
+    return left.remainder > right.remainder ? -1 : 1;
+  })) {
+    if (remaining === 0n) break;
+    item.tokens += 1n;
+    remaining -= 1n;
+  }
+  return partitions.map((partition, index) => ({
+    kind: partition.kind,
+    itemCount: partition.itemCount,
+    requestShapeUnits: partition.requestShapeUnits,
+    estimatedInputTokens: Number(allocated[index].tokens),
+    tokenSource: 'sessionEstimated',
+  }));
 }
 
 function cloneActivity(activity: ActivityProjection): ActivityProjection {

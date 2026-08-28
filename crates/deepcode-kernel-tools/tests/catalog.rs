@@ -1,17 +1,32 @@
-use deepcode_kernel_tools::KernelToolRegistry;
+use deepcode_kernel_tools::{KernelToolCatalogError, KernelToolRegistry, ToolAvailability};
 use serde_json::json;
 
 #[test]
-fn catalog_contains_only_executable_tools() {
+fn catalog_contains_callable_tools_and_blocked_capability_slots() {
     let registry = KernelToolRegistry::new();
     let names = registry
         .descriptors()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 13);
+    assert_eq!(names.len(), 14);
     assert!(names.contains(&"fs.read"));
     assert!(names.contains(&"fs.edit"));
     assert!(names.contains(&"web.fetch"));
+    assert!(names.contains(&"process.shell"));
+    assert_eq!(
+        registry.descriptor("fs.read").unwrap().availability,
+        ToolAvailability::Callable,
+    );
+    for blocked in ["web.search", "web.fetch", "process.shell"] {
+        assert_eq!(
+            registry.descriptor(blocked).unwrap().availability,
+            ToolAvailability::Blocked,
+        );
+        assert!(matches!(
+            registry.canonicalize(blocked, json!({})),
+            Err(KernelToolCatalogError::ToolBlocked(name)) if name == blocked
+        ));
+    }
     for removed in [
         "fs.rename",
         "git.commit",
@@ -41,13 +56,23 @@ fn canonical_arguments_match_the_executor_boundary() {
     let delete = registry
         .canonicalize(
             "fs.delete",
-            json!({"path":"build/cache","targetKind":"directory","recursive":true}),
+            json!({"path":"build/cache","targetKind":"directoryTree"}),
         )
         .unwrap();
     assert_eq!(
         delete.arguments,
-        json!({"path":"build/cache","targetKind":"directory","recursive":true})
+        json!({"path":"build/cache","targetKind":"directoryTree"})
     );
+
+    assert!(registry
+        .canonicalize(
+            "fs.delete",
+            json!({"path":"build/cache","targetKind":"directory","recursive":true}),
+        )
+        .is_err());
+    assert!(registry
+        .canonicalize("fs.delete", json!({"path":"build/cache"}))
+        .is_err());
 
     let edit = registry
         .canonicalize(

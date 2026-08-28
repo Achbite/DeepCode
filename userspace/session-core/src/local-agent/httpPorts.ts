@@ -116,7 +116,7 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
   async listTools(): Promise<readonly ToolDescriptor[]> {
-    return await this.json('/api/local-agent/kernel/tools');
+    return decodeToolDescriptors(await this.json('/api/local-agent/kernel/tools'));
   }
 
   async execute(request: ToolExecutionRequest): Promise<ToolExecutionReply> {
@@ -138,6 +138,38 @@ export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
       `/api/local-agent/kernel/records/${encodeURIComponent(callId)}`,
     );
   }
+}
+
+function decodeToolDescriptors(value: unknown): readonly ToolDescriptor[] {
+  if (!Array.isArray(value)) throw new Error('kernel_tool_catalog_invalid');
+  const seen = new Set<string>();
+  return Object.freeze(value.map((candidate) => {
+    if (
+      !isExactRecord(candidate, [
+        'name',
+        'description',
+        'inputSchema',
+        'possibleEffects',
+        'availability',
+      ])
+      || !isNonEmptyText(candidate.name)
+      || !/^[A-Za-z0-9_.-]+$/u.test(candidate.name)
+      || !isNonEmptyText(candidate.description)
+      || !isRecord(candidate.inputSchema)
+      || !Array.isArray(candidate.possibleEffects)
+      || candidate.possibleEffects.some((effect) => ![
+        'workspaceRead',
+        'workspaceMutation',
+        'process',
+        'network',
+        'external',
+      ].includes(String(effect)))
+      || candidate.availability !== 'callable' && candidate.availability !== 'blocked'
+      || seen.has(candidate.name)
+    ) throw new Error('kernel_tool_catalog_invalid');
+    seen.add(candidate.name);
+    return candidate as unknown as ToolDescriptor;
+  }));
 }
 
 export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort {

@@ -278,17 +278,85 @@ export interface ContextCompositionCategory {
   items: ContextCompositionItem[];
 }
 
+export type ContextCompositionMessageKind = Exclude<
+  ContextCompositionCategoryKind,
+  'messageAttachments' | 'tools'
+>;
+
+export type ContextCompositionMessageBlock =
+  | {
+      blockIndex: number;
+      kind: 'text' | 'reasoning';
+    }
+  | {
+      blockIndex: number;
+      kind: 'toolCall';
+      callId: string;
+      toolName: string;
+    }
+  | {
+      blockIndex: number;
+      kind: 'toolResult';
+      resultForCallId: string;
+    };
+
+export interface ContextCompositionMessage {
+  messageIndex: number;
+  contributionId: string;
+  contributionKind: ContextCompositionMessageKind;
+  label: string;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  blocks: ContextCompositionMessageBlock[];
+  attachments: ContextCompositionItem[];
+}
+
+export interface ContextCompositionPartitionReceipt {
+  kind: ContextCompositionCategoryKind;
+  itemCount: number;
+  requestShapeUnits: number;
+}
+
+export interface ContextCompositionPartitionProjection
+  extends ContextCompositionPartitionReceipt {
+  estimatedInputTokens?: number;
+  tokenSource?: 'sessionEstimated';
+}
+
 export interface ContextCompositionReceipt {
   providerRequestId: string;
   responseConstraint: 'normal' | 'answerOnly';
-  categories: ContextCompositionCategory[];
+  messages: ContextCompositionMessage[];
+  workspaceBindings: ContextCompositionItem[];
+  tools: ContextCompositionItem[];
+  /** Absent on immutable receipts written before Session partition estimation existed. */
+  partitions?: ContextCompositionPartitionReceipt[];
 }
 
-export interface ContextCompositionProjection extends ContextCompositionReceipt {
+interface ContextCompositionProjectionBase {
+  providerRequestId: string;
+  responseConstraint: 'normal' | 'answerOnly';
   runId: string;
   sequence: number;
   createdAt: string;
 }
+
+export type ContextCompositionProjection = ContextCompositionProjectionBase & (
+  | {
+      messages: ContextCompositionMessage[];
+      workspaceBindings: ContextCompositionItem[];
+      tools: ContextCompositionItem[];
+      partitions?: ContextCompositionPartitionProjection[];
+      categories?: never;
+    }
+  /** schema-5 早期只记录分类摘要；旧不可变回执不会伪造已丢失的请求结构。 */
+  | {
+      categories: ContextCompositionCategory[];
+      messages?: never;
+      workspaceBindings?: never;
+      tools?: never;
+      partitions?: never;
+    }
+);
 
 export type TodoStatus = 'pending' | 'inProgress' | 'completed';
 
@@ -429,6 +497,16 @@ export type SessionEvent =
       runId: string;
       callId: string;
       payload: { record: ToolExecutionRecord };
+    })
+  | (SessionEventBase & {
+      type: 'session.control.rejected';
+      runId: string;
+      callId: string;
+      payload: {
+        toolName: string;
+        input: JsonObject;
+        error: LocalAgentError;
+      };
     })
   | (SessionEventBase & {
       type: 'context.composed';
@@ -700,6 +778,7 @@ export interface ToolDescriptor {
   description: string;
   inputSchema: JsonObject;
   possibleEffects: EffectKind[];
+  availability: 'callable' | 'blocked';
 }
 
 export interface PlanAuthority {

@@ -298,12 +298,112 @@
         }
       }
     },
+    "ContextCompositionPartition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "itemCount", "requestShapeUnits"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "instructions", "sessionControls", "tools", "workspaceBindings",
+            "contextProviders", "journalMessages", "messageAttachments"
+          ]
+        },
+        "itemCount": { "type": "integer", "minimum": 0 },
+        "requestShapeUnits": { "type": "integer", "minimum": 0 },
+        "estimatedInputTokens": { "type": "integer", "minimum": 0 },
+        "tokenSource": { "const": "sessionEstimated" }
+      },
+      "dependentRequired": {
+        "estimatedInputTokens": ["tokenSource"],
+        "tokenSource": ["estimatedInputTokens"]
+      }
+    },
+    "ContextCompositionMessageBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["blockIndex", "kind"],
+          "properties": {
+            "blockIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "enum": ["text", "reasoning"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["blockIndex", "kind", "callId", "toolName"],
+          "properties": {
+            "blockIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "toolCall" },
+            "callId": { "$ref": "#/$defs/Id" },
+            "toolName": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["blockIndex", "kind", "resultForCallId"],
+          "properties": {
+            "blockIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "toolResult" },
+            "resultForCallId": { "$ref": "#/$defs/Id" }
+          }
+        }
+      ]
+    },
+    "ContextCompositionMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageIndex", "contributionId", "contributionKind", "label", "role",
+        "blocks", "attachments"
+      ],
+      "properties": {
+        "messageIndex": { "type": "integer", "minimum": 0 },
+        "contributionId": { "$ref": "#/$defs/Id" },
+        "contributionKind": {
+          "enum": [
+            "instructions", "workspaceBindings", "sessionControls", "journalMessages",
+            "contextProviders"
+          ]
+        },
+        "label": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["system", "user", "assistant", "tool"] },
+        "blocks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionMessageBlock" }
+        },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionItem" }
+        }
+      }
+    },
     "ContextComposition": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "providerRequestId", "runId", "responseConstraint", "categories",
+        "providerRequestId", "runId", "responseConstraint",
         "sequence", "createdAt"
+      ],
+      "oneOf": [
+        {
+          "required": ["messages", "workspaceBindings", "tools"],
+          "not": { "required": ["categories"] }
+        },
+        {
+          "required": ["categories"],
+          "not": {
+            "anyOf": [
+              { "required": ["messages"] },
+              { "required": ["workspaceBindings"] },
+              { "required": ["tools"] },
+              { "required": ["partitions"] }
+            ]
+          }
+        }
       ],
       "properties": {
         "providerRequestId": { "$ref": "#/$defs/Id" },
@@ -312,6 +412,24 @@
         "categories": {
           "type": "array",
           "items": { "$ref": "#/$defs/ContextCompositionCategory" }
+        },
+        "messages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionMessage" }
+        },
+        "workspaceBindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionItem" }
+        },
+        "tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextCompositionItem" }
+        },
+        "partitions": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": { "$ref": "#/$defs/ContextCompositionPartition" }
         },
         "sequence": { "type": "integer", "minimum": 1 },
         "createdAt": { "$ref": "#/$defs/Timestamp" }
@@ -556,6 +674,7 @@
             "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested",
             "interaction.resolved", "plan.intent.requested", "plan.intent.resolved",
             "todo.updated", "tool.requested", "approval.requested", "approval.resolved", "tool.completed",
+            "session.control.rejected",
             "context.composed", "context.updated", "run.waiting", "run.settled"
           ]
         },

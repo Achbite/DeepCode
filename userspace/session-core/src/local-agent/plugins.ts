@@ -4,7 +4,6 @@ import type {
   ModelMessage,
   ProviderPort,
   SessionEvent,
-  ToolDescriptor,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 
@@ -49,7 +48,7 @@ export interface PassiveObserver {
 export interface PluginContribution {
   instructions?: readonly InstructionContribution[];
   contextProviders?: readonly ContextProvider[];
-  tools?: readonly ToolDescriptor[];
+  toolIds?: readonly string[];
   providerAdapters?: readonly ProviderAdapter[];
   memoryProviders?: readonly MemoryProvider[];
   observers?: readonly PassiveObserver[];
@@ -74,7 +73,7 @@ export interface AgentPlugin {
 export interface AgentComposition {
   instructions: readonly InstructionContribution[];
   contextProviders: readonly ContextProvider[];
-  tools: readonly ToolDescriptor[];
+  toolIds: readonly string[];
   provider: ProviderPort;
   memory: MemoryProvider;
   observers: readonly PassiveObserver[];
@@ -112,13 +111,13 @@ export async function composeAgent(
 
   const instructions = contributions.flatMap((value) => value.instructions ?? []);
   const contextProviders = contributions.flatMap((value) => value.contextProviders ?? []);
-  const tools = contributions.flatMap((value) => value.tools ?? []);
+  const toolIds = contributions.flatMap((value) => value.toolIds ?? []);
   const providers = contributions.flatMap((value) => value.providerAdapters ?? []);
   const memories = contributions.flatMap((value) => value.memoryProviders ?? []);
   const observers = contributions.flatMap((value) => value.observers ?? []);
   assertUnique(instructions.map((value) => value.id), 'instruction');
   assertUnique(contextProviders.map((value) => value.id), 'context provider');
-  assertUnique(tools.map((value) => value.name), 'tool');
+  assertUnique(toolIds, 'tool');
   assertUnique(providers.map((value) => value.id), 'Provider');
   assertUnique(memories.map((value) => value.id), 'Memory provider');
   assertUnique(observers.map((value) => value.id), 'observer');
@@ -131,7 +130,7 @@ export async function composeAgent(
   return Object.freeze({
     instructions: Object.freeze([...instructions]),
     contextProviders: Object.freeze([...contextProviders]),
-    tools: Object.freeze(tools.map((tool) => Object.freeze({ ...tool }))),
+    toolIds: Object.freeze([...toolIds]),
     provider,
     memory,
     observers: Object.freeze([...observers]),

@@ -15,6 +15,14 @@ pub enum ToolEffectScope {
     WorkspaceRead,
     WorkspaceWrite,
     NetworkRead,
+    Process,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolAvailability {
+    Callable,
+    Blocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +33,7 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
     pub effect_class: ToolEffectClass,
     pub effect_scope: ToolEffectScope,
+    pub availability: ToolAvailability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

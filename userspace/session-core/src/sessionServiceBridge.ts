@@ -83,7 +83,9 @@ async function main(): Promise<void> {
     },
     {
       id: 'deepcode.kernel.tools',
-      setup: async () => ({ tools: await kernel.listTools() }),
+      setup: async () => ({
+        toolIds: (await kernel.listTools()).map((tool) => tool.name),
+      }),
     },
     ...startupPlugins.skills.map(skillPlugin),
   ];

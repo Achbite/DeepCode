@@ -43,11 +43,12 @@ def check_runtime_contracts() -> None:
             "session-v2-to-v3.sql",
             "session-v3-to-v4.sql",
             "session-v4-to-v5.sql",
+            "session-v5-to-v6.sql",
             "session.sql",
             "tool-record-v2-to-v3.sql",
             "tool-record.sql",
         ],
-        f"v2 合同目录不是精确十文件：{files}",
+        f"v2 合同目录不是精确十一文件：{files}",
     )
     contract_readme = read("contracts/agent-runtime-v2/README.md")
     for boundary in (
@@ -55,6 +56,7 @@ def check_runtime_contracts() -> None:
         "Session:    2 -> session-v2-to-v3.sql -> 3",
         "3 -> session-v3-to-v4.sql -> 4",
         "4 -> session-v4-to-v5.sql -> 5",
+        "5 -> session-v5-to-v6.sql -> 6",
         "ToolRecord: 2 -> tool-record-v2-to-v3.sql -> 3",
         "不是冗余建库脚本",
     ):
@@ -78,7 +80,7 @@ def check_runtime_contracts() -> None:
         ),
         "session.sql": (
             {"sessions", "session_workspace_bindings", "session_events", "session_commands"},
-            5,
+            6,
         ),
         "tool-record.sql": ({"tool_records"}, 3),
     }
@@ -154,12 +156,13 @@ def check_runtime_contracts() -> None:
     connection = sqlite3.connect(":memory:")
     try:
         current_schema = read("contracts/agent-runtime-v2/session.sql")
-        v2_schema = current_schema.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 2;")
+        v2_schema = current_schema.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 2;")
         v2_schema = v2_schema.replace("        'session.directory-index.attached',\n", "")
         v2_schema = v2_schema.replace("        'session.directory-index.detached',\n", "")
         v2_schema = v2_schema.replace("        'todo.updated',\n", "")
         v2_schema = v2_schema.replace("        'message.feedback.updated',\n", "")
         v2_schema = v2_schema.replace("        'context.composed',\n", "")
+        v2_schema = v2_schema.replace("        'session.control.rejected',\n", "")
         connection.executescript(v2_schema)
         connection.execute(
             "INSERT INTO sessions(session_id, display_title, created_at) VALUES (?, ?, ?)",
@@ -200,6 +203,8 @@ def check_runtime_contracts() -> None:
         require(connection.execute("PRAGMA user_version").fetchone()[0] == 4, "Session schema 3 未迁移到 4")
         connection.executescript(read("contracts/agent-runtime-v2/session-v4-to-v5.sql"))
         require(connection.execute("PRAGMA user_version").fetchone()[0] == 5, "Session schema 4 未迁移到 5")
+        connection.executescript(read("contracts/agent-runtime-v2/session-v5-to-v6.sql"))
+        require(connection.execute("PRAGMA user_version").fetchone()[0] == 6, "Session schema 5 未迁移到 6")
         connection.execute(
             "INSERT INTO session_events("
             "session_id, sequence, event_id, event_type, payload_json, occurred_at"
@@ -212,7 +217,7 @@ def check_runtime_contracts() -> None:
             ),
         )
     except sqlite3.Error as error:
-        ISSUES.append(f"Session schema 2 -> 3 -> 4 -> 5 迁移失败：{error}")
+        ISSUES.append(f"Session schema 2 -> 3 -> 4 -> 5 -> 6 迁移失败：{error}")
     finally:
         connection.close()
 
@@ -309,7 +314,7 @@ def check_current_path() -> None:
         (gui_panel, 'name="thumbDown"', "GUI Assistant 回答缺少踩操作"),
         (gui_panel, "作为本条消息的内容快照", "GUI 加号菜单缺少文件快照入口"),
         (gui_panel, "作为此对话的目录索引", "GUI 加号菜单缺少目录索引入口"),
-        (model_selector, "contextReceipt.categories.map", "上下文球没有消费请求回执分类"),
+        (model_selector, "receipt.partitions.map", "上下文球没有消费 Session 分区投影"),
         (gui_settings, "tokenUsageHistory.slice", "设置页没有分页消费逐轮用量"),
         (gui_settings, "Newest first, 10 per page", "设置页缺少新到旧每页十条语义"),
         (gui_styles, "margin: 10px auto 0", "前往最新消息按钮没有居中"),

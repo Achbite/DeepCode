@@ -204,6 +204,48 @@ fn executor_uses_the_prepared_target_without_resolving_the_logical_path_again() 
 }
 
 #[test]
+fn fs_delete_requires_the_closed_target_kind_and_deletes_the_exact_tree() {
+    let workspace = TempWorkspace::new("delete-target-kind");
+    let directory = workspace.0.join("build/cache");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("entry.txt"), "cache\n").unwrap();
+
+    for input in [
+        serde_json::json!({ "path": "build/cache" }),
+        serde_json::json!({ "path": "build/cache", "targetKind": "directory" }),
+    ] {
+        FsDeleteExecutor
+            .invoke(
+                KernelToolInvocation {
+                    id: "delete-invalid-kind".to_string(),
+                    tool_id: "fs.delete".to_string(),
+                    input,
+                },
+                context_with_target(&workspace.0, "build/cache"),
+            )
+            .expect_err("missing or legacy delete targetKind must fail closed");
+        assert!(directory.is_dir());
+    }
+
+    let result = FsDeleteExecutor
+        .invoke(
+            KernelToolInvocation {
+                id: "delete-directory-tree".to_string(),
+                tool_id: "fs.delete".to_string(),
+                input: serde_json::json!({
+                    "path": "build/cache",
+                    "targetKind": "directoryTree"
+                }),
+            },
+            context_with_target(&workspace.0, "build/cache"),
+        )
+        .expect("directoryTree deletes the exact PreparedEffect tree");
+    assert_eq!(result.output["kind"], "directoryTree");
+    assert_eq!(result.output["path"], "build/cache");
+    assert!(!directory.exists());
+}
+
+#[test]
 fn catalog_tools_have_exactly_one_runtime_binding() {
     let registry = KernelToolRegistry::default();
     let executors = builtin_executors(
@@ -221,7 +263,9 @@ fn catalog_tools_have_exactly_one_runtime_binding() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(binding_ids.len(), unique_binding_ids.len());
 
-    for descriptor in registry.descriptors() {
+    for descriptor in registry.descriptors().filter(|descriptor| {
+        descriptor.availability == deepcode_kernel_tools::ToolAvailability::Callable
+    }) {
         let binding_count = binding_ids
             .iter()
             .filter(|tool_id| tool_id.as_str() == descriptor.name)

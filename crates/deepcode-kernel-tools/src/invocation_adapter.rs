@@ -217,10 +217,7 @@ fn canonicalize_delete_arguments(arguments: &Value) -> Result<Value, InvocationN
         .ok_or_else(|| invalid_arguments(tool_id))?;
     match target_kind {
         "file" if fields.len() == 2 => Ok(json!({"kind":"file","data":{"path":path}})),
-        "directory"
-            if fields.len() == 3
-                && fields.get("recursive").and_then(Value::as_bool) == Some(true) =>
-        {
+        "directoryTree" if fields.len() == 2 => {
             Ok(json!({"kind":"directoryTree","data":{"path":path}}))
         }
         _ => Err(invalid_arguments(tool_id)),
