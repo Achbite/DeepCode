@@ -37,7 +37,7 @@ export function emptySessionState(sessionId: string): SessionState {
   return {
     sessionId,
     revision: 0,
-    display: { title: '新对话' },
+    display: { creationTitle: '新对话' },
     creationWorkspaceBindings: [],
     sessionDirectoryIndexes: [],
     workspaceBindings: [],
@@ -103,7 +103,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
 
   switch (event.type) {
     case 'session.created':
-      next.display = { title: event.payload.displayTitle };
+      next.display = { creationTitle: event.payload.displayTitle };
       next.creationWorkspaceBindings = event.payload.workspaceBindings.map((binding) => ({ ...binding }));
       next.sessionDirectoryIndexes = [];
       next.workspaceBindings = effectiveWorkspaceBindings(next);

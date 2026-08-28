@@ -31,14 +31,14 @@ DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通
 
 ## 选择界面
 
-| 界面 | 适合场景 | 入口 |
-| --- | --- | --- |
+| 界面            | 适合场景                                    | 入口                                            |
+| --------------- | ------------------------------------------- | ----------------------------------------------- |
 | DeepCode Editor | 文件树、编辑器、终端、Git 面板和 Agent 对话 | `DeepCode.app`、`DeepCode.exe` 或 Linux GUI |
-| DeepCode-GUI | 专注的本地 Agent 对话 | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe` |
-| CLI | 一次性任务、脚本和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
-| TUI | 持续的交互式终端对话 | `DeepCode-TUI.command` 或 `deepcode-tui` |
+| DeepCode-GUI    | 专注的本地 Agent 对话                       | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe`    |
+| CLI             | 一次性任务、脚本和终端工作流                | `DeepCode-CLI.command` 或 `deepcode-cli`    |
+| TUI             | 持续的交互式终端对话                        | `DeepCode-TUI.command` 或 `deepcode-tui`    |
 
-日常开发推荐使用完整的 DeepCode Editor GUI，将文件树、编辑器、终端、Git 与 Agent 工作流集中在同一界面；偏好终端工作流时推荐使用 TUI。CLI 继续用于一次性操作、自动化与诊断。
+日常开发推荐使用完整的 DeepCode GUI，将文件树、编辑器、终端、Git 与 Agent 工作流集中在同一界面；偏好终端工作流时推荐使用 TUI。CLI 继续用于一次性操作、自动化与诊断。
 
 只要使用同一配置根，四个界面就会读取同一批模型配置、Session journal、Kernel 工具记录和共享投影。
 
@@ -73,14 +73,30 @@ make package-macos-clean
 
 当前 macOS 包用于本机运行，采用 ad-hoc 签名；它不是 Developer ID 签名或公证的 DMG。
 
+macOS package service 固定使用当前仓库内的请求目录，并只发布到当前仓库的 `bin/macos-arm64/`。请求回执会直接打印 worker 根目录、输出目录和日志位置；打包脚本仍会在发布前确认源码没有在同一事务中发生变化。
+
 ## Linux 与 Windows 包
 
-开发和便携打包通过项目容器完成。Windows 请在 WSL 中运行：
+开发和便携打包通过唯一的 `deepcode-dev` 容器完成。推荐直接在宿主机运行完整构建：
+
+```bash
+make build
+```
+
+需要交互调试时（Windows 请先进入 WSL）：
 
 ```bash
 make shell
 bash ./build.sh
 ```
+
+每次入口都会通过 Docker 缓存重新求值 `Dockerfile.dev`。若源码挂载、开发镜像或端口发生变化，工具只重建固定名称的 `deepcode-dev` 容器并保留依赖/编译缓存；不再存在分支专用容器或 `DEEPCODE_WORKTREE_ID`。只想重建容器时执行：
+
+```bash
+make reset-dev
+```
+
+Rust 开发版本由 `rust-toolchain.toml` 统一指定为 1.88.0；workspace 的最低版本合同是 1.86，满足当前锁文件中依赖的实际要求。
 
 产物写入：
 

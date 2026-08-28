@@ -205,9 +205,20 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-pub(crate) fn read_json_file(path: &PathBuf) -> Option<Value> {
+pub(crate) fn read_best_effort_json_file(path: &PathBuf) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+pub(crate) fn read_optional_json_file(path: &FsPath) -> Result<Option<Value>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
 pub(crate) fn atomic_write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
@@ -242,6 +253,37 @@ pub(crate) fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_json_distinguishes_absence_from_invalid_content() {
+        let root = std::env::temp_dir().join(format!(
+            "deepcode-json-read-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let path = root.join("settings.json");
+        assert_eq!(
+            read_optional_json_file(&path).expect("missing is valid"),
+            None
+        );
+
+        std::fs::create_dir_all(&root).expect("create owned temporary root");
+        std::fs::write(&path, "{").expect("write invalid json");
+        let error = read_optional_json_file(&path).expect_err("invalid JSON must fail");
+        assert!(error.contains("parse"), "{error}");
+
+        std::fs::write(&path, r#"{"value":1}"#).expect("write valid json");
+        assert_eq!(
+            read_optional_json_file(&path).expect("read valid json"),
+            Some(json!({"value": 1}))
+        );
+        std::fs::remove_dir_all(root).expect("remove owned temporary root");
+    }
 }
 
 pub(crate) fn now_text() -> String {

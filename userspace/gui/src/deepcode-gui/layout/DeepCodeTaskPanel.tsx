@@ -62,12 +62,7 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
 };
 
 function todoStatus(status: 'pending' | 'inProgress' | 'completed', language: UiLanguage): string {
-  const labels = {
-    pending: ['待处理', 'Pending'],
-    inProgress: ['进行中', 'In progress'],
-    completed: ['完成', 'Done'],
-  } as const;
-  return labels[status][language === 'zh-CN' ? 0 : 1];
+  return t(language, `deepcodeGui.tasks.status.${status}`);
 }
 
 export default DeepCodeTaskPanel;

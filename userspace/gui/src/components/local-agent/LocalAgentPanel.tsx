@@ -6,7 +6,7 @@ import type {
   SessionProjection,
   UserMessageAttachment,
 } from '@deepcode/protocol';
-import { normalizeUiLanguage } from '../../i18n';
+import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
 import ProjectFolderDialog from '../../deepcode-gui/layout/ProjectFolderDialog';
 import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector';
@@ -90,14 +90,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const suppressScrollEventsUntilRef = useRef(0);
   const scrollFrameRef = useRef<number | null>(null);
   const scrollTimeoutRef = useRef<number | null>(null);
-  const zh = language === 'zh-CN';
   const activeSummary = catalog.sessions.find((session) => session.id === sessionId);
   const activeProject = catalog.projects.find((project) => (
     project.id === (activeSummary?.projectId ?? draftProjectId)
   ));
   const title = activeSummary?.title.trim()
-    || projection?.display.title.trim()
-    || conversationTitle(projection?.messages, zh);
+    || conversationTitle(projection?.messages, language);
   const conversationItems = useMemo(() => projectionItems(projection), [projection]);
   const hasConversationContent = conversationItems.length > 0
     || Boolean(projection?.assistantDraft)
@@ -286,14 +284,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     try {
       const remaining = 8 - attachments.length;
       if (remaining <= 0 || files.length > remaining) {
-        throw new Error(zh ? '单次消息最多附加 8 个文件。' : 'Attach at most 8 files per message.');
+        throw new Error(t(language, 'agent.attachment.error.maxFiles'));
       }
       const next = await Promise.all([...files].map(async (file) => {
         const content = await file.text();
         if (content.includes('\0')) {
-          throw new Error(zh
-            ? `“${file.name}”不是可直接附加的文本文件。`
-            : `“${file.name}” is not a text attachment.`);
+          throw new Error(t(language, 'agent.attachment.error.notText', {
+            name: file.name,
+          }));
         }
         return {
           attachmentId: nextAttachmentId(),
@@ -307,9 +305,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         0,
       );
       if (totalBytes > 512 * 1024) {
-        throw new Error(zh
-          ? '附件文本总计不能超过 512 KiB。'
-          : 'Attachment text cannot exceed 512 KiB in total.');
+        throw new Error(t(language, 'agent.attachment.error.totalSize'));
       }
       setAttachments((current) => [...current, ...next]);
       setAttachmentError(null);
@@ -415,16 +411,16 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           <span className="local-agent__heading-mark"><DeepCodeShellIcon name="session" /></span>
           <div>
             <strong>{title}</strong>
-            <span>{activeProject?.title ?? (zh ? '独立对话' : 'Independent chat')}</span>
+            <span>{activeProject?.title ?? t(language, 'agent.chat.independent')}</span>
           </div>
         </div>
         <div className="local-agent__header-actions">
           <span className={`local-agent__run-label local-agent__run-label--${projection?.run?.status ?? 'idle'}`}>
             {projection
-              ? runLabel(projection.run, zh)
+              ? runLabel(projection.run, language)
               : loading
-                ? (zh ? '连接中' : 'Connecting')
-                : (zh ? '新对话' : 'New chat')}
+                ? t(language, 'agent.chat.connecting')
+                : t(language, 'agent.chat.new')}
           </span>
         </div>
       </header>
@@ -467,16 +463,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       >
         <div ref={transcriptRef} className="local-agent__transcript">
           {loading && !projection && (
-            <div className="local-agent__empty">{zh ? '正在打开会话…' : 'Opening session…'}</div>
+            <div className="local-agent__empty">{t(language, 'agent.chat.opening')}</div>
           )}
           {!hasConversationContent && !loading && (
             <div className="local-agent__empty local-agent__empty--welcome">
               <strong>
                 {activeProject
-                  ? (zh
-                    ? `我们要在 ${activeProject.title} 中做些什么？`
-                    : `What shall we do in ${activeProject.title}?`)
-                  : (zh ? '我们要在 DeepCode 中做些什么？' : 'What shall we do in DeepCode?')}
+                  ? t(language, 'agent.chat.welcomeProject', { project: activeProject.title })
+                  : t(language, 'agent.chat.welcomeDefault')}
               </strong>
             </div>
           )}
@@ -492,20 +486,23 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     {item.value.attachments.map((attachment) => (
                       <span key={attachment.attachmentId}>
                         {attachment.name}
-                        <small>{formatBytes(attachment.byteLength)}</small>
+                        <small>{formatBytes(attachment.byteLength, language)}</small>
                       </span>
                     ))}
                   </div>
                 )}
               </div>
               {item.value.role === 'assistant' && (
-                <div className="local-agent__message-actions" aria-label={zh ? '消息操作' : 'Message actions'}>
+                <div
+                  className="local-agent__message-actions"
+                  aria-label={t(language, 'agent.message.actions')}
+                >
                   <button
                     type="button"
-                    title={zh ? '复制' : 'Copy'}
+                    title={t(language, 'agent.message.copy')}
                     aria-label={copiedMessageId === item.value.messageId
-                      ? (zh ? '已复制' : 'Copied')
-                      : (zh ? '复制回答' : 'Copy response')}
+                      ? t(language, 'agent.message.copied')
+                      : t(language, 'agent.message.copyResponse')}
                     onClick={() => void copyAssistantMessage(item.value.messageId, item.value.content)}
                   >
                     <DeepCodeShellIcon name="copy" />
@@ -514,8 +511,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         type="button"
                         className={item.value.feedback === 'up' ? 'is-selected' : ''}
                         aria-pressed={item.value.feedback === 'up'}
-                        title={zh ? '赞' : 'Helpful'}
-                        aria-label={zh ? '赞' : 'Helpful'}
+                        title={t(language, 'agent.message.helpful')}
+                        aria-label={t(language, 'agent.message.helpful')}
                         disabled={submitting}
                         onClick={() => void updateMessageFeedback(
                           item.value.messageId,
@@ -528,8 +525,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         type="button"
                         className={item.value.feedback === 'down' ? 'is-selected' : ''}
                         aria-pressed={item.value.feedback === 'down'}
-                        title={zh ? '踩' : 'Not helpful'}
-                        aria-label={zh ? '踩' : 'Not helpful'}
+                        title={t(language, 'agent.message.notHelpful')}
+                        aria-label={t(language, 'agent.message.notHelpful')}
                         disabled={submitting}
                         onClick={() => void updateMessageFeedback(
                           item.value.messageId,
@@ -549,7 +546,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             <ToolActivityGroup
               activities={item.values}
               key={item.groupId}
-              zh={zh}
+              language={language}
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
@@ -566,7 +563,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           {projection?.run?.status === 'running' && (
             <div className="local-agent__run-thinking" role="status" aria-live="polite">
               <span className="local-agent__run-spinner" aria-hidden="true" />
-              <span>{zh ? '正在思考…' : 'Thinking…'}</span>
+              <span>{t(language, 'agent.run.thinking')}</span>
             </div>
           )}
           {projection?.terminalError && (
@@ -581,8 +578,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           <button
             type="button"
             className="local-agent__jump-latest"
-            aria-label={zh ? '前往最新消息' : 'Jump to latest message'}
-            title={zh ? '前往最新消息' : 'Jump to latest message'}
+            aria-label={t(language, 'agent.jumpLatest')}
+            title={t(language, 'agent.jumpLatest')}
             onClick={scrollToLatest}
           >
             <DeepCodeShellIcon name="chevronDown" />
@@ -608,9 +605,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               <div className="local-agent__decision-heading">
                 <strong>{pendingPlan.prompt}</strong>
                 <span>
-                  {zh
-                    ? '首次点击选择，再次点击或按 Enter 确认'
-                    : 'Click once to select; click again or press Enter to confirm'}
+                  {t(language, 'agent.plan.confirmHint')}
                 </span>
               </div>
               <ol>
@@ -629,9 +624,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         {option.description && <small>{option.description}</small>}
                         {option.operationsDisplay.length > 0 && (
                           <small>
-                            {zh
-                              ? `${option.operationsDisplay.length} 项精确操作`
-                              : `${option.operationsDisplay.length} exact operation(s)`}
+                            {t(language, 'agent.plan.operationCount', {
+                              count: option.operationsDisplay.length,
+                            })}
                           </small>
                         )}
                       </span>
@@ -642,7 +637,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     {option.operationsDisplay.length > 0 && (
                       <details className="local-agent__plan-operations">
                         <summary>
-                          {zh ? '查看操作目标' : 'Review operation targets'}
+                          {t(language, 'agent.plan.reviewTargets')}
                         </summary>
                         <ul>
                           {option.operationsDisplay.map((operation) => (
@@ -660,7 +655,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             <div className="local-agent__decision">
               <div className="local-agent__decision-heading">
                 <strong>{pendingInteraction.prompt}</strong>
-                <span>{zh ? '需要你的决定' : 'Your input is needed'}</span>
+                <span>{t(language, 'agent.interaction.inputNeeded')}</span>
               </div>
               {pendingInteraction.options && pendingInteraction.options.length > 0 && (
                 <ol>
@@ -693,7 +688,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             <div className="local-agent__decision">
               <div className="local-agent__decision-heading">
                 <strong>{pendingApproval.preview.summary}</strong>
-                <span>{zh ? '需要你批准此操作' : 'This action needs your approval'}</span>
+                <span>{t(language, 'agent.approval.required')}</span>
               </div>
               {pendingApproval.preview.logicalTargets.length > 0 && (
                 <ul className="local-agent__decision-targets">
@@ -707,13 +702,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   type="button"
                   disabled={submitting}
                   onClick={() => void respondApproval('deny')}
-                >{zh ? '拒绝' : 'Deny'}</button>
+                >{t(language, 'agent.approval.deny')}</button>
                 <button
                   type="button"
                   className="local-agent__button--primary"
                   disabled={submitting}
                   onClick={() => void respondApproval('allow')}
-                >{zh ? '允许' : 'Allow'}</button>
+                >{t(language, 'agent.approval.allow')}</button>
               </div>
             </div>
           )}
@@ -723,12 +718,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             disabled={loading || profiles.length === 0 || Boolean(pendingApproval)}
             rows={pendingPlan || pendingInteraction || pendingApproval ? 2 : 3}
             placeholder={pendingPlan
-              ? (zh ? '输入选项编号，或直接说明如何调整计划…' : 'Enter an option number, or describe revisions…')
+              ? t(language, 'agent.composer.placeholder.plan')
               : pendingInteraction
-                ? (zh ? '输入你的回应…' : 'Enter your response…')
+                ? t(language, 'agent.composer.placeholder.interaction')
                 : pendingApproval
-                  ? (zh ? '请允许或拒绝上述操作。' : 'Allow or deny the action above.')
-                : (zh ? '描述要完成的编码任务…' : 'Describe a coding task…')}
+                  ? t(language, 'agent.composer.placeholder.approval')
+                  : t(language, 'agent.composer.placeholder.task')}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === 'Escape' && pendingPlan && !event.nativeEvent.isComposing) {
@@ -749,7 +744,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   {attachment.name}
                   <button
                     type="button"
-                    aria-label={zh ? `移除 ${attachment.name}` : `Remove ${attachment.name}`}
+                    aria-label={t(language, 'agent.attachment.remove', {
+                      name: attachment.name,
+                    })}
                     onClick={() => setAttachments((current) => current.filter((item) => (
                       item.attachmentId !== attachment.attachmentId
                     )))}
@@ -762,26 +759,26 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             <div className="local-agent__draft-attachments local-agent__directory-indexes">
               {projection?.sessionDirectoryIndexes.map((binding) => (
                 <span key={binding.workspaceId}>
-                  {zh ? '目录' : 'Folder'} · {binding.displayName}
+                  {t(language, 'agent.attachment.folder')} · {binding.displayName}
                   {activeRun && !runWorkspaceIds.has(binding.workspaceId) && (
-                    <small>{zh ? '下轮生效' : 'Next run'}</small>
+                    <small>{t(language, 'agent.attachment.nextRun')}</small>
                   )}
                   <button
                     type="button"
                     disabled={catalogBusy}
-                    aria-label={zh
-                      ? `移除目录索引 ${binding.displayName}`
-                      : `Remove folder index ${binding.displayName}`}
+                    aria-label={t(language, 'agent.attachment.removeDirectoryIndex', {
+                      name: binding.displayName,
+                    })}
                     onClick={() => void detachSessionDirectory(binding.workspaceId)}
                   >×</button>
                 </span>
               ))}
               {pendingDirectoryPaths.map((path) => (
                 <span key={path}>
-                  {zh ? '目录' : 'Folder'} · {directoryDisplayName(path)}
+                  {t(language, 'agent.attachment.folder')} · {directoryDisplayName(path)}
                   <button
                     type="button"
-                    aria-label={zh ? '移除待附加目录' : 'Remove pending folder'}
+                    aria-label={t(language, 'agent.attachment.removePendingDirectory')}
                     onClick={() => setPendingDirectoryPaths((current) => (
                       current.filter((candidate) => candidate !== path)
                     ))}
@@ -792,9 +789,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           ) : null}
           {directoryIndexChangeDeferred && (
             <small className="local-agent__directory-index-note">
-              {zh
-                ? '目录索引变化从下一轮生效；当前运行继续使用启动时冻结的目录集合。'
-                : 'Directory-index changes apply next run; the active run keeps its frozen start snapshot.'}
+              {t(language, 'agent.attachment.deferred')}
             </small>
           )}
           <div className="local-agent__composer-footer">
@@ -803,8 +798,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 <button
                   type="button"
                   className="local-agent__attach"
-                  aria-label={zh ? '附加文件或目录' : 'Attach files or folders'}
-                  title={zh ? '附加文件或目录' : 'Attach files or folders'}
+                  aria-label={t(language, 'agent.attachment.menu')}
+                  title={t(language, 'agent.attachment.menu')}
                   aria-expanded={attachmentMenuOpen}
                   disabled={Boolean(pendingPlan || pendingInteraction || pendingApproval || catalogBusy)}
                   onClick={() => {
@@ -835,8 +830,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     >
                       <DeepCodeShellIcon name="artifact" />
                       <span>
-                        <strong>{zh ? '添加文件' : 'Add files'}</strong>
-                        <small>{zh ? '作为本条消息的内容快照' : 'Immutable content snapshots for this message'}</small>
+                        <strong>{t(language, 'agent.attachment.addFiles')}</strong>
+                        <small>{t(language, 'agent.attachment.fileHint')}</small>
                       </span>
                     </button>
                     <button
@@ -848,8 +843,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     >
                       <DeepCodeShellIcon name="folder" />
                       <span>
-                        <strong>{zh ? '添加文件夹' : 'Add folder'}</strong>
-                        <small>{zh ? '作为此对话的目录索引' : 'Attach as a directory index for this conversation'}</small>
+                        <strong>{t(language, 'agent.attachment.addFolder')}</strong>
+                        <small>{t(language, 'agent.attachment.folderHint')}</small>
                       </span>
                     </button>
                   </div>
@@ -865,31 +860,31 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     setAttachmentMenuOpen(false);
                   }}
                 >
-                  {zh ? '读取：工作区内允许 · 写入：Plan 门禁' : 'Read: bound workspaces · Write: Plan-gated'}
+                  {t(language, 'agent.permission.summary')}
                 </button>
                 {permissionMenuOpen && (
                   <div className="local-agent__permission-menu">
                     <div className="local-agent__permission-invariant">
-                      <span>{zh ? '工作区读取' : 'Workspace read'}</span>
-                      <strong>{zh ? '绑定目录内允许' : 'Allowed when bound'}</strong>
+                      <span>{t(language, 'agent.permission.workspaceRead')}</span>
+                      <strong>{t(language, 'agent.permission.workspaceReadAllowed')}</strong>
                     </div>
                     <div className="local-agent__permission-invariant">
-                      <span>{zh ? '工作区修改' : 'Workspace mutation'}</span>
-                      <strong>{zh ? '结构化 Plan 门禁' : 'Structured Plan gate'}</strong>
+                      <span>{t(language, 'agent.permission.workspaceMutation')}</span>
+                      <strong>{t(language, 'agent.permission.workspaceMutationPlanGate')}</strong>
                     </div>
                     {permissionSetting(
-                      zh ? '网络读取' : 'Network read',
+                      t(language, 'agent.permission.networkRead'),
                       'agent.permissions.networkRead',
                       effectiveSettings,
                       patchUserSetting,
-                      zh,
+                      language,
                     )}
                     {permissionSetting(
-                      zh ? '外部操作' : 'External effects',
+                      t(language, 'agent.permission.externalEffects'),
                       'agent.permissions.external',
                       effectiveSettings,
                       patchUserSetting,
-                      zh,
+                      language,
                     )}
                   </div>
                 )}
@@ -903,7 +898,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   disabled={submitting}
                   onClick={() => void submitIgnorePlan()}
                 >
-                  {zh ? '忽略' : 'Ignore'}
+                  {t(language, 'agent.plan.ignore')}
                 </button>
               )}
               <SessionModelSelector
@@ -919,13 +914,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 type="button"
                 className={`local-agent__send${showStopAction ? ' local-agent__send--stop' : ''}`}
                 aria-label={showStopAction
-                  ? (zh ? '停止当前运行' : 'Stop current run')
+                  ? t(language, 'agent.composer.stopCurrentRun')
                   : submitting
-                    ? (zh ? '提交中' : 'Sending')
-                    : (zh ? '发送' : 'Send')}
+                    ? t(language, 'agent.composer.sending')
+                    : t(language, 'agent.composer.send')}
                 title={showStopAction
-                  ? (zh ? '停止' : 'Stop')
-                  : (zh ? '发送（Enter）' : 'Send (Enter)')}
+                  ? t(language, 'agent.composer.stop')
+                  : t(language, 'agent.composer.sendEnter')}
                 disabled={showStopAction ? submitting : !canSend}
                 onClick={() => {
                   if (showStopAction) {
@@ -941,7 +936,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           </div>
         </div>
         <div className="local-agent__composer-hint">
-          {zh ? 'Enter 发送 · Shift+Enter 换行' : 'Enter to send · Shift+Enter for a new line'}
+          {t(language, 'agent.composer.hint')}
         </div>
       </footer>
       {resourcePreview && (
@@ -956,32 +951,33 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             className="local-agent__resource-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={zh ? '只读资源预览' : 'Read-only resource preview'}
+            aria-label={t(language, 'agent.resource.preview')}
           >
             <header>
               <div>
                 <strong>{resourcePreview.logicalPath}</strong>
-                <span>{zh ? '工作区资源 · 只读' : 'Workspace resource · Read only'}</span>
+                <span>{t(language, 'agent.resource.readOnly')}</span>
               </div>
               <button
                 type="button"
-                aria-label={zh ? '关闭' : 'Close'}
+                aria-label={t(language, 'window.close')}
                 onClick={() => setResourcePreview(null)}
               >×</button>
             </header>
             <div className="local-agent__resource-body">
               {resourcePreview.status === 'loading' ? (
-                <p>{zh ? '正在读取资源…' : 'Reading resource…'}</p>
+                <p>{t(language, 'agent.resource.reading')}</p>
               ) : resourcePreview.status === 'error' ? (
                 <p className="local-agent__resource-error">{resourcePreview.error}</p>
               ) : (
                 <>
                   <div className="local-agent__resource-meta">
-                    <span>{formatBytes(resourcePreview.result.sizeBytes)}</span>
+                    <span>{formatBytes(resourcePreview.result.sizeBytes, language)}</span>
                     <span>
-                      {zh
-                        ? `${resourcePreview.result.startLine}–${resourcePreview.result.endLine} 行`
-                        : `Lines ${resourcePreview.result.startLine}–${resourcePreview.result.endLine}`}
+                      {t(language, 'agent.resource.lines', {
+                        start: resourcePreview.result.startLine,
+                        end: resourcePreview.result.endLine,
+                      })}
                     </span>
                   </div>
                   <pre>{resourcePreview.result.content}</pre>
@@ -1004,13 +1000,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 
 interface ToolActivityGroupProps {
   activities: ActivityProjection[];
-  zh: boolean;
+  language: UiLanguage;
   onOpenWorkspaceResource(workspaceId: string, logicalPath: string): void;
 }
 
 const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   activities,
-  zh,
+  language,
   onOpenWorkspaceResource,
 }) => {
   const terminal = activities.every((activity) => isTerminalActivity(activity.status));
@@ -1039,8 +1035,8 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
         <span className="local-agent__tool-group-icon">
           <DeepCodeShellIcon name="tool" />
         </span>
-        <strong>{toolGroupSummary(activities, zh)}</strong>
-        <span>{toolActivityStatus(groupStatus, zh)}</span>
+        <strong>{toolGroupSummary(activities, language)}</strong>
+        <span>{toolActivityStatus(groupStatus, language)}</span>
         <span className="local-agent__tool-group-chevron" aria-hidden="true">
           <DeepCodeShellIcon name="chevronRight" />
         </span>
@@ -1054,7 +1050,7 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
             >
               <div className="local-agent__tool-entry-heading">
                 <strong>{activity.tool?.operation ?? activity.label}</strong>
-                <span>{toolActivityStatus(activity.status, zh)}</span>
+                <span>{toolActivityStatus(activity.status, language)}</span>
               </div>
               {activity.tool?.resources.length ? (
                 <div className="local-agent__tool-resources">
@@ -1101,15 +1097,15 @@ function permissionSetting(
   key: 'agent.permissions.networkRead' | 'agent.permissions.external',
   settings: Record<string, unknown>,
   patch: (key: string, value: string) => Promise<unknown>,
-  zh: boolean,
+  language: UiLanguage,
 ): React.ReactNode {
   return (
     <label>
       <span>{label}</span>
       <select value={String(settings[key] ?? 'ask')} onChange={(event) => void patch(key, event.target.value)}>
-        <option value="allow">{zh ? '允许' : 'Allow'}</option>
-        <option value="ask">{zh ? '询问' : 'Ask'}</option>
-        <option value="deny">{zh ? '拒绝' : 'Deny'}</option>
+        <option value="allow">{t(language, 'agent.permission.allow')}</option>
+        <option value="ask">{t(language, 'agent.permission.ask')}</option>
+        <option value="deny">{t(language, 'agent.permission.deny')}</option>
       </select>
     </label>
   );
@@ -1117,31 +1113,23 @@ function permissionSetting(
 
 function conversationTitle(
   messages: { role: string; content: string }[] | undefined,
-  zh: boolean,
+  language: UiLanguage,
 ): string {
   const first = messages?.find((message) => message.role === 'user')?.content.trim();
-  if (!first) return zh ? '新对话' : 'New conversation';
+  if (!first) return t(language, 'agent.session.newTitle');
   const line = first.split(/\r?\n/u, 1)[0].trim();
   return line.length > 34 ? `${line.slice(0, 34)}…` : line;
 }
 
-function runLabel(run: RunProjection | null, zh: boolean): string {
-  if (!run) return zh ? '空闲' : 'Idle';
+function runLabel(run: RunProjection | null, language: UiLanguage): string {
+  if (!run) return t(language, 'agent.run.status.idle');
   if (run.status === 'waiting' && run.waitingReason === 'userInput') {
-    return zh ? '等待输入' : 'Waiting for input';
+    return t(language, 'agent.run.status.waitingUserInput');
   }
   if (run.status === 'waiting' && run.waitingReason === 'plan') {
-    return zh ? '等待计划选择' : 'Waiting for plan response';
+    return t(language, 'agent.run.status.waitingPlan');
   }
-  const labels: Record<RunProjection['status'], readonly [string, string]> = {
-    running: ['运行中', 'Running'],
-    waiting: ['等待决定', 'Waiting'],
-    completed: ['已完成', 'Completed'],
-    failed: ['失败', 'Failed'],
-    cancelled: ['已取消', 'Cancelled'],
-    indeterminate: ['结果待确认', 'Indeterminate'],
-  };
-  return labels[run.status][zh ? 0 : 1];
+  return t(language, `agent.run.status.${run.status}`);
 }
 
 type RawProjectionItem =
@@ -1191,45 +1179,41 @@ function projectionItems(projection: SessionProjection | null): ProjectionItem[]
   }, []);
 }
 
-function toolGroupSummary(activities: ActivityProjection[], zh: boolean): string {
+function toolGroupSummary(
+  activities: ActivityProjection[],
+  language: UiLanguage,
+): string {
   const status = toolGroupStatus(activities);
   const operation = activities.length === 1
     ? (activities[0].tool?.operation ?? activities[0].label)
     : null;
   if (status === 'active') {
-    if (operation) return zh ? `正在调用工具 ${operation}` : `Calling tool ${operation}`;
-    return zh ? `正在调用 ${activities.length} 个工具` : `Calling ${activities.length} tools`;
+    if (operation) return t(language, 'agent.tool.summary.activeOne', { operation });
+    return t(language, 'agent.tool.summary.activeMany', { count: activities.length });
   }
   if (status === 'requested') {
-    if (operation) return zh ? `已请求工具 ${operation}` : `Requested tool ${operation}`;
-    return zh ? `已请求 ${activities.length} 个工具` : `Requested ${activities.length} tools`;
+    if (operation) return t(language, 'agent.tool.summary.requestedOne', { operation });
+    return t(language, 'agent.tool.summary.requestedMany', { count: activities.length });
   }
   if (status === 'waiting') {
-    if (operation) return zh ? `工具 ${operation} 等待中` : `Tool ${operation} is waiting`;
-    return zh ? `${activities.length} 个工具等待中` : `${activities.length} tools are waiting`;
+    if (operation) return t(language, 'agent.tool.summary.waitingOne', { operation });
+    return t(language, 'agent.tool.summary.waitingMany', { count: activities.length });
   }
   if (activities.length === 1) {
-    return zh ? `使用了工具 ${operation}` : `Used tool ${operation}`;
+    return t(language, 'agent.tool.summary.usedOne', { operation });
   }
-  return zh ? `使用了 ${activities.length} 次工具` : `Used ${activities.length} tools`;
+  return t(language, 'agent.tool.summary.usedMany', { count: activities.length });
 }
 
 function isTerminalActivity(status: ActivityProjection['status']): boolean {
   return ['completed', 'denied', 'failed', 'cancelled', 'indeterminate'].includes(status);
 }
 
-function toolActivityStatus(status: ActivityProjection['status'], zh: boolean): string {
-  const labels: Record<ActivityProjection['status'], readonly [string, string]> = {
-    active: ['调用中', 'Running'],
-    requested: ['已请求', 'Requested'],
-    waiting: ['等待中', 'Waiting'],
-    completed: ['完成', 'Done'],
-    denied: ['已拒绝', 'Denied'],
-    failed: ['失败', 'Failed'],
-    cancelled: ['已取消', 'Cancelled'],
-    indeterminate: ['待确认', 'Unknown'],
-  };
-  return labels[status][zh ? 0 : 1];
+function toolActivityStatus(
+  status: ActivityProjection['status'],
+  language: UiLanguage,
+): string {
+  return t(language, `agent.tool.status.${status}`);
 }
 
 function toolGroupStatus(
@@ -1260,9 +1244,15 @@ function directoryDisplayName(absolutePath: string): string {
   return normalized.split(/[\\/]/u).at(-1) || absolutePath;
 }
 
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  return `${Math.ceil(value / 1024)} KiB`;
+function formatBytes(value: number, language: UiLanguage): string {
+  if (value < 1024) {
+    return t(language, 'agent.attachment.size.bytes', {
+      value: value.toLocaleString(language),
+    });
+  }
+  return t(language, 'agent.attachment.size.kibibytes', {
+    value: Math.ceil(value / 1024).toLocaleString(language),
+  });
 }
 
 type ResourcePreviewState =

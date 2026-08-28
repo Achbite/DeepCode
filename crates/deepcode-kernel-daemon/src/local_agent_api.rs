@@ -523,6 +523,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
         }
         if message.role == "assistant"
             && message.content.is_empty()
+            && message.reasoning_content.is_none()
             && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
         {
             return Err("Provider 请求的 assistant 消息没有正文或工具调用。".to_string());

@@ -166,6 +166,20 @@ pub(crate) fn llm_profile_store_is_current(config: &Value) -> bool {
     default_is_valid
 }
 
+pub(crate) fn llm_secret_store_is_current(store: &Value) -> bool {
+    store.as_object().is_some_and(|store| {
+        store.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 128
+                && key.trim() == key
+                && !key.chars().any(char::is_control)
+                && value
+                    .as_str()
+                    .is_some_and(|secret| !secret.trim().is_empty())
+        })
+    })
+}
+
 pub(crate) fn resolve_llm_profile(
     gui: &GuiState,
     profile_id: Option<&str>,
@@ -198,12 +212,11 @@ pub(crate) fn resolve_llm_profile(
         .and_then(Value::as_str)
         .expect("validated profile id")
         .to_string();
-    let secret_store = match read_json_file(&gui.paths.llm_secrets_path) {
-        Some(Value::Object(store)) => store,
-        Some(_) => return Err("LLM secret 文件必须是 JSON 对象。".to_string()),
-        None if gui.paths.llm_secrets_path.exists() => {
-            return Err("LLM secret 文件存在但无法读取。".to_string())
+    let secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path)? {
+        Some(value) if llm_secret_store_is_current(&value) => {
+            value.as_object().cloned().expect("validated secret store")
         }
+        Some(_) => return Err("LLM secret 文件不是当前字符串映射格式。".to_string()),
         None => serde_json::Map::new(),
     };
     let api_key = match profile.get("secretRef").and_then(Value::as_str) {
@@ -1062,5 +1075,21 @@ mod tests {
             body["messages"][0]["tool_calls"][0]["id"],
             json!("call:list")
         );
+    }
+
+    #[test]
+    fn llm_secret_store_rejects_non_string_or_empty_entries() {
+        assert!(llm_secret_store_is_current(&json!({
+            "profile:one": "secret-value"
+        })));
+        assert!(!llm_secret_store_is_current(&json!({
+            "profile:one": null
+        })));
+        assert!(!llm_secret_store_is_current(&json!({
+            "profile:one": "  "
+        })));
+        assert!(!llm_secret_store_is_current(&json!({
+            " profile:one": "secret-value"
+        })));
     }
 }

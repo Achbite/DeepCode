@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { normalizeUiLanguage } from '../../../i18n';
+import { normalizeUiLanguage, t, type UiLanguage } from '../../../i18n';
 import { useSettingsStore } from '../../../state/settingsStore';
 
 interface McpServer {
@@ -34,10 +34,10 @@ function parseServers(value: unknown): McpServer[] {
   }
 }
 
-function newServer(): McpServer {
+function newServer(language: UiLanguage): McpServer {
   return {
     id: `mcp-${Date.now().toString(36)}`,
-    name: 'Local MCP',
+    name: t(language, 'settings.mcp.defaultName'),
     transport: 'stdio',
     command: '',
     args: '',
@@ -50,7 +50,6 @@ const McpServicesSection: React.FC = () => {
   const loading = useSettingsStore((state) => state.loading);
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
-  const zh = language === 'zh-CN';
   const stored = useMemo(
     () => parseServers(effectiveSettings['mcp.servers']),
     [effectiveSettings],
@@ -73,12 +72,12 @@ const McpServicesSection: React.FC = () => {
     setMessage(null);
     await patchUserSetting('mcp.autoLoad', autoLoad);
     await patchUserSetting('mcp.servers', JSON.stringify(servers, null, 2));
-    setMessage(zh ? '已保存；重启本地 Daemon 后生效。' : 'Saved; restart the local daemon to apply.');
+    setMessage(t(language, 'settings.runtime.restartDaemonAfterSave'));
   };
 
   return (
     <div>
-      <h2 className="settings-title">MCP</h2>
+      <h2 className="settings-title">{t(language, 'settings.mcp.title')}</h2>
       <div className="settings-card">
         <div className="settings-card__body">
           <label className="settings-inline-check">
@@ -87,26 +86,24 @@ const McpServicesSection: React.FC = () => {
               checked={autoLoad}
               onChange={(event) => setAutoLoad(event.target.checked)}
             />
-            {zh ? '启动本地 stdio MCP Server' : 'Start local stdio MCP servers'}
+            {t(language, 'settings.mcp.autoLoad')}
           </label>
           <p className="settings-card__hint">
-            {zh
-              ? 'MCP 工具并入同一个工具目录，并沿同一 Kernel 执行与用户决定路径运行。'
-              : 'MCP tools join the same tool catalog and use the same Kernel execution and user-decision path.'}
+            {t(language, 'settings.mcp.scopeHint')}
           </p>
         </div>
       </div>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
-          <h3 className="settings-card__title">{zh ? '本地服务' : 'Local servers'}</h3>
+          <h3 className="settings-card__title">{t(language, 'settings.mcp.localServers')}</h3>
           <button
             type="button"
             className="settings-action-button"
-            onClick={() => setServers((current) => [...current, newServer()])}
+            onClick={() => setServers((current) => [...current, newServer(language)])}
             disabled={loading}
           >
-            {zh ? '添加' : 'Add'}
+            {t(language, 'settings.common.add')}
           </button>
         </div>
         <div className="settings-list-editor">
@@ -119,7 +116,7 @@ const McpServicesSection: React.FC = () => {
                     checked={server.enabled}
                     onChange={(event) => update(server.id, { enabled: event.target.checked })}
                   />
-                  {zh ? '启用' : 'Enabled'}
+                  {t(language, 'settings.common.enabled')}
                 </label>
                 <input
                   className="settings-field__input"
@@ -131,7 +128,7 @@ const McpServicesSection: React.FC = () => {
                   className="settings-field__input"
                   value={server.name}
                   onChange={(event) => update(server.id, { name: event.target.value })}
-                  placeholder={zh ? '显示名称' : 'Display name'}
+                  placeholder={t(language, 'settings.mcp.displayName')}
                 />
                 <button
                   type="button"
@@ -139,7 +136,7 @@ const McpServicesSection: React.FC = () => {
                   onClick={() => setServers((current) =>
                     current.filter((candidate) => candidate !== server))}
                 >
-                  {zh ? '移除' : 'Remove'}
+                  {t(language, 'settings.common.remove')}
                 </button>
               </div>
               <div className="mcp-service-row__grid">
@@ -147,19 +144,19 @@ const McpServicesSection: React.FC = () => {
                   className="settings-field__input settings-field__input--wide"
                   value={server.command}
                   onChange={(event) => update(server.id, { command: event.target.value })}
-                  placeholder={zh ? '可执行文件绝对路径或命令' : 'Executable path or command'}
+                  placeholder={t(language, 'settings.mcp.commandPlaceholder')}
                 />
                 <input
                   className="settings-field__input settings-field__input--wide"
                   value={server.args}
                   onChange={(event) => update(server.id, { args: event.target.value })}
-                  placeholder={zh ? '参数字符串' : 'Argument string'}
+                  placeholder={t(language, 'settings.mcp.argsPlaceholder')}
                 />
               </div>
             </div>
           ))}
           {servers.length === 0 && (
-            <div className="settings-card__hint">{zh ? '尚未配置 MCP Server。' : 'No MCP servers configured.'}</div>
+            <div className="settings-card__hint">{t(language, 'settings.mcp.empty')}</div>
           )}
         </div>
         <div className="settings-card__footer-row">
@@ -169,7 +166,7 @@ const McpServicesSection: React.FC = () => {
             onClick={() => void save()}
             disabled={loading}
           >
-            {zh ? '保存' : 'Save'}
+            {t(language, 'settings.common.save')}
           </button>
           {message && <span className="settings-save-message">{message}</span>}
         </div>

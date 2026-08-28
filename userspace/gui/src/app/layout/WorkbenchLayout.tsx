@@ -66,10 +66,10 @@ function scheduleWorkbenchIdle(task: () => void, timeout = 900): () => void {
   return () => window.clearTimeout(id);
 }
 
-const getLanguageLabel = (filePath?: string | null) => {
-  if (!filePath) return 'Plain Text';
+const getLanguageLabel = (filePath: string | null | undefined, language: ReturnType<typeof normalizeUiLanguage>) => {
+  if (!filePath) return t(language, 'workbench.language.plainText');
   const ext = filePath.split('.').pop()?.toLowerCase();
-  if (!ext || ext === filePath) return 'Plain Text';
+  if (!ext || ext === filePath) return t(language, 'workbench.language.plainText');
   const known: Record<string, string> = {
     ts: 'TypeScript',
     tsx: 'TypeScript React',
@@ -426,13 +426,15 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
 
       <footer className="status-bar">
         <div className="status-bar__group">
-          <span>{activeFile ? `${activeFile.path}${activeFile.isDirty ? '*' : ''}` : 'No file'}</span>
-          <span>{getLanguageLabel(activeFile?.path)}</span>
-          <span>UTF-8</span>
+          <span>{activeFile
+            ? `${activeFile.path}${activeFile.isDirty ? '*' : ''}`
+            : t(language, 'workbench.status.noFile')}</span>
+          <span>{getLanguageLabel(activeFile?.path, language)}</span>
+          <span>{t(language, 'workbench.status.encoding')}</span>
         </div>
         <div className="status-bar__group">
-          <span>API {apiStatus}</span>
-          <span>WS {wsStatus}</span>
+          <span>{t(language, 'workbench.status.api')} {apiStatus}</span>
+          <span>{t(language, 'workbench.status.websocket')} {wsStatus}</span>
         </div>
       </footer>
 

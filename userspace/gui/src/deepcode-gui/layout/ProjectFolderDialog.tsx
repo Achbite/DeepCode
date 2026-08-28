@@ -138,7 +138,7 @@ const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                 title={location.absolutePath}
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {location.kind === 'home' ? 'HOME' : location.kind === 'drive' ? 'DISK' : 'WS'}
+                  {t(language, `workspaceDialog.locationKind.${location.kind}`)}
                 </span>
                 <span>{location.label}</span>
               </button>
@@ -161,7 +161,7 @@ const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                     title={entry.absolutePath}
                   >
                     <span className="ws-open-dialog__entry-icon">
-                      {entry.type === 'directory' ? 'DIR' : 'FILE'}
+                      {t(language, `workspaceDialog.entryKind.${entry.type}`)}
                     </span>
                     <span className="ws-open-dialog__entry-name">{entry.name}</span>
                   </li>

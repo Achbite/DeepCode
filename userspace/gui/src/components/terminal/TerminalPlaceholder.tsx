@@ -224,8 +224,16 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
           const eventKey = `${event.sessionId}:${event.sequence}`;
           if (seenEventKeysRef.current.has(eventKey)) return '';
           seenEventKeysRef.current.add(eventKey);
-          if (event.type === 'exit') return `\n[process exited ${event.exitCode ?? ''}]\n`;
-          if (event.type === 'error') return `\n[error] ${event.data ?? ''}\n`;
+          if (event.type === 'exit') {
+            return `\n${t(language, 'terminal.event.exited', {
+              code: event.exitCode ?? '',
+            })}\n`;
+          }
+          if (event.type === 'error') {
+            return `\n${t(language, 'terminal.event.error', {
+              message: event.data ?? '',
+            })}\n`;
+          }
           if (event.type === 'ready') return '';
           if (event.type === 'status') return '';
           return event.data ?? '';
@@ -242,7 +250,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
       void refreshSessions();
     }, 600);
     return () => window.clearInterval(timer);
-  }, [active?.id, describeFailure, refreshSessions]);
+  }, [active?.id, describeFailure, language, refreshSessions]);
 
   useEffect(() => {
     if (!active?.id || !terminalHostRef.current) {

@@ -85,7 +85,7 @@ class ErrorBoundary extends React.Component<
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {
-  throw new Error('Cannot find #root element');
+  throw new Error(activeT('app.bootstrap.rootMissing'));
 }
 
 const isTauriShell =

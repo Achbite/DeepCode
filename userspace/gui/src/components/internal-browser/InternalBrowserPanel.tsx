@@ -163,7 +163,7 @@ const InternalBrowserPanel: React.FC = () => {
             <iframe
               key={previewUrl}
               className="internal-browser-panel__frame"
-              title="DeepCode internal browser"
+              title={t(language, 'browser.frameTitle')}
               src={previewUrl}
               sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
             />
