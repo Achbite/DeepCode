@@ -126,7 +126,6 @@ def check_runtime_contracts() -> None:
 
 def check_current_path() -> None:
     required = [
-        "docs/architecture/agent-architecture-hard-cut.md",
         "userspace/protocol/src/localAgent.ts",
         "userspace/session-core/src/local-agent/loop.ts",
         "userspace/session-core/src/local-agent/actor.ts",

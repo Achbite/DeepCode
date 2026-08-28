@@ -38,6 +38,8 @@ DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通
 | CLI | 一次性任务、脚本和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
 | TUI | 持续的交互式终端对话 | `DeepCode-TUI.command` 或 `deepcode-tui` |
 
+日常开发推荐使用完整的 DeepCode Editor GUI，将文件树、编辑器、终端、Git 与 Agent 工作流集中在同一界面；偏好终端工作流时推荐使用 TUI。CLI 继续用于一次性操作、自动化与诊断。
+
 只要使用同一配置根，四个界面就会读取同一批模型配置、Session journal、Kernel 工具记录和共享投影。
 
 ## macOS 快速开始
@@ -232,8 +234,6 @@ bash ./test.sh full
 ```
 
 `static` 检查分层与仓库结构，`required` 执行 Rust/TypeScript 构建和单元测试，`full` 额外运行本地 Provider、工具决定、取消、命令回放和重启恢复的端到端路径。
-
-贡献者分支与 Pull Request 流程见 [docs/git-branch-flow.md](docs/git-branch-flow.md)。
 
 ## 第三方说明与许可证
 
