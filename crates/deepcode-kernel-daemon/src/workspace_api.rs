@@ -39,13 +39,7 @@ pub(crate) async fn workspace_open(
     let service = &state.host_services.workspace;
     match service.open(body.path) {
         Ok(result) => match host_workspace_payload(result.output) {
-            Ok(output) => {
-                state
-                    .host_services
-                    .active_runs_v2
-                    .notify_all_composer_projections("workspaceOpened");
-                ApiResponse::ok(output)
-            }
+            Ok(output) => ApiResponse::ok(output),
             Err(error) => ApiResponse::error(error.code, error.message),
         },
         Err(error) => ApiResponse::error(error.code, error.message),

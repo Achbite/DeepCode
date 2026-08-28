@@ -6,11 +6,12 @@ DeepCode combines original architecture work with open-source dependencies, publ
 
 Project-specific contributions include:
 
-- Kernel/session architecture for plan/check/complete/review workflow control.
-- JSON Envelope v2 Agent protocol and fail-closed parser/repair policy.
-- Kernel-visible tool catalog, permission gate, audit path, and conversation archive model.
-- Editor, DeepCode-GUI, CLI, and TUI packaging around one shared Kernel/session source of truth.
-- Session-level chronological export for user-visible conversation review and debugging.
+- A single functional Agent Loop owned by the local Session service.
+- A minimal cross-layer protocol, append-only Session journal, and shared projection reducer.
+- A controlled Kernel tool catalog with one user-decision boundary immediately before uncovered effects.
+- Durable Kernel tool-result records used for exact replay and restart recovery.
+- Editor, DeepCode-GUI, CLI, and TUI shells that consume one shared Session projection.
+- Plugin-shaped Skill and MCP contributions composed without introducing another Agent Loop.
 
 ## Design References
 

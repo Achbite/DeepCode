@@ -61,7 +61,7 @@ impl HostInspectionExecutor {
             HostInspectionQuery::Read { folder_id, path } => {
                 validate_folder_id(folder_id.as_deref())?;
                 let root = required_workspace_root(workspace_root)?;
-                host_read(root, &path).map(HostInspectionOutput::Read)
+                host_read(root, &path, folder_id.as_deref()).map(HostInspectionOutput::Read)
             }
             HostInspectionQuery::Grep {
                 folder_id,
@@ -193,10 +193,14 @@ fn host_home_dir() -> Option<PathBuf> {
 }
 
 fn validate_folder_id(folder_id: Option<&str>) -> Result<(), KernelErrorEnvelope> {
-    if folder_id.is_some_and(|folder_id| folder_id != "wf-0") {
+    if folder_id.is_some_and(|folder_id| {
+        folder_id.is_empty()
+            || folder_id.len() > 128
+            || folder_id.chars().any(|character| character.is_control())
+    }) {
         return Err(host_error(
             "host_inspection_unknown_folder",
-            format!("unknown workspace folder {}", folder_id.unwrap_or_default()),
+            "invalid workspace folder identity",
         ));
     }
     Ok(())
@@ -317,7 +321,11 @@ fn list_nodes(
     Ok(nodes)
 }
 
-fn host_read(root: &Path, path: &str) -> Result<HostFileReadResult, KernelErrorEnvelope> {
+fn host_read(
+    root: &Path,
+    path: &str,
+    folder_id: Option<&str>,
+) -> Result<HostFileReadResult, KernelErrorEnvelope> {
     let target = resolve_workspace_read_path(root, path)?;
     if !target.is_file() {
         return Err(host_error(
@@ -335,7 +343,7 @@ fn host_read(root: &Path, path: &str) -> Result<HostFileReadResult, KernelErrorE
     let end_line = content.lines().count();
     let file_size_bytes = read.classification.size_bytes as usize;
     Ok(HostFileReadResult {
-        folder_id: "wf-0".to_string(),
+        folder_id: folder_id.unwrap_or("wf-0").to_string(),
         path: normalized_relative_path(root, &target),
         size_bytes: content.len(),
         file_size_bytes,

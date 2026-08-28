@@ -7,9 +7,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
 use deepcode_kernel_abi::{
-    is_valid_host_instance_id_v2, is_valid_host_shell_capability_v2,
-    is_valid_host_ui_capability_v2, HOST_INSTANCE_ID_ENV_V2, HOST_SHELL_CAPABILITY_ENV_V2,
-    HOST_SHELL_CAPABILITY_HEADER_V2, HOST_UI_CAPABILITY_ENV_V2, HOST_UI_CAPABILITY_HEADER_V2,
+    is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
+    HOST_INSTANCE_ID_ENV, HOST_SHELL_TOKEN_ENV, HOST_SHELL_TOKEN_HEADER, HOST_UI_TOKEN_ENV,
+    HOST_UI_TOKEN_HEADER,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -23,13 +23,13 @@ use tower_http::services::{ServeDir, ServeFile};
 struct AppState {
     daemon_base_url: String,
     client: reqwest::Client,
-    host_ui_capability: String,
-    identity: HostProcessIdentityV2,
+    host_ui_token: String,
+    identity: HostProcessIdentity,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HostProcessIdentityV2 {
+struct HostProcessIdentity {
     service: &'static str,
     instance_id: String,
     pid: u32,
@@ -87,15 +87,11 @@ async fn main() {
         std::env::var("DEEPCODE_HOST_WEB_SPAWN_DAEMON").as_deref() == Ok("0"),
         "DeepCode Host proxy must be launched by the owning Host process with DEEPCODE_HOST_WEB_SPAWN_DAEMON=0"
     );
-    let host_ui_capability =
-        required_authority_value(HOST_UI_CAPABILITY_ENV_V2, is_valid_host_ui_capability_v2);
-    let daemon_host_capability = required_authority_value(
-        HOST_SHELL_CAPABILITY_ENV_V2,
-        is_valid_host_shell_capability_v2,
-    );
+    let host_ui_token = required_local_token(HOST_UI_TOKEN_ENV, is_valid_host_ui_token);
+    let daemon_host_token = required_local_token(HOST_SHELL_TOKEN_ENV, is_valid_host_shell_token);
     assert!(
-        host_ui_capability != daemon_host_capability,
-        "Host UI and daemon capabilities must be independent"
+        host_ui_token != daemon_host_token,
+        "Host UI 与 daemon 必须使用不同的本地连接令牌"
     );
     let instance_id = required_instance_id();
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
@@ -106,9 +102,9 @@ async fn main() {
 
     let state = AppState {
         daemon_base_url,
-        client: daemon_client(&daemon_host_capability),
-        host_ui_capability,
-        identity: HostProcessIdentityV2 {
+        client: daemon_client(&daemon_host_token),
+        host_ui_token,
+        identity: HostProcessIdentity {
             service: "deepcode-host-web",
             instance_id,
             pid: std::process::id(),
@@ -166,7 +162,7 @@ fn localhost_cors_layer() -> CorsLayer {
         ])
         .allow_headers([
             header::CONTENT_TYPE,
-            header::HeaderName::from_static(HOST_UI_CAPABILITY_HEADER_V2),
+            header::HeaderName::from_static(HOST_UI_TOKEN_HEADER),
         ])
 }
 
@@ -194,16 +190,16 @@ fn trusted_local_origin(headers: &HeaderMap) -> bool {
     if trusted_desktop_origin(origin) {
         return true;
     }
-    let Some(origin_authority) = origin.strip_prefix("http://") else {
+    let Some(origin_token) = origin.strip_prefix("http://") else {
         return false;
     };
-    let Some(request_authority) = headers
+    let Some(request_token) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
     else {
         return false;
     };
-    origin_authority == request_authority && is_loopback_authority(origin_authority)
+    origin_token == request_token && is_loopback_token(origin_token)
 }
 
 fn trusted_cors_origin(origin: &HeaderValue) -> bool {
@@ -215,27 +211,36 @@ fn trusted_cors_origin(origin: &HeaderValue) -> bool {
     }
     origin
         .strip_prefix("http://")
-        .map(is_loopback_authority)
+        .map(is_loopback_token)
         .unwrap_or(false)
 }
 
 fn trusted_desktop_origin(origin: &str) -> bool {
-    matches!(
+    if matches!(
         origin,
-        "deepcode-gui://localhost"
-            | "deepcode-editor://localhost"
-            | "http://deepcode-gui.localhost"
-            | "http://deepcode-editor.localhost"
-    )
+        "deepcode-gui://localhost" | "deepcode-editor://localhost"
+    ) {
+        return true;
+    }
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if !matches!(host, "deepcode-gui.localhost" | "deepcode-editor.localhost") {
+        return false;
+    }
+    port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0))
 }
 
-fn is_loopback_authority(authority: &str) -> bool {
-    authority == "localhost"
-        || authority.starts_with("localhost:")
-        || authority == "127.0.0.1"
-        || authority.starts_with("127.0.0.1:")
-        || authority == "[::1]"
-        || authority.starts_with("[::1]:")
+fn is_loopback_token(token: &str) -> bool {
+    token == "localhost"
+        || token.starts_with("localhost:")
+        || token == "127.0.0.1"
+        || token.starts_with("127.0.0.1:")
+        || token == "[::1]"
+        || token.starts_with("[::1]:")
 }
 
 fn client_dist_dir() -> Option<PathBuf> {
@@ -317,7 +322,7 @@ async fn gui_asset(State(_state): State<AppState>, uri: Uri) -> Response {
 
 async fn proxy_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.authorizes_host_request(&headers) {
-        return host_admission_rejected();
+        return host_connection_rejected();
     }
     match state
         .client
@@ -349,7 +354,7 @@ async fn proxy_api(
     body: Body,
 ) -> Response {
     if !state.authorizes_host_request(&headers) {
-        return host_admission_rejected();
+        return host_connection_rejected();
     }
     let path_and_query = uri
         .path_and_query()
@@ -381,14 +386,6 @@ async fn proxy_api(
     {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
-    if uri.path().contains("/private-analysis") {
-        if let Some(lease) = headers
-            .get("x-deepcode-private-analysis-lease")
-            .and_then(|value| value.to_str().ok())
-        {
-            request = request.header("x-deepcode-private-analysis-lease", lease);
-        }
-    }
     let request = if method == Method::GET && uri.path().ends_with("/stream") {
         request
     } else {
@@ -405,12 +402,12 @@ async fn proxy_api(
 impl AppState {
     fn authorizes_host_request(&self, headers: &HeaderMap) -> bool {
         let Some(submitted) = headers
-            .get(HOST_UI_CAPABILITY_HEADER_V2)
+            .get(HOST_UI_TOKEN_HEADER)
             .and_then(|value| value.to_str().ok())
         else {
             return false;
         };
-        constant_time_eq(submitted.as_bytes(), self.host_ui_capability.as_bytes())
+        constant_time_eq(submitted.as_bytes(), self.host_ui_token.as_bytes())
     }
 }
 
@@ -432,15 +429,16 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("PATCH", ["api", "workspaces", "current", "settings"])
         | ("GET", ["api", "fs", "initial-locations"])
         | ("GET", ["api", "fs", "browse"])
-        | ("POST", ["api", "host", "user-attachments"])
         | ("POST", ["api", "host", "inspect"])
-        | ("POST", ["api", "host", "skills", "scan-mount"])
-        | ("GET", ["api", "host", "skills"])
         | ("GET", ["api", "user-settings"])
         | ("PATCH", ["api", "user-settings"])
         | ("GET", ["api", "llm", "profiles"])
         | ("PATCH", ["api", "llm", "profiles"])
         | ("POST", ["api", "llm", "probe"])
+        | ("GET", ["api", "conversation", "catalog"])
+        | ("GET", ["api", "conversation", "catalog", "manage"])
+        | ("POST", ["api", "conversation", "projects"])
+        | ("POST", ["api", "conversation", "sessions"])
         | ("GET", ["api", "runtime", "shell"])
         | ("GET", ["api", "terminal", "capabilities"])
         | ("GET", ["api", "terminal", "warmup"])
@@ -448,14 +446,6 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("GET", ["api", "terminal", "sessions"])
         | ("POST", ["api", "terminal", "sessions"])
         | ("GET", ["api", "terminal", "events"])
-        | ("GET", ["api", "agent", "sessions"])
-        | ("POST", ["api", "agent", "sessions"])
-        | ("GET", ["api", "agent", "projects"])
-        | ("POST", ["api", "agent", "projects"])
-        | ("GET", ["api", "agent", "composer"])
-        | ("GET", ["api", "agent", "composer", "stream"])
-        | ("POST", ["api", "agent", "conversation-drafts", "runs"])
-        | ("GET", ["api", "agent", "sessions", "current"])
         | ("GET", ["api", "browser", "runtime-status"])
         | ("POST", ["api", "browser", "open"])
         | ("POST", ["api", "browser", "reload"])
@@ -465,36 +455,26 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "terminal", "sessions", _, "restart"])
         | ("PATCH", ["api", "terminal", "sessions", _])
         | ("DELETE", ["api", "terminal", "sessions", _])
-        | ("GET", ["api", "agent", "projects", _])
-        | ("PATCH", ["api", "agent", "projects", _])
-        | ("DELETE", ["api", "agent", "projects", _])
-        | ("DELETE", ["api", "host", "user-attachments", _])
-        | ("POST", ["api", "agent", "projects", _, "rebind"])
-        | ("POST", ["api", "agent", "sessions", _, "activate"])
-        | ("POST", ["api", "agent", "sessions", _, "archive"])
-        | ("POST", ["api", "agent", "sessions", _, "runs"])
-        | ("GET", ["api", "agent", "sessions", _, "timeline"])
-        | ("GET", ["api", "agent", "sessions", _])
-        | ("PATCH", ["api", "agent", "sessions", _])
-        | ("DELETE", ["api", "agent", "sessions", _])
-        | ("GET", ["api", "agent", "sessions", _, "runs", _])
-        | ("POST", ["api", "agent", "sessions", _, "runs", _, "cancel"])
-        | ("POST", ["api", "agent", "sessions", _, "runs", _, "guidance"])
-        | ("POST", ["api", "agent", "sessions", _, "runs", _, "authority", "revoke"])
-        | ("POST", ["api", "agent", "sessions", _, "private-analysis", "lease"])
-        | ("DELETE", ["api", "agent", "sessions", _, "private-analysis", "lease"])
-        | ("GET", ["api", "agent", "sessions", _, "private-analysis"])
-        | ("GET", ["api", "agent", "sessions", _, "timeline", "stream"]) => true,
+        | ("POST", ["api", "conversation", "sessions", _, "commands"])
+        | ("PATCH", ["api", "conversation", "projects", _])
+        | ("DELETE", ["api", "conversation", "projects", _])
+        | ("PATCH", ["api", "conversation", "sessions", _])
+        | ("DELETE", ["api", "conversation", "sessions", _])
+        | ("POST", ["api", "conversation", "sessions", _, "directory-indexes"])
+        | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
+        | ("GET", ["api", "conversation", "sessions", _, "projection"])
+        | ("GET", ["api", "conversation", "sessions", _, "projection", "stream"])
+        | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
         _ => false,
     }
 }
 
-fn host_admission_rejected() -> Response {
+fn host_connection_rejected() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         ApiResponse::error(
-            "host_admission_required",
-            "This Host proxy requires its process-private Host UI admission capability",
+            "host_connection_required",
+            "This Host proxy requires its process-private Host UI connection token",
         ),
     )
         .into_response()
@@ -504,7 +484,7 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host.trim(), "127.0.0.1" | "::1" | "localhost")
 }
 
-fn required_authority_value(environment_key: &str, validator: fn(&str) -> bool) -> String {
+fn required_local_token(environment_key: &str, validator: fn(&str) -> bool) -> String {
     let value =
         std::env::var(environment_key).unwrap_or_else(|_| panic!("{environment_key} is required"));
     assert!(validator(&value), "{environment_key} is malformed");
@@ -512,23 +492,23 @@ fn required_authority_value(environment_key: &str, validator: fn(&str) -> bool) 
 }
 
 fn required_instance_id() -> String {
-    let instance_id = std::env::var(HOST_INSTANCE_ID_ENV_V2)
-        .unwrap_or_else(|_| panic!("{HOST_INSTANCE_ID_ENV_V2} is required"));
+    let instance_id = std::env::var(HOST_INSTANCE_ID_ENV)
+        .unwrap_or_else(|_| panic!("{HOST_INSTANCE_ID_ENV} is required"));
     assert!(
-        is_valid_host_instance_id_v2(&instance_id),
-        "{HOST_INSTANCE_ID_ENV_V2} is malformed"
+        is_valid_host_instance_id(&instance_id),
+        "{HOST_INSTANCE_ID_ENV} is malformed"
     );
     instance_id
 }
 
-fn daemon_client(host_shell_capability: &str) -> reqwest::Client {
-    let mut capability_header = reqwest::header::HeaderValue::from_str(host_shell_capability)
-        .expect("validated Host shell capability must be an HTTP header value");
-    capability_header.set_sensitive(true);
+fn daemon_client(host_shell_token: &str) -> reqwest::Client {
+    let mut token_header = reqwest::header::HeaderValue::from_str(host_shell_token)
+        .expect("validated Host shell token must be an HTTP header value");
+    token_header.set_sensitive(true);
     let mut default_headers = reqwest::header::HeaderMap::new();
     default_headers.insert(
-        reqwest::header::HeaderName::from_static(HOST_SHELL_CAPABILITY_HEADER_V2),
-        capability_header,
+        reqwest::header::HeaderName::from_static(HOST_SHELL_TOKEN_HEADER),
+        token_header,
     );
     reqwest::Client::builder()
         .default_headers(default_headers)
@@ -547,6 +527,86 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         );
     }
     difference == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_proxy_path_allowed, trusted_desktop_origin};
+
+    #[test]
+    fn desktop_http_origin_accepts_the_local_review_port() {
+        assert!(trusted_desktop_origin(
+            "http://deepcode-gui.localhost:31245"
+        ));
+        assert!(trusted_desktop_origin("http://deepcode-editor.localhost"));
+        assert!(!trusted_desktop_origin(
+            "http://deepcode-gui.localhost.example:31245"
+        ));
+        assert!(!trusted_desktop_origin(
+            "http://deepcode-gui.localhost:not-a-port"
+        ));
+    }
+
+    #[test]
+    fn conversation_catalog_routes_are_exposed_to_the_gui_shell() {
+        assert!(host_proxy_path_allowed("GET", "/api/conversation/catalog"));
+        assert!(host_proxy_path_allowed(
+            "GET",
+            "/api/conversation/catalog/manage"
+        ));
+        assert!(host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/projects"
+        ));
+        assert!(host_proxy_path_allowed(
+            "PATCH",
+            "/api/conversation/projects/project%3Aone"
+        ));
+        assert!(host_proxy_path_allowed(
+            "DELETE",
+            "/api/conversation/projects/project%3Aone"
+        ));
+        assert!(host_proxy_path_allowed(
+            "PATCH",
+            "/api/conversation/sessions/session%3Aone"
+        ));
+        assert!(host_proxy_path_allowed(
+            "DELETE",
+            "/api/conversation/sessions/session%3Aone"
+        ));
+        assert!(host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/sessions/session%3Aone/resources/read"
+        ));
+        assert!(host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/sessions/session%3Aone/directory-indexes"
+        ));
+        assert!(host_proxy_path_allowed(
+            "DELETE",
+            "/api/conversation/sessions/session%3Aone/directory-indexes/workspace%3Aone"
+        ));
+    }
+
+    #[test]
+    fn conversation_catalog_does_not_open_an_unbounded_proxy_prefix() {
+        assert!(!host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/catalog"
+        ));
+        assert!(!host_proxy_path_allowed(
+            "GET",
+            "/api/conversation/projects/project%3Aone"
+        ));
+        assert!(!host_proxy_path_allowed(
+            "DELETE",
+            "/api/conversation/sessions/session%3Aone/projection"
+        ));
+        assert!(!host_proxy_path_allowed(
+            "GET",
+            "/api/conversation/sessions/session%3Aone/resources/read"
+        ));
+    }
 }
 
 async fn proxy_response(response: reqwest::Response) -> Response {

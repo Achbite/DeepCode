@@ -1,15 +1,11 @@
 export type UserSettingValue = string | number | boolean | null;
-
 export type UserSettings = Record<string, UserSettingValue>;
-
 export type SettingsSurface = 'editor' | 'gui' | 'cli' | 'tui';
 
 export type SettingCatalogDomain =
   | 'agent'
-  | 'ruler'
   | 'skills'
   | 'mcp'
-  | 'llm'
   | 'editor'
   | 'workbench'
   | 'files'
@@ -20,16 +16,11 @@ export type SettingCatalogDomain =
   | 'cli'
   | 'tui';
 
-export type SettingCatalogScope = 'user' | 'workspace';
-
 export interface SettingCatalogEntry {
   key: string;
   domain: SettingCatalogDomain;
-  scope: SettingCatalogScope;
   shellSurface: SettingsSurface[];
-  agentConfigurable: boolean;
   workspaceOverridable: boolean;
-  requiresAudit: boolean;
 }
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -39,9 +30,6 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'editor.fontSize': 14,
   'editor.fontFamily': "Consolas, 'Courier New', monospace",
   'editor.renderWhitespace': 'none',
-  'editor.tabCompletion': 'on',
-  'editor.accessibilitySupport': 'off',
-  'editor.unicodeHighlight.invisibleCharacters': false,
   'files.autoSave': 'afterDelay',
   'files.autoSaveDelay': 1000,
   'files.hotExit': true,
@@ -52,56 +40,37 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'workbench.colorTheme': 'vs-dark',
   'workbench.language': 'zh-CN',
   'workbench.styleTokenOverrides': '{}',
-  'workbench.previewEditor': 'vscode',
   'gui.colorTheme': 'light',
   'gui.accentColor': 'blue',
-  'gui.timelineDensity': 'normal',
-  'gui.typewriterAnimation': true,
-  'gui.collapseCompletedThinking': true,
-  'cli.outputFormat': 'rich',
-  'cli.colorMode': 'auto',
-  'tui.colorTheme': 'system',
-  'tui.panelDensity': 'normal',
+  'gui.navigationDensity': 'comfortable',
+  'gui.showContextRail': true,
   'terminal.integrated.defaultProfile.windows': 'wsl',
   'terminal.integrated.prewarm': 'afterStartup',
   'terminal.integrated.spawnTimeoutMs': 8000,
-  'agent.permissions.workspaceRead': 'allow',
-  'agent.permissions.autoApprovePlans': false,
-  'agent.permissions.workspaceWrite': 'ask',
-  'agent.permissions.gitWrite': 'ask',
-  'agent.permissions.webRead': 'deny',
-  'agent.permissions.privateWebRead': 'deny',
+  'agent.systemPrompt': '',
+  'agent.permissions.networkRead': 'ask',
+  'agent.permissions.external': 'ask',
   'agent.web.search.endpointTemplate': '',
   'agent.web.search.authHeaderName': 'Authorization',
   'agent.web.search.authSecretRef': '',
-  'skills.pythonPath': 'python',
   'skills.autoLoad': true,
   'skills.mounts': '[]',
   'mcp.autoLoad': false,
   'mcp.servers': '[]',
-  'ruler.enabled': true,
-  'ruler.rules':
-    '[{"id":"default-safety","name":"Default Safety Boundary","source":"system","priority":100,"path":"<builtin>/default-safety.md","content":"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.","enabled":true}]',
 };
 
-const ALL_SURFACES: SettingsSurface[] = ['editor', 'gui', 'cli', 'tui'];
-
-const SHARED_AGENT_KEY_PREFIXES = [
-  'agent.',
-  'ruler.',
-  'skills.',
-  'mcp.',
-  'llm.',
-];
-
-const WORKSPACE_OVERRIDABLE_KEYS = new Set([
-  'skills.mounts',
-  'mcp.servers',
-  'ruler.rules',
-]);
+const SHARED_AGENT_PREFIX = 'agent.';
+const PLUGIN_SETTING_PREFIXES = ['skills.', 'mcp.'];
+const NON_SHELL_SETTING_PREFIXES = [SHARED_AGENT_PREFIX, ...PLUGIN_SETTING_PREFIXES];
+const WORKSPACE_OVERRIDABLE_KEYS = new Set(['skills.mounts', 'mcp.servers']);
 
 export const SETTING_CATALOG: readonly SettingCatalogEntry[] = Object.freeze(
-  Object.keys(DEFAULT_USER_SETTINGS).map((key) => settingCatalogEntry(key))
+  Object.keys(DEFAULT_USER_SETTINGS).map((key) => ({
+    key,
+    domain: domainForKey(key),
+    shellSurface: surfacesForKey(key),
+    workspaceOverridable: WORKSPACE_OVERRIDABLE_KEYS.has(key),
+  })),
 );
 
 export function settingCatalogIndex(): readonly SettingCatalogEntry[] {
@@ -109,12 +78,21 @@ export function settingCatalogIndex(): readonly SettingCatalogEntry[] {
 }
 
 export function agentSettingsIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG.filter((entry) => isSharedAgentSetting(entry));
+  return SETTING_CATALOG.filter((entry) => entry.key.startsWith(SHARED_AGENT_PREFIX));
 }
 
-export function shellPreferenceSettingsIndex(surface: SettingsSurface): readonly SettingCatalogEntry[] {
+export function pluginSettingsIndex(): readonly SettingCatalogEntry[] {
   return SETTING_CATALOG.filter((entry) =>
-    !isSharedAgentSetting(entry) && entry.shellSurface.includes(surface)
+    PLUGIN_SETTING_PREFIXES.some((prefix) => entry.key.startsWith(prefix)),
+  );
+}
+
+export function shellPreferenceSettingsIndex(
+  surface: SettingsSurface,
+): readonly SettingCatalogEntry[] {
+  return SETTING_CATALOG.filter((entry) =>
+    !NON_SHELL_SETTING_PREFIXES.some((prefix) => entry.key.startsWith(prefix))
+      && entry.shellSurface.includes(surface),
   );
 }
 
@@ -122,70 +100,27 @@ export function workspaceOverridableSettingsIndex(): readonly SettingCatalogEntr
   return SETTING_CATALOG.filter((entry) => entry.workspaceOverridable);
 }
 
-export function agentConfigurableSettingsIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG.filter((entry) => entry.agentConfigurable);
+function domainForKey(key: string): SettingCatalogDomain {
+  const prefix = key.split('.')[0];
+  return isDomain(prefix) ? prefix : 'agent';
 }
 
-export function settingCatalogEntryForKey(key: string): SettingCatalogEntry | undefined {
-  return SETTING_CATALOG.find((entry) => entry.key === key);
+function isDomain(value: string): value is SettingCatalogDomain {
+  return [
+    'agent', 'skills', 'mcp', 'editor', 'workbench', 'files', 'keyboard',
+    'explorer', 'terminal', 'gui', 'cli', 'tui',
+  ].includes(value);
 }
 
-function settingCatalogEntry(key: string): SettingCatalogEntry {
-  const domain = settingDomainForKey(key);
-  const sharedAgent = SHARED_AGENT_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
-  const workspaceOverridable = WORKSPACE_OVERRIDABLE_KEYS.has(key);
-  return {
-    key,
-    domain,
-    scope: 'user',
-    shellSurface: sharedAgent ? ALL_SURFACES : shellSurfacesForDomain(domain),
-    agentConfigurable: sharedAgent,
-    workspaceOverridable,
-    requiresAudit: sharedAgent || workspaceOverridable,
-  };
-}
-
-function isSharedAgentSetting(entry: SettingCatalogEntry): boolean {
-  return SHARED_AGENT_KEY_PREFIXES.some((prefix) => entry.key.startsWith(prefix));
-}
-
-function settingDomainForKey(key: string): SettingCatalogDomain {
-  const prefix = key.split('.')[0] as SettingCatalogDomain | undefined;
-  if (prefix === 'agent' ||
-    prefix === 'ruler' ||
-    prefix === 'skills' ||
-    prefix === 'mcp' ||
-    prefix === 'llm' ||
-    prefix === 'editor' ||
-    prefix === 'workbench' ||
-    prefix === 'files' ||
-    prefix === 'keyboard' ||
-    prefix === 'explorer' ||
-    prefix === 'terminal' ||
-    prefix === 'gui' ||
-    prefix === 'cli' ||
-    prefix === 'tui'
-  ) {
-    return prefix;
+function surfacesForKey(key: string): SettingsSurface[] {
+  const domain = domainForKey(key);
+  if (NON_SHELL_SETTING_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+    return ['editor', 'gui', 'cli', 'tui'];
   }
-  return 'agent';
-}
-
-function shellSurfacesForDomain(domain: SettingCatalogDomain): SettingsSurface[] {
   if (domain === 'gui') return ['gui'];
   if (domain === 'cli') return ['cli'];
   if (domain === 'tui') return ['tui'];
-  if (
-    domain === 'editor' ||
-    domain === 'workbench' ||
-    domain === 'files' ||
-    domain === 'keyboard' ||
-    domain === 'explorer' ||
-    domain === 'terminal'
-  ) {
-    return ['editor'];
-  }
-  return ALL_SURFACES;
+  return ['editor'];
 }
 
 export interface GetUserSettingsResult {
@@ -201,13 +136,5 @@ export interface PatchUserSettingsRequest {
 export interface PatchUserSettingsResult {
   settings: UserSettings;
   changedKeys: string[];
-  configAudit?: {
-    kind: string;
-    changedKeys: string[];
-    source: string;
-    storePath?: string;
-    oldHash?: string;
-    newHash?: string;
-    message: string;
-  };
+  restartRequired?: boolean;
 }

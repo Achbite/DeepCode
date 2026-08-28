@@ -11,6 +11,7 @@ import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useSettingsStore } from '../state/settingsStore';
+import { useLocalAgentStore } from '../state/localAgentStore';
 import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
@@ -226,6 +227,7 @@ const App: React.FC = () => {
     connectedReloadDoneRef.current = true;
     void loadWorkspace().finally(() => markStartup('deepcode:workspace-reloaded-after-connect'));
     void loadUserSettings().finally(() => markStartup('deepcode:settings-reloaded-after-connect'));
+    void useLocalAgentStore.getState().initialize();
   }, [apiStatus, loadWorkspace, loadUserSettings]);
 
 

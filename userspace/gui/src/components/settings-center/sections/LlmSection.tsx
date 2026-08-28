@@ -1,18 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   DEFAULT_LLM_PROVIDER_PROFILES,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
   DEPRECATED_DEEPSEEK_LLM_MODELS,
-  hasCompatibleReasoningTransport,
-  reasoningTransportForProviderKind,
 } from '@deepcode/protocol';
 import type {
   LlmProviderFlavor,
   LlmProviderKind,
   LlmProviderProfile,
-  LlmReasoningTransport,
 } from '@deepcode/protocol';
 import {
   getLlmProfiles,
@@ -37,19 +34,13 @@ const PROVIDER_FLAVORS: Array<{
   { value: 'zhipu', label: 'Zhipu' },
 ];
 
-const REASONING_TRANSPORT_LABELS: Record<LlmReasoningTransport, string> = {
-  openaiPlaintext: 'OpenAI plaintext reasoning',
-  anthropicPlaintext: 'Anthropic plaintext thinking',
-  ollamaPlaintext: 'Ollama plaintext reasoning',
-};
-
 const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
 const DEFAULT_REPLACEMENT_PROFILE_ID = 'deepseek-v4-pro-openai';
 
 type ProfileWithoutId<T> = T extends unknown ? Omit<T, 'id'> : never;
 type NewProfile = ProfileWithoutId<LlmProviderProfile>;
 type ProfileCommonPatch = Partial<
-  Omit<LlmProviderProfile, 'kind' | 'reasoningTransport'>
+  Omit<LlmProviderProfile, 'kind'>
 >;
 
 const PROFILE_PRESETS: Array<{
@@ -61,7 +52,6 @@ const PROFILE_PRESETS: Array<{
     profile: {
       name: 'DeepSeek V4 Flash',
       kind: 'openaiCompatible',
-      reasoningTransport: 'openaiPlaintext',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-flash',
@@ -78,7 +68,6 @@ const PROFILE_PRESETS: Array<{
     profile: {
       name: 'DeepSeek V4 Pro',
       kind: 'openaiCompatible',
-      reasoningTransport: 'openaiPlaintext',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-pro',
@@ -95,7 +84,6 @@ const PROFILE_PRESETS: Array<{
     profile: {
       name: 'DeepSeek V4 Flash (Anthropic)',
       kind: 'anthropic',
-      reasoningTransport: 'anthropicPlaintext',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
       model: 'deepseek-v4-flash',
@@ -120,7 +108,6 @@ function createProfile(
     id,
     name: 'OpenAI Compatible',
     kind: 'openaiCompatible',
-    reasoningTransport: 'openaiPlaintext',
     providerFlavor: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
@@ -140,26 +127,7 @@ function profileWithProviderKind(
   profile: LlmProviderProfile,
   kind: LlmProviderKind,
 ): LlmProviderProfile {
-  switch (kind) {
-    case 'openaiCompatible':
-      return {
-        ...profile,
-        kind,
-        reasoningTransport: reasoningTransportForProviderKind(kind),
-      };
-    case 'anthropic':
-      return {
-        ...profile,
-        kind,
-        reasoningTransport: reasoningTransportForProviderKind(kind),
-      };
-    case 'ollama':
-      return {
-        ...profile,
-        kind,
-        reasoningTransport: reasoningTransportForProviderKind(kind),
-      };
-  }
+  return { ...profile, kind };
 }
 
 function optionalNumber(value: string): number | undefined {
@@ -179,7 +147,6 @@ const LlmSection: React.FC = () => {
   const [message, setMessage] = useState<string | null>(null);
   const [messageTone, setMessageTone] = useState<'error' | 'success'>('error');
   const [probeState, setProbeState] = useState<Record<string, string>>({});
-  const reenableProfileIdsRef = useRef<Set<string>>(new Set());
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -195,7 +162,6 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
       setStoreReplacementRequired(false);
-      reenableProfileIdsRef.current.clear();
     } else if (result.error === INVALID_PROFILE_STORE_SCHEMA) {
       const replacementDrafts = currentProfileReplacementDrafts();
       setProfiles(replacementDrafts);
@@ -242,12 +208,7 @@ const LlmSection: React.FC = () => {
     );
   };
 
-  const updateProfileEnabled = (id: string, wasEnabled: boolean, enabled: boolean) => {
-    if (!wasEnabled && enabled) {
-      reenableProfileIdsRef.current.add(id);
-    } else if (wasEnabled && !enabled) {
-      reenableProfileIdsRef.current.delete(id);
-    }
+  const updateProfileEnabled = (id: string, enabled: boolean) => {
     updateProfile(id, { enabled });
   };
 
@@ -262,7 +223,6 @@ const LlmSection: React.FC = () => {
   };
 
   const removeProfile = (id: string) => {
-    reenableProfileIdsRef.current.delete(id);
     setProfiles((prev) => prev.filter((profile) => profile.id !== id));
     setSecrets((prev) => {
       const next = { ...prev };
@@ -277,30 +237,7 @@ const LlmSection: React.FC = () => {
   const save = async () => {
     setLoading(true);
     setMessage(null);
-    const savableProfiles = profiles.filter(hasCompatibleReasoningTransport);
-    if (savableProfiles.length !== profiles.length) {
-      setMessageTone('error');
-      setMessage(
-        language === 'zh-CN'
-          ? '存在未配置或与 Provider 不匹配的 reasoning transport；请先完成配置。'
-          : 'A profile has a missing or mismatched reasoning transport. Configure it before saving.'
-      );
-      setLoading(false);
-      return;
-    }
-    const enabledWithoutThinking = savableProfiles.find(
-      (profile) => profile.enabled && profile.thinking !== 'enabled'
-    );
-    if (enabledWithoutThinking) {
-      setMessageTone('error');
-      setMessage(
-        language === 'zh-CN'
-          ? `已启用的 Profile“${enabledWithoutThinking.name}”必须开启 thinking。`
-          : `Enabled profile "${enabledWithoutThinking.name}" must have thinking enabled.`
-      );
-      setLoading(false);
-      return;
-    }
+    const savableProfiles = profiles;
     const replacementProfileMissingApiKey = storeReplacementRequired
       ? savableProfiles.find((profile) => (
         profile.enabled
@@ -323,7 +260,6 @@ const LlmSection: React.FC = () => {
       profiles: savableProfiles,
       defaultProfileId,
       secrets,
-      reenableProfileIds: [...reenableProfileIdsRef.current],
     });
     if (result.ok && result.data) {
       setProfiles(result.data.profiles);
@@ -331,7 +267,6 @@ const LlmSection: React.FC = () => {
       setStorePath(result.data.storePath);
       setSecrets({});
       setStoreReplacementRequired(false);
-      reenableProfileIdsRef.current.clear();
       setMessageTone('success');
       setMessage(t(language, 'settings.llm.saved'));
       window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
@@ -362,11 +297,7 @@ const LlmSection: React.FC = () => {
 
   const defaultOptions = useMemo(
     () => profiles
-      .filter((profile) => (
-        profile.enabled
-        && profile.thinking === 'enabled'
-        && hasCompatibleReasoningTransport(profile)
-      ))
+      .filter((profile) => profile.enabled)
       .map((profile) => ({ id: profile.id, name: profile.name })),
     [profiles]
   );
@@ -472,10 +403,8 @@ const LlmSection: React.FC = () => {
                   <input
                     type="checkbox"
                     checked={profile.enabled}
-                    disabled={!profile.enabled && profile.thinking !== 'enabled'}
                     onChange={(e) => updateProfileEnabled(
                       profile.id,
-                      profile.enabled,
                       e.target.checked,
                     )}
                   />
@@ -498,20 +427,6 @@ const LlmSection: React.FC = () => {
                         {flavor.label}
                       </option>
                     ))}
-                  </select>
-                </label>
-                <label>
-                  <span>Reasoning transport</span>
-                  <select
-                    className="settings-field__select"
-                    value={profile.reasoningTransport}
-                    onChange={() => updateProfileProviderKind(profile.id, profile.kind)}
-                  >
-                    <option value={reasoningTransportForProviderKind(profile.kind)}>
-                      {REASONING_TRANSPORT_LABELS[
-                        reasoningTransportForProviderKind(profile.kind)
-                      ]}
-                    </option>
                   </select>
                 </label>
                 <label>
@@ -641,23 +556,13 @@ const LlmSection: React.FC = () => {
                   {t(language, 'settings.llm.thinkingHint')}
                 </div>
               )}
-              {profile.thinking !== 'enabled' && (
-                <div className="settings-card__hint" role="status">
-                  {language === 'zh-CN'
-                    ? '此 Profile 未开启 plaintext thinking，当前不可用于会话；请先将 thinking 设为启用。'
-                    : 'This profile has no plaintext thinking enabled and is unavailable for sessions. Enable thinking before enabling the profile.'}
-                </div>
-              )}
-
               <div className="llm-profile__actions">
                 <button
                   className="settings-action-button"
                   onClick={() => void probe(profile.id)}
                   disabled={
                     loading
-                    || !hasCompatibleReasoningTransport(profile)
-                    || profile.thinking !== 'enabled'
-                    || !profile.secretRef
+                    || (profile.kind !== 'ollama' && !profile.secretRef)
                     || !!secrets[profile.id]
                   }
                   title={secrets[profile.id]
@@ -685,7 +590,7 @@ const LlmSection: React.FC = () => {
 
         {storePath && (
           <div className="settings-card__hint">
-            {t(language, 'settings.llm.profileStore', { path: storePath })}
+            {t(language, 'settings.llm.profileStoreLoaded')}
           </div>
         )}
         {message && (

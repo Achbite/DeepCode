@@ -1,237 +1,239 @@
 # DeepCode
 
-> Chinese guide: [README.zh-CN.md](README.zh-CN.md)
+> 中文说明：[README.zh-CN.md](README.zh-CN.md)
 
-DeepCode is a local-first AI coding workbench with four user interfaces over the same local Session Runtime and Kernel: a full Editor, a focused conversational GUI, a CLI, and a TUI.
+DeepCode is a local-first coding-agent framework. The Editor, DeepCode-GUI, CLI, and TUI share one local Session Runtime, Kernel, and `SessionProjection`; their differences are limited to rendering and interaction.
 
-“Local-first” means the application, workspace access, session records, permissions, and tool execution are hosted locally. Prompts and selected context are still sent to the LLM provider you configure unless you use a local provider such as Ollama.
+“Local-first” means workspace access, the Session journal, shared projections, tool execution, and tool records stay on this machine. Prompts and context selected by the Agent are still sent to the configured model provider unless you use a local provider such as Ollama.
 
-## Choose an interface
+## How it works
+
+```text
+user input
+  -> the single Agent Loop owned by Session
+  -> typed Provider turn deltas or a native tool call
+  -> Session classifies and journals narrative / answer / interaction / Plan facts
+  -> an exact Plan selection before workspace mutation
+  -> Kernel prepares, authorizes, executes, and records one effect
+  -> Session continues and reduces a shared projection
+  -> UI / CLI / TUI render the same facts
+```
+
+- Session owns the Agent Loop, context, Provider lifecycle, journal, and shared projection.
+- Kernel owns the controlled tool catalog, `PreparedEffect`, real side-effect boundary, and tool-result records that remain immutable while their Session is retained.
+- Host only composes local services and owns process, transport, and configuration concerns.
+- UI submits commands and consumes `SessionProjection`; it does not maintain another task state machine.
+- Skills and MCP servers contribute through plugin-shaped values without creating another Agent Loop.
+
+DeepCode has no parallel Requirement, Plan, or Review workflow engine. Ordinary narrative and final answers are native LLM Markdown; Session classifies them only from the typed Provider turn lifecycle and projects the current run's text deltas as a disposable `assistantDraft` to every shell. Plan and interaction facts can only come from the LLM invoking reserved structured Session control tools—there is no JSONL body envelope, prose inference, or parse-failure fallback. Selecting a Plan option journals `plan.respond(select)` and creates run-scoped authority only for its exact workspace, operation, and normalized targets. Free-form adjustment closes the old Plan without authority; explicit ignore continues the same Loop in answer-only mode. A Session binding allows reads inside its immutable workspace snapshot; workspace mutation has no per-call `ask` or global `allow` fallback. Other effect classes can still use their own explicit interaction request.
+
+## Interfaces
 
 | Interface | Best for | Entry |
 | --- | --- | --- |
-| DeepCode Editor | Editing, file tree, terminal, Git panel, browser, and Agent conversation in one workbench | `DeepCode.app`, `DeepCode.exe`, or the Linux GUI launcher |
-| DeepCode-GUI | Focused conversations, attachments, project sessions, and review | `DeepCode-GUI.app` or `DeepCode-GUI.exe` |
-| CLI | Scripts, one-shot questions, session inspection, and terminal workflows | `DeepCode-CLI.command` or `deepcode-cli` |
-| TUI | Interactive terminal conversations | `DeepCode-TUI.command` or `deepcode-tui` |
+| DeepCode Editor | Files, editor, terminal, Git panel, and Agent conversation | `DeepCode.app`, `DeepCode.exe`, or the Linux GUI |
+| DeepCode-GUI | A focused local Agent conversation | `DeepCode-GUI.app` or `DeepCode-GUI.exe` |
+| CLI | One-shot tasks, scripts, and terminal workflows | `DeepCode-CLI.command` or `deepcode-cli` |
+| TUI | Continuous interactive terminal conversations | `DeepCode-TUI.command` or `deepcode-tui` |
 
-The interfaces share sessions, model profiles, permissions, and the canonical timeline when they use the same configuration root.
+All interfaces read the same model profiles, Session journal, Kernel records, and projection when they use the same configuration root.
 
 ## macOS quick start
 
-### Use an existing local package
-
-If `bin/macos-arm64/` has already been built:
+Open an existing local package:
 
 ```bash
 open bin/macos-arm64/DeepCode.app
 open bin/macos-arm64/DeepCode-GUI.app
 ```
 
-For terminal interfaces:
+Use a terminal interface:
 
 ```bash
 cd bin/macos-arm64
-./DeepCode-TUI.command
+./DeepCode-TUI.command -C /path/to/project
 ./DeepCode-CLI.command --help
 ```
 
-Both apps start their bundled local Kernel automatically. The TUI launcher starts a package-local Kernel when it cannot connect to one.
-
-### Build the local package from source
-
-Start Docker Desktop or Colima, then run:
+Build the local package from source:
 
 ```bash
 make package-macos
 ```
 
-The output is written to `bin/macos-arm64/` and includes both apps, CLI/TUI launchers, the Kernel, Session runtime, web assets, and a package-local writable data root.
-
-If a packaged app appears to be using stale assets or an old Kernel, quit the running DeepCode apps and rebuild with:
+Output is written to `bin/macos-arm64/` and includes both apps, the CLI/TUI launchers, Kernel, Session runtime, web assets, and a package-local writable data root. If a package still shows stale resources, quit every DeepCode app and run:
 
 ```bash
 make package-macos-clean
 ```
 
-The macOS package is intended for local use. It is ad-hoc signed, but it is not distributed as a DMG and is not Developer ID signed or notarized.
+The macOS package is intended for local use and is ad-hoc signed. It is not a Developer ID signed or notarized DMG.
 
 ## Linux and Windows packages
 
-Development and portable packaging use the project container. On Windows, run these commands from WSL; native PowerShell is not a supported build entry.
+Portable builds use the project container. On Windows, run from WSL:
 
 ```bash
 make shell
-```
-
-Then, inside the container:
-
-```bash
 bash ./build.sh
 ```
 
-The build writes:
+Artifacts are written to:
 
 ```text
 bin/linux-x64/
 bin/win64/
 ```
 
-On Linux, start the GUI host and open its local URL:
+On Linux:
 
 ```bash
 cd bin/linux-x64
 ./deepcode-gui
 ```
 
-Then open [http://127.0.0.1:31245/](http://127.0.0.1:31245/). The Linux package also includes `deepcode-cli` and `deepcode-tui`.
+Then open [http://127.0.0.1:31245/](http://127.0.0.1:31245/). On Windows, use `DeepCode.exe` or `DeepCode-GUI.exe`; Microsoft Edge WebView2 Evergreen Runtime is required.
 
-On Windows, open `DeepCode.exe` for the full Editor or `DeepCode-GUI.exe` for the conversation-focused GUI. Keep `WebView2Loader.dll` next to the executable and install the Microsoft Edge WebView2 Evergreen Runtime on the target system.
+## Configure a model
 
-## Configure an LLM
+Before the first task:
 
-Before the first conversation:
+1. Open **Settings → LLM**.
+2. Create an OpenAI-compatible, Anthropic, or Ollama profile.
+3. Enter the base URL, model, and any API key required by the provider.
+4. Enable the profile, select it as the default, and save.
+5. Use **Probe** when available to check connectivity.
 
-1. Open **Settings** and select **LLM**.
-2. Add a preset or create an OpenAI-compatible, Anthropic, or Ollama profile.
-3. Enter the provider base URL, model name, and API key when the provider requires one.
-4. Enable the profile, select the default profile, and save it.
-5. Use **Probe** to check connectivity when available.
+Packages never include your API key. Secrets are stored in the active configuration root's local secret store; do not share that directory.
 
-Packaged builds may include profile presets, but they do not include your API key. API keys are written to the local secret store for the active configuration root; do not share that directory.
+For providers that require a reasoning field to be echoed across a tool continuation, Session keeps that field only in memory for the current run and sends it back along the same Provider call chain. It is never journaled, projected, or rendered as narrative. User-visible intermediate progress still comes only from ordinary model Markdown and structured tool activities.
 
-The model selector in the conversation composer chooses the profile for the current session. Once a session has started work, the selector can be locked until the active run reaches a safe boundary.
+## GUI workflow
 
-## Start a conversation
+1. Start an independent conversation, or create a project and attach one or more local folders.
+2. A project's ordered folders are a template for new Sessions; every created Session keeps an immutable creation snapshot. Changing the project affects only Sessions created afterwards.
+3. The composer can attach a file or a folder. A file is copied into that user message as an immutable content snapshot. A folder is not copied: it is attached to the Session as a directory index, and the model explores it with `fs.list`, `fs.glob`, `code.grep`, and `fs.read`.
+4. A Session folder can be detached later without deleting prior messages, activities, or tool records. Attach/detach during an active run is marked as applying to the next run and changes only that next run's frozen directory set; it never silently changes the project template.
+5. Describe the coding result you want. An independent Session may remain unbound until folder access is actually needed.
+6. While the Provider/tool loop runs, Session projects the current typed turn's LLM text deltas as a shared `assistantDraft`, then commits that text as narrative or a final answer when the turn closes.
+7. For a workspace mutation, use the Plan card in the existing composer. Options are a vertical `1..N` list: the first click selects, and a second click or Enter confirms. You can instead enter adjustment details or explicitly ignore the Plan and request a direct answer.
+8. The model selector remains available during the conversation and changes subsequent Provider turns.
+9. Messages, Plan state, activities, artifacts, context usage, and run status all come from the shared projection.
+10. A committed Assistant answer can be copied, rated up or down, or have its rating cleared. Ratings are durable local Session facts, recover after restart, are not stored by the GUI, and are not sent to the Provider.
+11. Click the context ball in the composer to inspect the current Provider request partitions. Per-partition item counts and estimates come from Session; cache hit and miss counts come from Provider usage. Missing facts display `N/A`, and GUI/TUI do not attribute or recompute them. Settings shows Session-aggregated per-round token consumption newest first, 10 rows per page.
+12. For complex work, the LLM explicitly submits Todo state through the structured `todo.update` control call. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
 
-The usual GUI flow is:
+Deleting a Session deletes the conversation catalog entry and its complete archive: Session events, command replay rows, binding relations, and Kernel tool records. An active run must be stopped first.
 
-1. Open or select a project workspace, or attach the files needed for a read-only question.
-2. Create a session and choose a model profile.
-3. Describe the result you want in the composer.
-4. Review requirement or Plan cards when DeepCode needs confirmation.
-5. Approve or deny Kernel permission requests based on their exact target.
-6. Review the resulting facts and changes before accepting the final review.
+## CLI
 
-An accepted Plan is not blanket permission. File writes, deletes, Git mutations, and other gated actions still follow the Kernel permission and audit path.
-
-For ordinary chat without a workspace, use the GUI without a project binding or pass `--no-workspace` in CLI/TUI. Workspace tools fail closed when no workspace is bound.
-
-## CLI examples
-
-The following examples use the macOS launcher. On Linux, replace `./DeepCode-CLI.command` with `./deepcode-cli`.
-
-```bash
-./DeepCode-CLI.command daemon status
-./DeepCode-CLI.command sessions list
-./DeepCode-CLI.command ask -C /path/to/project "Explain this project"
-./DeepCode-CLI.command -p ask --no-workspace "Explain RAII briefly"
-./DeepCode-CLI.command timeline
-```
-
-Use an existing session:
+These examples use the macOS launcher. Replace it with `./deepcode-cli` on Linux.
 
 ```bash
-./DeepCode-CLI.command sessions resume <session-id>
-./DeepCode-CLI.command --session <session-id> ask "Continue the analysis"
+./DeepCode-CLI.command status
+./DeepCode-CLI.command ask "Explain this coding question without a workspace"
+./DeepCode-CLI.command ask -C /path/to/project "Find and fix the current build error"
+./DeepCode-CLI.command chat -C /path/to/project
+./DeepCode-CLI.command show --session <session-id>
 ```
 
-Run `./DeepCode-CLI.command --help` for permission and requirement/plan/review decision commands.
-
-## TUI basics
-
-Start the TUI with the current directory as its workspace:
+Respond to an existing Session or pending Plan:
 
 ```bash
-./DeepCode-TUI.command
+./DeepCode-CLI.command ask --session <session-id> 1
+./DeepCode-CLI.command ask --session <session-id> "Adjust the targets and propose the Plan again"
+./DeepCode-CLI.command ignore-plan --session <session-id>
+./DeepCode-CLI.command model --session <session-id> <profile-id>
+./DeepCode-CLI.command cancel --session <session-id> <run-id>
+./DeepCode-CLI.command attach-directory --session <session-id> /path/to/folder
+./DeepCode-CLI.command detach-directory --session <session-id> <workspace-id>
 ```
 
-Or bind an explicit workspace:
+Only an explicit `-C` / `--workspace` creates a binding for a new CLI Session; the current directory is never implicit. During a pending Plan, `1..N` selects an option and other non-empty text is revision feedback. Only `ignore-plan` means ignore. `ask` waits until the run is terminal or needs user action, and failed, cancelled, or indeterminate runs exit non-zero. The CLI submits only through `ConversationPort` and never invokes tools directly.
+
+## TUI
 
 ```bash
 ./DeepCode-TUI.command -C /path/to/project
+./DeepCode-TUI.command -C /path/to/project --session <session-id>
 ```
 
-Useful interactive commands include:
+Plain text is submitted to the current Session. Interactive commands are:
 
-- `/help` — show all commands.
-- `/status` — check the local Kernel.
-- `/workspace` — inspect or change the workspace binding.
-- `/sessions`, `/new`, `/use`, `/timeline` — manage and inspect sessions.
-- `/allow` and `/deny` — resolve a displayed permission request.
-- `/decision` — resolve requirement, Plan, or review requests.
-- `/cancel` — cancel the active run request and refresh the shared projection.
+- `/help` — show command hints.
+- `/show` — render the current shared projection again.
+- `/ignore` — explicitly ignore the current Plan and continue answer-only.
+- `/model <profile>` — switch the profile used by subsequent Provider turns.
+- `/cancel` — cancel the active run.
+- `/attach <path>` — attach a folder as a Session directory index.
+- `/detach <workspace-id>` — detach a Session directory index for subsequent runs.
+- `/clear` — refresh visible state without changing the durable Session.
+- `/quit`, `/exit` — exit the TUI.
 
-## Local data and configuration
+For a pending Plan, enter `1..N` to select an option or enter other non-empty text as revision feedback. `Esc` is the explicit TUI ignore action; empty input, EOF, and Ctrl-C do not ignore a Plan. As with the CLI, only explicit `-C` / `--workspace` creates a new binding.
 
-Packaged desktop shells keep writable data under the distribution root by default:
+## Local data
+
+The default configuration root contains:
 
 ```text
-config/user/local/settings/   Settings and LLM profiles
-config/user/local/secrets/    Local secret references
-sessions/                     Session projection and transcript cache
-conversation-archives/        Conversation exports and debug packages
-kernel/                       Kernel ledger and runtime records
-logs/                         Launcher and Kernel logs when emitted
+config/user/local/settings/llm-profiles.json  Model profiles
+config/user/local/settings/user-settings.json User settings
+config/user/local/secrets/                    Local secrets
+runtime/agent-runtime/catalog.sqlite3        Host-private project/workspace catalog
+runtime/agent-runtime/session.sqlite3        Session journal and command replay
+runtime/agent-runtime/tool-record.sqlite3    Kernel tool-result records
+logs/                                         Launcher or Kernel logs when emitted
 ```
 
-Set `DEEPCODE_CONFIG_DIR` to use another configuration root. Direct CLI or daemon runs use the OS configuration root unless this variable is set. To share sessions and profiles between interfaces, start them with the same configuration root.
+Set `DEEPCODE_CONFIG_DIR` to select another root. Interfaces must use the same root to share Sessions.
+The packaged `session-core/` directory contains Session Runtime code, not conversation archives. Conversation history lives in `runtime/agent-runtime/session.sqlite3`.
 
-Do not publish the secrets directory, raw conversation archives, or debug exports without reviewing their contents.
+Within `contracts/agent-runtime/`, `catalog.sql`, `session.sql`, and `tool-record.sql` are the current creation contracts for the three fact owners. Runtime opens only this exact schema and rejects other database versions; there is no migration or alternate history path. See [contracts/agent-runtime/README.md](contracts/agent-runtime/README.md).
 
 ## Troubleshooting
 
 ### No model is available
 
-Open **Settings → LLM**, make sure at least one profile is enabled, add the required API key, save, and probe the profile.
+Open **Settings → LLM**, enable and select a default profile, add the required API key, save, and probe it.
 
-### The app cannot reach the Kernel
+### CLI/TUI cannot reach the local Daemon
 
-Check the local health endpoint:
+Run:
 
 ```bash
-curl http://127.0.0.1:31245/api/health
+./DeepCode-CLI.command status
 ```
 
-Desktop shells normally choose or start a local port automatically. For direct CLI/TUI use, `DEEPCODE_API_URL` selects an existing daemon and `DEEPCODE_PORT` overrides the default port.
+Desktop shells and launchers normally start the local Daemon they own. Direct runs can use `--api` for an existing instance or `DEEPCODE_PORT` to change the default port. Protected Host APIs require the shell's local token, so an unauthenticated `curl /api/health` is not a supported diagnostic path.
 
-### CLI/TUI reports a missing Session runtime
+### The Session runtime is missing
 
-Use a packaged distribution, or build the Session runtime in the source checkout:
+Use a complete package or build it in the source checkout:
 
 ```bash
 pnpm --filter @deepcode/session-core build
 ```
 
-A portable package must keep its `session-core/`, bundled Node runtime, and protocol package next to the launchers.
+Portable packages must keep `session-core/`, the Node runtime, and the protocol package next to their launchers.
 
-### The packaged macOS app looks stale
+### Inspect a runtime problem
 
-Quit every running DeepCode app and run:
+Use CLI `status`, the UI's API/Agent status, and package-local `logs/`. Session and tool facts live in the two SQLite files above; there is no separate UI-owned fact store.
 
-```bash
-make package-macos-clean
-```
-
-You can also inspect `bin/macos-arm64/build-info.json` and `/api/health` to compare the packaged source identity.
-
-### Inspect runtime diagnostics
-
-Use **Settings → Runtime Doctor**, the session timeline, or the package-local `logs/` directory. Conversation exports are under `conversation-archives/`.
-
-## Run from source for UI development
-
-For a local conversational GUI preview:
+## Source validation
 
 ```bash
-make dev-deepcode-gui
+bash ./test.sh static
+bash ./test.sh required
+bash ./test.sh full
 ```
 
-Open [http://127.0.0.1:31246/](http://127.0.0.1:31246/). Use `make docker-info` to inspect the effective container, port, mounts, and volumes.
+`static` checks layering and repository structure. `required` runs Rust/TypeScript builds and unit tests. `full` additionally exercises a local Provider, tool decisions, cancellation, command replay, and restart recovery end to end.
 
-Contributor workflow and protected test-change rules live in [docs/git-branch-flow.md](docs/git-branch-flow.md) and [docs/test-change-request.md](docs/test-change-request.md); they are not part of the end-user workflow.
+Contributor branch and pull-request workflow is documented in Chinese at [docs/git-branch-flow.md](docs/git-branch-flow.md).
 
-## Third-party notices and license
+## Notices and license
 
 See [NOTICE.md](NOTICE.md), [ATTRIBUTION.md](ATTRIBUTION.md), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and [CITATION.cff](CITATION.cff).
 

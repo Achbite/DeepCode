@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import type { UserSettingValue } from '@deepcode/protocol';
-import { normalizeUiLanguage, t, type UiLanguage } from '../../../i18n';
+import { normalizeUiLanguage, t } from '../../../i18n';
 import { localizeSettingDefinition } from '../../../settingsLocalization';
 import {
   agentSettingDefinitions,
@@ -18,137 +18,53 @@ interface RuntimeProps {
   query?: string;
 }
 
-interface QueryProps {
-  query?: string;
-}
-
-interface PlaceholderProps {
-  integration: 'github' | 'skill' | 'mcp';
-}
-
-const GUI_APPEARANCE_SETTING_KEYS = [
-  'gui.colorTheme',
-  'gui.accentColor',
-] as const;
-
-const GUI_INTERFACE_SETTING_KEYS = [
+const APPEARANCE_KEYS = ['gui.colorTheme', 'gui.accentColor'] as const;
+const INTERFACE_KEYS = [
   'workbench.language',
-  'gui.timelineDensity',
-  'gui.typewriterAnimation',
-  'gui.collapseCompletedThinking',
+  'gui.navigationDensity',
+  'gui.showContextRail',
 ] as const;
-
-const EDITABLE_PERMISSION_KEYS = [
-  'agent.permissions.autoApprovePlans',
-  'agent.permissions.webRead',
-  'agent.permissions.privateWebRead',
+const AGENT_INSTRUCTION_KEYS = ['agent.systemPrompt'] as const;
+const AGENT_PERMISSION_KEYS = [
+  'agent.permissions.networkRead',
+  'agent.permissions.external',
 ] as const;
-
-const PUBLIC_WEB_SETTING_KEYS = [
+const AGENT_WEB_KEYS = [
   'agent.web.search.endpointTemplate',
   'agent.web.search.authHeaderName',
   'agent.web.search.authSecretRef',
 ] as const;
 
-const KERNEL_OWNED_PERMISSION_KEYS = [
-  'agent.permissions.workspaceRead',
-  'agent.permissions.workspaceWrite',
-  'agent.permissions.gitWrite',
-] as const;
-
-function allDefinitions(): SettingDefinition[] {
-  const definitions = [
+function guiDefinitions(): SettingDefinition[] {
+  return [
     ...shellPreferenceSettingDefinitions('editor').filter(
-      (definition) => definition.key === 'workbench.language'
+      (definition) => definition.key === 'workbench.language',
     ),
     ...shellPreferenceSettingDefinitions('gui'),
-    ...agentSettingDefinitions(),
   ];
-  return [...new Map(definitions.map((definition) => [definition.key, definition])).values()];
 }
 
-function definitionsForKeys(
+function definitionsFor(
   keys: readonly string[],
-  language: UiLanguage,
-  query: string
+  available: readonly SettingDefinition[],
+  language: ReturnType<typeof normalizeUiLanguage>,
+  query: string,
 ): SettingDefinition[] {
-  const byKey = new Map(allDefinitions().map((definition) => [definition.key, definition]));
+  const byKey = new Map(available.map((definition) => [definition.key, definition]));
   const normalizedQuery = query.trim().toLowerCase();
   return keys.flatMap((key) => {
-    const definition = byKey.get(key);
-    if (!definition) return [];
-    const localized = localizeSettingDefinition(definition, language);
-    if (!normalizedQuery) return [localized];
-    const searchable = [
-      localized.key,
-      localized.label,
-      localized.description,
-      definition.label,
-      definition.description,
-    ].join(' ').toLowerCase();
-    return searchable.includes(normalizedQuery) ? [localized] : [];
+    const original = byKey.get(key);
+    if (!original) return [];
+    const definition = localizeSettingDefinition(original, language);
+    if (!normalizedQuery) return [definition];
+    return [definition.key, definition.label, definition.description]
+      .join(' ')
+      .toLowerCase()
+      .includes(normalizedQuery)
+      ? [definition]
+      : [];
   });
 }
-
-interface SettingsCardProps {
-  title: string;
-  definitions: SettingDefinition[];
-  language: UiLanguage;
-  emptyText: string;
-  hint?: string;
-  locked?: boolean;
-}
-
-const SettingsCard: React.FC<SettingsCardProps> = ({
-  title,
-  definitions,
-  language,
-  emptyText,
-  hint,
-  locked = false,
-}) => {
-  const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
-  const sources = useSettingsStore((state) => state.sources);
-  const loading = useSettingsStore((state) => state.loading);
-  const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
-  const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
-
-  const handleChange = (key: string, value: UserSettingValue) => {
-    void patchUserSetting(key, value);
-  };
-
-  return (
-    <div className={`settings-card${locked ? ' settings-card--locked' : ''}`}>
-      <h3 className="settings-card__title">
-        <span>{title}</span>
-        {locked && (
-          <span className="settings-card__lock-badge">
-            {t(language, 'settings.permissions.kernelOwnedBadge')}
-          </span>
-        )}
-      </h3>
-      <div className="settings-card__body">
-        {definitions.length === 0 ? (
-          <div>{emptyText}</div>
-        ) : (
-          definitions.map((definition) => (
-            <SettingsField
-              key={definition.key}
-              definition={definition}
-              value={effectiveSettings[definition.key]}
-              source={sources[definition.key] ?? 'default'}
-              language={language}
-              disabled={locked || loading || sources[definition.key] === 'workspace'}
-              onChange={handleChange}
-              onReset={locked ? undefined : (key) => void resetUserSetting(key)}
-            />
-          ))
-        )}
-      </div>
-      {hint && <div className="settings-card__hint">{hint}</div>}
-    </div>
-  );
-};
 
 export const GuiSettingsSection: React.FC<RuntimeProps> = ({
   apiStatus,
@@ -157,34 +73,46 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
   query = '',
 }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
-  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
+  const sources = useSettingsStore((state) => state.sources);
+  const loading = useSettingsStore((state) => state.loading);
   const errorMessage = useSettingsStore((state) => state.errorMessage);
   const storePath = useSettingsStore((state) => state.storePath);
-  const appearanceDefinitions = useMemo(
-    () => definitionsForKeys(GUI_APPEARANCE_SETTING_KEYS, language, query),
-    [language, query]
+  const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
+  const appearance = useMemo(
+    () => definitionsFor(APPEARANCE_KEYS, guiDefinitions(), language, query),
+    [language, query],
   );
-  const interfaceDefinitions = useMemo(
-    () => definitionsForKeys(GUI_INTERFACE_SETTING_KEYS, language, query),
-    [language, query]
+  const preferences = useMemo(
+    () => definitionsFor(INTERFACE_KEYS, guiDefinitions(), language, query),
+    [language, query],
   );
-  const hasSearchMatch = appearanceDefinitions.length > 0 || interfaceDefinitions.length > 0;
+  const onChange = (key: string, value: UserSettingValue) => {
+    void patchUserSetting(key, value);
+  };
 
   return (
     <div>
       <h2 className="settings-title">{t(language, 'settings.gui.title')}</h2>
-      <GuiAppearanceSettings definitions={appearanceDefinitions} language={language} />
-      {interfaceDefinitions.length > 0 && (
-        <SettingsCard
-          title={t(language, 'settings.gui.preferences')}
-          definitions={interfaceDefinitions}
-          language={language}
-          emptyText={t(language, 'settings.noSearchMatch')}
-        />
-      )}
-      {query.trim() && !hasSearchMatch && (
+      <GuiAppearanceSettings definitions={appearance} language={language} />
+      {preferences.length > 0 && (
         <div className="settings-card">
-          <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
+          <h3 className="settings-card__title">{t(language, 'settings.gui.preferences')}</h3>
+          <div className="settings-card__body">
+            {preferences.map((definition) => (
+              <SettingsField
+                key={definition.key}
+                definition={definition}
+                value={effectiveSettings[definition.key]}
+                source={sources[definition.key] ?? 'default'}
+                language={language}
+                disabled={loading}
+                onChange={onChange}
+                onReset={(key) => void resetUserSetting(key)}
+              />
+            ))}
+          </div>
         </div>
       )}
       {!query.trim() && (
@@ -196,7 +124,12 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
               <tr><td>{t(language, 'settings.runtime.serverVersion')}</td><td>{serverVersion ?? '-'}</td></tr>
               <tr><td>{t(language, 'settings.runtime.apiStatus')}</td><td>{apiStatus}</td></tr>
               <tr><td>{t(language, 'settings.runtime.wsStatus')}</td><td>{wsStatus}</td></tr>
-              <tr><td>{t(language, 'settings.runtime.userSettingsFile')}</td><td>{storePath ?? t(language, 'settings.runtime.notLoaded')}</td></tr>
+              <tr>
+                <td>{t(language, 'settings.runtime.userSettingsFile')}</td>
+                <td>{storePath
+                  ? t(language, 'settings.runtime.loaded')
+                  : t(language, 'settings.runtime.notLoaded')}</td>
+              </tr>
             </tbody>
           </table>
           {errorMessage && <div className="settings-error">{errorMessage}</div>}
@@ -206,71 +139,78 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
   );
 };
 
-export const PermissionSettingsSection: React.FC<QueryProps> = ({ query = '' }) => {
-  const language = normalizeUiLanguage(
-    useSettingsStore((state) => state.effectiveSettings['workbench.language'])
-  );
-  const editable = useMemo(
-    () => definitionsForKeys(EDITABLE_PERMISSION_KEYS, language, query),
-    [language, query]
-  );
-  const publicWeb = useMemo(
-    () => definitionsForKeys(PUBLIC_WEB_SETTING_KEYS, language, query),
-    [language, query]
-  );
-  const kernelOwned = useMemo(
-    () => definitionsForKeys(KERNEL_OWNED_PERMISSION_KEYS, language, query),
-    [language, query]
-  );
-  return (
-    <div>
-      <h2 className="settings-title">{t(language, 'settings.permissions.title')}</h2>
-      <div className="settings-boundary-notice">
-        {t(language, 'settings.permissions.boundary')}
-      </div>
-      <SettingsCard
-        title={t(language, 'settings.permissions.editable')}
-        definitions={editable}
-        language={language}
-        emptyText={t(language, 'settings.noSearchMatch')}
-        hint={t(language, 'settings.permissions.editableHint')}
-      />
-      <SettingsCard
-        title={t(language, 'settings.permissions.publicWeb')}
-        definitions={publicWeb}
-        language={language}
-        emptyText={t(language, 'settings.noSearchMatch')}
-        hint={t(language, 'settings.permissions.publicWebHint')}
-      />
-      <SettingsCard
-        title={t(language, 'settings.permissions.kernelOwned')}
-        definitions={kernelOwned}
-        language={language}
-        emptyText={t(language, 'settings.noSearchMatch')}
-        hint={t(language, 'settings.permissions.kernelOwnedHint')}
-        locked
-      />
-    </div>
-  );
-};
+interface AgentSettingsSectionProps {
+  query?: string;
+}
 
-export const UnavailableIntegrationSection: React.FC<PlaceholderProps> = ({ integration }) => {
-  const language = normalizeUiLanguage(
-    useSettingsStore((state) => state.effectiveSettings['workbench.language'])
+export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ query = '' }) => {
+  const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
+  const sources = useSettingsStore((state) => state.sources);
+  const loading = useSettingsStore((state) => state.loading);
+  const restartRequired = useSettingsStore((state) => state.restartRequired);
+  const errorMessage = useSettingsStore((state) => state.errorMessage);
+  const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
+  const available = useMemo(() => agentSettingDefinitions(), []);
+  const instructions = useMemo(
+    () => definitionsFor(AGENT_INSTRUCTION_KEYS, available, language, query),
+    [available, language, query],
   );
-  return (
-    <div>
-      <h2 className="settings-title">
-        {t(language, `settings.integration.${integration}.title`)}
-      </h2>
-      <div className="settings-card settings-placeholder-card">
-        <div className="settings-placeholder-card__mark">{integration.toUpperCase()}</div>
-        <div>
-          <h3>{t(language, 'settings.integration.unavailable')}</h3>
-          <p>{t(language, `settings.integration.${integration}.body`)}</p>
-          <p>{t(language, 'settings.integration.boundary')}</p>
+  const permissions = useMemo(
+    () => definitionsFor(AGENT_PERMISSION_KEYS, available, language, query),
+    [available, language, query],
+  );
+  const web = useMemo(
+    () => definitionsFor(AGENT_WEB_KEYS, available, language, query),
+    [available, language, query],
+  );
+  const onChange = (key: string, value: UserSettingValue) => {
+    void patchUserSetting(key, value);
+  };
+  const renderCard = (title: string, definitions: readonly SettingDefinition[]) => {
+    if (definitions.length === 0) return null;
+    return (
+      <div className="settings-card">
+        <h3 className="settings-card__title">{title}</h3>
+        <div className="settings-card__body">
+          {definitions.map((definition) => (
+            <SettingsField
+              key={definition.key}
+              definition={definition}
+              value={effectiveSettings[definition.key]}
+              source={sources[definition.key] ?? 'default'}
+              language={language}
+              disabled={loading}
+              onChange={onChange}
+              onReset={(key) => void resetUserSetting(key)}
+            />
+          ))}
         </div>
       </div>
+    );
+  };
+
+  return (
+    <div>
+      <h2 className="settings-title">{t(language, 'settings.agent.title')}</h2>
+      <div className="settings-boundary-notice">
+        {t(language, 'settings.agent.scopeHint')}
+      </div>
+      {restartRequired && (
+        <div className="settings-restart-notice">
+          {t(language, 'settings.agent.restartRequired')}
+        </div>
+      )}
+      {renderCard(t(language, 'settings.agent.instructions'), instructions)}
+      {renderCard(t(language, 'settings.agent.permissions'), permissions)}
+      {renderCard(t(language, 'settings.agent.webTools'), web)}
+      {errorMessage && <div className="settings-error">{errorMessage}</div>}
+      {instructions.length + permissions.length + web.length === 0 && (
+        <div className="settings-card">
+          <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
+        </div>
+      )}
     </div>
   );
 };
