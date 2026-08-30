@@ -2,21 +2,25 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   ActivityProjection,
   MessageFeedback,
+  PlanResponse,
   RunProjection,
   SessionProjection,
   UserMessageAttachment,
 } from '@deepcode/protocol';
-import { normalizeUiLanguage } from '../../i18n';
+import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
 import ProjectFolderDialog from '../../deepcode-gui/layout/ProjectFolderDialog';
 import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
+import PlanCard from './PlanCard';
+import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import {
   readConversationResource,
   type ConversationResourceReadResult,
 } from '../../services/localAgentApi';
+import { readMessageAttachmentFile } from '../../services/runtimeAdapter';
 import './localAgentPanel.css';
 
 interface LocalAgentPanelProps {
@@ -41,6 +45,8 @@ async function copyTextToClipboard(text: string): Promise<void> {
 
 const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
+  const runtimeEffectiveSettings = useSettingsStore((state) => state.runtimeEffectiveSettings);
+  const settingsRestartRequired = useSettingsStore((state) => state.restartRequired);
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const sessionId = useLocalAgentStore((state) => state.sessionId);
@@ -56,11 +62,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const refresh = useLocalAgentStore((state) => state.refresh);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
-  const attachSessionDirectory = useLocalAgentStore((state) => state.attachSessionDirectory);
-  const detachSessionDirectory = useLocalAgentStore((state) => state.detachSessionDirectory);
+  const respondInteraction = useLocalAgentStore((state) => state.respondInteraction);
   const respondApproval = useLocalAgentStore((state) => state.respondApproval);
   const respondPlan = useLocalAgentStore((state) => state.respondPlan);
-  const ignorePlan = useLocalAgentStore((state) => state.ignorePlan);
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
   const selectProfile = useLocalAgentStore((state) => state.selectProfile);
   const [draft, setDraft] = useState('');
@@ -68,20 +72,21 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const [pendingDirectoryPaths, setPendingDirectoryPaths] = useState<string[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
-  const [folderDialogOpen, setFolderDialogOpen] = useState(false);
+  const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [followingLatest, setFollowingLatest] = useState(true);
-  const [selectedPlanOptionId, setSelectedPlanOptionId] = useState<string | null>(null);
   const [resourcePreview, setResourcePreview] = useState<ResourcePreviewState | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [uiActionError, setUiActionError] = useState<string | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
-  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentControlRef = useRef<HTMLDivElement | null>(null);
   const permissionControlRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const compositionActiveRef = useRef(false);
+  const compositionCommitPendingRef = useRef(false);
+  const compositionGuardFrameRef = useRef<number | null>(null);
   const activeViewRef = useRef<string | null>(sessionId);
   const followingLatestRef = useRef(true);
   const userDetachedFromLatestRef = useRef(false);
@@ -90,14 +95,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const suppressScrollEventsUntilRef = useRef(0);
   const scrollFrameRef = useRef<number | null>(null);
   const scrollTimeoutRef = useRef<number | null>(null);
-  const zh = language === 'zh-CN';
   const activeSummary = catalog.sessions.find((session) => session.id === sessionId);
   const activeProject = catalog.projects.find((project) => (
     project.id === (activeSummary?.projectId ?? draftProjectId)
   ));
   const title = activeSummary?.title.trim()
-    || projection?.display.title.trim()
-    || conversationTitle(projection?.messages, zh);
+    || conversationTitle(projection?.messages, language);
   const conversationItems = useMemo(() => projectionItems(projection), [projection]);
   const hasConversationContent = conversationItems.length > 0
     || Boolean(projection?.assistantDraft)
@@ -108,19 +111,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const pendingInteraction = projection?.pendingInteraction ?? null;
   const pendingApproval = projection?.pendingApproval ?? null;
   const pendingPlan = projection?.pendingPlan ?? null;
-  const activeRun = projection?.run && ['running', 'waiting'].includes(projection.run.status)
-    ? projection.run
-    : null;
-  const runWorkspaceIds = new Set(
-    activeRun?.workspaceBindings.map((binding) => binding.workspaceId) ?? [],
-  );
-  const effectiveWorkspaceIds = new Set(
-    projection?.workspaceBindings.map((binding) => binding.workspaceId) ?? [],
-  );
-  const directoryIndexChangeDeferred = Boolean(activeRun) && (
-    [...runWorkspaceIds].some((workspaceId) => !effectiveWorkspaceIds.has(workspaceId))
-    || [...effectiveWorkspaceIds].some((workspaceId) => !runWorkspaceIds.has(workspaceId))
-  );
 
   const setLatestFollowMode = useCallback((following: boolean) => {
     followingLatestRef.current = following;
@@ -151,9 +141,41 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   }, [scrollToLatestNow]);
 
   useEffect(() => {
-    const id = window.setInterval(() => void refresh(), 500);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+    if (!sessionId) return undefined;
+    let cancelled = false;
+    let timeout: number | null = null;
+
+    const schedule = () => {
+      if (cancelled) return;
+      const current = useLocalAgentStore.getState().projection;
+      const active = Boolean(
+        current?.run && ['running', 'waiting'].includes(current.run.status),
+      );
+      const delay = document.visibilityState === 'hidden'
+        ? 10_000
+        : active
+          ? 750
+          : 4_000;
+      timeout = window.setTimeout(() => {
+        timeout = null;
+        void refresh().finally(schedule);
+      }, delay);
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (timeout !== null) window.clearTimeout(timeout);
+      timeout = null;
+      void refresh().finally(schedule);
+    };
+
+    schedule();
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      if (timeout !== null) window.clearTimeout(timeout);
+    };
+  }, [refresh, sessionId]);
 
   useEffect(() => {
     if (activeViewRef.current !== sessionId) {
@@ -161,7 +183,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         setPendingDirectoryPaths([]);
         setAttachments([]);
         setAttachmentMenuOpen(false);
-        setFolderDialogOpen(false);
+        setAttachmentDialogOpen(false);
       }
       setLatestFollowMode(true);
       activeViewRef.current = sessionId;
@@ -184,18 +206,21 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
     if (scrollTimeoutRef.current !== null) window.clearTimeout(scrollTimeoutRef.current);
+    if (compositionGuardFrameRef.current !== null) {
+      window.cancelAnimationFrame(compositionGuardFrameRef.current);
+    }
   }, []);
 
   useEffect(() => {
-    if (!attachmentMenuOpen && !permissionMenuOpen) return undefined;
+    if (!permissionMenuOpen && !attachmentMenuOpen) return undefined;
     const closeOnOutsidePointer = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (attachmentMenuOpen && !attachmentControlRef.current?.contains(target)) {
-        setAttachmentMenuOpen(false);
-      }
       if (permissionMenuOpen && !permissionControlRef.current?.contains(target)) {
         setPermissionMenuOpen(false);
+      }
+      if (attachmentMenuOpen && !attachmentControlRef.current?.contains(target)) {
+        setAttachmentMenuOpen(false);
       }
     };
     document.addEventListener('pointerdown', closeOnOutsidePointer);
@@ -207,131 +232,173 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       setAttachments([]);
       setPendingDirectoryPaths([]);
       setAttachmentMenuOpen(false);
+      setAttachmentDialogOpen(false);
     }
   }, [pendingApproval, pendingInteraction, pendingPlan]);
 
-  useEffect(() => {
-    setSelectedPlanOptionId(null);
-  }, [pendingPlan?.planId]);
-
   const submitDraft = async () => {
-    const text = draft.trim();
-    const numericPlanOption = pendingPlan && /^\d+$/u.test(text)
-      ? pendingPlan.options[Number.parseInt(text, 10) - 1]
-      : undefined;
-    const selectedPlanOption = numericPlanOption ?? pendingPlan?.options.find((option) => (
-      option.optionId === selectedPlanOptionId
-    ));
-    if ((!text && !selectedPlanOption) || submitting) return;
+    const submittedText = draft;
+    if (
+      !submittedText.trim()
+      || loading
+      || submitting
+      || catalogBusy
+      || pendingApproval
+      || (!selectedProfileId && !pendingInteraction && !pendingPlan)
+      || compositionActiveRef.current
+      || compositionCommitPendingRef.current
+    ) return;
     const submittedAttachments = attachments;
     const submittedDirectoryPaths = pendingDirectoryPaths;
     setDraft('');
     setLatestFollowMode(true);
     try {
-      if (pendingPlan) {
-        await respondPlan(numericPlanOption
-          ? { kind: 'select', optionId: numericPlanOption.optionId }
-          : text
-          ? {
-              kind: 'feedback',
-              text,
-              ...(selectedPlanOption ? { optionId: selectedPlanOption.optionId } : {}),
-            }
-          : { kind: 'select', optionId: selectedPlanOption!.optionId });
-      } else {
-        await sendMessage(text, submittedAttachments, submittedDirectoryPaths);
-      }
-      setSelectedPlanOptionId(null);
+      await sendMessage(submittedText, submittedAttachments, submittedDirectoryPaths);
       setAttachments([]);
       setPendingDirectoryPaths([]);
       setAttachmentError(null);
     } catch {
-      setDraft(text);
+      setDraft(submittedText);
     }
   };
 
-  const selectOrConfirmPlanOption = async (optionId: string) => {
-    if (!pendingPlan || submitting) return;
-    if (selectedPlanOptionId !== optionId) {
-      setSelectedPlanOptionId(optionId);
-      textareaRef.current?.focus();
+  const beginComposition = () => {
+    if (compositionGuardFrameRef.current !== null) {
+      window.cancelAnimationFrame(compositionGuardFrameRef.current);
+      compositionGuardFrameRef.current = null;
+    }
+    compositionCommitPendingRef.current = false;
+    compositionActiveRef.current = true;
+  };
+
+  const endComposition = () => {
+    compositionActiveRef.current = false;
+    compositionCommitPendingRef.current = true;
+    if (compositionGuardFrameRef.current !== null) {
+      window.cancelAnimationFrame(compositionGuardFrameRef.current);
+    }
+    compositionGuardFrameRef.current = window.requestAnimationFrame(() => {
+      compositionGuardFrameRef.current = null;
+      compositionCommitPendingRef.current = false;
+    });
+  };
+
+  const insertFocusCommand = () => {
+    const nextDraft = /^\/focus(?:\s|$)/u.test(draft)
+      ? draft
+      : `/focus ${draft}`;
+    focusComposerDraft(nextDraft);
+  };
+
+  const selectFocusCommand = () => {
+    focusComposerDraft('/focus ');
+  };
+
+  const focusComposerDraft = (nextDraft: string) => {
+    setDraft(nextDraft);
+    setAttachmentMenuOpen(false);
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(nextDraft.length, nextDraft.length);
+    });
+  };
+
+  const focusCommandSuggestionVisible = shouldOfferFocusCommand(draft);
+
+  const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!shouldSubmitComposerKey({
+      key: event.key,
+      shiftKey: event.shiftKey,
+      repeat: event.repeat,
+      isComposing: event.nativeEvent.isComposing,
+      keyCode: event.nativeEvent.keyCode,
+    }, {
+      active: compositionActiveRef.current,
+      commitPending: compositionCommitPendingRef.current,
+    })) return;
+    event.preventDefault();
+    if (focusCommandSuggestionVisible) {
+      selectFocusCommand();
       return;
     }
-    const adjustment = draft.trim();
-    setLatestFollowMode(true);
+    void submitDraft();
+  };
+
+  const submitPlanDecision = useCallback(async (
+    response: Extract<PlanResponse, { kind: 'confirm' | 'cancel' }>,
+  ) => {
+    if (!pendingPlan || submitting) return;
     try {
-      await respondPlan(adjustment
-        ? { kind: 'feedback', text: adjustment, optionId }
-        : { kind: 'select', optionId });
-      setSelectedPlanOptionId(null);
+      await respondPlan(response);
       setDraft('');
     } catch {
-      // Store exposes the canonical command rejection in the shared error region.
+      // The store preserves the authoritative command error for the shared error panel.
     }
-  };
+  }, [pendingPlan, respondPlan, submitting]);
 
-  const submitIgnorePlan = async () => {
-    if (!pendingPlan || submitting) return;
-    setDraft('');
-    try {
-      await ignorePlan();
-      setSelectedPlanOptionId(null);
-    } catch {
-      // Store exposes the canonical command rejection in the shared error region.
+  useEffect(() => {
+    if (!pendingPlan || submitting) return undefined;
+    const ignorePlanOnEscape = (event: KeyboardEvent) => {
+      if (
+        event.key !== 'Escape'
+        || event.repeat
+        || compositionActiveRef.current
+        || event.isComposing
+        || event.keyCode === 229
+        || event.defaultPrevented
+      ) return;
+      event.preventDefault();
+      void submitPlanDecision({ kind: 'cancel' });
+    };
+    window.addEventListener('keydown', ignorePlanOnEscape);
+    return () => window.removeEventListener('keydown', ignorePlanOnEscape);
+  }, [pendingPlan, submitPlanDecision, submitting]);
+
+  const selectMessageAttachment = async (
+    absolutePath: string,
+    type: 'directory' | 'file',
+  ) => {
+    setAttachmentDialogOpen(false);
+    if (pendingPlan || pendingInteraction || pendingApproval) return;
+    if (type === 'directory') {
+      setAttachmentError(null);
+      setPendingDirectoryPaths((current) => (
+        current.includes(absolutePath) ? current : [...current, absolutePath]
+      ));
+      return;
     }
-  };
-
-  const selectAttachments = async (files: FileList | null) => {
-    if (!files?.length || pendingPlan || pendingInteraction || pendingApproval) return;
     try {
-      const remaining = 8 - attachments.length;
-      if (remaining <= 0 || files.length > remaining) {
-        throw new Error(zh ? '单次消息最多附加 8 个文件。' : 'Attach at most 8 files per message.');
+      if (attachments.length >= 8) {
+        throw new Error(t(language, 'agent.attachment.error.maxFiles'));
       }
-      const next = await Promise.all([...files].map(async (file) => {
-        const content = await file.text();
-        if (content.includes('\0')) {
-          throw new Error(zh
-            ? `“${file.name}”不是可直接附加的文本文件。`
-            : `“${file.name}” is not a text attachment.`);
-        }
-        return {
-          attachmentId: nextAttachmentId(),
-          name: file.name,
-          mediaType: file.type || 'text/plain',
-          content,
-        } satisfies UserMessageAttachment;
-      }));
-      const totalBytes = [...attachments, ...next].reduce(
+      const result = await readMessageAttachmentFile(absolutePath);
+      if (!result.ok || !result.data) {
+        throw new Error(t(language, 'agent.attachment.error.readFile', {
+          message: result.message ?? result.error ?? 'unknown',
+        }));
+      }
+      if (result.data.content.includes('\0')) {
+        throw new Error(t(language, 'agent.attachment.error.notText', {
+          name: result.data.name,
+        }));
+      }
+      const next = {
+        attachmentId: nextAttachmentId(),
+        name: result.data.name,
+        mediaType: result.data.mediaType || 'text/plain',
+        content: result.data.content,
+      } satisfies UserMessageAttachment;
+      const totalBytes = [...attachments, next].reduce(
         (total, attachment) => total + new TextEncoder().encode(attachment.content).byteLength,
         0,
       );
       if (totalBytes > 512 * 1024) {
-        throw new Error(zh
-          ? '附件文本总计不能超过 512 KiB。'
-          : 'Attachment text cannot exceed 512 KiB in total.');
+        throw new Error(t(language, 'agent.attachment.error.totalSize'));
       }
-      setAttachments((current) => [...current, ...next]);
+      setAttachments((current) => [...current, next]);
       setAttachmentError(null);
-    } catch (selectionError) {
-      setAttachmentError(selectionError instanceof Error
-        ? selectionError.message
-        : String(selectionError));
-    }
-  };
-
-  const selectDirectoryIndex = async (absolutePath: string) => {
-    setFolderDialogOpen(false);
-    setAttachmentMenuOpen(false);
-    setAttachmentError(null);
-    try {
-      if (sessionId) {
-        await attachSessionDirectory(absolutePath);
-      } else {
-        setPendingDirectoryPaths((current) => (
-          current.includes(absolutePath) ? current : [...current, absolutePath]
-        ));
-      }
     } catch (selectionError) {
       setAttachmentError(selectionError instanceof Error
         ? selectionError.message
@@ -374,15 +441,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const canCancel = Boolean(
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
-  const hasSelectedPlanOption = Boolean(pendingPlan?.options.some((option) => (
-    option.optionId === selectedPlanOptionId
-  )));
-  const canSend = Boolean(draft.trim() || hasSelectedPlanOption)
+  const canSend = Boolean(draft.trim())
+    && !loading
     && !submitting
     && !catalogBusy
     && !pendingApproval
-    && Boolean(selectedProfileId || pendingPlan || pendingInteraction);
-  const showStopAction = canCancel && !draft.trim() && !hasSelectedPlanOption;
+    && Boolean(selectedProfileId || pendingInteraction || pendingPlan);
+  const showStopAction = canCancel && !pendingPlan && !draft.trim();
 
   const openWorkspaceResource = async (workspaceId: string, logicalPath: string) => {
     if (!sessionId) return;
@@ -415,16 +480,16 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           <span className="local-agent__heading-mark"><DeepCodeShellIcon name="session" /></span>
           <div>
             <strong>{title}</strong>
-            <span>{activeProject?.title ?? (zh ? '独立对话' : 'Independent chat')}</span>
+            <span>{activeProject?.title ?? t(language, 'agent.chat.independent')}</span>
           </div>
         </div>
         <div className="local-agent__header-actions">
           <span className={`local-agent__run-label local-agent__run-label--${projection?.run?.status ?? 'idle'}`}>
             {projection
-              ? runLabel(projection.run, zh)
+              ? runLabel(projection.run, language)
               : loading
-                ? (zh ? '连接中' : 'Connecting')
-                : (zh ? '新对话' : 'New chat')}
+                ? t(language, 'agent.chat.connecting')
+                : t(language, 'agent.chat.new')}
           </span>
         </div>
       </header>
@@ -467,16 +532,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       >
         <div ref={transcriptRef} className="local-agent__transcript">
           {loading && !projection && (
-            <div className="local-agent__empty">{zh ? '正在打开会话…' : 'Opening session…'}</div>
+            <div className="local-agent__empty">{t(language, 'agent.chat.opening')}</div>
           )}
           {!hasConversationContent && !loading && (
             <div className="local-agent__empty local-agent__empty--welcome">
               <strong>
                 {activeProject
-                  ? (zh
-                    ? `我们要在 ${activeProject.title} 中做些什么？`
-                    : `What shall we do in ${activeProject.title}?`)
-                  : (zh ? '我们要在 DeepCode 中做些什么？' : 'What shall we do in DeepCode?')}
+                  ? t(language, 'agent.chat.welcomeProject', { project: activeProject.title })
+                  : t(language, 'agent.chat.welcomeDefault')}
               </strong>
             </div>
           )}
@@ -487,25 +550,36 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             >
               <div className="local-agent__message-content">
                 <MarkdownContent>{item.value.content}</MarkdownContent>
-                {item.value.attachments.length > 0 && (
+                {(item.value.attachments.length > 0
+                  || item.value.directoryAttachments.length > 0) && (
                   <div className="local-agent__message-attachments">
                     {item.value.attachments.map((attachment) => (
                       <span key={attachment.attachmentId}>
+                        <DeepCodeShellIcon name="artifact" />
                         {attachment.name}
-                        <small>{formatBytes(attachment.byteLength)}</small>
+                        <small>{formatBytes(attachment.byteLength, language)}</small>
+                      </span>
+                    ))}
+                    {item.value.directoryAttachments.map((attachment) => (
+                      <span className="local-agent__message-directory" key={attachment.workspaceId}>
+                        <DeepCodeShellIcon name="folder" />
+                        {attachment.displayName}
                       </span>
                     ))}
                   </div>
                 )}
               </div>
               {item.value.role === 'assistant' && (
-                <div className="local-agent__message-actions" aria-label={zh ? '消息操作' : 'Message actions'}>
+                <div
+                  className="local-agent__message-actions"
+                  aria-label={t(language, 'agent.message.actions')}
+                >
                   <button
                     type="button"
-                    title={zh ? '复制' : 'Copy'}
+                    title={t(language, 'agent.message.copy')}
                     aria-label={copiedMessageId === item.value.messageId
-                      ? (zh ? '已复制' : 'Copied')
-                      : (zh ? '复制回答' : 'Copy response')}
+                      ? t(language, 'agent.message.copied')
+                      : t(language, 'agent.message.copyResponse')}
                     onClick={() => void copyAssistantMessage(item.value.messageId, item.value.content)}
                   >
                     <DeepCodeShellIcon name="copy" />
@@ -514,8 +588,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         type="button"
                         className={item.value.feedback === 'up' ? 'is-selected' : ''}
                         aria-pressed={item.value.feedback === 'up'}
-                        title={zh ? '赞' : 'Helpful'}
-                        aria-label={zh ? '赞' : 'Helpful'}
+                        title={t(language, 'agent.message.helpful')}
+                        aria-label={t(language, 'agent.message.helpful')}
                         disabled={submitting}
                         onClick={() => void updateMessageFeedback(
                           item.value.messageId,
@@ -528,8 +602,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                         type="button"
                         className={item.value.feedback === 'down' ? 'is-selected' : ''}
                         aria-pressed={item.value.feedback === 'down'}
-                        title={zh ? '踩' : 'Not helpful'}
-                        aria-label={zh ? '踩' : 'Not helpful'}
+                        title={t(language, 'agent.message.notHelpful')}
+                        aria-label={t(language, 'agent.message.notHelpful')}
                         disabled={submitting}
                         onClick={() => void updateMessageFeedback(
                           item.value.messageId,
@@ -545,11 +619,18 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             <article className="local-agent__narrative" key={`narrative:${item.value.narrativeId}`}>
               <div><MarkdownContent>{item.value.content}</MarkdownContent></div>
             </article>
+          ) : item.type === 'plan' ? (
+            <PlanCard
+              key={`plan:${item.value.planId}:${item.value.revision}`}
+              plan={item.value}
+              active={samePlanReference(projection?.activePlanRef, item.value)}
+              language={language}
+            />
           ) : (
             <ToolActivityGroup
               activities={item.values}
               key={item.groupId}
-              zh={zh}
+              language={language}
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
@@ -566,7 +647,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           {projection?.run?.status === 'running' && (
             <div className="local-agent__run-thinking" role="status" aria-live="polite">
               <span className="local-agent__run-spinner" aria-hidden="true" />
-              <span>{zh ? '正在思考…' : 'Thinking…'}</span>
+              <span>{t(language, 'agent.run.thinking')}</span>
             </div>
           )}
           {projection?.terminalError && (
@@ -581,8 +662,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           <button
             type="button"
             className="local-agent__jump-latest"
-            aria-label={zh ? '前往最新消息' : 'Jump to latest message'}
-            title={zh ? '前往最新消息' : 'Jump to latest message'}
+            aria-label={t(language, 'agent.jumpLatest')}
+            title={t(language, 'agent.jumpLatest')}
             onClick={scrollToLatest}
           >
             <DeepCodeShellIcon name="chevronDown" />
@@ -590,11 +671,114 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         )}
       </div>
 
-      <footer className="local-agent__composer-shell">
+      <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction
+        ? ' local-agent__composer-shell--decision'
+        : ''}`}>
         {error && <div className="local-agent__error">{error}</div>}
         {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
         {uiActionError && <div className="local-agent__error">{uiActionError}</div>}
-        <div
+        {(pendingPlan || pendingInteraction) && (
+          <section className="local-agent__interaction-panel">
+            <header className="local-agent__interaction-panel-heading">
+              <strong>{pendingPlan
+                ? t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })
+                : pendingInteraction?.prompt}</strong>
+              {pendingPlan && (
+                <button
+                  type="button"
+                  className="local-agent__interaction-close"
+                  aria-label={t(language, 'agent.plan.ignoreAndStop')}
+                  title={t(language, 'agent.plan.ignoreAndStop')}
+                  disabled={submitting}
+                  onClick={() => void submitPlanDecision({ kind: 'cancel' })}
+                >×</button>
+              )}
+            </header>
+            <ol className="local-agent__interaction-options">
+              {pendingPlan ? (
+                <li>
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => void submitPlanDecision({ kind: 'confirm' })}
+                  >
+                    <span className="local-agent__interaction-option-marker" aria-hidden="true">1</span>
+                    <span className="local-agent__interaction-option-copy">
+                      <b>{t(language, 'agent.plan.adopt')}</b>
+                      <small>{t(language, 'agent.plan.adoptTodoHint')}</small>
+                    </span>
+                    <span className="local-agent__interaction-option-chevron" aria-hidden="true">
+                      <DeepCodeShellIcon name="chevronRight" />
+                    </span>
+                  </button>
+                </li>
+              ) : pendingInteraction?.options?.map((option, index) => (
+                <li key={option.id}>
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => {
+                      setDraft('');
+                      void respondInteraction(option.label).catch(() => undefined);
+                    }}
+                  >
+                    <span className="local-agent__interaction-option-marker" aria-hidden="true">
+                      {index + 1}
+                    </span>
+                    <span className="local-agent__interaction-option-copy">
+                      <b>{option.label}</b>
+                      {option.description && <small>{option.description}</small>}
+                    </span>
+                    <span className="local-agent__interaction-option-chevron" aria-hidden="true">
+                      <DeepCodeShellIcon name="chevronRight" />
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+            {(pendingPlan || pendingInteraction?.allowFreeform) && (
+              <div className="local-agent__interaction-composer">
+                <span className="local-agent__interaction-compose-mark" aria-hidden="true">
+                  <DeepCodeShellIcon name="compose" />
+                </span>
+                <textarea
+                  ref={textareaRef}
+                  value={draft}
+                  rows={1}
+                  placeholder={pendingPlan
+                    ? t(language, 'agent.composer.placeholder.plan')
+                    : t(language, 'agent.composer.placeholder.interaction')}
+                  onChange={(event) => setDraft(event.target.value)}
+                  onCompositionStart={beginComposition}
+                  onCompositionEnd={endComposition}
+                  onKeyDown={submitOnComposerEnter}
+                />
+                {pendingPlan ? (
+                  <button
+                    type="button"
+                    className="local-agent__interaction-secondary"
+                    disabled={submitting}
+                    onClick={() => void submitPlanDecision({ kind: 'cancel' })}
+                  >
+                    <span>{t(language, 'agent.plan.ignoreAndStop')}</span>
+                    <kbd>Esc</kbd>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="local-agent__interaction-secondary"
+                    disabled={submitting}
+                    onClick={() => {
+                      setDraft('');
+                      void respondInteraction(t(language, 'agent.interaction.skip')).catch(() => undefined);
+                    }}
+                  >{t(language, 'agent.interaction.skip')}</button>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+        {!pendingPlan && !pendingInteraction && <div
           className="local-agent__composer"
           onMouseDown={(event) => {
             const target = event.target as HTMLElement;
@@ -603,97 +787,32 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             textareaRef.current?.focus();
           }}
         >
-          {pendingPlan && (
-            <div className="local-agent__decision">
-              <div className="local-agent__decision-heading">
-                <strong>{pendingPlan.prompt}</strong>
+          {focusCommandSuggestionVisible && (
+            <div
+              className="local-agent__command-suggestions"
+              role="listbox"
+              aria-label={t(language, 'agent.context.focusCommand')}
+            >
+              <button
+                type="button"
+                role="option"
+                aria-selected="true"
+                onClick={selectFocusCommand}
+              >
+                <DeepCodeShellIcon name="activity" />
                 <span>
-                  {zh
-                    ? '首次点击选择，再次点击或按 Enter 确认'
-                    : 'Click once to select; click again or press Enter to confirm'}
+                  <b>{t(language, 'agent.context.focusCommand')}</b>
+                  <small>{t(language, 'agent.context.focusCommandDescription')}</small>
                 </span>
-              </div>
-              <ol>
-                {pendingPlan.options.map((option, index) => (
-                  <li key={option.optionId}>
-                    <button
-                      type="button"
-                      className={selectedPlanOptionId === option.optionId ? 'is-selected' : ''}
-                      aria-pressed={selectedPlanOptionId === option.optionId}
-                      disabled={submitting}
-                      onClick={() => void selectOrConfirmPlanOption(option.optionId)}
-                    >
-                      <span className="local-agent__plan-option-marker" aria-hidden="true">{index + 1}</span>
-                      <span>
-                        <b>{option.label}</b>
-                        {option.description && <small>{option.description}</small>}
-                        {option.operationsDisplay.length > 0 && (
-                          <small>
-                            {zh
-                              ? `${option.operationsDisplay.length} 项精确操作`
-                              : `${option.operationsDisplay.length} exact operation(s)`}
-                          </small>
-                        )}
-                      </span>
-                      <span className="local-agent__plan-option-confirm" aria-hidden="true">
-                        <DeepCodeShellIcon name="chevronRight" />
-                      </span>
-                    </button>
-                    {option.operationsDisplay.length > 0 && (
-                      <details className="local-agent__plan-operations">
-                        <summary>
-                          {zh ? '查看操作目标' : 'Review operation targets'}
-                        </summary>
-                        <ul>
-                          {option.operationsDisplay.map((operation) => (
-                            <li key={operation}><code>{operation}</code></li>
-                          ))}
-                        </ul>
-                      </details>
-                    )}
-                  </li>
-                ))}
-              </ol>
-            </div>
-          )}
-          {pendingInteraction && (
-            <div className="local-agent__decision">
-              <div className="local-agent__decision-heading">
-                <strong>{pendingInteraction.prompt}</strong>
-                <span>{zh ? '需要你的决定' : 'Your input is needed'}</span>
-              </div>
-              {pendingInteraction.options && pendingInteraction.options.length > 0 && (
-                <ol>
-                  {pendingInteraction.options.map((option, index) => (
-                    <li key={option.id}>
-                      <button
-                        type="button"
-                        disabled={submitting}
-                        onClick={() => {
-                          setDraft(option.label);
-                          textareaRef.current?.focus();
-                        }}
-                      >
-                        <span className="local-agent__plan-option-marker" aria-hidden="true">{index + 1}</span>
-                        <span>
-                          <b>{option.label}</b>
-                          {option.description && <small>{option.description}</small>}
-                        </span>
-                        <span className="local-agent__plan-option-confirm" aria-hidden="true">
-                          <DeepCodeShellIcon name="chevronRight" />
-                        </span>
-                      </button>
-                    </li>
-                  ))}
-                </ol>
-              )}
+                <kbd>/focus</kbd>
+              </button>
             </div>
           )}
           {pendingApproval && (
             <div className="local-agent__decision">
               <div className="local-agent__decision-heading">
                 <strong>{pendingApproval.preview.summary}</strong>
-                <span>{zh ? '需要你批准此操作' : 'This action needs your approval'}</span>
+                <span>{t(language, 'agent.approval.required')}</span>
               </div>
               {pendingApproval.preview.logicalTargets.length > 0 && (
                 <ul className="local-agent__decision-targets">
@@ -707,81 +826,53 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   type="button"
                   disabled={submitting}
                   onClick={() => void respondApproval('deny')}
-                >{zh ? '拒绝' : 'Deny'}</button>
+                >{t(language, 'agent.approval.deny')}</button>
                 <button
                   type="button"
                   className="local-agent__button--primary"
                   disabled={submitting}
                   onClick={() => void respondApproval('allow')}
-                >{zh ? '允许' : 'Allow'}</button>
+                >{t(language, 'agent.approval.allow')}</button>
               </div>
             </div>
           )}
           <textarea
             ref={textareaRef}
             value={draft}
-            disabled={loading || profiles.length === 0 || Boolean(pendingApproval)}
-            rows={pendingPlan || pendingInteraction || pendingApproval ? 2 : 3}
-            placeholder={pendingPlan
-              ? (zh ? '输入选项编号，或直接说明如何调整计划…' : 'Enter an option number, or describe revisions…')
-              : pendingInteraction
-                ? (zh ? '输入你的回应…' : 'Enter your response…')
-                : pendingApproval
-                  ? (zh ? '请允许或拒绝上述操作。' : 'Allow or deny the action above.')
-                : (zh ? '描述要完成的编码任务…' : 'Describe a coding task…')}
+            disabled={Boolean(pendingApproval)}
+            rows={pendingApproval ? 2 : 3}
+            placeholder={pendingApproval
+              ? t(language, 'agent.composer.placeholder.approval')
+              : t(language, 'agent.composer.placeholder.task')}
             onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape' && pendingPlan && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                void submitIgnorePlan();
-                return;
-              }
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                void submitDraft();
-              }
-            }}
+            onCompositionStart={beginComposition}
+            onCompositionEnd={endComposition}
+            onKeyDown={submitOnComposerEnter}
           />
-          {attachments.length > 0 && (
+          {(attachments.length > 0 || pendingDirectoryPaths.length > 0) && (
             <div className="local-agent__draft-attachments">
               {attachments.map((attachment) => (
                 <span key={attachment.attachmentId}>
+                  <DeepCodeShellIcon name="artifact" />
                   {attachment.name}
                   <button
                     type="button"
-                    aria-label={zh ? `移除 ${attachment.name}` : `Remove ${attachment.name}`}
+                    aria-label={t(language, 'agent.attachment.remove', {
+                      name: attachment.name,
+                    })}
                     onClick={() => setAttachments((current) => current.filter((item) => (
                       item.attachmentId !== attachment.attachmentId
                     )))}
                   >×</button>
                 </span>
               ))}
-            </div>
-          )}
-          {(projection?.sessionDirectoryIndexes.length || pendingDirectoryPaths.length) ? (
-            <div className="local-agent__draft-attachments local-agent__directory-indexes">
-              {projection?.sessionDirectoryIndexes.map((binding) => (
-                <span key={binding.workspaceId}>
-                  {zh ? '目录' : 'Folder'} · {binding.displayName}
-                  {activeRun && !runWorkspaceIds.has(binding.workspaceId) && (
-                    <small>{zh ? '下轮生效' : 'Next run'}</small>
-                  )}
-                  <button
-                    type="button"
-                    disabled={catalogBusy}
-                    aria-label={zh
-                      ? `移除目录索引 ${binding.displayName}`
-                      : `Remove folder index ${binding.displayName}`}
-                    onClick={() => void detachSessionDirectory(binding.workspaceId)}
-                  >×</button>
-                </span>
-              ))}
               {pendingDirectoryPaths.map((path) => (
-                <span key={path}>
-                  {zh ? '目录' : 'Folder'} · {directoryDisplayName(path)}
+                <span className="local-agent__draft-directory" key={path}>
+                  <DeepCodeShellIcon name="folder" />
+                  {t(language, 'agent.attachment.folder')} · {directoryDisplayName(path)}
                   <button
                     type="button"
-                    aria-label={zh ? '移除待附加目录' : 'Remove pending folder'}
+                    aria-label={t(language, 'agent.attachment.removePendingDirectory')}
                     onClick={() => setPendingDirectoryPaths((current) => (
                       current.filter((candidate) => candidate !== path)
                     ))}
@@ -789,13 +880,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 </span>
               ))}
             </div>
-          ) : null}
-          {directoryIndexChangeDeferred && (
-            <small className="local-agent__directory-index-note">
-              {zh
-                ? '目录索引变化从下一轮生效；当前运行继续使用启动时冻结的目录集合。'
-                : 'Directory-index changes apply next run; the active run keeps its frozen start snapshot.'}
-            </small>
           )}
           <div className="local-agent__composer-footer">
             <div className="local-agent__composer-tools">
@@ -803,10 +887,11 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 <button
                   type="button"
                   className="local-agent__attach"
-                  aria-label={zh ? '附加文件或目录' : 'Attach files or folders'}
-                  title={zh ? '附加文件或目录' : 'Attach files or folders'}
+                  aria-label={t(language, 'agent.attachment.menu')}
+                  title={t(language, 'agent.attachment.menu')}
                   aria-expanded={attachmentMenuOpen}
-                  disabled={Boolean(pendingPlan || pendingInteraction || pendingApproval || catalogBusy)}
+                  aria-haspopup="menu"
+                  disabled={Boolean(pendingApproval || catalogBusy)}
                   onClick={() => {
                     setAttachmentMenuOpen((open) => !open);
                     setPermissionMenuOpen(false);
@@ -814,42 +899,31 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 >
                   <DeepCodeShellIcon name="plus" />
                 </button>
-                <input
-                  ref={attachmentInputRef}
-                  className="local-agent__attachment-input"
-                  type="file"
-                  multiple
-                  onChange={(event) => {
-                    void selectAttachments(event.target.files);
-                    event.target.value = '';
-                  }}
-                />
                 {attachmentMenuOpen && (
-                  <div className="local-agent__attachment-menu">
+                  <div className="local-agent__attachment-menu" role="menu">
                     <button
                       type="button"
+                      role="menuitem"
                       onClick={() => {
                         setAttachmentMenuOpen(false);
-                        attachmentInputRef.current?.click();
+                        setAttachmentDialogOpen(true);
                       }}
                     >
-                      <DeepCodeShellIcon name="artifact" />
+                      <DeepCodeShellIcon name="paperclip" />
                       <span>
-                        <strong>{zh ? '添加文件' : 'Add files'}</strong>
-                        <small>{zh ? '作为本条消息的内容快照' : 'Immutable content snapshots for this message'}</small>
+                        <b>{t(language, 'agent.attachment.filesAndFolders')}</b>
+                        <small>{t(language, 'agent.attachment.pickerDescription')}</small>
                       </span>
                     </button>
                     <button
                       type="button"
-                      onClick={() => {
-                        setAttachmentMenuOpen(false);
-                        setFolderDialogOpen(true);
-                      }}
+                      role="menuitem"
+                      onClick={insertFocusCommand}
                     >
-                      <DeepCodeShellIcon name="folder" />
+                      <DeepCodeShellIcon name="activity" />
                       <span>
-                        <strong>{zh ? '添加文件夹' : 'Add folder'}</strong>
-                        <small>{zh ? '作为此对话的目录索引' : 'Attach as a directory index for this conversation'}</small>
+                        <b>{t(language, 'agent.context.focusCommand')}</b>
+                        <small>{t(language, 'agent.context.focusCommandDescription')}</small>
                       </span>
                     </button>
                   </div>
@@ -865,47 +939,87 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     setAttachmentMenuOpen(false);
                   }}
                 >
-                  {zh ? '读取：工作区内允许 · 写入：Plan 门禁' : 'Read: bound workspaces · Write: Plan-gated'}
+                  {t(
+                    language,
+                    runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
+                      ? 'agent.permission.summary.allow'
+                      : 'agent.permission.summary.plan',
+                  )}
                 </button>
                 {permissionMenuOpen && (
                   <div className="local-agent__permission-menu">
+                    {settingsRestartRequired && (
+                      <div className="local-agent__permission-restart-notice">
+                        {t(language, 'agent.permission.restartRequired')}
+                      </div>
+                    )}
                     <div className="local-agent__permission-invariant">
-                      <span>{zh ? '工作区读取' : 'Workspace read'}</span>
-                      <strong>{zh ? '绑定目录内允许' : 'Allowed when bound'}</strong>
-                    </div>
-                    <div className="local-agent__permission-invariant">
-                      <span>{zh ? '工作区修改' : 'Workspace mutation'}</span>
-                      <strong>{zh ? '结构化 Plan 门禁' : 'Structured Plan gate'}</strong>
+                      <span>{t(language, 'agent.permission.workspaceRead')}</span>
+                      <strong>{t(language, 'agent.permission.workspaceReadAllowed')}</strong>
                     </div>
                     {permissionSetting(
-                      zh ? '网络读取' : 'Network read',
+                      t(language, 'agent.permission.workspaceMutation'),
+                      'agent.permissions.workspaceMutation',
+                      effectiveSettings,
+                      patchUserSetting,
+                      [
+                        {
+                          value: 'plan',
+                          label: t(language, 'agent.permission.workspaceMutationPlan'),
+                        },
+                        {
+                          value: 'allow',
+                          label: t(language, 'agent.permission.workspaceMutationAllow'),
+                        },
+                      ],
+                      'plan',
+                    )}
+                    {permissionSetting(
+                      t(language, 'agent.permission.engineeringDecisions'),
+                      'agent.permissions.engineeringDecisions',
+                      effectiveSettings,
+                      patchUserSetting,
+                      [
+                        {
+                          value: 'ask',
+                          label: t(language, 'agent.permission.engineeringDecisionsAsk'),
+                        },
+                        {
+                          value: 'delegate',
+                          label: t(language, 'agent.permission.engineeringDecisionsDelegate'),
+                        },
+                      ],
+                      'ask',
+                    )}
+                    {permissionSetting(
+                      t(language, 'agent.permission.networkRead'),
                       'agent.permissions.networkRead',
                       effectiveSettings,
                       patchUserSetting,
-                      zh,
+                      [
+                        { value: 'allow', label: t(language, 'agent.permission.allow') },
+                        { value: 'ask', label: t(language, 'agent.permission.ask') },
+                        { value: 'deny', label: t(language, 'agent.permission.deny') },
+                      ],
+                      'ask',
                     )}
                     {permissionSetting(
-                      zh ? '外部操作' : 'External effects',
+                      t(language, 'agent.permission.externalEffects'),
                       'agent.permissions.external',
                       effectiveSettings,
                       patchUserSetting,
-                      zh,
+                      [
+                        { value: 'allow', label: t(language, 'agent.permission.allow') },
+                        { value: 'ask', label: t(language, 'agent.permission.ask') },
+                        { value: 'deny', label: t(language, 'agent.permission.deny') },
+                      ],
+                      'ask',
                     )}
                   </div>
                 )}
               </div>
             </div>
             <div className="local-agent__composer-actions">
-              {pendingPlan && (
-                <button
-                  type="button"
-                  className="local-agent__plan-ignore"
-                  disabled={submitting}
-                  onClick={() => void submitIgnorePlan()}
-                >
-                  {zh ? '忽略' : 'Ignore'}
-                </button>
-              )}
               <SessionModelSelector
                 language={language}
                 profiles={profiles}
@@ -919,13 +1033,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 type="button"
                 className={`local-agent__send${showStopAction ? ' local-agent__send--stop' : ''}`}
                 aria-label={showStopAction
-                  ? (zh ? '停止当前运行' : 'Stop current run')
+                  ? t(language, 'agent.composer.stopCurrentRun')
                   : submitting
-                    ? (zh ? '提交中' : 'Sending')
-                    : (zh ? '发送' : 'Send')}
+                    ? t(language, 'agent.composer.sending')
+                    : t(language, 'agent.composer.send')}
                 title={showStopAction
-                  ? (zh ? '停止' : 'Stop')
-                  : (zh ? '发送（Enter）' : 'Send (Enter)')}
+                  ? t(language, 'agent.composer.stop')
+                  : t(language, 'agent.composer.sendEnter')}
                 disabled={showStopAction ? submitting : !canSend}
                 onClick={() => {
                   if (showStopAction) {
@@ -939,10 +1053,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               </button>
             </div>
           </div>
-        </div>
-        <div className="local-agent__composer-hint">
-          {zh ? 'Enter 发送 · Shift+Enter 换行' : 'Enter to send · Shift+Enter for a new line'}
-        </div>
+        </div>}
+        {!pendingPlan && !pendingInteraction && (
+          <div className="local-agent__composer-hint">
+            {t(language, 'agent.composer.hint')}
+          </div>
+        )}
       </footer>
       {resourcePreview && (
         <div
@@ -956,32 +1072,33 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             className="local-agent__resource-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={zh ? '只读资源预览' : 'Read-only resource preview'}
+            aria-label={t(language, 'agent.resource.preview')}
           >
             <header>
               <div>
                 <strong>{resourcePreview.logicalPath}</strong>
-                <span>{zh ? '工作区资源 · 只读' : 'Workspace resource · Read only'}</span>
+                <span>{t(language, 'agent.resource.readOnly')}</span>
               </div>
               <button
                 type="button"
-                aria-label={zh ? '关闭' : 'Close'}
+                aria-label={t(language, 'window.close')}
                 onClick={() => setResourcePreview(null)}
               >×</button>
             </header>
             <div className="local-agent__resource-body">
               {resourcePreview.status === 'loading' ? (
-                <p>{zh ? '正在读取资源…' : 'Reading resource…'}</p>
+                <p>{t(language, 'agent.resource.reading')}</p>
               ) : resourcePreview.status === 'error' ? (
                 <p className="local-agent__resource-error">{resourcePreview.error}</p>
               ) : (
                 <>
                   <div className="local-agent__resource-meta">
-                    <span>{formatBytes(resourcePreview.result.sizeBytes)}</span>
+                    <span>{formatBytes(resourcePreview.result.sizeBytes, language)}</span>
                     <span>
-                      {zh
-                        ? `${resourcePreview.result.startLine}–${resourcePreview.result.endLine} 行`
-                        : `Lines ${resourcePreview.result.startLine}–${resourcePreview.result.endLine}`}
+                      {t(language, 'agent.resource.lines', {
+                        start: resourcePreview.result.startLine,
+                        end: resourcePreview.result.endLine,
+                      })}
                     </span>
                   </div>
                   <pre>{resourcePreview.result.content}</pre>
@@ -991,11 +1108,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           </section>
         </div>
       )}
-      {folderDialogOpen && (
+      {attachmentDialogOpen && (
         <ProjectFolderDialog
           language={language}
-          onCancel={() => setFolderDialogOpen(false)}
-          onSelect={(absolutePath) => void selectDirectoryIndex(absolutePath)}
+          selectionMode="messageAttachment"
+          onCancel={() => setAttachmentDialogOpen(false)}
+          onSelect={(absolutePath, type) => {
+            void selectMessageAttachment(absolutePath, type);
+          }}
         />
       )}
     </section>
@@ -1004,13 +1124,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 
 interface ToolActivityGroupProps {
   activities: ActivityProjection[];
-  zh: boolean;
+  language: UiLanguage;
   onOpenWorkspaceResource(workspaceId: string, logicalPath: string): void;
 }
 
 const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   activities,
-  zh,
+  language,
   onOpenWorkspaceResource,
 }) => {
   const terminal = activities.every((activity) => isTerminalActivity(activity.status));
@@ -1039,8 +1159,10 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
         <span className="local-agent__tool-group-icon">
           <DeepCodeShellIcon name="tool" />
         </span>
-        <strong>{toolGroupSummary(activities, zh)}</strong>
-        <span>{toolActivityStatus(groupStatus, zh)}</span>
+        <strong>{toolGroupSummary(activities, language)}</strong>
+        {groupStatus !== 'completed' && (
+          <span>{toolActivityStatus(groupStatus, language)}</span>
+        )}
         <span className="local-agent__tool-group-chevron" aria-hidden="true">
           <DeepCodeShellIcon name="chevronRight" />
         </span>
@@ -1048,47 +1170,12 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
       {expanded && (
         <div className="local-agent__tool-group-items">
           {activities.map((activity) => (
-            <div
-              className={`local-agent__tool-entry local-agent__tool-entry--${activity.status}`}
+            <ToolActivityEntry
+              activity={activity}
               key={activity.activityId}
-            >
-              <div className="local-agent__tool-entry-heading">
-                <strong>{activity.tool?.operation ?? activity.label}</strong>
-                <span>{toolActivityStatus(activity.status, zh)}</span>
-              </div>
-              {activity.tool?.resources.length ? (
-                <div className="local-agent__tool-resources">
-                  {activity.tool.resources.map((resource, index) => {
-                    const key = `${resource.kind}:${resource.workspaceId ?? ''}:${resource.logicalPath ?? resource.uri ?? resource.label}:${index}`;
-                    if (
-                      resource.kind === 'workspacePath'
-                      && resource.workspaceId
-                      && resource.logicalPath
-                    ) {
-                      return (
-                        <button
-                          type="button"
-                          key={key}
-                          onClick={() => onOpenWorkspaceResource(
-                            resource.workspaceId!, resource.logicalPath!,
-                          )}
-                        >
-                          {resource.label}
-                        </button>
-                      );
-                    }
-                    if (resource.kind === 'url' && resource.uri) {
-                      return (
-                        <a href={resource.uri} key={key} rel="noreferrer" target="_blank">
-                          {resource.label}
-                        </a>
-                      );
-                    }
-                    return <span key={key}>{resource.label}</span>;
-                  })}
-                </div>
-              ) : null}
-            </div>
+              language={language}
+              onOpenWorkspaceResource={onOpenWorkspaceResource}
+            />
           ))}
         </div>
       )}
@@ -1096,20 +1183,156 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   );
 };
 
+interface ToolActivityEntryProps {
+  activity: ActivityProjection;
+  language: UiLanguage;
+  onOpenWorkspaceResource(workspaceId: string, logicalPath: string): void;
+}
+
+const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
+  activity,
+  language,
+  onOpenWorkspaceResource,
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const tool = activity.tool;
+  const shell = tool?.shell;
+  const result = shell?.result;
+  return (
+    <div className={`local-agent__tool-entry local-agent__tool-entry--${activity.status}`}>
+      <button
+        type="button"
+        className="local-agent__tool-entry-heading"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <strong>{toolActivitySummary(activity, language)}</strong>
+        {activity.status !== 'completed' && (
+          <span>{toolActivityStatus(activity.status, language)}</span>
+        )}
+        <span className="local-agent__tool-entry-chevron" aria-hidden="true">
+          <DeepCodeShellIcon name="chevronRight" />
+        </span>
+      </button>
+      {expanded && (
+        <div className="local-agent__tool-entry-details">
+          <dl>
+            <div>
+              <dt>{t(language, 'agent.tool.detail.operation')}</dt>
+              <dd><code>{tool?.operation ?? activity.label}</code></dd>
+            </div>
+            {shell && (
+              <>
+                <div>
+                  <dt>{t(language, 'agent.tool.shell.command')}</dt>
+                  <dd><code>{shell.command}</code></dd>
+                </div>
+                <div>
+                  <dt>{t(language, 'agent.tool.shell.cwd')}</dt>
+                  <dd><code>{shell.cwd}</code></dd>
+                </div>
+                {result?.environment && (
+                  <>
+                    <div>
+                      <dt>{t(language, 'agent.tool.shell.environment')}</dt>
+                      <dd>{t(language, 'agent.tool.shell.environmentValue', {
+                        shell: result.environment.shell,
+                      })}</dd>
+                    </div>
+                    <div>
+                      <dt>{t(language, 'agent.tool.shell.writeScope')}</dt>
+                      <dd>{t(language, 'agent.tool.shell.writeScopeValue')}</dd>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </dl>
+          {tool?.resources.length ? (
+            <div className="local-agent__tool-resources">
+              {tool.resources.map((resource, index) => {
+                const key = `${resource.kind}:${resource.workspaceId ?? ''}:${resource.logicalPath ?? resource.uri ?? resource.label}:${index}`;
+                if (
+                  resource.kind === 'workspacePath'
+                  && resource.workspaceId
+                  && resource.logicalPath
+                ) {
+                  return (
+                    <button
+                      type="button"
+                      key={key}
+                      onClick={() => onOpenWorkspaceResource(
+                        resource.workspaceId!, resource.logicalPath!,
+                      )}
+                    >
+                      {resource.label}
+                    </button>
+                  );
+                }
+                if (resource.kind === 'url' && resource.uri) {
+                  return (
+                    <a href={resource.uri} key={key} rel="noreferrer" target="_blank">
+                      {resource.label}
+                    </a>
+                  );
+                }
+                return <span key={key}>{resource.label}</span>;
+              })}
+            </div>
+          ) : null}
+          {result && (
+            <div className="local-agent__shell-result">
+              <div className="local-agent__shell-result-meta">
+                <span>{t(language, 'agent.tool.shell.exit', {
+                  code: result.exitCode ?? t(language, 'agent.tool.shell.noExitCode'),
+                })}</span>
+                <span>{t(language, 'agent.tool.shell.duration', {
+                  duration: result.durationMs,
+                })}</span>
+                {result.timedOut && <span>{t(language, 'agent.tool.shell.timedOut')}</span>}
+                {result.truncated && <span>{t(language, 'agent.tool.shell.truncated')}</span>}
+              </div>
+              {result.stdout && (
+                <section>
+                  <span>{t(language, 'agent.tool.shell.stdout')}</span>
+                  <pre>{result.stdout}</pre>
+                </section>
+              )}
+              {result.stderr && (
+                <section>
+                  <span>{t(language, 'agent.tool.shell.stderr')}</span>
+                  <pre>{result.stderr}</pre>
+                </section>
+              )}
+              {!result.stdout && !result.stderr && (
+                <small>{t(language, 'agent.tool.shell.noOutput')}</small>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 function permissionSetting(
   label: string,
-  key: 'agent.permissions.networkRead' | 'agent.permissions.external',
+  key: string,
   settings: Record<string, unknown>,
   patch: (key: string, value: string) => Promise<unknown>,
-  zh: boolean,
+  options: readonly {value: string; label: string}[],
+  defaultValue: string,
 ): React.ReactNode {
   return (
     <label>
       <span>{label}</span>
-      <select value={String(settings[key] ?? 'ask')} onChange={(event) => void patch(key, event.target.value)}>
-        <option value="allow">{zh ? '允许' : 'Allow'}</option>
-        <option value="ask">{zh ? '询问' : 'Ask'}</option>
-        <option value="deny">{zh ? '拒绝' : 'Deny'}</option>
+      <select
+        value={String(settings[key] ?? defaultValue)}
+        onChange={(event) => void patch(key, event.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
       </select>
     </label>
   );
@@ -1117,36 +1340,36 @@ function permissionSetting(
 
 function conversationTitle(
   messages: { role: string; content: string }[] | undefined,
-  zh: boolean,
+  language: UiLanguage,
 ): string {
   const first = messages?.find((message) => message.role === 'user')?.content.trim();
-  if (!first) return zh ? '新对话' : 'New conversation';
+  if (!first) return t(language, 'agent.session.newTitle');
   const line = first.split(/\r?\n/u, 1)[0].trim();
   return line.length > 34 ? `${line.slice(0, 34)}…` : line;
 }
 
-function runLabel(run: RunProjection | null, zh: boolean): string {
-  if (!run) return zh ? '空闲' : 'Idle';
+function runLabel(run: RunProjection | null, language: UiLanguage): string {
+  if (!run) return t(language, 'agent.run.status.idle');
   if (run.status === 'waiting' && run.waitingReason === 'userInput') {
-    return zh ? '等待输入' : 'Waiting for input';
+    return t(language, 'agent.run.status.waitingUserInput');
   }
   if (run.status === 'waiting' && run.waitingReason === 'plan') {
-    return zh ? '等待计划选择' : 'Waiting for plan response';
+    return t(language, 'agent.run.status.waitingPlan');
   }
-  const labels: Record<RunProjection['status'], readonly [string, string]> = {
-    running: ['运行中', 'Running'],
-    waiting: ['等待决定', 'Waiting'],
-    completed: ['已完成', 'Completed'],
-    failed: ['失败', 'Failed'],
-    cancelled: ['已取消', 'Cancelled'],
-    indeterminate: ['结果待确认', 'Indeterminate'],
-  };
-  return labels[run.status][zh ? 0 : 1];
+  return t(language, `agent.run.status.${run.status}`);
+}
+
+function samePlanReference(
+  reference: { planId: string; revision: number } | null | undefined,
+  plan: { planId: string; revision: number },
+): boolean {
+  return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
 type RawProjectionItem =
   | { type: 'message'; sequence: number; value: SessionProjection['messages'][number] }
   | { type: 'narrative'; sequence: number; value: SessionProjection['narratives'][number] }
+  | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
   | { type: 'tool'; sequence: number; value: ActivityProjection };
 
 type ProjectionItem =
@@ -1166,6 +1389,9 @@ function projectionItems(projection: SessionProjection | null): ProjectionItem[]
       .map((value): RawProjectionItem => ({ type: 'message', sequence: value.sequence, value })),
     ...projection.narratives.map((value): RawProjectionItem => ({
       type: 'narrative', sequence: value.sequence, value,
+    })),
+    ...projection.plans.map((value): RawProjectionItem => ({
+      type: 'plan', sequence: value.sequence, value,
     })),
     ...projection.activities
       .filter((activity) => activity.kind === 'tool')
@@ -1191,45 +1417,111 @@ function projectionItems(projection: SessionProjection | null): ProjectionItem[]
   }, []);
 }
 
-function toolGroupSummary(activities: ActivityProjection[], zh: boolean): string {
+function toolGroupSummary(
+  activities: ActivityProjection[],
+  language: UiLanguage,
+): string {
   const status = toolGroupStatus(activities);
   const operation = activities.length === 1
     ? (activities[0].tool?.operation ?? activities[0].label)
     : null;
   if (status === 'active') {
-    if (operation) return zh ? `正在调用工具 ${operation}` : `Calling tool ${operation}`;
-    return zh ? `正在调用 ${activities.length} 个工具` : `Calling ${activities.length} tools`;
+    if (operation) return t(language, 'agent.tool.summary.activeOne', { operation });
+    return t(language, 'agent.tool.summary.activeMany', { count: activities.length });
   }
   if (status === 'requested') {
-    if (operation) return zh ? `已请求工具 ${operation}` : `Requested tool ${operation}`;
-    return zh ? `已请求 ${activities.length} 个工具` : `Requested ${activities.length} tools`;
+    if (operation) return t(language, 'agent.tool.summary.requestedOne', { operation });
+    return t(language, 'agent.tool.summary.requestedMany', { count: activities.length });
   }
   if (status === 'waiting') {
-    if (operation) return zh ? `工具 ${operation} 等待中` : `Tool ${operation} is waiting`;
-    return zh ? `${activities.length} 个工具等待中` : `${activities.length} tools are waiting`;
+    if (operation) return t(language, 'agent.tool.summary.waitingOne', { operation });
+    return t(language, 'agent.tool.summary.waitingMany', { count: activities.length });
   }
   if (activities.length === 1) {
-    return zh ? `使用了工具 ${operation}` : `Used tool ${operation}`;
+    return toolActivitySummary(activities[0], language);
   }
-  return zh ? `使用了 ${activities.length} 次工具` : `Used ${activities.length} tools`;
+  if (status === 'completed') {
+    const hasShell = activities.some((activity) => (
+      activity.tool?.operation === 'process.shell'
+    ));
+    const editCount = activities.filter((activity) => (
+      isFileMutationOperation(activity.tool?.operation)
+    )).length;
+    if (hasShell && editCount > 0) {
+      return t(language, 'agent.tool.summary.editedAndRan');
+    }
+    if (editCount === activities.length) {
+      return t(language, 'agent.tool.summary.editedMany', { count: editCount });
+    }
+  }
+  return t(language, 'agent.tool.summary.usedMany', { count: activities.length });
+}
+
+function toolActivitySummary(activity: ActivityProjection, language: UiLanguage): string {
+  const operation = activity.tool?.operation ?? activity.label;
+  const target = activity.tool?.resources[0]?.label;
+  const command = activity.tool?.shell?.command;
+  if (activity.status === 'completed') {
+    if (operation === 'process.shell' && command) {
+      return t(language, 'agent.tool.activity.ranCommand', { command });
+    }
+    if (operation === 'fs.ensure_directory' && target) {
+      return t(language, 'agent.tool.activity.createdDirectory', { path: target });
+    }
+    if (operation === 'fs.delete' && target) {
+      return t(language, 'agent.tool.activity.deletedPath', { path: target });
+    }
+    if (isFileMutationOperation(operation) && target) {
+      return t(language, 'agent.tool.activity.editedPath', { path: target });
+    }
+    if (operation === 'fs.read' && target) {
+      return t(language, 'agent.tool.activity.readPath', { path: target });
+    }
+    if (operation === 'fs.list' && target) {
+      return t(language, 'agent.tool.activity.readDirectory', { path: target });
+    }
+    if (operation === 'fs.stat' && target) {
+      return t(language, 'agent.tool.activity.inspectedPath', { path: target });
+    }
+    return t(language, 'agent.tool.summary.usedOne', { operation });
+  }
+  if (['failed', 'denied', 'indeterminate', 'cancelled'].includes(activity.status)) {
+    if (operation === 'process.shell' && command) {
+      return t(language, 'agent.tool.activity.commandDidNotComplete', { command });
+    }
+    return t(language, 'agent.tool.activity.didNotComplete', {
+      operation,
+      target: target ? ` · ${target}` : '',
+    });
+  }
+  if (operation === 'process.shell' && command) {
+    return t(language, 'agent.tool.activity.runningCommand', { command });
+  }
+  return t(language, 'agent.tool.activity.runningOperation', {
+    operation,
+    target: target ? ` · ${target}` : '',
+  });
+}
+
+function isFileMutationOperation(operation: string | undefined): boolean {
+  return operation !== undefined && [
+    'fs.create',
+    'fs.write',
+    'fs.edit',
+    'fs.ensure_directory',
+    'fs.delete',
+  ].includes(operation);
 }
 
 function isTerminalActivity(status: ActivityProjection['status']): boolean {
   return ['completed', 'denied', 'failed', 'cancelled', 'indeterminate'].includes(status);
 }
 
-function toolActivityStatus(status: ActivityProjection['status'], zh: boolean): string {
-  const labels: Record<ActivityProjection['status'], readonly [string, string]> = {
-    active: ['调用中', 'Running'],
-    requested: ['已请求', 'Requested'],
-    waiting: ['等待中', 'Waiting'],
-    completed: ['完成', 'Done'],
-    denied: ['已拒绝', 'Denied'],
-    failed: ['失败', 'Failed'],
-    cancelled: ['已取消', 'Cancelled'],
-    indeterminate: ['待确认', 'Unknown'],
-  };
-  return labels[status][zh ? 0 : 1];
+function toolActivityStatus(
+  status: ActivityProjection['status'],
+  language: UiLanguage,
+): string {
+  return t(language, `agent.tool.status.${status}`);
 }
 
 function toolGroupStatus(
@@ -1260,9 +1552,15 @@ function directoryDisplayName(absolutePath: string): string {
   return normalized.split(/[\\/]/u).at(-1) || absolutePath;
 }
 
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  return `${Math.ceil(value / 1024)} KiB`;
+function formatBytes(value: number, language: UiLanguage): string {
+  if (value < 1024) {
+    return t(language, 'agent.attachment.size.bytes', {
+      value: value.toLocaleString(language),
+    });
+  }
+  return t(language, 'agent.attachment.size.kibibytes', {
+    value: Math.ceil(value / 1024).toLocaleString(language),
+  });
 }
 
 type ResourcePreviewState =

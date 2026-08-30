@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './app/App';
 import { installNativeContextMenuGuard } from './utils/nativeContextMenuGuard';
+import { activeT } from './i18n';
 
 const ROOT_EL_ID = 'root';
 
@@ -37,10 +38,10 @@ function showBootstrapError(label: string, err: unknown): void {
       overflow: auto;
       box-sizing: border-box;
     ">
-      <h2 style="color:#ff6b6b;margin:0 0 12px 0;">DeepCode bootstrap error (${escapeHtml(label)})</h2>
+      <h2 style="color:#ff6b6b;margin:0 0 12px 0;">${escapeHtml(activeT('app.bootstrap.errorTitle', { label }))}</h2>
       <pre style="white-space:pre-wrap;word-break:break-word;margin:0;color:#ddd;">${escapeHtml(message)}</pre>
       <p style="margin-top:16px;color:#888;font-size:12px;">
-        The frontend failed before React could finish mounting. Copy this page content for diagnosis.
+        ${escapeHtml(activeT('app.bootstrap.errorBody'))}
       </p>
     </div>
   `;
@@ -93,7 +94,7 @@ class ErrorBoundary extends React.Component<
           }}
         >
           <h2 style={{ color: '#ff6b6b', margin: '0 0 12px 0' }}>
-            DeepCode UI render error
+            {activeT('app.bootstrap.renderErrorTitle')}
           </h2>
           <pre
             style={{
@@ -108,7 +109,7 @@ class ErrorBoundary extends React.Component<
             {err.stack}
           </pre>
           <p style={{ marginTop: 16, color: '#888', fontSize: 12 }}>
-            React failed while rendering the UI tree. Copy this page content for diagnosis.
+            {activeT('app.bootstrap.renderErrorBody')}
           </p>
         </div>
       );
@@ -119,7 +120,7 @@ class ErrorBoundary extends React.Component<
 
 const rootEl = document.getElementById(ROOT_EL_ID);
 if (!rootEl) {
-  throw new Error('Cannot find #root element');
+  throw new Error(activeT('app.bootstrap.rootMissing'));
 }
 
 installNativeContextMenuGuard();

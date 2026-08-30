@@ -10,7 +10,7 @@ const EmptyEditorSurface: React.FC = () => {
     <div className="workbench-empty-editor">
       <div className="workbench-empty-editor__inner">
         <div className="workbench-empty-editor__icon" aria-hidden="true">
-          FILE
+          {t(language, 'editor.empty.iconLabel')}
         </div>
         <div>{t(language, 'editor.empty.title')}</div>
         <div className="workbench-empty-editor__hint">{t(language, 'editor.empty.hint')}</div>

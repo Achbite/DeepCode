@@ -5,6 +5,7 @@ pub(crate) async fn user_settings_get(State(state): State<AppState>) -> Json<Api
     let gui = state.gui.lock().expect("gui state lock");
     ApiResponse::ok(json!({
         "settings": gui.user_settings,
+        "runtimeSettings": state.runtime_user_settings,
         "overriddenKeys": [],
         "storePath": gui.paths.settings_path.to_string_lossy()
     }))
@@ -150,21 +151,16 @@ pub(crate) async fn llm_profiles_patch(
 
     let (profiles_path, secrets_path, old_secret_store) = {
         let gui = state.gui.lock().expect("gui state lock");
-        let old_secret_store = match read_json_file(&gui.paths.llm_secrets_path) {
-            Some(value @ Value::Object(_)) => value,
-            Some(_) => {
+        let old_secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path) {
+            Ok(Some(value)) if llm_secret_store_is_current(&value) => value,
+            Ok(Some(_)) => {
                 return ApiResponse::error(
                     "llm_secret_store_invalid",
-                    "本地 LLM secret 文件不是 JSON 对象。",
+                    "本地 LLM secret 文件不是当前字符串映射格式。",
                 )
             }
-            None if gui.paths.llm_secrets_path.exists() => {
-                return ApiResponse::error(
-                    "llm_secret_store_unreadable",
-                    "本地 LLM secret 文件无法读取。",
-                )
-            }
-            None => json!({}),
+            Err(error) => return ApiResponse::error("llm_secret_store_unreadable", error),
+            Ok(None) => json!({}),
         };
         (
             gui.paths.llm_profiles_path.clone(),
@@ -297,7 +293,9 @@ pub(crate) fn default_user_settings() -> Value {
         "workbench.language": "zh-CN",
         "workbench.styleTokenOverrides": "{}",
         "agent.systemPrompt": "",
-        "agent.permissions.networkRead": "ask",
+        "agent.permissions.workspaceMutation": "plan",
+        "agent.permissions.engineeringDecisions": "ask",
+        "agent.permissions.networkRead": "allow",
         "agent.permissions.external": "ask",
         "terminal.integrated.defaultProfile.windows": "wsl",
         "terminal.integrated.prewarm": "afterStartup",
@@ -316,7 +314,7 @@ pub(crate) fn default_user_settings() -> Value {
     })
 }
 
-fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
     if let Some(object) = settings.as_object() {
         for key in object
             .keys()
@@ -324,7 +322,10 @@ fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
         {
             if !matches!(
                 key.as_str(),
-                "agent.permissions.networkRead" | "agent.permissions.external"
+                "agent.permissions.workspaceMutation"
+                    | "agent.permissions.engineeringDecisions"
+                    | "agent.permissions.networkRead"
+                    | "agent.permissions.external"
             ) {
                 return Err(format!("{key} 不是当前 Agent Runtime 权限设置。"));
             }
@@ -349,6 +350,27 @@ fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
             if !matches!(value, "allow" | "ask" | "deny") {
                 return Err(format!("{key} 必须是 allow、ask 或 deny。"));
             }
+        }
+    }
+    if let Some(value) = settings.get("agent.permissions.workspaceMutation") {
+        if !matches!(value.as_str(), Some("plan" | "allow")) {
+            return Err("agent.permissions.workspaceMutation 必须是 plan 或 allow。".to_string());
+        }
+    }
+    if let Some(value) = settings.get("agent.permissions.engineeringDecisions") {
+        if !matches!(value.as_str(), Some("ask" | "delegate")) {
+            return Err(
+                "agent.permissions.engineeringDecisions 必须是 ask 或 delegate。".to_string(),
+            );
+        }
+    }
+    for key in [
+        "agent.web.search.endpointTemplate",
+        "agent.web.search.authHeaderName",
+        "agent.web.search.authSecretRef",
+    ] {
+        if settings.get(key).is_some_and(|value| !value.is_string()) {
+            return Err(format!("{key} 必须是字符串。"));
         }
     }
     Ok(())

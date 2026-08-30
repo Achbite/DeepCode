@@ -3,6 +3,7 @@ import type {
   ConversationCatalog,
   ConversationCatalogManagement,
   ConversationCommand,
+  MessageDirectoryAttachment,
   SessionProjection,
 } from '@deepcode/protocol';
 import {
@@ -10,6 +11,7 @@ import {
   SESSION_PROJECTION_VERSION,
 } from '@deepcode/protocol';
 import { getHostConnectionHeaders, getKernelApiBase } from './hostTarget';
+import { isShellActivityResult } from './shellActivityCodec';
 
 interface ApiEnvelope<T> {
   ok: boolean;
@@ -130,6 +132,21 @@ export async function attachConversationDirectoryIndex(
   return decodeProjection(projection);
 }
 
+export async function resolveConversationDirectoryAttachments(
+  sessionId: string,
+  paths: string[],
+  signal?: AbortSignal,
+): Promise<MessageDirectoryAttachment[]> {
+  const value = await request<unknown>(
+    `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/directory-attachments/resolve`,
+    { method: 'POST', body: JSON.stringify({ paths }), signal },
+  );
+  if (!isWorkspaceBindings(value)) {
+    throw new Error('conversation_directory_attachments_response_invalid');
+  }
+  return value as MessageDirectoryAttachment[];
+}
+
 export async function detachConversationDirectoryIndex(
   sessionId: string,
   workspaceId: string,
@@ -233,6 +250,8 @@ function decodeProjection(value: unknown): SessionProjection {
       'assistantDraft',
       'pendingInteraction',
       'pendingApproval',
+      'plans',
+      'activePlanRef',
       'pendingPlan',
       'todoList',
       'contextUsage',
@@ -255,6 +274,8 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isNullable(value.assistantDraft, isAssistantDraft)
     || !isNullable(value.pendingInteraction, isInteraction)
     || !isNullable(value.pendingApproval, isApproval)
+    || !isArrayOf(value.plans, isPlanProjection)
+    || !isNullable(value.activePlanRef, isPlanReference)
     || !isNullable(value.pendingPlan, isPendingPlan)
     || !isNullable(value.todoList, isTodoList)
     || !isNullable(value.contextUsage, isContextUsage)
@@ -265,6 +286,28 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isArrayOf(value.activities, isActivity)
     || !isArrayOf(value.artifacts, isArtifact)
     || !isNullable(value.terminalError, isLocalAgentError)
+  ) {
+    throw new Error('conversation_projection_invalid');
+  }
+  const plans = value.plans as Array<{planId: string; revision: number}>;
+  const activePlanRef = value.activePlanRef as {planId: string; revision: number} | null;
+  const pendingPlan = value.pendingPlan as {planId: string; revision: number} | null;
+  const todoList = value.todoList as {
+    sourcePlanId: string;
+    sourcePlanRevision: number;
+  } | null;
+  const planKeys = plans.map((plan) => planReferenceKey(plan));
+  if (
+    new Set(planKeys).size !== planKeys.length
+    || (activePlanRef !== null
+      && !planKeys.includes(planReferenceKey(activePlanRef)))
+    || (pendingPlan !== null
+      && !planKeys.includes(planReferenceKey(pendingPlan)))
+    || (todoList !== null
+      && !planKeys.includes(planReferenceKey({
+        planId: todoList.sourcePlanId,
+        revision: todoList.sourcePlanRevision,
+      })))
   ) {
     throw new Error('conversation_projection_invalid');
   }
@@ -344,19 +387,20 @@ function isWorkspaceBindings(value: unknown): boolean {
 }
 
 function isSessionDisplay(value: unknown): boolean {
-  return isExactRecord(value, ['title'], ['projectId'])
-    && typeof value.title === 'string'
-    && (value.projectId === undefined || isIdentifier(value.projectId));
+  return isExactRecord(value, ['creationTitle'])
+    && typeof value.creationTitle === 'string';
 }
 
 function isProjectionMessage(value: unknown): boolean {
   return isExactRecord(value, [
-    'messageId', 'role', 'content', 'attachments', 'feedback', 'sequence', 'createdAt',
+    'messageId', 'role', 'content', 'attachments', 'directoryAttachments',
+    'feedback', 'sequence', 'createdAt',
   ])
     && isIdentifier(value.messageId)
     && ['user', 'assistant', 'tool', 'system'].includes(String(value.role))
     && typeof value.content === 'string'
     && isArrayOf(value.attachments, isMessageAttachment)
+    && isWorkspaceBindings(value.directoryAttachments)
     && (value.feedback === null || ['up', 'down'].includes(String(value.feedback)))
     && isNaturalNumber(value.sequence)
     && isNonEmptyText(value.createdAt);
@@ -432,41 +476,111 @@ function isEffectPreview(value: unknown): boolean {
     && value.logicalTargets.every(isNonEmptyText);
 }
 
-function isPendingPlan(value: unknown): boolean {
-  return isExactRecord(value, [
-    'planId',
-    'runId',
-    'prompt',
-    'options',
-    'responseMode',
-    'ignoreAllowed',
-    'sequence',
-    'createdAt',
-  ])
-    && isIdentifier(value.planId)
-    && isIdentifier(value.runId)
-    && isNonEmptyText(value.prompt)
-    && isArrayOf(value.options, isPlanOption)
-    && value.options.length > 0
-    && value.responseMode === 'optionOrFreeform'
-    && value.ignoreAllowed === true
-    && isNaturalNumber(value.sequence)
-    && isNonEmptyText(value.createdAt);
+const PLAN_STATUSES = [
+  'published',
+  'revisionRequested',
+  'confirmed',
+  'superseded',
+  'cancelled',
+  'completed',
+  'invalidated',
+] as const;
+
+const PLAN_FIELDS = [
+  'planId',
+  'revision',
+  'title',
+  'summary',
+  'steps',
+  'mutationManifest',
+  'runId',
+  'callId',
+  'status',
+  'sequence',
+  'createdAt',
+  'updatedAt',
+] as const;
+
+function isPlanProjection(value: unknown): value is Record<string, unknown> & {
+  planId: string;
+  revision: number;
+} {
+  return isExactRecord(value, PLAN_FIELDS, ['decisionId'])
+    && isPlanProjectionFields(value);
 }
 
-function isPlanOption(value: unknown): boolean {
-  return isExactRecord(value, ['optionId', 'label', 'operationsDisplay'], ['description'])
-    && isIdentifier(value.optionId)
-    && isNonEmptyText(value.label)
-    && (value.description === undefined || isNonEmptyText(value.description))
-    && Array.isArray(value.operationsDisplay)
-    && value.operationsDisplay.every(isNonEmptyText);
+function isPendingPlan(value: unknown): boolean {
+  return isExactRecord(value, [...PLAN_FIELDS, 'responseMode'], ['decisionId'])
+    && isPlanProjectionFields(value)
+    && value.status === 'published'
+    && value.responseMode === 'confirmReviseOrCancel';
+}
+
+function isPlanProjectionFields(value: Record<string, unknown>): boolean {
+  if (
+    !isIdentifier(value.planId)
+    || !isPositiveNaturalNumber(value.revision)
+    || !isNonEmptyText(value.title)
+    || !isNonEmptyText(value.summary)
+    || !isIdentifier(value.runId)
+    || !isIdentifier(value.callId)
+    || !PLAN_STATUSES.includes(value.status as typeof PLAN_STATUSES[number])
+    || !isNaturalNumber(value.sequence)
+    || !isNonEmptyText(value.createdAt)
+    || !isNonEmptyText(value.updatedAt)
+    || (value.decisionId !== undefined && !isIdentifier(value.decisionId))
+    || !isArrayOf(value.steps, isPlanStep)
+    || value.steps.length < 1
+    || value.steps.length > 12
+    || !isArrayOf(value.mutationManifest, isPlanOperation)
+    || value.mutationManifest.length > 128
+  ) return false;
+  return new Set(value.steps.map((step) => step.stepId)).size === value.steps.length;
+}
+
+function isPlanStep(value: unknown): value is Record<string, unknown> & { stepId: string } {
+  return isExactRecord(value, ['stepId', 'title', 'details'], ['verification'])
+    && isIdentifier(value.stepId)
+    && isNonEmptyText(value.title)
+    && isNonEmptyText(value.details)
+    && (value.verification === undefined
+      || (Array.isArray(value.verification) && value.verification.every(isNonEmptyText)));
+}
+
+function isPlanOperation(value: unknown): boolean {
+  if (!isRecord(value) || !isIdentifier(value.workspaceId) || !isNonEmptyText(value.target)) {
+    return false;
+  }
+  if (value.operation === 'fs.delete') {
+    return isExactRecord(value, ['workspaceId', 'operation', 'target', 'targetKind'])
+      && ['file', 'directoryTree'].includes(String(value.targetKind));
+  }
+  return isExactRecord(value, ['workspaceId', 'operation', 'target'])
+    && ['fs.create', 'fs.write', 'fs.edit', 'fs.ensure_directory']
+      .includes(String(value.operation));
+}
+
+function isPlanReference(value: unknown): value is { planId: string; revision: number } {
+  return isExactRecord(value, ['planId', 'revision'])
+    && isIdentifier(value.planId)
+    && isPositiveNaturalNumber(value.revision);
+}
+
+function planReferenceKey(value: { planId: string; revision: number }): string {
+  return `${value.planId}\u0000${value.revision}`;
 }
 
 function isTodoList(value: unknown): boolean {
   if (
-    !isExactRecord(value, ['runId', 'items', 'sequence', 'updatedAt'])
-    || !isIdentifier(value.runId)
+    !isExactRecord(value, [
+      'sourcePlanId',
+      'sourcePlanRevision',
+      'items',
+      'sequence',
+      'updatedAt',
+    ])
+    || !isIdentifier(value.sourcePlanId)
+    || !isPositiveNaturalNumber(value.sourcePlanRevision)
     || !isNaturalNumber(value.sequence)
     || !isNonEmptyText(value.updatedAt)
     || !isArrayOf(value.items, isTodoItem)
@@ -476,8 +590,9 @@ function isTodoList(value: unknown): boolean {
 }
 
 function isTodoItem(value: unknown): value is Record<string, unknown> & { todoId: string } {
-  return isExactRecord(value, ['todoId', 'label', 'status'])
+  return isExactRecord(value, ['todoId', 'sourceStepId', 'label', 'status'])
     && isIdentifier(value.todoId)
+    && isIdentifier(value.sourceStepId)
     && isNonEmptyText(value.label)
     && ['pending', 'inProgress', 'completed'].includes(String(value.status));
 }
@@ -519,6 +634,7 @@ function isContextUsage(value: unknown): boolean {
 function isContextComposition(value: unknown): boolean {
   return isExactRecord(value, [
     'providerRequestId',
+    'purpose',
     'responseConstraint',
     'runId',
     'messages',
@@ -529,6 +645,7 @@ function isContextComposition(value: unknown): boolean {
     'createdAt',
   ])
     && isIdentifier(value.providerRequestId)
+    && ['agent', 'contextCompaction'].includes(String(value.purpose))
     && ['normal', 'answerOnly'].includes(String(value.responseConstraint))
     && isIdentifier(value.runId)
     && isNaturalNumber(value.sequence)
@@ -715,13 +832,25 @@ function isActivity(value: unknown): boolean {
     && isIdentifier(value.runId)
     && (value.callId === undefined || isIdentifier(value.callId))
     && isNaturalNumber(value.sequence)
-    && (value.tool === undefined || isToolActivity(value.tool));
+    && (value.tool === undefined || isToolActivity(value.tool, String(value.status)));
 }
 
-function isToolActivity(value: unknown): boolean {
-  return isExactRecord(value, ['operation', 'resources'])
+function isToolActivity(value: unknown, activityStatus: string): boolean {
+  return isExactRecord(value, ['operation', 'resources'], ['shell'])
     && isNonEmptyText(value.operation)
-    && isArrayOf(value.resources, isActivityResource);
+    && isArrayOf(value.resources, isActivityResource)
+    && (value.operation === 'process.shell'
+      ? isShellActivity(value.shell, activityStatus === 'completed')
+      : value.shell === undefined);
+}
+
+function isShellActivity(value: unknown, resultRequired: boolean): boolean {
+  return isExactRecord(value, ['command', 'cwd'], ['result'])
+    && isNonEmptyText(value.command)
+    && isNonEmptyText(value.cwd)
+    && (resultRequired
+      ? value.result !== undefined && isShellActivityResult(value.result)
+      : value.result === undefined);
 }
 
 function isActivityResource(value: unknown): boolean {

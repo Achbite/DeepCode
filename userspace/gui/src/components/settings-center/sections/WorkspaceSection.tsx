@@ -97,7 +97,7 @@ const WorkspaceSection: React.FC = () => {
               <td>{workspace.name}</td>
             </tr>
             <tr>
-              <td>ID</td>
+              <td>{t(language, 'workspace.id')}</td>
               <td>{workspace.id}</td>
             </tr>
             <tr>

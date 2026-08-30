@@ -43,7 +43,8 @@ set -euo pipefail
 export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export CI="${CI:-true}"
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$ROOT_DIR/scripts/source-identity.sh"
 BIN_ROOT="$ROOT_DIR/bin"
 LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
@@ -256,6 +257,7 @@ run_deepcode_gui_tauri=0
 run_package=0
 run_verify_package_runtime=0
 SCCACHE_SERVER_RESET_DONE=0
+SCCACHE_CONFIGURED=0
 
 enable_stage() {
   case "$1" in
@@ -574,6 +576,11 @@ if [ "$docker_build_stage_count" -gt 0 ]; then
 fi
 
 configure_sccache() {
+  if [ "$SCCACHE_CONFIGURED" = "1" ]; then
+    return
+  fi
+  SCCACHE_CONFIGURED=1
+
   if [ "${DEEPCODE_DISABLE_SCCACHE:-0}" = "1" ]; then
     unset RUSTC_WRAPPER
     echo "==[build][cache]== sccache disabled by DEEPCODE_DISABLE_SCCACHE=1"
@@ -1108,23 +1115,7 @@ runtime_sha256_stream() {
 }
 
 distribution_source_fingerprint() {
-  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    {
-      git -C "$ROOT_DIR" rev-parse HEAD
-      git -C "$ROOT_DIR" diff --binary --no-ext-diff HEAD --
-      git -C "$ROOT_DIR" ls-files --others --exclude-standard -z \
-        | while IFS= read -r -d '' path; do
-            printf 'untracked=%s\n' "$path"
-            [ -f "$ROOT_DIR/$path" ] && runtime_sha256 "$ROOT_DIR/$path"
-          done
-    } | runtime_sha256_stream
-    return
-  fi
-  find "$ROOT_DIR" \
-    \( -type d \( -name .git -o -name node_modules -o -name target -o -name bin -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
-    \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -print \) \
-    | LC_ALL=C sort \
-    | runtime_sha256_stream
+  deepcode_source_fingerprint "$ROOT_DIR"
 }
 
 PACKAGE_BUILD_COMMIT=""
@@ -1136,16 +1127,16 @@ PACKAGE_PRODUCT_VERSION=""
 
 prepare_distribution_build_identity() {
   [ -z "$PACKAGE_BUILD_COMMIT" ] || return 0
-  PACKAGE_BUILD_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf unknown)"
+  PACKAGE_BUILD_COMMIT="$(deepcode_source_commit "$ROOT_DIR" 2>/dev/null || printf unknown)"
   PACKAGE_BUILD_TIME_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-  local status
-  status="$(git -C "$ROOT_DIR" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
-  if [ -n "$status" ]; then
+  local source_dirty
+  source_dirty="$(deepcode_source_dirty "$ROOT_DIR")"
+  if [ "$source_dirty" = "1" ]; then
     PACKAGE_SOURCE_DIRTY=true
   else
     PACKAGE_SOURCE_DIRTY=false
   fi
-  PACKAGE_SOURCE_STATUS_HASH="$(printf '%s' "$status" | runtime_sha256_stream)"
+  PACKAGE_SOURCE_STATUS_HASH="$(deepcode_source_status_hash "$ROOT_DIR")"
   PACKAGE_SOURCE_FINGERPRINT="$(distribution_source_fingerprint)"
   PACKAGE_PRODUCT_VERSION="$(awk -F '"' '/"version"[[:space:]]*:/ { print $4; exit }' "$ROOT_DIR/package.json")"
 }
@@ -1636,6 +1627,7 @@ verify_macos_package_runtime() {
   local macos_dir="$BIN_ROOT/macos-arm64"
   local missing=0
   local checked_app=0
+  local validation_node=""
   [ -d "$macos_dir" ] || return 2
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
@@ -1649,9 +1641,19 @@ verify_macos_package_runtime() {
     "$macos_dir/node_modules/@deepcode/protocol/dist" \
     "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
+  # The profile check only parses JSON. A Linux compile container must use a
+  # Node binary for its own architecture instead of executing the packaged
+  # Darwin runtime; the Darwin binary itself is validated by the host package.
+  if [ "$(uname -s)" = "Darwin" ] && [ -x "$macos_dir/node/bin/node" ]; then
+    validation_node="$macos_dir/node/bin/node"
+  elif [ -x "$LINUX_DIR/node/bin/node" ]; then
+    validation_node="$LINUX_DIR/node/bin/node"
+  elif command -v node >/dev/null 2>&1; then
+    validation_node="$(command -v node)"
+  fi
   verify_llm_profiles_current \
     "$macos_dir/config/user/local/settings/llm-profiles.json" \
-    "$macos_dir/node/bin/node" \
+    "$validation_node" \
     "macOS LLM Profile store" || missing=1
 
   if [ -d "$macos_dir/DeepCode.app" ]; then

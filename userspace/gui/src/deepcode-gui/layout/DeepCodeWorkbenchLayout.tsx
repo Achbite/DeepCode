@@ -60,6 +60,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     : 'comfortable';
   const showContextRail = effectiveSettings['gui.showContextRail'] !== false;
   const projection = useLocalAgentStore((state) => state.projection);
+  const profiles = useLocalAgentStore((state) => state.profiles);
   const activeSessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
@@ -245,7 +246,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       <DeepCodeTitlebar
         language={language}
         apiStatus={apiStatus}
-        agentReady={apiStatus === 'connected'}
+        agentReady={apiStatus === 'connected' && profiles.length > 0}
         cacheHitSummary={cacheHitSummary(projection, language)}
         kernelStartBusy={kernelStartBusy}
         kernelStartMessage={kernelStartMessage}
@@ -385,7 +386,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                     void updateSession(session.id, { projectId: null });
                   }}
                 >
-                  {language === 'zh-CN' ? '移出项目' : 'Move out of project'}
+                  {t(language, 'deepcodeGui.session.removeFromProject')}
                 </button>
               )}
           </>
@@ -434,7 +435,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               void openWorkspaceManager(project);
             }}
           >
-            {language === 'zh-CN' ? '管理工作目录' : 'Manage workspaces'}
+            {t(language, 'deepcodeGui.project.manageWorkspaces')}
           </button>
           <button
             type="button"
@@ -456,7 +457,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           >
             <header>
               <h2>{textDialog.title}</h2>
-              <button type="button" onClick={() => setTextDialog(null)}>×</button>
+              <button
+                type="button"
+                aria-label={t(language, 'window.close')}
+                onClick={() => setTextDialog(null)}
+              >×</button>
             </header>
             <label>
               <span>{t(language, 'deepcodeGui.nameLabel')}</span>
@@ -555,22 +560,21 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             onMouseDown={(event) => event.stopPropagation()}
           >
             <header>
-              <h2>{language === 'zh-CN' ? '工作目录' : 'Workspaces'}</h2>
+              <h2>{t(language, 'deepcodeGui.project.workspacesTitle')}</h2>
               <button
                 type="button"
+                aria-label={t(language, 'window.close')}
                 disabled={workspaceManager.loading}
                 onClick={() => setWorkspaceManager(null)}
               >×</button>
             </header>
             <p className="deepcode-gui-text-dialog__message">
-              {language === 'zh-CN'
-                ? '这些目录只作为新对话的绑定模板；已有对话的创建快照不会改变。'
-                : 'These folders are a template for new chats. Existing creation snapshots stay unchanged.'}
+              {t(language, 'deepcodeGui.project.workspaceTemplateHint')}
             </p>
             <div className="deepcode-gui-workspace-manager__list">
               {!workspaceManager.loading && workspaceManager.records.length === 0 && (
                 <div className="deepcode-gui-workspace-manager__empty">
-                  {language === 'zh-CN' ? '尚未附加工作目录' : 'No workspace attached'}
+                  {t(language, 'deepcodeGui.project.noWorkspaces')}
                 </div>
               )}
               {workspaceManager.records.map((record) => (
@@ -584,7 +588,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                     disabled={workspaceManager.loading}
                     onClick={() => void removeManagedWorkspace(record.workspaceId)}
                   >
-                    {language === 'zh-CN' ? '移除' : 'Remove'}
+                    {t(language, 'settings.common.remove')}
                   </button>
                 </div>
               ))}
@@ -594,7 +598,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             )}
             <footer>
               <button type="button" onClick={() => setWorkspaceManager(null)}>
-                {language === 'zh-CN' ? '完成' : 'Done'}
+                {t(language, 'deepcodeGui.common.done')}
               </button>
               <button
                 type="button"
@@ -610,7 +614,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   });
                 }}
               >
-                {language === 'zh-CN' ? '添加文件夹' : 'Add folder'}
+                {t(language, 'deepcodeGui.project.addFolder')}
               </button>
             </footer>
           </div>
@@ -657,25 +661,26 @@ function cacheHitSummary(
 ): { label: string; title: string } {
   const usage = projection?.tokenUsage;
   const cache = completeInputCacheMetric(usage);
-  const percent = cache ? formatCachePercent(cache.hitPercent) : 'N/A';
+  const percent = cache ? formatCachePercent(cache.hitPercent) : null;
   const providerCallCount = usage?.providerCallCount ?? 0;
-  return language === 'zh-CN'
-    ? {
-        label: `总缓存命中 ${cache ? `${percent}%` : 'N/A'}`,
-        title: cache
-          ? `当前会话累计：${providerCallCount} 次 Provider 调用；输入 ${cache.inputTokens} Token；缓存读取 ${cache.hitTokens}；缓存未命中 ${cache.missTokens}。总命中率按全会话缓存读取输入 / 全会话输入 Token 计算。`
-          : usage
-            ? `当前会话有 ${usage.providerCallCount} 次 Provider 调用，缓存字段报告 ${usage.cacheReportedCallCount}/${usage.providerCallCount} 次，无法给出完整会话的精确总缓存命中率。`
-            : '当前会话尚无 Provider 用量。',
-      }
-    : {
-        label: `Total cache hit ${cache ? `${percent}%` : 'N/A'}`,
-        title: cache
-          ? `Current session total: ${providerCallCount} Provider calls, ${cache.inputTokens} input tokens, ${cache.hitTokens} cache-read tokens, and ${cache.missTokens} cache-miss tokens. The total hit rate is session cache-read input divided by session input tokens.`
-          : usage
-            ? `The current session has ${usage.providerCallCount} Provider calls, with cache fields reported for ${usage.cacheReportedCallCount}/${usage.providerCallCount}; an exact total cache hit rate is unavailable.`
-            : 'No Provider usage for the current session yet.',
-      };
+  return {
+    label: t(language, 'deepcodeGui.cache.summary', {
+      value: cache ? `${percent}%` : t(language, 'common.notAvailable'),
+    }),
+    title: cache
+      ? t(language, 'deepcodeGui.cache.completeTitle', {
+          calls: providerCallCount.toLocaleString(language),
+          input: cache.inputTokens.toLocaleString(language),
+          hit: cache.hitTokens.toLocaleString(language),
+          miss: cache.missTokens.toLocaleString(language),
+        })
+      : usage
+        ? t(language, 'deepcodeGui.cache.partialTitle', {
+            calls: usage.providerCallCount.toLocaleString(language),
+            reported: usage.cacheReportedCallCount.toLocaleString(language),
+          })
+        : t(language, 'deepcodeGui.cache.emptyTitle'),
+  };
 }
 
 function formatCachePercent(value: number): string {

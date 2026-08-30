@@ -7,13 +7,15 @@ import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
 interface ProjectFolderDialogProps {
   language: UiLanguage;
   onCancel: () => void;
-  onSelect: (absolutePath: string) => void;
+  onSelect: (absolutePath: string, type: BrowseEntry['type']) => void;
+  selectionMode?: 'directory' | 'messageAttachment';
 }
 
 const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
   language,
   onCancel,
   onSelect,
+  selectionMode = 'directory',
 }) => {
   const [locations, setLocations] = useState<InitialLocation[]>([]);
   const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
@@ -68,26 +70,43 @@ const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onCancel]);
 
+  const isAttachmentSelection = selectionMode === 'messageAttachment';
   const entries = useMemo(
-    () => (browseResult?.entries ?? []).filter((entry) => showHidden || !entry.hidden),
-    [browseResult, showHidden],
+    () => (browseResult?.entries ?? []).filter((entry) => (
+      (showHidden || !entry.hidden)
+      && (isAttachmentSelection || entry.type === 'directory')
+    )),
+    [browseResult, isAttachmentSelection, showHidden],
   );
-  const selectedPath = selectedEntry?.type === 'directory'
-    ? selectedEntry.absolutePath
-    : browseResult?.absolutePath ?? '';
+  const selectedPath = selectedEntry?.absolutePath ?? browseResult?.absolutePath ?? '';
+  const selectedType = selectedEntry?.type ?? 'directory';
 
   return (
     <div className="ws-open-dialog__backdrop" onClick={onCancel}>
       <div
-        className="ws-open-dialog"
+        className={`ws-open-dialog${isAttachmentSelection ? ' ws-open-dialog--message-attachment' : ''}`}
         role="dialog"
         aria-modal="true"
-        aria-label={t(language, 'deepcodeGui.project.folderDialogTitle')}
+        aria-label={t(language, isAttachmentSelection
+          ? 'agent.attachment.pickerTitle'
+          : 'deepcodeGui.project.folderDialogTitle')}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="ws-open-dialog__header">
-          <span>{t(language, 'deepcodeGui.project.folderDialogTitle')}</span>
-          <button type="button" className="ws-open-dialog__close" onClick={onCancel}>×</button>
+          <span>
+            <strong>{t(language, isAttachmentSelection
+              ? 'agent.attachment.pickerTitle'
+              : 'deepcodeGui.project.folderDialogTitle')}</strong>
+            {isAttachmentSelection && (
+              <small>{t(language, 'agent.attachment.pickerDescription')}</small>
+            )}
+          </span>
+          <button
+            type="button"
+            className="ws-open-dialog__close"
+            aria-label={t(language, 'workspaceDialog.cancel')}
+            onClick={onCancel}
+          >×</button>
         </div>
         <div className="ws-open-dialog__addressbar">
           <button
@@ -138,7 +157,7 @@ const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                 title={location.absolutePath}
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {location.kind === 'home' ? 'HOME' : location.kind === 'drive' ? 'DISK' : 'WS'}
+                  {t(language, `workspaceDialog.locationKind.${location.kind}`)}
                 </span>
                 <span>{location.label}</span>
               </button>
@@ -157,11 +176,17 @@ const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                     key={entry.absolutePath}
                     className={`ws-open-dialog__entry${selectedEntry?.absolutePath === entry.absolutePath ? ' ws-open-dialog__entry--selected' : ''}`}
                     onClick={() => setSelectedEntry(entry)}
-                    onDoubleClick={() => entry.type === 'directory' && void navigateTo(entry.absolutePath)}
+                    onDoubleClick={() => {
+                      if (entry.type === 'directory') {
+                        void navigateTo(entry.absolutePath);
+                      } else if (isAttachmentSelection) {
+                        onSelect(entry.absolutePath, entry.type);
+                      }
+                    }}
                     title={entry.absolutePath}
                   >
                     <span className="ws-open-dialog__entry-icon">
-                      {entry.type === 'directory' ? 'DIR' : 'FILE'}
+                      {t(language, `workspaceDialog.entryKind.${entry.type}`)}
                     </span>
                     <span className="ws-open-dialog__entry-name">{entry.name}</span>
                   </li>
@@ -179,10 +204,12 @@ const ProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
             <button
               type="button"
               className="ws-open-dialog__btn ws-open-dialog__btn--primary"
-              disabled={!selectedPath}
-              onClick={() => selectedPath && onSelect(selectedPath)}
+              disabled={!selectedPath || !selectedType}
+              onClick={() => selectedPath && selectedType && onSelect(selectedPath, selectedType)}
             >
-              {t(language, 'workspaceDialog.openSelectedFolder')}
+              {t(language, isAttachmentSelection
+                ? 'agent.attachment.attachSelected'
+                : 'workspaceDialog.openSelectedFolder')}
             </button>
           </div>
         </div>

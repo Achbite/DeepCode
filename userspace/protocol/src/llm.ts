@@ -3,7 +3,7 @@ export type LlmProviderKind =
   | 'anthropic'
   | 'ollama';
 
-export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu';
+export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu' | 'moonshot';
 export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
 export type LlmThinkingMode = 'enabled' | 'disabled';
 
@@ -27,6 +27,8 @@ export type LlmProviderProfile = LlmProviderProfileFields;
 
 export const DEEPSEEK_OPENAI_BASE_URL = 'https://api.deepseek.com';
 export const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
+export const GLM_OPENAI_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
+export const KIMI_OPENAI_BASE_URL = 'https://api.moonshot.ai/v1';
 
 export const DEEPSEEK_LLM_MODEL_OPTIONS = [
   'deepseek-v4-flash',
@@ -39,6 +41,9 @@ export const DEPRECATED_DEEPSEEK_LLM_MODELS = [
   'deepseek-chat',
   'deepseek-reasoner',
 ] as const;
+
+export const GLM_LLM_MODEL_OPTIONS = ['glm-5.2', 'glm-5.1', 'glm-5'] as const;
+export const KIMI_LLM_MODEL_OPTIONS = ['kimi-k2.6', 'kimi-k2.5'] as const;
 
 export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
   {

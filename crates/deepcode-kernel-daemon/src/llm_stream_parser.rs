@@ -90,6 +90,7 @@ pub(crate) struct ProviderStreamAccumulator {
     kind: ProviderStreamKind,
     content: String,
     reasoning: String,
+    reasoning_signature: String,
     tool_calls: BTreeMap<i64, ToolBuffer>,
     finish_reason: Option<String>,
     input_tokens: Option<u64>,
@@ -106,6 +107,7 @@ impl ProviderStreamAccumulator {
             kind,
             content: String::new(),
             reasoning: String::new(),
+            reasoning_signature: String::new(),
             tool_calls: BTreeMap::new(),
             finish_reason: None,
             input_tokens: None,
@@ -165,6 +167,12 @@ impl ProviderStreamAccumulator {
                 "Provider 流结束前没有完成标记。",
             ));
         }
+        if !self.reasoning_signature.trim().is_empty() && self.reasoning.trim().is_empty() {
+            return Err(ProviderStreamError::new(
+                "provider_reasoning_signature_without_content",
+                "Provider reasoning signature 缺少对应 reasoning content。",
+            ));
+        }
         let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
         for (index, call) in self.tool_calls {
             let name = call.name.ok_or_else(|| {
@@ -204,6 +212,8 @@ impl ProviderStreamAccumulator {
             output: LlmChatOutput {
                 content: self.content,
                 reasoning: (!self.reasoning.trim().is_empty()).then_some(self.reasoning),
+                reasoning_signature: (!self.reasoning_signature.trim().is_empty())
+                    .then_some(self.reasoning_signature),
                 tool_calls,
             },
             completion: ProviderCompletion {
@@ -322,11 +332,10 @@ impl ProviderStreamAccumulator {
                     "工具调用 ID",
                 )?;
                 let function = call.get("function").unwrap_or(&Value::Null);
-                set_once(
+                append_streamed_tool_name(
                     &mut buffer.name,
                     function.get("name").and_then(Value::as_str),
-                    "工具名称",
-                )?;
+                );
                 if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                     buffer.arguments.push_str(arguments);
                 }
@@ -364,6 +373,14 @@ impl ProviderStreamAccumulator {
                 let index =
                     required_tool_call_index(value.get("index"), "Anthropic content block start")?;
                 let block = value.get("content_block").unwrap_or(&Value::Null);
+                if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                    if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                        self.reasoning.push_str(thinking);
+                    }
+                    if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                        self.reasoning_signature.push_str(signature);
+                    }
+                }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     let buffer = self.tool_calls.entry(index).or_default();
                     set_once(
@@ -376,7 +393,10 @@ impl ProviderStreamAccumulator {
                         block.get("name").and_then(Value::as_str),
                         "工具名称",
                     )?;
-                    if let Some(input) = block.get("input").filter(|value| !value.is_null()) {
+                    if let Some(input) = block.get("input").filter(|value| {
+                        !value.is_null()
+                            && value.as_object().is_none_or(|object| !object.is_empty())
+                    }) {
                         buffer.complete_arguments = Some(input.clone());
                     }
                 }
@@ -394,6 +414,11 @@ impl ProviderStreamAccumulator {
                     Some("thinking_delta") => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
                             self.reasoning.push_str(text);
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                            self.reasoning_signature.push_str(signature);
                         }
                     }
                     Some("input_json_delta") => {
@@ -608,6 +633,24 @@ fn set_once(
         *slot = Some(value.to_owned());
     }
     Ok(())
+}
+
+fn append_streamed_tool_name(slot: &mut Option<String>, value: Option<&str>) {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let Some(existing) = slot.as_mut() else {
+        *slot = Some(value.to_owned());
+        return;
+    };
+    if existing == value {
+        return;
+    }
+    if value.starts_with(existing.as_str()) {
+        *existing = value.to_owned();
+        return;
+    }
+    existing.push_str(value);
 }
 
 fn set_token_count(
@@ -847,6 +890,21 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_tool_name_accepts_glm_stream_fragments() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        for payload in [
+            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs__","arguments":"{"}}]}}]}"#.as_slice(),
+            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+        ] {
+            parser.ingest_payload(payload).unwrap();
+        }
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(result.output.tool_calls[0].name, "fs.read");
+        assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
+    }
+
+    #[test]
     fn openai_tool_call_without_index_is_rejected_instead_of_merged_into_zero() {
         let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
         let error = parser
@@ -868,5 +926,30 @@ mod tests {
             .expect_err("missing index rejected");
 
         assert_eq!(error.code, "provider_tool_call_index_invalid");
+    }
+
+    #[test]
+    fn anthropic_thinking_signature_is_preserved_for_tool_continuation() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
+        for payload in [
+            br#"{"type":"message_start","message":{"usage":{"input_tokens":3}}}"#.as_slice(),
+            br#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#.as_slice(),
+            br#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}"#.as_slice(),
+            br#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}"#.as_slice(),
+            br#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-1","name":"fs__read","input":{}}}"#.as_slice(),
+            br#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"README.md\"}"}}"#.as_slice(),
+            br#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}"#.as_slice(),
+            br#"{"type":"message_stop"}"#.as_slice(),
+        ] {
+            parser.ingest_payload(payload).unwrap();
+        }
+        let result = parser.finalize().unwrap();
+        assert_eq!(result.output.reasoning.as_deref(), Some("reason"));
+        assert_eq!(
+            result.output.reasoning_signature.as_deref(),
+            Some("opaque-signature")
+        );
+        assert_eq!(result.output.tool_calls[0].name, "fs.read");
+        assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
     }
 }

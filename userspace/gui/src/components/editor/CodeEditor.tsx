@@ -267,11 +267,17 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       <div className="code-editor__statusbar">
         <div className="code-editor__statusbar-left">
           <span>{t(language, 'editor.status.cursor', { line: cursorLine, column: cursorCol })}</span>
-          <span>UTF-8</span>
-          <span>{sizeBytes.toLocaleString()} B</span>
+          <span>{t(language, 'editor.status.encoding')}</span>
+          <span>{t(language, 'editor.status.sizeBytes', {
+            size: sizeBytes.toLocaleString(language),
+          })}</span>
         </div>
         <div className="code-editor__statusbar-right">
-          <span>{editorOptions.insertSpaces ? 'Spaces' : 'Tab'}: {editorOptions.tabSize}</span>
+          <span>
+            {t(language, editorOptions.insertSpaces
+              ? 'editor.status.indentation.spaces'
+              : 'editor.status.indentation.tab')}: {editorOptions.tabSize}
+          </span>
           <span>{monacoLanguage}</span>
           {isDirty && <span className="code-editor__dirty-flag">{t(language, 'editor.status.unsaved')}</span>}
         </div>

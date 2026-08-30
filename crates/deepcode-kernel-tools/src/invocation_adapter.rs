@@ -46,6 +46,27 @@ pub fn canonicalize_invocation(
             materialize("maxResults", json!(200));
         }
         Tool::FsCreate => materialize("executable", json!(false)),
+        Tool::GithubSearch => {
+            materialize("kind", json!("repositories"));
+            materialize("page", json!(1));
+            materialize("limit", json!(10));
+        }
+        Tool::GithubRead => {
+            materialize("path", json!("."));
+            materialize("maxBytes", json!(262_144));
+        }
+        Tool::ArxivSearch => {
+            materialize("field", json!("all"));
+            materialize("start", json!(0));
+            materialize("limit", json!(10));
+            materialize("sortBy", json!("relevance"));
+            materialize("sortOrder", json!("descending"));
+        }
+        Tool::ProcessShell => {
+            materialize("cwd", json!("."));
+            materialize("timeoutMs", json!(120_000));
+            materialize("maxOutputBytes", json!(262_144));
+        }
         Tool::WebSearch => materialize("limit", json!(5)),
         Tool::WebFetch => materialize("maxBytes", json!(98_304)),
         _ => {}
@@ -72,7 +93,11 @@ fn normalize_invocation(
         | KernelCanonicalInvocation::DocumentRead { path, .. } => {
             *path = normalize_workspace_path(path, false)?;
         }
-        KernelCanonicalInvocation::FsList { path, .. } => {
+        KernelCanonicalInvocation::FsStat { path }
+        | KernelCanonicalInvocation::FsList { path, .. } => {
+            *path = normalize_workspace_path(path, true)?;
+        }
+        KernelCanonicalInvocation::GithubRead { path, .. } => {
             *path = normalize_workspace_path(path, true)?;
         }
         KernelCanonicalInvocation::FsGlob { root, .. } => {
@@ -87,6 +112,9 @@ fn normalize_invocation(
             *root = normalize_workspace_path(root, true)?;
             *include = normalize_string_set(std::mem::take(include))?;
             *exclude = normalize_string_set(std::mem::take(exclude))?;
+        }
+        KernelCanonicalInvocation::ProcessShell { cwd, .. } => {
+            *cwd = normalize_workspace_path(cwd, true)?;
         }
         KernelCanonicalInvocation::FsDelete(target) => {
             let path = match target {
@@ -141,6 +169,9 @@ fn adapt_public_arguments(
             };
             fields.insert("range".to_owned(), range);
         }
+        Tool::FsStat => {
+            ensure_allowed_fields(fields, &["path"], tool_id)?;
+        }
         Tool::FsList => {
             ensure_allowed_fields(fields, &["path", "depth", "includeHidden"], tool_id)?;
             fields
@@ -182,6 +213,32 @@ fn adapt_public_arguments(
                 _ => return Err(invalid_arguments(tool_id.as_str())),
             };
             fields.insert("pages".to_owned(), pages);
+        }
+        Tool::GithubSearch => {
+            ensure_allowed_fields(fields, &["query", "kind", "page", "limit"], tool_id)?;
+        }
+        Tool::GithubRead => {
+            ensure_allowed_fields(fields, &["repository", "path", "ref", "maxBytes"], tool_id)?;
+            if let Some(reference) = fields.remove("ref") {
+                fields.insert("reference".to_owned(), reference);
+            }
+        }
+        Tool::ArxivSearch => {
+            ensure_allowed_fields(
+                fields,
+                &["query", "field", "start", "limit", "sortBy", "sortOrder"],
+                tool_id,
+            )?;
+        }
+        Tool::ArxivRead => {
+            ensure_allowed_fields(fields, &["id"], tool_id)?;
+        }
+        Tool::ProcessShell => {
+            ensure_allowed_fields(
+                fields,
+                &["command", "cwd", "timeoutMs", "maxOutputBytes"],
+                tool_id,
+            )?;
         }
         _ => {}
     }

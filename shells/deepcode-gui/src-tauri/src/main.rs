@@ -4,17 +4,18 @@ use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
     HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_INSTANCE_ID_ENV,
     HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_ENV, HOST_SHELL_TOKEN_HEADER,
-    HOST_SHELL_TOKEN_PREFIX, HOST_TOKEN_ENTROPY_BYTES, HOST_UI_TOKEN_ENV, HOST_UI_TOKEN_HEADER,
-    HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
+    HOST_SHELL_TOKEN_PREFIX, HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS, HOST_TOKEN_ENTROPY_BYTES,
+    HOST_UI_TOKEN_ENV, HOST_UI_TOKEN_HEADER, HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{header, Request, Response, StatusCode};
@@ -41,11 +42,23 @@ const APP_ASSET_SCHEME: &str = "deepcode-gui";
 const APP_ASSET_DIR: &str = "web-deepcode-gui";
 
 struct HostProcessGroup {
-    children: Mutex<Option<OwnedHostChildren>>,
+    state: Mutex<HostProcessState>,
+    startup_idle: Condvar,
+}
+
+struct HostProcessState {
+    children: Option<OwnedHostChildren>,
+    active_startups: usize,
+    shutting_down: bool,
+}
+
+struct HostStartupLease<'a> {
+    processes: &'a HostProcessGroup,
 }
 
 const HOST_STARTUP_STATUS_SCHEMA: &str = "deepcode.host-shell.startup-status";
 const HOST_STARTUP_LOG_LIMIT_BYTES: u64 = 1024 * 1024;
+const MESSAGE_ATTACHMENT_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +82,14 @@ struct HostStartupStatusV1 {
 
 struct HostStartupStatusStore {
     status: Mutex<HostStartupStatusV1>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageAttachmentFileSnapshot {
+    name: String,
+    media_type: &'static str,
+    content: String,
 }
 
 impl HostStartupStatusStore {
@@ -187,24 +208,106 @@ struct WindowsKillOnCloseJob {
 impl HostProcessGroup {
     fn new(children: Option<OwnedHostChildren>) -> Self {
         Self {
-            children: Mutex::new(children),
+            state: Mutex::new(HostProcessState {
+                children,
+                active_startups: 0,
+                shutting_down: false,
+            }),
+            startup_idle: Condvar::new(),
         }
     }
 
-    fn replace(&self, children: Option<OwnedHostChildren>) {
-        if let Ok(mut current) = self.children.lock() {
-            if let Some(mut processes) = current.take() {
-                processes.shutdown();
+    fn begin_startup(&self) -> Option<HostStartupLease<'_>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.shutting_down {
+            return None;
+        }
+        state.active_startups = state.active_startups.saturating_add(1);
+        Some(HostStartupLease { processes: self })
+    }
+
+    fn install(&self, children: OwnedHostChildren) -> bool {
+        let mut candidate = Some(children);
+        let previous = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.shutting_down {
+                None
+            } else {
+                state
+                    .children
+                    .replace(candidate.take().expect("candidate is present"))
             }
-            *current = children;
+        };
+        if let Some(mut processes) = previous {
+            processes.shutdown();
+        }
+        if let Some(mut rejected) = candidate {
+            rejected.shutdown();
+            return false;
+        }
+        true
+    }
+
+    fn reclaim_current(&self) {
+        let current = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .children
+            .take();
+        if let Some(mut processes) = current {
+            processes.shutdown();
         }
     }
 
-    fn terminate(&self) {
-        if let Ok(mut children) = self.children.lock() {
-            if let Some(mut processes) = children.take() {
-                processes.shutdown();
-            }
+    fn shutdown(&self) {
+        let current = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.shutting_down = true;
+            state.children.take()
+        };
+        if let Some(mut processes) = current {
+            processes.shutdown();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.active_startups > 0 {
+            state = self
+                .startup_idle
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutting_down
+    }
+}
+
+impl Drop for HostStartupLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .processes
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_startups = state.active_startups.saturating_sub(1);
+        if state.active_startups == 0 {
+            self.processes.startup_idle.notify_all();
         }
     }
 }
@@ -226,7 +329,7 @@ impl OwnedHostChildren {
 
 impl Drop for HostProcessGroup {
     fn drop(&mut self) {
-        self.terminate();
+        self.shutdown();
     }
 }
 
@@ -238,6 +341,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
             deepcode_default_workspace_path,
+            deepcode_read_message_attachment_file,
             deepcode_host_startup_status,
             deepcode_start_kernel_after_permission,
             deepcode_window_minimize,
@@ -276,7 +380,7 @@ fn main() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
-                window.state::<HostProcessGroup>().terminate();
+                window.state::<HostProcessGroup>().shutdown();
                 window.app_handle().exit(0);
             }
             _ => {}
@@ -286,7 +390,7 @@ fn main() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            app_handle.state::<HostProcessGroup>().terminate();
+            app_handle.state::<HostProcessGroup>().shutdown();
         }
         _ => {}
     });
@@ -429,6 +533,54 @@ fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
 #[tauri::command]
 fn deepcode_default_workspace_path() -> Option<String> {
     default_workspace_path().map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn deepcode_read_message_attachment_file(
+    path: String,
+) -> Result<MessageAttachmentFileSnapshot, String> {
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Err("message_attachment_path_must_be_absolute".to_string());
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("message_attachment_path_unavailable:{error}"))?;
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("message_attachment_metadata_unavailable:{error}"))?;
+    if !metadata.is_file() {
+        return Err("message_attachment_path_not_file".to_string());
+    }
+    if metadata.len() > MESSAGE_ATTACHMENT_MAX_BYTES {
+        return Err("message_attachment_too_large".to_string());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&canonical)
+        .and_then(|file| {
+            file.take(MESSAGE_ATTACHMENT_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| format!("message_attachment_read_failed:{error}"))?;
+    if bytes.len() as u64 > MESSAGE_ATTACHMENT_MAX_BYTES {
+        return Err("message_attachment_too_large".to_string());
+    }
+    if bytes.contains(&0) {
+        return Err("message_attachment_not_text".to_string());
+    }
+    let content =
+        String::from_utf8(bytes).map_err(|_| "message_attachment_not_utf8".to_string())?;
+    let name = canonical
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "message_attachment_name_unavailable".to_string())?
+        .to_string();
+    Ok(MessageAttachmentFileSnapshot {
+        name,
+        media_type: message_attachment_media_type(&canonical),
+        content,
+    })
 }
 
 #[tauri::command]
@@ -684,6 +836,28 @@ fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+fn message_attachment_media_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "mdx" => "text/markdown",
+        "json" => "application/json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "ts" | "tsx" => "text/typescript",
+        "xml" | "svg" => "application/xml",
+        _ => "text/plain",
+    }
+}
+
 fn start_host_processes(
     target: &LaunchTarget,
     host_tokens: &HostConnectionTokens,
@@ -691,6 +865,19 @@ fn start_host_processes(
     status: &HostStartupStatusStore,
 ) -> HostStartupStatusV1 {
     let attempt_id = startup_attempt_id();
+    let Some(_startup_lease) = processes.begin_startup() else {
+        return status.update(
+            &attempt_id,
+            "stopped",
+            "shutdown",
+            "host_startup_stopped",
+            None,
+            "Host startup was stopped because the application is closing.",
+            false,
+            false,
+            None,
+        );
+    };
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return status.update(
             &attempt_id,
@@ -708,7 +895,7 @@ fn start_host_processes(
     // Retry may be requested while this shell still owns a surviving proxy or
     // daemon.  Reclaim only those exact children before checking ports; an
     // external listener is never terminated by this path.
-    processes.terminate();
+    processes.reclaim_current();
     let diagnostic = prepare_host_startup_diagnostics(&attempt_id).ok();
     let diagnostic_ref = diagnostic.as_ref().map(|value| value.reference.clone());
     status.update(
@@ -726,12 +913,25 @@ fn start_host_processes(
     match spawn_host_processes_if_available(
         target,
         host_tokens,
+        processes,
         status,
         &attempt_id,
         diagnostic.as_ref(),
     ) {
         Ok(children) => {
-            processes.replace(Some(children));
+            if !processes.install(children) {
+                return status.update(
+                    &attempt_id,
+                    "stopped",
+                    "shutdown",
+                    "host_startup_stopped",
+                    None,
+                    "Host startup completed after application shutdown and was reclaimed.",
+                    false,
+                    false,
+                    diagnostic_ref,
+                );
+            }
             status.update(
                 &attempt_id,
                 "ready",
@@ -744,27 +944,47 @@ fn start_host_processes(
                 diagnostic_ref,
             )
         }
-        Err(failure) => status.update(
-            &attempt_id,
-            "failed",
-            failure.stage,
-            failure.code,
-            failure.reason_code,
-            failure.message,
-            failure.retryable,
-            false,
-            diagnostic_ref,
-        ),
+        Err(failure) => {
+            if processes.is_shutting_down() || failure.code == "host_startup_stopped" {
+                status.update(
+                    &attempt_id,
+                    "stopped",
+                    "shutdown",
+                    "host_startup_stopped",
+                    None,
+                    "Host startup was stopped because the application is closing.",
+                    false,
+                    false,
+                    diagnostic_ref,
+                )
+            } else {
+                status.update(
+                    &attempt_id,
+                    "failed",
+                    failure.stage,
+                    failure.code,
+                    failure.reason_code,
+                    failure.message,
+                    failure.retryable,
+                    false,
+                    diagnostic_ref,
+                )
+            }
+        }
     }
 }
 
 fn spawn_host_processes_if_available(
     target: &LaunchTarget,
     host_tokens: &HostConnectionTokens,
+    processes: &HostProcessGroup,
     status: &HostStartupStatusStore,
     attempt_id: &str,
     diagnostic: Option<&HostDiagnosticAttempt>,
 ) -> Result<OwnedHostChildren, HostStartupFailure> {
+    if processes.is_shutting_down() {
+        return Err(startup_stopped_failure());
+    }
     if local_port_has_listener(&target.host, &target.port)
         || local_port_has_listener(&target.host, &target.daemon_port)
     {
@@ -863,6 +1083,9 @@ fn spawn_host_processes_if_available(
         false,
         diagnostic.map(|value| value.reference.clone()),
     );
+    if processes.is_shutting_down() {
+        return Err(startup_stopped_failure());
+    }
     let mut daemon_command = Command::new(daemon_path);
     daemon_command
         .current_dir(&daemon_dir)
@@ -913,6 +1136,7 @@ fn spawn_host_processes_if_available(
         &target.daemon_port,
         KERNEL_DAEMON_SERVICE,
         host_tokens.instance_id(),
+        processes,
         40,
     ) else {
         terminate_owned_process_tree(&mut daemon);
@@ -941,6 +1165,7 @@ fn spawn_host_processes_if_available(
         &target.daemon_port,
         HOST_SHELL_TOKEN_HEADER,
         host_tokens.daemon_token(),
+        processes,
         400,
     ) {
         terminate_owned_process_tree(&mut daemon);
@@ -964,6 +1189,16 @@ fn spawn_host_processes_if_available(
         true,
         diagnostic.map(|value| value.reference.clone()),
     );
+    if processes.is_shutting_down() {
+        shutdown_daemon_process(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            host_tokens.daemon_token(),
+            &daemon_identity,
+        );
+        return Err(startup_stopped_failure());
+    }
     let mut proxy_command = Command::new(proxy_path);
     proxy_command
         .current_dir(&proxy_dir)
@@ -1034,6 +1269,7 @@ fn spawn_host_processes_if_available(
         &target.port,
         "deepcode-host-web",
         host_tokens.instance_id(),
+        processes,
         40,
     )
     .is_none()
@@ -1071,6 +1307,7 @@ fn spawn_host_processes_if_available(
         &target.port,
         HOST_UI_TOKEN_HEADER,
         host_tokens.ui_token(),
+        processes,
         80,
     ) {
         terminate_owned_process_tree(&mut proxy);
@@ -1155,6 +1392,16 @@ fn startup_failure(
         message: message.into(),
         retryable,
     }
+}
+
+fn startup_stopped_failure() -> HostStartupFailure {
+    startup_failure(
+        "shutdown",
+        "host_startup_stopped",
+        None,
+        "Host startup was stopped because the application is closing.",
+        false,
+    )
 }
 
 fn prepare_host_startup_diagnostics(attempt_id: &str) -> std::io::Result<HostDiagnosticAttempt> {
@@ -1338,9 +1585,13 @@ fn wait_for_authenticated_health(
     port: &str,
     token_header: &str,
     token: &str,
+    processes: &HostProcessGroup,
     attempts: usize,
 ) -> Result<(), HostStartupFailure> {
     for _ in 0..attempts {
+        if processes.is_shutting_down() {
+            return Err(startup_stopped_failure());
+        }
         match process.child.try_wait() {
             Ok(Some(status)) => {
                 process.join_capture_threads();
@@ -1393,10 +1644,14 @@ fn wait_for_public_identity(
     port: &str,
     expected_service: &str,
     expected_instance_id: &str,
+    processes: &HostProcessGroup,
     attempts: usize,
 ) -> Option<HostProcessIdentity> {
     let expected_pid = process.child.id();
     for _ in 0..attempts {
+        if processes.is_shutting_down() {
+            return None;
+        }
         match process.child.try_wait() {
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) => {}
@@ -1483,9 +1738,12 @@ fn request_daemon_shutdown(
         &[(HOST_SHELL_TOKEN_HEADER, token)],
         &body,
     );
-    let Some(envelope) =
-        request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(host, port, &request, 600)
-    else {
+    let Some(envelope) = request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(
+        host,
+        port,
+        &request,
+        HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS,
+    ) else {
         return false;
     };
     let Some(receipt) = envelope.ok.then_some(envelope.data).flatten() else {
@@ -1823,4 +2081,110 @@ fn env_truthy(name: &str) -> bool {
             matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn sleeping_owned_host_process() -> OwnedHostProcess {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        spawn_owned_host_process(&mut command).expect("spawn owned test process")
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[test]
+    fn application_shutdown_latches_before_late_startup_can_install_children() {
+        let processes = HostProcessGroup::new(None);
+        assert!(!processes.is_shutting_down());
+
+        processes.shutdown();
+
+        assert!(processes.is_shutting_down());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn application_shutdown_rejects_and_reclaims_late_host_children() {
+        let processes = HostProcessGroup::new(None);
+        processes.shutdown();
+
+        let daemon = sleeping_owned_host_process();
+        let proxy = sleeping_owned_host_process();
+        let daemon_pid = daemon.child.id();
+        let proxy_pid = proxy.child.id();
+        let children = OwnedHostChildren {
+            daemon,
+            proxy,
+            daemon_host: "127.0.0.1".to_string(),
+            daemon_port: "0".to_string(),
+            daemon_token: "test-token".to_string(),
+            daemon_identity: HostProcessIdentity {
+                service: KERNEL_DAEMON_SERVICE.to_string(),
+                instance_id: format!("{HOST_INSTANCE_ID_PREFIX}test"),
+                pid: daemon_pid,
+                address: "127.0.0.1:0".to_string(),
+            },
+        };
+
+        assert!(process_exists(daemon_pid));
+        assert!(process_exists(proxy_pid));
+        assert!(!processes.install(children));
+        assert!(!process_exists(daemon_pid));
+        assert!(!process_exists(proxy_pid));
+    }
+
+    #[test]
+    fn retry_reclaim_does_not_latch_application_shutdown() {
+        let processes = HostProcessGroup::new(None);
+
+        processes.reclaim_current();
+
+        assert!(!processes.is_shutting_down());
+    }
+
+    #[test]
+    fn application_shutdown_waits_for_every_active_startup_lease() {
+        let processes = std::sync::Arc::new(HostProcessGroup::new(None));
+        let startup_processes = std::sync::Arc::clone(&processes);
+        let startup_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let startup_finished_by_thread = std::sync::Arc::clone(&startup_finished);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let startup_thread = std::thread::spawn(move || {
+            let _startup_lease = startup_processes
+                .begin_startup()
+                .expect("startup is admitted before application shutdown");
+            started_tx.send(()).expect("report admitted startup");
+            while !startup_processes.is_shutting_down() {
+                std::thread::yield_now();
+            }
+            startup_finished_by_thread.store(true, std::sync::atomic::Ordering::Release);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup lease is active");
+
+        processes.shutdown();
+
+        assert!(startup_finished.load(std::sync::atomic::Ordering::Acquire));
+        startup_thread.join().expect("startup thread exits");
+    }
+
+    #[test]
+    fn message_attachment_media_type_is_derived_from_selected_file() {
+        assert_eq!(
+            message_attachment_media_type(Path::new("notes.md")),
+            "text/markdown"
+        );
+        assert_eq!(
+            message_attachment_media_type(Path::new("source.cpp")),
+            "text/plain"
+        );
+    }
 }

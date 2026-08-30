@@ -7,12 +7,16 @@ pub(crate) struct AppState {
     pub(crate) session_service: crate::session_service::SessionServiceProcess,
     pub(crate) host_connection: crate::host_connection::HostConnection,
     pub(crate) gui: Arc<Mutex<GuiState>>,
+    /// Immutable settings snapshot used to assemble the current Kernel and
+    /// Session runtimes. Saved settings may diverge until the daemon restarts.
+    pub(crate) runtime_user_settings: Value,
     pub(crate) host_services: HostServices,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct HostPaths {
+    pub(crate) root_owner_lease_path: PathBuf,
     pub(crate) settings_path: PathBuf,
     pub(crate) llm_profiles_path: PathBuf,
     pub(crate) llm_secrets_path: PathBuf,
@@ -23,6 +27,7 @@ pub(crate) struct HostPaths {
 
 #[derive(Debug)]
 pub(crate) struct GuiState {
+    _config_root_lease: ConfigRootLease,
     pub(crate) paths: HostPaths,
     pub(crate) user_settings: Value,
     pub(crate) llm_profiles: Value,
@@ -31,14 +36,21 @@ pub(crate) struct GuiState {
 }
 
 impl GuiState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn open() -> Result<Self, String> {
         let paths = HostPaths::new();
-        let user_settings =
-            read_json_file(&paths.settings_path).unwrap_or_else(default_user_settings);
-        let llm_profiles = if paths.llm_profiles_path.exists() {
-            read_json_file(&paths.llm_profiles_path).unwrap_or(Value::Null)
-        } else {
-            default_llm_profiles()
+        let config_root_lease = ConfigRootLease::acquire(&paths.root_owner_lease_path)?;
+        let user_settings = match read_optional_json_file(&paths.settings_path)? {
+            Some(value @ Value::Object(_)) => {
+                validate_agent_runtime_settings(&value)?;
+                value
+            }
+            Some(_) => return Err("本地用户设置文件必须是 JSON 对象。".to_string()),
+            None => default_user_settings(),
+        };
+        let llm_profiles = match read_optional_json_file(&paths.llm_profiles_path)? {
+            Some(value) if llm_profile_store_is_current(&value) => value,
+            Some(_) => return Err("本地 LLM Profile 文件不是当前格式。".to_string()),
+            None => default_llm_profiles(),
         };
         let (conversation_catalog, conversation_catalog_error) =
             match crate::conversation_catalog::ConversationCatalog::load(&paths.catalog_store_path)
@@ -49,13 +61,14 @@ impl GuiState {
                     Some(error),
                 ),
             };
-        Self {
+        Ok(Self {
+            _config_root_lease: config_root_lease,
             paths,
             user_settings,
             llm_profiles,
             conversation_catalog,
             conversation_catalog_error,
-        }
+        })
     }
 }
 
@@ -74,6 +87,7 @@ impl HostPaths {
             .join("secrets");
         let runtime_root = root.join("runtime").join("agent-runtime");
         Self {
+            root_owner_lease_path: runtime_root.join("root-owner.lock"),
             settings_path: settings_dir.join("user-settings.json"),
             llm_profiles_path: settings_dir.join("llm-profiles.json"),
             llm_secrets_path: secrets_dir.join("llm-secrets.json"),

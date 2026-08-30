@@ -15,7 +15,7 @@ DeepCode 是一个本地优先的编码 Agent 框架。Editor、DeepCode-GUI、C
   -> Session 中唯一的 Agent Loop
   -> Provider 返回 typed turn 文本增量或原生工具调用
   -> Session 按 turn 生命周期记录叙述、答案、交互或 Plan 事实
-  -> 工作区变更前等待精确 Plan 选择
+  -> 按当前工作区权限策略选择是否等待完整 Plan 确认
   -> Kernel 以同一 PreparedEffect 授权、执行并记录
   -> Session 继续循环并生成共享投影
   -> UI / CLI / TUI 渲染同一份事实
@@ -27,18 +27,20 @@ DeepCode 是一个本地优先的编码 Agent 框架。Editor、DeepCode-GUI、C
 - UI 只提交命令并消费 `SessionProjection`，不维护另一套任务状态或执行事实。
 - Skill 与 MCP 以插件贡献接入组合，不产生第二个 Agent Loop。
 
-DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通叙述和最终回答是 LLM 的原生 Markdown 正文；Session 只依据 typed Provider turn 是否包含工具调用来区分两者，并把当前 run 的文本增量作为可丢弃 `assistantDraft` 投影给所有界面。Plan 与 interaction 只能由 LLM 调用 Session 保留的结构化 control 工具产生，不使用 JSONL 正文封装、自然语言推断或失败回退。Plan 选择持久化为 `plan.respond(select)` 后，只为该 run 中精确的 workspace、operation 和 normalized targets 产生 authority。自由输入调整会关闭旧 Plan但不产生 authority；明确忽略会让同一 Loop 进入 answer-only continuation。Session binding 允许读取 immutable workspace snapshot 内的内容；工作区变更不存在逐调用 `ask` 或全局 `allow` 兜底。其他 effect class 仍可使用各自明确的 interaction request。
+DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通叙述和最终回答是 LLM 的原生 Markdown 正文；Session 只依据 typed Provider turn 是否包含工具调用来区分两者，并把当前 run 的文本增量作为可丢弃 `assistantDraft` 投影给所有界面。Plan 与 interaction 只能由 LLM 调用 Session 保留的结构化 control 工具产生，不使用 JSONL 正文封装、自然语言推断或失败回退。`plan.publish` 发布一份完整 revision；`plan.respond(confirm)` 只为精确的 workspace、operation 和 normalized targets 提交 session-scoped authority，并从 Plan 步骤原子生成 Todo。修订请求保留同一 Plan identity 并递增 revision，取消则不生成 authority 或 Todo。已确认的 Plan/Todo 会跨普通补充输入和后续 run 保留，直到显式 Plan lifecycle 事实将其 supersede、complete、cancel 或 invalidate。
+
+Session binding 始终把工作区工具限制在当前 run 的不可变目录快照内。`agent.permissions.workspaceMutation` 默认是 `plan`；改为 `allow` 只会关闭结构化 `fs.*` 修改的 Plan admission 门禁。在 macOS 上，`process.shell` 是独立授权的项目调试能力：只要求绑定工作区、无需 Plan，以关闭 stdin 的非交互 `/bin/sh` 执行有界命令，并继续硬拒绝破坏性命令。PATH 由 Host PATH 与当前存在的标准开发工具目录组成。文件写入只允许当前工作区和 Kernel 为本次调用持有的 `$TMPDIR`；`HOME` 可读但不可写，需要可变状态的开发工具必须把状态目录显式指向 `$TMPDIR` 或工作区。调用结束后 Kernel 会清理该临时目录。`success` 只表示整段 Shell 的最终退出状态，stdout 与 stderr 始终作为独立事实保留。缺少当前工作区写入沙箱的平台会在工具目录中把 `process.shell` 标成 blocked，而不是暴露一个必然失败的 callable 工具。网络读取默认 `allow`，可以访问 Host 任意可达的 HTTP(S) 地址；外部副作用工具仍默认 `ask`。`agent.web.search.endpointTemplate` 留空时，`web.search` 使用内建 Bing RSS；显式模板继续按现有 JSON 搜索结果合同覆盖内建后端。两种设置都不会放宽工作区路径解析或工作区外副作用确认。`agent.permissions.engineeringDecisions` 独立控制实质工程路线不明确时通过 `interaction.request` 询问，还是委托 Agent 依据当前代码事实自行裁决。公开 GitHub 仓库/Issue 搜索和 contents 读取无需凭据；GitHub REST code search 按官方要求使用 daemon 启动时捕获的 `DEEPCODE_GITHUB_TOKEN`。
 
 ## 选择界面
 
-| 界面 | 适合场景 | 入口 |
-| --- | --- | --- |
+| 界面            | 适合场景                                    | 入口                                            |
+| --------------- | ------------------------------------------- | ----------------------------------------------- |
 | DeepCode Editor | 文件树、编辑器、终端、Git 面板和 Agent 对话 | `DeepCode.app`、`DeepCode.exe` 或 Linux GUI |
-| DeepCode-GUI | 专注的本地 Agent 对话 | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe` |
-| CLI | 一次性任务、脚本和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
-| TUI | 持续的交互式终端对话 | `DeepCode-TUI.command` 或 `deepcode-tui` |
+| DeepCode-GUI    | 专注的本地 Agent 对话                       | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe`    |
+| CLI             | 一次性任务、脚本和终端工作流                | `DeepCode-CLI.command` 或 `deepcode-cli`    |
+| TUI             | 持续的交互式终端对话                        | `DeepCode-TUI.command` 或 `deepcode-tui`    |
 
-日常开发推荐使用完整的 DeepCode Editor GUI，将文件树、编辑器、终端、Git 与 Agent 工作流集中在同一界面；偏好终端工作流时推荐使用 TUI。CLI 继续用于一次性操作、自动化与诊断。
+日常开发推荐使用完整的 DeepCode GUI，将文件树、编辑器、终端、Git 与 Agent 工作流集中在同一界面；偏好终端工作流时推荐使用 TUI。CLI 继续用于一次性操作、自动化与诊断。
 
 只要使用同一配置根，四个界面就会读取同一批模型配置、Session journal、Kernel 工具记录和共享投影。
 
@@ -73,14 +75,30 @@ make package-macos-clean
 
 当前 macOS 包用于本机运行，采用 ad-hoc 签名；它不是 Developer ID 签名或公证的 DMG。
 
+macOS package service 固定使用当前仓库内的请求目录，并只发布到当前仓库的 `bin/macos-arm64/`。请求回执会直接打印 worker 根目录、输出目录和日志位置；打包脚本仍会在发布前确认源码没有在同一事务中发生变化。
+
 ## Linux 与 Windows 包
 
-开发和便携打包通过项目容器完成。Windows 请在 WSL 中运行：
+开发和便携打包通过唯一的 `deepcode-dev` 容器完成。推荐直接在宿主机运行完整构建：
+
+```bash
+make build
+```
+
+需要交互调试时（Windows 请先进入 WSL）：
 
 ```bash
 make shell
 bash ./build.sh
 ```
+
+每次入口都会通过 Docker 缓存重新求值 `Dockerfile.dev`。若源码挂载、开发镜像或端口发生变化，工具只重建固定名称的 `deepcode-dev` 容器并保留依赖/编译缓存；不再存在分支专用容器或 `DEEPCODE_WORKTREE_ID`。只想重建容器时执行：
+
+```bash
+make reset-dev
+```
+
+Rust 开发版本由 `rust-toolchain.toml` 统一指定为 1.88.0；workspace 的最低版本合同是 1.86，满足当前锁文件中依赖的实际要求。
 
 产物写入：
 
@@ -116,16 +134,16 @@ cd bin/linux-x64
 
 1. 可以直接开始独立对话，也可以新建项目并附加一个或多个本地文件夹。
 2. 项目的有序文件夹列表只作为新 Session 的模板；Session 创建后保留不可变的 creation snapshot，项目变化只影响之后创建的 Session。
-3. 输入框可以附加文件或文件夹。文件会作为该条消息的不可变内容快照保存；文件夹不复制内容，而是作为 Session 目录索引，由模型通过 `fs.list`、`fs.glob`、`code.grep` 和 `fs.read` 自主探索。
-4. 对话目录索引可以随后移除，但不会删除既有消息、activity 或工具记录。活动 run 中的附加或移除会标记为“下轮生效”，只改变下一 run 冻结的有效目录集合，也不会静默写回项目模板。
+3. 输入框在同一个附件区附加文件或文件夹。文件作为该条消息的不可变内容快照保存；文件夹不复制内容，而是作为该条消息的逻辑目录引用保存，只进入由该消息启动的 run 目录快照，模型通过 `fs.list`、`fs.glob`、`code.grep` 和 `fs.read` 自主探索。
+4. 消息中的文件夹引用会永久随原消息展示，但不会改写 Session 或 Project 的持久目录索引。CLI/TUI 的显式 `attach-directory`/`/attach` 仍管理 Session 目录索引，只影响随后启动的 run，且不会静默写回项目模板。
 5. 输入希望 Agent 完成的编码任务。独立 Session 可以保持无 binding，直到确实需要访问文件夹。
 6. Agent 在 Provider 与工具循环运行时，将当前 typed turn 的 LLM 文本增量作为共享 `assistantDraft` 投影；turn 闭合后再提交为叙述或终答。
-7. 工作区变更使用原输入框中的 Plan 卡。选项按 `1..N` 纵向排列：首次点击只选中，再次点击或按 Enter 才确认；也可以自由输入调整细节，或明确忽略 Plan 并直接回答。
+7. Agent 发布 Plan 后，在可折叠 Plan 卡中审阅完整步骤和 mutation manifest；可以确认、用自由文本请求修订或取消。确认后卡片自动折叠但不会被删除，同时原子生成 Todo。若工作区修改策略设为 `allow`，Agent 可以在绑定工作区内直接工作，不必为了权限门禁发布 Plan。
 8. 对话中仍可切换模型，新的 profile 从后续 Provider turn 起生效。
 9. 消息、Plan、activities、产物、上下文用量和 run 状态都来自同一份共享投影。
 10. 已提交的 Assistant 回答可以复制、赞、踩或清除反馈。赞踩是本地 Session 持久事实，重启后可恢复，不会由 GUI 私存，也不会发送给 Provider。
 11. 点击输入框中的上下文球可以查看当前 Provider 请求的上下文分区。分区条目数和估算取 Session，缓存命中/未命中取 Provider；缺失显示 `N/A`，GUI/TUI 不自行归因或重算。设置页显示由 Session 汇总、按新到旧排列的逐轮 Token 消耗（每页 10 条）。
-12. 复杂任务由 LLM 通过结构化 `todo.update` 明确提交 Todo；右侧任务面板只消费该共享投影，不把工具调用或 GUI 推断伪装成任务。工具调用仍与叙述按 Session 时间线交错显示在主对话区。
+12. 复杂任务由 LLM 通过 `plan.publish` 发布完整 Plan；用户确认时 Session 从 Plan 步骤原子生成 Todo，后续 `todo.progress` 只能更新已生成条目的状态。右侧任务面板只消费该共享投影，不把工具调用或 GUI 推断伪装成任务。工具调用仍与叙述按 Session 时间线交错显示在主对话区。
 
 删除 Session 会同时删除对话 Catalog 条目及其完整归档：Session events、command replay、binding 关系和 Kernel ToolRecord。活动 run 必须先停止。
 
@@ -146,14 +164,14 @@ cd bin/linux-x64
 ```bash
 ./DeepCode-CLI.command ask --session <session-id> 1
 ./DeepCode-CLI.command ask --session <session-id> "调整目标后重新给出 Plan"
-./DeepCode-CLI.command ignore-plan --session <session-id>
+./DeepCode-CLI.command cancel-plan --session <session-id>
 ./DeepCode-CLI.command model --session <session-id> <profile-id>
 ./DeepCode-CLI.command cancel --session <session-id> <run-id>
 ./DeepCode-CLI.command attach-directory --session <session-id> /path/to/folder
 ./DeepCode-CLI.command detach-directory --session <session-id> <workspace-id>
 ```
 
-只有显式 `-C` / `--workspace` 才会为新的 CLI Session 创建 binding，当前目录不会被隐式采用。Plan 等待时输入 `1..N` 选择选项，其他非空文本作为调整反馈；只有 `ignore-plan` 表示忽略。`ask` 会等待 run 到达终态或需要用户决定；failed、cancelled 或 indeterminate 必须非零退出。CLI 只通过 `ConversationPort` 提交命令，不直接调用工具。
+只有显式 `-C` / `--workspace` 才会为新的 CLI Session 创建 binding，当前目录不会被隐式采用。Plan 等待时输入 `1`/`确认`确认完整 Plan，其他非空文本请求修订；`cancel-plan` 明确取消。`ask` 会等待 run 到达终态或需要用户决定；failed、cancelled 或 indeterminate 必须非零退出。CLI 只通过 `ConversationPort` 提交命令，不直接调用工具。
 
 ## TUI
 
@@ -166,7 +184,7 @@ cd bin/linux-x64
 
 - `/help`：显示命令提示。
 - `/show`：重新显示当前共享投影。
-- `/ignore`：明确忽略当前 Plan，并以 answer-only continuation 继续。
+- `/cancel-plan`：明确取消当前等待中的 Plan。
 - `/model <profile>`：切换后续 Provider turn 使用的 profile。
 - `/cancel`：取消活动 run。
 - `/attach <path>`：把文件夹作为 Session 目录索引附加。
@@ -174,7 +192,7 @@ cd bin/linux-x64
 - `/clear`：刷新可见状态，不修改 durable Session。
 - `/quit`、`/exit`：退出 TUI。
 
-Plan 等待时输入 `1..N` 选择选项，其他非空文本作为调整反馈。`Esc` 是 TUI 的明确忽略动作；空输入、EOF 和 Ctrl-C 都不会忽略 Plan。与 CLI 相同，只有显式 `-C` / `--workspace` 才为新 Session 创建 binding。
+Plan 等待时输入 `1`/`确认`确认完整 Plan，其他非空文本作为修订反馈。`Esc` 明确取消等待中的 Plan；空输入、EOF 和 Ctrl-C 都不会取消。与 CLI 相同，只有显式 `-C` / `--workspace` 才为新 Session 创建 binding。
 
 ## 本地数据
 

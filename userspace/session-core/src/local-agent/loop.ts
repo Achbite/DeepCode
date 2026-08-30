@@ -2,18 +2,18 @@ import type {
   AssistantDraftProjection,
   ContextCompositionMessage,
   ContextCompositionReceipt,
+  ExecutionPlan,
   LocalAgentError,
   ModelInteractionRequest,
   ModelMessage,
   NewSessionEvent,
   PlanAuthority,
-  PlanIntent,
   ProviderTokenUsage,
   ProviderEvent,
   ProviderRequest,
   ProviderToolDefinition,
   SessionEvent,
-  TodoItem,
+  TodoProgressUpdate,
   ToolDescriptor,
   ToolExecutionRecord,
   ToolExecutionRequest,
@@ -22,9 +22,10 @@ import type {
 import {
   KERNEL_REQUEST_VERSION,
   LOCAL_AGENT_PROTOCOL_VERSION,
+  SESSION_CONTROL_CONTEXT_FOCUS,
   SESSION_CONTROL_INTERACTION_REQUEST,
-  SESSION_CONTROL_PLAN_INTENT,
-  SESSION_CONTROL_TODO_UPDATE,
+  SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_TODO_PROGRESS,
 } from '@deepcode/protocol';
 import type { AgentComposition, ContextMessageContribution } from './plugins.js';
 import { recoverSession, type SessionState } from './reducer.js';
@@ -33,6 +34,7 @@ import {
   SESSION_CONTROL_INSTRUCTIONS,
   SessionControlError,
   sessionControlToolDefinitions,
+  type PlanPublicationDraft,
   type SessionControlCall,
 } from './sessionControls.js';
 
@@ -74,11 +76,18 @@ export interface ProviderRunTransientState {
   runId: string;
   observedCallIds: Set<string>;
   reasoningByCallId: Map<string, string>;
+  reasoningSignatureByCallId: Map<string, string>;
 }
 
 type ProviderTurnCommon = {
   contextUsage?: ProviderTokenUsage & { providerRequestId: string };
-  todo?: { callId: string; items: TodoItem[] };
+  todo?: {
+    callId: string;
+    providerCallId: string;
+    planId: string;
+    revision: number;
+    updates: TodoProgressUpdate[];
+  };
 };
 
 interface PreparedProviderRequest {
@@ -91,26 +100,53 @@ type ProviderTurn =
   | {
       kind: 'interaction';
       interactionId: string;
+      providerCallId: string;
       request: ModelInteractionRequest;
       narrative?: string;
     } & ProviderTurnCommon
-  | ({ kind: 'plan'; intent: PlanIntent; narrative?: string } & ProviderTurnCommon)
+  | ({
+      kind: 'plan';
+      callId: string;
+      draft: PlanPublicationDraft;
+      providerCallId: string;
+      narrative?: string;
+    } & ProviderTurnCommon)
   | ({
       kind: 'tools';
-      calls: Array<{ callId: string; name: string; input: Record<string, unknown> }>;
+      calls: Array<{
+        callId: string;
+        providerCallId: string;
+        name: string;
+        input: Record<string, unknown>;
+      }>;
       narrative?: string;
     } & ProviderTurnCommon)
   | ({
       kind: 'controlRejected';
       rejection: {
         callId: string;
+        providerCallId: string;
         toolName: string;
         input: Record<string, unknown>;
         error: LocalAgentError;
       };
       narrative?: string;
     } & ProviderTurnCommon)
+  | ({
+      kind: 'focus';
+      callId: string;
+      providerCallId: string;
+      focus: string;
+      narrative?: string;
+    } & ProviderTurnCommon)
   | ({ kind: 'continue'; narrative?: string } & ProviderTurnCommon);
+
+const PRESSURE_COMPACTION_RATIO = 0.9;
+const DEFAULT_COMPACTION_OUTPUT_TOKENS = 4096;
+const MAX_COMPACTION_OUTPUT_TOKENS = 8192;
+const COMPACTION_INSTRUCTIONS = `把给定 Session 历史压缩为后续 Agent 可直接继续工作的事实摘要。
+保留用户目标、已确认决定、边界与约束、未解决问题、精确标识、路径、命令、错误、已完成和待完成工作，以及仍有效的 Plan、Todo 和工具结果。
+区分事实、推断和未知；不得补造事实、回答新任务或执行任何操作。只输出压缩摘要 Markdown。`;
 
 export async function runAgentLoop(
   initial: LoopSnapshot,
@@ -149,10 +185,14 @@ export async function runAgentLoop(
       return { status: 'settled', runId, outcome: 'completed' };
     }
 
-    const answerOnly = command.type === 'resume' && command.answerOnly === true
-      || requiresAnswerOnly(snapshot.events, runId);
+    const answerOnly = command.type === 'resume' && command.answerOnly === true;
     while (true) {
       throwIfAborted(signal);
+      const pendingCompaction = pendingContextCompaction(snapshot.events, runId);
+      if (pendingCompaction) {
+        await performContextCompaction(snapshot, pendingCompaction, runId, deps, signal, commit);
+        continue;
+      }
       const pending = pendingToolRequests(snapshot.events, runId);
       for (const requestEvent of pending) {
         const approval = latestApproval(snapshot.events, runId, requestEvent.callId);
@@ -176,8 +216,8 @@ export async function runAgentLoop(
           toolName: requestEvent.payload.toolName,
           input: requestEvent.payload.input,
           workspaceBindings: runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId),
-          ...(selectedPlanAuthorities(snapshot.events, runId).length
-            ? { planAuthorities: selectedPlanAuthorities(snapshot.events, runId) }
+          ...(selectedPlanAuthorities(snapshot.events).length
+            ? { planAuthorities: selectedPlanAuthorities(snapshot.events) }
             : {}),
           ...(approval.resolved
             ? {
@@ -218,7 +258,31 @@ export async function runAgentLoop(
       }
 
       throwIfAborted(signal);
+      const completedPlan = completedPlanAwaitingLifecycle(snapshot.state);
+      if (completedPlan) {
+        await commit({
+          type: 'plan.completed',
+          sessionId: snapshot.state.sessionId,
+          runId,
+          payload: completedPlan,
+        });
+      }
       const preparedProviderRequest = await buildProviderRequest(snapshot, runId, deps, answerOnly);
+      const pressureCutoff = pressureCompactionCutoff(snapshot, runId, preparedProviderRequest.receipt);
+      if (pressureCutoff !== null) {
+        await commit({
+          type: 'context.compaction.requested',
+          sessionId: snapshot.state.sessionId,
+          runId,
+          payload: {
+            compactionId: deps.nextId('compaction'),
+            providerRequestId: deps.nextId('provider-request'),
+            trigger: 'pressure',
+            coveredThroughSequence: pressureCutoff,
+          },
+        });
+        continue;
+      }
       await commit({
         type: 'context.composed',
         sessionId: snapshot.state.sessionId,
@@ -244,12 +308,18 @@ export async function runAgentLoop(
         });
       }
       if (turn.todo) {
+        assertTodoProgressSource(snapshot.state, turn.todo);
         turnFacts.push({
-          type: 'todo.updated',
+          type: 'todo.progressed',
           sessionId: snapshot.state.sessionId,
           runId,
           callId: turn.todo.callId,
-          payload: { items: turn.todo.items.map((item) => ({ ...item })) },
+          payload: {
+            providerCallId: turn.todo.providerCallId,
+            sourcePlanId: turn.todo.planId,
+            sourcePlanRevision: turn.todo.revision,
+            updates: turn.todo.updates.map((update) => ({ ...update })),
+          },
         });
       }
 
@@ -261,7 +331,11 @@ export async function runAgentLoop(
               type: 'interaction.requested',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: { interactionId: turn.interactionId, ...turn.request },
+              payload: {
+                interactionId: turn.interactionId,
+                providerCallId: turn.providerCallId,
+                ...turn.request,
+              },
             },
             {
               type: 'run.waiting',
@@ -277,39 +351,56 @@ export async function runAgentLoop(
             interactionId: turn.interactionId,
           };
         }
-        case 'plan':
-          if (snapshot.events.some((event) => (
-            event.type === 'plan.intent.requested'
-            && event.runId === runId
-            && event.payload.planId === turn.intent.planId
-          ))) {
-            throw new LoopFailure('plan_id_reused', '同一运行不能重复使用 planId。');
+        case 'plan': {
+          const identity = nextPlanIdentity(snapshot.events, runId, () => deps.nextId('plan'));
+          if (
+            identity.planId === turn.callId
+            || identity.planId === turn.providerCallId
+            || turn.callId === turn.providerCallId
+          ) {
+            throw new LoopFailure(
+              'plan_identity_invalid',
+              'PlanId、LogicalCallId 与 ProviderCallId 必须是互不复用的独立身份。',
+            );
           }
+          const plan: ExecutionPlan = {
+            planId: identity.planId,
+            revision: identity.revision,
+            title: turn.draft.title,
+            summary: turn.draft.summary,
+            steps: turn.draft.steps.map((step) => ({
+              ...step,
+              ...(step.verification ? { verification: [...step.verification] } : {}),
+            })),
+            mutationManifest: turn.draft.mutationManifest.map((operation) => ({ ...operation })),
+          };
           assertPlanWorkspaceBindings(
-            turn.intent,
+            plan,
             runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId),
           );
           await commit([
             ...turnFacts,
             {
-              type: 'plan.intent.requested',
+              type: 'plan.published',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: clonePlan(turn.intent),
+              callId: turn.callId,
+              payload: { ...clonePlan(plan), providerCallId: turn.providerCallId },
             },
             {
               type: 'run.waiting',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: { reason: 'plan', detail: turn.intent.prompt },
+              payload: { reason: 'plan', detail: plan.title },
             },
           ]);
           return {
             status: 'waiting',
             runId,
             reason: 'plan',
-            planId: turn.intent.planId,
+            planId: plan.planId,
           };
+        }
         case 'answer': {
           const messageId = turn.messageId ?? deps.nextId('message');
           await commit([
@@ -343,6 +434,7 @@ export async function runAgentLoop(
               runId,
               callId: call.callId,
               payload: {
+                providerCallId: call.providerCallId,
                 attemptId: deps.nextId('attempt'),
                 toolName: call.name,
                 input: call.input,
@@ -359,6 +451,7 @@ export async function runAgentLoop(
             runId,
             callId: turn.rejection.callId,
             payload: {
+              providerCallId: turn.rejection.providerCallId,
               toolName: turn.rejection.toolName,
               input: { ...turn.rejection.input },
               error: { ...turn.rejection.error },
@@ -382,6 +475,26 @@ export async function runAgentLoop(
             },
           ]);
           return { status: 'settled', runId, outcome: 'failed' };
+        }
+        case 'focus': {
+          await commit([
+            ...turnFacts,
+            {
+              type: 'context.compaction.requested',
+              sessionId: snapshot.state.sessionId,
+              runId,
+              callId: turn.callId,
+              payload: {
+                compactionId: deps.nextId('compaction'),
+                providerRequestId: deps.nextId('provider-request'),
+                trigger: 'agentFocus',
+                coveredThroughSequence: snapshot.state.revision,
+                focus: turn.focus,
+                providerCallId: turn.providerCallId,
+              },
+            },
+          ]);
+          break;
         }
         case 'continue':
           await commit(turnFacts);
@@ -458,7 +571,7 @@ async function buildProviderRequest(
     message: {
       role: 'system',
       content: `当前 Session workspace binding（仅逻辑身份，不含绝对路径）：${JSON.stringify(
-        runWorkspaceBindings(snapshot, runId),
+        snapshot.state.workspaceBindings,
       )}`,
     },
   });
@@ -469,7 +582,7 @@ async function buildProviderRequest(
       label: 'Answer-only continuation',
       message: {
         role: 'system',
-        content: '当前是 Plan ignore 后的 answer-only continuation。直接输出最终 Markdown 答复；不要调用任何工具或 Session control。',
+        content: '当前 run 被明确限制为 answer-only continuation。直接输出最终 Markdown 答复；不要调用任何工具或 Session control。',
       },
     });
   }
@@ -485,6 +598,7 @@ async function buildProviderRequest(
     sessionId: snapshot.state.sessionId,
     runId,
     ...(profileId ? { profileId } : {}),
+    purpose: 'agent',
     responseConstraint: answerOnly ? 'answerOnly' : 'normal',
     workspaceBindings: runWorkspaceBindings(snapshot, runId),
     messages: selected.map((item) => cloneModelMessage(item.message)),
@@ -494,6 +608,7 @@ async function buildProviderRequest(
     request,
     receipt: buildContextCompositionReceipt(
       requestId,
+      'agent',
       answerOnly ? 'answerOnly' : 'normal',
       selected,
       composedTools,
@@ -501,6 +616,286 @@ async function buildProviderRequest(
       runWorkspaceBindings(snapshot, runId),
       snapshot.events,
     ),
+  };
+}
+
+type ContextCompactionRequestEvent = Extract<
+  SessionEvent,
+  { type: 'context.compaction.requested' }
+>;
+
+function pendingContextCompaction(
+  events: readonly SessionEvent[],
+  runId: string,
+): ContextCompactionRequestEvent | null {
+  const completed = new Set(events
+    .filter((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
+      event.type === 'context.compacted' && event.runId === runId
+    ))
+    .map((event) => event.payload.compactionId));
+  return [...events]
+    .reverse()
+    .find((event): event is ContextCompactionRequestEvent => (
+      event.type === 'context.compaction.requested'
+      && event.runId === runId
+      && !completed.has(event.payload.compactionId)
+    )) ?? null;
+}
+
+async function performContextCompaction(
+  snapshot: LoopSnapshot,
+  requestEvent: ContextCompactionRequestEvent,
+  runId: string,
+  deps: AgentLoopDeps,
+  signal: AbortSignal,
+  commit: (event: NewSessionEvent | readonly NewSessionEvent[]) => Promise<void>,
+): Promise<void> {
+  if (snapshot.events.some((event) => (
+    event.type === 'context.composed'
+    && event.payload.providerRequestId === requestEvent.payload.providerRequestId
+  ))) {
+    throw new LoopFailure(
+      'context_compaction_interrupted',
+      '上下文压缩 Provider 调用已开始但没有形成完成事实；Session 不会隐藏重试该调用。',
+    );
+  }
+  const cutoff = requestEvent.payload.coveredThroughSequence;
+  const sourceEvents = snapshot.events.filter((event) => event.sequence <= cutoff);
+  const sourceMessages = messagesFromJournal(sourceEvents, runId, deps.providerRunState);
+  const focus = 'focus' in requestEvent.payload ? requestEvent.payload.focus : undefined;
+  const selected: ContextMessageContribution[] = [
+    {
+      contributionId: `context-compaction:${requestEvent.payload.compactionId}:instructions`,
+      contributionKind: 'instructions',
+      label: '上下文压缩指令',
+      message: { role: 'system', content: COMPACTION_INSTRUCTIONS },
+    },
+    ...sourceMessages,
+  ];
+  if (focus) {
+    selected.push({
+      contributionId: `context-compaction:${requestEvent.payload.compactionId}:focus`,
+      contributionKind: 'instructions',
+      label: '后续任务焦点',
+      message: {
+        role: 'system',
+        content: `后续工作焦点如下。压缩时优先保留与此焦点相关的既有事实，但不要回答它：\n${focus}`,
+      },
+    });
+  }
+  assertContextContributions(selected);
+  const profileId = snapshot.state.run?.profileId ?? deps.defaultProfileId;
+  const request: ProviderRequest = {
+    protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
+    requestId: requestEvent.payload.providerRequestId,
+    sessionId: snapshot.state.sessionId,
+    runId,
+    ...(profileId ? { profileId } : {}),
+    purpose: 'contextCompaction',
+    responseConstraint: 'answerOnly',
+    maxOutputTokens: compactionOutputBudget(snapshot.state.contextUsage?.contextWindowTokens),
+    workspaceBindings: runWorkspaceBindings(snapshot, runId),
+    messages: selected.map((item) => cloneModelMessage(item.message)),
+    tools: [],
+  };
+  const receipt = buildContextCompositionReceipt(
+    request.requestId,
+    'contextCompaction',
+    'answerOnly',
+    selected,
+    [],
+    [],
+    runWorkspaceBindings(snapshot, runId),
+    sourceEvents,
+  );
+  await commit({
+    type: 'context.composed',
+    sessionId: snapshot.state.sessionId,
+    runId,
+    payload: receipt,
+  });
+  const compacted = await consumeCompactionProvider(request, deps, signal);
+  const facts: NewSessionEvent[] = [];
+  if (compacted.contextUsage) {
+    facts.push({
+      type: 'context.updated',
+      sessionId: snapshot.state.sessionId,
+      runId,
+      payload: compacted.contextUsage,
+    });
+  }
+  facts.push({
+    type: 'context.compacted',
+    sessionId: snapshot.state.sessionId,
+    runId,
+    ...(requestEvent.callId ? { callId: requestEvent.callId } : {}),
+    payload: {
+      compactionId: requestEvent.payload.compactionId,
+      providerRequestId: requestEvent.payload.providerRequestId,
+      trigger: requestEvent.payload.trigger,
+      coveredThroughSequence: cutoff,
+      summary: compacted.summary,
+    },
+  });
+  await commit(facts);
+}
+
+function compactionOutputBudget(contextWindowTokens?: number): number {
+  if (!contextWindowTokens) return DEFAULT_COMPACTION_OUTPUT_TOKENS;
+  return Math.max(
+    1024,
+    Math.min(MAX_COMPACTION_OUTPUT_TOKENS, Math.floor(contextWindowTokens * 0.08)),
+  );
+}
+
+function pressureCompactionCutoff(
+  snapshot: LoopSnapshot,
+  runId: string,
+  currentReceipt: ContextCompositionReceipt,
+): number | null {
+  const usage = snapshot.state.contextUsage;
+  if (!usage || usage.contextWindowTokens <= 0) return null;
+  const latestCheckpoint = [...snapshot.events]
+    .reverse()
+    .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
+      event.type === 'context.compacted'
+    ));
+  if (latestCheckpoint && latestCheckpoint.sequence > usage.sequence) return null;
+  const priorReceipt = [...snapshot.state.contextCompositions]
+    .reverse()
+    .find((receipt) => (
+      receipt.purpose === 'agent'
+      && receipt.providerRequestId === usage.providerRequestId
+    ));
+  if (!priorReceipt) return null;
+  const priorUnits = contextShapeUnits(priorReceipt.partitions);
+  const currentUnits = contextShapeUnits(currentReceipt.partitions);
+  if (priorUnits <= 0 || currentUnits <= 0) return null;
+  const estimatedCurrentInput = Math.round(usage.inputTokens * currentUnits / priorUnits);
+  const observedUsed = usage.inputTokens + usage.outputTokens;
+  if (
+    Math.max(observedUsed, estimatedCurrentInput) / usage.contextWindowTokens
+    < PRESSURE_COMPACTION_RATIO
+  ) return null;
+  const input = runInputMessageEvent(snapshot.events, runId);
+  if (!input) return null;
+  const coveredThrough = latestCheckpoint?.payload.coveredThroughSequence ?? 0;
+  const priorRunCutoff = input.sequence - 1;
+  const priorJournalFacts = snapshot.events.some((event) => (
+    event.sequence <= priorRunCutoff
+    && event.sequence > coveredThrough
+    && (event.type === 'message.committed' || event.type === 'narrative.committed')
+  ));
+  if (priorRunCutoff >= 1 && priorJournalFacts) return priorRunCutoff;
+
+  // Once the history before this run has already been checkpointed, pressure can
+  // continue to grow inside the active run. Only advance across facts that close
+  // a model-visible prefix; the current user input is retained verbatim on replay.
+  const sameRunCutoff = snapshot.state.revision;
+  if (sameRunCutoff <= coveredThrough) return null;
+  const sameRunProgress = snapshot.events.some((event) => (
+    event.sequence > Math.max(coveredThrough, input.sequence)
+    && event.sequence <= sameRunCutoff
+    && closesModelContextPrefix(event)
+  ));
+  return sameRunProgress ? sameRunCutoff : null;
+}
+
+function runInputMessageEvent(
+  events: readonly SessionEvent[],
+  runId: string,
+): Extract<SessionEvent, { type: 'message.committed' }> | null {
+  const started = events.find((event): event is Extract<SessionEvent, { type: 'run.started' }> => (
+    event.type === 'run.started' && event.runId === runId
+  ));
+  if (!started) return null;
+  return events.find((event): event is Extract<SessionEvent, { type: 'message.committed' }> => (
+    event.type === 'message.committed'
+    && event.payload.messageId === started.payload.inputMessageId
+  )) ?? null;
+}
+
+function closesModelContextPrefix(event: SessionEvent): boolean {
+  return event.type === 'narrative.committed'
+    || event.type === 'interaction.resolved'
+    || event.type === 'plan.confirmed'
+    || event.type === 'plan.revision.requested'
+    || event.type === 'plan.cancelled'
+    || event.type === 'plan.invalidated'
+    || event.type === 'todo.seeded'
+    || event.type === 'todo.reconciled'
+    || event.type === 'todo.progressed'
+    || event.type === 'session.control.rejected'
+    || event.type === 'tool.completed';
+}
+
+function contextShapeUnits(
+  partitions: readonly { requestShapeUnits: number }[],
+): number {
+  return partitions.reduce((total, partition) => total + partition.requestShapeUnits, 0);
+}
+
+async function consumeCompactionProvider(
+  request: ProviderRequest,
+  deps: AgentLoopDeps,
+  signal: AbortSignal,
+): Promise<{
+  summary: string;
+  contextUsage?: ProviderTokenUsage & { providerRequestId: string };
+}> {
+  let deltas = '';
+  let completeMessage: string | undefined;
+  let contextUsage: ProviderTokenUsage | undefined;
+  let completed = false;
+  for await (const event of deps.composition.provider.stream(request, signal)) {
+    assertProviderEvent(event, request.requestId);
+    if (completed) {
+      throw new LoopFailure(
+        'provider_event_after_completion',
+        'Provider 在 completed 之后继续发送压缩事件。',
+      );
+    }
+    switch (event.type) {
+      case 'text.delta':
+        deltas += event.data.text;
+        break;
+      case 'assistant.message':
+        if (completeMessage !== undefined) {
+          throw new LoopFailure(
+            'provider_message_duplicate',
+            '上下文压缩返回了多个最终消息。',
+          );
+        }
+        completeMessage = event.data.content;
+        break;
+      case 'tool.call':
+        throw new LoopFailure(
+          'context_compaction_tool_call_invalid',
+          '上下文压缩请求不能调用工具或 Session control。',
+        );
+      case 'completed':
+        contextUsage = decodeContextUsage(event.data);
+        completed = true;
+        break;
+      case 'failed':
+        throw new LoopFailure(event.data.code, event.data.message);
+    }
+  }
+  if (!completed) {
+    throw new LoopFailure('provider_stream_incomplete', '上下文压缩 Provider 流未产生完成事件。');
+  }
+  if (completeMessage !== undefined && deltas && completeMessage !== deltas) {
+    throw new LoopFailure('provider_message_mismatch', '上下文压缩最终消息与流式文本不一致。');
+  }
+  const summary = (completeMessage ?? deltas).trim();
+  if (!summary) {
+    throw new LoopFailure('context_compaction_empty', '上下文压缩没有产生摘要。');
+  }
+  return {
+    summary,
+    ...(contextUsage
+      ? { contextUsage: { ...contextUsage, providerRequestId: request.requestId } }
+      : {}),
   };
 }
 
@@ -565,16 +960,14 @@ function canonicalJsonValue(value: unknown): unknown {
   ));
 }
 
-function assertPlanWorkspaceBindings(intent: PlanIntent, bindings: readonly string[]): void {
+function assertPlanWorkspaceBindings(plan: ExecutionPlan, bindings: readonly string[]): void {
   const bound = new Set(bindings);
-  for (const option of intent.options) {
-    for (const operation of option.operations) {
-      if (!bound.has(operation.workspaceId)) {
-        throw new LoopFailure(
-          'plan_workspace_not_bound',
-          `Plan 引用了当前 Session creation snapshot 之外的 workspaceId：${operation.workspaceId}`,
-        );
-      }
+  for (const operation of plan.mutationManifest) {
+    if (!bound.has(operation.workspaceId)) {
+      throw new LoopFailure(
+        'plan_workspace_not_bound',
+        `Plan 引用了当前 Session creation snapshot 之外的 workspaceId：${operation.workspaceId}`,
+      );
     }
   }
 }
@@ -590,9 +983,10 @@ async function consumeProvider(
     messageId: string;
     content: string;
     reasoningContent?: string;
+    reasoningSignature?: string;
   } | undefined;
   const providerCalls: Array<{
-    callId: string;
+    providerCallId: string;
     name: string;
     input: Record<string, unknown>;
   }> = [];
@@ -626,7 +1020,11 @@ async function consumeProvider(
         completeMessage = event.data;
         break;
       case 'tool.call':
-        providerCalls.push(event.data);
+        providerCalls.push({
+          providerCallId: event.data.callId,
+          name: event.data.name,
+          input: event.data.input,
+        });
         break;
       case 'completed':
         contextUsage = decodeContextUsage(event.data);
@@ -645,6 +1043,24 @@ async function consumeProvider(
       throw new LoopFailure(
         'provider_reasoning_content_invalid',
         'Provider 返回了空的 reasoningContent。',
+      );
+    }
+    if (
+      completeMessage.reasoningSignature !== undefined
+      && !completeMessage.reasoningSignature.trim()
+    ) {
+      throw new LoopFailure(
+        'provider_reasoning_signature_invalid',
+        'Provider 返回了空的 reasoningSignature。',
+      );
+    }
+    if (
+      completeMessage.reasoningSignature !== undefined
+      && completeMessage.reasoningContent === undefined
+    ) {
+      throw new LoopFailure(
+        'provider_reasoning_signature_without_content',
+        'Provider reasoningSignature 缺少对应 reasoningContent。',
       );
     }
     if (deltas && completeMessage.content !== deltas) {
@@ -666,7 +1082,7 @@ async function consumeProvider(
     if (providerCalls.length !== 0) {
       throw new LoopFailure(
         'answer_only_contract_violated',
-        'Plan 已忽略；answer-only continuation 不能调用工具或 Session control。',
+        'answer-only continuation 不能调用工具或 Session control。',
       );
     }
   }
@@ -678,13 +1094,13 @@ async function consumeProvider(
   const seenCalls = new Set<string>();
   const declaredTools = new Set(request.tools.map((tool) => tool.name));
   for (const call of providerCalls) {
-    if (!call.callId || seenCalls.has(call.callId)) {
+    if (!call.providerCallId || seenCalls.has(call.providerCallId)) {
       throw new LoopFailure(
         'provider_tool_call_duplicate',
         'Provider 工具调用标识为空或重复。',
       );
     }
-    seenCalls.add(call.callId);
+    seenCalls.add(call.providerCallId);
     if (request.responseConstraint !== 'answerOnly' && !declaredTools.has(call.name)) {
       throw new LoopFailure(
         'provider_tool_not_declared',
@@ -692,19 +1108,37 @@ async function consumeProvider(
       );
     }
   }
+  const logicalCallIds = new Set<string>();
+  const calls = providerCalls.map((call) => {
+    const callId = deps.nextId('call');
+    if (!callId || callId === call.providerCallId || logicalCallIds.has(callId)) {
+      throw new LoopFailure(
+        'logical_call_identity_invalid',
+        'Session 必须为每个 Provider call 生成非空、唯一且不复用原生值的 LogicalCallId。',
+      );
+    }
+    logicalCallIds.add(callId);
+    return {
+      callId,
+      providerCallId: call.providerCallId,
+      name: call.name,
+      input: call.input,
+    };
+  });
   recordProviderTurnState(
     deps.providerRunState,
     runId,
-    providerCalls.map((call) => call.callId),
+    calls.map((call) => call.callId),
     completeMessage?.reasoningContent,
+    completeMessage?.reasoningSignature,
   );
 
-  const controlCalls: SessionControlCall[] = [];
-  const kernelCalls: typeof providerCalls = [];
-  for (const call of providerCalls) {
+  const controlCalls: Array<SessionControlCall & { providerCallId: string }> = [];
+  const kernelCalls: typeof calls = [];
+  for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
-      if (control) controlCalls.push(control);
+      if (control) controlCalls.push({ ...control, providerCallId: call.providerCallId });
       else kernelCalls.push(call);
     } catch (error) {
       if (!(error instanceof SessionControlError)) throw error;
@@ -712,6 +1146,7 @@ async function consumeProvider(
         kind: 'controlRejected',
         rejection: {
           callId: call.callId,
+          providerCallId: call.providerCallId,
           toolName: call.name,
           input: { ...call.input },
           error: { code: error.code, message: error.message },
@@ -725,21 +1160,36 @@ async function consumeProvider(
     (control) => control.kind === 'interaction' || control.kind === 'plan',
   );
   const todoControls = controlCalls.filter(
-    (control): control is Extract<SessionControlCall, { kind: 'todo' }> => control.kind === 'todo',
+    (control): control is Extract<SessionControlCall, { kind: 'todo' }>
+      & { providerCallId: string } => control.kind === 'todo',
+  );
+  const focusControls = controlCalls.filter(
+    (control): control is Extract<SessionControlCall, { kind: 'focus' }>
+      & { providerCallId: string } => control.kind === 'focus',
   );
   if (
     blockingControls.length > 1
     || todoControls.length > 1
+    || focusControls.length > 1
     || blockingControls.length > 0 && (todoControls.length > 0 || kernelCalls.length > 0)
+    || focusControls.length > 0 && (controlCalls.length > 1 || kernelCalls.length > 0)
   ) {
     throw new LoopFailure(
       'session_control_turn_conflict',
-      'interaction.request 或 plan.intent 必须独占 Provider turn；todo.update 每个 turn 最多一次，且只能与 Kernel 工具并存。',
+      'interaction.request、plan.publish 与 context.focus 必须独占 Provider turn；todo.progress 每个 turn 最多一次，且只能与 Kernel 工具并存。',
     );
   }
 
   const todo = todoControls[0]
-    ? { todo: { callId: todoControls[0].callId, items: todoControls[0].items } }
+    ? {
+        todo: {
+          callId: todoControls[0].callId,
+          providerCallId: todoControls[0].providerCallId,
+          planId: todoControls[0].planId,
+          revision: todoControls[0].revision,
+          updates: todoControls[0].updates,
+        },
+      }
     : {};
   const common = { ...usage, ...todo };
   const control = blockingControls[0];
@@ -747,6 +1197,7 @@ async function consumeProvider(
     return {
       kind: 'interaction',
       interactionId: control.interactionId,
+      providerCallId: control.providerCallId,
       request: control.request,
       ...(narrative ? { narrative } : {}),
       ...common,
@@ -755,7 +1206,19 @@ async function consumeProvider(
   if (control?.kind === 'plan') {
     return {
       kind: 'plan',
-      intent: control.intent,
+      callId: control.callId,
+      draft: control.draft,
+      providerCallId: control.providerCallId,
+      ...(narrative ? { narrative } : {}),
+      ...common,
+    };
+  }
+  if (focusControls[0]) {
+    return {
+      kind: 'focus',
+      callId: focusControls[0].callId,
+      providerCallId: focusControls[0].providerCallId,
+      focus: focusControls[0].focus,
       ...(narrative ? { narrative } : {}),
       ...common,
     };
@@ -795,7 +1258,29 @@ function messagesFromJournal(
   providerRunState: ProviderRunTransientState,
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
+  const retainedRunInputId = runInputMessageEvent(events, runId)?.payload.messageId;
+  const checkpoint = [...events]
+    .reverse()
+    .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
+      event.type === 'context.compacted'
+    ));
+  if (checkpoint) {
+    messages.push({
+      contributionId: `context-checkpoint:${checkpoint.payload.compactionId}`,
+      contributionKind: 'journalMessages',
+      label: '上下文压缩摘要',
+      message: { role: 'system', content: checkpoint.payload.summary },
+    });
+  }
   for (const event of events) {
+    if (
+      checkpoint
+      && event.sequence <= checkpoint.payload.coveredThroughSequence
+      && !(
+        event.type === 'message.committed'
+        && event.payload.messageId === retainedRunInputId
+      )
+    ) continue;
     if (event.type === 'message.committed') {
       messages.push({
         contributionId: `message:${event.payload.messageId}`,
@@ -832,31 +1317,103 @@ function messagesFromJournal(
           content: JSON.stringify({ response: event.payload.response }),
         },
       });
-    } else if (event.type === 'plan.intent.requested') {
-      attachToolCall(messages, {
-        callId: event.payload.planId,
-        name: SESSION_CONTROL_PLAN_INTENT,
-        input: {
-          prompt: event.payload.prompt,
-          options: event.payload.options,
-        },
-      });
-    } else if (event.type === 'plan.intent.resolved') {
-      messages.push({
-        contributionId: `plan-result:${event.payload.planId}`,
-        contributionKind: 'journalMessages',
-        label: '用户 Plan 答复',
-        message: {
-          role: 'tool',
-          toolCallId: event.payload.planId,
-          content: JSON.stringify({ response: event.payload.response }),
-        },
-      });
-    } else if (event.type === 'todo.updated') {
+    } else if (event.type === 'plan.published') {
       attachToolCall(messages, {
         callId: event.callId,
-        name: SESSION_CONTROL_TODO_UPDATE,
-        input: { items: event.payload.items },
+        name: SESSION_CONTROL_PLAN_PUBLISH,
+        input: {
+          title: event.payload.title,
+          summary: event.payload.summary,
+          steps: event.payload.steps,
+          mutationManifest: event.payload.mutationManifest,
+        },
+      });
+    } else if (event.type === 'plan.confirmed') {
+      messages.push({
+        contributionId: `plan-result:${event.payload.planId}:${event.payload.revision}`,
+        contributionKind: 'journalMessages',
+        label: '用户确认 Plan',
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          content: JSON.stringify({
+            response: { kind: 'confirm' },
+            planId: event.payload.planId,
+            revision: event.payload.revision,
+            todoSeeded: true,
+          }),
+        },
+      });
+    } else if (event.type === 'plan.revision.requested') {
+      messages.push({
+        contributionId: `plan-revision-result:${event.payload.planId}:${event.payload.revision}`,
+        contributionKind: 'journalMessages',
+        label: '用户请求修改 Plan',
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          content: JSON.stringify({
+            response: { kind: 'requestRevision', text: event.payload.text },
+            planId: event.payload.planId,
+            revision: event.payload.revision,
+          }),
+        },
+      });
+    } else if (event.type === 'plan.cancelled') {
+      messages.push({
+        contributionId: `plan-cancel-result:${event.payload.planId}:${event.payload.revision}`,
+        contributionKind: 'journalMessages',
+        label: '用户取消 Plan',
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          content: JSON.stringify({
+            response: { kind: 'cancel' },
+            planId: event.payload.planId,
+            revision: event.payload.revision,
+          }),
+        },
+      });
+    } else if (event.type === 'plan.invalidated') {
+      messages.push({
+        contributionId: `plan-invalidated:${event.payload.planId}:${event.payload.revision}:${event.eventId}`,
+        contributionKind: 'journalMessages',
+        label: 'Plan 已失效',
+        message: {
+          role: 'system',
+          content: JSON.stringify({
+            type: 'plan.invalidated',
+            planId: event.payload.planId,
+            revision: event.payload.revision,
+            reason: event.payload.reason,
+            sourceFactRef: event.payload.sourceFactRef,
+          }),
+        },
+      });
+    } else if (event.type === 'todo.seeded' || event.type === 'todo.reconciled') {
+      messages.push({
+        contributionId: `todo-list:${event.payload.sourcePlanId}:${event.payload.sourcePlanRevision}`,
+        contributionKind: 'journalMessages',
+        label: event.type === 'todo.seeded' ? 'Plan Todo 已生成' : 'Plan Todo 已协调',
+        message: {
+          role: 'system',
+          content: JSON.stringify({
+            type: event.type,
+            sourcePlanId: event.payload.sourcePlanId,
+            sourcePlanRevision: event.payload.sourcePlanRevision,
+            items: event.payload.items,
+          }),
+        },
+      });
+    } else if (event.type === 'todo.progressed') {
+      attachToolCall(messages, {
+        callId: event.callId,
+        name: SESSION_CONTROL_TODO_PROGRESS,
+        input: {
+          planId: event.payload.sourcePlanId,
+          revision: event.payload.sourcePlanRevision,
+          updates: event.payload.updates,
+        },
       });
       messages.push({
         contributionId: `todo-result:${event.callId}`,
@@ -882,6 +1439,30 @@ function messagesFromJournal(
           role: 'tool',
           toolCallId: event.callId,
           content: JSON.stringify({ accepted: false, error: event.payload.error }),
+        },
+      });
+    } else if (
+      event.type === 'context.compaction.requested'
+      && event.payload.trigger === 'agentFocus'
+      && event.callId
+    ) {
+      attachToolCall(messages, {
+        callId: event.callId,
+        name: SESSION_CONTROL_CONTEXT_FOCUS,
+        input: { focus: event.payload.focus },
+      });
+    } else if (event.type === 'context.compacted' && event.callId) {
+      messages.push({
+        contributionId: `context-focus-result:${event.payload.compactionId}`,
+        contributionKind: 'journalMessages',
+        label: '上下文聚焦结果',
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          content: JSON.stringify({
+            accepted: true,
+            compactionId: event.payload.compactionId,
+          }),
         },
       });
     } else if (event.type === 'tool.requested') {
@@ -912,6 +1493,7 @@ function recordProviderTurnState(
   runId: string,
   callIds: readonly string[],
   reasoningContent?: string,
+  reasoningSignature?: string,
 ): void {
   if (state.runId !== runId) {
     throw new LoopFailure(
@@ -922,6 +1504,9 @@ function recordProviderTurnState(
   for (const callId of callIds) {
     state.observedCallIds.add(callId);
     if (reasoningContent !== undefined) state.reasoningByCallId.set(callId, reasoningContent);
+    if (reasoningSignature !== undefined) {
+      state.reasoningSignatureByCallId.set(callId, reasoningSignature);
+    }
   }
 }
 
@@ -954,7 +1539,26 @@ function applyProviderRunState(
         '同一 assistant tool-call turn 关联了冲突的 Provider 瞬态状态。',
       );
     }
+    const reasoningSignatures = [...new Set(callIds.flatMap((callId) => {
+      const value = state.reasoningSignatureByCallId.get(callId);
+      return value === undefined ? [] : [value];
+    }))];
+    if (reasoningSignatures.length > 1) {
+      throw new LoopFailure(
+        'provider_transient_turn_signature_conflict',
+        '同一 assistant tool-call turn 关联了冲突的 Provider reasoning signature。',
+      );
+    }
+    if (reasoningSignatures[0] !== undefined && reasoning[0] === undefined) {
+      throw new LoopFailure(
+        'provider_transient_turn_signature_without_content',
+        'Provider reasoning signature 缺少对应 reasoning content。',
+      );
+    }
     if (reasoning[0] !== undefined) message.reasoningContent = reasoning[0];
+    if (reasoningSignatures[0] !== undefined) {
+      message.reasoningSignature = reasoningSignatures[0];
+    }
   }
 }
 
@@ -963,13 +1567,14 @@ function currentRunCallIds(events: readonly SessionEvent[], runId: string): Set<
   for (const event of events) {
     if (!('runId' in event) || event.runId !== runId) continue;
     if (event.type === 'interaction.requested') callIds.add(event.payload.interactionId);
-    else if (event.type === 'plan.intent.requested') callIds.add(event.payload.planId);
+    else if (event.type === 'plan.published') callIds.add(event.callId);
     else if (
-      event.type === 'todo.updated'
+      event.type === 'todo.progressed'
       || event.type === 'tool.requested'
       || event.type === 'session.control.rejected'
+      || event.type === 'context.compaction.requested' && event.payload.trigger === 'agentFocus'
     ) {
-      callIds.add(event.callId);
+      if (event.callId) callIds.add(event.callId);
     }
   }
   return callIds;
@@ -997,6 +1602,7 @@ function attachToolCall(
 
 function buildContextCompositionReceipt(
   providerRequestId: string,
+  purpose: ContextCompositionReceipt['purpose'],
   responseConstraint: ContextCompositionReceipt['responseConstraint'],
   selected: readonly ContextMessageContribution[],
   kernelTools: readonly ProviderToolDefinition[],
@@ -1036,6 +1642,7 @@ function buildContextCompositionReceipt(
   }));
   return {
     providerRequestId,
+    purpose,
     responseConstraint,
     messages,
     workspaceBindings: workspaceBindingItems,
@@ -1186,15 +1793,23 @@ function cloneModelMessage(message: ModelMessage): ModelMessage {
 function messageContentForModel(
   payload: Extract<SessionEvent, { type: 'message.committed' }>['payload'],
 ): string {
-  if (!payload.attachments?.length) return payload.content;
-  return `${payload.content}\n\n用户明确附加的文件（内容按 JSON 精确编码）：\n${JSON.stringify(
-    payload.attachments.map((attachment) => ({
-      attachmentId: attachment.attachmentId,
-      name: attachment.name,
-      mediaType: attachment.mediaType,
-      content: attachment.content,
-    })),
-  )}`;
+  const sections = [payload.content];
+  if (payload.directoryAttachments?.length) {
+    sections.push(`用户为本条消息附加的目录引用（仅逻辑身份，不含绝对路径）：\n${JSON.stringify(
+      payload.directoryAttachments.map((attachment) => ({ ...attachment })),
+    )}`);
+  }
+  if (payload.attachments?.length) {
+    sections.push(`用户明确附加的文件（内容按 JSON 精确编码）：\n${JSON.stringify(
+      payload.attachments.map((attachment) => ({
+        attachmentId: attachment.attachmentId,
+        name: attachment.name,
+        mediaType: attachment.mediaType,
+        content: attachment.content,
+      })),
+    )}`);
+  }
+  return sections.join('\n\n');
 }
 
 function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown> {
@@ -1208,22 +1823,26 @@ function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown
   };
 }
 
-function selectedPlanAuthorities(events: readonly SessionEvent[], runId: string): PlanAuthority[] {
-  const lastIgnore = events.findLast(
-    (event): event is Extract<SessionEvent, { type: 'plan.intent.resolved' }> => (
-      event.type === 'plan.intent.resolved'
-      && event.runId === runId
-      && event.payload.response.kind === 'ignore'
+function selectedPlanAuthorities(events: readonly SessionEvent[]): PlanAuthority[] {
+  const confirmed = events.findLast(
+    (event): event is Extract<SessionEvent, { type: 'plan.confirmed' }> => (
+      event.type === 'plan.confirmed'
     ),
-  )?.sequence ?? 0;
-  return events.flatMap((event) => (
-    event.type === 'plan.intent.resolved'
-    && event.runId === runId
-    && event.sequence > lastIgnore
-    && event.payload.response.kind === 'select'
-      ? (event.payload.authorities ?? []).map(cloneAuthority)
-      : []
+  );
+  if (!confirmed) return [];
+  const inactive = events.some((event) => (
+    event.sequence > confirmed.sequence
+    && (
+      event.type === 'plan.revision.requested'
+      || event.type === 'plan.superseded'
+      || event.type === 'plan.cancelled'
+      || event.type === 'plan.completed'
+      || event.type === 'plan.invalidated'
+    )
+    && event.payload.planId === confirmed.payload.planId
+    && event.payload.revision === confirmed.payload.revision
   ));
+  return inactive ? [] : confirmed.payload.authorities.map(cloneAuthority);
 }
 
 function cloneAuthority(authority: PlanAuthority): PlanAuthority {
@@ -1231,15 +1850,6 @@ function cloneAuthority(authority: PlanAuthority): PlanAuthority {
     ...authority,
     coveredOperations: authority.coveredOperations.map((operation) => ({ ...operation })),
   };
-}
-
-function requiresAnswerOnly(events: readonly SessionEvent[], runId: string): boolean {
-  const lastResolution = events.findLast(
-    (event): event is Extract<SessionEvent, { type: 'plan.intent.resolved' }> => (
-      event.type === 'plan.intent.resolved' && event.runId === runId
-    ),
-  );
-  return lastResolution?.payload.response.kind === 'ignore';
 }
 
 async function cancelRun(
@@ -1405,15 +2015,111 @@ function assertProviderEvent(event: ProviderEvent, requestId: string): void {
   }
 }
 
-function clonePlan(plan: PlanIntent): PlanIntent {
+function clonePlan(plan: ExecutionPlan): ExecutionPlan {
   return {
     planId: plan.planId,
-    prompt: plan.prompt,
-    options: plan.options.map((option) => ({
-      ...option,
-      operations: option.operations.map((operation) => ({ ...operation })),
+    revision: plan.revision,
+    title: plan.title,
+    summary: plan.summary,
+    steps: plan.steps.map((step) => ({
+      ...step,
+      ...(step.verification ? { verification: [...step.verification] } : {}),
     })),
+    mutationManifest: plan.mutationManifest.map((operation) => ({ ...operation })),
   };
+}
+
+function nextPlanIdentity(
+  events: readonly SessionEvent[],
+  runId: string,
+  createPlanId: () => string,
+): Pick<ExecutionPlan, 'planId' | 'revision'> {
+  const revisionRequest = events.findLast(
+    (event): event is Extract<SessionEvent, { type: 'plan.revision.requested' }> => (
+      event.type === 'plan.revision.requested'
+      && event.runId === runId
+      && !events.some((candidate) => (
+        candidate.sequence > event.sequence
+        && candidate.type === 'run.settled'
+        && candidate.runId === runId
+      ))
+      && !events.some((candidate) => (
+        candidate.sequence > event.sequence
+        && (
+          candidate.type === 'plan.cancelled'
+          || candidate.type === 'plan.invalidated'
+        )
+        && candidate.payload.planId === event.payload.planId
+        && candidate.payload.revision === event.payload.revision
+      ))
+      && !events.some((candidate) => (
+        candidate.type === 'plan.published'
+        && candidate.sequence > event.sequence
+        && candidate.payload.planId === event.payload.planId
+        && candidate.payload.revision === event.payload.revision + 1
+      ))
+    ),
+  );
+  if (revisionRequest) {
+    return {
+      planId: revisionRequest.payload.planId,
+      revision: revisionRequest.payload.revision + 1,
+    };
+  }
+  const planId = createPlanId();
+  if (!planId || events.some((event) => event.type === 'plan.published' && event.payload.planId === planId)) {
+    throw new LoopFailure('plan_id_reused', 'Session 生成的 planId 已经存在。');
+  }
+  return { planId, revision: 1 };
+}
+
+function assertTodoProgressSource(
+  state: SessionState,
+  progress: NonNullable<ProviderTurnCommon['todo']>,
+): void {
+  const todo = state.todoList;
+  if (
+    !todo
+    || todo.sourcePlanId !== progress.planId
+    || todo.sourcePlanRevision !== progress.revision
+    || !state.activePlanRef
+    || state.activePlanRef.planId !== progress.planId
+    || state.activePlanRef.revision !== progress.revision
+    || !state.plans.some((plan) => (
+      plan.planId === progress.planId
+      && plan.revision === progress.revision
+      && plan.status === 'confirmed'
+    ))
+  ) {
+    throw new LoopFailure(
+      'todo_source_plan_mismatch',
+      'todo.progress 必须引用当前会话已确认 Plan revision 生成的 Todo。',
+    );
+  }
+  const todoIds = new Set(todo.items.map((item) => item.todoId));
+  const missing = progress.updates.find((update) => !todoIds.has(update.todoId));
+  if (missing) {
+    throw new LoopFailure(
+      'todo_item_missing',
+      `todo.progress 引用了不存在的 todoId：${missing.todoId}`,
+    );
+  }
+}
+
+function completedPlanAwaitingLifecycle(
+  state: SessionState,
+): { planId: string; revision: number } | null {
+  const todo = state.todoList;
+  if (!todo) return null;
+  const plan = state.plans.find((candidate) => (
+    candidate.planId === todo.sourcePlanId
+    && candidate.revision === todo.sourcePlanRevision
+  ));
+  return plan?.status === 'confirmed'
+    && todo.items.length > 0
+    && todo.items.every((item) => item.status === 'completed')
+    ? { planId: plan.planId, revision: plan.revision }
+    : null;
 }
 
 function hasSettlement(events: readonly SessionEvent[], runId: string): boolean {

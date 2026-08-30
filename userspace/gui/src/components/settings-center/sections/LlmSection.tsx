@@ -5,6 +5,10 @@ import {
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
   DEPRECATED_DEEPSEEK_LLM_MODELS,
+  GLM_LLM_MODEL_OPTIONS,
+  GLM_OPENAI_BASE_URL,
+  KIMI_LLM_MODEL_OPTIONS,
+  KIMI_OPENAI_BASE_URL,
 } from '@deepcode/protocol';
 import type {
   LlmProviderFlavor,
@@ -19,19 +23,13 @@ import {
 import { useSettingsStore } from '../../../state/settingsStore';
 import { normalizeUiLanguage, t } from '../../../i18n';
 
-const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
-  { value: 'openaiCompatible', label: 'OpenAI Compatible' },
-  { value: 'anthropic', label: 'Anthropic' },
-  { value: 'ollama', label: 'Ollama' },
-];
+const PROVIDERS: LlmProviderKind[] = ['openaiCompatible', 'anthropic', 'ollama'];
 
-const PROVIDER_FLAVORS: Array<{
-  value: LlmProviderFlavor;
-  label: string;
-}> = [
-  { value: 'openai', label: 'OpenAI' },
-  { value: 'deepseek', label: 'DeepSeek' },
-  { value: 'zhipu', label: 'Zhipu' },
+const PROVIDER_FLAVORS: LlmProviderFlavor[] = [
+  'openai',
+  'deepseek',
+  'zhipu',
+  'moonshot',
 ];
 
 const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
@@ -44,11 +42,11 @@ type ProfileCommonPatch = Partial<
 >;
 
 const PROFILE_PRESETS: Array<{
-  label: string;
+  labelKey: string;
   profile: NewProfile;
 }> = [
   {
-    label: 'DeepSeek Flash',
+    labelKey: 'settings.llm.preset.deepseekFlash',
     profile: {
       name: 'DeepSeek V4 Flash',
       kind: 'openaiCompatible',
@@ -64,7 +62,7 @@ const PROFILE_PRESETS: Array<{
     },
   },
   {
-    label: 'DeepSeek Pro',
+    labelKey: 'settings.llm.preset.deepseekPro',
     profile: {
       name: 'DeepSeek V4 Pro',
       kind: 'openaiCompatible',
@@ -80,7 +78,7 @@ const PROFILE_PRESETS: Array<{
     },
   },
   {
-    label: 'DeepSeek Anthropic',
+    labelKey: 'settings.llm.preset.deepseekAnthropic',
     profile: {
       name: 'DeepSeek V4 Flash (Anthropic)',
       kind: 'anthropic',
@@ -91,6 +89,31 @@ const PROFILE_PRESETS: Array<{
       maxOutputTokens: 384000,
       temperature: 0.2,
       reasoningEffort: 'high',
+      thinking: 'enabled',
+      enabled: true,
+    },
+  },
+  {
+    labelKey: 'settings.llm.preset.glm',
+    profile: {
+      name: 'GLM 5.2',
+      kind: 'openaiCompatible',
+      providerFlavor: 'zhipu',
+      baseUrl: GLM_OPENAI_BASE_URL,
+      model: 'glm-5.2',
+      enabled: true,
+    },
+  },
+  {
+    labelKey: 'settings.llm.preset.kimi',
+    profile: {
+      name: 'Kimi K2.6',
+      kind: 'openaiCompatible',
+      providerFlavor: 'moonshot',
+      baseUrl: KIMI_OPENAI_BASE_URL,
+      model: 'kimi-k2.6',
+      contextWindowTokens: 256000,
+      maxOutputTokens: 32768,
       thinking: 'enabled',
       enabled: true,
     },
@@ -248,11 +271,9 @@ const LlmSection: React.FC = () => {
       : undefined;
     if (replacementProfileMissingApiKey) {
       setMessageTone('error');
-      setMessage(
-        language === 'zh-CN'
-          ? `当前 schema 的恢复不会自动关联旧密钥；请为已启用的 Profile“${replacementProfileMissingApiKey.name}”重新输入 API Key。`
-          : `Current-schema recovery does not automatically reconnect old secrets. Re-enter the API key for enabled profile "${replacementProfileMissingApiKey.name}".`
-      );
+      setMessage(t(language, 'settings.llm.reenterRecoveredApiKey', {
+        name: replacementProfileMissingApiKey.name,
+      }));
       setLoading(false);
       return;
     }
@@ -284,7 +305,9 @@ const LlmSection: React.FC = () => {
       setProbeState((prev) => ({
         ...prev,
         [profileId]: result.data!.ok
-          ? `OK ${result.data!.latencyMs ?? 0}ms`
+          ? t(language, 'settings.llm.probeSucceeded', {
+              latency: result.data!.latencyMs ?? 0,
+            })
           : result.data!.error ?? t(language, 'settings.llm.probeFailed'),
       }));
     } else {
@@ -329,11 +352,11 @@ const LlmSection: React.FC = () => {
           {PROFILE_PRESETS.map((preset) => (
             <button
               className="settings-action-button"
-              key={preset.label}
+              key={preset.labelKey}
               onClick={() => addProfile(preset.profile)}
               disabled={loading}
             >
-              {preset.label}
+              {t(language, preset.labelKey)}
             </button>
           ))}
           <button
@@ -394,8 +417,8 @@ const LlmSection: React.FC = () => {
                   )}
                 >
                   {PROVIDERS.map((provider) => (
-                    <option key={provider.value} value={provider.value}>
-                      {provider.label}
+                    <option key={provider} value={provider}>
+                      {t(language, `settings.llm.providerKind.${provider}`)}
                     </option>
                   ))}
                 </select>
@@ -414,7 +437,7 @@ const LlmSection: React.FC = () => {
 
               <div className="llm-profile__grid">
                 <label>
-                  <span>Provider flavor</span>
+                  <span>{t(language, 'settings.llm.providerFlavor')}</span>
                   <select
                     className="settings-field__select"
                     value={profile.providerFlavor}
@@ -423,8 +446,8 @@ const LlmSection: React.FC = () => {
                     })}
                   >
                     {PROVIDER_FLAVORS.map((flavor) => (
-                      <option key={flavor.value} value={flavor.value}>
-                        {flavor.label}
+                      <option key={flavor} value={flavor}>
+                        {t(language, `settings.llm.providerFlavor.${flavor}`)}
                       </option>
                     ))}
                   </select>
@@ -444,15 +467,19 @@ const LlmSection: React.FC = () => {
                   <span>{t(language, 'settings.llm.model')}</span>
                   <input
                     className="settings-field__input"
-                    list="deepseek-model-options"
+                    list="llm-model-options"
                     value={profile.model}
                     onChange={(e) =>
                       updateProfile(profile.id, { model: e.target.value })
                     }
                     placeholder="deepseek-v4-flash"
                   />
-                  <datalist id="deepseek-model-options">
-                    {DEEPSEEK_LLM_MODEL_OPTIONS.map((model) => (
+                  <datalist id="llm-model-options">
+                    {[
+                      ...DEEPSEEK_LLM_MODEL_OPTIONS,
+                      ...GLM_LLM_MODEL_OPTIONS,
+                      ...KIMI_LLM_MODEL_OPTIONS,
+                    ].map((model) => (
                       <option
                         key={model}
                         value={model}

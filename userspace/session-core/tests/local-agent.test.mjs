@@ -27,27 +27,58 @@ const writeTool = {
   availability: 'callable',
 };
 
-test('Todo label whitespace is rejected at the Session control boundary', () => {
-  assert.throws(
-    () => decodeSessionControlCall('todo:call', 'todo.update', {
-      items: [{ todoId: 'inspect', label: ' 读取项目入口', status: 'pending' }],
+test('Todo progress 只接受已生成 Todo 的来源与状态更新', () => {
+  assert.deepEqual(
+    decodeSessionControlCall('todo:call', 'todo.progress', {
+      planId: 'plan:test',
+      revision: 1,
+      updates: [{ todoId: 'todo:inspect', status: 'inProgress' }],
     }),
-    (error) => error?.code === 'session_control_todo_label_invalid',
+    {
+      kind: 'todo',
+      callId: 'todo:call',
+      planId: 'plan:test',
+      revision: 1,
+      updates: [{ todoId: 'todo:inspect', status: 'inProgress' }],
+    },
   );
   assert.throws(
-    () => decodeSessionControlCall('todo:call', 'todo.update', {
-      items: [{ todoId: 'inspect', label: '读取项目入口 ', status: 'pending' }],
+    () => decodeSessionControlCall('todo:call', 'todo.progress', {
+      planId: 'plan:test',
+      revision: 1,
+      updates: [{ todoId: 'todo:inspect', label: '不能改写', status: 'pending' }],
     }),
-    (error) => error?.code === 'session_control_todo_label_invalid',
+    (error) => error?.code === 'session_control_shape_invalid',
+  );
+});
+
+test('context.focus 只接受一个明确的任务焦点', () => {
+  assert.deepEqual(
+    decodeSessionControlCall('call:focus', 'context.focus', {
+      focus: '  只保留新的调试任务  ',
+    }),
+    {
+      kind: 'focus',
+      callId: 'call:focus',
+      focus: '只保留新的调试任务',
+    },
+  );
+  assert.throws(
+    () => decodeSessionControlCall('call:focus', 'context.focus', { focus: '   ' }),
+    (error) => error?.code === 'session_control_focus_invalid',
   );
 });
 
 test('共享系统提示词与 Skill 插件配置保持独立贡献', () => {
   const config = decodeStartupPluginConfig(JSON.stringify({
     systemPrompt: '使用函数式组合，并保持层间透明。',
+    workspaceMutation: 'allow',
+    engineeringDecisions: 'delegate',
     skills: [{ id: 'example', instructions: '只处理示例领域。' }],
   }));
   assert.equal(config.systemPrompt, '使用函数式组合，并保持层间透明。');
+  assert.equal(config.workspaceMutation, 'allow');
+  assert.equal(config.engineeringDecisions, 'delegate');
   assert.deepEqual(config.skills, [{ id: 'example', instructions: '只处理示例领域。' }]);
   assert.throws(
     () => decodeStartupPluginConfig(JSON.stringify({ systemPrompt: 1, skills: [] })),
@@ -79,6 +110,7 @@ test('累计 token 用量超过安全整数边界时拒绝生成不精确投影'
   state.contextCompositions.push({
     runId: 'run:usage-overflow',
     providerRequestId: 'provider-request:usage-overflow',
+    purpose: 'agent',
     responseConstraint: 'normal',
     messages: [],
     workspaceBindings: [],
@@ -178,7 +210,7 @@ test('Profile 与 workspace creation snapshot 写入 Journal 并用于恢复', a
   const recoveredInputs = [];
   const recovered = serviceWith(journal, recoveredInputs);
   const projection = await recovered.snapshot('session:profile');
-  assert.equal(projection.display.title, '新对话');
+  assert.equal(projection.display.creationTitle, '新对话');
   assert.deepEqual(projection.workspaceBindings, [binding]);
   assert.deepEqual(recoveredInputs[0], created[0]);
   await recovered.dispose();
@@ -341,6 +373,57 @@ test('文本附件只把显示元数据投影给 UI，原文仍作为 Session �
   await actor.dispose();
 });
 
+test('目录附件属于单条消息，只进入该消息启动的 run 目录快照', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:message-directory';
+  const directoryAttachment = {
+    workspaceId: 'workspace:attached',
+    displayName: 'Attached',
+  };
+  await createSession(journal, sessionId, [binding]);
+  const requests = [];
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      requests.push(request);
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: `message:message-directory:${requests.length}`,
+        content: '完成。',
+      });
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  });
+
+  await actor.submit(message(
+    sessionId,
+    'command:message-directory:first',
+    '分析这个目录',
+    undefined,
+    undefined,
+    [directoryAttachment],
+  ));
+  const first = await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  assert.deepEqual(requests[0].workspaceBindings, [binding, directoryAttachment]);
+  assert.deepEqual(first.workspaceBindings, [binding]);
+  assert.deepEqual(first.sessionDirectoryIndexes, []);
+  assert.deepEqual(first.messages[0].directoryAttachments, [directoryAttachment]);
+  assert.match(
+    requests[0].messages.find((item) => item.role === 'user').content,
+    /"workspaceId":"workspace:attached"/,
+  );
+
+  await actor.submit(message(
+    sessionId,
+    'command:message-directory:second',
+    '继续，但本轮不附加目录',
+  ));
+  await waitFor(actor, (projection) => (
+    requests.length === 2 && projection.run?.status === 'completed'
+  ));
+  assert.deepEqual(requests[1].workspaceBindings, [binding]);
+  assert.deepEqual((await actor.snapshot()).messages[0].directoryAttachments, [directoryAttachment]);
+  await actor.dispose();
+});
+
 test('typed turn 叙述、模型主动介入和上下文计数进入共享投影，活动 run 可切换模型', async () => {
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:structured', [binding]);
@@ -355,6 +438,7 @@ test('typed turn 叙述、模型主动介入和上下文计数进入共享投影
           messageId: 'message:interaction',
           content: '正在确认项目希望采用的构建入口。',
           reasoningContent: 'private provider reasoning for the tool continuation',
+          reasoningSignature: 'opaque provider reasoning signature',
         });
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'interaction:build-entry',
@@ -378,11 +462,20 @@ test('typed turn 叙述、模型主动介入和上下文计数进入共享投影
       assert.ok(request.messages.some((item) => item.role === 'user' && item.content === 'cargo'));
       const interactionTurn = request.messages.find((item) => (
         item.role === 'assistant'
-        && item.toolCalls?.some((call) => call.callId === 'interaction:build-entry')
+        && item.toolCalls?.some((call) => call.name === 'interaction.request')
       ));
+      const interactionCall = interactionTurn?.toolCalls?.find(
+        (call) => call.name === 'interaction.request',
+      );
+      assert.ok(interactionCall);
+      assert.notEqual(interactionCall.callId, 'interaction:build-entry');
       assert.equal(
         interactionTurn?.reasoningContent,
         'private provider reasoning for the tool continuation',
+      );
+      assert.equal(
+        interactionTurn?.reasoningSignature,
+        'opaque provider reasoning signature',
       );
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'message:answer',
@@ -431,17 +524,20 @@ test('typed turn 叙述、模型主动介入和上下文计数进入共享投影
   ]);
   assert.equal(completed.messages.at(-1).content, '采用 **Cargo** 作为构建入口。');
   assert.deepEqual(requests.map((item) => item.profileId), ['profile:flash', 'profile:pro']);
+  const interactionRequested = (await readEvents(journal, 'session:structured'))
+    .find((event) => event.type === 'interaction.requested');
+  assert.equal(interactionRequested.payload.providerCallId, 'interaction:build-entry');
+  assert.notEqual(interactionRequested.payload.interactionId, 'interaction:build-entry');
   assert.doesNotMatch(
     JSON.stringify(await readEvents(journal, 'session:structured')),
-    /private provider reasoning/u,
+    /private provider reasoning|opaque provider reasoning signature/u,
   );
   await actor.dispose();
 });
 
-test('当前 turn 的累计 assistant draft 进入共享投影但不写入 Journal', async () => {
+test('当前 turn 的累计 assistant draft 可从共享 snapshot 拉取且不写入 Journal', async () => {
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:streaming');
-  const updates = [];
   let release;
   const paused = new Promise((resolve) => { release = resolve; });
   const actor = actorWith(journal, 'session:streaming', {
@@ -453,16 +549,11 @@ test('当前 turn 的累计 assistant draft 进入共享投影但不写入 Journ
       yield providerEvent(request.requestId, 'text.delta', { text: '\n\n检查完成。' });
       yield providerEvent(request.requestId, 'completed', {});
     },
-  }, undefined, [], 'streaming', (update) => updates.push(update));
+  }, undefined, [], 'streaming');
   await actor.submit(message('session:streaming', 'command:start', '检查项目入口'));
   const running = await waitFor(actor, (p) => p.assistantDraft?.content === '正在检查项目入口。');
   assert.equal(running.narratives.length, 0);
   assert.equal(running.messages.length, 1);
-  assert.ok(updates.some((update) => (
-    update.type === 'snapshot'
-    && update.projection.assistantDraft?.content === '正在检查项目入口。'
-  )));
-  assert.ok(updates.every((update) => update.type === 'snapshot' && !('event' in update)));
   assert.equal((await readEvents(journal, 'session:streaming')).some((event) => (
     event.type === 'assistant.chunk'
   )), false);
@@ -530,6 +621,8 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
       const receipt = eventsBeforeProvider.at(-1);
       assert.equal(receipt.type, 'context.composed');
       assert.equal(receipt.payload.providerRequestId, request.requestId);
+      assert.equal(receipt.payload.purpose, 'agent');
+      assert.equal(request.purpose, 'agent');
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'message:request-receipt',
         content: '回执已绑定。',
@@ -563,8 +656,9 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
   })));
   assert.deepEqual(providerRequest.tools.map((entry) => entry.name), [
     'interaction.request',
-    'plan.intent',
-    'todo.update',
+    'plan.publish',
+    'todo.progress',
+    'context.focus',
   ]);
   assert.deepEqual(receipt.tools, []);
   assert.deepEqual(receipt.partitions.map((partition) => partition.kind), [
@@ -603,6 +697,336 @@ test('Provider 请求回执先于调用持久化，并与用量事实使用同�
     cacheMissInputTokens: 10,
     outcome: 'completed',
   }]);
+  await actor.dispose();
+});
+
+test('/focus 压缩此前内容后只把任务正文作为新的用户消息继续', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:user-focus';
+  await createSession(journal, sessionId);
+  const requests = [];
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        assert.equal(request.purpose, 'agent');
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:old-answer',
+          content: '旧任务已经完成。',
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 100, outputTokens: 10, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      if (requests.length === 2) {
+        assert.equal(request.purpose, 'contextCompaction');
+        assert.equal(request.responseConstraint, 'answerOnly');
+        assert.deepEqual(request.tools, []);
+        assert.ok(request.messages.some((item) => item.content.includes('新的诊断任务')));
+        assert.ok(request.messages.some((item) => item.content === '旧任务'));
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:user-focus-summary',
+          content: '旧任务事实摘要：旧任务已经完成。',
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 120, outputTokens: 20, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      assert.equal(request.purpose, 'agent');
+      assert.ok(request.messages.some((item) => (
+        item.role === 'system' && item.content.includes('旧任务事实摘要')
+      )));
+      assert.ok(request.messages.some((item) => (
+        item.role === 'user' && item.content === '新的诊断任务'
+      )));
+      assert.equal(request.messages.some((item) => item.content === '旧任务'), false);
+      assert.equal(request.messages.some((item) => item.content.includes('/focus')), false);
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'message:user-focus-answer',
+        content: '已切换到新的诊断任务。',
+      });
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { inputTokens: 80, outputTokens: 8, contextWindowTokens: 10_000 },
+      });
+    },
+  }, undefined, [], 'user-focus');
+
+  await actor.submit(message(sessionId, 'command:old', '旧任务'));
+  await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  await actor.submit(message(sessionId, 'command:focus', '/focus 新的诊断任务'));
+  const completed = await waitFor(actor, (projection) => (
+    projection.run?.status === 'completed'
+    && projection.messages.at(-1)?.content === '已切换到新的诊断任务。'
+  ));
+  assert.equal(requests.length, 3);
+  assert.equal(completed.contextUsage.providerRequestId, requests[2].requestId);
+  const events = await readEvents(journal, sessionId);
+  const requested = events.find((event) => (
+    event.type === 'context.compaction.requested'
+    && event.payload.trigger === 'userFocus'
+  ));
+  const compacted = events.find((event) => (
+    event.type === 'context.compacted'
+    && event.payload.compactionId === requested.payload.compactionId
+  ));
+  assert.equal(requested.payload.commandId, 'command:focus');
+  assert.equal(requested.payload.focus, '新的诊断任务');
+  assert.equal(compacted.payload.summary, '旧任务事实摘要：旧任务已经完成。');
+  assert.deepEqual(events.filter((event) => (
+    event.type === 'message.committed' && event.payload.role === 'user'
+  )).map((event) => event.payload.content), ['旧任务', '新的诊断任务']);
+  await actor.dispose();
+});
+
+test('Pressure compaction 在估算达到九成时生成 checkpoint 并保留当前任务原文', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:pressure-compaction';
+  await createSession(journal, sessionId);
+  const requests = [];
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:pressure-old-answer',
+          content: '旧上下文回答。',
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 9_000, outputTokens: 100, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      if (requests.length === 2) {
+        assert.equal(request.purpose, 'contextCompaction');
+        assert.equal(request.maxOutputTokens, 1_024);
+        assert.ok(request.messages.some((item) => item.content === '高占用旧任务'));
+        assert.equal(request.messages.some((item) => item.content === '当前任务必须保留'), false);
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:pressure-summary',
+          content: '压力压缩摘要：此前高占用任务已经回答。',
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 1_000, outputTokens: 120, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      assert.equal(request.purpose, 'agent');
+      assert.ok(request.messages.some((item) => (
+        item.role === 'system' && item.content.includes('压力压缩摘要')
+      )));
+      assert.ok(request.messages.some((item) => (
+        item.role === 'user' && item.content === '当前任务必须保留'
+      )));
+      assert.equal(request.messages.some((item) => item.content === '高占用旧任务'), false);
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'message:pressure-current-answer',
+        content: '当前任务已完成。',
+      });
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { inputTokens: 900, outputTokens: 50, contextWindowTokens: 10_000 },
+      });
+    },
+  }, undefined, [], 'pressure');
+
+  await actor.submit(message(sessionId, 'command:pressure-old', '高占用旧任务'));
+  await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  await actor.submit(message(sessionId, 'command:pressure-current', '当前任务必须保留'));
+  const completed = await waitFor(actor, (projection) => (
+    projection.run?.status === 'completed'
+    && projection.messages.at(-1)?.content === '当前任务已完成。'
+  ));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(completed.contextCompositions.slice(-2).map((receipt) => receipt.purpose), [
+    'contextCompaction',
+    'agent',
+  ]);
+  const events = await readEvents(journal, sessionId);
+  const requested = events.find((event) => (
+    event.type === 'context.compaction.requested'
+    && event.payload.trigger === 'pressure'
+  ));
+  assert.ok(requested);
+  assert.ok(events.some((event) => (
+    event.type === 'context.compacted'
+    && event.payload.compactionId === requested.payload.compactionId
+  )));
+  await actor.dispose();
+});
+
+test('Pressure compaction 可在同一运行内折叠已闭合工具前缀并保留当前任务原文', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:pressure-mid-run';
+  await createSession(journal, sessionId, [binding]);
+  const readTool = {
+    name: 'fs.read',
+    description: '读取工作区文件',
+    inputSchema: { type: 'object' },
+    possibleEffects: [],
+    availability: 'callable',
+  };
+  const kernel = {
+    async listTools() { return [readTool]; },
+    async execute(request) {
+      return executionReply(
+        request,
+        { decision: 'allow', source: 'workspaceRead', workspaceId: 'workspace:test' },
+        'README.md',
+        { content: '已读取的项目事实' },
+      );
+    },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  };
+  const requests = [];
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        assert.equal(request.purpose, 'agent');
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider-call:pressure-read',
+          name: 'fs.read',
+          input: { workspaceId: 'workspace:test', path: 'README.md' },
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 9_200, outputTokens: 100, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      if (requests.length === 2) {
+        assert.equal(request.purpose, 'contextCompaction');
+        assert.ok(request.messages.some((item) => (
+          item.role === 'user' && item.content === '读取后继续分析当前任务'
+        )));
+        assert.ok(request.messages.some((item) => (
+          item.role === 'tool' && item.content.includes('已读取的项目事实')
+        )));
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:pressure-mid-run-summary',
+          content: '同轮压缩摘要：README.md 已读取，并获得项目事实。',
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 1_100, outputTokens: 80, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      assert.equal(request.purpose, 'agent');
+      assert.equal(request.messages.filter((item) => (
+        item.role === 'user' && item.content === '读取后继续分析当前任务'
+      )).length, 1);
+      assert.ok(request.messages.some((item) => (
+        item.role === 'system' && item.content.includes('同轮压缩摘要')
+      )));
+      assert.equal(request.messages.some((item) => item.role === 'tool'), false);
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'message:pressure-mid-run-answer',
+        content: '当前任务已基于读取结果完成。',
+      });
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { inputTokens: 700, outputTokens: 40, contextWindowTokens: 10_000 },
+      });
+    },
+  }, kernel, [readTool], 'pressure-mid-run');
+
+  await actor.submit(message(sessionId, 'command:pressure-mid-run', '读取后继续分析当前任务'));
+  const completed = await waitFor(actor, (projection) => (
+    projection.run?.status === 'completed'
+    && projection.messages.at(-1)?.content === '当前任务已基于读取结果完成。'
+  ));
+  assert.equal(requests.length, 3);
+  assert.equal(completed.terminalError, null);
+  const events = await readEvents(journal, sessionId);
+  const input = events.find((event) => (
+    event.type === 'message.committed'
+    && event.payload.content === '读取后继续分析当前任务'
+  ));
+  const requested = events.find((event) => (
+    event.type === 'context.compaction.requested'
+    && event.payload.trigger === 'pressure'
+  ));
+  assert.ok(input);
+  assert.ok(requested.payload.coveredThroughSequence > input.sequence);
+  assert.ok(events.some((event) => (
+    event.type === 'context.compacted'
+    && event.payload.compactionId === requested.payload.compactionId
+  )));
+  await actor.dispose();
+});
+
+test('Agent context.focus 作为独占 control 触发同一 Session 压缩后继续', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:agent-focus';
+  await createSession(journal, sessionId);
+  const requests = [];
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        assert.ok(request.tools.some((tool) => tool.name === 'context.focus'));
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider-call:focus',
+          name: 'context.focus',
+          input: { focus: '聚焦真实构建失败' },
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 500, outputTokens: 20, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      if (requests.length === 2) {
+        assert.equal(request.purpose, 'contextCompaction');
+        assert.ok(request.messages.some((item) => item.content.includes('聚焦真实构建失败')));
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:agent-focus-summary',
+          content: '构建失败相关事实摘要。',
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 300, outputTokens: 30, contextWindowTokens: 10_000 },
+        });
+        return;
+      }
+      assert.equal(request.purpose, 'agent');
+      const focusTurn = request.messages.find((item) => (
+        item.role === 'assistant'
+        && item.toolCalls?.some((call) => call.name === 'context.focus')
+      ));
+      const focusCall = focusTurn?.toolCalls?.find((call) => call.name === 'context.focus');
+      assert.ok(focusCall);
+      assert.ok(request.messages.some((item) => (
+        item.role === 'tool'
+        && item.toolCallId === focusCall.callId
+        && item.content.includes('"accepted":true')
+      )));
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'message:agent-focus-answer',
+        content: '已围绕构建失败继续。',
+      });
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { inputTokens: 450, outputTokens: 25, contextWindowTokens: 10_000 },
+      });
+    },
+  }, undefined, [], 'agent-focus');
+
+  await actor.submit(message(sessionId, 'command:agent-focus', '分析所有历史并决定焦点'));
+  const completed = await waitFor(actor, (projection) => (
+    projection.run?.status === 'completed'
+    && projection.messages.at(-1)?.content === '已围绕构建失败继续。'
+  ));
+  assert.equal(requests.length, 3);
+  const events = await readEvents(journal, sessionId);
+  const requested = events.find((event) => (
+    event.type === 'context.compaction.requested'
+    && event.payload.trigger === 'agentFocus'
+  ));
+  const compacted = events.find((event) => (
+    event.type === 'context.compacted'
+    && event.payload.compactionId === requested.payload.compactionId
+  ));
+  assert.notEqual(requested.callId, requested.payload.providerCallId);
+  assert.equal(compacted.callId, requested.callId);
+  assert.equal(completed.contextUsage.providerRequestId, requests[2].requestId);
   await actor.dispose();
 });
 
@@ -656,8 +1080,9 @@ test('Session 只按 Kernel 目录身份冻结 callable 工具快照，并排除
   const completed = await waitFor(actor, (projection) => projection.run?.status === 'completed');
   assert.deepEqual(capturedRequest.tools.map((tool) => tool.name), [
     'interaction.request',
-    'plan.intent',
-    'todo.update',
+    'plan.publish',
+    'todo.progress',
+    'context.focus',
     'a.tool',
     'z.tool',
   ]);
@@ -711,10 +1136,12 @@ test('首个非法 Session control 持久拒绝与用量，并在同一 run 给 
         });
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'plan:invalid:first',
-          name: 'plan.intent',
+          name: 'plan.publish',
           input: {
-            prompt: '请选择。',
-            options: [{ optionId: 'write', label: '写入', operations: [] }],
+            title: '无效计划',
+            summary: '缺少步骤。',
+            steps: [],
+            mutationManifest: [],
           },
         });
         yield providerEvent(request.requestId, 'completed', {
@@ -722,14 +1149,19 @@ test('首个非法 Session control 持久拒绝与用量，并在同一 run 给 
         });
         return;
       }
+      const controlCall = request.messages
+        .find((entry) => entry.role === 'assistant' && entry.toolCalls?.length)
+        ?.toolCalls.find((call) => call.name === 'plan.publish');
+      assert.ok(controlCall);
+      assert.notEqual(controlCall.callId, 'plan:invalid:first');
       const rejection = request.messages.find(
-        (entry) => entry.role === 'tool' && entry.toolCallId === 'plan:invalid:first',
+        (entry) => entry.role === 'tool' && entry.toolCallId === controlCall.callId,
       );
       assert.deepEqual(JSON.parse(rejection.content), {
         accepted: false,
         error: {
-          code: 'session_control_plan_operations_invalid',
-          message: '每个 Plan option 必须包含至少一个闭合 operation。',
+          code: 'session_control_plan_steps_invalid',
+          message: 'plan.publish steps 必须包含一至十二个步骤。',
         },
       });
       yield providerEvent(request.requestId, 'assistant.message', {
@@ -752,7 +1184,9 @@ test('首个非法 Session control 持久拒绝与用量，并在同一 run 给 
   const rejections = (await readEvents(journal, 'session:control-invalid'))
     .filter((event) => event.type === 'session.control.rejected');
   assert.equal(rejections.length, 1);
-  assert.equal(rejections[0].payload.error.code, 'session_control_plan_operations_invalid');
+  assert.equal(rejections[0].payload.providerCallId, 'plan:invalid:first');
+  assert.notEqual(rejections[0].callId, 'plan:invalid:first');
+  assert.equal(rejections[0].payload.error.code, 'session_control_plan_steps_invalid');
   await actor.dispose();
 });
 
@@ -765,10 +1199,12 @@ test('同一 run 第二个非法 Session control 先持久用量与拒绝，再�
       turn += 1;
       yield providerEvent(request.requestId, 'tool.call', {
         callId: `plan:invalid:${turn}`,
-        name: 'plan.intent',
+        name: 'plan.publish',
         input: {
-          prompt: '请选择。',
-          options: [{ optionId: `write-${turn}`, label: '写入', operations: [] }],
+          title: `无效计划 ${turn}`,
+          summary: '缺少步骤。',
+          steps: [],
+          mutationManifest: [],
         },
       });
       yield providerEvent(request.requestId, 'completed', {
@@ -782,7 +1218,7 @@ test('同一 run 第二个非法 Session control 先持久用量与拒绝，再�
     '测试重复 control 拒绝',
   ));
   const failed = await waitFor(actor, (p) => p.run?.status === 'failed');
-  assert.equal(failed.terminalError.code, 'session_control_plan_operations_invalid');
+  assert.equal(failed.terminalError.code, 'session_control_plan_steps_invalid');
   assert.equal(failed.tokenUsage.providerCallCount, 2);
   assert.equal(failed.tokenUsage.inputTokens, 23);
   assert.equal(failed.tokenUsage.outputTokens, 3);
@@ -856,12 +1292,19 @@ test('非 workspace effect 通过独立 approval 事实采集决定并沿同一 
   ))).status, 'accepted');
   const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
   assert.equal(completed.pendingApproval, null);
-  assert.equal(completed.activities.find((item) => item.callId === 'call:external')?.status, 'completed');
+  const externalRequest = (await readEvents(journal, 'session:external'))
+    .find((event) => event.type === 'tool.requested');
+  assert.equal(externalRequest.payload.providerCallId, 'call:external');
+  assert.notEqual(externalRequest.callId, 'call:external');
+  assert.equal(
+    completed.activities.find((item) => item.callId === externalRequest.callId)?.status,
+    'completed',
+  );
   assert.equal(executions.length, 2);
   await actor.dispose();
 });
 
-test('Plan 选择生成同 session/run/workspace 的精确 authority', async () => {
+test('Plan 确认原子生成 Todo 与 session scoped 精确 authority', async () => {
   const planBinding = { workspaceId: 'workspace:plan', displayName: 'PlanProject' };
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:plan-select', [planBinding]);
@@ -874,15 +1317,19 @@ test('Plan 选择生成同 session/run/workspace 的精确 authority', async () 
       assert.equal(request.planAuthorities.length, 1);
       const authority = request.planAuthorities[0];
       assert.deepEqual(
-        [authority.sessionId, authority.runId, authority.workspaceId],
-        [request.sessionId, request.runId, 'workspace:plan'],
+        [authority.sessionId, authority.workspaceId],
+        [request.sessionId, 'workspace:plan'],
       );
+      assert.equal(authority.revision, 1);
+      assert.ok(authority.decisionId);
+      assert.equal('runId' in authority, false);
       assert.deepEqual(authority.coveredOperations, [{
         workspaceId: 'workspace:plan', operation: 'fs.write', target: 'src/output.txt',
       }]);
       return executionReply(request, {
         decision: 'allow', source: 'plan', workspaceId: 'workspace:plan',
         authorityId: authority.authorityId, planId: authority.planId,
+        revision: authority.revision, decisionId: authority.decisionId,
       }, 'src/output.txt');
     },
     async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
@@ -895,28 +1342,31 @@ test('Plan 选择生成同 session/run/workspace 的精确 authority', async () 
       if (turn === 1) {
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'plan:write',
-          name: 'plan.intent',
+          name: 'plan.publish',
           input: {
-            prompt: '请选择写入方案。',
-            options: [{
-              optionId: 'safe',
-              label: '写入目标文件',
-              description: '只修改一个精确目标。',
-              operations: [{
+            title: '写入目标文件',
+            summary: '只修改一个精确目标。',
+            steps: [{
+              stepId: 'step:write',
+              title: '写入文件',
+              details: '写入 src/output.txt。',
+              verification: ['确认工具回执为 completed。'],
+            }],
+            mutationManifest: [{
                 workspaceId: 'workspace:plan', operation: 'fs.write', target: 'src/output.txt',
-              }],
             }],
           },
         });
-      } else if (turn === 2) {
+      } else if (turn === 2 || turn === 4) {
         yield providerEvent(request.requestId, 'tool.call', {
-          callId: 'call:write',
+          callId: turn === 2 ? 'call:write' : 'call:write:supplement',
           name: 'fs.write',
           input: { workspaceId: 'workspace:plan', path: 'src/output.txt', content: 'hello' },
         });
       } else {
         yield providerEvent(request.requestId, 'assistant.message', {
-          messageId: 'message:done', content: '已按所选计划完成写入。',
+          messageId: turn === 3 ? 'message:done' : 'message:supplement-done',
+          content: turn === 3 ? '已按所选计划完成写入。' : '补充说明未改变已确认计划。',
         });
       }
       yield providerEvent(request.requestId, 'completed', {});
@@ -924,26 +1374,68 @@ test('Plan 选择生成同 session/run/workspace 的精确 authority', async () 
   }, kernel, [writeTool], 'plan-select');
   await actor.submit(message('session:plan-select', 'command:start', '写入文件'));
   const waiting = await waitFor(actor, (p) => p.pendingPlan !== null);
-  assert.equal(waiting.pendingPlan.responseMode, 'optionOrFreeform');
-  assert.equal(waiting.pendingPlan.ignoreAllowed, true);
-  assert.deepEqual(waiting.pendingPlan.options[0].operationsDisplay, [
-    'fs.write · PlanProject:src/output.txt',
-  ]);
+  assert.equal(waiting.pendingPlan.responseMode, 'confirmReviseOrCancel');
+  assert.equal(waiting.pendingPlan.status, 'published');
+  assert.equal(waiting.pendingPlan.revision, 1);
+  assert.deepEqual(waiting.pendingPlan.mutationManifest, [{
+    workspaceId: 'workspace:plan', operation: 'fs.write', target: 'src/output.txt',
+  }]);
   assert.equal((await actor.submit(planResponse(
     'session:plan-select',
-    'command:select',
+    'command:confirm',
     waiting.run.runId,
     waiting.pendingPlan.planId,
-    { kind: 'select', optionId: 'safe' },
+    waiting.pendingPlan.revision,
+    { kind: 'confirm' },
   ))).status, 'accepted');
   const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
   assert.equal(completed.pendingPlan, null);
+  assert.deepEqual(completed.activePlanRef, {
+    planId: waiting.pendingPlan.planId,
+    revision: 1,
+  });
+  assert.equal(completed.plans.at(-1).status, 'confirmed');
+  assert.equal(completed.todoList.sourcePlanId, waiting.pendingPlan.planId);
+  assert.equal(completed.todoList.sourcePlanRevision, 1);
+  assert.deepEqual(completed.todoList.items.map((item) => ({
+    sourceStepId: item.sourceStepId,
+    label: item.label,
+    status: item.status,
+  })), [{ sourceStepId: 'step:write', label: '写入文件', status: 'pending' }]);
   assert.equal(executions.length, 1);
-  assert.equal(completed.activities.find((item) => item.callId === 'call:write')?.status, 'completed');
+  const writeRequest = (await readEvents(journal, 'session:plan-select'))
+    .find((event) => event.type === 'tool.requested');
+  assert.equal(writeRequest.payload.providerCallId, 'call:write');
+  assert.notEqual(writeRequest.callId, 'call:write');
+  assert.equal(
+    completed.activities.find((item) => item.callId === writeRequest.callId)?.status,
+    'completed',
+  );
+
+  const retainedPlan = completed.plans;
+  const retainedTodo = completed.todoList;
+  await actor.submit(message(
+    'session:plan-select',
+    'command:supplement',
+    '补充说明，不改变已确认计划',
+  ));
+  const supplemented = await waitFor(actor, (projection) => (
+    projection.run?.status === 'completed'
+    && projection.messages.at(-1)?.content === '补充说明未改变已确认计划。'
+  ));
+  assert.deepEqual(supplemented.plans, retainedPlan);
+  assert.deepEqual(supplemented.todoList, retainedTodo);
+  assert.deepEqual(supplemented.activePlanRef, completed.activePlanRef);
+  assert.equal(executions.length, 2);
+  assert.notEqual(executions[0].runId, executions[1].runId);
+  assert.equal(
+    executions[0].planAuthorities[0].authorityId,
+    executions[1].planAuthorities[0].authorityId,
+  );
   await actor.dispose();
 });
 
-test('Plan 自由调整作为用户事实进入同一 run，旧 Plan 不产生 authority', async () => {
+test('Plan 修订保留同一 PlanId、递增 revision 并使旧 revision superseded', async () => {
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:feedback', [binding]);
   const requests = [];
@@ -954,13 +1446,30 @@ test('Plan 自由调整作为用户事实进入同一 run，旧 Plan 不产生 a
       turn += 1;
       if (turn === 1) {
         yield providerEvent(request.requestId, 'tool.call', simplePlanCall('plan:feedback'));
-      } else {
+      } else if (turn === 2) {
         assert.equal(request.responseConstraint, 'normal');
         assert.ok(request.messages.some((item) => (
           item.role === 'user' && item.content === '改为只写 docs/notes.md'
         )));
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'plan:feedback:revised',
+          name: 'plan.publish',
+          input: {
+            title: '写入修订说明',
+            summary: '只修改修订后的目标。',
+            steps: [{
+              stepId: 'step:write',
+              title: '写入修订说明',
+              details: '写入 docs/notes.md。',
+            }],
+            mutationManifest: [{
+              workspaceId: 'workspace:test', operation: 'fs.write', target: 'docs/notes.md',
+            }],
+          },
+        });
+      } else {
         yield providerEvent(request.requestId, 'assistant.message', {
-          messageId: 'message:answer', content: '已重新整理，暂不执行写入。',
+          messageId: 'message:answer', content: '修订后的计划已确认。',
         });
       }
       yield providerEvent(request.requestId, 'completed', {});
@@ -973,34 +1482,40 @@ test('Plan 自由调整作为用户事实进入同一 run，旧 Plan 不产生 a
     'command:feedback',
     waiting.run.runId,
     waiting.pendingPlan.planId,
-    { kind: 'feedback', text: '改为只写 docs/notes.md' },
+    waiting.pendingPlan.revision,
+    { kind: 'requestRevision', text: '改为只写 docs/notes.md' },
   ));
-  await waitFor(actor, (p) => p.run?.status === 'completed');
-  const resolved = (await readEvents(journal, 'session:feedback'))
-    .find((event) => event.type === 'plan.intent.resolved');
-  assert.equal(resolved.payload.response.kind, 'feedback');
-  assert.equal(resolved.payload.authorities, undefined);
-  assert.equal(requests.length, 2);
+  const revised = await waitFor(actor, (p) => p.pendingPlan?.revision === 2);
+  assert.equal(revised.pendingPlan.planId, waiting.pendingPlan.planId);
+  assert.notEqual(revised.pendingPlan.callId, waiting.pendingPlan.callId);
+  assert.equal(revised.pendingPlan.mutationManifest[0].target, 'docs/notes.md');
+  await actor.submit(planResponse(
+    'session:feedback',
+    'command:confirm-revision',
+    revised.run.runId,
+    revised.pendingPlan.planId,
+    revised.pendingPlan.revision,
+    { kind: 'confirm' },
+  ));
+  const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
+  assert.deepEqual(completed.plans.map((plan) => [plan.revision, plan.status]), [
+    [1, 'superseded'],
+    [2, 'confirmed'],
+  ]);
+  const events = await readEvents(journal, 'session:feedback');
+  assert.equal(events.filter((event) => event.type === 'plan.revision.requested').length, 1);
+  assert.equal(events.filter((event) => event.type === 'plan.superseded').length, 1);
+  assert.equal(events.filter((event) => event.type === 'plan.confirmed').length, 1);
+  assert.equal(requests.length, 3);
   await actor.dispose();
 });
 
-test('Plan 忽略关闭 mutation authority，并强制同一 Loop 只接受最终 answer', async () => {
+test('Plan 取消关闭 pending Plan 且不生成 authority 或 Todo', async () => {
   const journal = new InMemoryCommandJournal();
   await createSession(journal, 'session:ignore', [binding]);
-  let turn = 0;
   const actor = actorWith(journal, 'session:ignore', {
     async *stream(request) {
-      turn += 1;
-      if (turn === 1) {
-        yield providerEvent(request.requestId, 'tool.call', simplePlanCall('plan:ignore'));
-      } else {
-        assert.equal(request.responseConstraint, 'answerOnly');
-        assert.deepEqual(request.tools, []);
-        yield providerEvent(request.requestId, 'assistant.message', {
-          messageId: 'message:answer',
-          content: '已忽略计划；这里只给出最终说明，不执行修改。',
-        });
-      }
+      yield providerEvent(request.requestId, 'tool.call', simplePlanCall('plan:ignore'));
       yield providerEvent(request.requestId, 'completed', {});
     },
   });
@@ -1011,15 +1526,275 @@ test('Plan 忽略关闭 mutation authority，并强制同一 Loop 只接受最�
     'command:ignore',
     waiting.run.runId,
     waiting.pendingPlan.planId,
-    { kind: 'ignore' },
+    waiting.pendingPlan.revision,
+    { kind: 'cancel' },
   ));
-  const completed = await waitFor(actor, (p) => p.run?.status === 'completed');
-  assert.equal(completed.pendingPlan, null);
-  assert.equal(completed.messages.at(-1).content, '已忽略计划；这里只给出最终说明，不执行修改。');
-  const resolved = (await readEvents(journal, 'session:ignore'))
-    .find((event) => event.type === 'plan.intent.resolved');
-  assert.equal(resolved.payload.response.kind, 'ignore');
-  assert.equal(resolved.payload.authorities, undefined);
+  const cancelled = await waitFor(actor, (p) => p.run?.status === 'cancelled');
+  assert.equal(cancelled.pendingPlan, null);
+  assert.equal(cancelled.activePlanRef, null);
+  assert.equal(cancelled.todoList, null);
+  assert.equal(cancelled.plans[0].status, 'cancelled');
+  assert.deepEqual(cancelled.messages.map(({ role, content }) => ({ role, content })), [
+    { role: 'user', content: '给出计划' },
+  ]);
+  const events = await readEvents(journal, 'session:ignore');
+  assert.equal(events.filter((event) => event.type === 'plan.cancelled').length, 1);
+  assert.equal(events.some((event) => event.type === 'plan.confirmed'), false);
+  assert.equal(events.some((event) => event.type === 'todo.seeded'), false);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'run.settled').map((event) => event.payload.outcome),
+    ['cancelled'],
+  );
+  await actor.dispose();
+});
+
+test('Provider 跨 turn 复用原生 callId 时 Session 生成独立 LogicalCallId', async () => {
+  const journal = new InMemoryCommandJournal();
+  await createSession(journal, 'session:logical-call', [binding]);
+  const readTool = {
+    name: 'fs.read',
+    description: '读取工作区文件',
+    inputSchema: { type: 'object' },
+    possibleEffects: [],
+    availability: 'callable',
+  };
+  const executedCallIds = [];
+  const kernel = {
+    async listTools() { return [readTool]; },
+    async execute(request) {
+      executedCallIds.push(request.callId);
+      return executionReply(request, {
+        decision: 'allow', source: 'workspaceRead', workspaceId: 'workspace:test',
+      }, String(request.input.path));
+    },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  };
+  let turn = 0;
+  const actor = actorWith(journal, 'session:logical-call', {
+    async *stream(request) {
+      turn += 1;
+      if (turn <= 2) {
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:reused',
+          name: 'fs.read',
+          input: { workspaceId: 'workspace:test', path: `file-${turn}.txt` },
+        });
+      } else {
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:logical-call',
+          content: '两个读取调用均已完成。',
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  }, kernel, [readTool], 'logical-call');
+
+  await actor.submit(message('session:logical-call', 'command:start', '连续读取两个文件'));
+  const completed = await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  assert.equal(completed.terminalError, null);
+  const requests = (await readEvents(journal, 'session:logical-call'))
+    .filter((event) => event.type === 'tool.requested');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map((event) => event.payload.providerCallId), [
+    'provider:reused',
+    'provider:reused',
+  ]);
+  assert.equal(new Set(requests.map((event) => event.callId)).size, 2);
+  assert.ok(requests.every((event) => event.callId !== event.payload.providerCallId));
+  assert.deepEqual(executedCallIds, requests.map((event) => event.callId));
+  await actor.dispose();
+});
+
+test('同一 Provider turn 的 reasoning 只瞬态关联全部 LogicalCallId 并用于多工具续轮', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:multi-tool-reasoning';
+  await createSession(journal, sessionId, [binding]);
+  const readTool = {
+    name: 'fs.read',
+    description: '读取工作区文件',
+    inputSchema: { type: 'object' },
+    possibleEffects: [],
+    availability: 'callable',
+  };
+  const kernel = {
+    async listTools() { return [readTool]; },
+    async execute(request) {
+      return executionReply(request, {
+        decision: 'allow', source: 'workspaceRead', workspaceId: 'workspace:test',
+      }, String(request.input.path));
+    },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  };
+  const requests = [];
+  let turn = 0;
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      requests.push(request);
+      turn += 1;
+      if (turn === 1) {
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:multi-tool',
+          content: '',
+          reasoningContent: 'private reasoning for both reads',
+        });
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:read-a',
+          name: 'fs.read',
+          input: { workspaceId: 'workspace:test', path: 'a.txt' },
+        });
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:read-b',
+          name: 'fs.read',
+          input: { workspaceId: 'workspace:test', path: 'b.txt' },
+        });
+      } else {
+        const assistantTurn = request.messages.find((item) => (
+          item.role === 'assistant' && item.toolCalls?.length === 2
+        ));
+        assert.ok(assistantTurn);
+        assert.equal(assistantTurn.reasoningContent, 'private reasoning for both reads');
+        assert.deepEqual(
+          assistantTurn.toolCalls.map((call) => call.name),
+          ['fs.read', 'fs.read'],
+        );
+        assert.equal(new Set(assistantTurn.toolCalls.map((call) => call.callId)).size, 2);
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:multi-tool-answer',
+          content: '两个文件均已读取。',
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  }, kernel, [readTool], 'multi-tool-reasoning');
+
+  await actor.submit(message(sessionId, 'command:start', '读取两个文件'));
+  const completed = await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  assert.equal(requests.length, 2);
+  assert.equal(completed.messages.at(-1).content, '两个文件均已读取。');
+  assert.doesNotMatch(
+    JSON.stringify(await readEvents(journal, sessionId)),
+    /private reasoning for both reads/u,
+  );
+  assert.doesNotMatch(JSON.stringify(completed), /private reasoning for both reads/u);
+  await actor.dispose();
+});
+
+test('Provider 续轮失败不改写已完成工具、已确认 Plan 或 Todo 投影', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:tool-completed-provider-failed';
+  await createSession(journal, sessionId, [binding]);
+  const ensureDirectoryTool = {
+    name: 'fs.ensure_directory',
+    description: '确保工作区目录存在',
+    inputSchema: { type: 'object' },
+    possibleEffects: ['workspaceMutation'],
+    availability: 'callable',
+  };
+  const kernel = {
+    async listTools() { return [ensureDirectoryTool]; },
+    async execute(request) {
+      const authority = request.planAuthorities[0];
+      assert.ok(authority);
+      return executionReply(request, {
+        decision: 'allow',
+        source: 'plan',
+        workspaceId: 'workspace:test',
+        authorityId: authority.authorityId,
+        planId: authority.planId,
+        revision: authority.revision,
+        decisionId: authority.decisionId,
+      }, String(request.input.path));
+    },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  };
+  let turn = 0;
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      turn += 1;
+      if (turn === 1) {
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:plan',
+          name: 'plan.publish',
+          input: {
+            title: '创建项目目录',
+            summary: '创建 include 与 src 目录。',
+            steps: [{
+              stepId: 'step:directories',
+              title: '创建 include 与 src 目录',
+              details: '执行两个精确目录创建操作。',
+            }],
+            mutationManifest: [
+              {
+                workspaceId: 'workspace:test',
+                operation: 'fs.ensure_directory',
+                target: 'include',
+              },
+              {
+                workspaceId: 'workspace:test',
+                operation: 'fs.ensure_directory',
+                target: 'src',
+              },
+            ],
+          },
+        });
+        yield providerEvent(request.requestId, 'completed', {});
+        return;
+      }
+      if (turn === 2) {
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:mkdir-include',
+          name: 'fs.ensure_directory',
+          input: { workspaceId: 'workspace:test', path: 'include' },
+        });
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider:mkdir-src',
+          name: 'fs.ensure_directory',
+          input: { workspaceId: 'workspace:test', path: 'src' },
+        });
+        yield providerEvent(request.requestId, 'completed', {});
+        return;
+      }
+      yield providerEvent(request.requestId, 'failed', {
+        code: 'provider_http_failed',
+        message: 'Provider 返回 HTTP 400。',
+      });
+    },
+  }, kernel, [ensureDirectoryTool], 'tool-completed-provider-failed');
+
+  await actor.submit(message(sessionId, 'command:start', '创建目录'));
+  const waiting = await waitFor(actor, (projection) => projection.pendingPlan !== null);
+  await actor.submit(planResponse(
+    sessionId,
+    'command:confirm',
+    waiting.run.runId,
+    waiting.pendingPlan.planId,
+    waiting.pendingPlan.revision,
+    { kind: 'confirm' },
+  ));
+  const failed = await waitFor(actor, (projection) => projection.run?.status === 'failed');
+  assert.equal(failed.terminalError.code, 'provider_http_failed');
+  assert.equal(failed.terminalError.message, 'Provider 返回 HTTP 400。');
+  assert.deepEqual(
+    failed.activities.filter((activity) => activity.kind === 'tool').map((activity) => (
+      [activity.tool.operation, activity.tool.resources[0].logicalPath, activity.status]
+    )),
+    [
+      ['fs.ensure_directory', 'include', 'completed'],
+      ['fs.ensure_directory', 'src', 'completed'],
+    ],
+  );
+  assert.equal(failed.plans.at(-1).status, 'confirmed');
+  assert.equal(failed.todoList.items[0].status, 'pending');
+  assert.deepEqual(failed.activePlanRef, {
+    planId: waiting.pendingPlan.planId,
+    revision: waiting.pendingPlan.revision,
+  });
+  assert.deepEqual(failed.messages.map(({ role, content }) => ({ role, content })), [
+    { role: 'user', content: '创建目录' },
+  ]);
   await actor.dispose();
 });
 
@@ -1044,6 +1819,7 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
     async readRecord() { return null; },
   };
   let turn = 0;
+  let seededTodo;
   let releaseSecondRun;
   const secondRunPaused = new Promise((resolve) => { releaseSecondRun = resolve; });
   const actor = actorWith(journal, 'session:projection-facts', {
@@ -1051,12 +1827,41 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
       turn += 1;
       if (turn === 1) {
         yield providerEvent(request.requestId, 'tool.call', {
-          callId: 'todo:read',
-          name: 'todo.update',
+          callId: 'plan:projection-facts',
+          name: 'plan.publish',
           input: {
-            items: [
-              { todoId: 'inspect', label: '读取项目入口', status: 'inProgress' },
-              { todoId: 'answer', label: '整理结论', status: 'pending' },
+            title: '读取并分析项目入口',
+            summary: '读取 README 并整理结论。',
+            steps: [
+              { stepId: 'step:inspect', title: '读取项目入口', details: '读取 README。' },
+              { stepId: 'step:answer', title: '整理结论', details: '形成最终答复。' },
+            ],
+            mutationManifest: [],
+          },
+        });
+        yield providerEvent(request.requestId, 'completed', {
+          usage: { inputTokens: 12, outputTokens: 3, contextWindowTokens: 1_000 },
+        });
+        return;
+      }
+      if (turn === 2) {
+        const todoFact = request.messages
+          .filter((item) => item.role === 'system')
+          .map((item) => {
+            try { return JSON.parse(item.content); } catch { return null; }
+          })
+          .find((item) => item?.type === 'todo.seeded');
+        assert.ok(todoFact);
+        seededTodo = todoFact;
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'todo:read',
+          name: 'todo.progress',
+          input: {
+            planId: todoFact.sourcePlanId,
+            revision: todoFact.sourcePlanRevision,
+            updates: [
+              { todoId: todoFact.items[0].todoId, status: 'inProgress' },
+              { todoId: todoFact.items[1].todoId, status: 'pending' },
             ],
           },
         });
@@ -1076,14 +1881,16 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
         });
         return;
       }
-      if (turn === 2) {
+      if (turn === 3) {
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'todo:done',
-          name: 'todo.update',
+          name: 'todo.progress',
           input: {
-            items: [
-              { todoId: 'inspect', label: '读取项目入口', status: 'completed' },
-              { todoId: 'answer', label: '整理结论', status: 'completed' },
+            planId: seededTodo.sourcePlanId,
+            revision: seededTodo.sourcePlanRevision,
+            updates: [
+              { todoId: seededTodo.items[0].todoId, status: 'completed' },
+              { todoId: seededTodo.items[1].todoId, status: 'completed' },
             ],
           },
         });
@@ -1092,7 +1899,7 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
         });
         return;
       }
-      if (turn === 3) {
+      if (turn === 4) {
         yield providerEvent(request.requestId, 'assistant.message', {
           messageId: 'message:projection-facts',
           content: '读取与分析完成。',
@@ -1116,6 +1923,15 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
   await actor.submit(message(
     'session:projection-facts', 'command:first', '读取 README 并分析',
   ));
+  const planWaiting = await waitFor(actor, (projection) => projection.pendingPlan !== null);
+  await actor.submit(planResponse(
+    'session:projection-facts',
+    'command:confirm-plan',
+    planWaiting.run.runId,
+    planWaiting.pendingPlan.planId,
+    planWaiting.pendingPlan.revision,
+    { kind: 'confirm' },
+  ));
   const completed = await waitFor(actor, (projection) => (
     ['completed', 'failed', 'indeterminate'].includes(projection.run?.status)
   ));
@@ -1125,13 +1941,27 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
     JSON.stringify(completed.terminalError),
   );
   assert.deepEqual(completed.todoList.items, [
-    { todoId: 'inspect', label: '读取项目入口', status: 'completed' },
-    { todoId: 'answer', label: '整理结论', status: 'completed' },
+    {
+      todoId: seededTodo.items[0].todoId,
+      sourceStepId: 'step:inspect',
+      label: '读取项目入口',
+      status: 'completed',
+    },
+    {
+      todoId: seededTodo.items[1].todoId,
+      sourceStepId: 'step:answer',
+      label: '整理结论',
+      status: 'completed',
+    },
   ]);
+  assert.equal(completed.todoList.sourcePlanId, planWaiting.pendingPlan.planId);
+  assert.equal(completed.todoList.sourcePlanRevision, 1);
+  assert.equal(completed.plans[0].status, 'completed');
+  assert.equal(completed.activePlanRef, null);
   assert.deepEqual(completed.tokenUsage, {
-    providerCallCount: 3,
-    inputTokens: 128,
-    outputTokens: 17,
+    providerCallCount: 4,
+    inputTokens: 140,
+    outputTokens: 20,
     cacheReadInputTokens: 70,
     cacheMissInputTokens: 30,
     cacheReportedCallCount: 1,
@@ -1152,13 +1982,18 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
     outcome: round.outcome,
   })), [{
     title: '读取 README 并分析',
-    providerCallCount: 3,
-    inputTokens: 128,
-    outputTokens: 17,
+    providerCallCount: 4,
+    inputTokens: 140,
+    outputTokens: 20,
     cacheReportedCallCount: 1,
     outcome: 'completed',
   }]);
-  const activity = completed.activities.find((item) => item.callId === 'call:read');
+  const requested = (await readEvents(journal, 'session:projection-facts'))
+    .find((event) => (
+      event.type === 'tool.requested' && event.payload.providerCallId === 'call:read'
+    ));
+  assert.notEqual(requested.callId, 'call:read');
+  const activity = completed.activities.find((item) => item.callId === requested.callId);
   assert.equal(activity.status, 'completed');
   assert.deepEqual(activity.tool, {
     operation: 'fs.read',
@@ -1169,8 +2004,6 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
       logicalPath: 'README.md',
     }],
   });
-  const requested = (await readEvents(journal, 'session:projection-facts'))
-    .find((event) => event.type === 'tool.requested' && event.callId === 'call:read');
   assert.equal(activity.sequence, requested.sequence);
 
   await actor.submit(message(
@@ -1179,19 +2012,125 @@ test('LLM Todo、Provider 缓存用量与 PreparedEffect 资源由同一共享�
   const secondRunning = await waitFor(actor, (projection) => (
     projection.run?.status === 'running' && projection.messages.at(-1)?.content === '继续回答'
   ));
-  assert.equal(secondRunning.todoList, null);
+  assert.deepEqual(secondRunning.todoList, completed.todoList);
+  assert.deepEqual(secondRunning.plans, completed.plans);
   releaseSecondRun();
   const secondCompleted = await waitFor(actor, (projection) => (
     projection.run?.status === 'completed'
     && projection.messages.at(-1)?.content === '第二轮完成。'
   ));
-  assert.equal(secondCompleted.tokenUsage.providerCallCount, 4);
+  assert.equal(secondCompleted.tokenUsage.providerCallCount, 5);
   assert.equal(secondCompleted.tokenUsage.cacheReportedCallCount, 1);
   assert.deepEqual(secondCompleted.tokenUsageHistory.map((round) => round.title), [
     '继续回答',
     '读取 README 并分析',
   ]);
   assert.equal(secondCompleted.tokenUsageHistory[0].providerCallCount, 1);
+  await actor.dispose();
+});
+
+test('process.shell 使用 canonical 默认参数投影命令与执行结果', async () => {
+  const sessionId = 'session:shell-activity';
+  const journal = new InMemoryCommandJournal();
+  await createSession(journal, sessionId, [binding]);
+  const shellTool = {
+    name: 'process.shell',
+    description: '在绑定工作区内运行项目调试命令',
+    inputSchema: { type: 'object' },
+    possibleEffects: ['process'],
+    availability: 'callable',
+  };
+  const kernel = {
+    async listTools() { return [shellTool]; },
+    async execute(request) {
+      return executionReply(request, {
+        decision: 'allow', source: 'workspaceBinding', workspaceId: 'workspace:test',
+      }, '.', {
+        workspaceId: 'workspace:test',
+        command: 'make build',
+        cwd: '.',
+        stdout: 'building\nfinished\n',
+        stderr: 'warning: example\n',
+        exitCode: 0,
+        success: true,
+        timedOut: false,
+        truncated: false,
+        capturedBytes: 36,
+        durationMs: 842,
+        environment: {
+          shell: '/bin/sh',
+          interactive: false,
+          pathSource: 'hostPlusStandardDeveloperPaths',
+          writeScope: 'workspaceAndKernelTemporary',
+          homeWritable: false,
+        },
+      }, {
+        command: 'make build',
+        cwd: '.',
+        timeoutMs: 120_000,
+        maxOutputBytes: 262_144,
+      });
+    },
+    async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
+    async readRecord() { return null; },
+  };
+  let turn = 0;
+  const actor = actorWith(journal, sessionId, {
+    async *stream(request) {
+      turn += 1;
+      if (turn === 1) {
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'call:shell',
+          name: 'process.shell',
+          input: {
+            workspaceId: 'workspace:test',
+            command: 'make build',
+            timeoutMs: 120_000,
+          },
+        });
+      } else {
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'message:shell-finished',
+          content: '构建命令已运行。',
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  }, kernel, [shellTool], 'shell-activity');
+
+  await actor.submit(message(sessionId, 'command:start', '运行构建'));
+  const completed = await waitFor(actor, (projection) => projection.run?.status === 'completed');
+  const activity = completed.activities.find((item) => item.kind === 'tool');
+  assert.deepEqual(activity.tool, {
+    operation: 'process.shell',
+    resources: [{
+      kind: 'workspacePath',
+      label: '.',
+      workspaceId: 'workspace:test',
+      logicalPath: '.',
+    }],
+    shell: {
+      command: 'make build',
+      cwd: '.',
+      result: {
+        stdout: 'building\nfinished\n',
+        stderr: 'warning: example\n',
+        exitCode: 0,
+        success: true,
+        timedOut: false,
+        truncated: false,
+        capturedBytes: 36,
+        durationMs: 842,
+        environment: {
+          shell: '/bin/sh',
+          interactive: false,
+          pathSource: 'hostPlusStandardDeveloperPaths',
+          writeScope: 'workspaceAndKernelTemporary',
+          homeWritable: false,
+        },
+      },
+    },
+  });
   await actor.dispose();
 });
 
@@ -1242,13 +2181,12 @@ function actorWith(
   kernel,
   tools = [],
   prefix = 'test',
-  onUpdate,
 ) {
   return new SessionActor(
     sessionId,
     journal,
     composition(providerPort, kernel ?? emptyKernel(), tools),
-    { nextId: idFactory(prefix), ...(onUpdate ? { onUpdate } : {}) },
+    { nextId: idFactory(prefix) },
   );
 }
 
@@ -1285,7 +2223,13 @@ function cancelNotFound(callId, attemptId) {
   };
 }
 
-function executionReply(request, authority, logicalTarget = 'example') {
+function executionReply(
+  request,
+  authority,
+  logicalTarget = 'example',
+  output = { changed: true },
+  canonicalArguments = request.input,
+) {
   return {
     schemaVersion: 'deepcode.kernel-reply',
     type: 'tool.execution',
@@ -1309,13 +2253,13 @@ function executionReply(request, authority, logicalTarget = 'example') {
         ...(request.input.workspaceId ? { workspaceId: request.input.workspaceId } : {}),
         operation: request.toolName,
         logicalTargets: [logicalTarget],
-        canonicalInvocation: { toolName: request.toolName, arguments: request.input },
+        canonicalInvocation: { toolName: request.toolName, arguments: canonicalArguments },
       },
       authority,
       startedAt: '2026-08-24T00:00:00.000Z',
       completedAt: '2026-08-24T00:00:01.000Z',
       outcome: 'completed',
-      output: { changed: true },
+      output,
     },
   };
 }
@@ -1324,7 +2268,14 @@ function providerEvent(requestId, type, data) {
   return { schemaVersion: 'deepcode.provider-event', requestId, type, data };
 }
 
-function message(sessionId, commandId, text, profileId, attachments) {
+function message(
+  sessionId,
+  commandId,
+  text,
+  profileId,
+  attachments,
+  directoryAttachments,
+) {
   return {
     schemaVersion: 'deepcode.command',
     type: 'message.submit',
@@ -1332,6 +2283,7 @@ function message(sessionId, commandId, text, profileId, attachments) {
     sessionId,
     text,
     ...(attachments?.length ? { attachments } : {}),
+    ...(directoryAttachments?.length ? { directoryAttachments } : {}),
     ...(profileId ? { profileId } : {}),
   };
 }
@@ -1357,25 +2309,27 @@ function approval(sessionId, commandId, runId, callId, approvalId, decision) {
   };
 }
 
-function planResponse(sessionId, commandId, runId, planId, response) {
+function planResponse(sessionId, commandId, runId, planId, revision, response) {
   return {
     schemaVersion: 'deepcode.command', type: 'plan.respond',
-    commandId, sessionId, runId, planId, response,
+    commandId, sessionId, runId, planId, revision, response,
   };
 }
 
 function simplePlanCall(callId) {
   return {
     callId,
-    name: 'plan.intent',
+    name: 'plan.publish',
     input: {
-      prompt: '请选择计划。',
-      options: [{
-        optionId: 'one',
-        label: '写入说明',
-        operations: [{
+      title: '写入说明',
+      summary: '写入一份项目说明。',
+      steps: [{
+        stepId: 'step:write',
+        title: '写入说明',
+        details: '写入 docs/plan.md。',
+      }],
+      mutationManifest: [{
           workspaceId: 'workspace:test', operation: 'fs.write', target: 'docs/plan.md',
-        }],
       }],
     },
   };

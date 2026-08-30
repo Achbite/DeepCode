@@ -6,13 +6,10 @@ use crate::conversation_catalog::{
 use crate::host_inspection::HostInspectionExecutor;
 use crate::prelude::*;
 use crate::{ApiResponse, AppState, SessionServiceError, SessionServiceProcess};
-use axum::body::Body;
-use bytes::Bytes;
 use deepcode_kernel_abi::{HostInspectionOutput, HostInspectionQuery};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::path::Path as StdPath;
 
 #[derive(Debug, Deserialize)]
@@ -49,12 +46,6 @@ pub(crate) struct UpdateConversationSessionRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProjectionStreamQuery {
-    from_revision: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReadConversationResourceRequest {
     workspace_id: String,
     logical_path: String,
@@ -64,6 +55,12 @@ pub(crate) struct ReadConversationResourceRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AttachConversationDirectoryIndexRequest {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ResolveConversationDirectoryAttachmentsRequest {
+    paths: Vec<String>,
 }
 
 pub(crate) async fn conversation_catalog_get(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -92,15 +89,7 @@ pub(crate) async fn conversation_resource_read(
         Ok(value) => value,
         Err(error) => return session_service_error(error),
     };
-    if !projection
-        .get("workspaceBindings")
-        .and_then(Value::as_array)
-        .is_some_and(|bindings| {
-            bindings.iter().any(|binding| {
-                binding.get("workspaceId").and_then(Value::as_str) == Some(&body.workspace_id)
-            })
-        })
-    {
+    if !projection_references_workspace(&projection, &body.workspace_id) {
         return ApiResponse::error(
             "conversation_resource_workspace_not_bound",
             "资源不属于当前 Session 的有效目录集合。",
@@ -141,6 +130,55 @@ pub(crate) async fn conversation_resource_read(
         ),
         Err(error) => ApiResponse::error(error.code, "无法读取所选工作区资源。"),
     }
+}
+
+pub(crate) async fn conversation_directory_attachments_resolve(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ResolveConversationDirectoryAttachmentsRequest>,
+) -> Json<ApiResponse> {
+    if !valid_id(&session_id) {
+        return ApiResponse::error("conversation_session_identity_invalid", "对话身份无效。");
+    }
+    if body.paths.is_empty() || body.paths.len() > 8 {
+        return ApiResponse::error(
+            "conversation_directory_attachments_invalid",
+            "单次消息必须附加一至八个目录。",
+        );
+    }
+    let roots = match canonical_roots(&body.paths) {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => {
+            return ApiResponse::error(
+                "conversation_directory_attachments_invalid",
+                "目录附件不能为空。",
+            )
+        }
+        Err(error) => {
+            return ApiResponse::error("conversation_directory_attachments_invalid", error)
+        }
+    };
+    let bindings = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        if let Some(error) = gui.conversation_catalog_error.as_deref() {
+            return ApiResponse::error("conversation_catalog_unavailable", error);
+        }
+        if gui.conversation_catalog.session(&session_id).is_none() {
+            return ApiResponse::error("conversation_session_not_found", "对话不存在。");
+        }
+        let previous = gui.conversation_catalog.clone();
+        let workspace_ids =
+            match register_roots(&mut gui.conversation_catalog, roots, &crate::now_text()) {
+                Ok(value) => value,
+                Err(error) => return session_service_error(error),
+            };
+        let bindings = binding_snapshot(&gui.conversation_catalog, &workspace_ids);
+        if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+            return ApiResponse::error("conversation_catalog_write_failed", error);
+        }
+        bindings
+    };
+    ApiResponse::ok(json!(bindings))
 }
 
 pub(crate) async fn conversation_directory_index_attach(
@@ -764,6 +802,17 @@ pub(crate) async fn conversation_command_submit(
             return ApiResponse::error(code, message);
         }
     }
+    if command.get("type").and_then(Value::as_str) == Some("message.submit") {
+        let gui = state.gui.lock().expect("gui state lock");
+        if let Some(error) = gui.conversation_catalog_error.as_deref() {
+            return ApiResponse::error("conversation_catalog_unavailable", error);
+        }
+        if let Err((code, message)) =
+            validate_message_directory_attachments(&gui.conversation_catalog, &session_id, &command)
+        {
+            return ApiResponse::error(code, message);
+        }
+    }
     let reply = match request_service(
         state.session_service,
         "submit",
@@ -812,57 +861,6 @@ pub(crate) async fn conversation_projection_get(
         Ok(value) => ApiResponse::ok(value),
         Err(error) => session_service_error(error),
     }
-}
-
-pub(crate) async fn conversation_projection_stream(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Query(query): Query<ProjectionStreamQuery>,
-) -> Response {
-    let service = state.session_service;
-    let mut revision = query.from_revision.unwrap_or(0);
-    let stream = async_stream::stream! {
-        loop {
-            let service = service.clone();
-            let session_id = session_id.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                service.request("snapshot", json!({ "sessionId": session_id }))
-            }).await;
-            match result {
-                Ok(Ok(projection)) => {
-                    let current = projection.get("revision").and_then(Value::as_u64).unwrap_or(0);
-                    if current > revision {
-                        revision = current;
-                        let frame = format!("event: projection\ndata: {projection}\n\n");
-                        yield Ok::<Bytes, Infallible>(Bytes::from(frame));
-                    }
-                }
-                Ok(Err(error)) => {
-                    let frame = format!(
-                        "event: error\ndata: {}\n\n",
-                        json!({ "code": error.code, "message": error.message }),
-                    );
-                    yield Ok::<Bytes, Infallible>(Bytes::from(frame));
-                    break;
-                }
-                Err(error) => {
-                    let frame = format!(
-                        "event: error\ndata: {}\n\n",
-                        json!({ "code": "session_service_join_failed", "message": error.to_string() }),
-                    );
-                    yield Ok::<Bytes, Infallible>(Bytes::from(frame));
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .expect("projection stream response is valid")
 }
 
 async fn request_service(
@@ -948,6 +946,70 @@ fn binding_snapshot(
             display_name: workspace.display_name.clone(),
         })
         .collect()
+}
+
+fn projection_references_workspace(projection: &Value, workspace_id: &str) -> bool {
+    let bindings_contain = |value: Option<&Value>| {
+        value.and_then(Value::as_array).is_some_and(|bindings| {
+            bindings.iter().any(|binding| {
+                binding.get("workspaceId").and_then(Value::as_str) == Some(workspace_id)
+            })
+        })
+    };
+    bindings_contain(projection.get("workspaceBindings"))
+        || projection
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| bindings_contain(message.get("directoryAttachments")))
+            })
+}
+
+fn validate_message_directory_attachments(
+    catalog: &ConversationCatalog,
+    session_id: &str,
+    command: &Value,
+) -> Result<(), (&'static str, String)> {
+    catalog
+        .session(session_id)
+        .ok_or(("conversation_session_not_found", "对话不存在。".to_string()))?;
+    let Some(value) = command.get("directoryAttachments") else {
+        return Ok(());
+    };
+    let bindings = value.as_array().ok_or((
+        "conversation_directory_attachments_invalid",
+        "directoryAttachments 必须是数组。".to_string(),
+    ))?;
+    if bindings.len() > 8 {
+        return Err((
+            "conversation_directory_attachments_invalid",
+            "单次消息最多附加八个目录。".to_string(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for binding in bindings {
+        let workspace_id = binding.get("workspaceId").and_then(Value::as_str).ok_or((
+            "conversation_directory_attachment_invalid",
+            "目录附件缺少 workspaceId。".to_string(),
+        ))?;
+        let display_name = binding.get("displayName").and_then(Value::as_str).ok_or((
+            "conversation_directory_attachment_invalid",
+            "目录附件缺少 displayName。".to_string(),
+        ))?;
+        let workspace = catalog.workspace(workspace_id).ok_or((
+            "conversation_directory_attachment_not_found",
+            "目录附件不在 Host workspace catalog 中。".to_string(),
+        ))?;
+        if workspace.display_name != display_name || !seen.insert(workspace_id) {
+            return Err((
+                "conversation_directory_attachment_mismatch",
+                "目录附件与 Host workspace catalog 不一致或重复。".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_directory_index_attach_command(
@@ -1120,5 +1182,50 @@ mod tests {
                 .0,
             "conversation_workspace_not_found"
         );
+    }
+
+    #[test]
+    fn message_directory_attachments_must_match_host_catalog_without_becoming_session_bindings() {
+        let catalog = catalog_fixture();
+        let command = json!({
+            "directoryAttachments": [{
+                "workspaceId": "workspace:test",
+                "displayName": "Test",
+            }]
+        });
+        assert!(
+            validate_message_directory_attachments(&catalog, "session:test", &command,).is_ok()
+        );
+
+        let forged = json!({
+            "directoryAttachments": [{
+                "workspaceId": "workspace:test",
+                "displayName": "Forged",
+            }]
+        });
+        assert_eq!(
+            validate_message_directory_attachments(&catalog, "session:test", &forged)
+                .expect_err("forged attachment rejected")
+                .0,
+            "conversation_directory_attachment_mismatch"
+        );
+
+        let projection = json!({
+            "workspaceBindings": [],
+            "messages": [{
+                "directoryAttachments": [{
+                    "workspaceId": "workspace:test",
+                    "displayName": "Test",
+                }]
+            }]
+        });
+        assert!(projection_references_workspace(
+            &projection,
+            "workspace:test"
+        ));
+        assert!(!projection_references_workspace(
+            &projection,
+            "workspace:other"
+        ));
     }
 }

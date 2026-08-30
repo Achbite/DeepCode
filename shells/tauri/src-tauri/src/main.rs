@@ -4,8 +4,8 @@ use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
     HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_INSTANCE_ID_ENV,
     HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_ENV, HOST_SHELL_TOKEN_HEADER,
-    HOST_SHELL_TOKEN_PREFIX, HOST_TOKEN_ENTROPY_BYTES, HOST_UI_TOKEN_ENV, HOST_UI_TOKEN_HEADER,
-    HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
+    HOST_SHELL_TOKEN_PREFIX, HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS, HOST_TOKEN_ENTROPY_BYTES,
+    HOST_UI_TOKEN_ENV, HOST_UI_TOKEN_HEADER, HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -840,9 +840,12 @@ fn request_daemon_shutdown(
         &[(HOST_SHELL_TOKEN_HEADER, token)],
         &body,
     );
-    let Some(envelope) =
-        request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(host, port, &request, 600)
-    else {
+    let Some(envelope) = request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(
+        host,
+        port,
+        &request,
+        HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS,
+    ) else {
         return false;
     };
     let Some(receipt) = envelope.ok.then_some(envelope.data).flatten() else {

@@ -23,6 +23,8 @@ test('GUI 壳设置与共享 Agent 设置使用不同目录边界', () => {
 
   for (const key of [
     'agent.systemPrompt',
+    'agent.permissions.workspaceMutation',
+    'agent.permissions.engineeringDecisions',
     'agent.permissions.networkRead',
     'agent.permissions.external',
   ]) {
@@ -32,6 +34,15 @@ test('GUI 壳设置与共享 Agent 设置使用不同目录边界', () => {
     Object.keys(DEFAULT_USER_SETTINGS)
       .filter((key) => key.startsWith('agent.permissions.'))
       .sort(),
-    ['agent.permissions.external', 'agent.permissions.networkRead'],
+    [
+      'agent.permissions.engineeringDecisions',
+      'agent.permissions.external',
+      'agent.permissions.networkRead',
+      'agent.permissions.workspaceMutation',
+    ],
   );
+  assert.equal(DEFAULT_USER_SETTINGS['agent.permissions.workspaceMutation'], 'plan');
+  assert.equal(DEFAULT_USER_SETTINGS['agent.permissions.engineeringDecisions'], 'ask');
+  assert.equal(DEFAULT_USER_SETTINGS['agent.permissions.networkRead'], 'allow');
+  assert.equal(DEFAULT_USER_SETTINGS['agent.permissions.external'], 'ask');
 });

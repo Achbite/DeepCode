@@ -6,15 +6,11 @@ import type {
   InteractionProjection,
   NewSessionEvent,
   PlanAuthority,
-  ProjectionUpdate,
   SessionEvent,
   SessionProjection,
+  WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
-import {
-  COMMAND_REPLY_VERSION,
-  PROJECTION_UPDATE_VERSION,
-  SESSION_EVENT_VERSION,
-} from '@deepcode/protocol';
+import { COMMAND_REPLY_VERSION, SESSION_EVENT_VERSION } from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
 import {
   loopSnapshot,
@@ -25,11 +21,8 @@ import {
 } from './loop.js';
 import { projectSession, reduceSession } from './reducer.js';
 
-export type SessionActorUpdate = ProjectionUpdate;
-
 export interface SessionActorOptions {
   profileId?: string;
-  onUpdate?(update: SessionActorUpdate): void;
   nextId?(kind: string): string;
 }
 
@@ -41,12 +34,12 @@ interface ActiveRun {
 
 const MAX_ATTACHMENT_COUNT = 8;
 const MAX_ATTACHMENT_BYTES = 512 * 1024;
+const MAX_DIRECTORY_ATTACHMENT_COUNT = 8;
 
 export class SessionActor {
   readonly #journal: CommandJournalPort;
   readonly #composition: AgentComposition;
   readonly #profileId?: string;
-  readonly #onUpdate?: (update: SessionActorUpdate) => void;
   readonly #nextId: (kind: string) => string;
   #mailbox = Promise.resolve();
   #active?: ActiveRun;
@@ -64,7 +57,6 @@ export class SessionActor {
     this.#journal = journal;
     this.#composition = composition;
     this.#profileId = options.profileId;
-    this.#onUpdate = options.onUpdate;
     this.#nextId = options.nextId ?? defaultIdFactory(sessionId);
   }
 
@@ -166,7 +158,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -190,16 +181,37 @@ export class SessionActor {
         '该目录不是当前 Session 可移除的对话目录索引。',
       );
     }
-    const reply = await this.#journal.commitCommand(
-      command,
-      [{
+    const events: NewSessionEvent[] = [{
         type: 'session.directory-index.detached',
         sessionId: this.sessionId,
         payload: { commandId: command.commandId, workspaceId: command.workspaceId },
-      }],
+      }];
+    const activePlan = snapshot.state.activePlanRef
+      ? snapshot.state.plans.find((candidate) => (
+          candidate.planId === snapshot.state.activePlanRef?.planId
+          && candidate.revision === snapshot.state.activePlanRef.revision
+        ))
+      : undefined;
+    if (activePlan?.mutationManifest.some((operation) => (
+      operation.workspaceId === command.workspaceId
+    ))) {
+      events.push({
+        type: 'plan.invalidated',
+        sessionId: this.sessionId,
+        runId: activePlan.runId,
+        payload: {
+          planId: activePlan.planId,
+          revision: activePlan.revision,
+          reason: `Plan 引用的 workspace binding 已从 Session 移除：${command.workspaceId}`,
+          sourceFactRef: command.commandId,
+        },
+      });
+    }
+    const reply = await this.#journal.commitCommand(
+      command,
+      events,
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -209,12 +221,29 @@ export class SessionActor {
     if (!command.text.trim()) {
       return await this.recordRejection(command, 'message_empty', '用户消息不能为空。');
     }
+    const focusTask = explicitFocusTask(command.text);
+    if (focusTask === '') {
+      return await this.recordRejection(
+        command,
+        'context_focus_task_empty',
+        '/focus 后必须提供新的任务正文。',
+      );
+    }
+    const submittedText = focusTask ?? command.text;
     if (command.profileId !== undefined && !validProfileId(command.profileId)) {
       return await this.recordRejection(command, 'llm_profile_invalid', '模型 Profile 标识无效。');
     }
     const attachmentError = validateAttachments(command.attachments);
     if (attachmentError) {
       return await this.recordRejection(command, 'message_attachment_invalid', attachmentError);
+    }
+    const directoryAttachmentError = validateDirectoryAttachments(command.directoryAttachments);
+    if (directoryAttachmentError) {
+      return await this.recordRejection(
+        command,
+        'message_directory_attachment_invalid',
+        directoryAttachmentError,
+      );
     }
     const before = await this.loadSnapshot();
     if (before.state.pendingPlan) {
@@ -242,40 +271,66 @@ export class SessionActor {
     const messageId = this.#nextId('message');
     const runId = this.#nextId('run');
     const profileId = command.profileId ?? this.#profileId;
+    const runWorkspaceBindings = mergeWorkspaceBindings(
+      before.state.workspaceBindings,
+      command.directoryAttachments ?? [],
+    );
+    const events: NewSessionEvent[] = [
+      {
+        type: 'input.accepted',
+        sessionId: this.sessionId,
+        payload: { commandId: command.commandId, messageId, text: submittedText },
+      },
+      {
+        type: 'message.committed',
+        sessionId: this.sessionId,
+        payload: {
+          messageId,
+          role: 'user',
+          content: submittedText,
+          ...(command.attachments?.length
+            ? { attachments: command.attachments.map((attachment) => ({ ...attachment })) }
+            : {}),
+          ...(command.directoryAttachments?.length
+            ? {
+                directoryAttachments: command.directoryAttachments.map((attachment) => ({
+                  ...attachment,
+                })),
+              }
+            : {}),
+        },
+      },
+      {
+        type: 'run.started',
+        sessionId: this.sessionId,
+        runId,
+        payload: {
+          inputMessageId: messageId,
+          workspaceBindings: runWorkspaceBindings,
+          ...(profileId ? { profileId } : {}),
+        },
+      },
+    ];
+    if (focusTask !== null) {
+      events.push({
+        type: 'context.compaction.requested',
+        sessionId: this.sessionId,
+        runId,
+        payload: {
+          compactionId: this.#nextId('compaction'),
+          providerRequestId: this.#nextId('provider-request'),
+          trigger: 'userFocus',
+          coveredThroughSequence: before.state.revision,
+          focus: focusTask,
+          commandId: command.commandId,
+        },
+      });
+    }
     const reply = await this.#journal.commitCommand(
       command,
-      [
-        {
-          type: 'input.accepted',
-          sessionId: this.sessionId,
-          payload: { commandId: command.commandId, messageId, text: command.text },
-        },
-        {
-          type: 'message.committed',
-          sessionId: this.sessionId,
-          payload: {
-            messageId,
-            role: 'user',
-            content: command.text,
-            ...(command.attachments?.length
-              ? { attachments: command.attachments.map((attachment) => ({ ...attachment })) }
-              : {}),
-          },
-        },
-        {
-          type: 'run.started',
-          sessionId: this.sessionId,
-          runId,
-          payload: {
-            inputMessageId: messageId,
-            workspaceBindings: before.state.workspaceBindings.map((binding) => ({ ...binding })),
-            ...(profileId ? { profileId } : {}),
-          },
-        },
-      ],
+      events,
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     this.startLoop({ type: 'start', runId });
     return reply;
   }
@@ -314,7 +369,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -371,7 +425,6 @@ export class SessionActor {
       },
     ];
     const reply = await this.#journal.commitCommand(command, events, acceptedReply(command));
-    await this.publishSnapshot();
     this.startLoop({ type: 'resume', runId: command.runId });
     return reply;
   }
@@ -412,7 +465,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     this.startLoop({ type: 'resume', runId: command.runId });
     return reply;
   }
@@ -425,6 +477,7 @@ export class SessionActor {
     if (
       !plan
       || plan.planId !== command.planId
+      || plan.revision !== command.revision
       || plan.runId !== command.runId
       || snapshot.state.run?.runId !== command.runId
       || snapshot.state.run.status !== 'waiting'
@@ -436,65 +489,112 @@ export class SessionActor {
         '该 Plan 已关闭、已变化或不属于当前运行。',
       );
     }
-    const optionIds = new Set(plan.options.map((option) => option.optionId));
-    if (
-      command.response.kind === 'select' && !optionIds.has(command.response.optionId)
-      || command.response.kind === 'feedback' && (
-        !command.response.text.trim()
-        || command.response.optionId !== undefined && !optionIds.has(command.response.optionId)
-      )
-    ) {
+    if (command.response.kind === 'requestRevision' && !command.response.text.trim()) {
       return await this.recordRejection(
         command,
         'plan_response_invalid',
-        'Plan 响应没有引用当前有效 option，或反馈文本为空。',
+        'Plan 修订说明不能为空。',
       );
     }
 
-    const authorities = command.response.kind === 'select'
-      ? planAuthoritiesForSelection(
-          snapshot.events,
-          command.runId,
-          command.planId,
-          command.response.optionId,
-          this.#nextId,
-        )
-      : [];
-    const resolution: NewSessionEvent = {
-      type: 'plan.intent.resolved',
-      sessionId: this.sessionId,
-      runId: command.runId,
-      payload: {
-        planId: command.planId,
-        commandId: command.commandId,
-        response: structuredClone(command.response),
-        ...(authorities.length ? { authorities } : {}),
-      },
-    };
-    const events: NewSessionEvent[] = [resolution];
-    if (command.response.kind === 'feedback') {
+    const events: NewSessionEvent[] = [];
+    if (command.response.kind === 'confirm') {
+      const decisionId = this.#nextId('plan-decision');
+      const superseded = planToSupersede(snapshot.state, plan.planId, plan.revision);
+      if (superseded) {
+        events.push({
+          type: 'plan.superseded',
+          sessionId: this.sessionId,
+          runId: command.runId,
+          payload: {
+            planId: superseded.planId,
+            revision: superseded.revision,
+            supersededByPlanId: plan.planId,
+            supersededByRevision: plan.revision,
+          },
+        });
+      }
+      const authorities = planAuthoritiesForConfirmation(
+        plan,
+        this.sessionId,
+        decisionId,
+        this.#nextId,
+      );
+      events.push({
+        type: 'plan.confirmed',
+        sessionId: this.sessionId,
+        runId: command.runId,
+        callId: plan.callId,
+        payload: {
+          planId: plan.planId,
+          revision: plan.revision,
+          commandId: command.commandId,
+          decisionId,
+          authorities,
+        },
+      });
+      const todoItems = todoItemsForPlan(plan, snapshot.state.todoList, this.#nextId);
+      events.push({
+        type: snapshot.state.todoList?.sourcePlanId === plan.planId
+          ? 'todo.reconciled'
+          : 'todo.seeded',
+        sessionId: this.sessionId,
+        runId: command.runId,
+        payload: {
+          sourcePlanId: plan.planId,
+          sourcePlanRevision: plan.revision,
+          items: todoItems,
+        },
+      });
+    } else if (command.response.kind === 'requestRevision') {
       const messageId = this.#nextId('message');
-      events.unshift({
+      events.push({
         type: 'input.accepted',
         sessionId: this.sessionId,
         payload: { commandId: command.commandId, messageId, text: command.response.text },
       });
-      events.push(
-        {
-          type: 'message.committed',
-          sessionId: this.sessionId,
-          runId: command.runId,
-          payload: { messageId, role: 'user', content: command.response.text },
+      events.push({
+        type: 'plan.revision.requested',
+        sessionId: this.sessionId,
+        runId: command.runId,
+        callId: plan.callId,
+        payload: {
+          planId: plan.planId,
+          revision: plan.revision,
+          commandId: command.commandId,
+          text: command.response.text,
         },
-      );
+      });
+      events.push({
+        type: 'message.committed',
+        sessionId: this.sessionId,
+        runId: command.runId,
+        payload: { messageId, role: 'user', content: command.response.text },
+      });
+    } else {
+      events.push({
+        type: 'plan.cancelled',
+        sessionId: this.sessionId,
+        runId: command.runId,
+        callId: plan.callId,
+        payload: {
+          planId: plan.planId,
+          revision: plan.revision,
+          commandId: command.commandId,
+        },
+      });
     }
     const reply = await this.#journal.commitCommand(command, events, acceptedReply(command));
-    await this.publishSnapshot();
-    this.startLoop({
-      type: 'resume',
-      runId: command.runId,
-      answerOnly: command.response.kind === 'ignore',
-    });
+    if (command.response.kind === 'cancel') {
+      if (this.#active?.runId === command.runId) {
+        this.#active.controller.abort('user_cancelled_plan');
+        await this.#active.task;
+      } else {
+        await this.runLoop({ type: 'cancel', runId: command.runId });
+      }
+    } else {
+      this.startLoop({ type: 'resume', runId: command.runId });
+    }
     return reply;
   }
 
@@ -526,7 +626,6 @@ export class SessionActor {
       }],
       acceptedReply(command),
     );
-    await this.publishSnapshot();
     return reply;
   }
 
@@ -540,7 +639,24 @@ export class SessionActor {
     if (isTerminal(snapshot.state.run.status)) {
       return await this.recordRejection(command, 'run_already_settled', '运行已经结束。');
     }
-    const reply = await this.#journal.commitCommand(command, [], acceptedReply(command));
+    const plan = snapshot.state.pendingPlan;
+    const reply = await this.#journal.commitCommand(
+      command,
+      plan
+        ? [{
+            type: 'plan.cancelled',
+            sessionId: this.sessionId,
+            runId: command.runId,
+            callId: plan.callId,
+            payload: {
+              planId: plan.planId,
+              revision: plan.revision,
+              commandId: command.commandId,
+            },
+          }]
+        : [],
+      acceptedReply(command),
+    );
     if (this.#active?.runId === command.runId) {
       this.#active.controller.abort('user_cancelled');
       await this.#active.task;
@@ -620,15 +736,7 @@ export class SessionActor {
             throw error;
           }
           for (const event of committed) await this.observe(event);
-          const next = await this.loadSnapshot();
-          this.#onUpdate?.({
-            schemaVersion: PROJECTION_UPDATE_VERSION,
-            type: 'snapshot',
-            sessionId: this.sessionId,
-            revision: next.state.revision,
-            projection: projectSession(next.state, this.#assistantDraft),
-          });
-          return next;
+          return await this.loadSnapshot();
         },
         updateAssistantDraft: (draft) => {
           if (draft && draft.runId !== command.runId) {
@@ -636,14 +744,6 @@ export class SessionActor {
           }
           this.#assistantDraft = draft ? { ...draft } : null;
           if (!this.#projectionState) throw new Error('session_projection_state_missing');
-          const projection = projectSession(this.#projectionState, this.#assistantDraft);
-          this.#onUpdate?.({
-            schemaVersion: PROJECTION_UPDATE_VERSION,
-            type: 'snapshot',
-            sessionId: this.sessionId,
-            revision: projection.revision,
-            projection,
-          });
         },
         nextId: this.#nextId,
       },
@@ -660,17 +760,6 @@ export class SessionActor {
     const snapshot = loopSnapshot(this.sessionId, events);
     this.#projectionState = snapshot.state;
     return snapshot;
-  }
-
-  private async publishSnapshot(): Promise<void> {
-    const snapshot = await this.loadSnapshot();
-    this.#onUpdate?.({
-      schemaVersion: PROJECTION_UPDATE_VERSION,
-      type: 'snapshot',
-      sessionId: this.sessionId,
-      revision: snapshot.state.revision,
-      projection: projectSession(snapshot.state, this.#assistantDraft),
-    });
   }
 
   private async observe(event: SessionEvent): Promise<void> {
@@ -714,6 +803,7 @@ function providerRunState(runId: string): ProviderRunTransientState {
     runId,
     observedCallIds: new Set(),
     reasoningByCallId: new Map(),
+    reasoningSignatureByCallId: new Map(),
   };
 }
 
@@ -721,34 +811,66 @@ function providerRunStateForRecovery(runId: string): ProviderRunTransientState {
   return providerRunState(runId);
 }
 
-function planAuthoritiesForSelection(
-  events: readonly SessionEvent[],
-  runId: string,
-  planId: string,
-  optionId: string,
+function planAuthoritiesForConfirmation(
+  plan: NonNullable<SessionProjection['pendingPlan']>,
+  sessionId: string,
+  decisionId: string,
   nextId: (kind: string) => string,
 ): PlanAuthority[] {
-  const requested = events.findLast(
-    (event): event is Extract<SessionEvent, { type: 'plan.intent.requested' }> => (
-      event.type === 'plan.intent.requested'
-      && event.runId === runId
-      && event.payload.planId === planId
-    ),
-  );
-  const option = requested?.payload.options.find((candidate) => candidate.optionId === optionId);
-  if (!requested || !option) throw new Error('plan_option_fact_missing');
-  const workspaceIds = [...new Set(option.operations.map((operation) => operation.workspaceId))];
+  const workspaceIds = [...new Set(plan.mutationManifest.map((operation) => operation.workspaceId))];
   return workspaceIds.map((workspaceId) => ({
     authorityId: nextId('plan-authority'),
-    planId,
-    optionId,
-    sessionId: requested.sessionId,
-    runId,
+    planId: plan.planId,
+    revision: plan.revision,
+    decisionId,
+    sessionId,
     workspaceId,
-    coveredOperations: option.operations
+    coveredOperations: plan.mutationManifest
       .filter((operation) => operation.workspaceId === workspaceId)
       .map((operation) => ({ ...operation })),
   }));
+}
+
+function planToSupersede(
+  state: LoopSnapshot['state'],
+  nextPlanId: string,
+  nextRevision: number,
+): { planId: string; revision: number } | null {
+  if (state.activePlanRef && (
+    state.activePlanRef.planId !== nextPlanId
+    || state.activePlanRef.revision !== nextRevision
+  )) return { ...state.activePlanRef };
+  const previousRevision = state.plans
+    .filter((candidate) => (
+      candidate.planId === nextPlanId
+      && candidate.revision < nextRevision
+      && (candidate.status === 'confirmed' || candidate.status === 'revisionRequested')
+    ))
+    .sort((left, right) => right.revision - left.revision)[0];
+  return previousRevision
+    ? { planId: previousRevision.planId, revision: previousRevision.revision }
+    : null;
+}
+
+function todoItemsForPlan(
+  plan: NonNullable<SessionProjection['pendingPlan']>,
+  previous: SessionProjection['todoList'],
+  nextId: (kind: string) => string,
+): NonNullable<SessionProjection['todoList']>['items'] {
+  const previousByStep = new Map(
+    previous?.sourcePlanId === plan.planId
+      ? previous.items.map((item) => [item.sourceStepId, item] as const)
+      : [],
+  );
+  return plan.steps.map((step) => {
+    const existing = previousByStep.get(step.stepId);
+    return {
+      todoId: existing?.todoId ?? nextId('todo'),
+      sourceStepId: step.stepId,
+      label: step.title,
+      status: existing?.status ?? 'pending',
+    };
+  });
 }
 
 function validInteractionResponse(interaction: InteractionProjection, response: string): boolean {
@@ -818,12 +940,19 @@ function closesAssistantDraft(
     && (
       event.type === 'narrative.committed'
       || event.type === 'interaction.requested'
-      || event.type === 'plan.intent.requested'
+      || event.type === 'plan.published'
       || event.type === 'tool.requested'
       || event.type === 'run.settled'
       || event.type === 'message.committed' && event.payload.role === 'assistant'
     )
   ));
+}
+
+function explicitFocusTask(text: string): string | null {
+  if (!text.startsWith('/focus')) return null;
+  const suffix = text.slice('/focus'.length);
+  if (suffix && !/^\s/u.test(suffix)) return null;
+  return suffix.trim();
 }
 
 function validProfileId(value: string): boolean {
@@ -865,6 +994,37 @@ function validateAttachments(
     }
   }
   return null;
+}
+
+function validateDirectoryAttachments(
+  attachments: Extract<ConversationCommand, { type: 'message.submit' }>['directoryAttachments'],
+): string | null {
+  if (attachments === undefined) return null;
+  if (!Array.isArray(attachments) || attachments.length > MAX_DIRECTORY_ATTACHMENT_COUNT) {
+    return `单次消息最多附加 ${MAX_DIRECTORY_ATTACHMENT_COUNT} 个目录。`;
+  }
+  const seen = new Set<string>();
+  for (const attachment of attachments) {
+    if (!validWorkspaceBinding(attachment) || seen.has(attachment.workspaceId)) {
+      return '目录附件的 workspace identity 无效或重复。';
+    }
+    seen.add(attachment.workspaceId);
+  }
+  return null;
+}
+
+function mergeWorkspaceBindings(
+  base: readonly WorkspaceBindingDisplay[],
+  additions: readonly WorkspaceBindingDisplay[],
+): WorkspaceBindingDisplay[] {
+  const seen = new Set<string>();
+  return [...base, ...additions]
+    .filter((binding) => {
+      if (seen.has(binding.workspaceId)) return false;
+      seen.add(binding.workspaceId);
+      return true;
+    })
+    .map((binding) => ({ ...binding }));
 }
 
 function defaultIdFactory(sessionId: string): (kind: string) => string {

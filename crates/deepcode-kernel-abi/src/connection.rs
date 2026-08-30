@@ -12,6 +12,7 @@ pub const HOST_TOKEN_ENTROPY_BYTES: usize = 32;
 pub const KERNEL_DAEMON_SERVICE: &str = "deepcode-kernel-daemon";
 pub const HOST_SHUTDOWN_OWNER: &str = "hostShell";
 pub const HOST_SHUTDOWN_IDENTITY_CONFLICT: &str = "host_shutdown_identity_conflict";
+pub const HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS: u64 = 15_000;
 
 pub fn is_valid_host_shell_token(value: &str) -> bool {
     is_valid_local_token(value, HOST_SHELL_TOKEN_PREFIX)

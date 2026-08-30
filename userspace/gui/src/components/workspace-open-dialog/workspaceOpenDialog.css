@@ -253,3 +253,193 @@
   gap: 8px;
   flex-shrink: 0;
 }
+
+/* DeepCode-GUI uses the shared shell palette instead of the editor's legacy dark dialog. */
+:root[data-product='deepcode-gui'] .ws-open-dialog__backdrop {
+  background: rgba(20, 20, 22, 0.22);
+  backdrop-filter: blur(7px);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog {
+  width: min(760px, 88vw);
+  height: min(520px, 78vh);
+  border: 1px solid var(--dc-border-strong);
+  border-radius: var(--dc-radius-outer);
+  background: color-mix(in srgb, var(--dc-surface-raised) 96%, transparent);
+  box-shadow: var(--dc-shadow-panel);
+  color: var(--dc-foreground);
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-label);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__header,
+:root[data-product='deepcode-gui'] .ws-open-dialog__footer {
+  border-color: var(--dc-border);
+  background: color-mix(in srgb, var(--dc-surface-subtle) 92%, transparent);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__header {
+  min-height: 50px;
+  padding: 10px 14px 10px 17px;
+  letter-spacing: 0;
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__header > span {
+  display: grid;
+  gap: 2px;
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__header strong {
+  color: var(--dc-foreground-strong);
+  font-size: var(--dc-font-label);
+  font-weight: var(--dc-weight-semibold);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__header small {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+  font-weight: var(--dc-weight-regular);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__close {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dc-faint);
+  font-family: var(--dc-font-ui);
+  font-size: 18px;
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__close:hover {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__addressbar {
+  gap: 7px;
+  padding: 8px 13px;
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__address {
+  height: 29px;
+  padding: 4px 9px;
+  border: 1px solid var(--dc-border-strong);
+  border-radius: var(--dc-radius-control);
+  background: var(--dc-surface);
+  color: var(--dc-foreground);
+  font-family: var(--dc-font-mono);
+  font-size: var(--dc-font-micro);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__address:focus {
+  border-color: var(--dc-accent-border);
+  outline: 2px solid var(--dc-focus-ring);
+  outline-offset: -1px;
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__btn {
+  min-height: 29px;
+  padding: 4px 10px;
+  border: 1px solid var(--dc-border-strong);
+  border-radius: var(--dc-radius-control);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-micro);
+  letter-spacing: 0;
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__btn:hover:not(:disabled) {
+  background: var(--dc-surface-hover);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__btn--primary {
+  border-color: var(--dc-accent);
+  background: var(--dc-accent);
+  color: var(--dc-accent-contrast);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__btn--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--dc-accent) 88%, black);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__toggle,
+:root[data-product='deepcode-gui'] .ws-open-dialog__footer-info {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__sidebar {
+  padding: 7px;
+  border-color: var(--dc-border);
+  background: var(--dc-surface-subtle);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__sidebar-title {
+  padding: 6px 8px;
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__sidebar-item {
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: var(--dc-radius-control);
+  color: var(--dc-muted);
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-caption);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__sidebar-item:hover {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__sidebar-icon,
+:root[data-product='deepcode-gui'] .ws-open-dialog__entry-icon {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__main {
+  padding: 7px;
+  background: var(--dc-surface-raised);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__entry {
+  min-height: 30px;
+  padding: 5px 9px;
+  border-radius: var(--dc-radius-control);
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__entry:hover {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__entry--selected {
+  background: var(--dc-accent-soft);
+  color: var(--dc-foreground-strong);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__placeholder {
+  color: var(--dc-faint);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__error {
+  color: var(--dc-danger);
+}
+
+:root[data-product='deepcode-gui'] .ws-open-dialog__footer {
+  padding: 10px 13px;
+}

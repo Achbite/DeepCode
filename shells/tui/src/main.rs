@@ -145,7 +145,7 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                     }
                     KeyCode::Esc => {
                         if app.has_pending_plan() {
-                            app.ignore_plan().await;
+                            app.cancel_plan().await;
                         } else {
                             app.clear_input();
                         }
@@ -226,8 +226,8 @@ fn print_help() {
   deepcode-tui --smoke
 
 只有显式 -C/--workspace 会给新 Session 创建 workspace binding。
-Plan 可输入 1..N 或调整文本；Esc 明确忽略当前 Plan，空输入、EOF 与 Ctrl-C 不会忽略。
-普通文本、/attach <path>、/detach <workspace-id>、/ignore、/model <profile>、/cancel 都通过 ConversationPort。
+Plan 输入 1/确认，其他文本请求修订；Esc 明确取消当前 Plan，空输入、EOF 与 Ctrl-C 不会取消。
+普通文本、/attach <path>、/detach <workspace-id>、/cancel-plan、/model <profile>、/cancel 都通过 ConversationPort。
 上下文视图：/context。"#,
     );
 }

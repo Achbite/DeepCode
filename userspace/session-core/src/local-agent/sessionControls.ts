@@ -1,24 +1,33 @@
 import type {
+  ExecutionPlanStep,
   InteractionOption,
   JsonObject,
   ModelInteractionRequest,
-  PlanIntent,
   PlanOperation,
-  PlanOption,
   ProviderToolDefinition,
-  TodoItem,
+  TodoProgressUpdate,
 } from '@deepcode/protocol';
 import {
+  SESSION_CONTROL_CONTEXT_FOCUS,
   SESSION_CONTROL_INTERACTION_REQUEST,
-  SESSION_CONTROL_PLAN_INTENT,
-  SESSION_CONTROL_TODO_UPDATE,
+  SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_TODO_PROGRESS,
 } from '@deepcode/protocol';
 
-export const SESSION_CONTROL_INSTRUCTIONS = `普通叙述和最终答复直接输出 Markdown 正文，不要把正文包装为 JSON、JSONL 或代码围栏。
-Session 会依据当前 Provider turn 的 typed 生命周期解释普通文本：同一 turn 包含工具或 Session control call 时，普通文本是 narrative；没有调用而正常结束时，普通文本是 answer。
-需要用户补充信息或确认时，调用 interaction.request；不要只在普通正文末尾向用户提问。需要 workspace mutation 时，先调用 plan.intent，等待用户选择或调整后再调用 mutation 工具。Plan 最多三个选项，每项列出闭合 operation 和精确的 workspace-relative normalized target；只有 fs.delete 必须且可以提供 targetKind。planId 由 tool callId 产生，不要在 plan.intent input 中另传 planId。
-复杂任务（包含多个依赖步骤、多个工具阶段或需要先调查再实施）必须调用 todo.update 建立并持续更新待办；简单的一步回答不需要 Todo。Todo 只表达你明确给出的当前 run 待办，不得从工具状态自动推断；最多十二项，每项保持稳定 todoId，并明确 pending、inProgress 或 completed。一个 turn 最多调用一次 todo.update；它可以与 Kernel 工具同 turn 出现，但不能与 interaction.request 或 plan.intent 同 turn 出现。
-调用任何工具或 Session control call 前，先用一段简短普通文本说明正在做什么。interaction.request 与 plan.intent 是阻塞 control，同一 turn 只能出现其中一个且不能同时调用其他工具或 todo.update。所有 workspace 工具 input 必须使用当前 Session binding 中的 workspaceId，不能使用绝对路径。`;
+export const SESSION_CONTROL_INSTRUCTIONS = `直接输出 Markdown。一个 Provider turn 有工具或 control call 时，普通文本是过程说明；无调用且正常结束时，普通文本是最终答复。
+需要用户补充或确认时调用 interaction.request。需要执行计划时调用 plan.publish，发布一份完整方案而非强制多选；mutationManifest 必须覆盖实际调用的全部 fs.* 修改，具体字段遵循工具 schema。
+Plan 确认后 Session 生成 Todo；仅用 todo.progress 更新已有 todoId 的状态。一个 turn 最多调用一次 todo.progress，且不能与 interaction.request 或 plan.publish 同时调用。
+当前任务需要主动丢弃无关历史并转向明确焦点时调用 context.focus；它只请求 Session 压缩此前上下文，不回答任务，也不执行工具，且必须独占当前 turn。
+工具调用前仅用一句话说明。interaction.request 与 plan.publish 是阻塞 control，同一 turn 只能调用其中一个且不能并用其他工具。workspace 工具使用当前 binding 的 workspaceId 和工作区相对路径。`;
+
+const CONTEXT_FOCUS_SCHEMA: JsonObject = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['focus'],
+  properties: {
+    focus: { type: 'string', minLength: 1, maxLength: 16_384 },
+  },
+};
 
 const INTERACTION_SCHEMA: JsonObject = {
   type: 'object',
@@ -77,28 +86,34 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
 const PLAN_SCHEMA: JsonObject = {
   type: 'object',
   additionalProperties: false,
-  required: ['prompt', 'options'],
+  required: ['title', 'summary', 'steps', 'mutationManifest'],
   properties: {
-    prompt: { type: 'string', minLength: 1 },
-    options: {
+    title: { type: 'string', minLength: 1, maxLength: 240 },
+    summary: { type: 'string', minLength: 1 },
+    steps: {
       type: 'array',
       minItems: 1,
-      maxItems: 3,
+      maxItems: 12,
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['optionId', 'label', 'operations'],
+        required: ['stepId', 'title', 'details'],
         properties: {
-          optionId: { type: 'string', minLength: 1 },
-          label: { type: 'string', minLength: 1 },
-          description: { type: 'string', minLength: 1 },
-          operations: {
+          stepId: { type: 'string', minLength: 1, maxLength: 128 },
+          title: { type: 'string', minLength: 1, maxLength: 240 },
+          details: { type: 'string', minLength: 1 },
+          verification: {
             type: 'array',
-            minItems: 1,
-            items: PLAN_OPERATION_SCHEMA,
+            maxItems: 8,
+            items: { type: 'string', minLength: 1 },
           },
         },
       },
+    },
+    mutationManifest: {
+      type: 'array',
+      maxItems: 128,
+      items: PLAN_OPERATION_SCHEMA,
     },
   },
 };
@@ -106,18 +121,20 @@ const PLAN_SCHEMA: JsonObject = {
 const TODO_SCHEMA: JsonObject = {
   type: 'object',
   additionalProperties: false,
-  required: ['items'],
+  required: ['planId', 'revision', 'updates'],
   properties: {
-    items: {
+    planId: { type: 'string', minLength: 1, maxLength: 128 },
+    revision: { type: 'integer', minimum: 1 },
+    updates: {
       type: 'array',
+      minItems: 1,
       maxItems: 12,
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['todoId', 'label', 'status'],
+        required: ['todoId', 'status'],
         properties: {
           todoId: { type: 'string', minLength: 1, maxLength: 128 },
-          label: { type: 'string', minLength: 1, maxLength: 240 },
           status: { type: 'string', enum: ['pending', 'inProgress', 'completed'] },
         },
       },
@@ -133,13 +150,28 @@ export type SessionControlCall =
     }
   | {
       kind: 'plan';
-      intent: PlanIntent;
+      callId: string;
+      draft: PlanPublicationDraft;
     }
   | {
       kind: 'todo';
       callId: string;
-      items: TodoItem[];
+      planId: string;
+      revision: number;
+      updates: TodoProgressUpdate[];
+    }
+  | {
+      kind: 'focus';
+      callId: string;
+      focus: string;
     };
+
+export interface PlanPublicationDraft {
+  title: string;
+  summary: string;
+  steps: ExecutionPlanStep[];
+  mutationManifest: PlanOperation[];
+}
 
 export function sessionControlToolDefinitions(): readonly ProviderToolDefinition[] {
   return [
@@ -149,14 +181,19 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
       inputSchema: structuredClone(INTERACTION_SCHEMA) as JsonObject,
     },
     {
-      name: SESSION_CONTROL_PLAN_INTENT,
-      description: '提出一个 workspace mutation Plan；input 只包含 prompt/options，planId 来自本次 tool callId。非删除 operation 不得发送 targetKind。',
+      name: SESSION_CONTROL_PLAN_PUBLISH,
+      description: '发布一份已经收敛的实际执行方案。Session 分配 planId/revision；正文步骤在用户确认后原子生成 Todo。',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
-      name: SESSION_CONTROL_TODO_UPDATE,
-      description: '发布当前 run 的结构化待办列表；它是 Session 投影元数据，不是工具执行状态。',
+      name: SESSION_CONTROL_TODO_PROGRESS,
+      description: '仅更新当前已确认 Plan 所生成 Todo 的状态；不能重写标题、顺序或来源。',
       inputSchema: structuredClone(TODO_SCHEMA) as JsonObject,
+    },
+    {
+      name: SESSION_CONTROL_CONTEXT_FOCUS,
+      description: '请求 Session 压缩此前上下文并把后续工作聚焦到给定任务；必须独占当前 Provider turn。',
+      inputSchema: structuredClone(CONTEXT_FOCUS_SCHEMA) as JsonObject,
     },
   ];
 }
@@ -168,8 +205,9 @@ export function decodeSessionControlCall(
 ): SessionControlCall | null {
   if (
     name !== SESSION_CONTROL_INTERACTION_REQUEST
-    && name !== SESSION_CONTROL_PLAN_INTENT
-    && name !== SESSION_CONTROL_TODO_UPDATE
+    && name !== SESSION_CONTROL_PLAN_PUBLISH
+    && name !== SESSION_CONTROL_TODO_PROGRESS
+    && name !== SESSION_CONTROL_CONTEXT_FOCUS
   ) return null;
   const canonicalCallId = requiredIdentifier(callId, 'callId');
   if (name === SESSION_CONTROL_INTERACTION_REQUEST) {
@@ -179,41 +217,61 @@ export function decodeSessionControlCall(
       request: decodeInteraction(input),
     };
   }
-  if (name === SESSION_CONTROL_TODO_UPDATE) {
+  if (name === SESSION_CONTROL_TODO_PROGRESS) {
+    const progress = decodeTodoProgress(input);
     return {
       kind: 'todo',
       callId: canonicalCallId,
-      items: decodeTodoItems(input),
+      ...progress,
+    };
+  }
+  if (name === SESSION_CONTROL_CONTEXT_FOCUS) {
+    assertExactKeys(input, ['focus']);
+    if (typeof input.focus !== 'string' || !input.focus.trim() || input.focus.length > 16_384) {
+      throw new SessionControlError(
+        'session_control_focus_invalid',
+        'context.focus focus 必须是一至 16384 字符的非空文本。',
+      );
+    }
+    return {
+      kind: 'focus',
+      callId: canonicalCallId,
+      focus: input.focus.trim(),
     };
   }
   return {
     kind: 'plan',
-    intent: decodePlan(canonicalCallId, input),
+    callId: canonicalCallId,
+    draft: decodePlan(input),
   };
 }
 
-function decodeTodoItems(value: Record<string, unknown>): TodoItem[] {
-  assertExactKeys(value, ['items']);
-  if (!Array.isArray(value.items) || value.items.length > 12) {
+function decodeTodoProgress(value: Record<string, unknown>): {
+  planId: string;
+  revision: number;
+  updates: TodoProgressUpdate[];
+} {
+  assertExactKeys(value, ['planId', 'revision', 'updates']);
+  if (!Array.isArray(value.updates) || value.updates.length < 1 || value.updates.length > 12) {
     throw new SessionControlError(
-      'session_control_todo_items_invalid',
-      'todo.update items 必须是最多十二项的数组。',
+      'session_control_todo_updates_invalid',
+      'todo.progress updates 必须是一至十二项的数组。',
     );
   }
   const seen = new Set<string>();
-  return value.items.map((candidate) => {
+  const updates = value.updates.map((candidate): TodoProgressUpdate => {
     if (!isRecord(candidate)) {
       throw new SessionControlError(
         'session_control_todo_item_invalid',
-        'todo.update item 必须是对象。',
+        'todo.progress update 必须是对象。',
       );
     }
-    assertExactKeys(candidate, ['todoId', 'label', 'status']);
+    assertExactKeys(candidate, ['todoId', 'status']);
     const todoId = requiredIdentifier(candidate.todoId, 'todoId');
     if (seen.has(todoId)) {
       throw new SessionControlError(
         'session_control_todo_id_duplicate',
-        'todo.update todoId 不能重复。',
+        'todo.progress todoId 不能重复。',
       );
     }
     seen.add(todoId);
@@ -224,22 +282,16 @@ function decodeTodoItems(value: Record<string, unknown>): TodoItem[] {
     ) {
       throw new SessionControlError(
         'session_control_todo_status_invalid',
-        'todo.update status 必须是 pending、inProgress 或 completed。',
+        'todo.progress status 必须是 pending、inProgress 或 completed。',
       );
     }
-    const label = requiredText(candidate.label, 'label');
-    if (
-      label.trim() !== label
-      || [...label].length > 240
-      || [...label].some((character) => /[\u0000-\u001f\u007f]/u.test(character))
-    ) {
-      throw new SessionControlError(
-        'session_control_todo_label_invalid',
-        'todo.update label 必须是最多 240 个可显示字符。',
-      );
-    }
-    return { todoId, label, status: candidate.status };
+    return { todoId, status: candidate.status };
   });
+  return {
+    planId: requiredIdentifier(value.planId, 'planId'),
+    revision: requiredPositiveInteger(value.revision, 'revision'),
+    updates,
+  };
 }
 
 function decodeInteraction(value: Record<string, unknown>): ModelInteractionRequest {
@@ -271,48 +323,62 @@ function decodeInteraction(value: Record<string, unknown>): ModelInteractionRequ
   return request;
 }
 
-function decodePlan(planId: string, value: Record<string, unknown>): PlanIntent {
-  assertExactKeys(value, ['prompt', 'options']);
-  if (!Array.isArray(value.options) || value.options.length < 1 || value.options.length > 3) {
+function decodePlan(value: Record<string, unknown>): PlanPublicationDraft {
+  assertExactKeys(value, ['title', 'summary', 'steps', 'mutationManifest']);
+  if (!Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > 12) {
     throw new SessionControlError(
-      'session_control_plan_options_invalid',
-      'plan.intent options 必须包含一至三个选项。',
+      'session_control_plan_steps_invalid',
+      'plan.publish steps 必须包含一至十二个步骤。',
     );
   }
-  const optionIds = new Set<string>();
+  if (!Array.isArray(value.mutationManifest) || value.mutationManifest.length > 128) {
+    throw new SessionControlError(
+      'session_control_plan_manifest_invalid',
+      'plan.publish mutationManifest 必须是最多 128 项的数组。',
+    );
+  }
+  const stepIds = new Set<string>();
   return {
-    planId,
-    prompt: requiredText(value.prompt, 'prompt'),
-    options: value.options.map((candidate) => decodePlanOption(candidate, optionIds)),
+    title: requiredDisplayText(value.title, 'title', 240),
+    summary: requiredText(value.summary, 'summary'),
+    steps: value.steps.map((candidate) => decodePlanStep(candidate, stepIds)),
+    mutationManifest: value.mutationManifest.map(decodePlanOperation),
   };
 }
 
-function decodePlanOption(value: unknown, seen: Set<string>): PlanOption {
+function decodePlanStep(value: unknown, seen: Set<string>): ExecutionPlanStep {
   if (!isRecord(value)) {
-    throw new SessionControlError('session_control_plan_option_invalid', 'Plan option 必须是对象。');
+    throw new SessionControlError('session_control_plan_step_invalid', 'Plan step 必须是对象。');
   }
-  assertExactKeys(value, ['optionId', 'label', 'description', 'operations'], ['description']);
-  const optionId = requiredIdentifier(value.optionId, 'optionId');
-  if (seen.has(optionId)) {
+  assertExactKeys(value, ['stepId', 'title', 'details', 'verification'], ['verification']);
+  const stepId = requiredIdentifier(value.stepId, 'stepId');
+  if (seen.has(stepId)) {
     throw new SessionControlError(
-      'session_control_plan_option_duplicate',
-      'Plan optionId 不能重复。',
+      'session_control_plan_step_duplicate',
+      'Plan stepId 不能重复。',
     );
   }
-  seen.add(optionId);
-  if (!Array.isArray(value.operations) || value.operations.length === 0) {
+  seen.add(stepId);
+  if (
+    value.verification !== undefined
+    && (!Array.isArray(value.verification) || value.verification.length > 8)
+  ) {
     throw new SessionControlError(
-      'session_control_plan_operations_invalid',
-      '每个 Plan option 必须包含至少一个闭合 operation。',
+      'session_control_plan_verification_invalid',
+      'Plan step verification 必须是最多八项的字符串数组。',
     );
   }
   return {
-    optionId,
-    label: requiredText(value.label, 'label'),
-    ...(value.description === undefined
+    stepId,
+    title: requiredDisplayText(value.title, 'title', 240),
+    details: requiredText(value.details, 'details'),
+    ...(value.verification === undefined
       ? {}
-      : { description: requiredText(value.description, 'description') }),
-    operations: value.operations.map(decodePlanOperation),
+      : {
+          verification: value.verification.map((entry, index) => (
+            requiredText(entry, `verification[${index}]`)
+          )),
+        }),
   };
 }
 
@@ -421,6 +487,31 @@ function requiredIdentifier(value: unknown, field: string): string {
     );
   }
   return id;
+}
+
+function requiredDisplayText(value: unknown, field: string, maxLength: number): string {
+  const text = requiredText(value, field);
+  if (
+    text.trim() !== text
+    || [...text].length > maxLength
+    || [...text].some((character) => /[\u0000-\u001f\u007f]/u.test(character))
+  ) {
+    throw new SessionControlError(
+      'session_control_display_text_invalid',
+      `Session control 字段 ${field} 必须是最多 ${maxLength} 个可显示字符。`,
+    );
+  }
+  return text;
+}
+
+function requiredPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new SessionControlError(
+      'session_control_integer_invalid',
+      `Session control 字段 ${field} 必须是正整数。`,
+    );
+  }
+  return value;
 }
 
 function assertExactKeys(

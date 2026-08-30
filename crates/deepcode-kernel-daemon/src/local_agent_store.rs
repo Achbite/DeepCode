@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const SESSION_STORE_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/session.sql");
-const SESSION_STORE_VERSION: u32 = 1;
+const SESSION_STORE_VERSION: u32 = 3;
 const EVENT_VERSION: &str = "deepcode.session-event";
 const COMMAND_VERSION: &str = "deepcode.command";
 const REPLY_VERSION: &str = "deepcode.command-reply";
@@ -40,7 +40,7 @@ impl LocalAgentJournal {
             })?;
         }
         let existed = path.exists();
-        let connection = Connection::open(path).map_err(sql_open_error)?;
+        let mut connection = Connection::open(path).map_err(sql_open_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(sql_error("session_store_busy_timeout_failed"))?;
@@ -59,6 +59,11 @@ impl LocalAgentJournal {
                 verify_session_store_version(&connection)?;
             }
             SESSION_STORE_VERSION => {
+                verify_session_store(&connection)?;
+                verify_session_store_version(&connection)?;
+            }
+            2 => {
+                migrate_session_store_v2_to_v3(&mut connection)?;
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
             }
@@ -275,6 +280,7 @@ impl LocalAgentJournal {
         let reply = object.get("reply").expect("required reply");
         validate_command(command)?;
         validate_reply(reply)?;
+        validate_command_event_batch(command, events)?;
         let session_id = required_string(command, "sessionId")?;
         let command_id = required_string(command, "commandId")?;
         if required_string(reply, "sessionId")? != session_id
@@ -400,41 +406,56 @@ impl LocalAgentJournal {
     pub(crate) fn plan_authority_is_committed(
         &self,
         session_id: &str,
-        run_id: &str,
         authority: &Value,
     ) -> Result<bool, LocalAgentStoreError> {
         validate_id("sessionId", session_id)?;
-        validate_id("runId", run_id)?;
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT payload_json FROM session_events
-                 WHERE session_id=?1 AND run_id=?2 AND event_type='plan.intent.resolved'
-                 ORDER BY sequence DESC",
+                "SELECT event_type, payload_json FROM session_events
+                 WHERE session_id=?1 AND event_type IN (
+                   'plan.confirmed', 'plan.revision.requested', 'plan.superseded',
+                   'plan.cancelled', 'plan.completed', 'plan.invalidated'
+                 ) ORDER BY sequence ASC",
             )
             .map_err(sql_error("plan_authority_fact_read_failed"))?;
         let rows = statement
-            .query_map(params![session_id, run_id], |row| row.get::<_, String>(0))
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(sql_error("plan_authority_fact_read_failed"))?;
+        let mut active_authorities: Option<Vec<Value>> = None;
+        let mut active_plan: Option<(String, u64)> = None;
         for row in rows {
-            let payload = decode_json(
-                &row.map_err(sql_error("plan_authority_fact_read_failed"))?,
-                "plan_authority_fact_corrupt",
-            )?;
-            if payload.pointer("/response/kind").and_then(Value::as_str) != Some("select") {
-                continue;
-            }
-            if payload
-                .get("authorities")
-                .and_then(Value::as_array)
-                .is_some_and(|authorities| {
-                    authorities.iter().any(|candidate| candidate == authority)
-                })
+            let (event_type, encoded) =
+                row.map_err(sql_error("plan_authority_fact_read_failed"))?;
+            let payload = decode_json(&encoded, "plan_authority_fact_corrupt")?;
+            let plan_id = required_string(&payload, "planId")?.to_string();
+            let revision = required_u64(&payload, "revision")?;
+            if event_type == "plan.confirmed" {
+                active_plan = Some((plan_id, revision));
+                active_authorities = Some(
+                    payload
+                        .get("authorities")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            LocalAgentStoreError::new(
+                                "plan_authority_fact_corrupt",
+                                "plan.confirmed 缺少 authorities。",
+                            )
+                        })?
+                        .clone(),
+                );
+            } else if active_plan
+                .as_ref()
+                .is_some_and(|active| active.0 == plan_id && active.1 == revision)
             {
-                return Ok(true);
+                active_plan = None;
+                active_authorities = None;
             }
         }
-        Ok(false)
+        Ok(active_authorities
+            .is_some_and(|authorities| authorities.iter().any(|candidate| candidate == authority)))
     }
 
     pub(crate) fn non_workspace_authority_is_committed(
@@ -489,6 +510,97 @@ impl LocalAgentJournal {
             LocalAgentStoreError::new("session_store_lock_failed", "Session Store 锁已损坏。")
         })
     }
+}
+
+fn migrate_session_store_v2_to_v3(connection: &mut Connection) -> Result<(), LocalAgentStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error("session_store_migration_transaction_failed"))?;
+    transaction
+        .execute_batch(
+            r#"
+            ALTER TABLE session_events RENAME TO session_events_v2;
+            DROP INDEX one_run_settlement;
+            DROP INDEX session_events_run_idx;
+            DROP INDEX session_events_call_idx;
+
+            CREATE TABLE session_events (
+                session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL CHECK(sequence > 0),
+                event_id TEXT NOT NULL UNIQUE CHECK(length(event_id) > 0),
+                event_type TEXT NOT NULL CHECK(event_type IN (
+                    'session.created',
+                    'session.directory-index.attached',
+                    'session.directory-index.detached',
+                    'input.accepted',
+                    'run.started',
+                    'run.profile.selected',
+                    'message.committed',
+                    'message.feedback.updated',
+                    'narrative.committed',
+                    'interaction.requested',
+                    'interaction.resolved',
+                    'plan.published',
+                    'plan.confirmed',
+                    'plan.revision.requested',
+                    'plan.superseded',
+                    'plan.cancelled',
+                    'plan.completed',
+                    'plan.invalidated',
+                    'todo.seeded',
+                    'todo.reconciled',
+                    'todo.progressed',
+                    'tool.requested',
+                    'approval.requested',
+                    'approval.resolved',
+                    'tool.completed',
+                    'session.control.rejected',
+                    'context.compaction.requested',
+                    'context.compacted',
+                    'context.composed',
+                    'context.updated',
+                    'run.waiting',
+                    'run.settled'
+                )),
+                run_id TEXT,
+                call_id TEXT,
+                payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+                occurred_at TEXT NOT NULL CHECK(length(occurred_at) > 0),
+                PRIMARY KEY(session_id, sequence)
+            ) STRICT;
+
+            INSERT INTO session_events(
+                session_id, sequence, event_id, event_type, run_id, call_id,
+                payload_json, occurred_at
+            )
+            SELECT
+                session_id, sequence, event_id, event_type, run_id, call_id,
+                CASE
+                    WHEN event_type='context.composed'
+                         AND json_type(payload_json, '$.purpose') IS NULL
+                    THEN json_set(payload_json, '$.purpose', 'agent')
+                    ELSE payload_json
+                END,
+                occurred_at
+            FROM session_events_v2
+            ORDER BY session_id, sequence;
+
+            DROP TABLE session_events_v2;
+
+            CREATE UNIQUE INDEX one_run_settlement
+                ON session_events(session_id, run_id)
+                WHERE event_type = 'run.settled';
+            CREATE INDEX session_events_run_idx
+                ON session_events(session_id, run_id, sequence);
+            CREATE INDEX session_events_call_idx
+                ON session_events(session_id, call_id, sequence);
+            PRAGMA user_version = 3;
+            "#,
+        )
+        .map_err(sql_error("session_store_migration_failed"))?;
+    transaction
+        .commit()
+        .map_err(sql_error("session_store_migration_commit_failed"))
 }
 
 /// Explicit Session deletion is the sole lifecycle operation that removes
@@ -642,14 +754,23 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         "narrative.committed",
         "interaction.requested",
         "interaction.resolved",
-        "plan.intent.requested",
-        "plan.intent.resolved",
-        "todo.updated",
+        "plan.published",
+        "plan.confirmed",
+        "plan.revision.requested",
+        "plan.superseded",
+        "plan.cancelled",
+        "plan.completed",
+        "plan.invalidated",
+        "todo.seeded",
+        "todo.reconciled",
+        "todo.progressed",
         "tool.requested",
         "approval.requested",
         "approval.resolved",
         "tool.completed",
         "session.control.rejected",
+        "context.compaction.requested",
+        "context.compacted",
         "context.composed",
         "context.updated",
         "run.waiting",
@@ -672,7 +793,11 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
     );
     let needs_call = matches!(
         event_type,
-        "todo.updated"
+        "plan.published"
+            | "plan.confirmed"
+            | "plan.revision.requested"
+            | "plan.cancelled"
+            | "todo.progressed"
             | "tool.requested"
             | "approval.requested"
             | "approval.resolved"
@@ -691,6 +816,38 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
     }
     if needs_call {
         validate_id("callId", required_string(event, "callId")?)?;
+    }
+    if matches!(
+        event_type,
+        "interaction.requested"
+            | "plan.published"
+            | "todo.progressed"
+            | "tool.requested"
+            | "session.control.rejected"
+    ) {
+        let payload = event.get("payload").expect("validated payload");
+        let provider_call_id = required_string(payload, "providerCallId")?;
+        validate_id("providerCallId", provider_call_id)?;
+        let logical_call_id = match event_type {
+            "interaction.requested" => required_string(payload, "interactionId")?,
+            _ => required_string(event, "callId")?,
+        };
+        if provider_call_id == logical_call_id {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Session LogicalCallId 不能复用 providerCallId。",
+            ));
+        }
+        if event_type == "plan.published" {
+            let plan_id = required_string(payload, "planId")?;
+            validate_id("planId", plan_id)?;
+            if plan_id == logical_call_id || plan_id == provider_call_id {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "PlanId、LogicalCallId 与 providerCallId 必须互不复用。",
+                ));
+            }
+        }
     }
     match event_type {
         "session.directory-index.attached" => {
@@ -720,6 +877,39 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 )
             })?)?;
         }
+        "message.committed" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &["messageId", "role", "content"],
+                &["attachments", "directoryAttachments"],
+            )?;
+            validate_id("messageId", required_string(payload, "messageId")?)?;
+            if !matches!(
+                required_string(payload, "role")?,
+                "user" | "assistant" | "tool" | "system"
+            ) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "message.committed role 无效。",
+                ));
+            }
+            if payload.get("content").and_then(Value::as_str).is_none() {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "message.committed content 必须是字符串。",
+                ));
+            }
+            if let Some(attachments) = payload.get("directoryAttachments") {
+                let bindings = validate_workspace_bindings(attachments)?;
+                if bindings.len() > 8 {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "单条消息最多包含八个目录附件。",
+                    ));
+                }
+            }
+        }
         "message.feedback.updated" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(payload, &["commandId", "messageId", "feedback"], &[])?;
@@ -727,44 +917,153 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             validate_id("messageId", required_string(payload, "messageId")?)?;
             validate_feedback(payload.get("feedback").expect("validated feedback"))?;
         }
-        "todo.updated" => {
+        "plan.published" => {
             let payload = event.get("payload").expect("validated payload");
-            exact_object(payload, &["items"], &[])?;
-            let items = payload
-                .get("items")
+            exact_object(
+                payload,
+                &[
+                    "providerCallId",
+                    "planId",
+                    "revision",
+                    "title",
+                    "summary",
+                    "steps",
+                    "mutationManifest",
+                ],
+                &[],
+            )?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+            validate_display_text(payload, "title", 240)?;
+            required_string(payload, "summary")?;
+            validate_plan_steps(payload.get("steps").expect("validated steps"))?;
+            validate_plan_operations(
+                payload
+                    .get("mutationManifest")
+                    .expect("validated mutation manifest"),
+            )?;
+        }
+        "plan.confirmed" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &[
+                    "planId",
+                    "revision",
+                    "commandId",
+                    "decisionId",
+                    "authorities",
+                ],
+                &[],
+            )?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+            validate_id("commandId", required_string(payload, "commandId")?)?;
+            validate_id("decisionId", required_string(payload, "decisionId")?)?;
+            validate_plan_authorities(payload)?;
+        }
+        "plan.revision.requested" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["planId", "revision", "commandId", "text"], &[])?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+            validate_id("commandId", required_string(payload, "commandId")?)?;
+            required_string(payload, "text")?;
+        }
+        "plan.superseded" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &[
+                    "planId",
+                    "revision",
+                    "supersededByPlanId",
+                    "supersededByRevision",
+                ],
+                &[],
+            )?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+            validate_id(
+                "supersededByPlanId",
+                required_string(payload, "supersededByPlanId")?,
+            )?;
+            required_positive_revision(payload, "supersededByRevision")?;
+        }
+        "plan.cancelled" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["planId", "revision", "commandId"], &[])?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+            validate_id("commandId", required_string(payload, "commandId")?)?;
+        }
+        "plan.completed" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["planId", "revision"], &[])?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+        }
+        "plan.invalidated" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &["planId", "revision", "reason", "sourceFactRef"],
+                &[],
+            )?;
+            validate_id("planId", required_string(payload, "planId")?)?;
+            required_positive_revision(payload, "revision")?;
+            required_string(payload, "reason")?;
+            validate_id("sourceFactRef", required_string(payload, "sourceFactRef")?)?;
+        }
+        "todo.seeded" | "todo.reconciled" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &["sourcePlanId", "sourcePlanRevision", "items"],
+                &[],
+            )?;
+            validate_id("sourcePlanId", required_string(payload, "sourcePlanId")?)?;
+            required_positive_revision(payload, "sourcePlanRevision")?;
+            validate_todo_items(payload.get("items").expect("validated todo items"))?;
+        }
+        "todo.progressed" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &[
+                    "providerCallId",
+                    "sourcePlanId",
+                    "sourcePlanRevision",
+                    "updates",
+                ],
+                &[],
+            )?;
+            validate_id("sourcePlanId", required_string(payload, "sourcePlanId")?)?;
+            required_positive_revision(payload, "sourcePlanRevision")?;
+            let updates = payload
+                .get("updates")
                 .and_then(Value::as_array)
                 .ok_or_else(|| {
                     LocalAgentStoreError::new(
                         "session_event_invalid",
-                        "todo.updated items 必须是数组。",
+                        "todo.progressed updates 必须是数组。",
                     )
                 })?;
-            if items.len() > 12 {
+            if updates.is_empty() || updates.len() > 12 {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "todo.updated 最多包含十二项。",
+                    "todo.progressed 必须包含一至十二项更新。",
                 ));
             }
-            let mut todo_ids = std::collections::HashSet::with_capacity(items.len());
-            for item in items {
-                exact_object(item, &["todoId", "label", "status"], &[])?;
+            let mut todo_ids = std::collections::HashSet::with_capacity(updates.len());
+            for item in updates {
+                exact_object(item, &["todoId", "status"], &[])?;
                 let todo_id = required_string(item, "todoId")?;
-                let label = required_string(item, "label")?;
                 validate_id("todoId", todo_id)?;
                 if !todo_ids.insert(todo_id) {
                     return Err(LocalAgentStoreError::new(
                         "session_event_invalid",
-                        "todo.updated 包含重复 todoId。",
-                    ));
-                }
-                if label.trim().is_empty()
-                    || label.trim() != label
-                    || label.chars().count() > 240
-                    || label.chars().any(char::is_control)
-                {
-                    return Err(LocalAgentStoreError::new(
-                        "session_event_invalid",
-                        "todo.updated label 无效。",
+                        "todo.progressed 包含重复 todoId。",
                     ));
                 }
                 if !matches!(
@@ -773,17 +1072,21 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 ) {
                     return Err(LocalAgentStoreError::new(
                         "session_event_invalid",
-                        "todo.updated status 无效。",
+                        "todo.progressed status 无效。",
                     ));
                 }
             }
         }
         "session.control.rejected" => {
             let payload = event.get("payload").expect("validated payload");
-            exact_object(payload, &["toolName", "input", "error"], &[])?;
+            exact_object(
+                payload,
+                &["providerCallId", "toolName", "input", "error"],
+                &[],
+            )?;
             if !matches!(
                 required_string(payload, "toolName")?,
-                "interaction.request" | "plan.intent" | "todo.update"
+                "interaction.request" | "plan.publish" | "todo.progress" | "context.focus"
             ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -801,12 +1104,140 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             required_string(error, "code")?;
             required_string(error, "message")?;
         }
+        "context.compaction.requested" => {
+            let payload = event.get("payload").expect("validated payload");
+            let trigger = required_string(payload, "trigger")?;
+            match trigger {
+                "pressure" => {
+                    exact_object(
+                        payload,
+                        &[
+                            "compactionId",
+                            "providerRequestId",
+                            "trigger",
+                            "coveredThroughSequence",
+                        ],
+                        &[],
+                    )?;
+                    if event.get("callId").is_some() {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "Pressure compaction 不能携带 callId。",
+                        ));
+                    }
+                }
+                "userFocus" => {
+                    exact_object(
+                        payload,
+                        &[
+                            "compactionId",
+                            "providerRequestId",
+                            "trigger",
+                            "coveredThroughSequence",
+                            "focus",
+                            "commandId",
+                        ],
+                        &[],
+                    )?;
+                    validate_id("commandId", required_string(payload, "commandId")?)?;
+                    validate_focus_text(required_string(payload, "focus")?)?;
+                    if event.get("callId").is_some() {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "User focus compaction 不能携带 callId。",
+                        ));
+                    }
+                }
+                "agentFocus" => {
+                    exact_object(
+                        payload,
+                        &[
+                            "compactionId",
+                            "providerRequestId",
+                            "trigger",
+                            "coveredThroughSequence",
+                            "focus",
+                            "providerCallId",
+                        ],
+                        &[],
+                    )?;
+                    let call_id = required_string(event, "callId")?;
+                    validate_id("callId", call_id)?;
+                    let provider_call_id = required_string(payload, "providerCallId")?;
+                    validate_id("providerCallId", provider_call_id)?;
+                    validate_focus_text(required_string(payload, "focus")?)?;
+                    if call_id == provider_call_id {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "context.focus LogicalCallId 不能复用 providerCallId。",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "context.compaction.requested trigger 无效。",
+                    ))
+                }
+            }
+            validate_id("compactionId", required_string(payload, "compactionId")?)?;
+            validate_id(
+                "providerRequestId",
+                required_string(payload, "providerRequestId")?,
+            )?;
+            required_u64(payload, "coveredThroughSequence")?;
+        }
+        "context.compacted" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(
+                payload,
+                &[
+                    "compactionId",
+                    "providerRequestId",
+                    "trigger",
+                    "coveredThroughSequence",
+                    "summary",
+                ],
+                &[],
+            )?;
+            validate_id("compactionId", required_string(payload, "compactionId")?)?;
+            validate_id(
+                "providerRequestId",
+                required_string(payload, "providerRequestId")?,
+            )?;
+            if !matches!(
+                required_string(payload, "trigger")?,
+                "pressure" | "userFocus" | "agentFocus"
+            ) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "context.compacted trigger 无效。",
+                ));
+            }
+            required_u64(payload, "coveredThroughSequence")?;
+            let summary = required_string(payload, "summary")?;
+            if summary.trim().is_empty() {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "context.compacted summary 不能为空。",
+                ));
+            }
+            if required_string(payload, "trigger")? == "agentFocus" {
+                validate_id("callId", required_string(event, "callId")?)?;
+            } else if event.get("callId").is_some() {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "非 Agent focus 的 context.compacted 不能携带 callId。",
+                ));
+            }
+        }
         "context.composed" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
                 payload,
                 &[
                     "providerRequestId",
+                    "purpose",
                     "responseConstraint",
                     "messages",
                     "workspaceBindings",
@@ -819,6 +1250,15 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 "providerRequestId",
                 required_string(payload, "providerRequestId")?,
             )?;
+            if !matches!(
+                required_string(payload, "purpose")?,
+                "agent" | "contextCompaction"
+            ) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "context.composed purpose 无效。",
+                ));
+            }
             if !matches!(
                 required_string(payload, "responseConstraint")?,
                 "normal" | "answerOnly"
@@ -905,7 +1345,20 @@ fn validate_event_facts(
     let session_id = required_string(event, "sessionId")?;
     if matches!(
         event_type,
-        "todo.updated" | "session.control.rejected" | "context.composed" | "context.updated"
+        "plan.published"
+            | "plan.confirmed"
+            | "plan.revision.requested"
+            | "plan.superseded"
+            | "plan.cancelled"
+            | "plan.completed"
+            | "todo.seeded"
+            | "todo.reconciled"
+            | "todo.progressed"
+            | "session.control.rejected"
+            | "context.compaction.requested"
+            | "context.compacted"
+            | "context.composed"
+            | "context.updated"
     ) {
         let run_id = required_string(event, "runId")?;
         let run_started: bool = transaction
@@ -936,13 +1389,15 @@ fn validate_event_facts(
         }
     }
     match event_type {
-        "todo.updated" => {
+        "plan.published" | "todo.progressed" => {
             let call_id = required_string(event, "callId")?;
             let duplicate: bool = transaction
                 .query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND call_id=?2 AND event_type='todo.updated'
+                         WHERE session_id=?1 AND call_id=?2
+                           AND event_type IN ('plan.published', 'todo.progressed', 'tool.requested',
+                                              'interaction.requested', 'session.control.rejected')
                      )",
                     params![session_id, call_id],
                     |row| row.get(0),
@@ -950,8 +1405,174 @@ fn validate_event_facts(
                 .map_err(sql_error("session_event_fact_read_failed"))?;
             if duplicate {
                 return Err(LocalAgentStoreError::new(
-                    "todo_call_duplicate",
-                    "todo.update callId 已经写入当前 Session。",
+                    "session_root_call_duplicate",
+                    "Provider-origin LogicalCallId 已经写入当前 Session。",
+                ));
+            }
+            let payload = event.get("payload").expect("validated payload");
+            if event_type == "plan.published" {
+                let plan_id = required_string(payload, "planId")?;
+                let revision = required_positive_revision(payload, "revision")?;
+                let revision_sql = i64::try_from(revision).map_err(|_| {
+                    LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "Plan revision 超出 SQLite 整数范围。",
+                    )
+                })?;
+                let plan_duplicate: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM session_events
+                             WHERE session_id=?1 AND event_type='plan.published'
+                               AND json_extract(payload_json, '$.planId')=?2
+                               AND json_extract(payload_json, '$.revision')=?3
+                         )",
+                        params![session_id, plan_id, revision_sql],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error("session_event_fact_read_failed"))?;
+                if plan_duplicate {
+                    return Err(LocalAgentStoreError::new(
+                        "plan_revision_duplicate",
+                        "Plan revision 已经发布。",
+                    ));
+                }
+            } else {
+                let plan_id = required_string(payload, "sourcePlanId")?;
+                let revision = required_positive_revision(payload, "sourcePlanRevision")?;
+                if !plan_revision_is_active(transaction, session_id, plan_id, revision)? {
+                    return Err(LocalAgentStoreError::new(
+                        "todo_source_plan_inactive",
+                        "todo.progressed 必须引用当前 active confirmed Plan revision。",
+                    ));
+                }
+                let todo = todo_state_for_plan(transaction, session_id, plan_id, revision)?
+                    .ok_or_else(|| {
+                        LocalAgentStoreError::new(
+                            "todo_source_missing",
+                            "todo.progressed 缺少对应的 seeded/reconciled Todo。",
+                        )
+                    })?;
+                for update in payload
+                    .get("updates")
+                    .and_then(Value::as_array)
+                    .expect("validated updates")
+                {
+                    if !todo.contains_key(required_string(update, "todoId")?) {
+                        return Err(LocalAgentStoreError::new(
+                            "todo_item_missing",
+                            "todo.progressed 引用了不存在的 todoId。",
+                        ));
+                    }
+                }
+            }
+        }
+        "plan.confirmed" | "plan.revision.requested" | "plan.cancelled" => {
+            let payload = event.get("payload").expect("validated payload");
+            let run_id = required_string(event, "runId")?;
+            let call_id = required_string(event, "callId")?;
+            let plan_id = required_string(payload, "planId")?;
+            let revision = required_positive_revision(payload, "revision")?;
+            let revision_sql = i64::try_from(revision).map_err(|_| {
+                LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "Plan revision 超出 SQLite 整数范围。",
+                )
+            })?;
+            let publication_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND run_id=?2 AND call_id=?3
+                           AND event_type='plan.published'
+                           AND json_extract(payload_json, '$.planId')=?4
+                           AND json_extract(payload_json, '$.revision')=?5
+                     )",
+                    params![session_id, run_id, call_id, plan_id, revision_sql],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            let decision_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND call_id=?2
+                           AND event_type IN ('plan.confirmed', 'plan.revision.requested', 'plan.cancelled')
+                           AND json_extract(payload_json, '$.planId')=?3
+                           AND json_extract(payload_json, '$.revision')=?4
+                     )",
+                    params![session_id, call_id, plan_id, revision_sql],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if !publication_exists || decision_exists {
+                return Err(LocalAgentStoreError::new(
+                    "plan_decision_fact_invalid",
+                    "Plan decision 必须精确引用仍未裁决的 publication。",
+                ));
+            }
+        }
+        "todo.seeded" | "todo.reconciled" => {
+            let payload = event.get("payload").expect("validated payload");
+            let plan_id = required_string(payload, "sourcePlanId")?;
+            let revision = required_positive_revision(payload, "sourcePlanRevision")?;
+            if !plan_revision_is_active(transaction, session_id, plan_id, revision)? {
+                return Err(LocalAgentStoreError::new(
+                    "todo_source_plan_inactive",
+                    "Todo seed/reconcile 必须引用刚确认且 active 的 Plan revision。",
+                ));
+            }
+        }
+        "plan.completed" => {
+            let payload = event.get("payload").expect("validated payload");
+            let plan_id = required_string(payload, "planId")?;
+            let revision = required_positive_revision(payload, "revision")?;
+            if !plan_revision_is_active(transaction, session_id, plan_id, revision)? {
+                return Err(LocalAgentStoreError::new(
+                    "plan_completion_inactive",
+                    "只有 active confirmed Plan revision 可以完成。",
+                ));
+            }
+            let todo = todo_state_for_plan(transaction, session_id, plan_id, revision)?
+                .ok_or_else(|| {
+                    LocalAgentStoreError::new(
+                        "plan_completion_todo_missing",
+                        "Plan completion 缺少 Todo。",
+                    )
+                })?;
+            if todo.is_empty() || todo.values().any(|status| status != "completed") {
+                return Err(LocalAgentStoreError::new(
+                    "plan_completion_todo_incomplete",
+                    "Plan completion 要求对应 Todo 全部完成。",
+                ));
+            }
+        }
+        "plan.superseded" => {
+            let payload = event.get("payload").expect("validated payload");
+            let plan_id = required_string(payload, "planId")?;
+            let revision = required_positive_revision(payload, "revision")?;
+            let next_plan_id = required_string(payload, "supersededByPlanId")?;
+            let next_revision = required_positive_revision(payload, "supersededByRevision")?;
+            if plan_id == next_plan_id && revision == next_revision
+                || !plan_revision_can_be_superseded(transaction, session_id, plan_id, revision)?
+            {
+                return Err(LocalAgentStoreError::new(
+                    "plan_supersede_invalid",
+                    "plan.superseded 必须引用不同的新 Plan revision 和当前 active revision。",
+                ));
+            }
+        }
+        "plan.invalidated" => {
+            let payload = event.get("payload").expect("validated payload");
+            if !plan_revision_is_active(
+                transaction,
+                session_id,
+                required_string(payload, "planId")?,
+                required_positive_revision(payload, "revision")?,
+            )? {
+                return Err(LocalAgentStoreError::new(
+                    "plan_invalidation_inactive",
+                    "plan.invalidated 只能作用于 active confirmed revision。",
                 ));
             }
         }
@@ -985,6 +1606,146 @@ fn validate_event_facts(
                 ));
             }
         }
+        "context.compaction.requested" => {
+            let payload = event.get("payload").expect("validated payload");
+            let compaction_id = required_string(payload, "compactionId")?;
+            let provider_request_id = required_string(payload, "providerRequestId")?;
+            let covered = required_u64(payload, "coveredThroughSequence")?;
+            let current_sequence: i64 = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id=?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            let current_sequence = u64::try_from(current_sequence).map_err(|_| {
+                LocalAgentStoreError::new(
+                    "session_event_fact_invalid",
+                    "Session event sequence 不能为负数。",
+                )
+            })?;
+            if covered > current_sequence {
+                return Err(LocalAgentStoreError::new(
+                    "context_compaction_cutoff_invalid",
+                    "上下文压缩 cutoff 超出当前 Session revision。",
+                ));
+            }
+            let duplicate: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND event_type='context.compaction.requested'
+                           AND (
+                             json_extract(payload_json, '$.compactionId')=?2
+                             OR json_extract(payload_json, '$.providerRequestId')=?3
+                           )
+                     )",
+                    params![session_id, compaction_id, provider_request_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if duplicate {
+                return Err(LocalAgentStoreError::new(
+                    "context_compaction_identity_duplicate",
+                    "上下文压缩身份或 Provider request 身份重复。",
+                ));
+            }
+            if required_string(payload, "trigger")? == "agentFocus" {
+                let call_id = required_string(event, "callId")?;
+                let call_duplicate: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM session_events
+                             WHERE session_id=?1 AND call_id=?2
+                               AND event_type IN (
+                                 'plan.published', 'todo.progressed', 'tool.requested',
+                                 'interaction.requested', 'session.control.rejected',
+                                 'context.compaction.requested'
+                               )
+                         )",
+                        params![session_id, call_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error("session_event_fact_read_failed"))?;
+                if call_duplicate {
+                    return Err(LocalAgentStoreError::new(
+                        "session_root_call_duplicate",
+                        "Provider-origin LogicalCallId 已经写入当前 Session。",
+                    ));
+                }
+            }
+        }
+        "context.compacted" => {
+            let payload = event.get("payload").expect("validated payload");
+            let compaction_id = required_string(payload, "compactionId")?;
+            let run_id = required_string(event, "runId")?;
+            let requested: Option<(String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT payload_json, call_id FROM session_events
+                     WHERE session_id=?1 AND run_id=?2
+                       AND event_type='context.compaction.requested'
+                       AND json_extract(payload_json, '$.compactionId')=?3",
+                    params![session_id, run_id, compaction_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            let Some((requested_json, requested_call_id)) = requested else {
+                return Err(LocalAgentStoreError::new(
+                    "context_compaction_request_missing",
+                    "context.compacted 缺少对应的 requested 事实。",
+                ));
+            };
+            let requested_payload: Value = serde_json::from_str(&requested_json).map_err(|_| {
+                LocalAgentStoreError::new(
+                    "session_event_fact_invalid",
+                    "已持久化的上下文压缩请求不是有效 JSON。",
+                )
+            })?;
+            if required_string(&requested_payload, "providerRequestId")?
+                != required_string(payload, "providerRequestId")?
+                || required_string(&requested_payload, "trigger")?
+                    != required_string(payload, "trigger")?
+                || required_u64(&requested_payload, "coveredThroughSequence")?
+                    != required_u64(payload, "coveredThroughSequence")?
+                || requested_call_id.as_deref() != event.get("callId").and_then(Value::as_str)
+            {
+                return Err(LocalAgentStoreError::new(
+                    "context_compaction_completion_mismatch",
+                    "context.compacted 与 requested 身份或 cutoff 不一致。",
+                ));
+            }
+            let provider_request_id = required_string(payload, "providerRequestId")?;
+            let receipt_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
+                           AND json_extract(payload_json, '$.providerRequestId')=?3
+                           AND json_extract(payload_json, '$.purpose')='contextCompaction'
+                     )",
+                    params![session_id, run_id, provider_request_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            let duplicate: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND event_type='context.compacted'
+                           AND json_extract(payload_json, '$.compactionId')=?2
+                     )",
+                    params![session_id, compaction_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if !receipt_exists || duplicate {
+                return Err(LocalAgentStoreError::new(
+                    "context_compaction_completion_invalid",
+                    "context.compacted 缺少压缩专用 composition receipt 或已经完成。",
+                ));
+            }
+        }
         "context.composed" => {
             let provider_request_id = required_string(
                 event.get("payload").expect("validated payload"),
@@ -1005,6 +1766,30 @@ fn validate_event_facts(
                 return Err(LocalAgentStoreError::new(
                     "provider_request_receipt_duplicate",
                     "providerRequestId 已经存在 composition receipt。",
+                ));
+            }
+            let purpose =
+                required_string(event.get("payload").expect("validated payload"), "purpose")?;
+            let compaction_request_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_events
+                         WHERE session_id=?1 AND run_id=?2
+                           AND event_type='context.compaction.requested'
+                           AND json_extract(payload_json, '$.providerRequestId')=?3
+                     )",
+                    params![
+                        session_id,
+                        required_string(event, "runId")?,
+                        provider_request_id,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if (purpose == "contextCompaction") != compaction_request_exists {
+                return Err(LocalAgentStoreError::new(
+                    "context_composition_purpose_mismatch",
+                    "context.composed purpose 与压缩请求事实不一致。",
                 ));
             }
         }
@@ -1050,6 +1835,223 @@ fn validate_event_facts(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn plan_revision_is_active(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    plan_id: &str,
+    revision: u64,
+) -> Result<bool, LocalAgentStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT event_type, payload_json FROM session_events
+             WHERE session_id=?1 AND event_type IN (
+               'plan.confirmed', 'plan.revision.requested', 'plan.superseded',
+               'plan.cancelled', 'plan.completed', 'plan.invalidated'
+             ) ORDER BY sequence ASC",
+        )
+        .map_err(sql_error("session_event_fact_read_failed"))?;
+    let rows = statement
+        .query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error("session_event_fact_read_failed"))?;
+    let mut active = false;
+    for row in rows {
+        let (event_type, encoded) = row.map_err(sql_error("session_event_fact_read_failed"))?;
+        let payload = decode_json(&encoded, "session_event_fact_corrupt")?;
+        let same = payload.get("planId").and_then(Value::as_str) == Some(plan_id)
+            && payload.get("revision").and_then(Value::as_u64) == Some(revision);
+        if event_type == "plan.confirmed" {
+            active = same;
+        } else if same {
+            active = false;
+        }
+    }
+    Ok(active)
+}
+
+fn plan_revision_can_be_superseded(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    plan_id: &str,
+    revision: u64,
+) -> Result<bool, LocalAgentStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT event_type, payload_json FROM session_events
+             WHERE session_id=?1 AND event_type IN (
+               'plan.confirmed', 'plan.revision.requested', 'plan.superseded',
+               'plan.cancelled', 'plan.completed', 'plan.invalidated'
+             ) ORDER BY sequence ASC",
+        )
+        .map_err(sql_error("session_event_fact_read_failed"))?;
+    let rows = statement
+        .query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error("session_event_fact_read_failed"))?;
+    let mut state: Option<String> = None;
+    for row in rows {
+        let (event_type, encoded) = row.map_err(sql_error("session_event_fact_read_failed"))?;
+        let payload = decode_json(&encoded, "session_event_fact_corrupt")?;
+        if payload.get("planId").and_then(Value::as_str) == Some(plan_id)
+            && payload.get("revision").and_then(Value::as_u64) == Some(revision)
+        {
+            state = Some(event_type);
+        }
+    }
+    Ok(matches!(
+        state.as_deref(),
+        Some("plan.confirmed" | "plan.revision.requested")
+    ))
+}
+
+fn todo_state_for_plan(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    plan_id: &str,
+    revision: u64,
+) -> Result<Option<std::collections::HashMap<String, String>>, LocalAgentStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT event_type, payload_json FROM session_events
+             WHERE session_id=?1 AND event_type IN (
+               'todo.seeded', 'todo.reconciled', 'todo.progressed'
+             ) ORDER BY sequence ASC",
+        )
+        .map_err(sql_error("session_event_fact_read_failed"))?;
+    let rows = statement
+        .query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error("session_event_fact_read_failed"))?;
+    let mut state: Option<std::collections::HashMap<String, String>> = None;
+    for row in rows {
+        let (event_type, encoded) = row.map_err(sql_error("session_event_fact_read_failed"))?;
+        let payload = decode_json(&encoded, "session_event_fact_corrupt")?;
+        let source_plan_id = payload.get("sourcePlanId").and_then(Value::as_str);
+        let source_revision = payload.get("sourcePlanRevision").and_then(Value::as_u64);
+        if source_plan_id != Some(plan_id) || source_revision != Some(revision) {
+            continue;
+        }
+        if matches!(event_type.as_str(), "todo.seeded" | "todo.reconciled") {
+            state = Some(
+                payload
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        LocalAgentStoreError::new(
+                            "session_event_fact_corrupt",
+                            "Todo seed/reconcile items 缺失。",
+                        )
+                    })?
+                    .iter()
+                    .map(|item| {
+                        Ok((
+                            required_string(item, "todoId")?.to_string(),
+                            required_string(item, "status")?.to_string(),
+                        ))
+                    })
+                    .collect::<Result<_, LocalAgentStoreError>>()?,
+            );
+        } else if let Some(current) = state.as_mut() {
+            for update in payload
+                .get("updates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    LocalAgentStoreError::new(
+                        "session_event_fact_corrupt",
+                        "Todo progress updates 缺失。",
+                    )
+                })?
+            {
+                let todo_id = required_string(update, "todoId")?;
+                if let Some(status) = current.get_mut(todo_id) {
+                    *status = required_string(update, "status")?.to_string();
+                }
+            }
+        }
+    }
+    Ok(state)
+}
+
+fn validate_command_event_batch(
+    command: &Value,
+    events: &[Value],
+) -> Result<(), LocalAgentStoreError> {
+    if command.get("type").and_then(Value::as_str) != Some("plan.respond") {
+        return Ok(());
+    }
+    let plan_id = required_string(command, "planId")?;
+    let revision = required_positive_revision(command, "revision")?;
+    let command_id = required_string(command, "commandId")?;
+    let response_kind = command
+        .pointer("/response/kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LocalAgentStoreError::new(
+                "session_command_invalid",
+                "plan.respond response kind 缺失。",
+            )
+        })?;
+    let matching = |event: &&Value, event_type: &str| {
+        event.get("type").and_then(Value::as_str) == Some(event_type)
+            && event.pointer("/payload/planId").and_then(Value::as_str) == Some(plan_id)
+            && event.pointer("/payload/revision").and_then(Value::as_u64) == Some(revision)
+            && event.pointer("/payload/commandId").and_then(Value::as_str) == Some(command_id)
+    };
+    let count = |event_type: &str| {
+        events
+            .iter()
+            .filter(|event| matching(event, event_type))
+            .count()
+    };
+    let todo_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("todo.seeded" | "todo.reconciled")
+            ) && event
+                .pointer("/payload/sourcePlanId")
+                .and_then(Value::as_str)
+                == Some(plan_id)
+                && event
+                    .pointer("/payload/sourcePlanRevision")
+                    .and_then(Value::as_u64)
+                    == Some(revision)
+        })
+        .count();
+    let valid = match response_kind {
+        "confirm" => {
+            count("plan.confirmed") == 1
+                && todo_count == 1
+                && count("plan.revision.requested") == 0
+                && count("plan.cancelled") == 0
+        }
+        "requestRevision" => {
+            count("plan.revision.requested") == 1
+                && count("plan.confirmed") == 0
+                && count("plan.cancelled") == 0
+                && todo_count == 0
+        }
+        "cancel" => {
+            count("plan.cancelled") == 1
+                && count("plan.confirmed") == 0
+                && count("plan.revision.requested") == 0
+                && todo_count == 0
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(LocalAgentStoreError::new(
+            "plan_command_event_batch_invalid",
+            "plan.respond 必须与对应 Plan lifecycle 和 Todo 事实原子提交。",
+        ));
     }
     Ok(())
 }
@@ -1104,6 +2106,81 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
         validate_id("messageId", required_string(command, "messageId")?)?;
         validate_feedback(command.get("feedback").expect("validated feedback"))?;
     }
+    if command_type == "message.submit" {
+        exact_object(
+            command,
+            &["schemaVersion", "type", "commandId", "sessionId", "text"],
+            &["attachments", "directoryAttachments", "profileId"],
+        )?;
+        if required_string(command, "text")?.trim().is_empty() {
+            return Err(LocalAgentStoreError::new(
+                "session_command_invalid",
+                "message.submit text 不能为空。",
+            ));
+        }
+        if let Some(profile_id) = command.get("profileId") {
+            validate_id(
+                "profileId",
+                profile_id.as_str().ok_or_else(|| {
+                    LocalAgentStoreError::new(
+                        "session_command_invalid",
+                        "message.submit profileId 无效。",
+                    )
+                })?,
+            )?;
+        }
+        if let Some(attachments) = command.get("directoryAttachments") {
+            let bindings = validate_workspace_bindings(attachments)?;
+            if bindings.len() > 8 {
+                return Err(LocalAgentStoreError::new(
+                    "session_command_invalid",
+                    "单次消息最多附加八个目录。",
+                ));
+            }
+        }
+    }
+    if command_type == "plan.respond" {
+        exact_object(
+            command,
+            &[
+                "schemaVersion",
+                "type",
+                "commandId",
+                "sessionId",
+                "runId",
+                "planId",
+                "revision",
+                "response",
+            ],
+            &[],
+        )?;
+        validate_id("runId", required_string(command, "runId")?)?;
+        validate_id("planId", required_string(command, "planId")?)?;
+        required_positive_revision(command, "revision")?;
+        let response = command.get("response").ok_or_else(|| {
+            LocalAgentStoreError::new("session_command_invalid", "plan.respond 缺少 response。")
+        })?;
+        match required_string(response, "kind")? {
+            "confirm" | "cancel" => {
+                exact_object(response, &["kind"], &[])?;
+            }
+            "requestRevision" => {
+                exact_object(response, &["kind", "text"], &[])?;
+                if required_string(response, "text")?.trim().is_empty() {
+                    return Err(LocalAgentStoreError::new(
+                        "session_command_invalid",
+                        "Plan revision text 不能为空。",
+                    ));
+                }
+            }
+            _ => {
+                return Err(LocalAgentStoreError::new(
+                    "session_command_invalid",
+                    "plan.respond response kind 无效。",
+                ))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1115,6 +2192,252 @@ fn validate_feedback(value: &Value) -> Result<(), LocalAgentStoreError> {
         "local_agent_message_invalid",
         "feedback 必须是 up、down 或 null。",
     ))
+}
+
+fn required_positive_revision(value: &Value, field: &str) -> Result<u64, LocalAgentStoreError> {
+    let revision = required_u64(value, field)?;
+    if revision == 0 {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            format!("{field} 必须是正整数。"),
+        ));
+    }
+    Ok(revision)
+}
+
+fn validate_display_text(
+    value: &Value,
+    field: &str,
+    max_chars: usize,
+) -> Result<(), LocalAgentStoreError> {
+    let text = required_string(value, field)?;
+    if text.trim() != text || text.chars().count() > max_chars || text.chars().any(char::is_control)
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            format!("{field} 不是有效的可显示文本。"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_focus_text(text: &str) -> Result<(), LocalAgentStoreError> {
+    if text.trim() != text || text.chars().count() > 16_384 || text.contains('\0') {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "context focus 不是有效任务文本。",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_steps(value: &Value) -> Result<(), LocalAgentStoreError> {
+    let steps = value.as_array().ok_or_else(|| {
+        LocalAgentStoreError::new("session_event_invalid", "Plan steps 必须是数组。")
+    })?;
+    if steps.is_empty() || steps.len() > 12 {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "Plan 必须包含一至十二个步骤。",
+        ));
+    }
+    let mut step_ids = std::collections::HashSet::with_capacity(steps.len());
+    for step in steps {
+        exact_object(step, &["stepId", "title", "details"], &["verification"])?;
+        let step_id = required_string(step, "stepId")?;
+        validate_id("stepId", step_id)?;
+        if !step_ids.insert(step_id) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Plan stepId 不能重复。",
+            ));
+        }
+        validate_display_text(step, "title", 240)?;
+        required_string(step, "details")?;
+        if let Some(verification) = step.get("verification") {
+            let items = verification.as_array().ok_or_else(|| {
+                LocalAgentStoreError::new("session_event_invalid", "Plan verification 必须是数组。")
+            })?;
+            if items.len() > 8
+                || items
+                    .iter()
+                    .any(|item| item.as_str().is_none_or(|text| text.trim().is_empty()))
+            {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "Plan verification 无效。",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
+    let operations = value.as_array().ok_or_else(|| {
+        LocalAgentStoreError::new(
+            "session_event_invalid",
+            "Plan mutationManifest 必须是数组。",
+        )
+    })?;
+    if operations.len() > 128 {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "Plan mutationManifest 最多包含 128 项。",
+        ));
+    }
+    for operation in operations {
+        let name = required_string(operation, "operation")?;
+        if name == "fs.delete" {
+            exact_object(
+                operation,
+                &["workspaceId", "operation", "target", "targetKind"],
+                &[],
+            )?;
+            if !matches!(
+                required_string(operation, "targetKind")?,
+                "file" | "directoryTree"
+            ) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "fs.delete Plan operation 的 targetKind 无效。",
+                ));
+            }
+        } else {
+            exact_object(operation, &["workspaceId", "operation", "target"], &[])?;
+            if !matches!(
+                name,
+                "fs.create" | "fs.write" | "fs.edit" | "fs.ensure_directory"
+            ) {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "Plan operation 不属于闭合 mutation 集合。",
+                ));
+            }
+        }
+        validate_id("workspaceId", required_string(operation, "workspaceId")?)?;
+        let target = required_string(operation, "target")?;
+        if target.trim() != target
+            || target.starts_with('/')
+            || target.contains('\\')
+            || target.contains('\0')
+            || target
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Plan target 必须是 normalized workspace-relative path。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plan_authorities(payload: &Value) -> Result<(), LocalAgentStoreError> {
+    let plan_id = required_string(payload, "planId")?;
+    let revision = required_positive_revision(payload, "revision")?;
+    let decision_id = required_string(payload, "decisionId")?;
+    let authorities = payload
+        .get("authorities")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LocalAgentStoreError::new(
+                "session_event_invalid",
+                "plan.confirmed authorities 必须是数组。",
+            )
+        })?;
+    let mut workspace_ids = std::collections::HashSet::with_capacity(authorities.len());
+    for authority in authorities {
+        exact_object(
+            authority,
+            &[
+                "authorityId",
+                "planId",
+                "revision",
+                "decisionId",
+                "sessionId",
+                "workspaceId",
+                "coveredOperations",
+            ],
+            &[],
+        )?;
+        for field in ["authorityId", "sessionId", "workspaceId"] {
+            validate_id(field, required_string(authority, field)?)?;
+        }
+        if required_string(authority, "planId")? != plan_id
+            || required_positive_revision(authority, "revision")? != revision
+            || required_string(authority, "decisionId")? != decision_id
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Plan authority identity 与 confirmation 不一致。",
+            ));
+        }
+        let workspace_id = required_string(authority, "workspaceId")?;
+        if !workspace_ids.insert(workspace_id) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "每个 workspace 只能有一个 Plan authority。",
+            ));
+        }
+        let operations = authority.get("coveredOperations").ok_or_else(|| {
+            LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Plan authority 缺少 coveredOperations。",
+            )
+        })?;
+        validate_plan_operations(operations)?;
+        if operations.as_array().is_some_and(|items| {
+            items.iter().any(|operation| {
+                operation.get("workspaceId").and_then(Value::as_str) != Some(workspace_id)
+            })
+        }) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Plan authority 只能覆盖自己的 workspace。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_todo_items(value: &Value) -> Result<(), LocalAgentStoreError> {
+    let items = value.as_array().ok_or_else(|| {
+        LocalAgentStoreError::new("session_event_invalid", "Todo items 必须是数组。")
+    })?;
+    if items.is_empty() || items.len() > 12 {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "Todo 必须包含一至十二项。",
+        ));
+    }
+    let mut todo_ids = std::collections::HashSet::with_capacity(items.len());
+    let mut step_ids = std::collections::HashSet::with_capacity(items.len());
+    for item in items {
+        exact_object(item, &["todoId", "sourceStepId", "label", "status"], &[])?;
+        let todo_id = required_string(item, "todoId")?;
+        let step_id = required_string(item, "sourceStepId")?;
+        validate_id("todoId", todo_id)?;
+        validate_id("sourceStepId", step_id)?;
+        if !todo_ids.insert(todo_id) || !step_ids.insert(step_id) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Todo todoId/sourceStepId 不能重复。",
+            ));
+        }
+        validate_display_text(item, "label", 240)?;
+        if !matches!(
+            required_string(item, "status")?,
+            "pending" | "inProgress" | "completed"
+        ) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Todo status 无效。",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_context_messages(value: &Value) -> Result<(), LocalAgentStoreError> {
@@ -1563,21 +2886,37 @@ mod tests {
             )
             .expect("create session");
         assert_eq!(created["schemaVersion"], EVENT_VERSION);
-        let plan = journal
+        journal
             .append(&json!({
-                "type":"plan.intent.requested",
+                "type":"run.started",
                 "sessionId":"session:test",
                 "runId":"run:test",
                 "payload":{
+                    "inputMessageId":"message:test",
+                    "workspaceBindings":[{"workspaceId":"workspace:test","displayName":"Test"}]
+                }
+            }))
+            .expect("start plan run");
+        let plan = journal
+            .append(&json!({
+                "type":"plan.published",
+                "sessionId":"session:test",
+                "runId":"run:test",
+                "callId":"call:plan-test",
+                "payload":{
+                    "providerCallId":"provider-call:plan-test",
                     "planId":"plan:test",
-                    "prompt":"选择",
-                    "options":[{"optionId":"option:test","label":"写入","operations":[{
+                    "revision":1,
+                    "title":"写入说明",
+                    "summary":"更新项目说明。",
+                    "steps":[{"stepId":"step:write","title":"写入","details":"更新 README。"}],
+                    "mutationManifest":[{
                         "workspaceId":"workspace:test","operation":"fs.write","target":"README.md"
-                    }]}]
+                    }]
                 }
             }))
             .expect("append plan");
-        assert_eq!(plan["type"], "plan.intent.requested");
+        assert_eq!(plan["type"], "plan.published");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1588,7 +2927,7 @@ mod tests {
             random_id("test").unwrap().replace(':', "-")
         ));
         let outdated_schema =
-            SESSION_STORE_SCHEMA.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;");
+            SESSION_STORE_SCHEMA.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 1;");
         Connection::open(&path)
             .expect("open outdated store")
             .execute_batch(&outdated_schema)
@@ -1599,8 +2938,85 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "session_store_version_unsupported");
-        assert!(error.message.contains("schema 2"));
+        assert!(error.message.contains("schema 1"));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_two_store_migrates_composition_purpose_without_rewriting_history() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-v2-migration-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let version_two_schema = SESSION_STORE_SCHEMA
+            .replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;")
+            .replace(
+                "        'context.compaction.requested',\n        'context.compacted',\n",
+                "",
+            );
+        let connection = Connection::open(&path).expect("open v2 store");
+        connection
+            .execute_batch(&version_two_schema)
+            .expect("create v2 store");
+        connection
+            .execute(
+                "INSERT INTO sessions(session_id, display_title, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params!["session:migrate", "Migration", "2026-08-30T00:00:00.000Z"],
+            )
+            .expect("insert v2 session");
+        let old_payload = json!({
+            "providerRequestId": "provider-request:old",
+            "responseConstraint": "normal",
+            "messages": [],
+            "workspaceBindings": [],
+            "tools": [],
+            "partitions": [
+                {"kind":"instructions","itemCount":1,"requestShapeUnits":10},
+                {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
+                {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                {"kind":"messageAttachments","itemCount":0,"requestShapeUnits":0}
+            ]
+        });
+        connection
+            .execute(
+                "INSERT INTO session_events(
+                     session_id, sequence, event_id, event_type, run_id,
+                     payload_json, occurred_at
+                 ) VALUES (?1, 1, ?2, 'context.composed', ?3, ?4, ?5)",
+                params![
+                    "session:migrate",
+                    "event:old-receipt",
+                    "run:old",
+                    old_payload.to_string(),
+                    "2026-08-30T00:00:01.000Z",
+                ],
+            )
+            .expect("insert v2 receipt");
+        drop(connection);
+
+        let journal = LocalAgentJournal::open(&path).expect("migrate v2 store");
+        let events = journal
+            .read_events("session:migrate", 0)
+            .expect("read migrated events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["eventId"], "event:old-receipt");
+        assert_eq!(events[0]["sequence"], 1);
+        assert_eq!(events[0]["payload"]["purpose"], "agent");
+        assert_eq!(
+            journal
+                .lock()
+                .expect("lock migrated store")
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .expect("read migrated version"),
+            3
+        );
+
+        drop(journal);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1617,13 +3033,16 @@ mod tests {
 
         let todo_without_run = journal
             .append(&json!({
-                "type":"todo.updated",
+                "type":"todo.progressed",
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo-before-run",
-                "payload":{"items":[{
+                "payload":{
+                    "providerCallId":"provider-call:todo-before-run",
+                    "sourcePlanId":"plan:facts",
+                    "sourcePlanRevision":1,
+                    "updates":[{
                     "todoId":"todo:one",
-                    "label":"Inspect",
                     "status":"pending"
                 }]}
             }))
@@ -1651,27 +3070,82 @@ mod tests {
             .expect("start fact run");
         journal
             .append(&json!({
-                "type":"todo.updated",
+                "type":"plan.published",
+                "sessionId":"session:facts",
+                "runId":"run:facts",
+                "callId":"call:plan",
+                "payload":{
+                    "providerCallId":"provider-call:plan",
+                    "planId":"plan:facts",
+                    "revision":1,
+                    "title":"Inspect",
+                    "summary":"Inspect the workspace.",
+                    "steps":[{"stepId":"step:one","title":"Inspect","details":"Inspect files."}],
+                    "mutationManifest":[]
+                }
+            }))
+            .expect("publish fact plan");
+        journal
+            .append(&json!({
+                "type":"plan.confirmed",
+                "sessionId":"session:facts",
+                "runId":"run:facts",
+                "callId":"call:plan",
+                "payload":{
+                    "planId":"plan:facts",
+                    "revision":1,
+                    "commandId":"command:confirm-plan",
+                    "decisionId":"decision:plan",
+                    "authorities":[]
+                }
+            }))
+            .expect("confirm fact plan");
+        journal
+            .append(&json!({
+                "type":"todo.seeded",
+                "sessionId":"session:facts",
+                "runId":"run:facts",
+                "payload":{
+                    "sourcePlanId":"plan:facts",
+                    "sourcePlanRevision":1,
+                    "items":[{
+                        "todoId":"todo:one",
+                        "sourceStepId":"step:one",
+                        "label":"Inspect",
+                        "status":"pending"
+                    }]
+                }
+            }))
+            .expect("seed fact todo");
+        journal
+            .append(&json!({
+                "type":"todo.progressed",
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo",
-                "payload":{"items":[{
-                    "todoId":"todo:one",
-                    "label":"Inspect",
-                    "status":"inProgress"
-                }]}
+                "payload":{
+                    "providerCallId":"provider-call:todo",
+                    "sourcePlanId":"plan:facts",
+                    "sourcePlanRevision":1,
+                    "updates":[{"todoId":"todo:one","status":"inProgress"}]
+                }
             }))
-            .expect("record active-run todo");
+            .expect("record active-run todo progress");
         let duplicate_todo = journal
             .append(&json!({
-                "type":"todo.updated",
+                "type":"todo.progressed",
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo",
-                "payload":{"items":[]}
+                "payload":{
+                    "providerCallId":"provider-call:todo-duplicate",
+                    "sourcePlanId":"plan:facts",
+                    "sourcePlanRevision":1,
+                    "updates":[{"todoId":"todo:one","status":"completed"}]
+                }
             }))
             .expect_err("todo call identity is immutable");
-        assert_eq!(duplicate_todo.code, "todo_call_duplicate");
+        assert_eq!(duplicate_todo.code, "session_root_call_duplicate");
 
         let usage_without_receipt = journal
             .append(&json!({
@@ -1698,6 +3172,7 @@ mod tests {
                 "runId":"run:facts",
                 "payload":{
                     "providerRequestId":"provider-request:facts",
+                    "purpose":"agent",
                     "responseConstraint":"normal",
                     "messages":[],
                     "workspaceBindings":[],
@@ -1752,11 +3227,16 @@ mod tests {
             .expect("settle fact run");
         let todo_after_settlement = journal
             .append(&json!({
-                "type":"todo.updated",
+                "type":"todo.progressed",
                 "sessionId":"session:facts",
                 "runId":"run:facts",
                 "callId":"call:todo-after-settlement",
-                "payload":{"items":[]}
+                "payload":{
+                    "providerCallId":"provider-call:todo-after-settlement",
+                    "sourcePlanId":"plan:facts",
+                    "sourcePlanRevision":1,
+                    "updates":[{"todoId":"todo:one","status":"completed"}]
+                }
             }))
             .expect_err("settled runs reject Todo updates");
         assert_eq!(todo_after_settlement.code, "session_event_run_not_active");
@@ -1981,6 +3461,36 @@ mod tests {
     }
 
     #[test]
+    fn provider_call_identity_is_required_and_distinct_from_logical_call_identity() {
+        let event = json!({
+            "type": "tool.requested",
+            "sessionId": "session:identity",
+            "runId": "run:identity",
+            "callId": "call:logical",
+            "payload": {
+                "providerCallId": "provider-call:native",
+                "attemptId": "attempt:one",
+                "toolName": "fs.read",
+                "input": {"workspaceId": "workspace:one", "path": "README.md"}
+            }
+        });
+        validate_new_event(&event, false).expect("accept separated call identities");
+
+        let mut missing = event.clone();
+        missing["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("providerCallId");
+        assert!(validate_new_event(&missing, false).is_err());
+
+        let mut reused = event;
+        reused["payload"]["providerCallId"] = json!("call:logical");
+        let error = validate_new_event(&reused, false).expect_err("identity reuse must fail");
+        assert_eq!(error.code, "session_event_invalid");
+        assert!(error.message.contains("不能复用"));
+    }
+
+    #[test]
     fn provider_request_receipt_and_usage_share_closed_identity_shapes() {
         validate_new_event(
             &json!({
@@ -1989,6 +3499,7 @@ mod tests {
                 "runId": "run:receipt",
                 "payload": {
                     "providerRequestId": "provider-request:one",
+                    "purpose": "agent",
                     "responseConstraint": "normal",
                     "messages": [{
                         "messageIndex": 0,
@@ -2022,6 +3533,7 @@ mod tests {
                 "runId": "run:receipt",
                 "payload": {
                     "providerRequestId": "provider-request:bad-partitions",
+                    "purpose": "agent",
                     "responseConstraint": "normal",
                     "messages": [],
                     "workspaceBindings": [],
@@ -2047,6 +3559,7 @@ mod tests {
                 "runId": "run:receipt",
                 "payload": {
                     "providerRequestId": "provider-request:unknown-field",
+                    "purpose": "agent",
                     "responseConstraint": "normal",
                     "unknownField": []
                 }
@@ -2079,6 +3592,7 @@ mod tests {
                 "runId": "run:receipt",
                 "payload": {
                     "providerRequestId": "provider-request:bad-count",
+                    "purpose": "agent",
                     "responseConstraint": "normal",
                     "messages": [],
                     "workspaceBindings": [],

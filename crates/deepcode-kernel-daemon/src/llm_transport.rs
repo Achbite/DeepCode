@@ -8,6 +8,8 @@ use std::convert::Infallible;
 const LLM_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const PROVIDER_REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 const PROVIDER_ENVELOPE_LIMIT: usize = 1024 * 1024;
+const PROVIDER_ERROR_BODY_LIMIT: usize = 16 * 1024;
+const PROVIDER_ERROR_MESSAGE_LIMIT: usize = 512;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLlmProfile {
@@ -41,6 +43,7 @@ pub(crate) struct LlmToolCall {
 pub(crate) struct LlmChatOutput {
     pub(crate) content: String,
     pub(crate) reasoning: Option<String>,
+    pub(crate) reasoning_signature: Option<String>,
     pub(crate) tool_calls: Vec<LlmToolCall>,
 }
 
@@ -48,6 +51,7 @@ pub(crate) struct LlmChatOutput {
 pub(crate) enum ProviderThinkingCompatibility {
     DeepSeek,
     Glm,
+    Moonshot,
     Generic,
 }
 
@@ -106,9 +110,12 @@ pub(crate) fn llm_profile_value_is_current(profile: &Value) -> bool {
             profile.get("kind").and_then(Value::as_str),
             Some("openaiCompatible" | "anthropic" | "ollama")
         )
-        && profile
-            .get("providerFlavor")
-            .is_none_or(|value| matches!(value.as_str(), Some("openai" | "deepseek" | "zhipu")))
+        && profile.get("providerFlavor").is_none_or(|value| {
+            matches!(
+                value.as_str(),
+                Some("openai" | "deepseek" | "zhipu" | "moonshot")
+            )
+        })
         && optional_text("baseUrl")
         && optional_positive_integer("contextWindowTokens")
         && optional_positive_integer("maxOutputTokens")
@@ -166,6 +173,20 @@ pub(crate) fn llm_profile_store_is_current(config: &Value) -> bool {
     default_is_valid
 }
 
+pub(crate) fn llm_secret_store_is_current(store: &Value) -> bool {
+    store.as_object().is_some_and(|store| {
+        store.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 128
+                && key.trim() == key
+                && !key.chars().any(char::is_control)
+                && value
+                    .as_str()
+                    .is_some_and(|secret| !secret.trim().is_empty())
+        })
+    })
+}
+
 pub(crate) fn resolve_llm_profile(
     gui: &GuiState,
     profile_id: Option<&str>,
@@ -198,12 +219,11 @@ pub(crate) fn resolve_llm_profile(
         .and_then(Value::as_str)
         .expect("validated profile id")
         .to_string();
-    let secret_store = match read_json_file(&gui.paths.llm_secrets_path) {
-        Some(Value::Object(store)) => store,
-        Some(_) => return Err("LLM secret 文件必须是 JSON 对象。".to_string()),
-        None if gui.paths.llm_secrets_path.exists() => {
-            return Err("LLM secret 文件存在但无法读取。".to_string())
+    let secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path)? {
+        Some(value) if llm_secret_store_is_current(&value) => {
+            value.as_object().cloned().expect("validated secret store")
         }
+        Some(_) => return Err("LLM secret 文件不是当前字符串映射格式。".to_string()),
         None => serde_json::Map::new(),
     };
     let api_key = match profile.get("secretRef").and_then(Value::as_str) {
@@ -282,7 +302,10 @@ pub(crate) fn openai_compatible_request_body(
     if let Some(tokens) = profile.max_output_tokens.filter(|tokens| *tokens > 0) {
         body["max_tokens"] = json!(tokens);
     }
-    if compatibility != ProviderThinkingCompatibility::DeepSeek {
+    if !matches!(
+        compatibility,
+        ProviderThinkingCompatibility::DeepSeek | ProviderThinkingCompatibility::Moonshot
+    ) {
         if let Some(temperature) = profile.temperature {
             body["temperature"] = json!(temperature);
         }
@@ -331,7 +354,11 @@ fn openai_compatible_message(
                 .or_else(|| record.get("reasoning_content"))
                 .and_then(Value::as_str)
             {
-                output[if compatibility == ProviderThinkingCompatibility::DeepSeek {
+                output[if matches!(
+                    compatibility,
+                    ProviderThinkingCompatibility::DeepSeek
+                        | ProviderThinkingCompatibility::Moonshot
+                ) {
                     "reasoning_content"
                 } else {
                     "reasoning"
@@ -350,6 +377,16 @@ fn openai_compatible_message(
                 .unwrap_or_default();
             if !calls.is_empty() {
                 output["tool_calls"] = Value::Array(calls);
+                if compatibility == ProviderThinkingCompatibility::DeepSeek
+                    && output.get("reasoning_content").is_none()
+                {
+                    // DeepSeek V4 rejects both an omitted field and JSON null
+                    // when a thinking-mode tool-call message is replayed. An
+                    // empty string is the accepted wire representation for a
+                    // sub-turn where the Provider emitted no reasoning text;
+                    // this does not invent reasoning in Session state.
+                    output["reasoning_content"] = json!("");
+                }
             }
             output
         }
@@ -399,7 +436,7 @@ fn openai_tool_call(value: &Value) -> Option<Value> {
     }))
 }
 
-fn message_content_string(value: Option<&Value>) -> String {
+pub(crate) fn message_content_string(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Null) | None => String::new(),
@@ -762,12 +799,13 @@ pub(crate) fn local_agent_provider_stream_response(
         };
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let message = provider_http_error_message(&mut response, status).await;
             yield Ok(Bytes::from(provider_event(
                 &request_id,
                 "failed",
                 json!({
                     "code": "provider_http_failed",
-                    "message": format!("Provider 返回 HTTP {status}。"),
+                    "message": message,
                 }),
             )));
             return;
@@ -875,6 +913,14 @@ pub(crate) fn local_agent_provider_stream_response(
             {
                 message["reasoningContent"] = json!(reasoning);
             }
+            if let Some(signature) = result
+                .output
+                .reasoning_signature
+                .as_deref()
+                .filter(|signature| !signature.trim().is_empty())
+            {
+                message["reasoningSignature"] = json!(signature);
+            }
             yield Ok(Bytes::from(provider_event(
                 &request_id,
                 "assistant.message",
@@ -930,6 +976,42 @@ pub(crate) fn local_agent_provider_stream_response(
                 }),
             )))
         })
+}
+
+async fn provider_http_error_message(response: &mut reqwest::Response, status: u16) -> String {
+    let mut body = Vec::new();
+    while body.len() < PROVIDER_ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = PROVIDER_ERROR_BODY_LIMIT - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    match provider_http_error_detail(&body) {
+        Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
+        None => format!("Provider 返回 HTTP {status}。"),
+    }
+}
+
+fn provider_http_error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)?
+        .trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(
+        message
+            .chars()
+            .filter(|character| !character.is_control() || character.is_whitespace())
+            .take(PROVIDER_ERROR_MESSAGE_LIMIT)
+            .collect(),
+    )
 }
 
 fn provider_event(request_id: &str, event_type: &str, data: Value) -> String {
@@ -994,6 +1076,7 @@ fn provider_thinking_compatibility(profile: &ResolvedLlmProfile) -> ProviderThin
     match profile.provider_flavor.as_deref() {
         Some("deepseek") => ProviderThinkingCompatibility::DeepSeek,
         Some("zhipu") => ProviderThinkingCompatibility::Glm,
+        Some("moonshot") => ProviderThinkingCompatibility::Moonshot,
         _ => ProviderThinkingCompatibility::Generic,
     }
 }
@@ -1062,5 +1145,196 @@ mod tests {
             body["messages"][0]["tool_calls"][0]["id"],
             json!("call:list")
         );
+    }
+
+    #[test]
+    fn deepseek_tool_continuation_uses_empty_reasoning_wire_field_when_absent() {
+        let profile = ResolvedLlmProfile {
+            kind: "openaiCompatible".to_string(),
+            provider_flavor: Some("deepseek".to_string()),
+            base_url: Some("https://api.deepseek.com".to_string()),
+            model: "deepseek-v4-flash".to_string(),
+            context_window_tokens: Some(1_000_000),
+            max_output_tokens: Some(384_000),
+            temperature: Some(0.2),
+            reasoning_effort: Some("high".to_string()),
+            thinking: Some("enabled".to_string()),
+            api_key: None,
+        };
+        let body = openai_compatible_request_body(
+            &profile,
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "toolCalls": [{
+                    "callId": "call:mkdir",
+                    "name": "fs.ensure_directory",
+                    "input": { "path": "src" }
+                }]
+            })],
+            &[],
+            true,
+        );
+
+        assert_eq!(body["messages"][0]["reasoning_content"], json!(""));
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            json!("fs__ensure_directory")
+        );
+    }
+
+    #[test]
+    fn provider_http_error_detail_keeps_only_bounded_structured_message() {
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": "The reasoning_content must be passed back."
+            },
+            "request": { "authorization": "must-not-be-rendered" }
+        }))
+        .expect("encode Provider error fixture");
+        assert_eq!(
+            provider_http_error_detail(&body).as_deref(),
+            Some("The reasoning_content must be passed back.")
+        );
+        assert_eq!(provider_http_error_detail(b"not-json"), None);
+    }
+
+    #[test]
+    fn moonshot_tool_continuation_uses_reasoning_content_and_omits_temperature() {
+        let profile = ResolvedLlmProfile {
+            kind: "openaiCompatible".to_string(),
+            provider_flavor: Some("moonshot".to_string()),
+            base_url: Some("https://api.moonshot.ai/v1".to_string()),
+            model: "kimi-k2.6".to_string(),
+            context_window_tokens: Some(256_000),
+            max_output_tokens: Some(32_768),
+            temperature: Some(0.2),
+            reasoning_effort: None,
+            thinking: Some("enabled".to_string()),
+            api_key: None,
+        };
+        let body = openai_compatible_request_body(
+            &profile,
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "reasoningContent": "preserved Kimi reasoning",
+                "toolCalls": [{
+                    "callId": "call:web",
+                    "name": "web.search",
+                    "input": { "query": "DeepCode" }
+                }]
+            })],
+            &[],
+            true,
+        );
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            json!("preserved Kimi reasoning")
+        );
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+    }
+
+    #[test]
+    fn moonshot_tool_continuation_does_not_invent_missing_reasoning() {
+        let profile = ResolvedLlmProfile {
+            kind: "openaiCompatible".to_string(),
+            provider_flavor: Some("moonshot".to_string()),
+            base_url: Some("https://api.moonshot.ai/v1".to_string()),
+            model: "kimi-k2.6".to_string(),
+            context_window_tokens: Some(256_000),
+            max_output_tokens: Some(32_768),
+            temperature: Some(0.2),
+            reasoning_effort: None,
+            thinking: Some("enabled".to_string()),
+            api_key: None,
+        };
+        let body = openai_compatible_request_body(
+            &profile,
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "toolCalls": [{
+                    "callId": "call:web",
+                    "name": "web.search",
+                    "input": { "query": "DeepCode" }
+                }]
+            })],
+            &[],
+            true,
+        );
+
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn anthropic_tool_continuation_uses_native_content_blocks() {
+        let profile = ResolvedLlmProfile {
+            kind: "anthropic".to_string(),
+            provider_flavor: Some("deepseek".to_string()),
+            base_url: Some("https://api.deepseek.com/anthropic".to_string()),
+            model: "deepseek-v4-flash".to_string(),
+            context_window_tokens: Some(1_000_000),
+            max_output_tokens: Some(8192),
+            temperature: None,
+            reasoning_effort: Some("high".to_string()),
+            thinking: Some("enabled".to_string()),
+            api_key: None,
+        };
+        let body = anthropic_stream_request_body(
+            &profile,
+            vec![
+                json!({ "role": "system", "content": "System facts" }),
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoningContent": "preserved reasoning",
+                    "reasoningSignature": "opaque-signature",
+                    "toolCalls": [{
+                        "callId": "call:list",
+                        "name": "fs.list",
+                        "input": { "workspaceId": "workspace:test", "path": "." }
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "toolCallId": "call:list",
+                    "content": "{\"entries\":[]}"
+                }),
+            ],
+            &[],
+        );
+        assert_eq!(body["system"], json!("System facts"));
+        assert_eq!(body["messages"][0]["role"], json!("assistant"));
+        assert_eq!(body["messages"][0]["content"][0]["type"], json!("thinking"));
+        assert_eq!(
+            body["messages"][0]["content"][0]["signature"],
+            json!("opaque-signature")
+        );
+        assert_eq!(body["messages"][0]["content"][1]["type"], json!("tool_use"));
+        assert_eq!(body["messages"][0]["content"][1]["name"], json!("fs__list"));
+        assert_eq!(body["messages"][1]["role"], json!("user"));
+        assert_eq!(
+            body["messages"][1]["content"][0]["tool_use_id"],
+            json!("call:list")
+        );
+    }
+
+    #[test]
+    fn llm_secret_store_rejects_non_string_or_empty_entries() {
+        assert!(llm_secret_store_is_current(&json!({
+            "profile:one": "secret-value"
+        })));
+        assert!(!llm_secret_store_is_current(&json!({
+            "profile:one": null
+        })));
+        assert!(!llm_secret_store_is_current(&json!({
+            "profile:one": "  "
+        })));
+        assert!(!llm_secret_store_is_current(&json!({
+            " profile:one": "secret-value"
+        })));
     }
 }

@@ -51,8 +51,8 @@ impl KernelToolRegistry {
         }
         assert_eq!(
             registrations.len(),
-            14,
-            "Kernel catalog must contain the callable tools and blocked capability slots"
+            19,
+            "Kernel catalog must contain the canonical callable tools"
         );
         Self { registrations }
     }

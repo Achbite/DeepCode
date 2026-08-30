@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct FsListExecutor;
 pub(super) struct FsReadExecutor;
+pub(super) struct FsStatExecutor;
 pub(super) struct FsDiffExecutor;
 pub(super) struct FsCreateExecutor;
 pub(super) struct FsWriteExecutor;
@@ -34,9 +35,66 @@ impl KernelToolExecutor for FsListExecutor {
             serde_json::json!({
                 "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&relative),
+                "requestedDepth": depth,
+                "includeHidden": include_hidden,
+                "completeAtRequestedDepth": true,
+                "truncated": false,
                 "nodes": list_nodes(&target, &root, depth, include_hidden)?
             }),
         ))
+    }
+}
+
+impl KernelToolExecutor for FsStatExecutor {
+    fn invoke(
+        &self,
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
+        let path = get_string(&invocation.input, "path").unwrap_or_else(|| ".".to_string());
+        let target = prepared_workspace_target(&context)?;
+        let metadata = match fs::metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ok(
+                    invocation.id,
+                    serde_json::json!({
+                        "workspaceId": workspace_id(&context)?,
+                        "path": normalize_relative_path(&path),
+                        "exists": false
+                    }),
+                ));
+            }
+            Err(error) => {
+                return Err(KernelError::Other(format!(
+                    "inspect workspace path {path}: {error}"
+                )))
+            }
+        };
+        let kind = if metadata.is_file() {
+            "file"
+        } else if metadata.is_dir() {
+            "directory"
+        } else {
+            "other"
+        };
+        let mut output = serde_json::json!({
+            "workspaceId": workspace_id(&context)?,
+            "path": normalize_relative_path(&path),
+            "exists": true,
+            "type": kind,
+            "sizeBytes": metadata.len(),
+            "readOnly": metadata.permissions().readonly()
+        });
+        if metadata.is_file() {
+            output["fileClassification"] =
+                serde_json::to_value(lightweight_file_classification(&target, &metadata))
+                    .unwrap_or(Value::Null);
+            let mode = file_mode(&target)?;
+            output["mode"] = serde_json::to_value(mode).unwrap_or(Value::Null);
+            output["executable"] = Value::Bool(mode.is_some_and(|value| value & 0o111 != 0));
+        }
+        Ok(ok(invocation.id, output))
     }
 }
 

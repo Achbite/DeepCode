@@ -282,7 +282,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const settingsTab: EditorTab = {
       kind: 'settings',
       id: SETTINGS_TAB_ID,
-      title: 'DeepCode Settings',
+      title: editorMessage('settings.title'),
     };
     set((state) => ({
       tabs: [...state.tabs, settingsTab],

@@ -55,10 +55,10 @@ const DeepCodeTitlebar: React.FC<DeepCodeTitlebarProps> = ({
         </button>
       )}
       <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${apiStatus}`}>
-        API {statusLabel(language, apiStatus)}
+        {t(language, 'deepcodeGui.titlebar.api')} {statusLabel(language, apiStatus)}
       </span>
       <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${agentReady ? 'ready' : 'checking'}`}>
-        Agent {statusLabel(language, agentReady ? 'ready' : 'checking')}
+        {t(language, 'deepcodeGui.titlebar.agent')} {statusLabel(language, agentReady ? 'ready' : 'checking')}
       </span>
     </div>
     <WindowControls language={language} />
