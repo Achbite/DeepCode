@@ -12,6 +12,7 @@
     "build:web": "vite build",
     "build:deepcode-gui": "pnpm run build:types && pnpm run build:deepcode-gui:web",
     "build:deepcode-gui:web": "vite build --config vite.deepcode-gui.config.ts && [ ! -f dist-deepcode-gui/deepcode-gui.html ] || cp dist-deepcode-gui/deepcode-gui.html dist-deepcode-gui/index.html",
+    "test": "pnpm run build:types && node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

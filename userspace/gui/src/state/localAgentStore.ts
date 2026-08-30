@@ -21,6 +21,7 @@ import {
   getConversationCatalog,
   getConversationCatalogManagement,
   getLocalAgentProjection,
+  resolveConversationDirectoryAttachments,
   submitLocalAgentCommand,
   updateConversationProject as updateProjectRequest,
   updateConversationSession as updateSessionRequest,
@@ -59,7 +60,6 @@ interface LocalAgentState {
   respondInteraction(response: string): Promise<CommandReply>;
   respondApproval(decision: 'allow' | 'deny'): Promise<CommandReply>;
   respondPlan(response: PlanResponse): Promise<CommandReply>;
-  ignorePlan(): Promise<CommandReply>;
   cancelRun(): Promise<CommandReply>;
   createProject(title: string, workspacePaths?: string[]): Promise<void>;
   updateProject(projectId: string, input: { title?: string; workspacePaths?: string[] }): Promise<void>;
@@ -185,7 +185,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       return;
     }
     const currentGeneration = ++generation;
-    set({ loading: true, error: null, sessionId: null, projection: null, draftProjectId: null });
+    set({ loading: true, error: null, sessionId, projection: null, draftProjectId: null });
     try {
       const projection = await getLocalAgentProjection(sessionId);
       if (currentGeneration !== generation) return;
@@ -234,13 +234,22 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     try {
       const projection = await getLocalAgentProjection(sessionId);
       if (get().sessionId !== sessionId) return;
-      set((state) => ({
-        projection: !state.projection || projection.revision >= state.projection.revision
+      set((state) => {
+        const nextProjection = shouldApplyProjection(state.projection, projection)
           ? projection
-          : state.projection,
-        selectedProfileId: projection.run?.profileId ?? state.selectedProfileId,
-        error: null,
-      }));
+          : state.projection;
+        const nextProfileId = projection.run?.profileId ?? state.selectedProfileId;
+        if (
+          nextProjection === state.projection
+          && nextProfileId === state.selectedProfileId
+          && state.error === null
+        ) return state;
+        return {
+          projection: nextProjection,
+          selectedProfileId: nextProfileId,
+          error: null,
+        };
+      });
     } catch (error) {
       if (get().sessionId === sessionId) set({ error: errorMessage(error) });
     } finally {
@@ -253,13 +262,18 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     if (!trimmed) throw new Error('message_empty');
     const { projection } = get();
     if (projection?.pendingPlan) {
-      throw new Error('plan_response_requires_explicit_command');
+      if (attachments.length || directoryPaths.length) {
+        throw new Error('plan_revision_attachments_unsupported');
+      }
+      return await get().respondPlan({ kind: 'requestRevision', text: trimmed });
     }
     if (projection?.pendingApproval) {
       throw new Error('approval_response_requires_explicit_command');
     }
     if (projection?.pendingInteraction) {
-      if (attachments.length) throw new Error('interaction_response_attachments_unsupported');
+      if (attachments.length || directoryPaths.length) {
+        throw new Error('interaction_response_attachments_unsupported');
+      }
       return await get().respondInteraction(trimmed);
     }
 
@@ -278,11 +292,10 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         set({ sessionId, projection: created, draftProjectId: null });
         await get().refreshCatalog();
       }
-      for (const directoryPath of directoryPaths) {
-        const nextProjection = await attachConversationDirectoryIndex(sessionId, directoryPath);
-        if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
-        set({ projection: nextProjection });
-      }
+      const directoryAttachments = directoryPaths.length
+        ? await resolveConversationDirectoryAttachments(sessionId, directoryPaths)
+        : [];
+      if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
       const messageProfileId = get().selectedProfileId;
       const reply = await submitLocalAgentCommand({
         schemaVersion: CONVERSATION_COMMAND_VERSION,
@@ -292,6 +305,13 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         text,
         ...(attachments.length
           ? { attachments: attachments.map((attachment) => ({ ...attachment })) }
+          : {}),
+        ...(directoryAttachments.length
+          ? {
+              directoryAttachments: directoryAttachments.map((attachment) => ({
+                ...attachment,
+              })),
+            }
           : {}),
         ...(messageProfileId ? { profileId: messageProfileId } : {}),
       });
@@ -385,8 +405,6 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   },
 
   respondPlan: async (response) => await submitPlanResponse(set, get, response),
-
-  ignorePlan: async () => await submitPlanResponse(set, get, { kind: 'ignore' }),
 
   cancelRun: async () => {
     const state = get();
@@ -485,6 +503,7 @@ async function submitPlanResponse(
     sessionId,
     runId: plan.runId,
     planId: plan.planId,
+    revision: plan.revision,
     response,
   });
 }
@@ -561,6 +580,25 @@ function enabledProfileId(
 
 function isTerminalRun(status: NonNullable<SessionProjection['run']>['status']): boolean {
   return ['completed', 'failed', 'cancelled', 'indeterminate'].includes(status);
+}
+
+function shouldApplyProjection(
+  current: SessionProjection | null,
+  incoming: SessionProjection,
+): boolean {
+  if (!current || incoming.revision > current.revision) return true;
+  if (incoming.revision < current.revision) return false;
+  return !sameAssistantDraft(current.assistantDraft, incoming.assistantDraft);
+}
+
+function sameAssistantDraft(
+  left: SessionProjection['assistantDraft'],
+  right: SessionProjection['assistantDraft'],
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.runId === right.runId
+    && left.turnId === right.turnId
+    && left.content === right.content;
 }
 
 function nextId(kind: string): string {

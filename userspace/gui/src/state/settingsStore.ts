@@ -64,8 +64,10 @@ export interface EditorEffectiveOptions {
 
 interface SettingsStateData {
   userSettings: UserSettings;
+  runtimeUserSettings: UserSettings;
   workspaceSettings: Record<string, unknown>;
   effectiveSettings: UserSettings;
+  runtimeEffectiveSettings: UserSettings;
   sources: Record<string, SettingSource>;
   overriddenKeys: string[];
   storePath: string | null;
@@ -245,6 +247,18 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     control: 'textarea',
   },
   {
+    key: 'agent.permissions.workspaceMutation',
+    group: 'agent',
+    control: 'select',
+    options: ['plan', 'allow'],
+  },
+  {
+    key: 'agent.permissions.engineeringDecisions',
+    group: 'agent',
+    control: 'select',
+    options: ['ask', 'delegate'],
+  },
+  {
     key: 'agent.permissions.networkRead',
     group: 'agent',
     control: 'select',
@@ -330,6 +344,13 @@ function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): Setting
 }
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
+const RUNTIME_RESTART_SETTING_KEYS = Object.keys(DEFAULT_USER_SETTINGS).filter((key) => (
+  key.startsWith('skills.')
+  || key.startsWith('mcp.')
+  || key.startsWith('agent.web.search.')
+  || key === 'agent.systemPrompt'
+  || key.startsWith('agent.permissions.')
+));
 const WORKSPACE_OVERRIDABLE_SETTING_KEYS = new Set(
   workspaceOverridableSettingsIndex().map((entry) => entry.key)
 );
@@ -408,13 +429,22 @@ function buildEffectiveSettings(
   return { effectiveSettings, sources };
 }
 
+function runtimeSettingsDiverge(
+  saved: UserSettings,
+  runtime: UserSettings,
+): boolean {
+  return RUNTIME_RESTART_SETTING_KEYS.some((key) => saved[key] !== runtime[key]);
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => {
   const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
 
   return {
     userSettings: DEFAULT_USER_SETTINGS,
+    runtimeUserSettings: DEFAULT_USER_SETTINGS,
     workspaceSettings: {},
     effectiveSettings: initialEffective.effectiveSettings,
+    runtimeEffectiveSettings: initialEffective.effectiveSettings,
     sources: initialEffective.sources,
     overriddenKeys: [],
     storePath: null,
@@ -438,14 +468,24 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         get().workspaceSettings,
         result.data.overriddenKeys
       );
+      const runtime = buildEffectiveSettings(
+        result.data.runtimeSettings,
+        get().workspaceSettings,
+        result.data.overriddenKeys
+      );
       set({
         userSettings: result.data.settings,
+        runtimeUserSettings: result.data.runtimeSettings,
         overriddenKeys: result.data.overriddenKeys,
         storePath: result.data.storePath,
         effectiveSettings: next.effectiveSettings,
+        runtimeEffectiveSettings: runtime.effectiveSettings,
         sources: next.sources,
         loading: false,
-        restartRequired: false,
+        restartRequired: runtimeSettingsDiverge(
+          next.effectiveSettings,
+          runtime.effectiveSettings,
+        ),
         errorMessage: null,
       });
     },
@@ -456,9 +496,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         settings,
         get().overriddenKeys
       );
+      const runtime = buildEffectiveSettings(
+        get().runtimeUserSettings,
+        settings,
+        get().overriddenKeys
+      );
       set({
         workspaceSettings: settings,
         effectiveSettings: next.effectiveSettings,
+        runtimeEffectiveSettings: runtime.effectiveSettings,
         sources: next.sources,
       });
     },
@@ -485,7 +531,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         overriddenKeys,
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
-        restartRequired: get().restartRequired || Boolean(result.data.restartRequired),
+        restartRequired: runtimeSettingsDiverge(
+          next.effectiveSettings,
+          get().runtimeEffectiveSettings,
+        ),
         errorMessage: null,
       });
     },
@@ -537,7 +586,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         overriddenKeys,
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
-        restartRequired: get().restartRequired || Boolean(result.data.restartRequired),
+        restartRequired: runtimeSettingsDiverge(
+          next.effectiveSettings,
+          get().runtimeEffectiveSettings,
+        ),
         errorMessage: null,
       });
     },

@@ -28,6 +28,12 @@ export interface KernelStartResult {
   status: HostStartupStatusV1;
 }
 
+export interface MessageAttachmentFileSnapshot {
+  name: string;
+  mediaType: string;
+  content: string;
+}
+
 export interface HostStartupStatusV1 {
   schemaVersion: 'deepcode.host-shell.startup-status';
   revision: number;
@@ -144,6 +150,34 @@ export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | nu
   return response.ok
     ? { ok: true, data: response.data?.path ?? null }
     : { ok: false, error: response.error, message: response.message };
+}
+
+export async function readMessageAttachmentFile(
+  absolutePath: string,
+): Promise<ApiResponse<MessageAttachmentFileSnapshot>> {
+  const invoke = tauriInvoke();
+  if (!invoke) {
+    return {
+      ok: false,
+      error: 'message_attachment_reader_unavailable',
+      message: activeT('runtime.messageAttachmentReader.desktopOnly'),
+    };
+  }
+  try {
+    return {
+      ok: true,
+      data: await invoke<MessageAttachmentFileSnapshot>(
+        'deepcode_read_message_attachment_file',
+        { path: absolutePath },
+      ),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'message_attachment_read_failed',
+      message: String(error),
+    };
+  }
 }
 
 export const getHealth = api.getHealth;

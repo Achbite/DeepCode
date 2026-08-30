@@ -5,6 +5,10 @@ import {
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
   DEPRECATED_DEEPSEEK_LLM_MODELS,
+  GLM_LLM_MODEL_OPTIONS,
+  GLM_OPENAI_BASE_URL,
+  KIMI_LLM_MODEL_OPTIONS,
+  KIMI_OPENAI_BASE_URL,
 } from '@deepcode/protocol';
 import type {
   LlmProviderFlavor,
@@ -21,7 +25,12 @@ import { normalizeUiLanguage, t } from '../../../i18n';
 
 const PROVIDERS: LlmProviderKind[] = ['openaiCompatible', 'anthropic', 'ollama'];
 
-const PROVIDER_FLAVORS: LlmProviderFlavor[] = ['openai', 'deepseek', 'zhipu'];
+const PROVIDER_FLAVORS: LlmProviderFlavor[] = [
+  'openai',
+  'deepseek',
+  'zhipu',
+  'moonshot',
+];
 
 const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
 const DEFAULT_REPLACEMENT_PROFILE_ID = 'deepseek-v4-pro-openai';
@@ -80,6 +89,31 @@ const PROFILE_PRESETS: Array<{
       maxOutputTokens: 384000,
       temperature: 0.2,
       reasoningEffort: 'high',
+      thinking: 'enabled',
+      enabled: true,
+    },
+  },
+  {
+    labelKey: 'settings.llm.preset.glm',
+    profile: {
+      name: 'GLM 5.2',
+      kind: 'openaiCompatible',
+      providerFlavor: 'zhipu',
+      baseUrl: GLM_OPENAI_BASE_URL,
+      model: 'glm-5.2',
+      enabled: true,
+    },
+  },
+  {
+    labelKey: 'settings.llm.preset.kimi',
+    profile: {
+      name: 'Kimi K2.6',
+      kind: 'openaiCompatible',
+      providerFlavor: 'moonshot',
+      baseUrl: KIMI_OPENAI_BASE_URL,
+      model: 'kimi-k2.6',
+      contextWindowTokens: 256000,
+      maxOutputTokens: 32768,
       thinking: 'enabled',
       enabled: true,
     },
@@ -433,15 +467,19 @@ const LlmSection: React.FC = () => {
                   <span>{t(language, 'settings.llm.model')}</span>
                   <input
                     className="settings-field__input"
-                    list="deepseek-model-options"
+                    list="llm-model-options"
                     value={profile.model}
                     onChange={(e) =>
                       updateProfile(profile.id, { model: e.target.value })
                     }
                     placeholder="deepseek-v4-flash"
                   />
-                  <datalist id="deepseek-model-options">
-                    {DEEPSEEK_LLM_MODEL_OPTIONS.map((model) => (
+                  <datalist id="llm-model-options">
+                    {[
+                      ...DEEPSEEK_LLM_MODEL_OPTIONS,
+                      ...GLM_LLM_MODEL_OPTIONS,
+                      ...KIMI_LLM_MODEL_OPTIONS,
+                    ].map((model) => (
                       <option
                         key={model}
                         value={model}

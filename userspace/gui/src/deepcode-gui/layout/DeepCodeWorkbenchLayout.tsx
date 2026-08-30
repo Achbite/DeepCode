@@ -60,6 +60,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     : 'comfortable';
   const showContextRail = effectiveSettings['gui.showContextRail'] !== false;
   const projection = useLocalAgentStore((state) => state.projection);
+  const profiles = useLocalAgentStore((state) => state.profiles);
   const activeSessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
@@ -245,7 +246,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       <DeepCodeTitlebar
         language={language}
         apiStatus={apiStatus}
-        agentReady={apiStatus === 'connected'}
+        agentReady={apiStatus === 'connected' && profiles.length > 0}
         cacheHitSummary={cacheHitSummary(projection, language)}
         kernelStartBusy={kernelStartBusy}
         kernelStartMessage={kernelStartMessage}

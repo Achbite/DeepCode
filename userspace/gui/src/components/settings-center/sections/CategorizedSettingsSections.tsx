@@ -26,6 +26,8 @@ const INTERFACE_KEYS = [
 ] as const;
 const AGENT_INSTRUCTION_KEYS = ['agent.systemPrompt'] as const;
 const AGENT_PERMISSION_KEYS = [
+  'agent.permissions.workspaceMutation',
+  'agent.permissions.engineeringDecisions',
   'agent.permissions.networkRead',
   'agent.permissions.external',
 ] as const;

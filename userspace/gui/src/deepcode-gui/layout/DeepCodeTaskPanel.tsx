@@ -14,7 +14,14 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
     <aside className="deepcode-gui-context-panel">
       <section className="deepcode-gui-task-list-card">
         <div className="deepcode-gui-task-list-card__title">
-          {t(language, 'deepcodeGui.tasks.title')}
+          <span>{t(language, 'deepcodeGui.tasks.title')}</span>
+          {projection?.todoList && (
+            <small>
+              {t(language, 'agent.plan.revision', {
+                revision: projection.todoList.sourcePlanRevision,
+              })}
+            </small>
+          )}
         </div>
         {todos.length === 0 ? (
           <div className="deepcode-gui-task-list-card__empty">
@@ -40,7 +47,7 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
 
       <section className="deepcode-gui-task-list-card deepcode-gui-output-card">
         <div className="deepcode-gui-task-list-card__title">
-          {t(language, 'deepcodeGui.outputs.title')}
+          <span>{t(language, 'deepcodeGui.outputs.title')}</span>
         </div>
         {artifacts.length === 0 ? (
           <div className="deepcode-gui-task-list-card__empty">

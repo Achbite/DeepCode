@@ -15,7 +15,6 @@ import {
   closeAppWindow,
   getHealth,
   getHostStartupStatus,
-  getRuntimeStatus,
   healthVersion,
   startKernelAfterPermission,
   warmupTerminalRuntime,
@@ -134,6 +133,9 @@ const DeepCodeGuiApp: React.FC = () => {
       )
       .join('|')
   );
+  const terminalPrewarm = String(
+    effectiveSettings['terminal.integrated.prewarm'] ?? 'afterStartup',
+  );
 
   const saveCurrentActiveFile = useCallback(async () => {
     const { activeTabId, tabs, saveFile } = useEditorStore.getState();
@@ -190,11 +192,7 @@ const DeepCodeGuiApp: React.FC = () => {
 
   useEffect(() => {
     document.documentElement.dataset.product = 'deepcode-gui';
-    return afterFirstPaint(() => {
-      void loadWorkspace();
-      void loadUserSettings();
-    });
-  }, [loadWorkspace, loadUserSettings]);
+  }, []);
 
   useEffect(() => {
     if (apiStatus !== 'connected' || connectedReloadDoneRef.current) return;
@@ -237,8 +235,6 @@ const DeepCodeGuiApp: React.FC = () => {
     let cancelled = false;
     let timeout: number | null = null;
     const check = async () => {
-      await getRuntimeStatus();
-      if (cancelled) return;
       const result = await getHealth();
       if (cancelled) return;
       if (result.ok && result.data) {
@@ -292,13 +288,12 @@ const DeepCodeGuiApp: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const terminalPrewarm = String(effectiveSettings['terminal.integrated.prewarm'] ?? 'afterStartup');
-    if (terminalPrewarm !== 'afterStartup') return;
+    if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
     const id = window.setTimeout(() => {
       void warmupTerminalRuntime();
     }, 1800);
     return () => window.clearTimeout(id);
-  }, [effectiveSettings]);
+  }, [apiStatus, terminalPrewarm]);
 
   useEffect(() => {
     const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');
