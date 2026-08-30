@@ -49,7 +49,6 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   onProfileChange,
 }) => {
   const [contextOpen, setContextOpen] = useState(false);
-  const [pinnedContextKey, setPinnedContextKey] = useState<ContextFocusKey | null>(null);
   const [hoverContextKey, setHoverContextKey] = useState<ContextFocusKey | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const enabled = useMemo(
@@ -100,7 +99,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     () => buildCompositionSegments(contextUsage, capacityMetrics, requestSections),
     [capacityMetrics, contextUsage, requestSections],
   );
-  const focusedContextKey = hoverContextKey ?? pinnedContextKey;
+  const focusedContextKey = hoverContextKey;
   const activeContextKey = focusedContextKey ?? 'input';
   const compositionLayout = useMemo(
     () => buildContextCompositionLayout(
@@ -142,12 +141,15 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     if (!hasContextFacts) setContextOpen(false);
   }, [hasContextFacts]);
 
+  useEffect(() => {
+    if (!contextOpen) setHoverContextKey(null);
+  }, [contextOpen]);
+
   const interactionProps = (key: ContextFocusKey) => ({
     onPointerEnter: () => setHoverContextKey(key),
     onPointerLeave: () => setHoverContextKey(null),
     onFocus: () => setHoverContextKey(key),
     onBlur: () => setHoverContextKey(null),
-    onClick: () => setPinnedContextKey((current) => current === key ? null : key),
   });
 
   const focusCompositionAtPointer = (event: React.PointerEvent<HTMLButtonElement>) => {
@@ -314,7 +316,6 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
                       key={section.key}
                       data-context-key={section.key}
                       className={section.key === activeContextKey ? 'is-active' : ''}
-                      aria-pressed={section.key === pinnedContextKey}
                       {...interactionProps(section.key)}
                     >
                       <span />
