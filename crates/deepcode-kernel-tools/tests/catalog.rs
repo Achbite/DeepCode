@@ -1,32 +1,52 @@
-use deepcode_kernel_tools::{KernelToolCatalogError, KernelToolRegistry, ToolAvailability};
+use deepcode_kernel_tools::{KernelToolRegistry, ToolAvailability};
 use serde_json::json;
 
 #[test]
-fn catalog_contains_callable_tools_and_blocked_capability_slots() {
+fn catalog_contains_the_canonical_callable_tools() {
     let registry = KernelToolRegistry::new();
     let names = registry
         .descriptors()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 19);
     assert!(names.contains(&"fs.read"));
+    assert!(names.contains(&"fs.stat"));
     assert!(names.contains(&"fs.edit"));
     assert!(names.contains(&"web.fetch"));
+    assert!(names.contains(&"github.search"));
+    assert!(names.contains(&"github.read"));
+    assert!(names.contains(&"arxiv.search"));
+    assert!(names.contains(&"arxiv.read"));
     assert!(names.contains(&"process.shell"));
     assert_eq!(
         registry.descriptor("fs.read").unwrap().availability,
         ToolAvailability::Callable,
     );
-    for blocked in ["web.search", "web.fetch", "process.shell"] {
+    assert_eq!(
+        registry.descriptor("fs.stat").unwrap().availability,
+        ToolAvailability::Callable,
+    );
+    for callable in [
+        "web.search",
+        "web.fetch",
+        "github.search",
+        "github.read",
+        "arxiv.search",
+        "arxiv.read",
+    ] {
         assert_eq!(
-            registry.descriptor(blocked).unwrap().availability,
-            ToolAvailability::Blocked,
+            registry.descriptor(callable).unwrap().availability,
+            ToolAvailability::Callable,
         );
-        assert!(matches!(
-            registry.canonicalize(blocked, json!({})),
-            Err(KernelToolCatalogError::ToolBlocked(name)) if name == blocked
-        ));
     }
+    assert_eq!(
+        registry.descriptor("process.shell").unwrap().availability,
+        if cfg!(target_os = "macos") {
+            ToolAvailability::Callable
+        } else {
+            ToolAvailability::Blocked
+        },
+    );
     for removed in [
         "fs.rename",
         "git.commit",
@@ -52,6 +72,11 @@ fn canonical_arguments_match_the_executor_boundary() {
         read.arguments,
         json!({"path":"src/lib.rs","startLine":2,"endLine":4})
     );
+
+    let stat = registry
+        .canonicalize("fs.stat", json!({"path":"."}))
+        .unwrap();
+    assert_eq!(stat.arguments, json!({"path":"."}));
 
     let delete = registry
         .canonicalize(
@@ -92,6 +117,67 @@ fn canonical_arguments_match_the_executor_boundary() {
             "replacement":"new"
         })
     );
+
+    let digest_edit = registry
+        .canonicalize(
+            "fs.edit",
+            json!({
+                "path":"src/lib.rs",
+                "matcher":{
+                    "kind":"lineRange",
+                    "data":{
+                        "startLine":1,
+                        "endLine":1,
+                        "precondition":{
+                            "kind":"expectedFileDigest",
+                            "data":{"digest":format!("sha256:{}", "a".repeat(64))}
+                        }
+                    }
+                },
+                "replacement":"new\n"
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        digest_edit.arguments["patchSpec"]["match"]["expectedFileHash"],
+        format!("sha256:{}", "a".repeat(64)),
+    );
+    assert!(registry
+        .canonicalize(
+            "fs.edit",
+            json!({
+                "path":"src/lib.rs",
+                "matcher":{
+                    "kind":"lineRange",
+                    "data":{
+                        "startLine":1,
+                        "endLine":1,
+                        "precondition":{
+                            "kind":"expectedFileDigest",
+                            "data":{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+                        }
+                    }
+                },
+                "replacement":"new"
+            }),
+        )
+        .is_err());
+
+    #[cfg(target_os = "macos")]
+    {
+        let shell = registry
+            .canonicalize("process.shell", json!({"command":"printf ready"}))
+            .unwrap();
+        assert_eq!(
+            shell.arguments,
+            json!({
+                "command":"printf ready",
+                "cwd":".",
+                "timeoutMs":120000,
+                "maxOutputBytes":262144
+            })
+        );
+    }
 }
 
 #[test]
@@ -106,6 +192,33 @@ fn catalog_rejects_unknown_fields_and_workspace_escape() {
     assert!(registry
         .canonicalize("fs.glob", json!({"pattern":"**/*","path":""}))
         .is_err());
+    assert!(registry
+        .canonicalize(
+            "process.shell",
+            json!({"command":"printf ok","cwd":"../outside"}),
+        )
+        .is_err());
+    for command in [
+        "mkfs.ext4 /dev/disk1",
+        "diskutil eraseDisk APFS Temporary /dev/disk1",
+        "rm -rf /",
+        "sudo /sbin/newfs_apfs /dev/disk1",
+        "sh -c 'rm -rf /'",
+    ] {
+        assert!(
+            registry
+                .canonicalize("process.shell", json!({"command":command}))
+                .is_err(),
+            "hard-denied command unexpectedly canonicalized: {command}"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    assert!(registry
+        .canonicalize(
+            "process.shell",
+            json!({"command":"rm -rf target && printf done","cwd":"."}),
+        )
+        .is_ok());
     assert_eq!(
         registry
             .descriptor("fs.glob")

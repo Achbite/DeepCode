@@ -1,8 +1,8 @@
 use crate::renderer::Renderer;
 use deepcode_kernel_client::{
     approval_response_command, cancel_command, interaction_response_command,
-    is_terminal_run_status, message_command, plan_feedback_command, plan_ignore_command,
-    plan_select_command, profile_selection_command, ConversationResourceReadResult,
+    is_terminal_run_status, message_command, plan_cancel_command, plan_confirm_command,
+    plan_revision_command, profile_selection_command, ConversationResourceReadResult,
     CreateConversationSessionRequest, HttpKernelClient, InteractionProjection, SessionProjection,
 };
 use std::path::PathBuf;
@@ -107,7 +107,7 @@ impl TuiApp {
         match input {
             "/quit" | "/exit" => return false,
             "/help" => {
-                self.status = "/attach <path> /detach <workspace-id> /ignore /model <profile> /cancel /context /open <workspace-id> <logical-path> /close /show /clear /quit；Plan 可输入编号".to_string();
+                self.status = "/attach <path> /detach <workspace-id> /cancel-plan /model <profile> /cancel /context /open <workspace-id> <logical-path> /close /show /clear /quit；Plan 输入 1/确认".to_string();
             }
             "/show" => self.status = self.projection_label(),
             "/clear" => self.status = "可见输入已清理；durable Session 未修改".to_string(),
@@ -117,7 +117,7 @@ impl TuiApp {
                 self.resource_preview = None;
                 self.status = "已关闭辅助视图。".to_string();
             }
-            "/ignore" => self.ignore_plan().await,
+            "/cancel-plan" => self.cancel_plan().await,
             "/cancel" => self.cancel_run().await,
             value if value.starts_with("/open ") => self.open_resource(value).await,
             value if value.starts_with("/attach ") => {
@@ -154,16 +154,11 @@ impl TuiApp {
             };
             approval_response_command(&session_id, &new_id("command"), approval, decision)
         } else if let Some(plan) = projection.pending_plan.as_ref() {
-            text.parse::<usize>()
-                .ok()
-                .and_then(|index| index.checked_sub(1))
-                .and_then(|index| plan.options.get(index))
-                .map(|option| {
-                    plan_select_command(&session_id, &new_id("command"), plan, &option.option_id)
-                })
-                .unwrap_or_else(|| {
-                    plan_feedback_command(&session_id, &new_id("command"), plan, text)
-                })
+            if is_plan_confirmation_input(text) {
+                plan_confirm_command(&session_id, &new_id("command"), plan)
+            } else {
+                plan_revision_command(&session_id, &new_id("command"), plan, text)
+            }
         } else if let Some(interaction) = projection.pending_interaction.as_ref() {
             let response = interaction_response_for_input(interaction, text);
             interaction_response_command(&session_id, &new_id("command"), interaction, &response)
@@ -174,7 +169,7 @@ impl TuiApp {
             .await;
     }
 
-    pub async fn ignore_plan(&mut self) {
+    pub async fn cancel_plan(&mut self) {
         let Some(projection) = self.projection.as_ref() else {
             self.status = "Session 尚未初始化。".to_string();
             return;
@@ -185,9 +180,9 @@ impl TuiApp {
             return;
         };
         let session_id = projection.session_id.clone();
-        let command = plan_ignore_command(&session_id, &new_id("command"), plan);
+        let command = plan_cancel_command(&session_id, &new_id("command"), plan);
         self.clear_input();
-        self.submit_command(&session_id, command, "忽略 Plan 失败")
+        self.submit_command(&session_id, command, "取消 Plan 失败")
             .await;
     }
 
@@ -350,7 +345,7 @@ impl TuiApp {
     fn update_action_required(&mut self) {
         self.action_required = self.projection.as_ref().and_then(|projection| {
             if projection.pending_plan.is_some() {
-                Some("Agent 正在等待 Plan 选项、调整反馈或显式忽略。".to_string())
+                Some("Agent 正在等待 Plan 确认、修订说明或显式取消。".to_string())
             } else if projection.pending_interaction.is_some() {
                 Some("Agent 正在等待你回答中间问题。".to_string())
             } else if projection.pending_approval.is_some() {
@@ -462,6 +457,13 @@ fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
         "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
         _ => Err("当前等待 effect 裁决：输入 1/允许 或 2/拒绝。".to_string()),
     }
+}
+
+fn is_plan_confirmation_input(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "1" | "y" | "yes" | "confirm"
+    ) || matches!(input.trim(), "确认" | "同意")
 }
 
 fn interaction_response_for_input(interaction: &InteractionProjection, input: &str) -> String {

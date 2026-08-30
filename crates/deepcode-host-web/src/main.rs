@@ -457,6 +457,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("PATCH", ["api", "conversation", "sessions", _])
         | ("DELETE", ["api", "conversation", "sessions", _])
         | ("POST", ["api", "conversation", "sessions", _, "directory-indexes"])
+        | ("POST", ["api", "conversation", "sessions", _, "directory-attachments", "resolve"])
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
         | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
@@ -576,6 +577,10 @@ mod tests {
         assert!(host_proxy_path_allowed(
             "POST",
             "/api/conversation/sessions/session%3Aone/directory-indexes"
+        ));
+        assert!(host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/sessions/session%3Aone/directory-attachments/resolve"
         ));
         assert!(host_proxy_path_allowed(
             "DELETE",

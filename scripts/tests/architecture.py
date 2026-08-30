@@ -133,7 +133,7 @@ def check_runtime_contracts() -> None:
         ),
         "session.sql": (
             {"sessions", "session_workspace_bindings", "session_events", "session_commands"},
-            1,
+            3,
         ),
         "tool-record.sql": ({"tool_records"}, 1),
     }
@@ -249,6 +249,9 @@ def check_current_path() -> None:
         )
 
     gui_panel = read("userspace/gui/src/components/local-agent/LocalAgentPanel.tsx")
+    plan_card = read("userspace/gui/src/components/local-agent/PlanCard.tsx")
+    composer_keyboard = read("userspace/gui/src/components/local-agent/composerKeyboard.ts")
+    gui_store = read("userspace/gui/src/state/localAgentStore.ts")
     gui_styles = read("userspace/gui/src/components/local-agent/localAgentPanel.css")
     model_selector = read("userspace/gui/src/deepcode-gui/panel/SessionModelSelector.tsx")
     shell_styles = read("userspace/gui/src/deepcode-gui/styles/deepcodeShell.css")
@@ -256,15 +259,20 @@ def check_current_path() -> None:
     require("projection?.display.title" not in gui_panel, "GUI 仍把 Session 创建标题当作当前标题")
     require("activeSummary?.title.trim()" in gui_panel, "GUI 当前标题没有消费 Catalog authority")
     for source, marker, message in (
-        (gui_panel, "selectOrConfirmPlanOption", "GUI Plan 缺少二次点击确认路径"),
-        (gui_panel, "event.key === 'Enter'", "GUI composer 缺少 Enter 确认路径"),
+        (gui_panel, "<PlanCard", "GUI timeline 没有渲染 Plan 卡片"),
+        (gui_panel, "{ kind: 'confirm' }", "GUI composer 缺少 Plan 确认动作"),
+        (plan_card, "plan.status === 'confirmed'", "GUI Plan 卡确认后没有自动折叠"),
+        (gui_panel, "local-agent__interaction-panel", "GUI 没有复用底部交互面板"),
+        (composer_keyboard, "event.key === 'Enter'", "GUI composer 缺少 Enter 确认路径"),
         (gui_panel, "local-agent__jump-latest", "GUI 缺少前往最新消息入口"),
         (gui_panel, "local-agent__run-spinner", "GUI 运行中缺少转圈状态"),
         (gui_panel, 'name="copy"', "GUI Assistant 回答缺少复制操作"),
         (gui_panel, 'name="thumbUp"', "GUI Assistant 回答缺少赞操作"),
         (gui_panel, 'name="thumbDown"', "GUI Assistant 回答缺少踩操作"),
-        (gui_panel, "agent.attachment.fileHint", "GUI 加号菜单缺少文件快照入口"),
-        (gui_panel, "agent.attachment.folderHint", "GUI 加号菜单缺少目录索引入口"),
+        (gui_panel, 'name="plus"', "GUI 附件入口没有使用一级加号入口"),
+        (gui_panel, 'name="paperclip"', "GUI 二级附件能力没有使用文件和文件夹符号"),
+        (gui_panel, "agent.attachment.filesAndFolders", "GUI 二级菜单缺少统一文件和文件夹能力"),
+        (gui_panel, 'selectionMode="messageAttachment"', "GUI 文件和文件夹能力没有进入统一选择器"),
         (model_selector, "receipt.partitions.map", "上下文球没有消费 Session 分区投影"),
         (gui_settings, "tokenUsageHistory.slice", "设置页没有分页消费逐轮用量"),
         (gui_settings, "settings.gui.usage.historyDescription", "设置页缺少新到旧每页十条语义"),
@@ -274,6 +282,26 @@ def check_current_path() -> None:
         (shell_styles, "conic-gradient", "上下文用量入口缺少环形进度"),
     ):
         require(marker in source, message)
+    require(
+        "shouldSubmitComposerKey" in gui_panel
+        and "compositionCommitPendingRef" in gui_panel
+        and "event.isComposing" in composer_keyboard
+        and "event.keyCode !== 229" in composer_keyboard,
+        "GUI composer 的 Enter 路径没有保护输入法组合态",
+    )
+    require(
+        "避免使用表情符号" in session_bridge,
+        "Session 最小系统指令缺少减少表情符号的表达约束",
+    )
+    require("<textarea" not in plan_card, "GUI Plan 卡不应创建第二个输入框")
+    require(
+        "respondPlan({ kind: 'requestRevision'" not in gui_panel,
+        "GUI Plan 修改意见没有复用主 composer 发送路径",
+    )
+    require(
+        "return await get().respondPlan({ kind: 'requestRevision', text: trimmed })" in gui_store,
+        "GUI 主 composer 没有把待确认 Plan 文本路由为 revision response",
+    )
 
 
 def check_development_tooling() -> None:

@@ -34,8 +34,27 @@ pub(crate) fn local_agent_plugin_config(settings: &Value) -> Result<Value, Strin
             "agent.systemPrompt 超过 {MAX_SYSTEM_PROMPT_BYTES} 字节上限。"
         ));
     }
+    let workspace_mutation = settings
+        .get("agent.permissions.workspaceMutation")
+        .and_then(Value::as_str)
+        .unwrap_or("plan");
+    if !matches!(workspace_mutation, "plan" | "allow") {
+        return Err("agent.permissions.workspaceMutation 必须是 plan 或 allow。".to_string());
+    }
+    let engineering_decisions = settings
+        .get("agent.permissions.engineeringDecisions")
+        .and_then(Value::as_str)
+        .unwrap_or("ask");
+    if !matches!(engineering_decisions, "ask" | "delegate") {
+        return Err("agent.permissions.engineeringDecisions 必须是 ask 或 delegate。".to_string());
+    }
     if settings.get("skills.autoLoad").and_then(Value::as_bool) != Some(true) {
-        return Ok(json!({ "systemPrompt": system_prompt, "skills": [] }));
+        return Ok(json!({
+            "systemPrompt": system_prompt,
+            "workspaceMutation": workspace_mutation,
+            "engineeringDecisions": engineering_decisions,
+            "skills": []
+        }));
     }
     let encoded = settings
         .get("skills.mounts")
@@ -81,7 +100,12 @@ pub(crate) fn local_agent_plugin_config(settings: &Value) -> Result<Value, Strin
             "instructions": instructions,
         }));
     }
-    Ok(json!({ "systemPrompt": system_prompt, "skills": skills }))
+    Ok(json!({
+        "systemPrompt": system_prompt,
+        "workspaceMutation": workspace_mutation,
+        "engineeringDecisions": engineering_decisions,
+        "skills": skills
+    }))
 }
 
 fn collect_skill_files(path: &Path, depth: usize, output: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -157,7 +181,15 @@ mod tests {
             "skills.mounts": "not parsed",
         }))
         .expect("disabled config");
-        assert_eq!(config, json!({ "systemPrompt": "", "skills": [] }));
+        assert_eq!(
+            config,
+            json!({
+                "systemPrompt": "",
+                "workspaceMutation": "plan",
+                "engineeringDecisions": "ask",
+                "skills": []
+            })
+        );
     }
 
     #[test]
@@ -168,6 +200,20 @@ mod tests {
         }))
         .expect("system prompt config");
         assert_eq!(config["systemPrompt"], "优先使用函数式组合。");
+        assert_eq!(config["workspaceMutation"], "plan");
+        assert_eq!(config["engineeringDecisions"], "ask");
         assert_eq!(config["skills"], json!([]));
+    }
+
+    #[test]
+    fn workspace_autonomy_settings_are_forwarded_to_session() {
+        let config = local_agent_plugin_config(&json!({
+            "agent.permissions.workspaceMutation": "allow",
+            "agent.permissions.engineeringDecisions": "delegate",
+            "skills.autoLoad": false,
+        }))
+        .expect("autonomous workspace config");
+        assert_eq!(config["workspaceMutation"], "allow");
+        assert_eq!(config["engineeringDecisions"], "delegate");
     }
 }

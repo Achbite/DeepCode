@@ -695,10 +695,20 @@
 }
 
 .deepcode-gui-task-list-card__title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 10px;
   color: var(--dc-muted);
   font-size: var(--dc-font-body);
   font-weight: var(--dc-weight-semibold);
+}
+
+.deepcode-gui-task-list-card__title small {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+  font-weight: var(--dc-weight-regular);
 }
 
 .deepcode-gui-task-list-card__empty {
@@ -1058,49 +1068,75 @@
   min-width: 0;
   align-items: center;
   gap: 6px;
-  height: 31px;
+  height: 34px;
 }
 
-.deepcode-session-model__context {
+.deepcode-session-model .deepcode-session-model__context {
   --deepcode-context-percent: 0%;
   position: relative;
   display: grid;
   width: 30px;
+  min-width: 30px;
   height: 30px;
+  min-height: 30px;
+  aspect-ratio: 1;
   flex: 0 0 30px;
   place-items: center;
-  min-height: 30px;
+  overflow: hidden;
+  box-sizing: border-box;
   padding: 0;
   border: 0;
   border-radius: 50%;
   background: conic-gradient(
-    var(--dc-accent) var(--deepcode-context-percent),
-    var(--dc-border-strong) 0
+    from -90deg,
+    var(--dc-accent) 0 var(--deepcode-context-percent),
+    color-mix(in srgb, var(--dc-muted) 34%, var(--dc-surface-raised))
+      var(--deepcode-context-percent) 100%
   );
-  color: var(--dc-faint);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--dc-border-strong) 78%, transparent);
+  color: var(--dc-muted);
   font-size: 7px;
   font-weight: var(--dc-weight-semibold);
+  font-variant-numeric: tabular-nums;
+  isolation: isolate;
   cursor: pointer;
 }
 
-.deepcode-session-model__context:disabled {
+.deepcode-session-model .deepcode-session-model__context:disabled {
   cursor: default;
   opacity: 0.72;
 }
 
-.deepcode-session-model__context::before {
+.deepcode-session-model .deepcode-session-model__context--unknown {
+  background: color-mix(in srgb, var(--dc-muted) 30%, var(--dc-surface-raised));
+  color: var(--dc-faint);
+}
+
+.deepcode-session-model .deepcode-session-model__context::before {
   position: absolute;
+  z-index: 0;
   inset: 2px;
+  border: 1px solid color-mix(in srgb, var(--dc-border) 72%, transparent);
   border-radius: 50%;
   background: var(--dc-surface-raised);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--dc-foreground-strong) 6%, transparent);
   content: '';
 }
 
-.deepcode-session-model__context > span {
+.deepcode-session-model .deepcode-session-model__context > span {
   position: relative;
+  z-index: 1;
 }
 
 .deepcode-session-model__context-popover {
+  --deepcode-context-instructions: light-dark(#626975, #b1b7c2);
+  --deepcode-context-session: light-dark(#7650b8, #a987e0);
+  --deepcode-context-tools: light-dark(#c26d0a, #e0a04f);
+  --deepcode-context-index: light-dark(#216bc1, #69a7e8);
+  --deepcode-context-provider: light-dark(#078b9b, #55bdc8);
+  --deepcode-context-messages: light-dark(#13845f, #59bb91);
+  --deepcode-context-attachments: light-dark(#bd3e75, #df7ca7);
+  --deepcode-context-output: light-dark(#d45132, #ed866d);
   position: absolute;
   right: 0;
   bottom: 38px;
@@ -1160,7 +1196,7 @@
 
 .deepcode-session-model__usage-track {
   height: 4px;
-  margin-top: 8px;
+  margin-top: 7px;
   overflow: hidden;
   border-radius: 999px;
   background: var(--dc-border);
@@ -1171,52 +1207,115 @@
   height: 100%;
   border-radius: inherit;
   background: var(--dc-success);
+  transition: width 600ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.deepcode-session-model__composition-stage {
+  position: relative;
+  height: 40px;
+  margin-top: 6px;
 }
 
 .deepcode-session-model__composition-bar {
+  position: absolute;
+  inset: 6px 0 auto;
   display: flex;
-  height: 27px;
-  gap: 2px;
-  margin-top: 8px;
+  width: 100%;
+  height: 28px;
+  appearance: none;
   overflow: hidden;
-  border-radius: 6px;
-  background: var(--dc-border);
+  box-sizing: border-box;
+  align-items: stretch;
+  padding: 0;
+  border: 1px solid var(--dc-border);
+  border-radius: 5px;
+  background: var(--dc-surface-subtle);
+  cursor: crosshair;
+  isolation: isolate;
+  touch-action: pan-y;
+}
+
+.deepcode-session-model__composition-bar.is-focused {
+  overflow: visible;
 }
 
 .deepcode-session-model__composition-bar--unknown {
   align-items: center;
   justify-content: center;
+  cursor: default;
   color: var(--dc-faint);
   font-size: var(--dc-font-micro);
 }
 
-.deepcode-session-model__composition-bar > button {
-  min-width: 3px;
+.deepcode-session-model__composition-bar:focus-visible {
+  outline: 2px solid var(--dc-focus-ring);
+  outline-offset: 2px;
+}
+
+.deepcode-session-model__composition-segment {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
   height: 100%;
-  flex-grow: 0;
-  flex-shrink: 1;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  cursor: pointer;
-  opacity: 0.45;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  opacity: 0.78;
+  pointer-events: none;
+  transform: scaleY(1);
+  transform-origin: center;
+  transition:
+    width 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 110ms ease,
+    filter 110ms ease,
+    transform 160ms cubic-bezier(0.18, 0.82, 0.22, 1),
+    box-shadow 120ms ease;
 }
 
-.deepcode-session-model__composition-bar > button.is-active {
+.deepcode-session-model__composition-segment:first-child {
+  border-radius: 4px 0 0 4px;
+}
+
+.deepcode-session-model__composition-segment:last-child {
+  border-radius: 0 4px 4px 0;
+}
+
+.deepcode-session-model__composition-segment + .deepcode-session-model__composition-segment {
+  box-shadow: -1px 0 0 color-mix(in srgb, var(--dc-surface-raised) 68%, transparent);
+}
+
+.deepcode-session-model__composition-bar.is-focused .deepcode-session-model__composition-segment {
+  opacity: 0.62;
+}
+
+.deepcode-session-model__composition-bar.is-focused
+  .deepcode-session-model__composition-segment[data-context-key='free'] {
+  opacity: 0.84;
+}
+
+.deepcode-session-model__composition-bar.is-focused
+  .deepcode-session-model__composition-segment.is-active {
+  z-index: 3;
   opacity: 1;
+  border-radius: 3px;
+  filter: saturate(1.4) brightness(1.07);
+  transform: scaleY(1.29);
+  clip-path: inset(0 2px round 3px);
+  box-shadow:
+    0 3px 8px light-dark(rgba(34, 30, 26, 0.24), rgba(0, 0, 0, 0.42)),
+    inset 0 -2px 0 color-mix(in srgb, var(--dc-foreground-strong) 17%, transparent);
 }
 
-.deepcode-session-model__composition-bar > button[data-context-key='input'],
+.deepcode-session-model__composition-segment[data-context-key='input'],
 .deepcode-session-model__context-detail > span[data-context-key='input'] {
   background: var(--dc-success);
 }
 
-.deepcode-session-model__composition-bar > button[data-context-key='output'],
+.deepcode-session-model__composition-segment[data-context-key='output'],
 .deepcode-session-model__context-detail > span[data-context-key='output'] {
-  background: var(--dc-warning);
+  background: var(--deepcode-context-output);
 }
 
-.deepcode-session-model__composition-bar > button[data-context-key='free'],
+.deepcode-session-model__composition-segment[data-context-key='free'],
 .deepcode-session-model__context-detail > span[data-context-key='free'] {
   background-color: var(--dc-surface-subtle);
   background-image: repeating-linear-gradient(
@@ -1314,7 +1413,7 @@
 
 .deepcode-session-model__cache-track > span:last-child {
   flex: 1;
-  background: var(--dc-warning);
+  background: var(--deepcode-context-output);
 }
 
 .deepcode-session-model__cache-legend {
@@ -1351,7 +1450,15 @@
 }
 
 .deepcode-session-model__context-sections > button.is-active {
-  background: var(--dc-surface-active);
+  background: color-mix(in srgb, var(--deepcode-context-color) 10%, transparent);
+  box-shadow: inset 3px 0 0 var(--deepcode-context-color);
+}
+
+.deepcode-session-model__context-sections > button:hover,
+.deepcode-session-model__context-sections > button:focus-visible {
+  background: color-mix(in srgb, var(--deepcode-context-color) 10%, transparent);
+  box-shadow: inset 3px 0 0 var(--deepcode-context-color);
+  outline: none;
 }
 
 .deepcode-session-model__context-sections > button strong {
@@ -1376,35 +1483,88 @@
 }
 
 .deepcode-session-model__context-detail > span[data-context-key='instructions'],
-.deepcode-session-model__context-sections > button[data-context-key='instructions'] > span:first-child {
-  background: var(--dc-muted);
+.deepcode-session-model__context-sections > button[data-context-key='instructions'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='instructions'] {
+  background: var(--deepcode-context-instructions);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='instructions'] {
+  --deepcode-context-color: var(--deepcode-context-instructions);
 }
 
 .deepcode-session-model__context-detail > span[data-context-key='tools'],
-.deepcode-session-model__context-sections > button[data-context-key='tools'] > span:first-child {
-  background: var(--dc-warning);
+.deepcode-session-model__context-sections > button[data-context-key='tools'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='tools'] {
+  background: var(--deepcode-context-tools);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='tools'] {
+  --deepcode-context-color: var(--deepcode-context-tools);
 }
 
 .deepcode-session-model__context-detail > span[data-context-key='workspaceBindings'],
-.deepcode-session-model__context-sections > button[data-context-key='workspaceBindings'] > span:first-child {
-  background: var(--dc-accent);
+.deepcode-session-model__context-sections > button[data-context-key='workspaceBindings'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='workspaceBindings'] {
+  background: var(--deepcode-context-index);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='workspaceBindings'] {
+  --deepcode-context-color: var(--deepcode-context-index);
 }
 
 .deepcode-session-model__context-detail > span[data-context-key='sessionControls'],
-.deepcode-session-model__context-sections > button[data-context-key='sessionControls'] > span:first-child {
-  background: var(--dc-faint);
+.deepcode-session-model__context-sections > button[data-context-key='sessionControls'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='sessionControls'] {
+  background: var(--deepcode-context-session);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='sessionControls'] {
+  --deepcode-context-color: var(--deepcode-context-session);
 }
 
 .deepcode-session-model__context-detail > span[data-context-key='contextProviders'],
 .deepcode-session-model__context-sections > button[data-context-key='contextProviders'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='contextProviders'] {
+  background: var(--deepcode-context-provider);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='contextProviders'] {
+  --deepcode-context-color: var(--deepcode-context-provider);
+}
+
 .deepcode-session-model__context-detail > span[data-context-key='journalMessages'],
-.deepcode-session-model__context-sections > button[data-context-key='journalMessages'] > span:first-child {
-  background: var(--dc-success);
+.deepcode-session-model__context-sections > button[data-context-key='journalMessages'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='journalMessages'] {
+  background: var(--deepcode-context-messages);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='journalMessages'] {
+  --deepcode-context-color: var(--deepcode-context-messages);
 }
 
 .deepcode-session-model__context-detail > span[data-context-key='messageAttachments'],
-.deepcode-session-model__context-sections > button[data-context-key='messageAttachments'] > span:first-child {
-  background: var(--dc-warning);
+.deepcode-session-model__context-sections > button[data-context-key='messageAttachments'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='messageAttachments'] {
+  background: var(--deepcode-context-attachments);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='messageAttachments'] {
+  --deepcode-context-color: var(--deepcode-context-attachments);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='output'] {
+  --deepcode-context-color: var(--deepcode-context-output);
+}
+
+.deepcode-session-model__context-sections > button[data-context-key='output'] > span:first-child {
+  background: var(--deepcode-context-output);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deepcode-session-model__composition-segment,
+  .deepcode-session-model__usage-track > span {
+    transition: none;
+  }
 }
 
 .deepcode-session-model__selector {

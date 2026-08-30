@@ -260,15 +260,19 @@ function decodeProviderFrame(frame: string): ProviderEvent {
       break;
     case 'assistant.message':
       {
-        const fields = Object.hasOwn(value.data, 'reasoningContent')
-          ? ['messageId', 'content', 'reasoningContent']
-          : ['messageId', 'content'];
+        const fields = ['messageId', 'content'];
+        if (Object.hasOwn(value.data, 'reasoningContent')) fields.push('reasoningContent');
+        if (Object.hasOwn(value.data, 'reasoningSignature')) fields.push('reasoningSignature');
       if (
         !isExactRecord(value.data, fields)
         || !isNonEmptyText(value.data.messageId)
         || typeof value.data.content !== 'string'
         || value.data.reasoningContent !== undefined
           && !isNonEmptyText(value.data.reasoningContent)
+        || value.data.reasoningSignature !== undefined
+          && !isNonEmptyText(value.data.reasoningSignature)
+        || value.data.reasoningSignature !== undefined
+          && value.data.reasoningContent === undefined
       ) throw new Error('provider_event_invalid');
       break;
       }

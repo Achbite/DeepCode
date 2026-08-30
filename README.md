@@ -13,7 +13,7 @@ user input
   -> the single Agent Loop owned by Session
   -> typed Provider turn deltas or a native tool call
   -> Session classifies and journals narrative / answer / interaction / Plan facts
-  -> an exact Plan selection before workspace mutation
+  -> optional complete Plan confirmation under the current workspace policy
   -> Kernel prepares, authorizes, executes, and records one effect
   -> Session continues and reduces a shared projection
   -> UI / CLI / TUI render the same facts
@@ -25,7 +25,9 @@ user input
 - UI submits commands and consumes `SessionProjection`; it does not maintain another task state machine.
 - Skills and MCP servers contribute through plugin-shaped values without creating another Agent Loop.
 
-DeepCode has no parallel Requirement, Plan, or Review workflow engine. Ordinary narrative and final answers are native LLM Markdown; Session classifies them only from the typed Provider turn lifecycle and projects the current run's text deltas as a disposable `assistantDraft` to every shell. Plan and interaction facts can only come from the LLM invoking reserved structured Session control tools—there is no JSONL body envelope, prose inference, or parse-failure fallback. Selecting a Plan option journals `plan.respond(select)` and creates run-scoped authority only for its exact workspace, operation, and normalized targets. Free-form adjustment closes the old Plan without authority; explicit ignore continues the same Loop in answer-only mode. A Session binding allows reads inside its immutable workspace snapshot; workspace mutation has no per-call `ask` or global `allow` fallback. Other effect classes can still use their own explicit interaction request.
+DeepCode has no parallel Requirement, Plan, or Review workflow engine. Ordinary narrative and final answers are native LLM Markdown; Session classifies them only from the typed Provider turn lifecycle and projects the current run's text deltas as a disposable `assistantDraft` to every shell. Plan and interaction facts can only come from the LLM invoking reserved structured Session control tools—there is no JSONL body envelope, prose inference, or parse-failure fallback. `plan.publish` publishes one complete revision; `plan.respond(confirm)` commits session-scoped authority only for its exact workspace, operation, and normalized targets and atomically seeds the Todo list from the Plan steps. Revision requests retain the Plan identity and increment its revision, while cancellation creates no authority or Todo. Confirmed Plan/Todo state survives ordinary supplemental input and subsequent runs until an explicit Plan lifecycle fact supersedes, completes, cancels, or invalidates it.
+
+A Session binding always limits workspace tools to its immutable run snapshot. `agent.permissions.workspaceMutation` defaults to `plan`; setting it to `allow` removes only the Plan admission gate for structured `fs.*` mutations. On macOS, `process.shell` is an independently authorized project-debugging capability: it needs a bound workspace but no Plan, runs a bounded non-interactive `/bin/sh` command with closed stdin, and retains destructive-command hard denials. Its PATH combines the Host PATH with existing standard developer-tool directories. File writes are limited to the workspace and a Kernel-owned temporary directory exposed through `$TMPDIR`; `HOME` remains readable but not writable, so tools needing mutable state must point it at `$TMPDIR` or the workspace. The Kernel removes the temporary directory after the call. `success` reports the final shell exit status, while stdout and stderr remain separate facts. The catalog reports `process.shell` as blocked on platforms without the current workspace-write sandbox instead of advertising an unusable callable tool. Network reads default to `allow` and may reach any HTTP(S) destination available to the Host; external-effect tools continue to default to `ask`. `web.search` uses the built-in Bing RSS backend when `agent.web.search.endpointTemplate` is empty; an explicit template overrides it with the existing JSON search-result contract. Neither setting relaxes workspace path resolution or approval for out-of-workspace effects. `agent.permissions.engineeringDecisions` independently chooses whether material engineering-route ambiguity is asked through `interaction.request` or delegated to the Agent. Public GitHub repository/issue search and contents reads work without credentials; REST code search uses `DEEPCODE_GITHUB_TOKEN` captured at daemon startup, as required by GitHub.
 
 ## Interfaces
 
@@ -130,16 +132,16 @@ For providers that require a reasoning field to be echoed across a tool continua
 
 1. Start an independent conversation, or create a project and attach one or more local folders.
 2. A project's ordered folders are a template for new Sessions; every created Session keeps an immutable creation snapshot. Changing the project affects only Sessions created afterwards.
-3. The composer can attach a file or a folder. A file is copied into that user message as an immutable content snapshot. A folder is not copied: it is attached to the Session as a directory index, and the model explores it with `fs.list`, `fs.glob`, `code.grep`, and `fs.read`.
-4. A Session folder can be detached later without deleting prior messages, activities, or tool records. Attach/detach during an active run is marked as applying to the next run and changes only that next run's frozen directory set; it never silently changes the project template.
+3. The composer places files and folders in one attachment area. A file is copied into that user message as an immutable content snapshot. A folder is not copied: it is retained as a logical reference on that message and enters only the frozen directory snapshot of the run started by that message, where the model explores it with `fs.list`, `fs.glob`, `code.grep`, and `fs.read`.
+4. A folder reference remains visible on its original message but does not mutate the Session or Project directory indexes. The explicit CLI/TUI `attach-directory`/`/attach` commands still manage Session directory indexes for subsequent runs and never silently change the project template.
 5. Describe the coding result you want. An independent Session may remain unbound until folder access is actually needed.
 6. While the Provider/tool loop runs, Session projects the current typed turn's LLM text deltas as a shared `assistantDraft`, then commits that text as narrative or a final answer when the turn closes.
-7. For a workspace mutation, use the Plan card in the existing composer. Options are a vertical `1..N` list: the first click selects, and a second click or Enter confirms. You can instead enter adjustment details or explicitly ignore the Plan and request a direct answer.
+7. When a Plan is published, review its complete steps and mutation manifest in the expandable Plan card. Confirm it, request a revision with free-form feedback, or cancel it. Confirmation automatically collapses the card without removing it and atomically creates the Todo list. If workspace mutation is configured as `allow`, the Agent may work directly inside bound workspaces without publishing a gate-only Plan.
 8. The model selector remains available during the conversation and changes subsequent Provider turns.
 9. Messages, Plan state, activities, artifacts, context usage, and run status all come from the shared projection.
 10. A committed Assistant answer can be copied, rated up or down, or have its rating cleared. Ratings are durable local Session facts, recover after restart, are not stored by the GUI, and are not sent to the Provider.
 11. Click the context ball in the composer to inspect the current Provider request partitions. Per-partition item counts and estimates come from Session; cache hit and miss counts come from Provider usage. Missing facts display `N/A`, and GUI/TUI do not attribute or recompute them. Settings shows Session-aggregated per-round token consumption newest first, 10 rows per page.
-12. For complex work, the LLM explicitly submits Todo state through the structured `todo.update` control call. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
+12. For complex work, the LLM publishes a complete Plan through `plan.publish`; confirmation atomically seeds the Todo list from Plan steps, and later `todo.progress` calls may update only those generated item states. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
 
 Deleting a Session deletes the conversation catalog entry and its complete archive: Session events, command replay rows, binding relations, and Kernel tool records. An active run must be stopped first.
 
@@ -160,14 +162,14 @@ Respond to an existing Session or pending Plan:
 ```bash
 ./DeepCode-CLI.command ask --session <session-id> 1
 ./DeepCode-CLI.command ask --session <session-id> "Adjust the targets and propose the Plan again"
-./DeepCode-CLI.command ignore-plan --session <session-id>
+./DeepCode-CLI.command cancel-plan --session <session-id>
 ./DeepCode-CLI.command model --session <session-id> <profile-id>
 ./DeepCode-CLI.command cancel --session <session-id> <run-id>
 ./DeepCode-CLI.command attach-directory --session <session-id> /path/to/folder
 ./DeepCode-CLI.command detach-directory --session <session-id> <workspace-id>
 ```
 
-Only an explicit `-C` / `--workspace` creates a binding for a new CLI Session; the current directory is never implicit. During a pending Plan, `1..N` selects an option and other non-empty text is revision feedback. Only `ignore-plan` means ignore. `ask` waits until the run is terminal or needs user action, and failed, cancelled, or indeterminate runs exit non-zero. The CLI submits only through `ConversationPort` and never invokes tools directly.
+Only an explicit `-C` / `--workspace` creates a binding for a new CLI Session; the current directory is never implicit. During a pending Plan, `1`/`confirm` confirms the complete Plan and other non-empty text requests a revision; `cancel-plan` explicitly cancels it. `ask` waits until the run is terminal or needs user action, and failed, cancelled, or indeterminate runs exit non-zero. The CLI submits only through `ConversationPort` and never invokes tools directly.
 
 ## TUI
 
@@ -180,7 +182,7 @@ Plain text is submitted to the current Session. Interactive commands are:
 
 - `/help` — show command hints.
 - `/show` — render the current shared projection again.
-- `/ignore` — explicitly ignore the current Plan and continue answer-only.
+- `/cancel-plan` — explicitly cancel the current pending Plan.
 - `/model <profile>` — switch the profile used by subsequent Provider turns.
 - `/cancel` — cancel the active run.
 - `/attach <path>` — attach a folder as a Session directory index.
@@ -188,7 +190,7 @@ Plain text is submitted to the current Session. Interactive commands are:
 - `/clear` — refresh visible state without changing the durable Session.
 - `/quit`, `/exit` — exit the TUI.
 
-For a pending Plan, enter `1..N` to select an option or enter other non-empty text as revision feedback. `Esc` is the explicit TUI ignore action; empty input, EOF, and Ctrl-C do not ignore a Plan. As with the CLI, only explicit `-C` / `--workspace` creates a new binding.
+For a pending Plan, enter `1`/`confirm` to confirm the complete Plan or enter other non-empty text as revision feedback. `Esc` explicitly cancels the pending Plan; empty input, EOF, and Ctrl-C do not cancel it. As with the CLI, only explicit `-C` / `--workspace` creates a new binding.
 
 ## Local data
 

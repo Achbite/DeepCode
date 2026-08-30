@@ -50,7 +50,9 @@ HOST_TOKEN_HEADER = "x-deepcode-host-shell-token"
 COMMAND_VERSION = "deepcode.command"
 EXPECTED_CONTENT = "created once\n"
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-MARKERS = ("EXECUTE", "FEEDBACK", "IGNORE", "CANCEL", "FAIL", "TODO")
+MARKERS = (
+    "EXECUTE", "FEEDBACK", "PLAN_CANCEL", "CANCEL", "FAIL", "TODO", "AUTONOMY",
+)
 CLI_CANCELLED_EXIT = 8
 
 
@@ -68,7 +70,10 @@ class ProviderState:
     def forbid_roots(self, roots: list[Path]) -> None:
         self._forbidden_roots = [str(root.resolve()) for root in roots]
 
-    def register(self, body: dict[str, Any]) -> tuple[str, int, str | None, set[str]]:
+    def register(
+        self,
+        body: dict[str, Any],
+    ) -> tuple[str, int, str | None, set[str], dict[str, Any] | None]:
         messages = body.get("messages")
         if not isinstance(messages, list):
             raise AssertionError("Provider 请求缺少 messages")
@@ -105,25 +110,61 @@ class ProviderState:
             and message.get("role") == "tool"
             and isinstance(message.get("tool_call_id"), str)
         }
+        tool_call_names: dict[str, str] = {}
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict) or not isinstance(call.get("id"), str):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    tool_call_names[call["id"]] = function["name"].replace("__", ".")
+        completed_tool_names = {
+            tool_call_names[call_id]
+            for call_id in tool_result_ids
+            if call_id in tool_call_names
+        }
+        todo_fact: dict[str, Any] | None = None
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                candidate = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and candidate.get("type") in {
+                "todo.seeded", "todo.reconciled",
+            }:
+                todo_fact = candidate
         tools = body.get("tools")
         tool_names = {
             item.get("function", {}).get("name")
             for item in tools
             if isinstance(item, dict)
         } if isinstance(tools, list) else set()
-        answer_only = "answer-only continuation" in joined
-        if marker == "IGNORE" and answer_only:
-            if tool_names:
-                raise AssertionError("answer-only continuation 仍向 Provider 暴露了工具")
-        elif not {
-            "fs__create", "fs__list", "plan__intent", "interaction__request", "todo__update",
+        if not {
+            "fs__create", "fs__list", "plan__publish", "interaction__request", "todo__progress",
         }.issubset(tool_names):
             raise AssertionError("普通 Provider 请求没有同时暴露 Kernel 工具与 Session control")
+        if marker == "AUTONOMY":
+            if "工作区内 fs.* 修改可直接执行" not in joined:
+                raise AssertionError("完全访问工作区模式没有进入 Session 指令")
+            if "process.shell 可直接用于工作区调试" not in joined:
+                raise AssertionError("项目调试 Shell 的独立授权没有进入 Session 指令")
+            if "有充分工作区事实时自行选择最小一致工程路线" not in joined:
+                raise AssertionError("工程路线委托模式没有进入 Session 指令")
         with self._lock:
             self._requests.append(body)
             self._counts[marker] += 1
             ordinal = self._counts[marker]
-        return marker, ordinal, workspace_id, tool_result_ids
+        return marker, ordinal, workspace_id, completed_tool_names, todo_fact
 
     def count(self, marker: str | None = None) -> int:
         with self._lock:
@@ -166,13 +207,15 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise AssertionError("Provider body 不是对象")
-            marker, ordinal, workspace_id, tool_result_ids = self.provider_state.register(body)
+            marker, ordinal, workspace_id, completed_tool_names, todo_fact = (
+                self.provider_state.register(body)
+            )
             self.send_response(200)
             self.send_header("content-type", "text/event-stream; charset=utf-8")
             self.send_header("cache-control", "no-cache")
             self.send_header("connection", "close")
             self.end_headers()
-            self._respond(marker, ordinal, workspace_id, tool_result_ids)
+            self._respond(marker, ordinal, workspace_id, completed_tool_names, todo_fact)
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as error:  # Make mock failures visible to the caller.
@@ -192,7 +235,8 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
         marker: str,
         ordinal: int,
         workspace_id: str | None,
-        tool_result_ids: set[str],
+        completed_tool_names: set[str],
+        todo_fact: dict[str, Any] | None,
     ) -> None:
         if marker == "CANCEL":
             self._send_text("正在等待可取消的 Provider 响应。")
@@ -204,8 +248,13 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
             self._send_tool_call(
                 "正在提交一个字段非法的 Plan 以验证失败边界。",
                 f"plan:invalid:{ordinal}",
-                "plan__intent",
-                {"prompt": "这个 Plan 缺少可用选项。", "options": []},
+                "plan__publish",
+                {
+                    "title": "无效 Plan",
+                    "summary": "这个 Plan 缺少步骤。",
+                    "steps": [],
+                    "mutationManifest": [],
+                },
             )
             self._send_done()
             return
@@ -216,33 +265,24 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
                 self._send_tool_call(
                     "正在核对目标并准备一个精确的写入计划。",
                     "plan:execute",
-                    "plan__intent",
+                    "plan__publish",
                     {
-                        "prompt": "请选择执行方案，或直接输入调整细节。",
-                        "options": [
-                            {
-                                "optionId": "option:create",
-                                "label": "创建验收文件",
-                                "description": "只创建一个精确目标。",
-                                "operations": [{
-                                    "workspaceId": workspace_id,
-                                    "operation": "fs.create",
-                                    "target": "executed.txt",
-                                }],
-                            },
-                            {
-                                "optionId": "option:notes",
-                                "label": "改为创建说明文件",
-                                "operations": [{
-                                    "workspaceId": workspace_id,
-                                    "operation": "fs.create",
-                                    "target": "notes.txt",
-                                }],
-                            },
-                        ],
+                        "title": "创建验收文件",
+                        "summary": "只创建一个精确目标。",
+                        "steps": [{
+                            "stepId": "step:create",
+                            "title": "创建验收文件",
+                            "details": "创建 executed.txt 并核对工具回执。",
+                            "verification": ["executed.txt 内容与预期一致。"],
+                        }],
+                        "mutationManifest": [{
+                            "workspaceId": workspace_id,
+                            "operation": "fs.create",
+                            "target": "executed.txt",
+                        }],
                     },
                 )
-            elif ordinal == 2 and "e2e-call-execute" not in tool_result_ids:
+            elif ordinal == 2 and "fs.create" not in completed_tool_names:
                 self._send_tool_call(
                     "计划已确认，正在创建唯一目标文件。",
                     "e2e-call-execute",
@@ -253,86 +293,129 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
                         "content": EXPECTED_CONTENT,
                     },
                 )
-            elif ordinal == 3 and "e2e-call-execute" in tool_result_ids:
+            elif ordinal == 3 and "fs.create" in completed_tool_names:
                 self._send_text("已完成 **Plan 授权** 的文件创建。", finish_reason="stop")
             else:
                 raise AssertionError(
-                    f"EXECUTE Provider 轮次异常：ordinal={ordinal}, results={tool_result_ids}"
+                    f"EXECUTE Provider 轮次异常：ordinal={ordinal}, results={completed_tool_names}"
                 )
         elif marker == "FEEDBACK":
             if ordinal == 1:
                 self._send_tool_call(
                     "正在形成可调整的计划。",
                     "plan:feedback",
-                    "plan__intent",
+                    "plan__publish",
                     {
-                        "prompt": "请选择计划，或在输入框写出调整细节。",
-                        "options": [{
-                            "optionId": "option:feedback",
-                            "label": "创建反馈文件",
-                            "operations": [{
+                        "title": "创建反馈文件",
+                        "summary": "创建初始目标。",
+                        "steps": [{
+                            "stepId": "step:feedback",
+                            "title": "创建反馈文件",
+                            "details": "创建 feedback.txt。",
+                        }],
+                        "mutationManifest": [{
                                 "workspaceId": workspace_id,
                                 "operation": "fs.create",
                                 "target": "feedback.txt",
-                            }],
                         }],
                     },
                 )
             elif ordinal == 2:
+                self._send_tool_call(
+                    "已按修订说明形成新的最终计划。",
+                    "plan:feedback:revised",
+                    "plan__publish",
+                    {
+                        "title": "说明修订目标",
+                        "summary": "只说明 docs/notes.md，不执行写入。",
+                        "steps": [{
+                            "stepId": "step:feedback",
+                            "title": "说明修订目标",
+                            "details": "说明 docs/notes.md 的处理方案。",
+                        }],
+                        "mutationManifest": [],
+                    },
+                )
+            elif ordinal == 3:
                 self._send_text(
-                    "已按调整意见直接说明，本轮未执行 workspace mutation。",
+                    "修订 Plan 已确认，本轮未执行 workspace mutation。",
                     finish_reason="stop",
                 )
             else:
                 raise AssertionError("FEEDBACK Provider 轮次异常")
-        elif marker == "IGNORE":
+        elif marker == "PLAN_CANCEL":
             if ordinal == 1:
                 self._send_tool_call(
-                    "正在准备一个可忽略的计划。",
+                    "正在准备一个可取消的计划。",
                     "plan:ignore",
-                    "plan__intent",
+                    "plan__publish",
                     {
-                        "prompt": "可选择计划、输入调整，或明确忽略并直接回答。",
-                        "options": [{
-                            "optionId": "option:ignore",
-                            "label": "创建不应执行的文件",
-                            "operations": [{
+                        "title": "创建不应执行的文件",
+                        "summary": "该 Plan 将由用户取消。",
+                        "steps": [{
+                            "stepId": "step:cancelled",
+                            "title": "创建不应执行的文件",
+                            "details": "创建 ignored.txt。",
+                        }],
+                        "mutationManifest": [{
                                 "workspaceId": workspace_id,
                                 "operation": "fs.create",
                                 "target": "ignored.txt",
-                            }],
                         }],
                     },
                 )
             elif ordinal == 2:
-                self._send_text("已忽略计划并直接回答；没有执行任何修改。", finish_reason="stop")
+                self._send_text("已取消计划；没有执行任何修改。", finish_reason="stop")
             else:
-                raise AssertionError("IGNORE Provider 轮次异常")
+                raise AssertionError("PLAN_CANCEL Provider 轮次异常")
         elif marker == "TODO":
             if ordinal == 1:
+                self._send_tool_call(
+                    "这是复杂任务；我先发布完整计划。",
+                    "plan:todo",
+                    "plan__publish",
+                    {
+                        "title": "读取目录并整理结论",
+                        "summary": "读取项目结构、分析关键链路并形成回答。",
+                        "steps": [
+                            {
+                                "stepId": "step:inspect",
+                                "title": "读取项目结构",
+                                "details": "读取工作区目录。",
+                            },
+                            {
+                                "stepId": "step:analyze",
+                                "title": "分析关键链路",
+                                "details": "分析目录与代码事实。",
+                            },
+                            {
+                                "stepId": "step:answer",
+                                "title": "整理最终结论",
+                                "details": "输出最终答复。",
+                            },
+                        ],
+                        "mutationManifest": [],
+                    },
+                )
+            elif ordinal == 2:
+                if todo_fact is None:
+                    raise AssertionError("TODO 确认后 Provider 没有收到 todo.seeded 事实")
+                items = todo_fact.get("items")
+                if not isinstance(items, list) or len(items) != 3:
+                    raise AssertionError("TODO seeded items 无效")
                 self._send_tool_calls(
-                    "这是复杂任务；我先建立待办并读取目录结构。",
+                    "Plan 已确认并生成待办；我先读取目录结构。",
                     [
                         (
                             "todo:complex:start",
-                            "todo__update",
+                            "todo__progress",
                             {
-                                "items": [
-                                    {
-                                        "todoId": "inspect",
-                                        "label": "读取项目结构",
-                                        "status": "inProgress",
-                                    },
-                                    {
-                                        "todoId": "analyze",
-                                        "label": "分析关键链路",
-                                        "status": "pending",
-                                    },
-                                    {
-                                        "todoId": "answer",
-                                        "label": "整理最终结论",
-                                        "status": "pending",
-                                    },
+                                "planId": todo_fact["sourcePlanId"],
+                                "revision": todo_fact["sourcePlanRevision"],
+                                "updates": [
+                                    {"todoId": items[0]["todoId"], "status": "inProgress"},
+                                    {"todoId": items[1]["todoId"], "status": "pending"},
+                                    {"todoId": items[2]["todoId"], "status": "pending"},
                                 ],
                             },
                         ),
@@ -343,38 +426,51 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
                         ),
                     ],
                 )
-            elif ordinal == 2 and "e2e-call-todo-list" in tool_result_ids:
+            elif ordinal == 3 and "fs.list" in completed_tool_names:
+                if todo_fact is None:
+                    raise AssertionError("TODO continuation 缺少 durable Todo fact")
+                items = todo_fact.get("items")
+                if not isinstance(items, list) or len(items) != 3:
+                    raise AssertionError("TODO continuation items 无效")
                 self.provider_state.todo_continuation_started.set()
                 self.provider_state.release_todo_continuation.wait(20)
                 self._send_tool_call(
                     "目录读取完成；我正在收敛分析并更新待办。",
                     "todo:complex:done",
-                    "todo__update",
+                    "todo__progress",
                     {
-                        "items": [
-                            {
-                                "todoId": "inspect",
-                                "label": "读取项目结构",
-                                "status": "completed",
-                            },
-                            {
-                                "todoId": "analyze",
-                                "label": "分析关键链路",
-                                "status": "completed",
-                            },
-                            {
-                                "todoId": "answer",
-                                "label": "整理最终结论",
-                                "status": "completed",
-                            },
+                        "planId": todo_fact["sourcePlanId"],
+                        "revision": todo_fact["sourcePlanRevision"],
+                        "updates": [
+                            {"todoId": item["todoId"], "status": "completed"}
+                            for item in items
                         ],
                     },
                 )
-            elif ordinal == 3:
+            elif ordinal == 4:
                 self._send_text("复杂任务的目录读取、链路分析与结论整理均已完成。", finish_reason="stop")
             else:
                 raise AssertionError(
-                    f"TODO Provider 轮次异常：ordinal={ordinal}, results={tool_result_ids}"
+                    f"TODO Provider 轮次异常：ordinal={ordinal}, results={completed_tool_names}"
+                )
+        elif marker == "AUTONOMY":
+            if ordinal == 1 and "fs.create" not in completed_tool_names:
+                self._send_tool_call(
+                    "当前工作区允许直接修改；无需发布权限门禁 Plan。",
+                    "e2e-call-autonomy",
+                    "fs__create",
+                    {
+                        "workspaceId": workspace_id,
+                        "path": "autonomy.txt",
+                        "content": "workspace autonomy\n",
+                    },
+                )
+            elif ordinal == 2 and "fs.create" in completed_tool_names:
+                self._send_text("已在绑定工作区内直接完成修改。", finish_reason="stop")
+            else:
+                raise AssertionError(
+                    f"AUTONOMY Provider 轮次异常：ordinal={ordinal}, "
+                    f"results={completed_tool_names}"
                 )
         else:
             raise AssertionError(f"未知 E2E marker：{marker}")
@@ -796,6 +892,25 @@ def message_command(session_id: str, command_id: str, text: str) -> dict[str, An
     }
 
 
+def plan_command(
+    session_id: str,
+    command_id: str,
+    run_id: str,
+    plan: dict[str, Any],
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": COMMAND_VERSION,
+        "type": "plan.respond",
+        "commandId": command_id,
+        "sessionId": session_id,
+        "runId": run_id,
+        "planId": plan["planId"],
+        "revision": plan["revision"],
+        "response": response,
+    }
+
+
 def run_execute(
     daemon: OwnedDaemon,
     workspace: Path,
@@ -820,13 +935,16 @@ def run_execute(
     )
     run_id = waiting["run"]["runId"]
     plan = waiting["pendingPlan"]
-    require(plan.get("responseMode") == "optionOrFreeform", "Plan responseMode 错误")
-    require(plan.get("ignoreAllowed") is True, "Plan 未显式允许 ignore")
-    require(len(plan.get("options", [])) == 2, "Plan 选项数量错误")
+    require(plan.get("responseMode") == "confirmReviseOrCancel", "Plan responseMode 错误")
+    require(plan.get("revision") == 1, "首个 Plan revision 错误")
+    require(plan.get("title") == "创建验收文件", "Plan 标题错误")
     require(
-        plan["options"][0]["operationsDisplay"]
-        == [f"fs.create · {workspace.name}:executed.txt"],
-        "Plan 展示没有使用逻辑 workspace 名称和精确 target",
+        plan.get("mutationManifest") == [{
+            "workspaceId": workspace_id,
+            "operation": "fs.create",
+            "target": "executed.txt",
+        }],
+        "Plan mutationManifest 没有精确 target",
     )
     require(
         any(
@@ -851,11 +969,14 @@ def run_execute(
     )
 
     resolved = run_tui(daemon, session_id, input_text="1\n/quit\n", timeout=25)
-    require(resolved.returncode == 0, f"TUI 数字选择 Plan 失败：{resolved.stderr}")
+    require(resolved.returncode == 0, f"TUI 确认 Plan 失败：{resolved.stderr}")
     output = f"{resolved.stdout}\n{resolved.stderr}"
-    require("Plan" in output and "1. 创建验收文件" in output, "TUI 没有渲染 Plan 选项")
+    require("Plan · revision 1" in output and "1. 创建验收文件" in output, "TUI 没有渲染完整 Plan")
     require("工具 fs.create [completed]" in output, "TUI 没有渲染完成的工具事实")
-    require("assistant: 已完成 **Plan 授权** 的文件创建。" in output, "TUI 缺少最终回答")
+    require(
+        "assistant: 已完成 **Plan 授权** 的文件创建。" in output,
+        f"TUI 缺少最终回答：{output}",
+    )
     final = wait_projection(
         daemon,
         session_id,
@@ -866,7 +987,8 @@ def run_execute(
     require((workspace / "executed.txt").read_text() == EXPECTED_CONTENT, "执行文件内容错误")
     activities = [
         item for item in final.get("activities", [])
-        if item.get("callId") == "e2e-call-execute"
+        if item.get("kind") == "tool"
+        and (item.get("tool") or {}).get("operation") == "fs.create"
     ]
     require(
         len(activities) == 1 and activities[0].get("status") == "completed",
@@ -906,19 +1028,34 @@ def run_feedback(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
         "FEEDBACK Plan waiting",
     )
     run_id = waiting["run"]["runId"]
+    original_plan = waiting["pendingPlan"]
     feedback = "改为只说明 docs/notes.md，不执行写入"
-    completed = run_cli(daemon, "--session", session_id, "ask", feedback, timeout=25)
-    require(completed.returncode == 0, f"CLI Plan 自由调整失败：{completed.stderr}")
+    revised_reply = run_cli(daemon, "--session", session_id, "ask", feedback, timeout=25)
+    require(revised_reply.returncode == 5, f"CLI Plan 修订没有停在新 Plan Gate：{revised_reply.stderr}")
+    revised = wait_projection(
+        daemon,
+        session_id,
+        lambda item: (item.get("pendingPlan") or {}).get("revision") == 2,
+        "FEEDBACK revised Plan waiting",
+    )
+    require(revised["pendingPlan"]["planId"] == original_plan["planId"], "修订 PlanId 漂移")
+    require(revised["pendingPlan"]["mutationManifest"] == [], "修订 Plan 意外保留 mutation")
+    completed = run_cli(daemon, "--session", session_id, "ask", "确认", timeout=25)
+    require(completed.returncode == 0, f"CLI 确认修订 Plan 失败：{completed.stderr}")
     output = f"{completed.stdout}\n{completed.stderr}"
-    require(feedback in output, "CLI 没有显示作为用户事实进入同一 run 的调整文本")
-    require("本轮未执行 workspace mutation" in output, "调整后没有 LLM 最终答复")
+    require("本轮未执行 workspace mutation" in output, "修订确认后没有 LLM 最终答复")
     final = wait_projection(
         daemon,
         session_id,
         lambda item: (item.get("run") or {}).get("status") == "completed",
         "FEEDBACK completed",
     )
-    require(final.get("pendingPlan") is None, "反馈后旧 Plan 未关闭")
+    require(final.get("pendingPlan") is None, "修订确认后 Plan 未关闭")
+    require(
+        [(plan.get("revision"), plan.get("status")) for plan in final.get("plans", [])]
+        == [(1, "superseded"), (2, "confirmed")],
+        "Plan revision lifecycle 错误",
+    )
     require(not (workspace / "feedback.txt").exists(), "反馈路线意外获得写入 authority")
     require(not (workspace / "docs" / "notes.md").exists(), "自然语言反馈被误当作 Plan")
     require(
@@ -928,37 +1065,38 @@ def run_feedback(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
     return session_id, run_id
 
 
-def run_ignore(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
+def run_plan_cancel(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
     created = create_session(daemon, workspace_paths=[workspace])
     session_id = created["sessionId"]
     original = message_command(
         session_id,
-        "command:ignore:start",
-        "E2E IGNORE：给出计划，我将明确忽略并直接回答。",
+        "command:plan-cancel:start",
+        "E2E PLAN_CANCEL：给出计划，我将明确取消。",
     )
-    require(command(daemon, session_id, original).get("status") == "accepted", "IGNORE 未接纳")
+    require(command(daemon, session_id, original).get("status") == "accepted", "PLAN_CANCEL 未接纳")
     waiting = wait_projection(
         daemon,
         session_id,
         lambda item: item.get("pendingPlan") is not None,
-        "IGNORE Plan waiting",
+        "PLAN_CANCEL Plan waiting",
     )
     run_id = waiting["run"]["runId"]
-    completed = run_cli(daemon, "--session", session_id, "ignore-plan", timeout=25)
-    require(completed.returncode == 0, f"CLI 忽略 Plan 失败：{completed.stderr}")
+    completed = run_cli(daemon, "--session", session_id, "cancel-plan", timeout=25)
+    require(completed.returncode == 0, f"CLI 取消 Plan 失败：{completed.stderr}")
     output = f"{completed.stdout}\n{completed.stderr}"
-    require("已忽略计划并直接回答" in output, "answer-only continuation 没有 LLM 最终回答")
+    require("已取消计划" in output, "取消后没有 LLM 最终回答")
     final = wait_projection(
         daemon,
         session_id,
         lambda item: (item.get("run") or {}).get("status") == "completed",
-        "IGNORE completed",
+        "PLAN_CANCEL completed",
     )
-    require(final.get("pendingPlan") is None, "忽略后 Plan 未关闭")
-    require(not (workspace / "ignored.txt").exists(), "忽略后仍执行了 mutation")
+    require(final.get("pendingPlan") is None, "取消后 Plan 未关闭")
+    require(final.get("plans", [])[0].get("status") == "cancelled", "Plan 未进入 cancelled")
+    require(not (workspace / "ignored.txt").exists(), "取消后仍执行了 mutation")
     require(
         not any(item.get("kind") == "tool" for item in final.get("activities", [])),
-        "忽略路线执行了工具",
+        "取消路线执行了工具",
     )
     return session_id, run_id
 
@@ -1020,13 +1158,13 @@ def run_failure(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
     )
     run_id = failed["run"]["runId"]
     require(
-        failed.get("terminalError", {}).get("code") == "session_control_plan_options_invalid",
+        failed.get("terminalError", {}).get("code") == "session_control_plan_steps_invalid",
         f"FAIL 原始结构错误未保留：{failed.get('terminalError')}",
     )
     shown = run_cli(daemon, "--session", session_id, "show")
     require(shown.returncode == 6, f"CLI failed 状态必须非零 6，实际 {shown.returncode}")
     require(
-        "session_control_plan_options_invalid" in f"{shown.stdout}\n{shown.stderr}",
+        "session_control_plan_steps_invalid" in f"{shown.stdout}\n{shown.stderr}",
         "CLI 未显示失败根因",
     )
     return session_id, run_id
@@ -1049,6 +1187,25 @@ def run_todo(
         "E2E TODO：这是复杂任务，请先形成 Todo，再读取目录并整理结论。",
     )
     require(command(daemon, session_id, original).get("status") == "accepted", "TODO 未接纳")
+    plan_waiting = wait_projection(
+        daemon,
+        session_id,
+        lambda item: item.get("pendingPlan") is not None,
+        "TODO Plan waiting",
+    )
+    run_id = plan_waiting["run"]["runId"]
+    confirm = command(
+        daemon,
+        session_id,
+        plan_command(
+            session_id,
+            "command:todo:confirm",
+            run_id,
+            plan_waiting["pendingPlan"],
+            {"kind": "confirm"},
+        ),
+    )
+    require(confirm.get("status") == "accepted", "TODO Plan 确认未接纳")
     wait_until(
         provider.todo_continuation_started.is_set,
         12,
@@ -1065,15 +1222,15 @@ def run_todo(
         ),
         "TODO active projection",
     )
-    run_id = active["run"]["runId"]
     require(
-        [todo.get("todoId") for todo in active["todoList"]["items"]]
-        == ["inspect", "analyze", "answer"],
-        "复杂任务 Todo 顺序或稳定 identity 错误",
+        [todo.get("sourceStepId") for todo in active["todoList"]["items"]]
+        == ["step:inspect", "step:analyze", "step:answer"],
+        "复杂任务 Todo 与 Plan step 顺序映射错误",
     )
     list_activities = [
         item for item in active.get("activities", [])
-        if item.get("callId") == "e2e-call-todo-list"
+        if item.get("kind") == "tool"
+        and (item.get("tool") or {}).get("operation") == "fs.list"
     ]
     require(
         len(list_activities) == 1 and list_activities[0].get("status") == "completed",
@@ -1081,7 +1238,7 @@ def run_todo(
     )
     require(
         any(
-            "建立待办并读取目录结构" in item.get("content", "")
+            "生成待办" in item.get("content", "")
             for item in active.get("narratives", [])
         ),
         "复杂任务调用工具前缺少 LLM narrative",
@@ -1286,7 +1443,7 @@ def inspect_sqlite(
     record_path = runtime_root / "tool-record.sqlite3"
     expected_versions = {
         catalog_path: 1,
-        session_path: 1,
+        session_path: 2,
         record_path: 1,
     }
     for path, expected_version in expected_versions.items():
@@ -1354,28 +1511,24 @@ def inspect_sqlite(
             else:
                 require(
                     payload.get("error", {}).get("code")
-                    == "session_control_plan_options_invalid",
+                    == "session_control_plan_steps_invalid",
                     "失败根因漂移",
                 )
 
-        execute_resolutions = [
+        execute_confirmations = [
             event for event in by_session[execute_session]
-            if event["type"] == "plan.intent.resolved"
+            if event["type"] == "plan.confirmed"
         ]
-        require(len(execute_resolutions) == 1, "EXECUTE Plan resolution 数量错误")
-        selected = execute_resolutions[0]["payload"]
-        require(
-            selected["response"] == {"kind": "select", "optionId": "option:create"},
-            "Plan 选择事实错误",
-        )
-        authorities = selected.get("authorities", [])
-        require(len(authorities) == 1, "Plan 选择没有产生单一 authority")
+        require(len(execute_confirmations) == 1, "EXECUTE Plan confirmation 数量错误")
+        confirmed = execute_confirmations[0]["payload"]
+        require(confirmed.get("revision") == 1, "Plan confirmation revision 错误")
+        authorities = confirmed.get("authorities", [])
+        require(len(authorities) == 1, "Plan 确认没有产生单一 authority")
         authority = authorities[0]
         require(authority["sessionId"] == execute_session, "PlanAuthority sessionId 错误")
-        require(
-            authority["runId"] == expected_runs[execute_session][0],
-            "PlanAuthority runId 错误",
-        )
+        require("runId" not in authority, "PlanAuthority 不应绑定单一 runId")
+        require(authority["revision"] == 1, "PlanAuthority revision 错误")
+        require(authority["decisionId"] == confirmed["decisionId"], "PlanAuthority decisionId 错误")
         require(authority["workspaceId"] == execute_workspace_id, "PlanAuthority workspaceId 错误")
         require(
             authority["coveredOperations"] == [{
@@ -1391,66 +1544,90 @@ def inspect_sqlite(
             if outcome == "completed"
             and sid != execute_session
             and any(
-                event["payload"].get("planId") == "plan:feedback"
+                event["payload"].get("providerCallId") == "plan:feedback"
                 for event in by_session[sid]
-                if event["type"] == "plan.intent.resolved"
+                if event["type"] == "plan.published"
             )
         )
-        feedback_resolution = next(
-            event["payload"] for event in by_session[feedback_session]
-            if event["type"] == "plan.intent.resolved"
+        feedback_events = by_session[feedback_session]
+        require(
+            len([event for event in feedback_events if event["type"] == "plan.revision.requested"]) == 1,
+            "Plan revision request 事实错误",
         )
         require(
-            feedback_resolution["response"]["kind"] == "feedback",
-            "Plan feedback 事实错误",
+            len([event for event in feedback_events if event["type"] == "plan.superseded"]) == 1,
+            "旧 Plan revision 未 supersede",
         )
-        require(
-            "authorities" not in feedback_resolution,
-            "Plan feedback 意外产生 authority",
+        revised_confirmation = next(
+            event["payload"] for event in feedback_events
+            if event["type"] == "plan.confirmed"
         )
+        require(revised_confirmation["revision"] == 2, "修订 Plan revision 错误")
+        require(revised_confirmation["authorities"] == [], "无 mutation 修订 Plan 意外产生 authority")
 
-        ignore_session = next(
+        plan_cancel_session = next(
             sid for sid, (_, outcome) in expected_runs.items()
             if outcome == "completed"
             and sid != execute_session
             and any(
-                event["payload"].get("planId") == "plan:ignore"
+                event["payload"].get("providerCallId") == "plan:ignore"
                 for event in by_session[sid]
-                if event["type"] == "plan.intent.resolved"
+                if event["type"] == "plan.published"
             )
         )
-        ignore_resolution = next(
-            event["payload"] for event in by_session[ignore_session]
-            if event["type"] == "plan.intent.resolved"
+        require(
+            len([
+                event for event in by_session[plan_cancel_session]
+                if event["type"] == "plan.cancelled"
+            ]) == 1,
+            "Plan cancel 事实错误",
         )
         require(
-            ignore_resolution["response"] == {"kind": "ignore"},
-            "Plan ignore 事实错误",
+            not any(
+                event["type"] == "plan.confirmed"
+                for event in by_session[plan_cancel_session]
+            ),
+            "Plan cancel 意外产生 confirmation",
         )
-        require("authorities" not in ignore_resolution, "Plan ignore 意外产生 authority")
 
         todo_sessions = [
             sid for sid, events in by_session.items()
-            if any(event["type"] == "todo.updated" for event in events)
+            if any(event["type"] == "todo.progressed" for event in events)
         ]
         require(len(todo_sessions) == 1, f"复杂任务 Todo Session 数量错误：{todo_sessions}")
-        todo_events = [
+        todo_seed = next(
             event for event in by_session[todo_sessions[0]]
-            if event["type"] == "todo.updated"
-        ]
-        require(
-            [event["callId"] for event in todo_events]
-            == ["todo:complex:start", "todo:complex:done"],
-            "Todo durable 调用顺序或 identity 错误",
+            if event["type"] == "todo.seeded"
         )
         require(
-            [item["status"] for item in todo_events[0]["payload"]["items"]]
+            [item["sourceStepId"] for item in todo_seed["payload"]["items"]]
+            == ["step:inspect", "step:analyze", "step:answer"],
+            "Todo seed 没有绑定 Plan steps",
+        )
+        todo_events = [
+            event for event in by_session[todo_sessions[0]]
+            if event["type"] == "todo.progressed"
+        ]
+        require(
+            [event["payload"]["providerCallId"] for event in todo_events]
+            == ["todo:complex:start", "todo:complex:done"],
+            "Todo durable Provider 调用顺序错误",
+        )
+        require(
+            [item["status"] for item in todo_events[0]["payload"]["updates"]]
             == ["inProgress", "pending", "pending"],
             "Todo 初始状态错误",
         )
         require(
-            all(item["status"] == "completed" for item in todo_events[1]["payload"]["items"]),
+            all(item["status"] == "completed" for item in todo_events[1]["payload"]["updates"]),
             "Todo 完成状态错误",
+        )
+        require(
+            any(
+                event["type"] == "plan.completed"
+                for event in by_session[todo_sessions[0]]
+            ),
+            "Todo 全部完成后 Plan 未进入 completed",
         )
 
         command_counts = dict(connection.execute(
@@ -1458,8 +1635,9 @@ def inspect_sqlite(
         ).fetchall())
         expected_command_counts = {
             execute_session: 3,
-            feedback_session: 2,
-            ignore_session: 2,
+            feedback_session: 3,
+            plan_cancel_session: 2,
+            todo_sessions[0]: 2,
         }
         for session_id, (_, outcome) in expected_runs.items():
             if session_id not in expected_command_counts:
@@ -1468,19 +1646,33 @@ def inspect_sqlite(
             command_counts == expected_command_counts,
             f"命令 durable 数量错误：{command_counts}",
         )
+        execute_tool_call_id = next(
+            event["callId"] for event in by_session[execute_session]
+            if event["type"] == "tool.requested"
+            and event["payload"].get("providerCallId") == "e2e-call-execute"
+        )
+        todo_tool_call_id = next(
+            event["callId"] for event in by_session[todo_sessions[0]]
+            if event["type"] == "tool.requested"
+            and event["payload"].get("providerCallId") == "e2e-call-todo-list"
+        )
 
     with sqlite3.connect(f"file:{record_path}?mode=ro", uri=True) as connection:
         rows = connection.execute(
             "SELECT call_id, workspace_id, operation, logical_targets_json, record_json "
             "FROM tool_records ORDER BY call_id"
         ).fetchall()
+        require(len(rows) == 2, "ToolRecord 数量错误")
+        rows_by_call = {row[0]: row for row in rows}
         require(
-            [row[0] for row in rows] == ["e2e-call-execute", "e2e-call-todo-list"],
-            "ToolRecord 闭包错误",
+            set(rows_by_call) == {execute_tool_call_id, todo_tool_call_id},
+            "ToolRecord 没有绑定 Session LogicalCallId",
         )
-        call_id, workspace_id, operation, logical_targets, encoded = rows[0]
+        call_id, workspace_id, operation, logical_targets, encoded = rows_by_call[
+            execute_tool_call_id
+        ]
         record = json.loads(encoded)
-        require(call_id == "e2e-call-execute", "ToolRecord callId 错误")
+        require(call_id == execute_tool_call_id, "ToolRecord callId 错误")
         require(workspace_id == execute_workspace_id, "ToolRecord workspaceId 错误")
         require(operation == "fs.create", "ToolRecord operation 错误")
         require(json.loads(logical_targets) == ["executed.txt"], "ToolRecord logical targets 错误")
@@ -1506,9 +1698,11 @@ def inspect_sqlite(
             == "executed.txt",
             "PreparedEffect canonical invocation 错误",
         )
-        todo_call_id, todo_workspace_id, todo_operation, todo_targets, todo_encoded = rows[1]
+        todo_call_id, todo_workspace_id, todo_operation, todo_targets, todo_encoded = rows_by_call[
+            todo_tool_call_id
+        ]
         todo_record = json.loads(todo_encoded)
-        require(todo_call_id == "e2e-call-todo-list", "Todo ToolRecord callId 错误")
+        require(todo_call_id == todo_tool_call_id, "Todo ToolRecord callId 错误")
         require(
             todo_workspace_id == expected_todo_workspace_id,
             "Todo ToolRecord workspaceId 错误",
@@ -1551,7 +1745,13 @@ def inspect_sqlite(
         )
 
 
-def write_configuration(config_root: Path, provider_url: str) -> None:
+def write_configuration(
+    config_root: Path,
+    provider_url: str,
+    *,
+    workspace_mutation: str = "plan",
+    engineering_decisions: str = "ask",
+) -> None:
     settings = config_root / "config" / "user" / "local" / "settings"
     settings.mkdir(parents=True)
     profile = {
@@ -1587,10 +1787,63 @@ def write_configuration(config_root: Path, provider_url: str) -> None:
     )
     user_settings = {
         "gui.colorTheme": "light",
+        "agent.permissions.workspaceMutation": workspace_mutation,
+        "agent.permissions.engineeringDecisions": engineering_decisions,
     }
     (settings / "user-settings.json").write_text(
         json.dumps(user_settings, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
+    )
+
+
+def run_workspace_autonomy(daemon: OwnedDaemon, workspace: Path) -> None:
+    created = create_session(daemon, workspace_paths=[workspace])
+    session_id = created["sessionId"]
+    workspace_id = created["workspaceBindings"][0]["workspaceId"]
+    reply = command(
+        daemon,
+        session_id,
+        message_command(
+            session_id,
+            "command:autonomy:start",
+            "E2E AUTONOMY：直接完成绑定工作区修改，不发布 Plan。",
+        ),
+    )
+    require(reply.get("status") == "accepted", "AUTONOMY 消息未接纳")
+    completed = wait_projection(
+        daemon,
+        session_id,
+        lambda item: (item.get("run") or {}).get("status") == "completed",
+        "AUTONOMY completed",
+    )
+    require(completed.get("plans") == [], "关闭 Plan 门禁后仍发布了 Plan")
+    require(completed.get("todoList") is None, "无 Plan 的直接修改意外生成 Todo")
+    require(
+        (workspace / "autonomy.txt").read_text(encoding="utf-8")
+        == "workspace autonomy\n",
+        "完全访问工作区模式没有创建目标文件",
+    )
+
+    record_path = (
+        daemon.config_root / "runtime" / "agent-runtime" / "tool-record.sqlite3"
+    )
+    with sqlite3.connect(f"file:{record_path}?mode=ro", uri=True) as connection:
+        rows = connection.execute(
+            "SELECT workspace_id, operation, record_json FROM tool_records"
+        ).fetchall()
+    require(len(rows) == 1, "AUTONOMY ToolRecord 数量错误")
+    record_workspace_id, operation, encoded = rows[0]
+    record = json.loads(encoded)
+    require(record_workspace_id == workspace_id, "AUTONOMY workspaceId 错误")
+    require(operation == "fs.create", "AUTONOMY operation 错误")
+    require(
+        record.get("authority") == {
+            "decision": "allow",
+            "source": "userSetting",
+            "authorityId": "user-setting:agent.permissions.workspaceMutation",
+            "workspaceId": workspace_id,
+        },
+        "AUTONOMY 写入没有使用显式工作区权限设置",
     )
 
 
@@ -1601,6 +1854,7 @@ def main() -> None:
     provider_thread.start()
     daemon_one: OwnedDaemon | None = None
     daemon_two: OwnedDaemon | None = None
+    daemon_three: OwnedDaemon | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="deepcode-agent-runtime-e2e-") as temporary:
             root = Path(temporary)
@@ -1633,7 +1887,7 @@ def main() -> None:
                 provider_state,
             )
             feedback_session, feedback_run = run_feedback(daemon_one, primary)
-            ignore_session, ignore_run = run_ignore(daemon_one, primary)
+            plan_cancel_session, plan_cancel_run = run_plan_cancel(daemon_one, primary)
             cancel_session, cancel_run = run_cancel(daemon_one, primary, provider_state)
             failure_session, failure_run = run_failure(daemon_one, primary)
             todo_session, todo_run, todo_revision, todo_workspace_id = run_todo(
@@ -1642,11 +1896,11 @@ def main() -> None:
                 provider_state,
             )
             require(provider_state.count("EXECUTE") == 3, "EXECUTE Provider 调用数错误")
-            require(provider_state.count("FEEDBACK") == 2, "FEEDBACK Provider 调用数错误")
-            require(provider_state.count("IGNORE") == 2, "IGNORE Provider 调用数错误")
+            require(provider_state.count("FEEDBACK") == 3, "FEEDBACK Provider 调用数错误")
+            require(provider_state.count("PLAN_CANCEL") == 2, "PLAN_CANCEL Provider 调用数错误")
             require(provider_state.count("CANCEL") == 1, "CANCEL Provider 调用数错误")
             require(provider_state.count("FAIL") == 2, "FAIL Provider 调用数错误")
-            require(provider_state.count("TODO") == 3, "TODO Provider 调用数错误")
+            require(provider_state.count("TODO") == 4, "TODO Provider 调用数错误")
             require(
                 provider_state.models("EXECUTE") == [
                     "mock-primary", "mock-secondary", "mock-secondary",
@@ -1663,7 +1917,7 @@ def main() -> None:
             expected_runs = {
                 execute_session: (execute_run, "completed"),
                 feedback_session: (feedback_run, "completed"),
-                ignore_session: (ignore_run, "completed"),
+                plan_cancel_session: (plan_cancel_run, "completed"),
                 cancel_session: (cancel_run, "cancelled"),
                 failure_session: (failure_run, "failed"),
                 todo_session: (todo_run, "completed"),
@@ -1719,15 +1973,33 @@ def main() -> None:
                 workspace_id,
                 todo_workspace_id,
             )
+            autonomy_config_root = root / "autonomy-config-root"
+            autonomy_workspace = root / "autonomy-workspace"
+            autonomy_config_root.mkdir()
+            autonomy_workspace.mkdir()
+            provider_state.forbid_roots([primary, secondary, autonomy_workspace])
+            write_configuration(
+                autonomy_config_root,
+                provider_url,
+                workspace_mutation="allow",
+                engineering_decisions="delegate",
+            )
+            daemon_three = OwnedDaemon(autonomy_config_root)
+            daemon_three.start()
+            run_workspace_autonomy(daemon_three, autonomy_workspace)
+            require(provider_state.count("AUTONOMY") == 2, "AUTONOMY Provider 调用数错误")
+            daemon_three.shutdown()
             print(
                 "[local-agent-e2e] PASS "
-                "plan/todo/catalog/snapshot/replay/restart/cli/tui/failure"
+                "plan/todo/autonomy/catalog/snapshot/replay/restart/cli/tui/failure"
             )
     finally:
         provider_state.release_cancel.set()
         provider_state.release_todo_continuation.set()
         if daemon_two is not None:
             daemon_two.close()
+        if daemon_three is not None:
+            daemon_three.close()
         if daemon_one is not None:
             daemon_one.close()
         provider_server.shutdown()

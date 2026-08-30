@@ -1627,6 +1627,7 @@ verify_macos_package_runtime() {
   local macos_dir="$BIN_ROOT/macos-arm64"
   local missing=0
   local checked_app=0
+  local validation_node=""
   [ -d "$macos_dir" ] || return 2
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
@@ -1640,9 +1641,19 @@ verify_macos_package_runtime() {
     "$macos_dir/node_modules/@deepcode/protocol/dist" \
     "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
+  # The profile check only parses JSON. A Linux compile container must use a
+  # Node binary for its own architecture instead of executing the packaged
+  # Darwin runtime; the Darwin binary itself is validated by the host package.
+  if [ "$(uname -s)" = "Darwin" ] && [ -x "$macos_dir/node/bin/node" ]; then
+    validation_node="$macos_dir/node/bin/node"
+  elif [ -x "$LINUX_DIR/node/bin/node" ]; then
+    validation_node="$LINUX_DIR/node/bin/node"
+  elif command -v node >/dev/null 2>&1; then
+    validation_node="$(command -v node)"
+  fi
   verify_llm_profiles_current \
     "$macos_dir/config/user/local/settings/llm-profiles.json" \
-    "$macos_dir/node/bin/node" \
+    "$validation_node" \
     "macOS LLM Profile store" || missing=1
 
   if [ -d "$macos_dir/DeepCode.app" ]; then

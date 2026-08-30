@@ -7,8 +7,9 @@ export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
 export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
-export const SESSION_CONTROL_PLAN_INTENT = 'plan.intent' as const;
-export const SESSION_CONTROL_TODO_UPDATE = 'todo.update' as const;
+export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
+export const SESSION_CONTROL_TODO_PROGRESS = 'todo.progress' as const;
+export const SESSION_CONTROL_CONTEXT_FOCUS = 'context.focus' as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -70,6 +71,9 @@ export interface MessageAttachmentProjection {
   byteLength: number;
 }
 
+/** Logical directory reference owned by one user message; absolute roots remain Host-private. */
+export interface MessageDirectoryAttachment extends WorkspaceBindingDisplay {}
+
 export type PlanOperationName =
   | 'fs.create'
   | 'fs.write'
@@ -90,23 +94,26 @@ export type PlanOperation =
       targetKind: 'file' | 'directoryTree';
     };
 
-export interface PlanOption {
-  optionId: string;
-  label: string;
-  description?: string;
-  operations: PlanOperation[];
+export interface ExecutionPlanStep {
+  stepId: string;
+  title: string;
+  details: string;
+  verification?: string[];
 }
 
-export interface PlanIntent {
+export interface ExecutionPlan {
   planId: string;
-  prompt: string;
-  options: PlanOption[];
+  revision: number;
+  title: string;
+  summary: string;
+  steps: ExecutionPlanStep[];
+  mutationManifest: PlanOperation[];
 }
 
 export type PlanResponse =
-  | { kind: 'select'; optionId: string }
-  | { kind: 'feedback'; text: string; optionId?: string }
-  | { kind: 'ignore' };
+  | { kind: 'confirm' }
+  | { kind: 'requestRevision'; text: string }
+  | { kind: 'cancel' };
 
 export type MessageFeedback = 'up' | 'down';
 
@@ -132,6 +139,7 @@ export type ConversationCommand =
       sessionId: string;
       text: string;
       attachments?: UserMessageAttachment[];
+      directoryAttachments?: MessageDirectoryAttachment[];
       profileId?: string;
     }
   | {
@@ -183,6 +191,7 @@ export type ConversationCommand =
       sessionId: string;
       runId: string;
       planId: string;
+      revision: number;
       response: PlanResponse;
     };
 
@@ -316,6 +325,7 @@ export interface ContextCompositionPartitionProjection
 
 export interface ContextCompositionReceipt {
   providerRequestId: string;
+  purpose: 'agent' | 'contextCompaction';
   responseConstraint: 'normal' | 'answerOnly';
   messages: ContextCompositionMessage[];
   workspaceBindings: ContextCompositionItem[];
@@ -325,6 +335,7 @@ export interface ContextCompositionReceipt {
 
 interface ContextCompositionProjectionBase {
   providerRequestId: string;
+  purpose: 'agent' | 'contextCompaction';
   responseConstraint: 'normal' | 'answerOnly';
   runId: string;
   sequence: number;
@@ -342,15 +353,42 @@ export type TodoStatus = 'pending' | 'inProgress' | 'completed';
 
 export interface TodoItem {
   todoId: string;
+  sourceStepId: string;
   label: string;
   status: TodoStatus;
 }
 
 export interface TodoListProjection {
-  runId: string;
+  sourcePlanId: string;
+  sourcePlanRevision: number;
   items: TodoItem[];
   sequence: number;
   updatedAt: string;
+}
+
+export interface TodoProgressUpdate {
+  todoId: string;
+  status: TodoStatus;
+}
+
+export type ContextCompactionTrigger = 'pressure' | 'userFocus' | 'agentFocus';
+
+export type ContextCompactionRequestPayload = {
+  compactionId: string;
+  providerRequestId: string;
+  coveredThroughSequence: number;
+} & (
+  | { trigger: 'pressure' }
+  | { trigger: 'userFocus'; focus: string; commandId: string }
+  | { trigger: 'agentFocus'; focus: string; providerCallId: string }
+);
+
+export interface ContextCompactedPayload {
+  compactionId: string;
+  providerRequestId: string;
+  trigger: ContextCompactionTrigger;
+  coveredThroughSequence: number;
+  summary: string;
 }
 
 export interface EffectPreview {
@@ -403,6 +441,7 @@ export type SessionEvent =
         role: 'user' | 'assistant' | 'tool' | 'system';
         content: string;
         attachments?: UserMessageAttachment[];
+        directoryAttachments?: MessageDirectoryAttachment[];
       };
     })
   | (SessionEventBase & {
@@ -429,25 +468,74 @@ export type SessionEvent =
       payload: { interactionId: string; commandId: string; response: string };
     })
   | (SessionEventBase & {
-      type: 'plan.intent.requested';
+      type: 'plan.published';
       runId: string;
-      payload: PlanIntent & { providerCallId: string };
+      callId: string;
+      payload: ExecutionPlan & { providerCallId: string };
     })
   | (SessionEventBase & {
-      type: 'plan.intent.resolved';
+      type: 'plan.confirmed';
       runId: string;
+      callId: string;
       payload: {
         planId: string;
+        revision: number;
         commandId: string;
-        response: PlanResponse;
-        authorities?: PlanAuthority[];
+        decisionId: string;
+        authorities: PlanAuthority[];
       };
     })
   | (SessionEventBase & {
-      type: 'todo.updated';
+      type: 'plan.revision.requested';
       runId: string;
       callId: string;
-      payload: { providerCallId: string; items: TodoItem[] };
+      payload: { planId: string; revision: number; commandId: string; text: string };
+    })
+  | (SessionEventBase & {
+      type: 'plan.superseded';
+      runId: string;
+      payload: {
+        planId: string;
+        revision: number;
+        supersededByPlanId: string;
+        supersededByRevision: number;
+      };
+    })
+  | (SessionEventBase & {
+      type: 'plan.cancelled';
+      runId: string;
+      callId: string;
+      payload: { planId: string; revision: number; commandId: string };
+    })
+  | (SessionEventBase & {
+      type: 'plan.completed';
+      runId: string;
+      payload: { planId: string; revision: number };
+    })
+  | (SessionEventBase & {
+      type: 'plan.invalidated';
+      runId: string;
+      payload: { planId: string; revision: number; reason: string; sourceFactRef: string };
+    })
+  | (SessionEventBase & {
+      type: 'todo.seeded' | 'todo.reconciled';
+      runId: string;
+      payload: {
+        sourcePlanId: string;
+        sourcePlanRevision: number;
+        items: TodoItem[];
+      };
+    })
+  | (SessionEventBase & {
+      type: 'todo.progressed';
+      runId: string;
+      callId: string;
+      payload: {
+        providerCallId: string;
+        sourcePlanId: string;
+        sourcePlanRevision: number;
+        updates: TodoProgressUpdate[];
+      };
     })
   | (SessionEventBase & {
       type: 'tool.requested';
@@ -495,6 +583,18 @@ export type SessionEvent =
       };
     })
   | (SessionEventBase & {
+      type: 'context.compaction.requested';
+      runId: string;
+      callId?: string;
+      payload: ContextCompactionRequestPayload;
+    })
+  | (SessionEventBase & {
+      type: 'context.compacted';
+      runId: string;
+      callId?: string;
+      payload: ContextCompactedPayload;
+    })
+  | (SessionEventBase & {
       type: 'context.composed';
       runId: string;
       payload: ContextCompositionReceipt;
@@ -526,6 +626,7 @@ export interface ProjectionMessage {
   role: 'user' | 'assistant' | 'tool' | 'system';
   content: string;
   attachments: MessageAttachmentProjection[];
+  directoryAttachments: MessageDirectoryAttachment[];
   feedback: MessageFeedback | null;
   sequence: number;
   createdAt: string;
@@ -565,22 +666,28 @@ export interface AssistantDraftProjection {
   content: string;
 }
 
-export interface PlanOptionProjection {
-  optionId: string;
-  label: string;
-  description?: string;
-  operationsDisplay: string[];
-}
+export type PlanProjectionStatus =
+  | 'published'
+  | 'revisionRequested'
+  | 'confirmed'
+  | 'superseded'
+  | 'cancelled'
+  | 'completed'
+  | 'invalidated';
 
-export interface PendingPlanProjection {
-  planId: string;
+export interface PlanProjection extends ExecutionPlan {
   runId: string;
-  prompt: string;
-  options: PlanOptionProjection[];
-  responseMode: 'optionOrFreeform';
-  ignoreAllowed: true;
+  callId: string;
+  status: PlanProjectionStatus;
+  decisionId?: string;
   sequence: number;
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface PendingPlanProjection extends PlanProjection {
+  status: 'published';
+  responseMode: 'confirmReviseOrCancel';
 }
 
 export interface RunProjection {
@@ -628,6 +735,33 @@ export interface ActivityResourceProjection {
 export interface ToolActivityProjection {
   operation: string;
   resources: ActivityResourceProjection[];
+  shell?: ShellActivityProjection;
+}
+
+export interface ShellActivityProjection {
+  command: string;
+  cwd: string;
+  result?: ShellActivityResultProjection;
+}
+
+export interface ShellActivityResultProjection {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  success: boolean;
+  timedOut: boolean;
+  truncated: boolean;
+  capturedBytes: number;
+  durationMs: number;
+  environment?: ShellExecutionEnvironmentProjection;
+}
+
+export interface ShellExecutionEnvironmentProjection {
+  shell: string;
+  interactive: false;
+  pathSource: 'hostPlusStandardDeveloperPaths';
+  writeScope: 'workspaceAndKernelTemporary';
+  homeWritable: false;
 }
 
 export interface ArtifactProjection {
@@ -656,6 +790,8 @@ export interface SessionProjection {
   assistantDraft: AssistantDraftProjection | null;
   pendingInteraction: InteractionProjection | null;
   pendingApproval: ApprovalProjection | null;
+  plans: PlanProjection[];
+  activePlanRef: { planId: string; revision: number } | null;
   pendingPlan: PendingPlanProjection | null;
   todoList: TodoListProjection | null;
   contextUsage: ContextUsageProjection | null;
@@ -677,6 +813,7 @@ export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   reasoningContent?: string;
+  reasoningSignature?: string;
   toolCallId?: string;
   toolCalls?: readonly ModelToolCall[];
 }
@@ -699,7 +836,9 @@ export interface ProviderRequest {
   sessionId: string;
   runId: string;
   profileId?: string;
+  purpose: 'agent' | 'contextCompaction';
   responseConstraint: 'normal' | 'answerOnly';
+  maxOutputTokens?: number;
   workspaceBindings: readonly WorkspaceBindingDisplay[];
   messages: readonly ModelMessage[];
   tools: readonly ProviderToolDefinition[];
@@ -716,7 +855,12 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'assistant.message';
-      data: { messageId: string; content: string; reasoningContent?: string };
+      data: {
+        messageId: string;
+        content: string;
+        reasoningContent?: string;
+        reasoningSignature?: string;
+      };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
@@ -759,9 +903,9 @@ export interface ToolDescriptor {
 export interface PlanAuthority {
   authorityId: string;
   planId: string;
-  optionId: string;
+  revision: number;
+  decisionId: string;
   sessionId: string;
-  runId: string;
   workspaceId: string;
   coveredOperations: PlanOperation[];
 }
@@ -804,6 +948,8 @@ export type AuthorityDecision =
       workspaceId: string;
       authorityId: string;
       planId: string;
+      revision: number;
+      decisionId: string;
     }
   | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string }
   | { decision: 'deny'; source: 'kernel' | 'user' | 'userSetting'; reason: string };

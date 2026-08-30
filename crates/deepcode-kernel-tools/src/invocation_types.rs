@@ -43,8 +43,20 @@ pub enum KernelToolKind {
     FsList,
     #[serde(rename = "fs.read")]
     FsRead,
+    #[serde(rename = "fs.stat")]
+    FsStat,
     #[serde(rename = "fs.write")]
     FsWrite,
+    #[serde(rename = "process.shell")]
+    ProcessShell,
+    #[serde(rename = "github.read")]
+    GithubRead,
+    #[serde(rename = "github.search")]
+    GithubSearch,
+    #[serde(rename = "arxiv.read")]
+    ArxivRead,
+    #[serde(rename = "arxiv.search")]
+    ArxivSearch,
     #[serde(rename = "web.fetch")]
     WebFetch,
     #[serde(rename = "web.search")]
@@ -64,7 +76,13 @@ impl KernelToolKind {
             Self::FsGlob => "fs.glob",
             Self::FsList => "fs.list",
             Self::FsRead => "fs.read",
+            Self::FsStat => "fs.stat",
             Self::FsWrite => "fs.write",
+            Self::ProcessShell => "process.shell",
+            Self::GithubRead => "github.read",
+            Self::GithubSearch => "github.search",
+            Self::ArxivRead => "arxiv.read",
+            Self::ArxivSearch => "arxiv.search",
             Self::WebFetch => "web.fetch",
             Self::WebSearch => "web.search",
         }
@@ -102,6 +120,40 @@ pub enum KernelDocumentPages {
 pub enum KernelSearchStrategy {
     Literal,
     Regex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelGithubSearchKind {
+    Repositories,
+    Code,
+    Issues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelArxivSearchField {
+    All,
+    Title,
+    Author,
+    Abstract,
+    Category,
+    Id,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelArxivSortBy {
+    Relevance,
+    LastUpdatedDate,
+    SubmittedDate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelSortOrder {
+    Ascending,
+    Descending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +219,8 @@ pub enum KernelCanonicalInvocation {
         path: String,
         range: KernelLineRange,
     },
+    #[serde(rename = "fs.stat")]
+    FsStat { path: String },
     #[serde(rename = "fs.list")]
     FsList {
         path: String,
@@ -217,6 +271,38 @@ pub enum KernelCanonicalInvocation {
         path: String,
         pages: KernelDocumentPages,
     },
+    #[serde(rename = "process.shell")]
+    ProcessShell {
+        command: String,
+        cwd: String,
+        timeout_ms: u32,
+        max_output_bytes: u32,
+    },
+    #[serde(rename = "github.search")]
+    GithubSearch {
+        query: String,
+        kind: KernelGithubSearchKind,
+        page: u32,
+        limit: u32,
+    },
+    #[serde(rename = "github.read")]
+    GithubRead {
+        repository: String,
+        path: String,
+        reference: Option<String>,
+        max_bytes: u32,
+    },
+    #[serde(rename = "arxiv.search")]
+    ArxivSearch {
+        query: String,
+        field: KernelArxivSearchField,
+        start: u32,
+        limit: u32,
+        sort_by: KernelArxivSortBy,
+        sort_order: KernelSortOrder,
+    },
+    #[serde(rename = "arxiv.read")]
+    ArxivRead { id: String },
     #[serde(rename = "web.search")]
     WebSearch { query: String, limit: u32 },
     #[serde(rename = "web.fetch")]
@@ -227,6 +313,7 @@ impl KernelCanonicalInvocation {
     pub fn tool_id(&self) -> KernelToolKind {
         match self {
             Self::FsRead { .. } => KernelToolKind::FsRead,
+            Self::FsStat { .. } => KernelToolKind::FsStat,
             Self::FsList { .. } => KernelToolKind::FsList,
             Self::FsGlob { .. } => KernelToolKind::FsGlob,
             Self::FsDiff { .. } => KernelToolKind::FsDiff,
@@ -237,6 +324,11 @@ impl KernelCanonicalInvocation {
             Self::FsDelete(_) => KernelToolKind::FsDelete,
             Self::FsEnsureDirectory { .. } => KernelToolKind::FsEnsureDirectory,
             Self::DocumentRead { .. } => KernelToolKind::DocumentRead,
+            Self::ProcessShell { .. } => KernelToolKind::ProcessShell,
+            Self::GithubSearch { .. } => KernelToolKind::GithubSearch,
+            Self::GithubRead { .. } => KernelToolKind::GithubRead,
+            Self::ArxivSearch { .. } => KernelToolKind::ArxivSearch,
+            Self::ArxivRead { .. } => KernelToolKind::ArxivRead,
             Self::WebSearch { .. } => KernelToolKind::WebSearch,
             Self::WebFetch { .. } => KernelToolKind::WebFetch,
         }
@@ -262,6 +354,7 @@ impl KernelCanonicalInvocation {
                     validate_range("range", *start_line, *end_line)?;
                 }
             }
+            Self::FsStat { path } => validate_path(path, true)?,
             Self::FsList { path, depth, .. } => {
                 validate_path(path, true)?;
                 validate_u32("depth", *depth, 1, 16)?;
@@ -317,6 +410,51 @@ impl KernelCanonicalInvocation {
                     }
                 }
             }
+            Self::ProcessShell {
+                command,
+                cwd,
+                timeout_ms,
+                max_output_bytes,
+            } => {
+                validate_text("command", command, false)?;
+                validate_path(cwd, true)?;
+                validate_u32("timeoutMs", *timeout_ms, 100, 600_000)?;
+                validate_u32("maxOutputBytes", *max_output_bytes, 1_024, 1_048_576)?;
+                if let Some(reason) = process_shell_hard_deny_reason(command) {
+                    return Err(invalid_value("command", reason));
+                }
+            }
+            Self::GithubSearch {
+                query, page, limit, ..
+            } => {
+                validate_text("query", query, false)?;
+                validate_u32("page", *page, 1, 100)?;
+                validate_u32("limit", *limit, 1, 30)?;
+            }
+            Self::GithubRead {
+                repository,
+                path,
+                reference,
+                max_bytes,
+            } => {
+                validate_repository(repository)?;
+                validate_path(path, true)?;
+                if let Some(reference) = reference {
+                    validate_text("ref", reference, false)?;
+                }
+                validate_u32("maxBytes", *max_bytes, 1_024, 262_144)?;
+            }
+            Self::ArxivSearch {
+                query,
+                start,
+                limit,
+                ..
+            } => {
+                validate_text("query", query, false)?;
+                validate_u32("start", *start, 0, 10_000)?;
+                validate_u32("limit", *limit, 1, 30)?;
+            }
+            Self::ArxivRead { id } => validate_arxiv_id(id)?,
             Self::WebSearch { query, limit } => {
                 validate_text("query", query, false)?;
                 validate_u32("limit", *limit, 1, 10)?;
@@ -348,6 +486,7 @@ impl KernelCanonicalInvocation {
                     "endLine": end_line,
                 }),
             },
+            Self::FsStat { path } => json!({ "path": path }),
             Self::FsList {
                 path,
                 depth,
@@ -429,10 +568,288 @@ impl KernelCanonicalInvocation {
                     "endPage": end_page,
                 }),
             },
+            Self::ProcessShell {
+                command,
+                cwd,
+                timeout_ms,
+                max_output_bytes,
+            } => json!({
+                "command": command,
+                "cwd": cwd,
+                "timeoutMs": timeout_ms,
+                "maxOutputBytes": max_output_bytes,
+            }),
+            Self::GithubSearch {
+                query,
+                kind,
+                page,
+                limit,
+            } => json!({
+                "query": query,
+                "kind": kind,
+                "page": page,
+                "limit": limit,
+            }),
+            Self::GithubRead {
+                repository,
+                path,
+                reference,
+                max_bytes,
+            } => {
+                let mut value = json!({
+                    "repository": repository,
+                    "path": path,
+                    "maxBytes": max_bytes,
+                });
+                if let Some(reference) = reference {
+                    value["ref"] = json!(reference);
+                }
+                value
+            }
+            Self::ArxivSearch {
+                query,
+                field,
+                start,
+                limit,
+                sort_by,
+                sort_order,
+            } => json!({
+                "query": query,
+                "field": field,
+                "start": start,
+                "limit": limit,
+                "sortBy": sort_by,
+                "sortOrder": sort_order,
+            }),
+            Self::ArxivRead { id } => json!({ "id": id }),
             Self::WebSearch { query, limit } => json!({ "query": query, "limit": limit }),
             Self::WebFetch { url, max_bytes } => json!({ "url": url, "maxBytes": max_bytes }),
         }
     }
+}
+
+/// Returns the narrow, non-configurable reason that a shell command must not
+/// be spawned. This is deliberately limited to disk/volume formatting and
+/// obvious recursive cleanup of operating-system roots; it is not a general
+/// shell policy engine.
+pub fn process_shell_hard_deny_reason(command: &str) -> Option<&'static str> {
+    process_shell_hard_deny_reason_at_depth(command, 0)
+}
+
+fn process_shell_hard_deny_reason_at_depth(
+    command: &str,
+    nesting_depth: usize,
+) -> Option<&'static str> {
+    for segment in shell_command_segments(command) {
+        let words = shell_words(segment);
+        let Some(program_index) = shell_program_index(&words) else {
+            continue;
+        };
+        let program = executable_basename(&words[program_index]).to_ascii_lowercase();
+        let arguments = &words[program_index + 1..];
+        if program == "mkfs"
+            || program.starts_with("mkfs.")
+            || program == "newfs"
+            || program.starts_with("newfs_")
+            || matches!(program.as_str(), "format" | "format.com")
+        {
+            return Some("is always denied because it formats a disk or volume");
+        }
+        if program == "diskutil"
+            && arguments.iter().any(|argument| {
+                matches!(
+                    argument.to_ascii_lowercase().as_str(),
+                    "erasedisk" | "erasevolume" | "partitiondisk" | "zerodisk"
+                )
+            })
+        {
+            return Some("is always denied because it formats or erases a disk or volume");
+        }
+        if program == "rm" && rm_recursively_forces_system_root(arguments) {
+            return Some("is always denied because it recursively removes a system root");
+        }
+        if nesting_depth < 4 && matches!(program.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+            if let Some(nested) = shell_command_argument(arguments) {
+                if let Some(reason) =
+                    process_shell_hard_deny_reason_at_depth(nested, nesting_depth + 1)
+                {
+                    return Some(reason);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn shell_command_argument(arguments: &[String]) -> Option<&str> {
+    arguments.windows(2).find_map(|pair| {
+        let option = pair[0].as_str();
+        (option == "-c" || option.starts_with('-') && option[1..].contains('c'))
+            .then_some(pair[1].as_str())
+    })
+}
+
+fn shell_command_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_none() && matches!(character, ';' | '\n' | '&' | '|') {
+            segments.push(&command[start..index]);
+            start = index + character.len_utf8();
+        }
+    }
+    segments.push(&command[start..]);
+    segments
+}
+
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in segment.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        if character.is_whitespace() && quote.is_none() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(character);
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn shell_program_index(words: &[String]) -> Option<usize> {
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = executable_basename(&words[index]).to_ascii_lowercase();
+        if is_environment_assignment(&words[index]) {
+            index += 1;
+            continue;
+        }
+        if matches!(word.as_str(), "command" | "builtin" | "exec") {
+            index += 1;
+            continue;
+        }
+        if word == "env" || word == "sudo" {
+            index += 1;
+            while index < words.len()
+                && (words[index].starts_with('-') || is_environment_assignment(&words[index]))
+            {
+                index += 1;
+            }
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn executable_basename(value: &str) -> &str {
+    value
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(value)
+}
+
+fn is_environment_assignment(value: &str) -> bool {
+    let Some((name, _)) = value.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
+}
+
+fn rm_recursively_forces_system_root(arguments: &[String]) -> bool {
+    let mut recursive = false;
+    let mut force = false;
+    let mut targets = Vec::new();
+    let mut options_finished = false;
+    for argument in arguments {
+        if !options_finished && argument == "--" {
+            options_finished = true;
+            continue;
+        }
+        if !options_finished && argument.starts_with("--") {
+            recursive |= argument == "--recursive";
+            force |= argument == "--force";
+            continue;
+        }
+        if !options_finished && argument.starts_with('-') && argument != "-" {
+            recursive |= argument[1..].chars().any(|flag| matches!(flag, 'r' | 'R'));
+            force |= argument[1..].chars().any(|flag| flag == 'f');
+            continue;
+        }
+        targets.push(argument.as_str());
+    }
+    recursive && force && targets.into_iter().any(is_system_root_target)
+}
+
+fn is_system_root_target(target: &str) -> bool {
+    let mut normalized = target.replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    let lower = normalized.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "/" | "/*"
+            | "/."
+            | "/system"
+            | "/system/*"
+            | "/system/volumes"
+            | "/system/volumes/*"
+            | "/system/volumes/data"
+            | "/system/volumes/data/*"
+            | "c:"
+            | "c:/*"
+    )
 }
 
 fn matcher_for_executor(matcher: &KernelEditMatcher) -> Value {
@@ -488,6 +905,37 @@ fn validate_path(value: &str, allow_dot: bool) -> Result<(), ToolValidationError
             "path",
             "must be a normalized workspace-relative path",
         ));
+    }
+    Ok(())
+}
+
+fn validate_repository(repository: &str) -> Result<(), ToolValidationError> {
+    validate_text("repository", repository, false)?;
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty()
+        || name.is_empty()
+        || parts.next().is_some()
+        || !owner.chars().all(is_github_name_character)
+        || !name.chars().all(is_github_name_character)
+    {
+        return Err(invalid_value("repository", "must use owner/name"));
+    }
+    Ok(())
+}
+
+fn is_github_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+}
+
+fn validate_arxiv_id(id: &str) -> Result<(), ToolValidationError> {
+    validate_text("id", id, false)?;
+    if id
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(invalid_value("id", "must be an arXiv identifier"));
     }
     Ok(())
 }
@@ -558,7 +1006,7 @@ fn validate_matcher(value: &KernelEditMatcher) -> Result<(), ToolValidationError
             validate_range("matcher.lineRange", *start_line, *end_line)?;
             match precondition {
                 KernelFileDigestPrecondition::ExpectedFileDigest { digest } => {
-                    validate_text("expectedFileDigest", digest, false)
+                    validate_file_digest("expectedFileDigest", digest)
                 }
                 KernelFileDigestPrecondition::ExpectedBeforeBlock { text } => {
                     validate_text("expectedBeforeBlock", text, false)
@@ -566,6 +1014,23 @@ fn validate_matcher(value: &KernelEditMatcher) -> Result<(), ToolValidationError
             }
         }
     }
+}
+
+fn validate_file_digest(field: &'static str, value: &str) -> Result<(), ToolValidationError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(invalid_value(field, "must include the sha256: prefix"));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_value(
+            field,
+            "must be sha256: followed by 64 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
 }
 
 fn url_has_user_info(url: &str) -> bool {

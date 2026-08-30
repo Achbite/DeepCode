@@ -7,6 +7,9 @@ pub(crate) struct AppState {
     pub(crate) session_service: crate::session_service::SessionServiceProcess,
     pub(crate) host_connection: crate::host_connection::HostConnection,
     pub(crate) gui: Arc<Mutex<GuiState>>,
+    /// Immutable settings snapshot used to assemble the current Kernel and
+    /// Session runtimes. Saved settings may diverge until the daemon restarts.
+    pub(crate) runtime_user_settings: Value,
     pub(crate) host_services: HostServices,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
 }

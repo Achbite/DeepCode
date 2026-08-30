@@ -24,6 +24,9 @@ pub struct KernelExecutorConfig {
     pub web_search_endpoint_template: String,
     pub web_search_auth_header_name: String,
     pub web_search_auth_secret_ref: String,
+    pub github_api_base_url: String,
+    pub github_auth_secret_ref: String,
+    pub arxiv_api_base_url: String,
 }
 
 impl Default for KernelExecutorConfig {
@@ -32,6 +35,9 @@ impl Default for KernelExecutorConfig {
             web_search_endpoint_template: String::new(),
             web_search_auth_header_name: String::new(),
             web_search_auth_secret_ref: String::new(),
+            github_api_base_url: "https://api.github.com".to_string(),
+            github_auth_secret_ref: String::new(),
+            arxiv_api_base_url: "https://export.arxiv.org/api".to_string(),
         }
     }
 }
@@ -161,6 +167,10 @@ pub fn resolved_network_target(
             web::validate_http_url(&target)?;
             Ok(Some(target))
         }
+        "github.search" => Ok(Some(web::github_search_target_url(config, input)?)),
+        "github.read" => Ok(Some(web::github_read_target_url(config, input)?)),
+        "arxiv.search" => Ok(Some(web::arxiv_search_target_url(config, input)?)),
+        "arxiv.read" => Ok(Some(web::arxiv_read_target_url(config, input)?)),
         _ => Ok(None),
     }
 }
@@ -172,6 +182,7 @@ fn executor_for_binding(
 ) -> Box<dyn KernelToolExecutor> {
     match binding {
         KernelExecutorBinding::FsRead => Box::new(FsReadExecutor),
+        KernelExecutorBinding::FsStat => Box::new(FsStatExecutor),
         KernelExecutorBinding::FsList => Box::new(FsListExecutor),
         KernelExecutorBinding::FsGlob => Box::new(FsGlobExecutor),
         KernelExecutorBinding::FsDiff => Box::new(FsDiffExecutor),
@@ -187,6 +198,17 @@ fn executor_for_binding(
             secret_provider,
         }),
         KernelExecutorBinding::WebFetch => Box::new(WebFetchExecutor),
+        KernelExecutorBinding::GithubSearch => Box::new(GithubSearchExecutor {
+            config,
+            secret_provider,
+        }),
+        KernelExecutorBinding::GithubRead => Box::new(GithubReadExecutor {
+            config,
+            secret_provider,
+        }),
+        KernelExecutorBinding::ArxivSearch => Box::new(ArxivSearchExecutor { config }),
+        KernelExecutorBinding::ArxivRead => Box::new(ArxivReadExecutor { config }),
+        KernelExecutorBinding::ProcessShell => Box::new(ProcessShellExecutor),
     }
 }
 
@@ -227,11 +249,13 @@ fn assert_executor_bindings_match_tool_registry(
 mod document;
 #[path = "executors/fs.rs"]
 mod filesystem;
+mod process;
 mod search;
 pub(crate) mod web;
 
 use document::DocumentReadExecutor;
 use filesystem::*;
+use process::*;
 use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
 use web::*;
 
@@ -735,10 +759,16 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
 }
 
 fn normalize_relative_path(path: &str) -> String {
-    path.replace('\\', "/")
+    let normalized = path
+        .replace('\\', "/")
         .trim_start_matches("./")
         .trim_matches('/')
-        .to_string()
+        .to_string();
+    if normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn list_nodes(

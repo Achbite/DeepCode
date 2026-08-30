@@ -50,6 +50,8 @@ pub struct SessionProjection {
     pub assistant_draft: Option<AssistantDraftProjection>,
     pub pending_interaction: Option<InteractionProjection>,
     pub pending_approval: Option<ApprovalProjection>,
+    pub plans: Vec<PlanProjection>,
+    pub active_plan_ref: Option<PlanRef>,
     pub pending_plan: Option<PendingPlanProjection>,
     pub todo_list: Option<TodoListProjection>,
     pub context_usage: Option<ContextUsageProjection>,
@@ -114,6 +116,7 @@ impl SessionProjection {
             return Err("shared Session projection has an invalid assistant draft".to_string());
         }
         if self.messages.iter().any(|message| {
+            let mut directory_ids = HashSet::new();
             message.message_id.is_empty()
                 || !matches!(
                     message.role.as_str(),
@@ -126,6 +129,11 @@ impl SessionProjection {
                     .as_deref()
                     .is_some_and(|feedback| !matches!(feedback, "up" | "down"))
                 || message.feedback.is_some() && message.role != "assistant"
+                || message.directory_attachments.iter().any(|binding| {
+                    binding.workspace_id.is_empty()
+                        || binding.display_name.is_empty()
+                        || !directory_ids.insert(binding.workspace_id.as_str())
+                })
         }) {
             return Err("shared Session projection has invalid messages".to_string());
         }
@@ -148,28 +156,52 @@ impl SessionProjection {
         }) {
             return Err("shared Session projection has an invalid approval".to_string());
         }
-        if self.pending_plan.as_ref().is_some_and(|plan| {
-            plan.plan_id.is_empty()
-                || plan.run_id.is_empty()
-                || plan.options.is_empty()
-                || plan.response_mode != "optionOrFreeform"
-                || !plan.ignore_allowed
+        let mut plan_revisions = HashSet::new();
+        if self.plans.iter().any(|plan| {
+            !valid_plan_projection(plan)
+                || !plan_revisions.insert((plan.plan_id.as_str(), plan.revision))
         }) {
             return Err("shared Session projection has an invalid plan".to_string());
         }
+        if self.active_plan_ref.as_ref().is_some_and(|active| {
+            active.plan_id.is_empty()
+                || active.revision == 0
+                || self.plans.iter().all(|plan| {
+                    plan.plan_id != active.plan_id
+                        || plan.revision != active.revision
+                        || plan.status != "confirmed"
+                })
+        }) {
+            return Err("shared Session projection has an invalid active plan".to_string());
+        }
+        if self.pending_plan.as_ref().is_some_and(|plan| {
+            !valid_pending_plan_projection(plan)
+                || self.plans.iter().all(|published| {
+                    published.plan_id != plan.plan_id
+                        || published.revision != plan.revision
+                        || published.status != "published"
+                })
+        }) {
+            return Err("shared Session projection has an invalid pending plan".to_string());
+        }
         if self.todo_list.as_ref().is_some_and(|todo_list| {
             let mut ids = HashSet::new();
-            todo_list.run_id.is_empty()
-                || self
-                    .run
-                    .as_ref()
-                    .is_none_or(|run| run.run_id != todo_list.run_id)
+            let mut step_ids = HashSet::new();
+            todo_list.source_plan_id.is_empty()
+                || todo_list.source_plan_revision == 0
+                || todo_list.items.is_empty()
                 || todo_list.items.len() > 12
+                || self.plans.iter().all(|plan| {
+                    plan.plan_id != todo_list.source_plan_id
+                        || plan.revision != todo_list.source_plan_revision
+                })
                 || todo_list.items.iter().any(|item| {
                     item.todo_id.is_empty()
+                        || item.source_step_id.is_empty()
                         || item.label.is_empty()
                         || !matches!(item.status.as_str(), "pending" | "inProgress" | "completed")
                         || !ids.insert(item.todo_id.as_str())
+                        || !step_ids.insert(item.source_step_id.as_str())
                 })
         }) {
             return Err("shared Session projection has an invalid todo list".to_string());
@@ -298,6 +330,20 @@ impl SessionProjection {
                 || activity.kind != "tool" && activity.tool.is_some()
                 || activity.tool.as_ref().is_some_and(|tool| {
                     tool.operation.is_empty()
+                        || tool.shell.as_ref().is_some_and(|shell| {
+                            tool.operation != "process.shell"
+                                || shell.command.trim().is_empty()
+                                || !is_normalized_logical_path(&shell.cwd)
+                                || shell.result.as_ref().is_some_and(|result| {
+                                    result.success
+                                        && (result.timed_out || result.exit_code != Some(0))
+                                })
+                        })
+                        || tool.operation == "process.shell"
+                            && (tool.shell.is_none()
+                                || tool.shell.as_ref().is_some_and(|shell| {
+                                    (activity.status == "completed") != shell.result.is_some()
+                                }))
                         || tool.resources.iter().any(|resource| {
                             resource.label.is_empty()
                                 || match resource.kind.as_str() {
@@ -477,6 +523,7 @@ pub struct ProjectionMessage {
     pub role: String,
     pub content: String,
     pub attachments: Vec<MessageAttachmentProjection>,
+    pub directory_attachments: Vec<WorkspaceBindingDisplay>,
     pub feedback: Option<String>,
     pub sequence: u64,
     pub created_at: String,
@@ -550,31 +597,72 @@ pub struct ApprovalProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanOptionProjection {
-    pub option_id: String,
-    pub label: String,
-    pub description: Option<String>,
-    pub operations_display: Vec<String>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanOperation {
+    pub workspace_id: String,
+    pub operation: String,
+    pub target: String,
+    pub target_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingPlanProjection {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionPlanStep {
+    pub step_id: String,
+    pub title: String,
+    pub details: String,
+    pub verification: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanProjection {
     pub plan_id: String,
+    pub revision: u64,
     pub run_id: String,
-    pub prompt: String,
-    pub options: Vec<PlanOptionProjection>,
-    pub response_mode: String,
-    pub ignore_allowed: bool,
+    pub call_id: String,
+    pub title: String,
+    pub summary: String,
+    pub steps: Vec<ExecutionPlanStep>,
+    pub mutation_manifest: Vec<PlanOperation>,
+    pub status: String,
+    pub decision_id: Option<String>,
     pub sequence: u64,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanRef {
+    pub plan_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingPlanProjection {
+    pub plan_id: String,
+    pub revision: u64,
+    pub run_id: String,
+    pub call_id: String,
+    pub title: String,
+    pub summary: String,
+    pub steps: Vec<ExecutionPlanStep>,
+    pub mutation_manifest: Vec<PlanOperation>,
+    pub status: String,
+    pub decision_id: Option<String>,
+    pub response_mode: String,
+    pub sequence: u64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoListProjection {
-    pub run_id: String,
+    pub source_plan_id: String,
+    pub source_plan_revision: u64,
     pub items: Vec<TodoItem>,
     pub sequence: u64,
     pub updated_at: String,
@@ -584,6 +672,7 @@ pub struct TodoListProjection {
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
     pub todo_id: String,
+    pub source_step_id: String,
     pub label: String,
     pub status: String,
 }
@@ -727,6 +816,28 @@ pub struct ActivityProjection {
 pub struct ToolActivityProjection {
     pub operation: String,
     pub resources: Vec<ActivityResourceProjection>,
+    pub shell: Option<ShellActivityProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellActivityProjection {
+    pub command: String,
+    pub cwd: String,
+    pub result: Option<ShellActivityResultProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellActivityResultProjection {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i64>,
+    pub success: bool,
+    pub timed_out: bool,
+    pub truncated: bool,
+    pub captured_bytes: u64,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -885,24 +996,15 @@ pub fn approval_response_command(
     })
 }
 
-pub fn plan_select_command(
+pub fn plan_confirm_command(
     session_id: &str,
     command_id: &str,
     plan: &PendingPlanProjection,
-    option_id: &str,
 ) -> Value {
-    plan_response_command(
-        session_id,
-        command_id,
-        plan,
-        json!({
-            "kind": "select",
-            "optionId": option_id,
-        }),
-    )
+    plan_response_command(session_id, command_id, plan, json!({ "kind": "confirm" }))
 }
 
-pub fn plan_feedback_command(
+pub fn plan_revision_command(
     session_id: &str,
     command_id: &str,
     plan: &PendingPlanProjection,
@@ -913,18 +1015,18 @@ pub fn plan_feedback_command(
         command_id,
         plan,
         json!({
-            "kind": "feedback",
+            "kind": "requestRevision",
             "text": text,
         }),
     )
 }
 
-pub fn plan_ignore_command(
+pub fn plan_cancel_command(
     session_id: &str,
     command_id: &str,
     plan: &PendingPlanProjection,
 ) -> Value {
-    plan_response_command(session_id, command_id, plan, json!({ "kind": "ignore" }))
+    plan_response_command(session_id, command_id, plan, json!({ "kind": "cancel" }))
 }
 
 fn plan_response_command(
@@ -940,8 +1042,79 @@ fn plan_response_command(
         "sessionId": session_id,
         "runId": plan.run_id,
         "planId": plan.plan_id,
+        "revision": plan.revision,
         "response": response,
     })
+}
+
+fn valid_plan_projection(plan: &PlanProjection) -> bool {
+    !plan.plan_id.is_empty()
+        && plan.revision > 0
+        && !plan.run_id.is_empty()
+        && !plan.call_id.is_empty()
+        && !plan.title.is_empty()
+        && !plan.summary.is_empty()
+        && !plan.steps.is_empty()
+        && plan.steps.len() <= 12
+        && matches!(
+            plan.status.as_str(),
+            "published"
+                | "revisionRequested"
+                | "confirmed"
+                | "superseded"
+                | "cancelled"
+                | "completed"
+                | "invalidated"
+        )
+        && plan.sequence > 0
+        && !plan.created_at.is_empty()
+        && !plan.updated_at.is_empty()
+        && valid_plan_body(&plan.steps, &plan.mutation_manifest)
+}
+
+fn valid_pending_plan_projection(plan: &PendingPlanProjection) -> bool {
+    !plan.plan_id.is_empty()
+        && plan.revision > 0
+        && !plan.run_id.is_empty()
+        && !plan.call_id.is_empty()
+        && !plan.title.is_empty()
+        && !plan.summary.is_empty()
+        && plan.status == "published"
+        && plan.response_mode == "confirmReviseOrCancel"
+        && plan.decision_id.is_none()
+        && plan.sequence > 0
+        && !plan.created_at.is_empty()
+        && !plan.updated_at.is_empty()
+        && valid_plan_body(&plan.steps, &plan.mutation_manifest)
+}
+
+fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) -> bool {
+    let mut step_ids = HashSet::new();
+    !steps.is_empty()
+        && steps.len() <= 12
+        && steps.iter().all(|step| {
+            !step.step_id.is_empty()
+                && !step.title.is_empty()
+                && !step.details.is_empty()
+                && step_ids.insert(step.step_id.as_str())
+                && step.verification.as_ref().is_none_or(|items| {
+                    items.len() <= 8 && items.iter().all(|item| !item.trim().is_empty())
+                })
+        })
+        && operations.iter().all(|operation| {
+            !operation.workspace_id.is_empty()
+                && !operation.target.is_empty()
+                && match operation.operation.as_str() {
+                    "fs.delete" => matches!(
+                        operation.target_kind.as_deref(),
+                        Some("file" | "directoryTree")
+                    ),
+                    "fs.create" | "fs.write" | "fs.edit" | "fs.ensure_directory" => {
+                        operation.target_kind.is_none()
+                    }
+                    _ => false,
+                }
+        })
 }
 
 pub fn is_terminal_run_status(status: &str) -> bool {
@@ -1004,6 +1177,7 @@ mod tests {
                     "role": "user",
                     "content": "分析项目",
                     "attachments": [],
+                    "directoryAttachments": [],
                     "feedback": null,
                     "sequence": 1,
                     "createdAt": "2026-08-25T00:00:00.000Z"
@@ -1013,6 +1187,7 @@ mod tests {
                     "role": "assistant",
                     "content": "分析完成",
                     "attachments": [],
+                    "directoryAttachments": [],
                     "feedback": "up",
                     "sequence": 8,
                     "createdAt": "2026-08-25T00:00:07.000Z"
@@ -1022,10 +1197,36 @@ mod tests {
             "assistantDraft": null,
             "pendingInteraction": null,
             "pendingApproval": null,
+            "plans": [{
+                "planId": "plan:test",
+                "revision": 1,
+                "runId": "run:test",
+                "callId": "call:plan",
+                "title": "分析项目",
+                "summary": "读取入口并形成结论。",
+                "steps": [{
+                    "stepId": "step:read",
+                    "title": "读取入口",
+                    "details": "读取 README。"
+                }],
+                "mutationManifest": [],
+                "status": "completed",
+                "decisionId": "decision:plan",
+                "sequence": 2,
+                "createdAt": "2026-08-25T00:00:01.000Z",
+                "updatedAt": "2026-08-25T00:00:06.000Z"
+            }],
+            "activePlanRef": null,
             "pendingPlan": null,
             "todoList": {
-                "runId": "run:test",
-                "items": [{ "todoId": "read", "label": "读取入口", "status": "completed" }],
+                "sourcePlanId": "plan:test",
+                "sourcePlanRevision": 1,
+                "items": [{
+                    "todoId": "todo:read",
+                    "sourceStepId": "step:read",
+                    "label": "读取入口",
+                    "status": "completed"
+                }],
                 "sequence": 3,
                 "updatedAt": "2026-08-25T00:00:00.000Z"
             },
@@ -1058,7 +1259,7 @@ mod tests {
                 "partitions": [
                     { "kind": "instructions", "itemCount": 1, "requestShapeUnits": 30,
                       "estimatedInputTokens": 30, "tokenSource": "sessionEstimated" },
-                    { "kind": "sessionControls", "itemCount": 4, "requestShapeUnits": 20,
+                    { "kind": "sessionControls", "itemCount": 3, "requestShapeUnits": 20,
                       "estimatedInputTokens": 20, "tokenSource": "sessionEstimated" },
                     { "kind": "tools", "itemCount": 1, "requestShapeUnits": 10,
                       "estimatedInputTokens": 10, "tokenSource": "sessionEstimated" },
@@ -1136,6 +1337,46 @@ mod tests {
         assert_eq!(projection.messages[1].feedback.as_deref(), Some("up"));
         assert_eq!(projection.context_compositions.len(), 1);
         assert_eq!(projection.token_usage_history.len(), 1);
+    }
+
+    #[test]
+    fn validates_canonical_shell_command_and_result_projection() {
+        let mut value = projection_value();
+        value["activities"][0]["label"] = json!("process.shell");
+        value["activities"][0]["tool"] = json!({
+            "operation": "process.shell",
+            "resources": [{
+                "kind": "workspacePath",
+                "label": ".",
+                "workspaceId": "workspace:test",
+                "logicalPath": "."
+            }],
+            "shell": {
+                "command": "make build",
+                "cwd": ".",
+                "result": {
+                    "stdout": "built\n",
+                    "stderr": "",
+                    "exitCode": 0,
+                    "success": true,
+                    "timedOut": false,
+                    "truncated": false,
+                    "capturedBytes": 6,
+                    "durationMs": 420
+                }
+            }
+        });
+        let projection: SessionProjection =
+            serde_json::from_value(value).expect("shell projection decodes");
+        assert_eq!(projection.validate(), Ok(()));
+        assert_eq!(
+            projection.activities[0]
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.shell.as_ref())
+                .map(|shell| shell.command.as_str()),
+            Some("make build")
+        );
     }
 
     #[test]

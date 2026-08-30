@@ -295,29 +295,33 @@ impl Renderer {
             }
             if let Some(plan) = projection.pending_plan.as_ref() {
                 lines.push(Line::from(Span::styled(
-                    "Plan",
+                    format!("Plan · revision {}", plan.revision),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(plan.prompt.as_str()));
-                for (index, option) in plan.options.iter().enumerate() {
-                    lines.push(Line::from(format!("{}. {}", index + 1, option.label)));
-                    if let Some(description) = option.description.as_deref() {
-                        lines.push(Line::from(Span::styled(
-                            format!("   {description}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    for operation in &option.operations_display {
-                        lines.push(Line::from(Span::styled(
-                            format!("   - {operation}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                lines.push(Line::from(Span::styled(
+                    plan.title.as_str(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(plan.summary.as_str()));
+                for (index, step) in plan.steps.iter().enumerate() {
+                    lines.push(Line::from(format!("{}. {}", index + 1, step.title)));
+                    lines.push(Line::from(Span::styled(
+                        format!("   {}", step.details),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    if let Some(verification) = step.verification.as_ref() {
+                        for item in verification {
+                            lines.push(Line::from(Span::styled(
+                                format!("   验证：{item}"),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
                     }
                 }
                 lines.push(Line::from(
-                    "输入编号选择；其他文本用于调整；Esc 或 /ignore 明确忽略。",
+                    "输入 1/确认；其他文本用于修订；Esc 或 /cancel-plan 明确取消。",
                 ));
                 lines.push(Line::from(""));
             }
@@ -765,6 +769,41 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
         Style::default().fg(color),
     )));
     if let Some(tool) = activity.tool.as_ref() {
+        if let Some(shell) = tool.shell.as_ref() {
+            lines.push(Line::from(Span::styled(
+                format!("  $ {}", shell.command),
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  cwd: {}", shell.cwd),
+                Style::default().fg(Color::DarkGray),
+            )));
+            if let Some(result) = shell.result.as_ref() {
+                let exit = result
+                    .exit_code
+                    .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  exit: {exit} · {} ms · {} bytes{}{}",
+                        result.duration_ms,
+                        result.captured_bytes,
+                        if result.timed_out {
+                            " · timed out"
+                        } else {
+                            ""
+                        },
+                        if result.truncated {
+                            " · truncated"
+                        } else {
+                            ""
+                        },
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                push_tool_stream_lines(lines, "stdout", &result.stdout);
+                push_tool_stream_lines(lines, "stderr", &result.stderr);
+            }
+        }
         for resource in &tool.resources {
             let detail = match (
                 resource.kind.as_str(),
@@ -787,6 +826,19 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
     }
 }
 
+fn push_tool_stream_lines(lines: &mut Vec<Line<'_>>, label: &str, output: &str) {
+    if output.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {label}:"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    for line in output.lines() {
+        lines.push(Line::from(Span::raw(format!("    {line}"))));
+    }
+}
+
 fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
     let operation = activity
         .tool
@@ -795,6 +847,32 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
         .unwrap_or(activity.label.as_str());
     output.push_str(&format!("工具 {operation} [{}]\n", activity.status));
     if let Some(tool) = activity.tool.as_ref() {
+        if let Some(shell) = tool.shell.as_ref() {
+            output.push_str(&format!("  $ {}\n", shell.command));
+            output.push_str(&format!("  cwd: {}\n", shell.cwd));
+            if let Some(result) = shell.result.as_ref() {
+                let exit = result
+                    .exit_code
+                    .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
+                output.push_str(&format!(
+                    "  exit: {exit} · {} ms · {} bytes{}{}\n",
+                    result.duration_ms,
+                    result.captured_bytes,
+                    if result.timed_out {
+                        " · timed out"
+                    } else {
+                        ""
+                    },
+                    if result.truncated {
+                        " · truncated"
+                    } else {
+                        ""
+                    },
+                ));
+                push_tool_stream_plain(output, "stdout", &result.stdout);
+                push_tool_stream_plain(output, "stderr", &result.stderr);
+            }
+        }
         for resource in &tool.resources {
             match (
                 resource.kind.as_str(),
@@ -814,6 +892,16 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
                 _ => output.push_str(&format!("  {}\n", resource.label)),
             }
         }
+    }
+}
+
+fn push_tool_stream_plain(output: &mut String, label: &str, stream: &str) {
+    if stream.is_empty() {
+        return;
+    }
+    output.push_str(&format!("  {label}:\n"));
+    for line in stream.lines() {
+        output.push_str(&format!("    {line}\n"));
     }
 }
 
@@ -865,19 +953,18 @@ fn cache_hit_label(projection: &SessionProjection) -> String {
 }
 
 fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
-    output.push_str("Plan\n");
-    output.push_str(&plan.prompt);
-    output.push('\n');
-    for (index, option) in plan.options.iter().enumerate() {
-        output.push_str(&format!("{}. {}\n", index + 1, option.label));
-        if let Some(description) = option.description.as_deref() {
-            output.push_str(&format!("   {description}\n"));
-        }
-        for operation in &option.operations_display {
-            output.push_str(&format!("   - {operation}\n"));
+    output.push_str(&format!("Plan · revision {}\n", plan.revision));
+    output.push_str(&format!("{}\n{}\n", plan.title, plan.summary));
+    for (index, step) in plan.steps.iter().enumerate() {
+        output.push_str(&format!("{}. {}\n", index + 1, step.title));
+        output.push_str(&format!("   {}\n", step.details));
+        if let Some(verification) = step.verification.as_ref() {
+            for item in verification {
+                output.push_str(&format!("   验证：{item}\n"));
+            }
         }
     }
-    output.push_str("输入编号选择；其他非空文本用于调整；/ignore 明确忽略。\n");
+    output.push_str("输入 1/确认；其他非空文本用于修订；/cancel-plan 明确取消。\n");
 }
 
 #[cfg(test)]

@@ -91,18 +91,27 @@ enum PermissionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceMutationMode {
+    Plan,
+    Allow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedEffectScope {
     WorkspaceRead,
     WorkspaceMutation,
+    Process,
     Network,
     External,
 }
 
-/// Workspace read and mutation are hard-cut semantics, not configurable policy:
-/// a bound workspace grants reads and only a selected structured Plan grants
-/// mutations. Settings remain relevant only to non-workspace effects.
+/// Workspace reads and the project-debugging process capability are authorized
+/// by the frozen binding. Structured fs.* mutation either requires an exact
+/// confirmed Plan revision or is allowed by the explicit workspace-autonomy
+/// setting. Neither path permits a prepared target outside the bound workspace.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalAgentPermissionPolicy {
+    workspace_mutation: WorkspaceMutationMode,
     network: PermissionMode,
     external: PermissionMode,
 }
@@ -110,10 +119,11 @@ pub(crate) struct LocalAgentPermissionPolicy {
 impl LocalAgentPermissionPolicy {
     pub(crate) fn from_settings(settings: &Value) -> Result<Self, LocalAgentKernelError> {
         Ok(Self {
+            workspace_mutation: workspace_mutation_mode(settings)?,
             network: permission_mode(
                 settings,
                 "agent.permissions.networkRead",
-                PermissionMode::Ask,
+                PermissionMode::Allow,
             )?,
             external: permission_mode(settings, "agent.permissions.external", PermissionMode::Ask)?,
         })
@@ -123,7 +133,9 @@ impl LocalAgentPermissionPolicy {
         match scope {
             PreparedEffectScope::Network => Some(self.network),
             PreparedEffectScope::External => Some(self.external),
-            PreparedEffectScope::WorkspaceRead | PreparedEffectScope::WorkspaceMutation => None,
+            PreparedEffectScope::WorkspaceRead
+            | PreparedEffectScope::WorkspaceMutation
+            | PreparedEffectScope::Process => None,
         }
     }
 }
@@ -217,12 +229,12 @@ impl LocalAgentKernel {
             .descriptors()
             .map(|tool| {
                 let input_schema = match tool.effect_scope {
-                    ToolEffectScope::WorkspaceRead | ToolEffectScope::WorkspaceWrite => {
+                    ToolEffectScope::WorkspaceRead
+                    | ToolEffectScope::WorkspaceWrite
+                    | ToolEffectScope::Process => {
                         schema_requiring_workspace_id(tool.input_schema.clone())
                     }
-                    ToolEffectScope::NetworkRead | ToolEffectScope::Process => {
-                        tool.input_schema.clone()
-                    }
+                    ToolEffectScope::NetworkRead => tool.input_schema.clone(),
                 };
                 json!({
                     "name": tool.name,
@@ -483,10 +495,10 @@ impl LocalAgentKernel {
         }
         let mut tool_input = request.input.clone();
         let workspace_id = match descriptor.effect_scope {
-            ToolEffectScope::WorkspaceRead | ToolEffectScope::WorkspaceWrite => {
-                Some(take_workspace_id(&mut tool_input)?)
-            }
-            ToolEffectScope::NetworkRead | ToolEffectScope::Process => {
+            ToolEffectScope::WorkspaceRead
+            | ToolEffectScope::WorkspaceWrite
+            | ToolEffectScope::Process => Some(take_workspace_id(&mut tool_input)?),
+            ToolEffectScope::NetworkRead => {
                 if tool_input.get("workspaceId").is_some() {
                     return Err(LocalAgentKernelError::new(
                         "tool_input_invalid",
@@ -542,11 +554,11 @@ impl LocalAgentKernel {
                 }
                 let boundary = WorkspaceBoundary::new(canonical_root.clone());
                 let resolve_target = |target: &str| match descriptor.effect_scope {
-                    ToolEffectScope::WorkspaceRead => boundary.resolve_read(target),
-                    ToolEffectScope::WorkspaceWrite => boundary.resolve_mutation(target),
-                    ToolEffectScope::NetworkRead | ToolEffectScope::Process => {
-                        unreachable!("workspace target scope")
+                    ToolEffectScope::WorkspaceRead | ToolEffectScope::Process => {
+                        boundary.resolve_read(target)
                     }
+                    ToolEffectScope::WorkspaceWrite => boundary.resolve_mutation(target),
+                    ToolEffectScope::NetworkRead => unreachable!("workspace target scope"),
                 };
                 let private = logical_targets
                     .iter()
@@ -584,7 +596,7 @@ impl LocalAgentKernel {
                 ToolEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
                 ToolEffectScope::WorkspaceWrite => PreparedEffectScope::WorkspaceMutation,
                 ToolEffectScope::NetworkRead => PreparedEffectScope::Network,
-                ToolEffectScope::Process => unreachable!("blocked process tool checked above"),
+                ToolEffectScope::Process => PreparedEffectScope::Process,
             },
             workspace_id,
             operation: request.tool_name.clone(),
@@ -627,16 +639,34 @@ impl LocalAgentKernel {
                     "workspaceId": workspace_id,
                 })))
             }
+            PreparedEffectScope::Process => {
+                let workspace_id = prepared
+                    .workspace_id
+                    .as_deref()
+                    .expect("prepared process workspace");
+                Ok(Admission::Allowed(json!({
+                    "decision": "allow",
+                    "source": "workspaceBinding",
+                    "workspaceId": workspace_id,
+                })))
+            }
             PreparedEffectScope::WorkspaceMutation => {
+                if self.permissions.workspace_mutation == WorkspaceMutationMode::Allow {
+                    return Ok(Admission::Allowed(json!({
+                        "decision": "allow",
+                        "source": "userSetting",
+                        "authorityId": "user-setting:agent.permissions.workspaceMutation",
+                        "workspaceId": prepared.workspace_id,
+                    })));
+                }
                 for authority in &request.plan_authorities {
                     if !authority_matches_identity(authority, request, prepared) {
                         continue;
                     }
-                    if !self.journal.plan_authority_is_committed(
-                        &request.session_id,
-                        &request.run_id,
-                        authority,
-                    )? {
+                    if !self
+                        .journal
+                        .plan_authority_is_committed(&request.session_id, authority)?
+                    {
                         continue;
                     }
                     if authority_covers(authority, prepared) {
@@ -646,12 +676,14 @@ impl LocalAgentKernel {
                             "workspaceId": prepared.workspace_id,
                             "authorityId": authority.get("authorityId"),
                             "planId": authority.get("planId"),
+                            "revision": authority.get("revision"),
+                            "decisionId": authority.get("decisionId"),
                         })));
                     }
                 }
                 Ok(Admission::denied(
                     "workspace_mutation_plan_required",
-                    "Workspace mutation 没有被当前 run 的已选择结构化 Plan 精确覆盖。",
+                    "Workspace mutation 没有被当前 Session 中 active 的已确认 Plan revision 精确覆盖。",
                 ))
             }
             PreparedEffectScope::Network | PreparedEffectScope::External => {
@@ -1031,6 +1063,7 @@ fn canonical_logical_targets(
 ) -> Result<Vec<String>, LocalAgentKernelError> {
     let field = match tool_name {
         "fs.read"
+        | "fs.stat"
         | "fs.list"
         | "fs.glob"
         | "fs.diff"
@@ -1041,6 +1074,7 @@ fn canonical_logical_targets(
         | "fs.delete"
         | "fs.ensure_directory"
         | "document.read" => Some("path"),
+        "process.shell" => Some("cwd"),
         "web.fetch" => Some("url"),
         "web.search" => None,
         _ => None,
@@ -1075,9 +1109,9 @@ fn authority_matches_identity(
     let allowed = [
         "authorityId",
         "planId",
-        "optionId",
+        "revision",
+        "decisionId",
         "sessionId",
-        "runId",
         "workspaceId",
         "coveredOperations",
     ];
@@ -1085,11 +1119,14 @@ fn authority_matches_identity(
         return false;
     }
     object.get("sessionId").and_then(Value::as_str) == Some(&request.session_id)
-        && object.get("runId").and_then(Value::as_str) == Some(&request.run_id)
         && object.get("workspaceId").and_then(Value::as_str) == prepared.workspace_id.as_deref()
         && object.get("authorityId").and_then(Value::as_str).is_some()
         && object.get("planId").and_then(Value::as_str).is_some()
-        && object.get("optionId").and_then(Value::as_str).is_some()
+        && object
+            .get("revision")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0)
+        && object.get("decisionId").and_then(Value::as_str).is_some()
         && object
             .get("coveredOperations")
             .and_then(Value::as_array)
@@ -1147,11 +1184,30 @@ fn permission_mode(
     }
 }
 
+fn workspace_mutation_mode(
+    settings: &Value,
+) -> Result<WorkspaceMutationMode, LocalAgentKernelError> {
+    match settings
+        .get("agent.permissions.workspaceMutation")
+        .and_then(Value::as_str)
+        .unwrap_or("plan")
+    {
+        "plan" => Ok(WorkspaceMutationMode::Plan),
+        "allow" => Ok(WorkspaceMutationMode::Allow),
+        _ => Err(LocalAgentKernelError::new(
+            "agent_permission_setting_invalid",
+            "agent.permissions.workspaceMutation 必须是 plan 或 allow。",
+        )),
+    }
+}
+
 fn permission_setting_id(scope: PreparedEffectScope) -> &'static str {
     match scope {
         PreparedEffectScope::Network => "user-setting:agent.permissions.networkRead",
         PreparedEffectScope::External => "user-setting:agent.permissions.external",
-        PreparedEffectScope::WorkspaceRead | PreparedEffectScope::WorkspaceMutation => {
+        PreparedEffectScope::WorkspaceRead
+        | PreparedEffectScope::WorkspaceMutation
+        | PreparedEffectScope::Process => {
             unreachable!("workspace effects are not setting-authorized")
         }
     }
@@ -1173,6 +1229,7 @@ fn effect_names(scope: PreparedEffectScope) -> Vec<&'static str> {
     match scope {
         PreparedEffectScope::WorkspaceRead => vec!["workspaceRead"],
         PreparedEffectScope::WorkspaceMutation => vec!["workspaceMutation"],
+        PreparedEffectScope::Process => vec!["process"],
         PreparedEffectScope::Network => vec!["network"],
         PreparedEffectScope::External => vec!["external"],
     }
@@ -1448,9 +1505,9 @@ mod tests {
         let authority = json!({
             "authorityId": "authority:test",
             "planId": "plan:test",
-            "optionId": "option:test",
+            "revision": 1,
+            "decisionId": "decision:test",
             "sessionId": "session:test",
-            "runId": "run:test",
             "workspaceId": "workspace:test",
             "coveredOperations": [{
                 "workspaceId": "workspace:test",
@@ -1464,5 +1521,26 @@ mod tests {
         let mut wrong = authority.clone();
         wrong["coveredOperations"][0]["targetKind"] = json!("directoryTree");
         assert!(!authority_covers(&wrong, &prepared));
+    }
+
+    #[test]
+    fn workspace_mutation_setting_defaults_to_plan_and_can_explicitly_allow() {
+        let default_policy = LocalAgentPermissionPolicy::from_settings(&json!({}))
+            .expect("default permission policy");
+        assert_eq!(
+            default_policy.workspace_mutation,
+            WorkspaceMutationMode::Plan
+        );
+        assert_eq!(default_policy.network, PermissionMode::Allow);
+        assert_eq!(default_policy.external, PermissionMode::Ask);
+
+        let autonomous_policy = LocalAgentPermissionPolicy::from_settings(&json!({
+            "agent.permissions.workspaceMutation": "allow"
+        }))
+        .expect("workspace autonomy policy");
+        assert_eq!(
+            autonomous_policy.workspace_mutation,
+            WorkspaceMutationMode::Allow
+        );
     }
 }

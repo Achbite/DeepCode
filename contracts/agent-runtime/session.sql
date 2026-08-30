@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = FULL;
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY NOT NULL CHECK(length(session_id) > 0),
@@ -35,14 +35,23 @@ CREATE TABLE IF NOT EXISTS session_events (
         'narrative.committed',
         'interaction.requested',
         'interaction.resolved',
-        'plan.intent.requested',
-        'plan.intent.resolved',
-        'todo.updated',
+        'plan.published',
+        'plan.confirmed',
+        'plan.revision.requested',
+        'plan.superseded',
+        'plan.cancelled',
+        'plan.completed',
+        'plan.invalidated',
+        'todo.seeded',
+        'todo.reconciled',
+        'todo.progressed',
         'tool.requested',
         'approval.requested',
         'approval.resolved',
         'tool.completed',
         'session.control.rejected',
+        'context.compaction.requested',
+        'context.compacted',
         'context.composed',
         'context.updated',
         'run.waiting',
