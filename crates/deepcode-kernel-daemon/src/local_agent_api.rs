@@ -432,7 +432,9 @@ pub(crate) async fn local_agent_provider_stream(
     };
     if let Some(limit) = body.max_output_tokens {
         profile.max_output_tokens = Some(
-            profile.max_output_tokens.map_or(limit, |configured| configured.min(limit)),
+            profile
+                .max_output_tokens
+                .map_or(limit, |configured| configured.min(limit)),
         );
     }
     let request_envelope = json!({
@@ -480,8 +482,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
                 || body.max_output_tokens.is_none_or(|value| value == 0)
             {
                 return Err(
-                    "上下文压缩请求必须使用 answerOnly、空工具目录和正数输出预算。"
-                        .to_string(),
+                    "上下文压缩请求必须使用 answerOnly、空工具目录和正数输出预算。".to_string(),
                 );
             }
         }

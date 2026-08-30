@@ -1,6 +1,6 @@
 {
   "name": "@deepcode/tauri-shell",
-  "version": "0.5.40",
+  "version": "0.5.45",
   "license": "MIT",
   "private": true,
   "type": "module",

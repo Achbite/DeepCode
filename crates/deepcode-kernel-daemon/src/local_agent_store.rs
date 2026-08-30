@@ -512,9 +512,7 @@ impl LocalAgentJournal {
     }
 }
 
-fn migrate_session_store_v2_to_v3(
-    connection: &mut Connection,
-) -> Result<(), LocalAgentStoreError> {
+fn migrate_session_store_v2_to_v3(connection: &mut Connection) -> Result<(), LocalAgentStoreError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error("session_store_migration_transaction_failed"))?;
@@ -1113,7 +1111,12 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 "pressure" => {
                     exact_object(
                         payload,
-                        &["compactionId", "providerRequestId", "trigger", "coveredThroughSequence"],
+                        &[
+                            "compactionId",
+                            "providerRequestId",
+                            "trigger",
+                            "coveredThroughSequence",
+                        ],
                         &[],
                     )?;
                     if event.get("callId").is_some() {
@@ -1127,8 +1130,12 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                     exact_object(
                         payload,
                         &[
-                            "compactionId", "providerRequestId", "trigger",
-                            "coveredThroughSequence", "focus", "commandId",
+                            "compactionId",
+                            "providerRequestId",
+                            "trigger",
+                            "coveredThroughSequence",
+                            "focus",
+                            "commandId",
                         ],
                         &[],
                     )?;
@@ -1145,8 +1152,12 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                     exact_object(
                         payload,
                         &[
-                            "compactionId", "providerRequestId", "trigger",
-                            "coveredThroughSequence", "focus", "providerCallId",
+                            "compactionId",
+                            "providerRequestId",
+                            "trigger",
+                            "coveredThroughSequence",
+                            "focus",
+                            "providerCallId",
                         ],
                         &[],
                     )?;
@@ -1181,8 +1192,11 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             exact_object(
                 payload,
                 &[
-                    "compactionId", "providerRequestId", "trigger",
-                    "coveredThroughSequence", "summary",
+                    "compactionId",
+                    "providerRequestId",
+                    "trigger",
+                    "coveredThroughSequence",
+                    "summary",
                 ],
                 &[],
             )?;
@@ -1694,8 +1708,7 @@ fn validate_event_facts(
                     != required_string(payload, "trigger")?
                 || required_u64(&requested_payload, "coveredThroughSequence")?
                     != required_u64(payload, "coveredThroughSequence")?
-                || requested_call_id.as_deref()
-                    != event.get("callId").and_then(Value::as_str)
+                || requested_call_id.as_deref() != event.get("callId").and_then(Value::as_str)
             {
                 return Err(LocalAgentStoreError::new(
                     "context_compaction_completion_mismatch",
@@ -1755,10 +1768,8 @@ fn validate_event_facts(
                     "providerRequestId 已经存在 composition receipt。",
                 ));
             }
-            let purpose = required_string(
-                event.get("payload").expect("validated payload"),
-                "purpose",
-            )?;
+            let purpose =
+                required_string(event.get("payload").expect("validated payload"), "purpose")?;
             let compaction_request_exists: bool = transaction
                 .query_row(
                     "SELECT EXISTS(
