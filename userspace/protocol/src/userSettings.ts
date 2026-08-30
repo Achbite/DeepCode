@@ -48,7 +48,9 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'terminal.integrated.prewarm': 'afterStartup',
   'terminal.integrated.spawnTimeoutMs': 8000,
   'agent.systemPrompt': '',
-  'agent.permissions.networkRead': 'ask',
+  'agent.permissions.workspaceMutation': 'plan',
+  'agent.permissions.engineeringDecisions': 'ask',
+  'agent.permissions.networkRead': 'allow',
   'agent.permissions.external': 'ask',
   'agent.web.search.endpointTemplate': '',
   'agent.web.search.authHeaderName': 'Authorization',
@@ -125,6 +127,7 @@ function surfacesForKey(key: string): SettingsSurface[] {
 
 export interface GetUserSettingsResult {
   settings: UserSettings;
+  runtimeSettings: UserSettings;
   overriddenKeys: string[];
   storePath: string;
 }

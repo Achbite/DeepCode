@@ -2,6 +2,8 @@ import type { AgentPlugin } from './plugins.js';
 
 export interface StartupPluginConfig {
   systemPrompt: string;
+  workspaceMutation: 'plan' | 'allow';
+  engineeringDecisions: 'ask' | 'delegate';
   skills: readonly {
     id: string;
     instructions: string;
@@ -9,7 +11,14 @@ export interface StartupPluginConfig {
 }
 
 export function decodeStartupPluginConfig(encoded: string | undefined): StartupPluginConfig {
-  if (!encoded) return { systemPrompt: '', skills: [] };
+  if (!encoded) {
+    return {
+      systemPrompt: '',
+      workspaceMutation: 'plan',
+      engineeringDecisions: 'ask',
+      skills: [],
+    };
+  }
   let value: unknown;
   try {
     value = JSON.parse(encoded) as unknown;
@@ -20,6 +29,8 @@ export function decodeStartupPluginConfig(encoded: string | undefined): StartupP
     !isRecord(value)
     || typeof value.systemPrompt !== 'string'
     || new TextEncoder().encode(value.systemPrompt).byteLength > 64 * 1024
+    || !['plan', 'allow'].includes(String(value.workspaceMutation))
+    || !['ask', 'delegate'].includes(String(value.engineeringDecisions))
     || !Array.isArray(value.skills)
   ) {
     throw new Error('startup_plugin_config_invalid');
@@ -36,7 +47,12 @@ export function decodeStartupPluginConfig(encoded: string | undefined): StartupP
     }
     return { id: item.id, instructions: item.instructions };
   });
-  return { systemPrompt: value.systemPrompt, skills };
+  return {
+    systemPrompt: value.systemPrompt,
+    workspaceMutation: value.workspaceMutation as 'plan' | 'allow',
+    engineeringDecisions: value.engineeringDecisions as 'ask' | 'delegate',
+    skills,
+  };
 }
 
 export function skillPlugin(skill: StartupPluginConfig['skills'][number]): AgentPlugin {

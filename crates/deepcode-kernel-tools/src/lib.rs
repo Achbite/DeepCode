@@ -21,9 +21,9 @@ pub mod kernel_internal {
         validate_canonical_invocation, InvocationNormalizationError,
     };
     pub use crate::invocation_types::{
-        KernelCanonicalInvocation, KernelDeleteTarget, KernelDocumentPages, KernelEditMatcher,
-        KernelFileDigestPrecondition, KernelLineRange, KernelSearchStrategy, KernelToolKind,
-        MAX_CANONICAL_INVOCATION_BYTES,
+        process_shell_hard_deny_reason, KernelCanonicalInvocation, KernelDeleteTarget,
+        KernelDocumentPages, KernelEditMatcher, KernelFileDigestPrecondition, KernelLineRange,
+        KernelSearchStrategy, KernelToolKind, MAX_CANONICAL_INVOCATION_BYTES,
     };
     pub use crate::registrations::KernelExecutorBinding;
     pub use crate::types::Platform;

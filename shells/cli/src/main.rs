@@ -1,7 +1,7 @@
 use deepcode_kernel_client::{
     approval_response_command, cancel_command, interaction_response_command,
-    is_terminal_run_status, message_command, plan_feedback_command, plan_ignore_command,
-    plan_select_command, profile_selection_command, ActivityProjection, ApprovalProjection,
+    is_terminal_run_status, message_command, plan_cancel_command, plan_confirm_command,
+    plan_revision_command, profile_selection_command, ActivityProjection, ApprovalProjection,
     CreateConversationSessionRequest, HttpKernelClient, InteractionProjection, KernelBootstrap,
     KernelBootstrapOptions, NarrativeProjection, PendingPlanProjection, ProjectionMessage,
     SessionProjection,
@@ -71,7 +71,7 @@ enum Command {
     Ask(String),
     Chat,
     Show,
-    IgnorePlan,
+    CancelPlan,
     SelectModel {
         profile_id: String,
     },
@@ -149,11 +149,11 @@ impl Args {
                 }
                 Command::Ask(text)
             }
-            Some("ignore-plan") => {
+            Some("cancel-plan") => {
                 if positional.len() != 1 {
-                    return Err("用法：ignore-plan --session <id>".to_string());
+                    return Err("用法：cancel-plan --session <id>".to_string());
                 }
-                Command::IgnorePlan
+                Command::CancelPlan
             }
             Some("model") => {
                 if positional.len() != 2 {
@@ -257,7 +257,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
             render_projection(&projection, true);
             Ok(outcome_for_projection(&projection).unwrap_or(Outcome::Done))
         }
-        Command::IgnorePlan => {
+        Command::CancelPlan => {
             let session_id = require_session(args.session_id.as_deref())?;
             let before = client
                 .conversation_projection(session_id)
@@ -267,7 +267,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 .pending_plan
                 .as_ref()
                 .ok_or_else(|| "当前没有待处理 Plan。".to_string())?;
-            let command = plan_ignore_command(session_id, &new_id("command"), plan);
+            let command = plan_cancel_command(session_id, &new_id("command"), plan);
             submit_checked(client, session_id, &command).await?;
             wait_for_projection(
                 client,
@@ -418,20 +418,14 @@ fn contextual_input_command(
         ));
     }
     if let Some(plan) = projection.pending_plan.as_ref() {
-        if let Ok(index) = text.parse::<usize>() {
-            if let Some(option) = index
-                .checked_sub(1)
-                .and_then(|index| plan.options.get(index))
-            {
-                return Ok(plan_select_command(
-                    &projection.session_id,
-                    &new_id("command"),
-                    plan,
-                    &option.option_id,
-                ));
-            }
+        if is_plan_confirmation_input(text) {
+            return Ok(plan_confirm_command(
+                &projection.session_id,
+                &new_id("command"),
+                plan,
+            ));
         }
-        return Ok(plan_feedback_command(
+        return Ok(plan_revision_command(
             &projection.session_id,
             &new_id("command"),
             plan,
@@ -622,7 +616,7 @@ async fn run_chat(
     }
     let mut projection = open_session(client, session_id, workspace).await?;
     println!("session: {}", projection.session_id);
-    println!("普通文本用于消息、交互回应或 Plan 反馈；Plan 可输入编号；effect 审批输入 1/允许或 2/拒绝；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/ignore；/model；/cancel；/quit。");
+    println!("普通文本用于消息、交互回应或 Plan 修订；Plan 输入 1/确认后执行；effect 审批输入 1/允许或 2/拒绝；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/cancel-plan；/model；/cancel；/quit。");
     render_action_required_if_any(&projection);
     let mut line = String::new();
     loop {
@@ -652,12 +646,12 @@ async fn run_chat(
         match input {
             "/quit" | "/exit" => return Ok(Outcome::Done),
             "/show" => render_projection(&projection, true),
-            "/ignore" => {
+            "/cancel-plan" => {
                 let plan = projection
                     .pending_plan
                     .as_ref()
                     .ok_or_else(|| "当前没有待处理 Plan。".to_string())?;
-                let command = plan_ignore_command(&projection.session_id, &new_id("command"), plan);
+                let command = plan_cancel_command(&projection.session_id, &new_id("command"), plan);
                 submit_checked(client, &projection.session_id, &command).await?;
                 let outcome = wait_for_projection(
                     client,
@@ -829,6 +823,32 @@ fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProje
         .unwrap_or(activity.label.as_str());
     println!("工具 {operation} [{}]", activity.status);
     if let Some(tool) = activity.tool.as_ref() {
+        if let Some(shell) = tool.shell.as_ref() {
+            println!("  $ {}", shell.command);
+            println!("  cwd: {}", shell.cwd);
+            if let Some(result) = shell.result.as_ref() {
+                let exit = result
+                    .exit_code
+                    .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
+                println!(
+                    "  exit: {exit} · {} ms · {} bytes{}{}",
+                    result.duration_ms,
+                    result.captured_bytes,
+                    if result.timed_out {
+                        " · timed out"
+                    } else {
+                        ""
+                    },
+                    if result.truncated {
+                        " · truncated"
+                    } else {
+                        ""
+                    },
+                );
+                print_tool_stream("stdout", &result.stdout);
+                print_tool_stream("stderr", &result.stderr);
+            }
+        }
         for resource in &tool.resources {
             match (
                 resource.kind.as_str(),
@@ -844,6 +864,16 @@ fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProje
                 _ => println!("  {}", resource.label),
             }
         }
+    }
+}
+
+fn print_tool_stream(label: &str, output: &str) {
+    if output.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for line in output.lines() {
+        println!("    {line}");
     }
 }
 
@@ -917,8 +947,8 @@ fn render_action_required(projection: &SessionProjection) {
     if let Some(plan) = projection.pending_plan.as_ref() {
         render_plan(plan);
         eprintln!(
-            "输入 1..{} 选择；输入其他非空文本调整；显式运行 `deepcode-cli ignore-plan --session {}` 忽略并直接回答。",
-            plan.options.len(), projection.session_id,
+            "输入 1/确认；输入其他非空文本请求修订；显式运行 `deepcode-cli cancel-plan --session {}` 取消。",
+            projection.session_id,
         );
     }
     if let Some(interaction) = projection.pending_interaction.as_ref() {
@@ -942,17 +972,25 @@ fn render_approval(approval: &ApprovalProjection) {
 }
 
 fn render_plan(plan: &PendingPlanProjection) {
-    println!("Plan");
-    println!("{}", plan.prompt);
-    for (index, option) in plan.options.iter().enumerate() {
-        println!("{}. {}", index + 1, option.label);
-        if let Some(description) = option.description.as_deref() {
-            println!("   {description}");
-        }
-        for operation in &option.operations_display {
-            println!("   - {operation}");
+    println!("Plan · revision {}", plan.revision);
+    println!("{}", plan.title);
+    println!("{}", plan.summary);
+    for (index, step) in plan.steps.iter().enumerate() {
+        println!("{}. {}", index + 1, step.title);
+        println!("   {}", step.details);
+        if let Some(verification) = step.verification.as_ref() {
+            for item in verification {
+                println!("   验证：{item}");
+            }
         }
     }
+}
+
+fn is_plan_confirmation_input(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "1" | "y" | "yes" | "confirm"
+    ) || matches!(input.trim(), "确认" | "同意")
 }
 
 fn render_interaction(interaction: &InteractionProjection) {
@@ -1075,7 +1113,7 @@ fn print_help() {
   deepcode-cli ask [-C <workspace>] [--session <id>] [--plain] <message-or-response>
   deepcode-cli chat [-C <workspace>] [--session <id>]
   deepcode-cli show --session <id>
-  deepcode-cli ignore-plan --session <id>
+  deepcode-cli cancel-plan --session <id>
   deepcode-cli model --session <id> <profile-id>
   deepcode-cli cancel --session <id> <run-id>
   deepcode-cli attach-directory --session <id> <path>
@@ -1084,7 +1122,7 @@ fn print_help() {
   deepcode-cli status
 
 只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
-Plan 等待时，数字 1..N 选择对应 option，其他非空输入作为调整反馈；ignore-plan 才表示忽略。
+Plan 等待时，输入 1/确认，其他非空输入作为修订说明；cancel-plan 明确取消。
 所有终端命令都通过 ConversationPort，并只读取共享 SessionProjection。"#,
     );
 }

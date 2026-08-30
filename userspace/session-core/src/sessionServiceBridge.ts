@@ -50,13 +50,19 @@ async function main(): Promise<void> {
   const kernel = new HttpKernelPort({ apiBase, serviceToken });
   const provider = new HttpProviderPort({ apiBase, serviceToken });
   const serviceAbort = new AbortController();
+  const workspaceAutonomyInstruction = startupPlugins.workspaceMutation === 'allow'
+    ? '工作区内 fs.* 修改可直接执行，不要仅因权限发布 Plan；process.shell 可直接用于工作区调试。工作区外副作用等待用户决定。'
+    : '工作区内 fs.* 修改前先调用 plan.publish 并等待确认；只读、process.shell 和普通回答不要求 Plan。';
+  const engineeringDecisionInstruction = startupPlugins.engineeringDecisions === 'delegate'
+    ? '有充分工作区事实时自行选择最小一致工程路线；缺少需求事实、涉及工作区外或不可逆外部动作时调用 interaction.request。'
+    : '实质改变需求、公共合同、事实 owner 或工程路线时调用 interaction.request；不强制提供多个选项。';
   const plugins: readonly AgentPlugin[] = [
     {
       id: 'deepcode.core.instructions',
       setup: () => ({
         instructions: [{
           id: 'deepcode.coding-agent',
-          text: '你是本地编码 Agent。依据用户指令和工具事实工作；需要未获授权的副作用时等待用户决定。',
+          text: '你是本地编码 Agent。依据用户指令和工具事实工作；需要未获授权的副作用时等待用户决定。除非用户明确要求或语义确有必要，避免使用表情符号。',
         }],
       }),
     },
@@ -71,6 +77,15 @@ async function main(): Promise<void> {
           }),
         } satisfies AgentPlugin]
       : []),
+    {
+      id: 'deepcode.core.workspace-autonomy',
+      setup: () => ({
+        instructions: [{
+          id: 'deepcode.workspace-autonomy',
+          text: `${workspaceAutonomyInstruction}\n${engineeringDecisionInstruction}`,
+        }],
+      }),
+    },
     {
       id: 'deepcode.core.provider',
       setup: () => ({
@@ -183,6 +198,8 @@ function decodeCommand(value: unknown): ConversationCommand {
     case 'message.submit':
       if (
         typeof value.text !== 'string'
+        || (value.directoryAttachments !== undefined
+          && !isWorkspaceBindingArray(value.directoryAttachments))
         || (value.profileId !== undefined && !validId(value.profileId))
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
@@ -220,6 +237,7 @@ function decodeCommand(value: unknown): ConversationCommand {
       if (
         !validId(value.runId)
         || !validId(value.planId)
+        || !positiveInteger(value.revision)
         || !decodePlanResponse(value.response)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
@@ -228,7 +246,10 @@ function decodeCommand(value: unknown): ConversationCommand {
   }
 }
 
-function isWorkspaceBinding(value: unknown): boolean {
+function isWorkspaceBinding(value: unknown): value is {
+  workspaceId: string;
+  displayName: string;
+} {
   return isRecord(value)
     && Object.keys(value).every((key) => ['workspaceId', 'displayName'].includes(key))
     && validId(value.workspaceId)
@@ -236,6 +257,15 @@ function isWorkspaceBinding(value: unknown): boolean {
     && Boolean(value.displayName.trim())
     && value.displayName.length <= 160
     && !/[\u0000-\u001f\u007f]/u.test(value.displayName);
+}
+
+function isWorkspaceBindingArray(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length > 8) return false;
+  const ids = new Set<string>();
+  return value.every((binding) => (
+    isWorkspaceBinding(binding)
+    && ids.size !== ids.add(binding.workspaceId).size
+  ));
 }
 
 function validId(value: unknown): value is string {
@@ -360,17 +390,19 @@ function decodeWorkspaceBindings(value: unknown): Array<{
 
 function decodePlanResponse(value: unknown): boolean {
   if (!isRecord(value) || typeof value.kind !== 'string') return false;
-  if (value.kind === 'ignore') return Object.keys(value).length === 1;
-  if (value.kind === 'select') {
-    return Object.keys(value).length === 2 && validId(value.optionId);
+  if (value.kind === 'confirm' || value.kind === 'cancel') {
+    return Object.keys(value).length === 1;
   }
-  if (value.kind === 'feedback') {
-    return Object.keys(value).every((key) => ['kind', 'text', 'optionId'].includes(key))
+  if (value.kind === 'requestRevision') {
+    return Object.keys(value).length === 2
       && typeof value.text === 'string'
-      && Boolean(value.text.trim())
-      && (value.optionId === undefined || validId(value.optionId));
+      && Boolean(value.text.trim());
   }
   return false;
+}
+
+function positiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

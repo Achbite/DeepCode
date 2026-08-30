@@ -3,8 +3,10 @@ import type {
   AssistantDraftProjection,
   ArtifactProjection,
   PendingPlanProjection,
+  PlanProjection,
   SessionEvent,
   SessionProjection,
+  ShellExecutionEnvironmentProjection,
   ToolExecutionRecord,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
@@ -21,6 +23,8 @@ export interface SessionState {
   narratives: SessionProjection['narratives'];
   pendingInteraction: SessionProjection['pendingInteraction'];
   pendingApproval: SessionProjection['pendingApproval'];
+  plans: SessionProjection['plans'];
+  activePlanRef: SessionProjection['activePlanRef'];
   pendingPlan: SessionProjection['pendingPlan'];
   todoList: SessionProjection['todoList'];
   contextUsage: SessionProjection['contextUsage'];
@@ -45,6 +49,8 @@ export function emptySessionState(sessionId: string): SessionState {
     narratives: [],
     pendingInteraction: null,
     pendingApproval: null,
+    plans: [],
+    activePlanRef: null,
     pendingPlan: null,
     todoList: null,
     contextUsage: null,
@@ -79,11 +85,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     messages: previous.messages.map((message) => ({
       ...message,
       attachments: message.attachments.map((attachment) => ({ ...attachment })),
+      directoryAttachments: message.directoryAttachments.map((attachment) => ({ ...attachment })),
     })),
     narratives: previous.narratives.map((narrative) => ({ ...narrative })),
     pendingInteraction: cloneInteraction(previous.pendingInteraction),
     pendingApproval: cloneApproval(previous.pendingApproval),
-    pendingPlan: clonePlanProjection(previous.pendingPlan),
+    plans: previous.plans.map((plan) => clonePlanProjection(plan)),
+    activePlanRef: previous.activePlanRef ? { ...previous.activePlanRef } : null,
+    pendingPlan: previous.pendingPlan ? clonePlanProjection(previous.pendingPlan) : null,
     todoList: cloneTodoList(previous.todoList),
     contextUsage: previous.contextUsage ? { ...previous.contextUsage } : null,
     contextCompositions: previous.contextCompositions.map(cloneContextComposition),
@@ -155,7 +164,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...(event.payload.profileId ? { profileId: event.payload.profileId } : {}),
       };
       next.terminalError = null;
-      next.todoList = null;
       next.activities[runActivityId(event.runId)] = {
         activityId: runActivityId(event.runId),
         kind: 'run',
@@ -179,6 +187,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           name: attachment.name,
           mediaType: attachment.mediaType,
           byteLength: new TextEncoder().encode(attachment.content).byteLength,
+        })),
+        directoryAttachments: (event.payload.directoryAttachments ?? []).map((attachment) => ({
+          ...attachment,
         })),
         feedback: null,
         sequence: event.sequence,
@@ -234,36 +245,217 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed', event.sequence);
       resumeRun(next, event.runId);
       break;
-    case 'plan.intent.requested':
-      next.pendingPlan = projectPlan(event, currentRunBindings(next, event.runId));
-      next.activities[planActivityId(event.payload.planId)] = {
-        activityId: planActivityId(event.payload.planId),
+    case 'plan.published': {
+      if (findPlanIndex(next, event.payload.planId, event.payload.revision) >= 0) {
+        throw new Error('plan_revision_duplicate');
+      }
+      const plan = projectPlan(event);
+      next.plans.push(plan);
+      next.pendingPlan = { ...clonePlanProjection(plan), responseMode: 'confirmReviseOrCancel' };
+      next.activities[planActivityId(event.payload.planId, event.payload.revision)] = {
+        activityId: planActivityId(event.payload.planId, event.payload.revision),
         kind: 'plan',
         status: 'waiting',
-        label: event.payload.prompt,
+        label: event.payload.title,
         runId: event.runId,
+        callId: event.callId,
         sequence: event.sequence,
       };
       break;
-    case 'plan.intent.resolved':
+    }
+    case 'plan.confirmed':
       if (
         !next.pendingPlan
         || next.pendingPlan.planId !== event.payload.planId
+        || next.pendingPlan.revision !== event.payload.revision
         || next.pendingPlan.runId !== event.runId
+        || next.pendingPlan.callId !== event.callId
       ) throw new Error('plan_request_missing');
+      updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
+        ...plan,
+        status: 'confirmed',
+        decisionId: event.payload.decisionId,
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      }));
       next.pendingPlan = null;
-      settleActivity(next, planActivityId(event.payload.planId), 'completed', event.sequence);
+      next.activePlanRef = {
+        planId: event.payload.planId,
+        revision: event.payload.revision,
+      };
+      settleActivity(
+        next,
+        planActivityId(event.payload.planId, event.payload.revision),
+        'completed',
+        event.sequence,
+      );
       resumeRun(next, event.runId);
       break;
-    case 'todo.updated':
+    case 'plan.revision.requested':
+      assertPendingPlan(next, event);
+      updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
+        ...plan,
+        status: 'revisionRequested',
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      }));
+      next.pendingPlan = null;
+      if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
+      settleActivity(
+        next,
+        planActivityId(event.payload.planId, event.payload.revision),
+        'completed',
+        event.sequence,
+      );
+      resumeRun(next, event.runId);
+      break;
+    case 'plan.cancelled':
+      assertPendingPlan(next, event);
+      updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
+        ...plan,
+        status: 'cancelled',
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      }));
+      next.pendingPlan = null;
+      if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
+      settleActivity(
+        next,
+        planActivityId(event.payload.planId, event.payload.revision),
+        'cancelled',
+        event.sequence,
+      );
+      resumeRun(next, event.runId);
+      break;
+    case 'plan.superseded':
+      if (!['confirmed', 'revisionRequested'].includes(
+        planFor(next, event.payload.planId, event.payload.revision).status,
+      )) throw new Error('plan_supersede_state_invalid');
+      updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
+        ...plan,
+        status: 'superseded',
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      }));
+      if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
+      break;
+    case 'plan.completed':
+      if (
+        !samePlanRef(next.activePlanRef, event.payload)
+        || planFor(next, event.payload.planId, event.payload.revision).status !== 'confirmed'
+        || !next.todoList
+        || next.todoList.sourcePlanId !== event.payload.planId
+        || next.todoList.sourcePlanRevision !== event.payload.revision
+        || next.todoList.items.length === 0
+        || next.todoList.items.some((item) => item.status !== 'completed')
+      ) throw new Error('plan_completion_state_invalid');
+      updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
+        ...plan,
+        status: 'completed',
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      }));
+      if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
+      settleActivity(
+        next,
+        planActivityId(event.payload.planId, event.payload.revision),
+        'completed',
+        event.sequence,
+      );
+      break;
+    case 'plan.invalidated':
+      if (!['published', 'confirmed', 'revisionRequested'].includes(
+        planFor(next, event.payload.planId, event.payload.revision).status,
+      )) throw new Error('plan_invalidation_state_invalid');
+      {
+        const invalidatedPending = samePlanRef(next.pendingPlan, event.payload);
+        updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
+          ...plan,
+          status: 'invalidated',
+          sequence: event.sequence,
+          updatedAt: event.occurredAt,
+        }));
+        if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
+        if (samePlanRef(next.pendingPlan, event.payload)) next.pendingPlan = null;
+        settleActivity(
+          next,
+          planActivityId(event.payload.planId, event.payload.revision),
+          'failed',
+          event.sequence,
+        );
+        if (invalidatedPending) resumeRun(next, event.runId);
+      }
+      break;
+    case 'todo.seeded':
+    case 'todo.reconciled': {
       assertRunningRun(next, event.runId, 'todo_run_not_active');
+      const sourcePlan = planFor(
+        next,
+        event.payload.sourcePlanId,
+        event.payload.sourcePlanRevision,
+      );
+      if (sourcePlan.status !== 'confirmed') throw new Error('todo_source_plan_not_confirmed');
+      const expectedSteps = new Map(sourcePlan.steps.map((step) => [step.stepId, step.title]));
+      const todoIds = new Set<string>();
+      const sourceStepIds = new Set<string>();
+      let itemsMatchPlan = event.payload.items.length === sourcePlan.steps.length;
+      for (const item of event.payload.items) {
+        if (
+          todoIds.has(item.todoId)
+          || sourceStepIds.has(item.sourceStepId)
+          || expectedSteps.get(item.sourceStepId) !== item.label
+        ) {
+          itemsMatchPlan = false;
+          break;
+        }
+        todoIds.add(item.todoId);
+        sourceStepIds.add(item.sourceStepId);
+      }
+      if (!itemsMatchPlan) throw new Error('todo_seed_plan_steps_mismatch');
       next.todoList = {
-        runId: event.runId,
+        sourcePlanId: event.payload.sourcePlanId,
+        sourcePlanRevision: event.payload.sourcePlanRevision,
         items: event.payload.items.map((item) => ({ ...item })),
         sequence: event.sequence,
         updatedAt: event.occurredAt,
       };
       break;
+    }
+    case 'todo.progressed': {
+      assertRunningRun(next, event.runId, 'todo_run_not_active');
+      if (
+        !next.todoList
+        || next.todoList.sourcePlanId !== event.payload.sourcePlanId
+        || next.todoList.sourcePlanRevision !== event.payload.sourcePlanRevision
+        || !samePlanRef(next.activePlanRef, {
+          planId: event.payload.sourcePlanId,
+          revision: event.payload.sourcePlanRevision,
+        })
+        || planFor(
+          next,
+          event.payload.sourcePlanId,
+          event.payload.sourcePlanRevision,
+        ).status !== 'confirmed'
+      ) throw new Error('todo_source_plan_mismatch');
+      if (new Set(event.payload.updates.map((update) => update.todoId)).size
+        !== event.payload.updates.length) throw new Error('todo_update_duplicate');
+      const updates = new Map(event.payload.updates.map((update) => [update.todoId, update.status]));
+      for (const todoId of updates.keys()) {
+        if (!next.todoList.items.some((item) => item.todoId === todoId)) {
+          throw new Error('todo_item_missing');
+        }
+      }
+      next.todoList = {
+        ...next.todoList,
+        items: next.todoList.items.map((item) => ({
+          ...item,
+          status: updates.get(item.todoId) ?? item.status,
+        })),
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+      break;
+    }
     case 'tool.requested':
       next.activities[toolActivityId(event.callId)] = {
         activityId: toolActivityId(event.callId),
@@ -327,6 +519,10 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     case 'session.control.rejected':
       assertRunningRun(next, event.runId, 'session_control_rejection_run_not_active');
       break;
+    case 'context.compaction.requested':
+    case 'context.compacted':
+      assertRunningRun(next, event.runId, 'context_compaction_run_not_active');
+      break;
     case 'context.composed':
       assertRunningRun(next, event.runId, 'provider_request_run_not_active');
       if (next.contextCompositions.some((receipt) => (
@@ -336,6 +532,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.contextCompositions.push({
         runId: event.runId,
         providerRequestId: event.payload.providerRequestId,
+        purpose: event.payload.purpose,
         responseConstraint: event.payload.responseConstraint,
         messages: event.payload.messages.map((message) => ({
           ...message,
@@ -362,13 +559,15 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...receipt,
         partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
       };
-      next.contextUsage = {
-        ...event.payload,
-        providerRequestId,
-        runId: event.runId,
-        sequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+      if (receipt.purpose === 'agent') {
+        next.contextUsage = {
+          ...event.payload,
+          providerRequestId,
+          runId: event.runId,
+          sequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
+      }
       next.tokenUsage = {
         providerCallCount: addTokenCount(next.tokenUsage.providerCallCount, 1),
         inputTokens: addTokenCount(next.tokenUsage.inputTokens, event.payload.inputTokens),
@@ -432,7 +631,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       next.pendingInteraction = null;
       next.pendingApproval = null;
-      next.pendingPlan = null;
       settleActivity(next, runActivityId(event.runId), event.payload.outcome, event.sequence);
       next.terminalError = event.payload.outcome === 'failed'
         || event.payload.outcome === 'indeterminate'
@@ -461,12 +659,15 @@ export function projectSession(
     messages: state.messages.map((message) => ({
       ...message,
       attachments: message.attachments.map((attachment) => ({ ...attachment })),
+      directoryAttachments: message.directoryAttachments.map((attachment) => ({ ...attachment })),
     })),
     narratives: state.narratives.map((narrative) => ({ ...narrative })),
     assistantDraft: assistantDraft ? { ...assistantDraft } : null,
     pendingInteraction: cloneInteraction(state.pendingInteraction),
     pendingApproval: cloneApproval(state.pendingApproval),
-    pendingPlan: clonePlanProjection(state.pendingPlan),
+    plans: state.plans.map((plan) => clonePlanProjection(plan)),
+    activePlanRef: state.activePlanRef ? { ...state.activePlanRef } : null,
+    pendingPlan: state.pendingPlan ? clonePlanProjection(state.pendingPlan) : null,
     todoList: cloneTodoList(state.todoList),
     contextUsage: state.contextUsage ? { ...state.contextUsage } : null,
     contextCompositions: state.contextCompositions.map(cloneContextComposition),
@@ -520,30 +721,24 @@ function cloneApproval(
 }
 
 function projectPlan(
-  event: Extract<SessionEvent, { type: 'plan.intent.requested' }>,
-  bindings: readonly WorkspaceBindingDisplay[],
-): PendingPlanProjection {
-  const names = new Map(bindings.map((binding) => [binding.workspaceId, binding.displayName]));
+  event: Extract<SessionEvent, { type: 'plan.published' }>,
+): PlanProjection & { status: 'published' } {
   return {
     planId: event.payload.planId,
+    revision: event.payload.revision,
     runId: event.runId,
-    prompt: event.payload.prompt,
-    options: event.payload.options.map((option) => ({
-      optionId: option.optionId,
-      label: option.label,
-      ...(option.description ? { description: option.description } : {}),
-      operationsDisplay: option.operations.map((operation) => {
-        const workspace = names.get(operation.workspaceId) ?? operation.workspaceId;
-        const targetKind = operation.operation === 'fs.delete'
-          ? ` (${operation.targetKind})`
-          : '';
-        return `${operation.operation} · ${workspace}:${operation.target}${targetKind}`;
-      }),
+    callId: event.callId,
+    title: event.payload.title,
+    summary: event.payload.summary,
+    steps: event.payload.steps.map((step) => ({
+      ...step,
+      ...(step.verification ? { verification: [...step.verification] } : {}),
     })),
-    responseMode: 'optionOrFreeform',
-    ignoreAllowed: true,
+    mutationManifest: event.payload.mutationManifest.map((operation) => ({ ...operation })),
+    status: 'published',
     sequence: event.sequence,
     createdAt: event.occurredAt,
+    updatedAt: event.occurredAt,
   };
 }
 
@@ -559,15 +754,65 @@ function cloneInteraction(
   };
 }
 
-function clonePlanProjection(plan: PendingPlanProjection | null): PendingPlanProjection | null {
-  if (!plan) return null;
+function clonePlanProjection<T extends PlanProjection | PendingPlanProjection>(plan: T): T;
+function clonePlanProjection(plan: null): null;
+function clonePlanProjection(
+  plan: PlanProjection | PendingPlanProjection | null,
+): PlanProjection | PendingPlanProjection | null {
+  if (plan === null) return null;
   return {
     ...plan,
-    options: plan.options.map((option) => ({
-      ...option,
-      operationsDisplay: [...option.operationsDisplay],
+    steps: plan.steps.map((step) => ({
+      ...step,
+      ...(step.verification ? { verification: [...step.verification] } : {}),
     })),
+    mutationManifest: plan.mutationManifest.map((operation) => ({ ...operation })),
   };
+}
+
+function findPlanIndex(state: SessionState, planId: string, revision: number): number {
+  return state.plans.findIndex((plan) => plan.planId === planId && plan.revision === revision);
+}
+
+function planFor(state: SessionState, planId: string, revision: number): PlanProjection {
+  const plan = state.plans[findPlanIndex(state, planId, revision)];
+  if (!plan) throw new Error('plan_revision_missing');
+  return plan;
+}
+
+function updatePlan(
+  state: SessionState,
+  planId: string,
+  revision: number,
+  update: (plan: PlanProjection) => PlanProjection,
+): void {
+  const index = findPlanIndex(state, planId, revision);
+  if (index < 0) throw new Error('plan_revision_missing');
+  state.plans[index] = update(planFor(state, planId, revision));
+}
+
+function assertPendingPlan(
+  state: SessionState,
+  event: Extract<SessionEvent, { type: 'plan.revision.requested' | 'plan.cancelled' }>,
+): void {
+  if (
+    !state.pendingPlan
+    || state.pendingPlan.planId !== event.payload.planId
+    || state.pendingPlan.revision !== event.payload.revision
+    || state.pendingPlan.runId !== event.runId
+    || state.pendingPlan.callId !== event.callId
+  ) throw new Error('plan_request_missing');
+}
+
+function samePlanRef(
+  reference: { planId: string; revision: number } | null,
+  candidate: { planId: string; revision: number },
+): boolean {
+  return Boolean(
+    reference
+    && reference.planId === candidate.planId
+    && reference.revision === candidate.revision
+  );
 }
 
 function cloneTodoList(todoList: SessionProjection['todoList']): SessionProjection['todoList'] {
@@ -664,6 +909,16 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
           tool: {
             ...activity.tool,
             resources: activity.tool.resources.map((resource) => ({ ...resource })),
+            ...(activity.tool.shell
+              ? {
+                  shell: {
+                    ...activity.tool.shell,
+                    ...(activity.tool.shell.result
+                      ? { result: { ...activity.tool.shell.result } }
+                      : {}),
+                  },
+                }
+              : {}),
           },
         }
       : {}),
@@ -719,7 +974,88 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
       }
       return { kind: 'logicalTarget' as const, label: target };
     }),
+    ...(record.toolName === 'process.shell' ? { shell: projectShellActivity(record) } : {}),
   };
+}
+
+function projectShellActivity(
+  record: ToolExecutionRecord,
+): NonNullable<NonNullable<ActivityProjection['tool']>['shell']> {
+  const canonicalArguments = record.preparedEffect.canonicalInvocation.arguments;
+  if (!isRecord(canonicalArguments)) {
+    throw new Error('process_shell_projection_input_invalid');
+  }
+  const command = canonicalArguments.command;
+  const cwd = canonicalArguments.cwd;
+  if (
+    typeof command !== 'string'
+    || !command.trim()
+    || typeof cwd !== 'string'
+    || !cwd.trim()
+  ) {
+    throw new Error('process_shell_projection_input_invalid');
+  }
+  if (record.outcome !== 'completed') return { command, cwd };
+  if (!isRecord(record.output)) throw new Error('process_shell_projection_output_invalid');
+  const {
+    command: outputCommand,
+    cwd: outputCwd,
+    stdout,
+    stderr,
+    exitCode,
+    success,
+    timedOut,
+    truncated,
+    capturedBytes,
+    durationMs,
+  } = record.output;
+  if (
+    outputCommand !== command
+    || outputCwd !== cwd
+    || typeof stdout !== 'string'
+    || typeof stderr !== 'string'
+    || !(exitCode === null || typeof exitCode === 'number' && Number.isSafeInteger(exitCode))
+    || typeof success !== 'boolean'
+    || typeof timedOut !== 'boolean'
+    || typeof truncated !== 'boolean'
+    || !isNaturalSafeInteger(capturedBytes)
+    || !isNaturalSafeInteger(durationMs)
+  ) {
+    throw new Error('process_shell_projection_output_invalid');
+  }
+  const environment = projectShellEnvironment(record.output.environment);
+  return {
+    command,
+    cwd,
+    result: {
+      stdout,
+      stderr,
+      exitCode,
+      success,
+      timedOut,
+      truncated,
+      capturedBytes,
+      durationMs,
+      ...(environment ? { environment } : {}),
+    },
+  };
+}
+
+function projectShellEnvironment(value: unknown): ShellExecutionEnvironmentProjection | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('process_shell_projection_environment_invalid');
+  const { shell, interactive, pathSource, writeScope, homeWritable } = value;
+  if (
+    typeof shell !== 'string'
+    || !shell.trim()
+    || interactive !== false
+    || pathSource !== 'hostPlusStandardDeveloperPaths'
+    || writeScope !== 'workspaceAndKernelTemporary'
+    || homeWritable !== false
+  ) {
+    throw new Error('process_shell_projection_environment_invalid');
+  }
+  return { shell, interactive, pathSource, writeScope, homeWritable };
 }
 
 function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] {
@@ -750,10 +1086,16 @@ function runActivityId(runId: string): string { return `run:${runId}`; }
 function toolActivityId(callId: string): string { return `tool:${callId}`; }
 function approvalActivityId(approvalId: string): string { return `approval:${approvalId}`; }
 function interactionActivityId(interactionId: string): string { return `interaction:${interactionId}`; }
-function planActivityId(planId: string): string { return `plan:${planId}`; }
+function planActivityId(planId: string, revision: number): string {
+  return `plan:${planId}:${revision}`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNaturalSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 function addTokenCount(left: number, right: number): number {

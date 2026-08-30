@@ -104,6 +104,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(conversation_directory_index_attach),
         )
         .route(
+            "/api/conversation/sessions/:session_id/directory-attachments/resolve",
+            post(conversation_directory_attachments_resolve),
+        )
+        .route(
             "/api/conversation/sessions/:session_id/directory-indexes/:workspace_id",
             delete(conversation_directory_index_detach),
         )

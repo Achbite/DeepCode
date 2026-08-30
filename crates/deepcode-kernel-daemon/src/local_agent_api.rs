@@ -119,7 +119,9 @@ struct LocalProviderRequest {
     session_id: String,
     run_id: String,
     profile_id: Option<String>,
+    purpose: String,
     response_constraint: String,
+    max_output_tokens: Option<u32>,
     workspace_bindings: Vec<LocalProviderWorkspaceBinding>,
     messages: Vec<LocalProviderMessage>,
     tools: Vec<LocalProviderTool>,
@@ -138,6 +140,7 @@ struct LocalProviderMessage {
     role: String,
     content: String,
     reasoning_content: Option<String>,
+    reasoning_signature: Option<String>,
     tool_call_id: Option<String>,
     tool_calls: Option<Vec<LocalProviderToolCall>>,
 }
@@ -421,12 +424,17 @@ pub(crate) async fn local_agent_provider_stream(
         let gui = state.gui.lock().expect("gui state lock");
         resolve_llm_profile(&gui, body.profile_id.as_deref())
     };
-    let profile = match profile {
+    let mut profile = match profile {
         Ok(profile) => profile,
         Err(error) => {
             return local_provider_error(&request_id, "llm_profile_unavailable", &error);
         }
     };
+    if let Some(limit) = body.max_output_tokens {
+        profile.max_output_tokens = Some(
+            profile.max_output_tokens.map_or(limit, |configured| configured.min(limit)),
+        );
+    }
     let request_envelope = json!({
         "messages": body.messages,
         "tools": body.tools,
@@ -460,6 +468,25 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
     if !matches!(body.response_constraint.as_str(), "normal" | "answerOnly") {
         return Err("Provider 请求的 responseConstraint 无效。".to_string());
     }
+    match body.purpose.as_str() {
+        "agent" => {
+            if body.max_output_tokens.is_some() {
+                return Err("普通 Agent 请求不能覆盖 Profile 输出预算。".to_string());
+            }
+        }
+        "contextCompaction" => {
+            if body.response_constraint != "answerOnly"
+                || !body.tools.is_empty()
+                || body.max_output_tokens.is_none_or(|value| value == 0)
+            {
+                return Err(
+                    "上下文压缩请求必须使用 answerOnly、空工具目录和正数输出预算。"
+                        .to_string(),
+                );
+            }
+        }
+        _ => return Err("Provider 请求的 purpose 无效。".to_string()),
+    }
     let mut workspace_ids = std::collections::HashSet::new();
     for binding in &body.workspace_bindings {
         if !valid_text(&binding.workspace_id)
@@ -481,6 +508,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
         if matches!(message.role.as_str(), "system" | "user")
             && (message.content.trim().is_empty()
                 || message.reasoning_content.is_some()
+                || message.reasoning_signature.is_some()
                 || message.tool_call_id.is_some()
                 || message.tool_calls.is_some())
         {
@@ -488,6 +516,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
         }
         if message.role == "tool" {
             if message.reasoning_content.is_some()
+                || message.reasoning_signature.is_some()
                 || message.tool_calls.is_some()
                 || message
                     .tool_call_id
@@ -502,12 +531,25 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
         if message.role != "assistant" && message.reasoning_content.is_some() {
             return Err("只有 assistant 消息可以携带 reasoningContent。".to_string());
         }
+        if message.role != "assistant" && message.reasoning_signature.is_some() {
+            return Err("只有 assistant 消息可以携带 reasoningSignature。".to_string());
+        }
         if message
             .reasoning_content
             .as_deref()
             .is_some_and(|reasoning| reasoning.trim().is_empty())
         {
             return Err("Provider 请求的 reasoningContent 不能为空。".to_string());
+        }
+        if message
+            .reasoning_signature
+            .as_deref()
+            .is_some_and(|signature| signature.trim().is_empty())
+        {
+            return Err("Provider 请求的 reasoningSignature 不能为空。".to_string());
+        }
+        if message.reasoning_signature.is_some() && message.reasoning_content.is_none() {
+            return Err("reasoningSignature 必须与 reasoningContent 一起提供。".to_string());
         }
         if message.role != "assistant" && message.tool_calls.is_some() {
             return Err("只有 assistant 消息可以携带 toolCalls。".to_string());

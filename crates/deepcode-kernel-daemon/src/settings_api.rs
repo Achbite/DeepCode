@@ -5,6 +5,7 @@ pub(crate) async fn user_settings_get(State(state): State<AppState>) -> Json<Api
     let gui = state.gui.lock().expect("gui state lock");
     ApiResponse::ok(json!({
         "settings": gui.user_settings,
+        "runtimeSettings": state.runtime_user_settings,
         "overriddenKeys": [],
         "storePath": gui.paths.settings_path.to_string_lossy()
     }))
@@ -292,7 +293,9 @@ pub(crate) fn default_user_settings() -> Value {
         "workbench.language": "zh-CN",
         "workbench.styleTokenOverrides": "{}",
         "agent.systemPrompt": "",
-        "agent.permissions.networkRead": "ask",
+        "agent.permissions.workspaceMutation": "plan",
+        "agent.permissions.engineeringDecisions": "ask",
+        "agent.permissions.networkRead": "allow",
         "agent.permissions.external": "ask",
         "terminal.integrated.defaultProfile.windows": "wsl",
         "terminal.integrated.prewarm": "afterStartup",
@@ -319,7 +322,10 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
         {
             if !matches!(
                 key.as_str(),
-                "agent.permissions.networkRead" | "agent.permissions.external"
+                "agent.permissions.workspaceMutation"
+                    | "agent.permissions.engineeringDecisions"
+                    | "agent.permissions.networkRead"
+                    | "agent.permissions.external"
             ) {
                 return Err(format!("{key} 不是当前 Agent Runtime 权限设置。"));
             }
@@ -344,6 +350,18 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
             if !matches!(value, "allow" | "ask" | "deny") {
                 return Err(format!("{key} 必须是 allow、ask 或 deny。"));
             }
+        }
+    }
+    if let Some(value) = settings.get("agent.permissions.workspaceMutation") {
+        if !matches!(value.as_str(), Some("plan" | "allow")) {
+            return Err("agent.permissions.workspaceMutation 必须是 plan 或 allow。".to_string());
+        }
+    }
+    if let Some(value) = settings.get("agent.permissions.engineeringDecisions") {
+        if !matches!(value.as_str(), Some("ask" | "delegate")) {
+            return Err(
+                "agent.permissions.engineeringDecisions 必须是 ask 或 delegate。".to_string(),
+            );
         }
     }
     for key in [
