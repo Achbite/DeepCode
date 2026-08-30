@@ -11,6 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICE = ROOT / "scripts" / "macos-package-service.sh"
+SOURCE_IDENTITY = ROOT / "scripts" / "source-identity.sh"
 
 
 def run(
@@ -68,6 +69,69 @@ def check_toolchain_contract() -> None:
     build = (ROOT / "build.sh").read_text(encoding="utf-8")
     if "SCCACHE_CONFIGURED=0" not in build or 'SCCACHE_CONFIGURED=1' not in build:
         raise AssertionError("sccache is not configured exactly once per build process")
+
+    test_entry = (ROOT / "test.sh").read_text(encoding="utf-8")
+    if 'source "$ROOT_DIR/scripts/source-identity.sh"' not in test_entry:
+        raise AssertionError("test.sh does not share the source identity owner")
+    if 'if deepcode_source_git_available "$ROOT_DIR"; then' not in test_entry:
+        raise AssertionError("test.sh still assumes host Git metadata exists in compile snapshots")
+    if "Git diff check: SKIP" not in test_entry:
+        raise AssertionError("test.sh does not report an unavailable Git diff check explicitly")
+    if 'if [ "$profile" != \'static\' ]; then' not in test_entry:
+        raise AssertionError("test.sh still requires the compile toolchain for its static profile")
+
+
+def check_compile_snapshot_without_git(temporary_root: Path) -> None:
+    fingerprints: list[str] = []
+    for index in range(2):
+        snapshot = temporary_root / f"compile-snapshot-{index}"
+        (snapshot / "src").mkdir(parents=True)
+        (snapshot / ".git").write_text(
+            f"gitdir: /host-only/worktree-{index}/.git/worktrees/compile-snapshot\n",
+            encoding="utf-8",
+        )
+        (snapshot / "src" / "main.txt").write_text("same compile input\n", encoding="utf-8")
+
+        result = run(
+            "bash",
+            "-c",
+            r"""
+set -euo pipefail
+source "$1"
+root="$2"
+printf 'commit=%s\n' "$(deepcode_source_commit "$root")"
+printf 'status=%s\n' "$(deepcode_source_status "$root")"
+printf 'dirty=%s\n' "$(deepcode_source_dirty "$root")"
+printf 'status_hash=%s\n' "$(deepcode_source_status_hash "$root")"
+printf 'fingerprint=%s\n' "$(deepcode_source_fingerprint "$root")"
+""",
+            "source-identity-test",
+            str(SOURCE_IDENTITY),
+            str(snapshot),
+        )
+        if result.stderr:
+            raise AssertionError(f"compile snapshot source identity wrote stderr: {result.stderr}")
+
+        identity = {
+            key: value
+            for line in result.stdout.splitlines()
+            for key, separator, value in (line.partition("="),)
+            if separator
+        }
+        if identity.get("commit") != "unknown":
+            raise AssertionError(f"compile snapshot commit was not explicit: {identity}")
+        if identity.get("status") != "git-metadata=unavailable":
+            raise AssertionError(f"compile snapshot Git state was not explicit: {identity}")
+        if identity.get("dirty") != "1":
+            raise AssertionError(f"compile snapshot was incorrectly certified clean: {identity}")
+        for field in ("status_hash", "fingerprint"):
+            value = identity.get(field, "")
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise AssertionError(f"compile snapshot {field} is not SHA-256: {identity}")
+        fingerprints.append(identity["fingerprint"])
+
+    if fingerprints[0] != fingerprints[1]:
+        raise AssertionError("compile fingerprint depends on the host-only .git pointer")
 
 
 def check_single_container_reconciliation(temporary_root: Path) -> None:
@@ -175,6 +239,7 @@ def main() -> int:
     check_toolchain_contract()
     with tempfile.TemporaryDirectory(prefix="deepcode-development-tooling-") as temporary:
         temporary_root = Path(temporary)
+        check_compile_snapshot_without_git(temporary_root)
         check_single_container_reconciliation(temporary_root)
         check_single_repository_package_queue(temporary_root)
     print("[PASS] 单 checkout 开发容器、Rust 工具链与 macOS 打包队列")

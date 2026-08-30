@@ -24,13 +24,31 @@ deepcode_physical_root() {
   (cd "$root" && pwd -P)
 }
 
+deepcode_source_git_available() {
+  local root="$1"
+  command -v git >/dev/null 2>&1 || return 1
+  git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
 deepcode_source_commit() {
   local root="$1"
+  if ! deepcode_source_git_available "$root"; then
+    printf 'unknown\n'
+    return 0
+  fi
   git -C "$root" rev-parse HEAD
 }
 
 deepcode_source_status() {
   local root="$1"
+  if ! deepcode_source_git_available "$root"; then
+    # Docker compile snapshots can contain a linked-worktree .git file whose
+    # host-only absolute gitdir is intentionally unavailable in the container.
+    # Keep that state explicit and dirty instead of emitting a Git fatal or
+    # accidentally certifying the snapshot as clean.
+    printf 'git-metadata=unavailable\n'
+    return 0
+  fi
   git -C "$root" status --porcelain=v1 --untracked-files=all
 }
 
@@ -50,7 +68,7 @@ deepcode_source_status_hash() {
 
 deepcode_source_fingerprint() {
   local root="$1"
-  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if deepcode_source_git_available "$root"; then
     {
       deepcode_source_commit "$root"
       git -C "$root" diff --binary --no-ext-diff HEAD --
@@ -70,7 +88,7 @@ deepcode_source_fingerprint() {
   (
     cd "$root"
     find . \
-      \( -type d \( -name .git -o -name node_modules -o -name target -o -name bin -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
+      \( -name .git -o -type d \( -name node_modules -o -name target -o -name bin -o -name dist -o -name 'dist-*' -o -name .build-cache \) \) -prune -o \
       \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -print \) \
       | LC_ALL=C sort \
       | while IFS= read -r path; do

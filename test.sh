@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/source-identity.sh"
 
 profile='required'
 if [ "${1:-}" = '--profile' ]; then
@@ -25,7 +26,11 @@ case "$profile" in
   *) printf '未知验证范围：%s\n' "$profile" >&2; exit 2 ;;
 esac
 
-for tool in cargo node pnpm python3; do
+required_tools=(python3 make)
+if [ "$profile" != 'static' ]; then
+  required_tools+=(cargo node pnpm)
+fi
+for tool in "${required_tools[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || { printf '缺少命令：%s\n' "$tool" >&2; exit 1; }
 done
 
@@ -35,7 +40,11 @@ run_static() {
   python3 -I -S ./scripts/tests/development_tooling.py
   bash -n ./test.sh ./build.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/check-architecture.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh
   bash ./scripts/check-architecture.sh
-  git diff --check
+  if deepcode_source_git_available "$ROOT_DIR"; then
+    git -C "$ROOT_DIR" diff --check
+  else
+    printf '[test] Git diff check: SKIP (Git metadata is host-owned and unavailable in this compile/test snapshot)\n'
+  fi
 }
 
 run_required() {
@@ -46,6 +55,7 @@ run_required() {
   printf '[test] TypeScript 协议、Session 与 UI\n'
   pnpm --filter @deepcode/protocol test
   pnpm --filter @deepcode/session-core test
+  pnpm --filter @deepcode/client test
   pnpm --filter @deepcode/client typecheck
 }
 
