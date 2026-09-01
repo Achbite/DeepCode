@@ -51,7 +51,7 @@ impl KernelToolRegistry {
         }
         assert_eq!(
             registrations.len(),
-            19,
+            7,
             "Kernel catalog must contain the canonical callable tools"
         );
         Self { registrations }

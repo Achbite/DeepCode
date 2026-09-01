@@ -1307,7 +1307,7 @@ verify_protocol_runtime() {
     verify_runtime_file "$dist_dir/$required" "$label $required" || failed=1
   done
   if [ -d "$dist_dir" ] && find "$dist_dir" -maxdepth 1 -type f \
-    \( -name 'agent.*' -o -name 'kernelAbiV1.*' -o -name 'kernelAbiV2.*' \) -print -quit | grep -q .; then
+    -name 'agent.*' -print -quit | grep -q .; then
     echo "==[build][verify-package-runtime][error]== $label contains a retired Agent protocol module" >&2
     failed=1
   fi

@@ -3,9 +3,9 @@ import type {
   ActivityProjection,
   MessageFeedback,
   PlanResponse,
+  PluginSelectionInput,
   RunProjection,
   SessionProjection,
-  UserMessageAttachment,
 } from '@deepcode/protocol';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
@@ -13,18 +13,23 @@ import ProjectFolderDialog from '../../deepcode-gui/layout/ProjectFolderDialog';
 import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
-import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
+import { usePresentedCommittedContent } from '../../presentation/PresentationRuntime';
+import { BufferedMarkdown } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import {
   readConversationResource,
   type ConversationResourceReadResult,
 } from '../../services/localAgentApi';
-import { readMessageAttachmentFile } from '../../services/runtimeAdapter';
 import './localAgentPanel.css';
 
 interface LocalAgentPanelProps {
   mode?: 'panel' | 'workbench';
+}
+
+interface PendingFilesystemPath {
+  path: string;
+  kind: 'file' | 'directory';
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -46,21 +51,26 @@ async function copyTextToClipboard(text: string): Promise<void> {
 const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const runtimeEffectiveSettings = useSettingsStore((state) => state.runtimeEffectiveSettings);
-  const settingsRestartRequired = useSettingsStore((state) => state.restartRequired);
+  const settingsPendingNextRunActivation = useSettingsStore(
+    (state) => state.pendingNextRunActivation,
+  );
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const sessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
+  const pluginCatalog = useLocalAgentStore((state) => state.pluginCatalog);
   const profiles = useLocalAgentStore((state) => state.profiles);
   const selectedProfileId = useLocalAgentStore((state) => state.selectedProfileId);
   const projection = useLocalAgentStore((state) => state.projection);
+  const presentation = usePresentedCommittedContent(projection, language);
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
   const refresh = useLocalAgentStore((state) => state.refresh);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
+  const focusContext = useLocalAgentStore((state) => state.focusContext);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const respondInteraction = useLocalAgentStore((state) => state.respondInteraction);
   const respondApproval = useLocalAgentStore((state) => state.respondApproval);
@@ -68,8 +78,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
   const selectProfile = useLocalAgentStore((state) => state.selectProfile);
   const [draft, setDraft] = useState('');
-  const [attachments, setAttachments] = useState<UserMessageAttachment[]>([]);
-  const [pendingDirectoryPaths, setPendingDirectoryPaths] = useState<string[]>([]);
+  const [pendingFilesystemPaths, setPendingFilesystemPaths] = useState<
+    PendingFilesystemPath[]
+  >([]);
+  const [pluginSelections, setPluginSelections] = useState<PluginSelectionInput[]>([]);
+  const [pluginPickerOpen, setPluginPickerOpen] = useState(false);
+  const [pluginQuery, setPluginQuery] = useState('');
+  const [pluginTriggerStart, setPluginTriggerStart] = useState<number | null>(null);
+  const [pluginActiveIndex, setPluginActiveIndex] = useState(0);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
@@ -82,6 +98,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const attachmentControlRef = useRef<HTMLDivElement | null>(null);
+  const pluginPickerRef = useRef<HTMLDivElement | null>(null);
   const permissionControlRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const compositionActiveRef = useRef(false);
@@ -94,16 +111,22 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const lastTouchYRef = useRef<number | null>(null);
   const suppressScrollEventsUntilRef = useRef(0);
   const scrollFrameRef = useRef<number | null>(null);
-  const scrollTimeoutRef = useRef<number | null>(null);
   const activeSummary = catalog.sessions.find((session) => session.id === sessionId);
   const activeProject = catalog.projects.find((project) => (
     project.id === (activeSummary?.projectId ?? draftProjectId)
   ));
   const title = activeSummary?.title.trim()
-    || conversationTitle(projection?.messages, language);
+    || projection?.display.creationTitle.trim()
+    || t(language, 'agent.session.newTitle');
   const conversationItems = useMemo(() => projectionItems(projection), [projection]);
+  const assistantDraft = projection?.assistantDraft ?? null;
+  const timelineExtentKey = projection?.timeline.map((item) => (
+    item.kind === 'toolGroup'
+      ? `${item.timelineId}:${item.activityIds.length}`
+      : item.timelineId
+  )).join('|') ?? '';
   const hasConversationContent = conversationItems.length > 0
-    || Boolean(projection?.assistantDraft)
+    || Boolean(assistantDraft)
     || Boolean(projection?.pendingInteraction)
     || Boolean(projection?.pendingApproval)
     || Boolean(projection?.pendingPlan)
@@ -127,17 +150,11 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 
   const scheduleScrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
     if (!followingLatestRef.current) return;
-    scrollToLatestNow(behavior);
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null;
       if (followingLatestRef.current) scrollToLatestNow(behavior);
     });
-    if (scrollTimeoutRef.current !== null) window.clearTimeout(scrollTimeoutRef.current);
-    scrollTimeoutRef.current = window.setTimeout(() => {
-      scrollTimeoutRef.current = null;
-      if (followingLatestRef.current) scrollToLatestNow('auto');
-    }, 80);
   }, [scrollToLatestNow]);
 
   useEffect(() => {
@@ -149,7 +166,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       if (cancelled) return;
       const current = useLocalAgentStore.getState().projection;
       const active = Boolean(
-        current?.run && ['running', 'waiting'].includes(current.run.status),
+        current?.run && ['running', 'waiting', 'releasing'].includes(current.run.status),
       );
       const delay = document.visibilityState === 'hidden'
         ? 10_000
@@ -180,8 +197,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   useEffect(() => {
     if (activeViewRef.current !== sessionId) {
       if (!submitting) {
-        setPendingDirectoryPaths([]);
-        setAttachments([]);
+        setPendingFilesystemPaths([]);
+        setPluginSelections([]);
+        setPluginPickerOpen(false);
         setAttachmentMenuOpen(false);
         setAttachmentDialogOpen(false);
       }
@@ -192,7 +210,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
-  }, [followingLatest, projection?.assistantDraft?.content, projection?.revision, scheduleScrollToLatest]);
+  }, [assistantDraft?.content, followingLatest, scheduleScrollToLatest, timelineExtentKey]);
 
   useEffect(() => {
     if (typeof ResizeObserver === 'undefined' || !transcriptRef.current) return undefined;
@@ -205,14 +223,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
-    if (scrollTimeoutRef.current !== null) window.clearTimeout(scrollTimeoutRef.current);
     if (compositionGuardFrameRef.current !== null) {
       window.cancelAnimationFrame(compositionGuardFrameRef.current);
     }
   }, []);
 
   useEffect(() => {
-    if (!permissionMenuOpen && !attachmentMenuOpen) return undefined;
+    if (!permissionMenuOpen && !attachmentMenuOpen && !pluginPickerOpen) return undefined;
     const closeOnOutsidePointer = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
@@ -222,15 +239,23 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       if (attachmentMenuOpen && !attachmentControlRef.current?.contains(target)) {
         setAttachmentMenuOpen(false);
       }
+      if (
+        pluginPickerOpen
+        && !pluginPickerRef.current?.contains(target)
+        && target !== textareaRef.current
+      ) {
+        setPluginPickerOpen(false);
+      }
     };
     document.addEventListener('pointerdown', closeOnOutsidePointer);
     return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
-  }, [attachmentMenuOpen, permissionMenuOpen]);
+  }, [attachmentMenuOpen, permissionMenuOpen, pluginPickerOpen]);
 
   useEffect(() => {
     if (pendingPlan || pendingInteraction || pendingApproval) {
-      setAttachments([]);
-      setPendingDirectoryPaths([]);
+      setPendingFilesystemPaths([]);
+      setPluginSelections([]);
+      setPluginPickerOpen(false);
       setAttachmentMenuOpen(false);
       setAttachmentDialogOpen(false);
     }
@@ -248,17 +273,32 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       || compositionActiveRef.current
       || compositionCommitPendingRef.current
     ) return;
-    const submittedAttachments = attachments;
-    const submittedDirectoryPaths = pendingDirectoryPaths;
+    const submittedFilesystemPaths = pendingFilesystemPaths;
+    const submittedPluginSelections = pluginSelections;
     setDraft('');
+    setPluginPickerOpen(false);
     setLatestFollowMode(true);
     try {
-      await sendMessage(submittedText, submittedAttachments, submittedDirectoryPaths);
-      setAttachments([]);
-      setPendingDirectoryPaths([]);
+      const focusMatch = submittedText.match(/^\/focus(?:\s+)([\s\S]+)$/u);
+      if (focusMatch) {
+        await focusContext(
+          focusMatch[1]!.trim(),
+          submittedFilesystemPaths,
+          submittedPluginSelections,
+        );
+      } else {
+        await sendMessage(
+          submittedText,
+          submittedFilesystemPaths,
+          submittedPluginSelections,
+        );
+      }
+      setPendingFilesystemPaths([]);
+      setPluginSelections([]);
       setAttachmentError(null);
     } catch {
       setDraft(submittedText);
+      setPluginSelections(submittedPluginSelections);
     }
   };
 
@@ -305,9 +345,118 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     });
   };
 
+  const filteredPlugins = useMemo(() => {
+    const query = pluginQuery.trim().toLocaleLowerCase();
+    return pluginCatalog.plugins.filter((plugin) => {
+      if (!query) return true;
+      return [plugin.displayName, plugin.shortDescription, plugin.uri]
+        .some((value) => value.toLocaleLowerCase().includes(query));
+    });
+  }, [pluginCatalog.plugins, pluginQuery]);
+
+  useEffect(() => {
+    setPluginActiveIndex((current) => Math.min(
+      current,
+      Math.max(0, filteredPlugins.length - 1),
+    ));
+  }, [filteredPlugins.length]);
+
+  const openPluginPicker = () => {
+    setAttachmentMenuOpen(false);
+    setPluginTriggerStart(null);
+    setPluginQuery('');
+    setPluginActiveIndex(0);
+    setPluginPickerOpen(true);
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  const updateDraft = (value: string, cursor: number) => {
+    setDraft(value);
+    setPluginSelections((current) => current.filter((selection) => (
+      value.includes(`@${selection.label}`)
+    )));
+    const prefix = value.slice(0, cursor);
+    const match = prefix.match(/(^|\s)@([^\s@/]*)$/u);
+    if (!match) {
+      setPluginPickerOpen(false);
+      setPluginTriggerStart(null);
+      setPluginQuery('');
+      setPluginActiveIndex(0);
+      return;
+    }
+    setPluginTriggerStart(cursor - match[2]!.length - 1);
+    setPluginQuery(match[2]!);
+    setPluginActiveIndex(0);
+    setPluginPickerOpen(true);
+  };
+
+  const selectPlugin = (plugin: (typeof pluginCatalog.plugins)[number]) => {
+    const cursor = textareaRef.current?.selectionStart ?? draft.length;
+    const mention = `@${plugin.displayName}`;
+    const alreadySelected = pluginSelections.some((selection) => selection.uri === plugin.uri);
+    const insertionStart = pluginTriggerStart ?? (
+      draft.length + (draft && !/\s$/u.test(draft) ? 1 : 0)
+    );
+    const nextDraft = alreadySelected
+      ? (pluginTriggerStart === null
+          ? draft
+          : `${draft.slice(0, pluginTriggerStart)}${draft.slice(cursor)}`)
+      : pluginTriggerStart === null
+        ? `${draft}${draft && !/\s$/u.test(draft) ? ' ' : ''}${mention} `
+        : `${draft.slice(0, pluginTriggerStart)}${mention} ${draft.slice(cursor)}`;
+    const nextCursor = alreadySelected
+      ? insertionStart
+      : insertionStart + mention.length + 1;
+    setDraft(nextDraft);
+    setPluginSelections((current) => (
+      current.some((selection) => selection.uri === plugin.uri)
+        ? current
+        : [...current, {
+            selectionId: nextPanelId('plugin-selection'),
+            uri: plugin.uri,
+            label: plugin.displayName,
+          }]
+    ));
+    setPluginPickerOpen(false);
+    setPluginTriggerStart(null);
+    setPluginQuery('');
+    setPluginActiveIndex(0);
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
+    });
+  };
+
   const focusCommandSuggestionVisible = shouldOfferFocusCommand(draft);
 
   const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      pluginPickerOpen
+      && !event.nativeEvent.isComposing
+      && !compositionActiveRef.current
+      && !compositionCommitPendingRef.current
+    ) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setPluginPickerOpen(false);
+        return;
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        setPluginActiveIndex((current) => {
+          if (filteredPlugins.length === 0) return 0;
+          const delta = event.key === 'ArrowDown' ? 1 : -1;
+          return (current + delta + filteredPlugins.length) % filteredPlugins.length;
+        });
+        return;
+      }
+      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+        event.preventDefault();
+        const plugin = filteredPlugins[pluginActiveIndex];
+        if (plugin) selectPlugin(plugin);
+        return;
+      }
+    }
     if (!shouldSubmitComposerKey({
       key: event.key,
       shiftKey: event.shiftKey,
@@ -362,42 +511,41 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   ) => {
     setAttachmentDialogOpen(false);
     if (pendingPlan || pendingInteraction || pendingApproval) return;
-    if (type === 'directory') {
-      setAttachmentError(null);
-      setPendingDirectoryPaths((current) => (
-        current.includes(absolutePath) ? current : [...current, absolutePath]
-      ));
-      return;
-    }
     try {
-      if (attachments.length >= 8) {
+      if (pendingFilesystemPaths.length >= 8) {
         throw new Error(t(language, 'agent.attachment.error.maxFiles'));
       }
-      const result = await readMessageAttachmentFile(absolutePath);
-      if (!result.ok || !result.data) {
-        throw new Error(t(language, 'agent.attachment.error.readFile', {
-          message: result.message ?? result.error ?? 'unknown',
-        }));
+      if (type === 'file' && mediaTypeForPath(absolutePath) === 'application/pdf') {
+        const matches = pluginCatalog.plugins.filter((plugin) => (
+          plugin.activationMediaTypes.includes('application/pdf')
+        ));
+        if (matches.length !== 1) {
+          throw new Error('plugin_selection_unavailable:application/pdf');
+        }
+        const plugin = matches[0]!;
+        setPluginSelections((current) => (
+          current.some((selection) => selection.uri === plugin.uri)
+            ? current
+            : [...current, {
+                selectionId: nextPanelId('plugin-selection'),
+                uri: plugin.uri,
+                label: plugin.displayName,
+              }]
+        ));
+        setDraft((current) => {
+          const mention = `@${plugin.displayName}`;
+          return current.includes(mention)
+            ? current
+            : `${current}${current && !/\s$/u.test(current) ? ' ' : ''}${mention} `;
+        });
       }
-      if (result.data.content.includes('\0')) {
-        throw new Error(t(language, 'agent.attachment.error.notText', {
-          name: result.data.name,
-        }));
-      }
-      const next = {
-        attachmentId: nextAttachmentId(),
-        name: result.data.name,
-        mediaType: result.data.mediaType || 'text/plain',
-        content: result.data.content,
-      } satisfies UserMessageAttachment;
-      const totalBytes = [...attachments, next].reduce(
-        (total, attachment) => total + new TextEncoder().encode(attachment.content).byteLength,
-        0,
-      );
-      if (totalBytes > 512 * 1024) {
-        throw new Error(t(language, 'agent.attachment.error.totalSize'));
-      }
-      setAttachments((current) => [...current, next]);
+      setPendingFilesystemPaths((current) => (
+        current.some((candidate) => (
+          candidate.path === absolutePath && candidate.kind === type
+        ))
+          ? current
+          : [...current, { path: absolutePath, kind: type }]
+      ));
       setAttachmentError(null);
     } catch (selectionError) {
       setAttachmentError(selectionError instanceof Error
@@ -549,21 +697,23 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               className={`local-agent__message local-agent__message--${item.value.role}`}
             >
               <div className="local-agent__message-content">
-                <MarkdownContent>{item.value.content}</MarkdownContent>
-                {(item.value.attachments.length > 0
-                  || item.value.directoryAttachments.length > 0) && (
+                {presentation.content(`message:${item.value.messageId}:content`)}
+                {item.value.filesystemReferences.length > 0 && (
                   <div className="local-agent__message-attachments">
-                    {item.value.attachments.map((attachment) => (
-                      <span key={attachment.attachmentId}>
-                        <DeepCodeShellIcon name="artifact" />
-                        {attachment.name}
-                        <small>{formatBytes(attachment.byteLength, language)}</small>
-                      </span>
-                    ))}
-                    {item.value.directoryAttachments.map((attachment) => (
-                      <span className="local-agent__message-directory" key={attachment.workspaceId}>
-                        <DeepCodeShellIcon name="folder" />
-                        {attachment.displayName}
+                    {item.value.filesystemReferences.map((reference) => (
+                      <span
+                        className={reference.kind === 'directory'
+                          ? 'local-agent__message-directory'
+                          : undefined}
+                        key={reference.referenceId}
+                      >
+                        <DeepCodeShellIcon name={reference.kind === 'directory'
+                          ? 'folder'
+                          : 'artifact'} />
+                        {reference.displayName}
+                        {reference.kind === 'file' && (
+                          <small>{formatBytes(reference.byteLength, language)}</small>
+                        )}
                       </span>
                     ))}
                   </div>
@@ -617,7 +767,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             </article>
           ) : item.type === 'narrative' ? (
             <article className="local-agent__narrative" key={`narrative:${item.value.narrativeId}`}>
-              <div><MarkdownContent>{item.value.content}</MarkdownContent></div>
+              <div>
+                {presentation.content(`narrative:${item.value.narrativeId}`)}
+              </div>
             </article>
           ) : item.type === 'plan' ? (
             <PlanCard
@@ -634,12 +786,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
-          {projection?.assistantDraft && (
+          {assistantDraft && (
             <article className="local-agent__message local-agent__message--assistant local-agent__message--draft">
               <div className="local-agent__message-content">
                 <BufferedMarkdown
-                  text={projection.assistantDraft.content}
-                  streamIdentity={projection.assistantDraft.turnId}
+                  text={assistantDraft.content}
+                  streamIdentity={`${assistantDraft.runId}:${assistantDraft.turnId}`}
                 />
               </div>
             </article>
@@ -677,6 +829,11 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         {error && <div className="local-agent__error">{error}</div>}
         {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
         {uiActionError && <div className="local-agent__error">{uiActionError}</div>}
+        {presentation.snapshot.status.state === 'unavailable' && (
+          <div className="local-agent__error">
+            {presentation.snapshot.status.error.message}
+          </div>
+        )}
         {(pendingPlan || pendingInteraction) && (
           <section className="local-agent__interaction-panel">
             <header className="local-agent__interaction-panel-heading">
@@ -787,6 +944,39 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             textareaRef.current?.focus();
           }}
         >
+          {pluginPickerOpen && (
+            <div
+              ref={pluginPickerRef}
+              className="local-agent__plugin-picker"
+              role="listbox"
+              aria-label={t(language, 'agent.plugin.picker')}
+            >
+              <div className="local-agent__plugin-picker-heading">
+                {t(language, 'agent.plugin.picker')}
+              </div>
+              {filteredPlugins.length ? filteredPlugins.map((plugin, index) => (
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={index === pluginActiveIndex}
+                  key={plugin.uri}
+                  onClick={() => selectPlugin(plugin)}
+                  onMouseEnter={() => setPluginActiveIndex(index)}
+                >
+                  <DeepCodeShellIcon name="extension" />
+                  <span>
+                    <b>{plugin.displayName}</b>
+                    <small>{plugin.shortDescription}</small>
+                  </span>
+                  <code>{plugin.uri}</code>
+                </button>
+              )) : (
+                <div className="local-agent__plugin-picker-empty">
+                  {t(language, 'agent.plugin.empty')}
+                </div>
+              )}
+            </div>
+          )}
           {focusCommandSuggestionVisible && (
             <div
               className="local-agent__command-suggestions"
@@ -844,38 +1034,54 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             placeholder={pendingApproval
               ? t(language, 'agent.composer.placeholder.approval')
               : t(language, 'agent.composer.placeholder.task')}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => updateDraft(
+              event.target.value,
+              event.target.selectionStart ?? event.target.value.length,
+            )}
             onCompositionStart={beginComposition}
             onCompositionEnd={endComposition}
             onKeyDown={submitOnComposerEnter}
           />
-          {(attachments.length > 0 || pendingDirectoryPaths.length > 0) && (
+          {(pendingFilesystemPaths.length > 0 || pluginSelections.length > 0) && (
             <div className="local-agent__draft-attachments">
-              {attachments.map((attachment) => (
-                <span key={attachment.attachmentId}>
-                  <DeepCodeShellIcon name="artifact" />
-                  {attachment.name}
+              {pluginSelections.map((selection) => (
+                <span className="local-agent__draft-plugin" key={selection.selectionId}>
+                  <DeepCodeShellIcon name="extension" />
+                  @{selection.label}
                   <button
                     type="button"
-                    aria-label={t(language, 'agent.attachment.remove', {
-                      name: attachment.name,
-                    })}
-                    onClick={() => setAttachments((current) => current.filter((item) => (
-                      item.attachmentId !== attachment.attachmentId
-                    )))}
+                    aria-label={t(language, 'agent.plugin.remove', { name: selection.label })}
+                    onClick={() => {
+                      setPluginSelections((current) => current.filter((item) => (
+                        item.selectionId !== selection.selectionId
+                      )));
+                      setDraft((current) => current.replace(`@${selection.label}`, '').trimStart());
+                    }}
                   >×</button>
                 </span>
               ))}
-              {pendingDirectoryPaths.map((path) => (
-                <span className="local-agent__draft-directory" key={path}>
-                  <DeepCodeShellIcon name="folder" />
-                  {t(language, 'agent.attachment.folder')} · {directoryDisplayName(path)}
+              {pendingFilesystemPaths.map((reference) => (
+                <span
+                  className={reference.kind === 'directory'
+                    ? 'local-agent__draft-directory'
+                    : undefined}
+                  key={`${reference.kind}:${reference.path}`}
+                >
+                  <DeepCodeShellIcon name={reference.kind === 'directory'
+                    ? 'folder'
+                    : 'artifact'} />
+                  {reference.kind === 'directory'
+                    ? `${t(language, 'agent.attachment.folder')} · `
+                    : ''}
+                  {filesystemPathDisplayName(reference.path)}
                   <button
                     type="button"
-                    aria-label={t(language, 'agent.attachment.removePendingDirectory')}
-                    onClick={() => setPendingDirectoryPaths((current) => (
-                      current.filter((candidate) => candidate !== path)
-                    ))}
+                    aria-label={t(language, 'agent.attachment.remove', {
+                      name: filesystemPathDisplayName(reference.path),
+                    })}
+                    onClick={() => setPendingFilesystemPaths((current) => current.filter((item) => (
+                      item.path !== reference.path || item.kind !== reference.kind
+                    )))}
                   >×</button>
                 </span>
               ))}
@@ -918,6 +1124,17 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     <button
                       type="button"
                       role="menuitem"
+                      onClick={openPluginPicker}
+                    >
+                      <DeepCodeShellIcon name="extension" />
+                      <span>
+                        <b>{t(language, 'agent.plugin.menu')}</b>
+                        <small>{t(language, 'agent.plugin.menuDescription')}</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
                       onClick={insertFocusCommand}
                     >
                       <DeepCodeShellIcon name="activity" />
@@ -948,9 +1165,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 </button>
                 {permissionMenuOpen && (
                   <div className="local-agent__permission-menu">
-                    {settingsRestartRequired && (
-                      <div className="local-agent__permission-restart-notice">
-                        {t(language, 'agent.permission.restartRequired')}
+                    {settingsPendingNextRunActivation && (
+                      <div className="local-agent__permission-activation-notice">
+                        {t(language, 'agent.permission.nextRunActivationPending')}
                       </div>
                     )}
                     <div className="local-agent__permission-invariant">
@@ -1026,6 +1243,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 selectedProfileId={selectedProfileId}
                 contextUsage={projection?.contextUsage ?? null}
                 contextCompositions={projection?.contextCompositions ?? []}
+                tokenUsage={projection?.tokenUsage ?? null}
                 busy={loading}
                 onProfileChange={selectProfile}
               />
@@ -1134,16 +1352,11 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   onOpenWorkspaceResource,
 }) => {
   const terminal = activities.every((activity) => isTerminalActivity(activity.status));
-  const userControlled = useRef(false);
   const [expanded, setExpanded] = useState(() => !terminal);
   const hasFailure = activities.some((activity) => (
     ['failed', 'denied', 'indeterminate'].includes(activity.status)
   ));
   const groupStatus = toolGroupStatus(activities);
-
-  useEffect(() => {
-    if (!userControlled.current) setExpanded(!terminal);
-  }, [terminal]);
 
   return (
     <article className={`local-agent__tool-group${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
@@ -1151,10 +1364,7 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
         type="button"
         className="local-agent__tool-group-summary"
         aria-expanded={expanded}
-        onClick={() => {
-          userControlled.current = true;
-          setExpanded((current) => !current);
-        }}
+        onClick={() => setExpanded((current) => !current)}
       >
         <span className="local-agent__tool-group-icon">
           <DeepCodeShellIcon name="tool" />
@@ -1231,7 +1441,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                   <dt>{t(language, 'agent.tool.shell.cwd')}</dt>
                   <dd><code>{shell.cwd}</code></dd>
                 </div>
-                {result?.environment && (
+                {result && (
                   <>
                     <div>
                       <dt>{t(language, 'agent.tool.shell.environment')}</dt>
@@ -1241,7 +1451,10 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                     </div>
                     <div>
                       <dt>{t(language, 'agent.tool.shell.writeScope')}</dt>
-                      <dd>{t(language, 'agent.tool.shell.writeScopeValue')}</dd>
+                      <dd>{t(
+                        language,
+                        `agent.tool.shell.writeScope.${result.environment.writeScope}`,
+                      )}</dd>
                     </div>
                   </>
                 )}
@@ -1338,16 +1551,6 @@ function permissionSetting(
   );
 }
 
-function conversationTitle(
-  messages: { role: string; content: string }[] | undefined,
-  language: UiLanguage,
-): string {
-  const first = messages?.find((message) => message.role === 'user')?.content.trim();
-  if (!first) return t(language, 'agent.session.newTitle');
-  const line = first.split(/\r?\n/u, 1)[0].trim();
-  return line.length > 34 ? `${line.slice(0, 34)}…` : line;
-}
-
 function runLabel(run: RunProjection | null, language: UiLanguage): string {
   if (!run) return t(language, 'agent.run.status.idle');
   if (run.status === 'waiting' && run.waitingReason === 'userInput') {
@@ -1366,14 +1569,10 @@ function samePlanReference(
   return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
-type RawProjectionItem =
+type ProjectionItem =
   | { type: 'message'; sequence: number; value: SessionProjection['messages'][number] }
   | { type: 'narrative'; sequence: number; value: SessionProjection['narratives'][number] }
   | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
-  | { type: 'tool'; sequence: number; value: ActivityProjection };
-
-type ProjectionItem =
-  | Exclude<RawProjectionItem, { type: 'tool' }>
   | {
       type: 'toolGroup';
       sequence: number;
@@ -1383,38 +1582,61 @@ type ProjectionItem =
 
 function projectionItems(projection: SessionProjection | null): ProjectionItem[] {
   if (!projection) return [];
-  const ordered: RawProjectionItem[] = [
-    ...projection.messages
-      .filter((message) => message.role === 'user' || message.role === 'assistant')
-      .map((value): RawProjectionItem => ({ type: 'message', sequence: value.sequence, value })),
-    ...projection.narratives.map((value): RawProjectionItem => ({
-      type: 'narrative', sequence: value.sequence, value,
-    })),
-    ...projection.plans.map((value): RawProjectionItem => ({
-      type: 'plan', sequence: value.sequence, value,
-    })),
-    ...projection.activities
-      .filter((activity) => activity.kind === 'tool')
-      .map((value): RawProjectionItem => ({ type: 'tool', sequence: value.sequence, value })),
-  ].sort((left, right) => left.sequence - right.sequence);
-  return ordered.reduce<ProjectionItem[]>((items, item) => {
-    if (item.type !== 'tool') {
-      items.push(item);
-      return items;
+  return projection.timeline.map((item): ProjectionItem => {
+    switch (item.kind) {
+      case 'message':
+        return {
+          type: 'message',
+          sequence: item.sequence,
+          value: requiredProjectionValue(
+            projection.messages,
+            (message) => message.messageId === item.messageId,
+            'conversation_timeline_message_missing',
+          ),
+        };
+      case 'narrative':
+        return {
+          type: 'narrative',
+          sequence: item.sequence,
+          value: requiredProjectionValue(
+            projection.narratives,
+            (narrative) => narrative.narrativeId === item.narrativeId,
+            'conversation_timeline_narrative_missing',
+          ),
+        };
+      case 'plan':
+        return {
+          type: 'plan',
+          sequence: item.sequence,
+          value: requiredProjectionValue(
+            projection.plans,
+            (plan) => plan.planId === item.planId && plan.revision === item.revision,
+            'conversation_timeline_plan_missing',
+          ),
+        };
+      case 'toolGroup':
+        return {
+          type: 'toolGroup',
+          sequence: item.sequence,
+          groupId: item.timelineId,
+          values: item.activityIds.map((activityId) => requiredProjectionValue(
+            projection.activities,
+            (activity) => activity.activityId === activityId,
+            'conversation_timeline_activity_missing',
+          )),
+        };
     }
-    const previous = items.at(-1);
-    if (previous?.type === 'toolGroup') {
-      previous.values.push(item.value);
-      return items;
-    }
-    items.push({
-      type: 'toolGroup',
-      sequence: item.sequence,
-      groupId: `tool-group:${item.value.activityId}`,
-      values: [item.value],
-    });
-    return items;
-  }, []);
+  });
+}
+
+function requiredProjectionValue<Value>(
+  values: readonly Value[],
+  predicate: (value: Value) => boolean,
+  error: string,
+): Value {
+  const value = values.find(predicate);
+  if (!value) throw new Error(error);
+  return value;
 }
 
 function toolGroupSummary(
@@ -1442,7 +1664,7 @@ function toolGroupSummary(
   }
   if (status === 'completed') {
     const hasShell = activities.some((activity) => (
-      activity.tool?.operation === 'process.shell'
+      activity.tool?.operation === 'bash'
     ));
     const editCount = activities.filter((activity) => (
       isFileMutationOperation(activity.tool?.operation)
@@ -1462,11 +1684,8 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
   const target = activity.tool?.resources[0]?.label;
   const command = activity.tool?.shell?.command;
   if (activity.status === 'completed') {
-    if (operation === 'process.shell' && command) {
+    if (operation === 'bash' && command) {
       return t(language, 'agent.tool.activity.ranCommand', { command });
-    }
-    if (operation === 'fs.ensure_directory' && target) {
-      return t(language, 'agent.tool.activity.createdDirectory', { path: target });
     }
     if (operation === 'fs.delete' && target) {
       return t(language, 'agent.tool.activity.deletedPath', { path: target });
@@ -1477,16 +1696,10 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
     if (operation === 'fs.read' && target) {
       return t(language, 'agent.tool.activity.readPath', { path: target });
     }
-    if (operation === 'fs.list' && target) {
-      return t(language, 'agent.tool.activity.readDirectory', { path: target });
-    }
-    if (operation === 'fs.stat' && target) {
-      return t(language, 'agent.tool.activity.inspectedPath', { path: target });
-    }
     return t(language, 'agent.tool.summary.usedOne', { operation });
   }
   if (['failed', 'denied', 'indeterminate', 'cancelled'].includes(activity.status)) {
-    if (operation === 'process.shell' && command) {
+    if (operation === 'bash' && command) {
       return t(language, 'agent.tool.activity.commandDidNotComplete', { command });
     }
     return t(language, 'agent.tool.activity.didNotComplete', {
@@ -1494,7 +1707,7 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
       target: target ? ` · ${target}` : '',
     });
   }
-  if (operation === 'process.shell' && command) {
+  if (operation === 'bash' && command) {
     return t(language, 'agent.tool.activity.runningCommand', { command });
   }
   return t(language, 'agent.tool.activity.runningOperation', {
@@ -1505,10 +1718,8 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
 
 function isFileMutationOperation(operation: string | undefined): boolean {
   return operation !== undefined && [
-    'fs.create',
     'fs.write',
     'fs.edit',
-    'fs.ensure_directory',
     'fs.delete',
   ].includes(operation);
 }
@@ -1541,15 +1752,21 @@ function toolGroupStatus(
     ?? 'indeterminate';
 }
 
-function nextAttachmentId(): string {
+function nextPanelId(kind: string): string {
   const random = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return `attachment:${random}`;
+  return `${kind}:${random}`;
 }
 
-function directoryDisplayName(absolutePath: string): string {
+function filesystemPathDisplayName(absolutePath: string): string {
   const normalized = absolutePath.replace(/[\\/]+$/u, '');
   return normalized.split(/[\\/]/u).at(-1) || absolutePath;
+}
+
+function mediaTypeForPath(absolutePath: string): string {
+  return absolutePath.toLocaleLowerCase().endsWith('.pdf')
+    ? 'application/pdf'
+    : 'application/octet-stream';
 }
 
 function formatBytes(value: number, language: UiLanguage): string {

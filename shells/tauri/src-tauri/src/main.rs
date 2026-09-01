@@ -91,13 +91,13 @@ impl HostProcessGroup {
 
 impl OwnedHostChildren {
     fn shutdown(&mut self) {
+        terminate_owned_process_tree(&mut self.proxy);
         let requested = request_daemon_shutdown(
             &self.daemon_host,
             &self.daemon_port,
             &self.daemon_token,
             &self.daemon_identity,
         );
-        terminate_owned_process_tree(&mut self.proxy);
         if !requested || !wait_for_child_exit(&mut self.daemon, 80) {
             terminate_owned_process_tree(&mut self.daemon);
         }
@@ -879,26 +879,37 @@ fn wait_for_child_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool 
     false
 }
 
-fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
-    if process.child.try_wait().ok().flatten().is_some() {
-        return;
+#[cfg(unix)]
+fn owned_process_group_exists(process_group_id: libc::pid_t) -> bool {
+    if unsafe { libc::kill(-process_group_id, 0) } == 0 {
+        return true;
     }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn wait_for_owned_process_group_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        let _ = process.child.try_wait();
+        if !owned_process_group_exists(process.process_group_id) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    !owned_process_group_exists(process.process_group_id)
+}
+
+fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
     #[cfg(unix)]
     {
-        let pid = process.child.id() as libc::pid_t;
-        if unsafe { libc::getpgid(pid) } == process.process_group_id {
-            unsafe {
-                libc::kill(-process.process_group_id, libc::SIGTERM);
-            }
+        unsafe {
+            libc::kill(-process.process_group_id, libc::SIGTERM);
         }
-        if !wait_for_child_exit(process, 20) {
-            if unsafe { libc::getpgid(pid) } == process.process_group_id {
-                unsafe {
-                    libc::kill(-process.process_group_id, libc::SIGKILL);
-                }
-            } else {
-                let _ = process.child.kill();
+        if !wait_for_owned_process_group_exit(process, 20) {
+            unsafe {
+                libc::kill(-process.process_group_id, libc::SIGKILL);
             }
+            let _ = wait_for_owned_process_group_exit(process, 20);
         }
     }
     #[cfg(windows)]

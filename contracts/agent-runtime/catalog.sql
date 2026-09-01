@@ -1,12 +1,13 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = FULL;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE IF NOT EXISTS workspaces (
     workspace_id TEXT PRIMARY KEY NOT NULL CHECK(length(workspace_id) > 0),
     display_name TEXT NOT NULL CHECK(length(display_name) > 0),
     canonical_root TEXT NOT NULL UNIQUE CHECK(length(canonical_root) > 0),
+    owner_session_id TEXT,
     created_at TEXT NOT NULL CHECK(length(created_at) > 0)
 ) STRICT;
 

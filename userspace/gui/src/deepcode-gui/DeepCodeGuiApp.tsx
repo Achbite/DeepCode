@@ -16,7 +16,9 @@ import {
   getHealth,
   getHostStartupStatus,
   healthVersion,
+  isRuntimeReady,
   startKernelAfterPermission,
+  type HostStartupStatusV1,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
@@ -100,6 +102,13 @@ function startupStatusMessage(
     : message;
 }
 
+function hostAttemptId(status?: HostStartupStatusV1): string | null {
+  if (!status || status.attemptId === 'not-started' || status.attemptId === 'unavailable') {
+    return null;
+  }
+  return status.attemptId;
+}
+
 const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> }> = ({ language }) => (
   <div className="deepcode-gui-boot-shell">
     <div className="deepcode-gui-boot-shell__title">DeepCode-GUI</div>
@@ -123,7 +132,10 @@ const DeepCodeGuiApp: React.FC = () => {
   const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
-  const connectedReloadDoneRef = useRef(false);
+  const loadedIncarnationRef = useRef<string | null>(null);
+  const healthWasReadyRef = useRef(false);
+  const healthConnectionSequenceRef = useRef(0);
+  const [connectedIncarnation, setConnectedIncarnation] = useState<string | null>(null);
   const [kernelStartBusy, setKernelStartBusy] = useState(false);
   const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
   const dirtySignature = useEditorStore((s) =>
@@ -136,6 +148,16 @@ const DeepCodeGuiApp: React.FC = () => {
   const terminalPrewarm = String(
     effectiveSettings['terminal.integrated.prewarm'] ?? 'afterStartup',
   );
+
+  const recordRuntimeReady = useCallback((attemptId: string | null) => {
+    if (attemptId) {
+      setConnectedIncarnation(`host:${attemptId}`);
+    } else if (!healthWasReadyRef.current) {
+      healthConnectionSequenceRef.current += 1;
+      setConnectedIncarnation(`health:${healthConnectionSequenceRef.current}`);
+    }
+    healthWasReadyRef.current = true;
+  }, []);
 
   const saveCurrentActiveFile = useCallback(async () => {
     const { activeTabId, tabs, saveFile } = useEditorStore.getState();
@@ -171,7 +193,8 @@ const DeepCodeGuiApp: React.FC = () => {
 
     for (let attempt = 0; attempt < 24; attempt += 1) {
       const result = await getHealth();
-      if (result.ok && result.data) {
+      if (isRuntimeReady(result)) {
+        recordRuntimeReady(hostAttemptId(startupStatus));
         setApiStatus('connected');
         setServerVersion(healthVersion(result.data));
         setKernelStartMessage(null);
@@ -188,19 +211,23 @@ const DeepCodeGuiApp: React.FC = () => {
     setErrorMessage(message);
     setKernelStartMessage(message);
     setKernelStartBusy(false);
-  }, [language, setApiStatus, setErrorMessage, setServerVersion]);
+  }, [language, recordRuntimeReady, setApiStatus, setErrorMessage, setServerVersion]);
 
   useEffect(() => {
     document.documentElement.dataset.product = 'deepcode-gui';
   }, []);
 
   useEffect(() => {
-    if (apiStatus !== 'connected' || connectedReloadDoneRef.current) return;
-    connectedReloadDoneRef.current = true;
+    if (
+      apiStatus !== 'connected'
+      || !connectedIncarnation
+      || loadedIncarnationRef.current === connectedIncarnation
+    ) return;
+    loadedIncarnationRef.current = connectedIncarnation;
     void loadWorkspace();
     void loadUserSettings();
     void useLocalAgentStore.getState().initialize();
-  }, [apiStatus, loadUserSettings, loadWorkspace]);
+  }, [apiStatus, connectedIncarnation, loadUserSettings, loadWorkspace]);
 
   useEffect(() => {
     syncWorkspaceSettings(workspaceSettings);
@@ -235,16 +262,20 @@ const DeepCodeGuiApp: React.FC = () => {
     let cancelled = false;
     let timeout: number | null = null;
     const check = async () => {
-      const result = await getHealth();
+      const [result, startup] = await Promise.all([
+        getHealth(),
+        getHostStartupStatus(),
+      ]);
       if (cancelled) return;
-      if (result.ok && result.data) {
+      if (isRuntimeReady(result)) {
+        const attemptId = startup.ok ? hostAttemptId(startup.data) : null;
+        recordRuntimeReady(attemptId);
         setApiStatus('connected');
         setServerVersion(healthVersion(result.data));
         setKernelStartMessage(null);
         timeout = window.setTimeout(() => void check(), 30000);
       } else {
-        const startup = await getHostStartupStatus();
-        if (cancelled) return;
+        healthWasReadyRef.current = false;
         if (startup.ok && startup.data) {
           const message = startupStatusMessage(language, startup.data);
           setKernelStartMessage(message);
@@ -271,21 +302,32 @@ const DeepCodeGuiApp: React.FC = () => {
       cancelFirstPaint();
       if (timeout) window.clearTimeout(timeout);
     };
-  }, [language, setApiStatus, setErrorMessage, setKernelStartMessage, setServerVersion]);
+  }, [
+    language,
+    recordRuntimeReady,
+    setApiStatus,
+    setErrorMessage,
+    setKernelStartMessage,
+    setServerVersion,
+  ]);
 
   useEffect(() => {
+    if (apiStatus !== 'connected') return;
     let disconnect: (() => void) | null = null;
+    let cancelled = false;
     const cancel = afterFirstPaint(() => {
       void import('../services/heartbeatSocket').then((heartbeat) => {
+        if (cancelled) return;
         heartbeat.connectHeartbeat();
         disconnect = heartbeat.disconnectHeartbeat;
       });
     });
     return () => {
+      cancelled = true;
       cancel();
       disconnect?.();
     };
-  }, []);
+  }, [apiStatus, connectedIncarnation]);
 
   useEffect(() => {
     if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
@@ -293,7 +335,7 @@ const DeepCodeGuiApp: React.FC = () => {
       void warmupTerminalRuntime();
     }, 1800);
     return () => window.clearTimeout(id);
-  }, [apiStatus, terminalPrewarm]);
+  }, [apiStatus, connectedIncarnation, terminalPrewarm]);
 
   useEffect(() => {
     const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');

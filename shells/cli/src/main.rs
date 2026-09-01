@@ -1,11 +1,13 @@
 use deepcode_kernel_client::{
-    approval_response_command, cancel_command, interaction_response_command,
-    is_terminal_run_status, message_command, plan_cancel_command, plan_confirm_command,
-    plan_revision_command, profile_selection_command, ActivityProjection, ApprovalProjection,
-    CreateConversationSessionRequest, HttpKernelClient, InteractionProjection, KernelBootstrap,
-    KernelBootstrapOptions, NarrativeProjection, PendingPlanProjection, ProjectionMessage,
-    SessionProjection,
+    approval_response_command, cancel_command, focus_command, interaction_response_command,
+    is_terminal_run_status, message_command_with_profile_and_plugins, plan_cancel_command,
+    plan_confirm_command, plan_revision_command, ActivityProjection, ApprovalProjection,
+    CreateConversationSessionRequest, FilesystemReference, FilesystemReferencePathInput,
+    HttpKernelClient, InteractionProjection, KernelBootstrap, KernelBootstrapOptions,
+    NarrativeProjection, PendingPlanProjection, PlanProjection, PluginCatalogProjection,
+    PluginSelectionInput, ProjectionMessage, SessionProjection, SessionTimelineItem,
 };
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -72,9 +74,6 @@ enum Command {
     Chat,
     Show,
     CancelPlan,
-    SelectModel {
-        profile_id: String,
-    },
     Cancel {
         run_id: String,
     },
@@ -97,6 +96,9 @@ struct Args {
     workspace: Option<PathBuf>,
     session_id: Option<String>,
     plain: bool,
+    plugins: Vec<String>,
+    files: Vec<String>,
+    directories: Vec<String>,
     command: Command,
 }
 
@@ -107,6 +109,9 @@ impl Args {
         let mut workspace = None;
         let mut session_id = None;
         let mut plain = false;
+        let mut plugins = Vec::new();
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
         let mut positional = Vec::new();
         let mut index = 0;
         while index < values.len() {
@@ -125,6 +130,18 @@ impl Args {
                     session_id = Some(required_arg(&values, index, "--session")?.to_string());
                 }
                 "--plain" => plain = true,
+                "--plugin" => {
+                    index += 1;
+                    plugins.push(required_arg(&values, index, "--plugin")?.to_string());
+                }
+                "--file" => {
+                    index += 1;
+                    files.push(required_arg(&values, index, "--file")?.to_string());
+                }
+                "--directory" => {
+                    index += 1;
+                    directories.push(required_arg(&values, index, "--directory")?.to_string());
+                }
                 "--help" | "-h" => positional.push("help".to_string()),
                 value if value.starts_with('-') => return Err(format!("未知选项：{value}")),
                 _ => positional.push(values[index].clone()),
@@ -154,14 +171,6 @@ impl Args {
                     return Err("用法：cancel-plan --session <id>".to_string());
                 }
                 Command::CancelPlan
-            }
-            Some("model") => {
-                if positional.len() != 2 {
-                    return Err("用法：model --session <id> <profile-id>".to_string());
-                }
-                Command::SelectModel {
-                    profile_id: positional[1].clone(),
-                }
             }
             Some("cancel") => {
                 if positional.len() != 2 {
@@ -207,6 +216,9 @@ impl Args {
             workspace,
             session_id,
             plain,
+            plugins,
+            files,
+            directories,
             command,
         })
     }
@@ -222,7 +234,120 @@ enum Outcome {
     Interrupted,
 }
 
+#[derive(Debug, Clone)]
+struct PluginBinding {
+    catalog_revision: String,
+    selections: Vec<PluginSelectionInput>,
+}
+
+async fn resolve_plugin_selections(
+    client: &HttpKernelClient,
+    plugin_uris: &[String],
+    filesystem_references: &[FilesystemReference],
+) -> Result<Option<PluginBinding>, String> {
+    if plugin_uris.is_empty() && filesystem_references.is_empty() {
+        return Ok(None);
+    }
+    let catalog = client
+        .conversation_plugin_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut effective_uris = plugin_uris.to_vec();
+    for reference in filesystem_references {
+        if reference.kind != "file" {
+            continue;
+        }
+        let Some(media_type) = reference.media_type.as_deref() else {
+            return Err("文件引用缺少 mediaType。".to_string());
+        };
+        let matches = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| {
+                plugin
+                    .activation_media_types
+                    .iter()
+                    .any(|candidate| candidate == media_type)
+            })
+            .collect::<Vec<_>>();
+        if media_type == "application/pdf" && matches.len() != 1 {
+            return Err("plugin_selection_unavailable:application/pdf".to_string());
+        }
+        if let [plugin] = matches.as_slice() {
+            effective_uris.push(plugin.uri.clone());
+        }
+    }
+    if effective_uris.is_empty() {
+        return Ok(None);
+    }
+    plugin_binding_from_catalog(catalog, &effective_uris).map(Some)
+}
+
+async fn resolve_cli_filesystem_references(
+    client: &HttpKernelClient,
+    session_id: &str,
+    files: &[String],
+    directories: &[String],
+) -> Result<Vec<FilesystemReference>, String> {
+    if files.len() + directories.len() > 8 {
+        return Err("单次 ask 最多附加八个文件系统引用。".to_string());
+    }
+    let references = files
+        .iter()
+        .map(|path| FilesystemReferencePathInput {
+            path: path.clone(),
+            kind: "file".to_string(),
+        })
+        .chain(directories.iter().map(|path| FilesystemReferencePathInput {
+            path: path.clone(),
+            kind: "directory".to_string(),
+        }))
+        .collect::<Vec<_>>();
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    client
+        .resolve_conversation_filesystem_references(session_id, references)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn plugin_binding_from_catalog(
+    catalog: PluginCatalogProjection,
+    plugin_uris: &[String],
+) -> Result<PluginBinding, String> {
+    let mut seen = HashSet::new();
+    let mut selections = Vec::with_capacity(plugin_uris.len());
+    for uri in plugin_uris {
+        if !seen.insert(uri.as_str()) {
+            continue;
+        }
+        let plugin = catalog
+            .plugins
+            .iter()
+            .find(|plugin| plugin.uri == *uri)
+            .ok_or_else(|| format!("插件不在当前目录中或不可用：{uri}"))?;
+        selections.push(PluginSelectionInput {
+            selection_id: new_id("plugin-selection"),
+            uri: plugin.uri.clone(),
+            label: plugin.display_name.clone(),
+        });
+    }
+    Ok(PluginBinding {
+        catalog_revision: catalog.revision,
+        selections,
+    })
+}
+
 async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
+    if !args.plugins.is_empty() && !matches!(&args.command, Command::Ask(_) | Command::Chat) {
+        return Err("--plugin 只适用于 ask 或 chat。".to_string());
+    }
+    if (!args.files.is_empty() || !args.directories.is_empty())
+        && !matches!(&args.command, Command::Ask(_))
+    {
+        return Err("--file/--directory 只适用于单次 ask。".to_string());
+    }
     match args.command {
         Command::Help => Ok(Outcome::Done),
         Command::Status => {
@@ -240,13 +365,37 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
         Command::Ask(text) => {
             let projection =
                 open_session(client, args.session_id.as_deref(), args.workspace.as_ref()).await?;
+            let filesystem_references = resolve_cli_filesystem_references(
+                client,
+                &projection.session_id,
+                &args.files,
+                &args.directories,
+            )
+            .await?;
+            let plugin_binding =
+                resolve_plugin_selections(client, &args.plugins, &filesystem_references).await?;
             if !args.plain {
                 eprintln!("session: {}", projection.session_id);
             }
-            submit_input_and_wait(client, &projection, &text, args.plain).await
+            submit_input_and_wait(
+                client,
+                &projection,
+                &text,
+                None,
+                &filesystem_references,
+                plugin_binding.as_ref(),
+                args.plain,
+            )
+            .await
         }
         Command::Chat => {
-            run_chat(client, args.session_id.as_deref(), args.workspace.as_ref()).await
+            run_chat(
+                client,
+                args.session_id.as_deref(),
+                args.workspace.as_ref(),
+                &args.plugins,
+            )
+            .await
         }
         Command::Show => {
             let session_id = require_session(args.session_id.as_deref())?;
@@ -280,22 +429,6 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
             )
             .await
         }
-        Command::SelectModel { profile_id } => {
-            let session_id = require_session(args.session_id.as_deref())?;
-            let projection = client
-                .conversation_projection(session_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let run = projection
-                .run
-                .as_ref()
-                .ok_or_else(|| "当前没有活动 run。".to_string())?;
-            let command =
-                profile_selection_command(session_id, &new_id("command"), &run.run_id, &profile_id);
-            submit_checked(client, session_id, &command).await?;
-            println!("下一次 Provider 调用将使用模型 Profile {profile_id}");
-            Ok(Outcome::Done)
-        }
         Command::Cancel { run_id } => {
             let session_id = require_session(args.session_id.as_deref())?;
             let command = cancel_command(session_id, &new_id("command"), &run_id);
@@ -309,17 +442,31 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
         }
         Command::AttachDirectory { path } => {
             let session_id = require_session(args.session_id.as_deref())?;
+            let before = client
+                .conversation_projection(session_id)
+                .await
+                .map_err(|error| error.to_string())?;
             let projection = client
                 .attach_conversation_directory_index(session_id, &path)
                 .await
                 .map_err(|error| error.to_string())?;
-            if let Some(binding) = projection.session_directory_indexes.last() {
+            let added = projection
+                .session_directory_indexes
+                .iter()
+                .filter(|binding| {
+                    before
+                        .session_directory_indexes
+                        .iter()
+                        .all(|existing| existing.workspace_id != binding.workspace_id)
+                })
+                .collect::<Vec<_>>();
+            if let [binding] = added.as_slice() {
                 println!(
                     "已附加目录索引：{} ({})；从下一次 run 起生效。",
                     binding.display_name, binding.workspace_id
                 );
             } else {
-                println!("该目录已在当前 Session 的有效目录集合中。");
+                println!("目录索引集合已更新；从下一次 run 起使用共享投影中的有效目录集合。");
             }
             Ok(Outcome::Done)
         }
@@ -384,9 +531,18 @@ async fn submit_input_and_wait(
     client: &HttpKernelClient,
     before: &SessionProjection,
     text: &str,
+    profile_id: Option<&str>,
+    filesystem_references: &[FilesystemReference],
+    plugin_binding: Option<&PluginBinding>,
     plain: bool,
 ) -> Result<Outcome, String> {
-    let command = contextual_input_command(before, text)?;
+    let command = contextual_input_command(
+        before,
+        text,
+        profile_id,
+        filesystem_references,
+        plugin_binding,
+    )?;
     submit_checked(client, &before.session_id, &command).await?;
     wait_for_projection(
         client,
@@ -403,12 +559,20 @@ async fn submit_input_and_wait(
 fn contextual_input_command(
     projection: &SessionProjection,
     text: &str,
+    profile_id: Option<&str>,
+    filesystem_references: &[FilesystemReference],
+    plugin_binding: Option<&PluginBinding>,
 ) -> Result<serde_json::Value, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("输入不能为空。".to_string());
     }
+    let has_plugin_selection = plugin_binding.is_some_and(|binding| !binding.selections.is_empty());
+    let has_filesystem_references = !filesystem_references.is_empty();
     if let Some(approval) = projection.pending_approval.as_ref() {
+        if has_plugin_selection || has_filesystem_references {
+            return Err("插件和文件系统引用不能用于已有 run 的 effect 回应。".to_string());
+        }
         let decision = approval_decision_for_input(text)?;
         return Ok(approval_response_command(
             &projection.session_id,
@@ -418,6 +582,9 @@ fn contextual_input_command(
         ));
     }
     if let Some(plan) = projection.pending_plan.as_ref() {
+        if has_plugin_selection || has_filesystem_references {
+            return Err("插件和文件系统引用不能用于已有 run 的 Plan 回应。".to_string());
+        }
         if is_plan_confirmation_input(text) {
             return Ok(plan_confirm_command(
                 &projection.session_id,
@@ -433,6 +600,9 @@ fn contextual_input_command(
         ));
     }
     if let Some(interaction) = projection.pending_interaction.as_ref() {
+        if has_plugin_selection || has_filesystem_references {
+            return Err("插件和文件系统引用不能用于已有 run 的交互回应。".to_string());
+        }
         let response = interaction_response_for_input(interaction, text);
         return Ok(interaction_response_command(
             &projection.session_id,
@@ -441,10 +611,40 @@ fn contextual_input_command(
             &response,
         ));
     }
-    Ok(message_command(
+    let empty = PluginBinding {
+        catalog_revision: String::new(),
+        selections: Vec::new(),
+    };
+    let plugins = plugin_binding.unwrap_or(&empty);
+    if let Some(task) = text.strip_prefix("/focus") {
+        if !task.is_empty() && !task.chars().next().is_some_and(char::is_whitespace) {
+            return Err("未知命令；/focus 后必须以空格分隔任务正文。".to_string());
+        }
+        let task = task.trim();
+        if task.is_empty() {
+            return Err("/focus 需要非空任务正文。".to_string());
+        }
+        return Ok(focus_command(
+            &projection.session_id,
+            &new_id("command"),
+            task,
+            profile_id,
+            filesystem_references,
+            &plugins.catalog_revision,
+            &plugins.selections,
+        ));
+    }
+    if text.starts_with('/') {
+        return Err(format!("未知命令：{text}"));
+    }
+    Ok(message_command_with_profile_and_plugins(
         &projection.session_id,
         &new_id("command"),
         text,
+        profile_id,
+        filesystem_references,
+        &plugins.catalog_revision,
+        &plugins.selections,
     ))
 }
 
@@ -503,7 +703,7 @@ async fn wait_for_projection(
     let mut last_revision = start_revision;
     let mut rendered_sequence = start_timeline_sequence;
     let mut rendered_todo_sequence = start_todo_sequence;
-    let mut live_turn: Option<String> = None;
+    let mut live_turn: Option<(String, String)> = None;
     let mut live_text = String::new();
     let mut live_open = false;
     loop {
@@ -519,8 +719,11 @@ async fn wait_for_projection(
                 let current_turn = projection
                     .assistant_draft
                     .as_ref()
-                    .map(|draft| draft.turn_id.as_str());
-                let previous_turn_closed = live_turn.as_deref() != current_turn;
+                    .map(|draft| (draft.run_id.as_str(), draft.turn_id.as_str()));
+                let previous_turn = live_turn
+                    .as_ref()
+                    .map(|(run_id, turn_id)| (run_id.as_str(), turn_id.as_str()));
+                let previous_turn_closed = previous_turn != current_turn;
                 if previous_turn_closed && live_open {
                     eprintln!();
                     live_open = false;
@@ -528,7 +731,7 @@ async fn wait_for_projection(
                 render_increment_except(
                     &projection,
                     rendered_sequence,
-                    previous_turn_closed.then_some(live_text.as_str()),
+                    previous_turn_closed.then_some(previous_turn).flatten(),
                 );
                 if projection
                     .todo_list
@@ -548,11 +751,15 @@ async fn wait_for_projection(
         }
         if !plain {
             if let Some(draft) = projection.assistant_draft.as_ref() {
-                if live_turn.as_deref() != Some(draft.turn_id.as_str()) {
+                let draft_identity = (draft.run_id.as_str(), draft.turn_id.as_str());
+                let live_identity = live_turn
+                    .as_ref()
+                    .map(|(run_id, turn_id)| (run_id.as_str(), turn_id.as_str()));
+                if live_identity != Some(draft_identity) {
                     if live_open {
                         eprintln!();
                     }
-                    live_turn = Some(draft.turn_id.clone());
+                    live_turn = Some((draft.run_id.clone(), draft.turn_id.clone()));
                     live_text.clear();
                     live_open = false;
                 }
@@ -610,15 +817,26 @@ async fn run_chat(
     client: &HttpKernelClient,
     session_id: Option<&str>,
     workspace: Option<&PathBuf>,
+    initial_plugin_uris: &[String],
 ) -> Result<Outcome, String> {
     if !io::stdin().is_terminal() {
         return Err("chat 需要交互式终端；非交互调用请使用 ask。".to_string());
     }
     let mut projection = open_session(client, session_id, workspace).await?;
+    let mut plugin_catalog = client
+        .conversation_plugin_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut selected_plugins = if initial_plugin_uris.is_empty() {
+        Vec::new()
+    } else {
+        plugin_binding_from_catalog(plugin_catalog.clone(), initial_plugin_uris)?.selections
+    };
     println!("session: {}", projection.session_id);
-    println!("普通文本用于消息、交互回应或 Plan 修订；Plan 输入 1/确认后执行；effect 审批输入 1/允许或 2/拒绝；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/cancel-plan；/model；/cancel；/quit。");
+    println!("普通文本用于消息、交互回应或 Plan 修订；Plan 输入 1/确认后执行；effect 审批输入 1/允许或 2/拒绝；@ 显示插件，@<名称或 URI> 为下一次请求选择插件；/focus <task> 启动聚焦上下文；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/cancel-plan；/model <profile> 设置后续消息草稿；/cancel；/quit。");
     render_action_required_if_any(&projection);
     let mut line = String::new();
+    let mut next_message_profile_id: Option<String> = None;
     loop {
         print!("deepcode> ");
         io::stdout().flush().map_err(|error| error.to_string())?;
@@ -682,18 +900,12 @@ async fn run_chat(
             }
             value if value.starts_with("/model ") => {
                 let profile_id = value.trim_start_matches("/model ").trim();
-                let run = projection
-                    .run
-                    .as_ref()
-                    .ok_or_else(|| "当前没有活动 run。".to_string())?;
-                let command = profile_selection_command(
-                    &projection.session_id,
-                    &new_id("command"),
-                    &run.run_id,
-                    profile_id,
-                );
-                submit_checked(client, &projection.session_id, &command).await?;
-                projection = refresh_projection(client, &projection.session_id).await?;
+                if profile_id.is_empty() {
+                    println!("用法：/model <profile>");
+                    continue;
+                }
+                next_message_profile_id = Some(profile_id.to_string());
+                println!("后续普通消息将提交模型 Profile {profile_id}；当前 run 不变。");
             }
             value if value.starts_with("/attach ") => {
                 let path = value.trim_start_matches("/attach ").trim();
@@ -719,9 +931,62 @@ async fn run_chat(
                     .map_err(|error| error.to_string())?;
                 println!("目录索引已移除；运行中的 run 保留其冻结快照。");
             }
-            value if value.starts_with('/') => println!("未知命令：{value}"),
-            text => {
-                let outcome = submit_input_and_wait(client, &projection, text, false).await?;
+            value if value.starts_with('@') => {
+                let query = value.trim_start_matches('@').trim();
+                if query.is_empty() {
+                    plugin_catalog = client
+                        .conversation_plugin_catalog()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    print_plugin_catalog(&plugin_catalog, &selected_plugins, "");
+                    continue;
+                }
+                let exact = plugin_catalog.plugins.iter().find(|plugin| {
+                    plugin.uri == query || plugin.display_name.eq_ignore_ascii_case(query)
+                });
+                if let Some(plugin) = exact {
+                    if selected_plugins
+                        .iter()
+                        .any(|selection| selection.uri == plugin.uri)
+                    {
+                        println!("插件已为下一次请求选择：{}", plugin.display_name);
+                    } else {
+                        selected_plugins.push(PluginSelectionInput {
+                            selection_id: new_id("plugin-selection"),
+                            uri: plugin.uri.clone(),
+                            label: plugin.display_name.clone(),
+                        });
+                        println!("已为下一次请求选择插件：{}", plugin.display_name);
+                    }
+                } else {
+                    print_plugin_catalog(&plugin_catalog, &selected_plugins, query);
+                }
+            }
+            text if !text.starts_with('/') || text == "/focus" || text.starts_with("/focus ") => {
+                let consumes_plugins = projection.pending_plan.is_none()
+                    && projection.pending_interaction.is_none()
+                    && projection.pending_approval.is_none();
+                let plugin_binding = if selected_plugins.is_empty() {
+                    None
+                } else {
+                    Some(PluginBinding {
+                        catalog_revision: plugin_catalog.revision.clone(),
+                        selections: selected_plugins.clone(),
+                    })
+                };
+                let outcome = submit_input_and_wait(
+                    client,
+                    &projection,
+                    text,
+                    next_message_profile_id.as_deref(),
+                    &[],
+                    plugin_binding.as_ref(),
+                    false,
+                )
+                .await?;
+                if consumes_plugins {
+                    selected_plugins.clear();
+                }
                 projection = refresh_projection(client, &projection.session_id).await?;
                 if matches!(
                     outcome,
@@ -730,7 +995,40 @@ async fn run_chat(
                     return Ok(outcome);
                 }
             }
+            value if value.starts_with('/') => println!("未知命令：{value}"),
+            _ => unreachable!("all non-slash input is handled above"),
         }
+    }
+}
+
+fn print_plugin_catalog(
+    catalog: &PluginCatalogProjection,
+    selected: &[PluginSelectionInput],
+    query: &str,
+) {
+    let query = query.to_lowercase();
+    let matches = catalog.plugins.iter().filter(|plugin| {
+        query.is_empty()
+            || plugin.display_name.to_lowercase().contains(&query)
+            || plugin.uri.to_lowercase().contains(&query)
+    });
+    let mut found = false;
+    for plugin in matches {
+        found = true;
+        let marker = if selected.iter().any(|selection| selection.uri == plugin.uri) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {}\n    {}\n    {}",
+            plugin.display_name, plugin.uri, plugin.short_description
+        );
+    }
+    if !found {
+        println!("没有匹配的可用插件。");
+    } else {
+        println!("输入 @<完整名称或 plugin:// URI> 为下一次请求选择插件。");
     }
 }
 
@@ -787,32 +1085,50 @@ fn render_increment(projection: &SessionProjection, after_sequence: u64) {
 fn render_increment_except(
     projection: &SessionProjection,
     after_sequence: u64,
-    suppress_content: Option<&str>,
+    suppress_turn: Option<(&str, &str)>,
 ) {
-    let mut suppressed = false;
     for item in timeline_items(projection)
         .into_iter()
         .filter(|item| item.sequence() > after_sequence)
     {
         match item {
-            TimelineItem::Message(message) => {
-                if !suppressed && suppress_content == Some(message.content.as_str()) {
-                    suppressed = true;
+            TimelineItem::Message { value: message, .. } => {
+                if message.role == "assistant" && message_identity(message) == suppress_turn {
                     continue;
                 }
                 println!("{}: {}", message.role, message.content);
                 render_attachments(message);
             }
-            TimelineItem::Narrative(narrative) => {
-                if !suppressed && suppress_content == Some(narrative.content.as_str()) {
-                    suppressed = true;
+            TimelineItem::Narrative {
+                value: narrative, ..
+            } => {
+                if narrative_identity(narrative) == suppress_turn {
                     continue;
                 }
                 println!("{}", narrative.content);
             }
-            TimelineItem::Tool(activity) => render_tool_activity(projection, activity),
+            TimelineItem::Plan { value: plan, .. } => render_timeline_plan(plan),
+            TimelineItem::ToolGroup { activities, .. } => {
+                for activity in activities {
+                    render_tool_activity(projection, activity);
+                }
+            }
         }
     }
+}
+
+fn message_identity(message: &ProjectionMessage) -> Option<(&str, &str)> {
+    Some((
+        message.run_id.as_deref()?,
+        message.provider_request_id.as_deref()?,
+    ))
+}
+
+fn narrative_identity(narrative: &NarrativeProjection) -> Option<(&str, &str)> {
+    Some((
+        narrative.run_id.as_str(),
+        narrative.provider_request_id.as_str(),
+    ))
 }
 
 fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProjection) {
@@ -827,6 +1143,14 @@ fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProje
             println!("  $ {}", shell.command);
             println!("  cwd: {}", shell.cwd);
             if let Some(result) = shell.result.as_ref() {
+                println!(
+                    "  environment: shell={} · interactive={} · pathSource={} · writeScope={} · homeWritable={}",
+                    result.environment.shell,
+                    result.environment.interactive,
+                    result.environment.path_source,
+                    result.environment.write_scope,
+                    result.environment.home_writable,
+                );
                 let exit = result
                     .exit_code
                     .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
@@ -898,36 +1222,39 @@ fn render_todo(projection: &SessionProjection) {
 
 fn render_usage(projection: &SessionProjection) {
     let usage = &projection.token_usage;
-    let cache_total = usage
-        .cache_read_input_tokens
-        .checked_add(usage.cache_miss_input_tokens);
-    let cache = if usage.cache_reported_call_count > 0 {
-        cache_total
-            .filter(|total| *total > 0)
-            .map(|total| {
-                format!(
-                    "{:.0}%",
-                    usage.cache_read_input_tokens as f64 * 100.0 / total as f64
-                )
-            })
-            .unwrap_or_else(|| "--%".to_string())
+    let cache = match (usage.cache_available, usage.cache_hit_ratio) {
+        (true, Some(ratio)) => format!("{:.0}%", ratio * 100.0),
+        _ => "--%".to_string(),
+    };
+    let coverage = if usage.cache_complete {
+        "complete"
+    } else if usage.cache_available {
+        "partial"
     } else {
-        "--%".to_string()
+        "unavailable"
     };
     eprintln!(
-        "Provider 调用 {} · 输入 {} · 输出 {} · 缓存命中 {}",
-        usage.provider_call_count, usage.input_tokens, usage.output_tokens, cache
+        "Provider 调用 {} · 输入 {} · 输出 {} · 缓存命中 {} · 缓存读取 {} · 缓存未命中 {} · 缓存报告 {}/{} ({})",
+        usage.provider_call_count,
+        usage.input_tokens,
+        usage.output_tokens,
+        cache,
+        usage.cache_read_input_tokens,
+        usage.cache_miss_input_tokens,
+        usage.reported_call_count,
+        usage.provider_call_count,
+        coverage,
     );
 }
 
 fn render_attachments(message: &ProjectionMessage) {
-    if !message.attachments.is_empty() {
+    if !message.filesystem_references.is_empty() {
         println!(
-            "  附件：{}",
+            "  文件系统引用：{}",
             message
-                .attachments
+                .filesystem_references
                 .iter()
-                .map(|attachment| attachment.name.as_str())
+                .map(|reference| reference.display_name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -986,6 +1313,21 @@ fn render_plan(plan: &PendingPlanProjection) {
     }
 }
 
+fn render_timeline_plan(plan: &PlanProjection) {
+    println!("Plan · revision {} · {}", plan.revision, plan.status);
+    println!("{}", plan.title);
+    println!("{}", plan.summary);
+    for (index, step) in plan.steps.iter().enumerate() {
+        println!("{}. {}", index + 1, step.title);
+        println!("   {}", step.details);
+        if let Some(verification) = step.verification.as_ref() {
+            for item in verification {
+                println!("   验证：{item}");
+            }
+        }
+    }
+}
+
 fn is_plan_confirmation_input(input: &str) -> bool {
     matches!(
         input.trim().to_ascii_lowercase().as_str(),
@@ -1006,40 +1348,96 @@ fn render_interaction(interaction: &InteractionProjection) {
 }
 
 enum TimelineItem<'a> {
-    Message(&'a ProjectionMessage),
-    Narrative(&'a NarrativeProjection),
-    Tool(&'a ActivityProjection),
+    Message {
+        sequence: u64,
+        value: &'a ProjectionMessage,
+    },
+    Narrative {
+        sequence: u64,
+        value: &'a NarrativeProjection,
+    },
+    Plan {
+        sequence: u64,
+        value: &'a PlanProjection,
+    },
+    ToolGroup {
+        sequence: u64,
+        activities: Vec<&'a ActivityProjection>,
+    },
 }
 
 impl TimelineItem<'_> {
     fn sequence(&self) -> u64 {
         match self {
-            Self::Message(value) => value.sequence,
-            Self::Narrative(value) => value.sequence,
-            Self::Tool(value) => value.sequence,
+            Self::Message { sequence, .. }
+            | Self::Narrative { sequence, .. }
+            | Self::Plan { sequence, .. }
+            | Self::ToolGroup { sequence, .. } => *sequence,
         }
     }
 }
 
 fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
-    let tool_count = projection
-        .activities
+    projection
+        .timeline
         .iter()
-        .filter(|activity| activity.kind == "tool")
-        .count();
-    let mut items =
-        Vec::with_capacity(projection.messages.len() + projection.narratives.len() + tool_count);
-    items.extend(projection.messages.iter().map(TimelineItem::Message));
-    items.extend(projection.narratives.iter().map(TimelineItem::Narrative));
-    items.extend(
-        projection
-            .activities
-            .iter()
-            .filter(|activity| activity.kind == "tool")
-            .map(TimelineItem::Tool),
-    );
-    items.sort_by_key(TimelineItem::sequence);
-    items
+        .map(|item| match item {
+            SessionTimelineItem::Message {
+                sequence,
+                message_id,
+                ..
+            } => TimelineItem::Message {
+                sequence: *sequence,
+                value: projection
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == *message_id)
+                    .expect("validated Session timeline message reference"),
+            },
+            SessionTimelineItem::Narrative {
+                sequence,
+                narrative_id,
+                ..
+            } => TimelineItem::Narrative {
+                sequence: *sequence,
+                value: projection
+                    .narratives
+                    .iter()
+                    .find(|narrative| narrative.narrative_id == *narrative_id)
+                    .expect("validated Session timeline narrative reference"),
+            },
+            SessionTimelineItem::Plan {
+                sequence,
+                plan_id,
+                revision,
+                ..
+            } => TimelineItem::Plan {
+                sequence: *sequence,
+                value: projection
+                    .plans
+                    .iter()
+                    .find(|plan| plan.plan_id == *plan_id && plan.revision == *revision)
+                    .expect("validated Session timeline plan reference"),
+            },
+            SessionTimelineItem::ToolGroup {
+                sequence,
+                activity_ids,
+                ..
+            } => TimelineItem::ToolGroup {
+                sequence: *sequence,
+                activities: activity_ids
+                    .iter()
+                    .map(|activity_id| {
+                        projection
+                            .activities
+                            .iter()
+                            .find(|activity| activity.activity_id == *activity_id)
+                            .expect("validated Session timeline activity reference")
+                    })
+                    .collect(),
+            },
+        })
+        .collect()
 }
 
 fn todo_sequence(projection: &SessionProjection) -> u64 {
@@ -1076,7 +1474,7 @@ fn outcome_for_projection(projection: &SessionProjection) -> Option<Outcome> {
 
 fn outcome_for_status(status: &str) -> Option<Outcome> {
     match status {
-        "failed" => Some(Outcome::Failed),
+        "failed" | "releaseFailed" => Some(Outcome::Failed),
         "indeterminate" => Some(Outcome::Indeterminate),
         "completed" => Some(Outcome::Done),
         "cancelled" => Some(Outcome::Cancelled),
@@ -1110,11 +1508,10 @@ fn print_help() {
         r#"DeepCode 本地编码 Agent
 
 用法：
-  deepcode-cli ask [-C <workspace>] [--session <id>] [--plain] <message-or-response>
-  deepcode-cli chat [-C <workspace>] [--session <id>]
+  deepcode-cli ask [-C <workspace>] [--session <id>] [--file <path>]... [--directory <path>]... [--plugin <plugin://uri>]... [--plain] <message-or-response>
+  deepcode-cli chat [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...
   deepcode-cli show --session <id>
   deepcode-cli cancel-plan --session <id>
-  deepcode-cli model --session <id> <profile-id>
   deepcode-cli cancel --session <id> <run-id>
   deepcode-cli attach-directory --session <id> <path>
   deepcode-cli detach-directory --session <id> <workspace-id>
@@ -1123,6 +1520,8 @@ fn print_help() {
 
 只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
 Plan 等待时，输入 1/确认，其他非空输入作为修订说明；cancel-plan 明确取消。
+文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复，文件内容不会嵌入首轮 Provider 请求。
+插件只在 ask/chat 中显式选择；--plugin 可重复。PDF 文件按 mediaType 要求一个已配置的 Skill 插件。交互 chat 使用 @ 查看并选择下一次请求的插件，/focus <task> 作为类型化命令提交。
 所有终端命令都通过 ConversationPort，并只读取共享 SessionProjection。"#,
     );
 }
@@ -1143,6 +1542,24 @@ mod tests {
         .expect("ask parses");
         assert_eq!(args.workspace, Some(PathBuf::from("/tmp/project")));
         assert_eq!(args.command, Command::Ask("解释 代码".to_string()));
+    }
+
+    #[test]
+    fn ask_parser_keeps_repeatable_filesystem_references() {
+        let args = Args::parse(vec![
+            "ask".into(),
+            "--file".into(),
+            "/tmp/report.pdf".into(),
+            "--file".into(),
+            "/tmp/notes.txt".into(),
+            "--directory".into(),
+            "/tmp/project".into(),
+            "检查引用".into(),
+        ])
+        .expect("ask references parse");
+        assert_eq!(args.files, ["/tmp/report.pdf", "/tmp/notes.txt"]);
+        assert_eq!(args.directories, ["/tmp/project"]);
+        assert_eq!(args.command, Command::Ask("检查引用".to_string()));
     }
 
     #[test]
@@ -1192,6 +1609,7 @@ mod tests {
     #[test]
     fn failed_indeterminate_and_cancelled_are_distinct_nonzero_cli_outcomes() {
         assert_eq!(outcome_for_status("failed"), Some(Outcome::Failed));
+        assert_eq!(outcome_for_status("releaseFailed"), Some(Outcome::Failed));
         assert_eq!(
             outcome_for_status("indeterminate"),
             Some(Outcome::Indeterminate)

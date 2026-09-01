@@ -4,6 +4,7 @@ import type {
   ContextCompositionProjection,
   ContextUsageProjection,
   LlmProviderProfile,
+  TokenUsageProjection,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { inputCacheMetric, type InputCacheMetric } from '../../utils/providerUsage';
@@ -18,6 +19,7 @@ interface SessionModelSelectorProps {
   selectedProfileId: string | null;
   contextUsage: ContextUsageProjection | null;
   contextCompositions: readonly ContextCompositionProjection[];
+  tokenUsage: TokenUsageProjection | null;
   busy?: boolean;
   onProfileChange: (profileId: string) => void | Promise<void>;
 }
@@ -45,6 +47,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   selectedProfileId,
   contextUsage,
   contextCompositions,
+  tokenUsage,
   busy = false,
   onProfileChange,
 }) => {
@@ -124,7 +127,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const activeMetric = [...capacityMetrics, ...requestSections]
     .find((metric) => metric.key === activeContextKey)
     ?? capacityMetrics[0];
-  const cache = inputCacheMetric(contextUsage);
+  const cache = inputCacheMetric(tokenUsage);
   const hasContextFacts = Boolean(contextUsage || contextReceipt);
 
   useEffect(() => {

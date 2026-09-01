@@ -3,19 +3,39 @@ import type {
   CommandReply,
   ConversationCommand,
   KernelPort,
+  PrepareRunRuntimeRequest,
+  PreparedRunRuntime,
+  PreparedToolDescriptor,
+  ProviderRuntimeSnapshot,
   NewSessionEvent,
   ProviderEvent,
   ProviderPort,
   ProviderRequest,
+  ReleaseRunRuntimeRequest,
+  ReleaseRunRuntimeResult,
+  RunPreparationPort,
+  SelectedPluginSnapshot,
   SessionCreationInput,
   SessionEvent,
   StoredCommand,
   ToolCancelReply,
-  ToolDescriptor,
   ToolExecutionRecord,
   ToolExecutionReply,
   ToolExecutionRequest,
 } from '@deepcode/protocol';
+import {
+  KERNEL_REPLY_VERSION,
+  LOCAL_AGENT_PROTOCOL_VERSION,
+  SESSION_CONTROL_INTERACTION_REQUEST,
+  SESSION_CONTROL_PLAN_PUBLISH,
+} from '@deepcode/protocol';
+import { createProviderToolAliases } from './providerToolCodec.js';
+import { sessionControlToolDefinitions } from './sessionControls.js';
+import {
+  decodeRunPluginConfig,
+  runtimeInstructions,
+  type InstructionContribution,
+} from './skillPlugins.js';
 
 interface HttpPortOptions {
   apiBase: string;
@@ -115,10 +135,6 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 }
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
-  async listTools(): Promise<readonly ToolDescriptor[]> {
-    return decodeToolDescriptors(await this.json('/api/local-agent/kernel/tools'));
-  }
-
   async execute(request: ToolExecutionRequest): Promise<ToolExecutionReply> {
     return await this.json('/api/local-agent/kernel/execute', {
       method: 'POST',
@@ -140,18 +156,24 @@ export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
   }
 }
 
-function decodeToolDescriptors(value: unknown): readonly ToolDescriptor[] {
+function decodePreparedToolDescriptors(value: unknown): readonly PreparedToolDescriptor[] {
   if (!Array.isArray(value)) throw new Error('kernel_tool_catalog_invalid');
-  const seen = new Set<string>();
-  return Object.freeze(value.map((candidate) => {
+  const seenNames = new Set<string>();
+  const seenBindings = new Set<string>();
+  return Object.freeze(value.map((candidate): PreparedToolDescriptor => {
+    const fields = [
+      'toolBindingRef',
+      'name',
+      'description',
+      'inputSchema',
+      'possibleEffects',
+      'availability',
+      'origin',
+    ];
+    if (isRecord(candidate) && Object.hasOwn(candidate, 'pluginUri')) fields.push('pluginUri');
     if (
-      !isExactRecord(candidate, [
-        'name',
-        'description',
-        'inputSchema',
-        'possibleEffects',
-        'availability',
-      ])
+      !isExactRecord(candidate, fields)
+      || !isNonEmptyText(candidate.toolBindingRef)
       || !isNonEmptyText(candidate.name)
       || !/^[A-Za-z0-9_.-]+$/u.test(candidate.name)
       || !isNonEmptyText(candidate.description)
@@ -164,12 +186,31 @@ function decodeToolDescriptors(value: unknown): readonly ToolDescriptor[] {
         'network',
         'external',
       ].includes(String(effect)))
+      || new Set(candidate.possibleEffects.map(String)).size !== candidate.possibleEffects.length
       || candidate.availability !== 'callable' && candidate.availability !== 'blocked'
-      || seen.has(candidate.name)
+      || candidate.origin !== 'coreBuiltin' && candidate.origin !== 'extension'
+      || (candidate.origin === 'coreBuiltin' && candidate.pluginUri !== undefined)
+      || (candidate.origin === 'extension'
+        && (!isNonEmptyText(candidate.pluginUri)
+          || !/^plugin:\/\/[^@\s]+@[^@\s]+$/u.test(candidate.pluginUri)))
+      || seenNames.has(candidate.name)
+      || seenBindings.has(candidate.toolBindingRef)
     ) throw new Error('kernel_tool_catalog_invalid');
-    seen.add(candidate.name);
-    return candidate as unknown as ToolDescriptor;
-  }));
+    seenNames.add(candidate.name);
+    seenBindings.add(candidate.toolBindingRef);
+    return Object.freeze({
+      toolBindingRef: candidate.toolBindingRef,
+      name: candidate.name,
+      description: candidate.description,
+      inputSchema: structuredClone(candidate.inputSchema),
+      possibleEffects: [...candidate.possibleEffects] as PreparedToolDescriptor['possibleEffects'],
+      availability: candidate.availability,
+      origin: candidate.origin,
+      ...(candidate.origin === 'extension'
+        ? { pluginUri: candidate.pluginUri as PreparedToolDescriptor['pluginUri'] }
+        : {}),
+    });
+  }).sort((left, right) => left.name.localeCompare(right.name, 'en')));
 }
 
 export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort {
@@ -196,6 +237,218 @@ export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort
     }
     yield* decodeProviderEvents(response.body, request.requestId, signal);
   }
+}
+
+interface HttpRunPreparationPortOptions extends HttpPortOptions {
+  stableCoreInstructions: readonly InstructionContribution[];
+}
+
+export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPreparationPort {
+  readonly #stableCoreInstructions: readonly InstructionContribution[];
+
+  constructor(options: HttpRunPreparationPortOptions) {
+    super(options);
+    this.#stableCoreInstructions = Object.freeze(options.stableCoreInstructions
+      .map((instruction) => Object.freeze({ ...instruction })));
+  }
+
+  async prepare(request: PrepareRunRuntimeRequest): Promise<PreparedRunRuntime> {
+    const value = await this.json('/api/local-agent/runtime/prepare-run', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+    if (!isExactRecord(value, [
+      'schemaVersion',
+      'type',
+      'sessionId',
+      'runId',
+      'provider',
+      'extensionGenerationRef',
+      'kernelCatalogSnapshotRef',
+      'tools',
+      'pluginConfig',
+      'selectedPlugins',
+    ])) throw new Error('run_runtime_prepared_invalid');
+    if (
+      value.schemaVersion !== LOCAL_AGENT_PROTOCOL_VERSION
+      || value.type !== 'run.runtime.prepared'
+      || value.sessionId !== request.sessionId
+      || value.runId !== request.runId
+      || !isNonEmptyText(value.extensionGenerationRef)
+      || !isNonEmptyText(value.kernelCatalogSnapshotRef)
+    ) throw new Error('run_runtime_prepared_invalid');
+    const releaseRequest = {
+      sessionId: request.sessionId,
+      runId: request.runId,
+      kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
+    };
+    try {
+      const provider = decodeProviderRuntime(value.provider);
+      const pluginConfig = decodeRunPluginConfig(value.pluginConfig);
+      if (pluginConfig.extensionGenerationRef !== value.extensionGenerationRef) {
+        throw new Error('run_runtime_extension_identity_mismatch');
+      }
+      if (request.profileId !== undefined && provider.profileId !== request.profileId) {
+        throw new Error('run_runtime_profile_identity_mismatch');
+      }
+      const tools = [...decodePreparedToolDescriptors(value.tools)];
+      const selectedPlugins = decodeSelectedPluginSnapshot(
+        value.selectedPlugins,
+        value.extensionGenerationRef,
+        request,
+      );
+      const providerToolAliases = createProviderToolAliases([
+        ...tools
+          .filter((tool) => tool.availability === 'callable')
+          .map((tool) => tool.name),
+        ...sessionControlToolDefinitions().map((tool) => tool.name),
+      ]);
+      const wireName = (canonicalName: string): string => {
+        const alias = providerToolAliases.find((candidate) => (
+          candidate.canonicalName === canonicalName
+        ));
+        if (!alias) throw new Error(`run_runtime_provider_tool_alias_missing:${canonicalName}`);
+        return alias.wireName;
+      };
+      return {
+        runtimeSnapshot: Object.freeze({
+          runRuntimeSnapshotRef: `run-runtime:${request.sessionId}:${request.runId}`,
+          extensionGenerationRef: value.extensionGenerationRef,
+          kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
+          provider,
+          instructions: [...runtimeInstructions(this.#stableCoreInstructions, pluginConfig, {
+            interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
+            planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
+          })],
+          tools,
+          providerToolAliases,
+          selectedPlugins,
+        }),
+      };
+    } catch (error) {
+      try {
+        await this.release(releaseRequest);
+      } catch (releaseError) {
+        throw new AggregateError([error, releaseError], 'run_runtime_prepare_rollback_failed');
+      }
+      throw error;
+    }
+  }
+
+  async release(request: ReleaseRunRuntimeRequest): Promise<ReleaseRunRuntimeResult> {
+    const released = decodeRunRuntimeReleased(await this.json('/api/local-agent/runtime/release-run', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }), request);
+    return Object.freeze({
+      kernelCatalogSnapshotRef: released.kernelCatalogSnapshotRef,
+      alreadyReleased: released.alreadyReleased,
+    });
+  }
+}
+
+function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
+  if (
+    !isExactRecord(value, [
+      'providerRuntimeRef',
+      'profileId',
+      'contextWindowTokens',
+      'maxOutputTokens',
+    ])
+    || !isNonEmptyText(value.providerRuntimeRef)
+    || !isNonEmptyText(value.profileId)
+    || !isPositiveSafeInteger(value.contextWindowTokens)
+    || !isPositiveSafeInteger(value.maxOutputTokens)
+    || value.maxOutputTokens >= value.contextWindowTokens
+  ) throw new Error('provider_runtime_snapshot_invalid');
+  return Object.freeze({
+    providerRuntimeRef: value.providerRuntimeRef,
+    profileId: value.profileId,
+    contextWindowTokens: value.contextWindowTokens,
+    maxOutputTokens: value.maxOutputTokens,
+  });
+}
+
+function decodeSelectedPluginSnapshot(
+  value: unknown,
+  extensionGenerationRef: string,
+  request: PrepareRunRuntimeRequest,
+): SelectedPluginSnapshot {
+  if (
+    !isExactRecord(value, ['catalogRevision', 'plugins'])
+    || !isNonEmptyText(value.catalogRevision)
+    || !Array.isArray(value.plugins)
+    || value.plugins.length > 16
+  ) throw new Error('selected_plugin_snapshot_invalid');
+  const seen = new Set<string>();
+  const plugins = value.plugins.map((plugin) => {
+    if (
+      !isExactRecord(plugin, [
+        'uri',
+        'pluginArtifactRef',
+        'pluginInstanceRef',
+        'extensionGenerationRef',
+        'capabilityRefs',
+      ])
+      || typeof plugin.uri !== 'string'
+      || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(plugin.uri)
+      || seen.has(plugin.uri)
+      || !isNonEmptyText(plugin.pluginArtifactRef)
+      || !isNonEmptyText(plugin.pluginInstanceRef)
+      || plugin.extensionGenerationRef !== extensionGenerationRef
+      || !Array.isArray(plugin.capabilityRefs)
+      || plugin.capabilityRefs.some((capability) => !isNonEmptyText(capability))
+    ) throw new Error('selected_plugin_snapshot_invalid');
+    seen.add(plugin.uri);
+    return {
+      uri: plugin.uri as SelectedPluginSnapshot['plugins'][number]['uri'],
+      pluginArtifactRef: plugin.pluginArtifactRef,
+      pluginInstanceRef: plugin.pluginInstanceRef,
+      extensionGenerationRef,
+      capabilityRefs: [...plugin.capabilityRefs] as string[],
+    };
+  });
+  const requested = request.pluginSelections ?? [];
+  if (
+    requested.length > 0
+    && (
+      value.catalogRevision !== request.pluginCatalogRevision
+      || requested.length !== plugins.length
+      || requested.some((selection) => !seen.has(selection.uri))
+    )
+  ) throw new Error('selected_plugin_snapshot_identity_mismatch');
+  return {
+    catalogRevision: value.catalogRevision,
+    plugins,
+  };
+}
+
+function decodeRunRuntimeReleased(
+  value: unknown,
+  request: ReleaseRunRuntimeRequest,
+): ReleaseRunRuntimeResult {
+  if (
+    !isExactRecord(value, [
+      'schemaVersion',
+      'type',
+      'sessionId',
+      'runId',
+      'kernelCatalogSnapshotRef',
+      'released',
+      'alreadyReleased',
+    ])
+    || value.schemaVersion !== KERNEL_REPLY_VERSION
+    || value.type !== 'tool.catalog.released'
+    || value.sessionId !== request.sessionId
+    || value.runId !== request.runId
+    || value.kernelCatalogSnapshotRef !== request.kernelCatalogSnapshotRef
+    || value.released !== true
+    || typeof value.alreadyReleased !== 'boolean'
+  ) throw new Error('kernel_tool_catalog_released_invalid');
+  return Object.freeze({
+    kernelCatalogSnapshotRef: request.kernelCatalogSnapshotRef,
+    alreadyReleased: value.alreadyReleased,
+  });
 }
 
 async function* decodeProviderEvents(
@@ -311,4 +564,8 @@ function isExactRecord(value: unknown, keys: readonly string[]): value is Record
 
 function isNonEmptyText(value: unknown): value is string {
   return typeof value === 'string' && Boolean(value.trim());
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
 }

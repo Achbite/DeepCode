@@ -757,7 +757,7 @@ validate_protocol_dist() {
       || fail "$label protocol dist is missing $name"
   done
   if find "$dist_dir" -maxdepth 1 -type f \
-    \( -name 'agent.*' -o -name 'kernelAbiV1.*' -o -name 'kernelAbiV2.*' \) -print -quit | grep -q .; then
+    -name 'agent.*' -print -quit | grep -q .; then
     fail "$label protocol dist contains a retired Agent protocol module"
   fi
 }

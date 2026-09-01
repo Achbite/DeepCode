@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { PlanProjection } from '@deepcode/protocol';
+import type { PlanOperation, PlanProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
 import { MarkdownContent } from './BufferedMarkdown';
@@ -87,9 +87,9 @@ const PlanCard: React.FC<PlanCardProps> = ({
               </summary>
               <ul>
                 {plan.mutationManifest.map((operation, index) => (
-                  <li key={`${operation.workspaceId}:${operation.operation}:${operation.target}:${index}`}>
+                  <li key={`${operation.workspaceId}:${operation.operation}:${planOperationDetail(operation)}:${index}`}>
                     <code>
-                      {operation.workspaceId} · {operation.operation} · {operation.target}
+                      {operation.workspaceId} · {operation.operation} · {planOperationDetail(operation)}
                       {'targetKind' in operation ? ` · ${operation.targetKind}` : ''}
                     </code>
                   </li>
@@ -117,5 +117,12 @@ const PlanCard: React.FC<PlanCardProps> = ({
     </article>
   );
 };
+
+function planOperationDetail(operation: PlanOperation): string {
+  if (operation.operation === 'bash') {
+    return `${operation.command} · workspaceMode=${operation.workspaceMode}`;
+  }
+  return operation.target;
+}
 
 export default PlanCard;

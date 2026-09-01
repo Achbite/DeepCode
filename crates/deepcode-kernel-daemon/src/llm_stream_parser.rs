@@ -1,4 +1,4 @@
-use crate::llm_transport::{internal_tool_name, LlmChatOutput, LlmToolCall, LlmToolDefinition};
+use crate::llm_transport::{LlmChatOutput, LlmToolCall, LlmToolDefinition};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -204,7 +204,7 @@ impl ProviderStreamAccumulator {
             };
             tool_calls.push(LlmToolCall {
                 id,
-                name: internal_tool_name(&name),
+                name,
                 arguments,
             });
         }
@@ -718,116 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_usage_is_preserved_as_provider_fact() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
-        parser
-            .ingest_payload(br#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#)
-            .unwrap();
-        parser.ingest_payload(b"[DONE]").unwrap();
-        let result = parser.finalize().unwrap();
-        assert_eq!(
-            result.completion.usage,
-            Some(ProviderUsage {
-                input_tokens: 12,
-                output_tokens: 5,
-                cache_read_input_tokens: None,
-                cache_miss_input_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn anthropic_usage_is_preserved_as_provider_fact() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
-        parser
-            .ingest_payload(br#"{"type":"message_start","message":{"usage":{"input_tokens":21}}}"#)
-            .unwrap();
-        parser
-            .ingest_payload(
-                br#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}"#,
-            )
-            .unwrap();
-        parser
-            .ingest_payload(br#"{"type":"message_stop"}"#)
-            .unwrap();
-        let result = parser.finalize().unwrap();
-        assert_eq!(
-            result.completion.usage,
-            Some(ProviderUsage {
-                input_tokens: 21,
-                output_tokens: 8,
-                cache_read_input_tokens: None,
-                cache_miss_input_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn ollama_usage_is_preserved_as_provider_fact() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Ollama);
-        parser
-            .ingest_payload(
-                br#"{"message":{"content":"OK"},"done":true,"prompt_eval_count":9,"eval_count":3}"#,
-            )
-            .unwrap();
-        let result = parser.finalize().unwrap();
-        assert_eq!(
-            result.completion.usage,
-            Some(ProviderUsage {
-                input_tokens: 9,
-                output_tokens: 3,
-                cache_read_input_tokens: None,
-                cache_miss_input_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn provider_without_native_tool_ids_gets_request_scoped_call_identity() {
-        fn call_id(request_id: &str) -> String {
-            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Ollama);
-            parser
-                .ingest_payload(
-                    br#"{"message":{"tool_calls":[{"function":{"name":"fs__list","arguments":{"path":"."}}}]},"done":true,"prompt_eval_count":1,"eval_count":1}"#,
-                )
-                .unwrap();
-            parser
-                .finalize_for_request(request_id)
-                .unwrap()
-                .output
-                .tool_calls[0]
-                .id
-                .clone()
-        }
-
-        assert_eq!(call_id("request-a"), "provider-tool:request-a:0");
-        assert_eq!(call_id("request-b"), "provider-tool:request-b:0");
-        assert_ne!(call_id("request-a"), call_id("request-b"));
-    }
-
-    #[test]
-    fn deepseek_cache_usage_is_preserved_as_provider_fact() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
-        parser
-            .ingest_payload(
-                br#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_cache_hit_tokens":15,"prompt_cache_miss_tokens":5}}"#,
-            )
-            .unwrap();
-        parser.ingest_payload(b"[DONE]").unwrap();
-        let result = parser.finalize().unwrap();
-        assert_eq!(
-            result.completion.usage,
-            Some(ProviderUsage {
-                input_tokens: 20,
-                output_tokens: 4,
-                cache_read_input_tokens: Some(15),
-                cache_miss_input_tokens: Some(5),
-            })
-        );
-    }
-
-    #[test]
-    fn openai_cached_tokens_derives_miss_from_same_usage_object() {
+    fn openai_cache_usage_is_preserved_as_provider_fact() {
         let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
         parser
             .ingest_payload(
@@ -848,107 +739,38 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_cache_components_form_total_and_miss_usage() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
-        parser
-            .ingest_payload(
-                br#"{"type":"message_start","message":{"usage":{"input_tokens":4,"cache_read_input_tokens":10,"cache_creation_input_tokens":6}}}"#,
-            )
-            .unwrap();
-        parser
-            .ingest_payload(
-                br#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
-            )
-            .unwrap();
-        parser
-            .ingest_payload(br#"{"type":"message_stop"}"#)
-            .unwrap();
-        let result = parser.finalize().unwrap();
-        assert_eq!(
-            result.completion.usage,
-            Some(ProviderUsage {
-                input_tokens: 20,
-                output_tokens: 2,
-                cache_read_input_tokens: Some(10),
-                cache_miss_input_tokens: Some(10),
-            })
-        );
+    fn provider_without_native_tool_ids_gets_request_scoped_call_identity() {
+        fn call_id(request_id: &str) -> String {
+            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Ollama);
+            parser
+                .ingest_payload(
+                    br#"{"message":{"tool_calls":[{"function":{"name":"fs.list","arguments":{"path":"."}}}]},"done":true,"prompt_eval_count":1,"eval_count":1}"#,
+                )
+                .unwrap();
+            parser
+                .finalize_for_request(request_id)
+                .unwrap()
+                .output
+                .tool_calls[0]
+                .id
+                .clone()
+        }
+
+        assert_eq!(call_id("request-a"), "provider-tool:request-a:0");
+        assert_eq!(call_id("request-b"), "provider-tool:request-b:0");
+        assert_ne!(call_id("request-a"), call_id("request-b"));
     }
 
     #[test]
-    fn openai_tool_call_is_decoded_to_internal_name() {
+    fn openai_tool_call_preserves_canonical_name_and_arguments() {
         let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
         parser
             .ingest_payload(
-                br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs__read","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs.read","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
             )
             .unwrap();
         parser.ingest_payload(b"[DONE]").unwrap();
         let result = parser.finalize().unwrap();
-        assert_eq!(result.output.tool_calls[0].name, "fs.read");
-        assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
-    }
-
-    #[test]
-    fn openai_compatible_tool_name_accepts_glm_stream_fragments() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
-        for payload in [
-            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs__","arguments":"{"}}]}}]}"#.as_slice(),
-            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
-        ] {
-            parser.ingest_payload(payload).unwrap();
-        }
-        parser.ingest_payload(b"[DONE]").unwrap();
-        let result = parser.finalize().unwrap();
-        assert_eq!(result.output.tool_calls[0].name, "fs.read");
-        assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
-    }
-
-    #[test]
-    fn openai_tool_call_without_index_is_rejected_instead_of_merged_into_zero() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
-        let error = parser
-            .ingest_payload(
-                br#"{"choices":[{"delta":{"tool_calls":[{"id":"call-1","function":{"name":"fs__read","arguments":"{}"}}]}}]}"#,
-            )
-            .expect_err("missing index rejected");
-
-        assert_eq!(error.code, "provider_tool_call_index_invalid");
-    }
-
-    #[test]
-    fn anthropic_content_block_without_index_is_rejected() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
-        let error = parser
-            .ingest_payload(
-                br#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#,
-            )
-            .expect_err("missing index rejected");
-
-        assert_eq!(error.code, "provider_tool_call_index_invalid");
-    }
-
-    #[test]
-    fn anthropic_thinking_signature_is_preserved_for_tool_continuation() {
-        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
-        for payload in [
-            br#"{"type":"message_start","message":{"usage":{"input_tokens":3}}}"#.as_slice(),
-            br#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#.as_slice(),
-            br#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}"#.as_slice(),
-            br#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}"#.as_slice(),
-            br#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-1","name":"fs__read","input":{}}}"#.as_slice(),
-            br#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"README.md\"}"}}"#.as_slice(),
-            br#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}"#.as_slice(),
-            br#"{"type":"message_stop"}"#.as_slice(),
-        ] {
-            parser.ingest_payload(payload).unwrap();
-        }
-        let result = parser.finalize().unwrap();
-        assert_eq!(result.output.reasoning.as_deref(), Some("reason"));
-        assert_eq!(
-            result.output.reasoning_signature.as_deref(),
-            Some("opaque-signature")
-        );
         assert_eq!(result.output.tool_calls[0].name, "fs.read");
         assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
     }

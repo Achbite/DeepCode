@@ -1,24 +1,28 @@
-use crate::local_agent_mcp::{McpRuntime, McpTool};
+use crate::local_agent_mcp::McpRuntime;
 use crate::local_agent_store::{LocalAgentJournal, LocalAgentStoreError};
+use crate::local_agent_tool_catalog::{
+    CatalogEffectScope, PreparedCatalogBinding, ToolCatalogError, ToolCatalogSnapshot,
+};
 use deepcode_kernel_runtime::executors::{
-    builtin_executors, resolved_network_target, KernelExecutorConfig, KernelExecutorRegistry,
-    KernelToolExecutionContext, KernelToolInvocation, SecretProvider,
+    resolved_network_target, KernelCancellationToken, KernelExecutorConfig,
+    KernelToolExecutionContext, KernelToolExecutionOutcome, KernelToolExecutionResult,
+    SecretProvider,
 };
 use deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary;
-use deepcode_kernel_tools::{
-    KernelToolRegistry, ToolAvailability, ToolEffectClass, ToolEffectScope,
-};
+use deepcode_kernel_tools::ToolAvailability;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const KERNEL_REQUEST_VERSION: &str = "deepcode.kernel-request";
 const KERNEL_REPLY_VERSION: &str = "deepcode.kernel-reply";
 const TOOL_RECORD_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/tool-record.sql");
 const TOOL_RECORD_STORE_VERSION: u32 = 1;
+const ATTEMPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalAgentKernelError {
@@ -149,6 +153,9 @@ pub(crate) struct LocalToolExecutionRequest {
     request_id: String,
     session_id: String,
     run_id: String,
+    extension_generation_ref: String,
+    kernel_catalog_snapshot_ref: String,
+    tool_binding_ref: String,
     call_id: String,
     attempt_id: String,
     tool_name: String,
@@ -161,6 +168,62 @@ pub(crate) struct LocalToolExecutionRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PrepareToolCatalogRequest {
+    session_id: String,
+    run_id: String,
+    extension_generation_ref: String,
+}
+
+impl PrepareToolCatalogRequest {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        extension_generation_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            extension_generation_ref: extension_generation_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReleaseToolCatalogRequest {
+    session_id: String,
+    run_id: String,
+    kernel_catalog_snapshot_ref: String,
+}
+
+impl ReleaseToolCatalogRequest {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        kernel_catalog_snapshot_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            kernel_catalog_snapshot_ref: kernel_catalog_snapshot_ref.into(),
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn kernel_catalog_snapshot_ref(&self) -> &str {
+        &self.kernel_catalog_snapshot_ref
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NonWorkspaceAuthority {
     authority_id: String,
     decision: String,
@@ -168,15 +231,38 @@ struct NonWorkspaceAuthority {
 
 #[derive(Clone)]
 pub(crate) struct LocalAgentKernel {
-    registry: Arc<KernelToolRegistry>,
-    executors: Arc<KernelExecutorRegistry>,
-    executor_config: KernelExecutorConfig,
     records: LocalToolRecordStore,
     journal: LocalAgentJournal,
     resolver: Arc<dyn WorkspaceResolverPort>,
-    mcp: McpRuntime,
-    permissions: LocalAgentPermissionPolicy,
+    generations: Arc<Mutex<KernelGenerationState>>,
     active: Arc<Mutex<HashMap<String, ActiveCall>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedKernelGeneration {
+    generation: Arc<KernelGeneration>,
+}
+
+struct KernelGeneration {
+    catalog: Arc<ToolCatalogSnapshot>,
+    executor_config: KernelExecutorConfig,
+    permissions: LocalAgentPermissionPolicy,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct RunCatalogKey {
+    session_id: String,
+    run_id: String,
+}
+
+struct KernelGenerationState {
+    run_bindings: HashMap<RunCatalogKey, Arc<KernelGeneration>>,
+    released_run_bindings: HashMap<RunCatalogKey, ReleasedRunBinding>,
+}
+
+struct ReleasedRunBinding {
+    snapshot_ref: String,
+    dispose_error: Option<LocalAgentKernelError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,10 +274,75 @@ enum ActivePhase {
 #[derive(Clone)]
 struct ActiveCall {
     request: LocalToolExecutionRequest,
-    prepared: PreparedEffect,
-    authority: Value,
-    started_at: String,
     phase: ActivePhase,
+    control: AttemptControl,
+}
+
+#[derive(Default)]
+struct AttemptCompletion {
+    cancel_phase: Option<ActivePhase>,
+    outcome_claimed: bool,
+    complete: bool,
+}
+
+#[derive(Clone, Default)]
+struct AttemptControl {
+    cancellation: KernelCancellationToken,
+    completion: Arc<(Mutex<AttemptCompletion>, Condvar)>,
+}
+
+impl AttemptControl {
+    fn cancellation(&self) -> KernelCancellationToken {
+        self.cancellation.clone()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    fn request_cancel(&self, phase: ActivePhase) {
+        let (state, _) = self.completion.as_ref();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.outcome_claimed || state.complete {
+            return;
+        }
+        state.cancel_phase.get_or_insert(phase);
+        self.cancellation.cancel();
+    }
+
+    fn claim_outcome(&self) -> Option<ActivePhase> {
+        let (state, _) = self.completion.as_ref();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outcome_claimed = true;
+        state.cancel_phase
+    }
+
+    fn finish(&self) {
+        let (state, complete) = self.completion.as_ref();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.complete = true;
+        complete.notify_all();
+    }
+
+    fn wait_complete(&self, timeout: Duration) -> bool {
+        let (state, complete) = self.completion.as_ref();
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.complete {
+            return true;
+        }
+        let (state, _) = complete
+            .wait_timeout_while(state, timeout, |state| !state.complete)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.complete
+    }
 }
 
 impl LocalAgentKernel {
@@ -199,62 +350,223 @@ impl LocalAgentKernel {
         record_path: &Path,
         journal: LocalAgentJournal,
         resolver: Arc<dyn WorkspaceResolverPort>,
-        executor_config: KernelExecutorConfig,
-        secret_provider: Arc<dyn SecretProvider>,
-        mcp: McpRuntime,
-        permissions: LocalAgentPermissionPolicy,
     ) -> Result<Self, LocalAgentKernelError> {
-        let registry = Arc::new(KernelToolRegistry::new());
-        let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
-            registry.as_ref(),
-            executor_config.clone(),
-            secret_provider,
-        )));
         Ok(Self {
-            registry,
-            executors,
-            executor_config,
             records: LocalToolRecordStore::open(record_path)?,
             journal,
             resolver,
-            mcp,
-            permissions,
+            generations: Arc::new(Mutex::new(KernelGenerationState {
+                run_bindings: HashMap::new(),
+                released_run_bindings: HashMap::new(),
+            })),
             active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub(crate) fn list_tools(&self) -> Result<Value, LocalAgentKernelError> {
-        let mut tools = self
-            .registry
-            .descriptors()
-            .map(|tool| {
-                let input_schema = match tool.effect_scope {
-                    ToolEffectScope::WorkspaceRead
-                    | ToolEffectScope::WorkspaceWrite
-                    | ToolEffectScope::Process => {
-                        schema_requiring_workspace_id(tool.input_schema.clone())
+    pub(crate) fn prepare_generation(
+        extension_generation_ref: &str,
+        kernel_runtime_generation_key: &str,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+        mcp: McpRuntime,
+        permissions: LocalAgentPermissionPolicy,
+    ) -> Result<PreparedKernelGeneration, LocalAgentKernelError> {
+        let catalog = ToolCatalogSnapshot::prepare(
+            extension_generation_ref,
+            kernel_runtime_generation_key,
+            executor_config.clone(),
+            secret_provider,
+            mcp,
+        )
+        .map_err(catalog_error)?;
+        Ok(PreparedKernelGeneration {
+            generation: Arc::new(KernelGeneration {
+                catalog,
+                executor_config,
+                permissions,
+            }),
+        })
+    }
+
+    pub(crate) fn bind_run_catalog(
+        &self,
+        request: PrepareToolCatalogRequest,
+        prepared: PreparedKernelGeneration,
+    ) -> Result<Value, LocalAgentKernelError> {
+        for (field, value) in [
+            ("sessionId", request.session_id.as_str()),
+            ("runId", request.run_id.as_str()),
+            (
+                "extensionGenerationRef",
+                request.extension_generation_ref.as_str(),
+            ),
+        ] {
+            validate_id(field, value)?;
+        }
+        let key = RunCatalogKey {
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+        };
+        let generation = prepared.generation;
+        {
+            let mut state = self.lock_generations()?;
+            if state.released_run_bindings.contains_key(&key) {
+                return Err(LocalAgentKernelError::new(
+                    "tool_catalog_run_already_released",
+                    "当前 run 的 catalog lease 已经释放，不能重新获取。",
+                ));
+            }
+            if let Some(existing) = state.run_bindings.get(&key) {
+                if existing.catalog.extension_generation_ref() != request.extension_generation_ref
+                    || existing.catalog.snapshot_ref() != generation.catalog.snapshot_ref()
+                {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_catalog_run_identity_conflict",
+                        "当前 run 已固定到其他 ExtensionGenerationRef 或 catalog snapshot。",
+                    ));
+                }
+            } else {
+                if generation.catalog.extension_generation_ref() != request.extension_generation_ref
+                {
+                    return Err(LocalAgentKernelError::new(
+                        "extension_generation_identity_conflict",
+                        "Prepared generation 与请求的 ExtensionGenerationRef 不一致。",
+                    ));
+                }
+                state.run_bindings.insert(key, Arc::clone(&generation));
+            }
+        }
+        Ok(catalog_prepare_reply(&request, &generation.catalog))
+    }
+
+    pub(crate) fn release_catalog(
+        &self,
+        request: ReleaseToolCatalogRequest,
+    ) -> Result<Value, LocalAgentKernelError> {
+        for (field, value) in [
+            ("sessionId", request.session_id.as_str()),
+            ("runId", request.run_id.as_str()),
+            (
+                "kernelCatalogSnapshotRef",
+                request.kernel_catalog_snapshot_ref.as_str(),
+            ),
+        ] {
+            validate_id(field, value)?;
+        }
+        let key = RunCatalogKey {
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+        };
+        let has_live_binding = {
+            let state = self.lock_generations()?;
+            if let Some(released) = state.released_run_bindings.get(&key) {
+                if released.snapshot_ref != request.kernel_catalog_snapshot_ref {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_catalog_release_identity_conflict",
+                        "当前 run 已释放的是其他 KernelCatalogSnapshotRef。",
+                    ));
+                }
+                if let Some(error) = released.dispose_error.clone() {
+                    return Err(error);
+                }
+                return Ok(catalog_release_reply(&request, true));
+            } else {
+                if let Some(generation) = state.run_bindings.get(&key) {
+                    if generation.catalog.snapshot_ref() != request.kernel_catalog_snapshot_ref {
+                        return Err(LocalAgentKernelError::new(
+                            "tool_catalog_release_identity_conflict",
+                            "KernelCatalogSnapshotRef 与当前 run 的 catalog lease 不一致。",
+                        ));
                     }
-                    ToolEffectScope::NetworkRead => tool.input_schema.clone(),
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !has_live_binding {
+            let runtime = self
+                .journal
+                .run_runtime_snapshot(&request.session_id, &request.run_id)?;
+            if runtime
+                .get("kernelCatalogSnapshotRef")
+                .and_then(Value::as_str)
+                != Some(request.kernel_catalog_snapshot_ref.as_str())
+            {
+                return Err(LocalAgentKernelError::new(
+                    "tool_catalog_release_identity_conflict",
+                    "KernelCatalogSnapshotRef 与持久化 run.runtime snapshot 不一致。",
+                ));
+            }
+            self.lock_generations()?.released_run_bindings.insert(
+                key,
+                ReleasedRunBinding {
+                    snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
+                    dispose_error: None,
+                },
+            );
+            return Ok(catalog_release_reply(&request, true));
+        }
+        self.cancel_and_drain_attempts(Some((&request.session_id, &request.run_id)))?;
+        let already_released = {
+            let mut state = self.lock_generations()?;
+            if let Some(released) = state.released_run_bindings.get(&key) {
+                if released.snapshot_ref != request.kernel_catalog_snapshot_ref {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_catalog_release_identity_conflict",
+                        "当前 run 已释放的是其他 KernelCatalogSnapshotRef。",
+                    ));
+                }
+                if let Some(error) = released.dispose_error.clone() {
+                    return Err(error);
+                }
+                true
+            } else {
+                let generation = state.run_bindings.get(&key).ok_or_else(|| {
+                    LocalAgentKernelError::new(
+                        "tool_catalog_run_binding_not_found",
+                        "当前 run 没有可释放的 catalog lease。",
+                    )
+                })?;
+                if generation.catalog.snapshot_ref() != request.kernel_catalog_snapshot_ref {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_catalog_release_identity_conflict",
+                        "KernelCatalogSnapshotRef 与当前 run 的 catalog lease 不一致。",
+                    ));
+                }
+                if generation.catalog.active_attempts() != 0 {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_catalog_release_cleanup_incomplete",
+                        "当前 run 的物理 attempt lease 尚未归零，不能释放 catalog。",
+                    ));
+                }
+                let generation = state
+                    .run_bindings
+                    .remove(&key)
+                    .expect("validated run binding exists");
+                let still_pinned = state
+                    .run_bindings
+                    .values()
+                    .any(|candidate| Arc::ptr_eq(candidate, &generation));
+                let dispose_error = if still_pinned {
+                    None
+                } else {
+                    generation.catalog.dispose().err().map(catalog_error)
                 };
-                json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": input_schema,
-                    "possibleEffects": possible_effects(tool.effect_class, tool.effect_scope),
-                    "availability": tool.availability,
-                })
-            })
-            .collect::<Vec<_>>();
-        tools.extend(self.mcp.tools().map(|tool| {
-            json!({
-                "name": tool.public_name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-                "possibleEffects": ["external"],
-                "availability": "callable",
-            })
-        }));
-        Ok(Value::Array(tools))
+                state.released_run_bindings.insert(
+                    key,
+                    ReleasedRunBinding {
+                        snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
+                        dispose_error: dispose_error.clone(),
+                    },
+                );
+                if let Some(error) = dispose_error {
+                    return Err(error);
+                }
+                false
+            }
+        };
+        Ok(catalog_release_reply(&request, already_released))
     }
 
     pub(crate) fn execute(
@@ -298,6 +610,7 @@ impl LocalAgentKernel {
             }
             Admission::Allowed(authority) => {
                 let started_at = crate::now_text();
+                let control = AttemptControl::default();
                 {
                     let mut active = self.lock_active()?;
                     if active.contains_key(&request.call_id) {
@@ -310,10 +623,8 @@ impl LocalAgentKernel {
                         request.call_id.clone(),
                         ActiveCall {
                             request: request.clone(),
-                            prepared: prepared.clone(),
-                            authority: authority.clone(),
-                            started_at: started_at.clone(),
                             phase: ActivePhase::Prepared,
+                            control: control.clone(),
                         },
                     );
                 }
@@ -321,43 +632,53 @@ impl LocalAgentKernel {
                 let start_execution = {
                     let mut active = self.lock_active()?;
                     match active.get_mut(&request.call_id) {
-                        Some(call) if call.request.attempt_id == request.attempt_id => {
+                        Some(call)
+                            if call.request.attempt_id == request.attempt_id
+                                && !call.control.is_cancelled() =>
+                        {
                             call.phase = ActivePhase::Executing;
                             true
                         }
                         _ => false,
                     }
                 };
-                if !start_execution {
-                    let record = self.records.read(&request.call_id)?.ok_or_else(|| {
-                        LocalAgentKernelError::new(
-                            "tool_call_state_lost",
-                            "工具调用在进入执行前丢失了确定状态。",
-                        )
-                    })?;
-                    validate_record_replay(&record, &request)?;
-                    return Ok(execution_reply(&request, &record));
-                }
-
-                let result = self.execute_prepared(&prepared, &request);
-                self.lock_active()?.remove(&request.call_id);
-                if let Some(record) = self.records.read(&request.call_id)? {
-                    validate_record_replay(&record, &request)?;
-                    return Ok(execution_reply(&request, &record));
-                }
+                let result = start_execution
+                    .then(|| self.execute_prepared(&prepared, &request, control.cancellation()));
+                let cancel_phase = control.claim_outcome();
                 let completed_at = crate::now_text();
-                let record = match result {
-                    Ok(output) => tool_record(
+                let record_result = match (cancel_phase, result) {
+                    (Some(ActivePhase::Prepared), _) => tool_record(
                         &request,
                         &prepared,
                         authority,
                         &started_at,
                         &completed_at,
-                        "completed",
-                        Some(output),
+                        "cancelled",
                         None,
-                    )?,
-                    Err(message) => tool_record(
+                        None,
+                    ),
+                    (Some(ActivePhase::Executing), _) => tool_record(
+                        &request,
+                        &prepared,
+                        authority,
+                        &started_at,
+                        &completed_at,
+                        "indeterminate",
+                        None,
+                        Some(json!({
+                            "code": "tool_effect_outcome_unknown",
+                            "message": "取消发生时工具 effect 已进入执行边界，结果无法确定。",
+                        })),
+                    ),
+                    (None, Some(Ok(result))) => tool_record_from_execution_result(
+                        &request,
+                        &prepared,
+                        authority,
+                        &started_at,
+                        &completed_at,
+                        result,
+                    ),
+                    (None, Some(Err(message))) => tool_record(
                         &request,
                         &prepared,
                         authority,
@@ -369,10 +690,22 @@ impl LocalAgentKernel {
                             "code": "tool_execution_failed",
                             "message": message,
                         })),
-                    )?,
+                    ),
+                    (None, None) => Err(LocalAgentKernelError::new(
+                        "tool_call_state_lost",
+                        "工具调用在进入执行前丢失了确定状态。",
+                    )),
                 };
-                self.records.insert(&record)?;
-                Ok(execution_reply(&request, &record))
+                let final_result = record_result.and_then(|record| {
+                    self.records.insert(&record)?;
+                    Ok(execution_reply(&request, &record))
+                });
+                let remove_result = self
+                    .lock_active()
+                    .map(|mut active| active.remove(&request.call_id));
+                control.finish();
+                remove_result?;
+                final_result
             }
         }
     }
@@ -396,6 +729,16 @@ impl LocalAgentKernel {
         }
         let active = self.lock_active()?.get(call_id).cloned();
         let Some(active) = active else {
+            if let Some(record) = self.records.read(call_id)? {
+                if record.get("attemptId").and_then(Value::as_str) != Some(attempt_id) {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_call_identity_conflict",
+                        "callId 已绑定到其他 attemptId。",
+                    ));
+                }
+                let outcome = required_record_string(&record, "outcome")?.to_string();
+                return Ok(cancel_reply(call_id, attempt_id, &outcome, Some(record)));
+            }
             return Ok(cancel_reply(call_id, attempt_id, "notFound", None));
         };
         if active.request.attempt_id != attempt_id {
@@ -404,30 +747,22 @@ impl LocalAgentKernel {
                 "callId 已绑定到其他 attemptId。",
             ));
         }
-        let completed_at = crate::now_text();
-        let (outcome, error) = match active.phase {
-            ActivePhase::Prepared => ("cancelled", None),
-            ActivePhase::Executing => (
-                "indeterminate",
-                Some(json!({
-                    "code": "tool_effect_outcome_unknown",
-                    "message": "取消发生时工具 effect 已进入执行边界，结果无法确定。",
-                })),
-            ),
-        };
-        let record = tool_record(
-            &active.request,
-            &active.prepared,
-            active.authority,
-            &active.started_at,
-            &completed_at,
-            outcome,
-            None,
-            error,
-        )?;
-        self.records.insert(&record)?;
-        self.lock_active()?.remove(call_id);
-        Ok(cancel_reply(call_id, attempt_id, outcome, Some(record)))
+        active.control.request_cancel(active.phase);
+        if !active.control.wait_complete(ATTEMPT_CLEANUP_TIMEOUT) {
+            return Err(LocalAgentKernelError::new(
+                "tool_cancel_cleanup_timeout",
+                "工具取消后物理资源未在限定时间内完成回收。",
+            ));
+        }
+        let record = self.records.read(call_id)?.ok_or_else(|| {
+            LocalAgentKernelError::new(
+                "tool_call_state_lost",
+                "工具执行 owner 完成清理后没有写入唯一终态记录。",
+            )
+        })?;
+        validate_record_replay(&record, &active.request)?;
+        let outcome = required_record_string(&record, "outcome")?.to_string();
+        Ok(cancel_reply(call_id, attempt_id, &outcome, Some(record)))
     }
 
     pub(crate) fn read_record(
@@ -439,9 +774,73 @@ impl LocalAgentKernel {
     }
 
     pub(crate) fn shutdown_plugins(&self) -> Result<(), LocalAgentKernelError> {
-        self.mcp
-            .shutdown()
-            .map_err(|error| LocalAgentKernelError::new(error.code, error.message))
+        self.cancel_and_drain_attempts(None)?;
+        let generations = {
+            let state = self.lock_generations()?;
+            let mut generations = Vec::new();
+            for generation in state.run_bindings.values() {
+                if !generations
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, generation))
+                {
+                    generations.push(Arc::clone(generation));
+                }
+            }
+            generations
+        };
+        if generations
+            .iter()
+            .any(|generation| generation.catalog.active_attempts() != 0)
+        {
+            return Err(LocalAgentKernelError::new(
+                "tool_runtime_busy",
+                "Kernel 仍有物理 attempt lease，不能释放 ToolProvider。",
+            ));
+        }
+        dispose_generations(generations)
+    }
+
+    fn cancel_and_drain_attempts(
+        &self,
+        target_run: Option<(&str, &str)>,
+    ) -> Result<(), LocalAgentKernelError> {
+        let matches_target = |call: &ActiveCall| {
+            target_run.map_or(true, |(session_id, run_id)| {
+                call.request.session_id == session_id && call.request.run_id == run_id
+            })
+        };
+        let attempts = {
+            let active = self.lock_active()?;
+            active
+                .values()
+                .filter(|call| matches_target(call))
+                .map(|call| (call.phase, call.control.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (phase, control) in &attempts {
+            control.request_cancel(*phase);
+        }
+        let deadline = Instant::now() + ATTEMPT_CLEANUP_TIMEOUT;
+        for (_, control) in attempts {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !control.wait_complete(remaining) {
+                return Err(LocalAgentKernelError::new(
+                    "tool_runtime_cleanup_timeout",
+                    "Kernel attempt 资源未在限定时间内完成回收。",
+                ));
+            }
+        }
+        if self
+            .lock_active()?
+            .values()
+            .any(|call| matches_target(call))
+        {
+            return Err(LocalAgentKernelError::new(
+                "tool_runtime_cleanup_incomplete",
+                "Kernel attempt 完成清理后仍保留 active call。",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_session_snapshot(
@@ -464,41 +863,30 @@ impl LocalAgentKernel {
         &self,
         request: &LocalToolExecutionRequest,
     ) -> Result<PreparedEffect, LocalAgentKernelError> {
-        if let Some(tool) = self.mcp.tool(&request.tool_name) {
-            return Ok(PreparedEffect {
-                scope: PreparedEffectScope::External,
-                workspace_id: None,
-                operation: request.tool_name.clone(),
-                logical_targets: vec![tool.target.clone()],
-                private_resolved_targets: Vec::new(),
-                canonical_invocation: json!({
-                    "toolName": request.tool_name,
-                    "arguments": request.input,
-                }),
-                canonical_arguments: request.input.clone(),
-                workspace_root: None,
-                delete_target_kind: None,
-                adapter: PreparedToolAdapter::Mcp(tool),
-            });
-        }
-        let descriptor = self
-            .registry
-            .descriptor(&request.tool_name)
-            .ok_or_else(|| {
-                LocalAgentKernelError::new("tool_not_found", "Kernel 工具目录中不存在该工具。")
-            })?;
-        if descriptor.availability == ToolAvailability::Blocked {
+        let generation = self.bound_generation(request)?;
+        let binding = generation
+            .catalog
+            .binding(&request.tool_binding_ref, &request.tool_name)
+            .map_err(catalog_error)?;
+        if binding.availability() == ToolAvailability::Blocked {
             return Err(LocalAgentKernelError::new(
                 "tool_blocked",
                 format!("Kernel 工具 {} 当前被阻止，不能执行。", request.tool_name),
             ));
         }
+        let scope = match binding.effect_scope() {
+            CatalogEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
+            CatalogEffectScope::WorkspaceMutation => PreparedEffectScope::WorkspaceMutation,
+            CatalogEffectScope::Process => PreparedEffectScope::Process,
+            CatalogEffectScope::Network => PreparedEffectScope::Network,
+            CatalogEffectScope::External => PreparedEffectScope::External,
+        };
         let mut tool_input = request.input.clone();
-        let workspace_id = match descriptor.effect_scope {
-            ToolEffectScope::WorkspaceRead
-            | ToolEffectScope::WorkspaceWrite
-            | ToolEffectScope::Process => Some(take_workspace_id(&mut tool_input)?),
-            ToolEffectScope::NetworkRead => {
+        let workspace_id = match scope {
+            PreparedEffectScope::WorkspaceRead
+            | PreparedEffectScope::WorkspaceMutation
+            | PreparedEffectScope::Process => Some(take_workspace_id(&mut tool_input)?),
+            PreparedEffectScope::Network | PreparedEffectScope::External => {
                 if tool_input.get("workspaceId").is_some() {
                     return Err(LocalAgentKernelError::new(
                         "tool_input_invalid",
@@ -520,16 +908,19 @@ impl LocalAgentKernel {
                 ));
             }
         }
-        let canonical = self
-            .registry
-            .canonicalize(&request.tool_name, tool_input)
-            .map_err(|error| LocalAgentKernelError::new("tool_input_invalid", error.to_string()))?;
-        let arguments = canonical.arguments;
-        let mut logical_targets = canonical_logical_targets(&request.tool_name, &arguments)?;
+        let arguments = binding.canonicalize(tool_input).map_err(catalog_error)?;
+        let mut logical_targets = if scope == PreparedEffectScope::External {
+            binding
+                .logical_target()
+                .map(|target| vec![target.to_string()])
+                .unwrap_or_default()
+        } else {
+            canonical_logical_targets(&request.tool_name, &arguments)?
+        };
         if let Some(target) = resolved_network_target(
             request.tool_name.as_str(),
             &arguments,
-            &self.executor_config,
+            &generation.executor_config,
         )
         .map_err(|error| LocalAgentKernelError::new("tool_target_invalid", error.to_string()))?
         {
@@ -553,12 +944,14 @@ impl LocalAgentKernel {
                     ));
                 }
                 let boundary = WorkspaceBoundary::new(canonical_root.clone());
-                let resolve_target = |target: &str| match descriptor.effect_scope {
-                    ToolEffectScope::WorkspaceRead | ToolEffectScope::Process => {
+                let resolve_target = |target: &str| match scope {
+                    PreparedEffectScope::WorkspaceRead | PreparedEffectScope::Process => {
                         boundary.resolve_read(target)
                     }
-                    ToolEffectScope::WorkspaceWrite => boundary.resolve_mutation(target),
-                    ToolEffectScope::NetworkRead => unreachable!("workspace target scope"),
+                    PreparedEffectScope::WorkspaceMutation => boundary.resolve_mutation(target),
+                    PreparedEffectScope::Network | PreparedEffectScope::External => {
+                        unreachable!("workspace target scope")
+                    }
                 };
                 let private = logical_targets
                     .iter()
@@ -591,13 +984,24 @@ impl LocalAgentKernel {
         } else {
             None
         };
+        let process_workspace_mode = if request.tool_name == "bash" {
+            match arguments.get("workspaceMode").and_then(Value::as_str) {
+                Some("read") => Some("read".to_string()),
+                Some("write") => Some("write".to_string()),
+                _ => {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_input_invalid",
+                        "bash 必须显式声明 workspaceMode=read 或 write。",
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         Ok(PreparedEffect {
-            scope: match descriptor.effect_scope {
-                ToolEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
-                ToolEffectScope::WorkspaceWrite => PreparedEffectScope::WorkspaceMutation,
-                ToolEffectScope::NetworkRead => PreparedEffectScope::Network,
-                ToolEffectScope::Process => PreparedEffectScope::Process,
-            },
+            generation,
+            binding,
+            scope,
             workspace_id,
             operation: request.tool_name.clone(),
             logical_targets,
@@ -609,7 +1013,7 @@ impl LocalAgentKernel {
             canonical_arguments: arguments,
             workspace_root,
             delete_target_kind,
-            adapter: PreparedToolAdapter::Builtin,
+            process_workspace_mode,
         })
     }
 
@@ -640,51 +1044,22 @@ impl LocalAgentKernel {
                 })))
             }
             PreparedEffectScope::Process => {
-                let workspace_id = prepared
-                    .workspace_id
-                    .as_deref()
-                    .expect("prepared process workspace");
-                Ok(Admission::Allowed(json!({
-                    "decision": "allow",
-                    "source": "workspaceBinding",
-                    "workspaceId": workspace_id,
-                })))
+                if prepared.process_workspace_mode.as_deref() == Some("read") {
+                    let workspace_id = prepared
+                        .workspace_id
+                        .as_deref()
+                        .expect("prepared process workspace");
+                    Ok(Admission::Allowed(json!({
+                        "decision": "allow",
+                        "source": "workspaceBinding",
+                        "workspaceId": workspace_id,
+                    })))
+                } else {
+                    self.admit_workspace_mutation(request, prepared)
+                }
             }
             PreparedEffectScope::WorkspaceMutation => {
-                if self.permissions.workspace_mutation == WorkspaceMutationMode::Allow {
-                    return Ok(Admission::Allowed(json!({
-                        "decision": "allow",
-                        "source": "userSetting",
-                        "authorityId": "user-setting:agent.permissions.workspaceMutation",
-                        "workspaceId": prepared.workspace_id,
-                    })));
-                }
-                for authority in &request.plan_authorities {
-                    if !authority_matches_identity(authority, request, prepared) {
-                        continue;
-                    }
-                    if !self
-                        .journal
-                        .plan_authority_is_committed(&request.session_id, authority)?
-                    {
-                        continue;
-                    }
-                    if authority_covers(authority, prepared) {
-                        return Ok(Admission::Allowed(json!({
-                            "decision": "allow",
-                            "source": "plan",
-                            "workspaceId": prepared.workspace_id,
-                            "authorityId": authority.get("authorityId"),
-                            "planId": authority.get("planId"),
-                            "revision": authority.get("revision"),
-                            "decisionId": authority.get("decisionId"),
-                        })));
-                    }
-                }
-                Ok(Admission::denied(
-                    "workspace_mutation_plan_required",
-                    "Workspace mutation 没有被当前 Session 中 active 的已确认 Plan revision 精确覆盖。",
-                ))
+                self.admit_workspace_mutation(request, prepared)
             }
             PreparedEffectScope::Network | PreparedEffectScope::External => {
                 if let Some(authority) = request.non_workspace_authority.as_ref() {
@@ -722,7 +1097,8 @@ impl LocalAgentKernel {
                         }),
                     });
                 }
-                match self
+                match prepared
+                    .generation
                     .permissions
                     .mode(prepared.scope)
                     .expect("non-workspace policy")
@@ -742,34 +1118,96 @@ impl LocalAgentKernel {
         }
     }
 
+    fn admit_workspace_mutation(
+        &self,
+        request: &LocalToolExecutionRequest,
+        prepared: &PreparedEffect,
+    ) -> Result<Admission, LocalAgentKernelError> {
+        if prepared.generation.permissions.workspace_mutation == WorkspaceMutationMode::Allow {
+            return Ok(Admission::Allowed(json!({
+                "decision": "allow",
+                "source": "userSetting",
+                "authorityId": "user-setting:agent.permissions.workspaceMutation",
+                "workspaceId": prepared.workspace_id,
+            })));
+        }
+        for authority in &request.plan_authorities {
+            if !authority_matches_identity(authority, request, prepared) {
+                continue;
+            }
+            if !self
+                .journal
+                .plan_authority_is_committed(&request.session_id, authority)?
+            {
+                continue;
+            }
+            if authority_covers(authority, prepared) {
+                return Ok(Admission::Allowed(json!({
+                    "decision": "allow",
+                    "source": "plan",
+                    "workspaceId": prepared.workspace_id,
+                    "authorityId": authority.get("authorityId"),
+                    "planId": authority.get("planId"),
+                    "revision": authority.get("revision"),
+                    "decisionId": authority.get("decisionId"),
+                })));
+            }
+        }
+        Ok(Admission::denied(
+            "workspace_mutation_plan_required",
+            "Workspace mutation 没有被当前 Session 中 active 的已确认 Plan revision 精确覆盖。",
+        ))
+    }
+
     fn execute_prepared(
         &self,
         prepared: &PreparedEffect,
         request: &LocalToolExecutionRequest,
-    ) -> Result<Value, String> {
+        cancellation: KernelCancellationToken,
+    ) -> Result<KernelToolExecutionResult, String> {
         let _private_targets = &prepared.private_resolved_targets;
-        match &prepared.adapter {
-            PreparedToolAdapter::Builtin => self
-                .executors
-                .invoke(
-                    &request.tool_name,
-                    KernelToolInvocation {
-                        id: request.attempt_id.clone(),
-                        tool_id: request.tool_name.clone(),
-                        input: prepared.canonical_arguments.clone(),
-                    },
-                    KernelToolExecutionContext {
-                        workspace_root: prepared.workspace_root.clone(),
-                        workspace_id: prepared.workspace_id.clone(),
-                        private_resolved_targets: prepared.private_resolved_targets.clone(),
-                    },
-                )
-                .map(|result| result.output)
-                .map_err(|error| error.to_string()),
-            PreparedToolAdapter::Mcp(tool) => tool
-                .call(prepared.canonical_arguments.clone())
-                .map_err(|error| format!("{}: {}", error.code, error.message)),
+        let lease = prepared.binding.begin_attempt();
+        let result = prepared
+            .binding
+            .invoke(
+                &request.attempt_id,
+                prepared.canonical_arguments.clone(),
+                KernelToolExecutionContext {
+                    workspace_root: prepared.workspace_root.clone(),
+                    workspace_id: prepared.workspace_id.clone(),
+                    private_resolved_targets: prepared.private_resolved_targets.clone(),
+                    cancellation,
+                },
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message));
+        drop(lease);
+        result
+    }
+
+    fn bound_generation(
+        &self,
+        request: &LocalToolExecutionRequest,
+    ) -> Result<Arc<KernelGeneration>, LocalAgentKernelError> {
+        let key = RunCatalogKey {
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+        };
+        let state = self.lock_generations()?;
+        let generation = state.run_bindings.get(&key).ok_or_else(|| {
+            LocalAgentKernelError::new(
+                "tool_catalog_run_binding_missing",
+                "当前 run 尚未 prepare immutable Kernel catalog。",
+            )
+        })?;
+        if generation.catalog.extension_generation_ref() != request.extension_generation_ref
+            || generation.catalog.snapshot_ref() != request.kernel_catalog_snapshot_ref
+        {
+            return Err(LocalAgentKernelError::new(
+                "tool_catalog_execution_identity_conflict",
+                "工具请求的 generation/catalog identity 与当前 run lease 不一致。",
+            ));
         }
+        Ok(Arc::clone(generation))
     }
 
     fn lock_active(
@@ -779,6 +1217,67 @@ impl LocalAgentKernel {
             LocalAgentKernelError::new("tool_runtime_lock_failed", "Kernel 工具运行状态锁已损坏。")
         })
     }
+
+    fn lock_generations(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, KernelGenerationState>, LocalAgentKernelError> {
+        self.generations.lock().map_err(|_| {
+            LocalAgentKernelError::new(
+                "tool_catalog_generation_lock_failed",
+                "Kernel catalog generation 状态锁已损坏。",
+            )
+        })
+    }
+}
+
+fn catalog_prepare_reply(
+    request: &PrepareToolCatalogRequest,
+    catalog: &ToolCatalogSnapshot,
+) -> Value {
+    json!({
+        "schemaVersion": KERNEL_REPLY_VERSION,
+        "type": "tool.catalog.prepared",
+        "sessionId": request.session_id,
+        "runId": request.run_id,
+        "extensionGenerationRef": catalog.extension_generation_ref(),
+        "kernelCatalogSnapshotRef": catalog.snapshot_ref(),
+        "tools": catalog.provider_view(),
+    })
+}
+
+fn catalog_release_reply(request: &ReleaseToolCatalogRequest, already_released: bool) -> Value {
+    json!({
+        "schemaVersion": KERNEL_REPLY_VERSION,
+        "type": "tool.catalog.released",
+        "sessionId": request.session_id,
+        "runId": request.run_id,
+        "kernelCatalogSnapshotRef": request.kernel_catalog_snapshot_ref,
+        "released": true,
+        "alreadyReleased": already_released,
+    })
+}
+
+fn dispose_generations(
+    generations: Vec<Arc<KernelGeneration>>,
+) -> Result<(), LocalAgentKernelError> {
+    let mut errors = Vec::new();
+    for generation in generations {
+        if let Err(error) = generation.catalog.dispose() {
+            errors.push(format!("{}: {}", error.code, error.message));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LocalAgentKernelError::new(
+            "tool_provider_dispose_failed",
+            errors.join("；"),
+        ))
+    }
+}
+
+fn catalog_error(error: ToolCatalogError) -> LocalAgentKernelError {
+    LocalAgentKernelError::new(error.code, error.message)
 }
 
 enum Admission {
@@ -802,6 +1301,8 @@ impl Admission {
 
 #[derive(Clone)]
 struct PreparedEffect {
+    generation: Arc<KernelGeneration>,
+    binding: PreparedCatalogBinding,
     scope: PreparedEffectScope,
     workspace_id: Option<String>,
     operation: String,
@@ -811,7 +1312,7 @@ struct PreparedEffect {
     canonical_arguments: Value,
     workspace_root: Option<String>,
     delete_target_kind: Option<String>,
-    adapter: PreparedToolAdapter,
+    process_workspace_mode: Option<String>,
 }
 
 impl PreparedEffect {
@@ -821,6 +1322,12 @@ impl PreparedEffect {
             "attemptId": request.attempt_id,
             "sessionId": request.session_id,
             "runId": request.run_id,
+            "extensionGenerationRef": self.binding.extension_generation_ref(),
+            "kernelCatalogSnapshotRef": self.binding.snapshot_ref(),
+            "toolBindingRef": self.binding.binding_ref(),
+            "contributionRef": self.binding.contribution_ref(),
+            "providerRef": self.binding.provider_ref(),
+            "origin": self.binding.origin(),
             "toolName": request.tool_name,
             "operation": self.operation,
             "logicalTargets": self.logical_targets,
@@ -829,22 +1336,28 @@ impl PreparedEffect {
         if let Some(workspace_id) = self.workspace_id.as_deref() {
             projection["workspaceId"] = json!(workspace_id);
         }
+        if let Some(plugin_instance_ref) = self.binding.plugin_instance_ref() {
+            projection["pluginInstanceRef"] = json!(plugin_instance_ref);
+        }
+        if let Some(workspace_mode) = self.process_workspace_mode.as_deref() {
+            projection["processWorkspaceMode"] = json!(workspace_mode);
+        }
         projection
     }
 
     fn preview(&self, tool_name: &str) -> Value {
         json!({
             "summary": effect_summary(tool_name, &self.logical_targets),
-            "effects": effect_names(self.scope),
+            "effects": if self.scope == PreparedEffectScope::Process
+                && self.process_workspace_mode.as_deref() == Some("write")
+            {
+                vec!["process", "workspaceMutation"]
+            } else {
+                effect_names(self.scope)
+            },
             "logicalTargets": self.logical_targets,
         })
     }
-}
-
-#[derive(Clone)]
-enum PreparedToolAdapter {
-    Builtin,
-    Mcp(McpTool),
 }
 
 #[derive(Clone)]
@@ -1007,6 +1520,15 @@ fn validate_request(request: &LocalToolExecutionRequest) -> Result<(), LocalAgen
         ("requestId", request.request_id.as_str()),
         ("sessionId", request.session_id.as_str()),
         ("runId", request.run_id.as_str()),
+        (
+            "extensionGenerationRef",
+            request.extension_generation_ref.as_str(),
+        ),
+        (
+            "kernelCatalogSnapshotRef",
+            request.kernel_catalog_snapshot_ref.as_str(),
+        ),
+        ("toolBindingRef", request.tool_binding_ref.as_str()),
         ("callId", request.call_id.as_str()),
         ("attemptId", request.attempt_id.as_str()),
         ("toolName", request.tool_name.as_str()),
@@ -1061,20 +1583,11 @@ fn canonical_logical_targets(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<Vec<String>, LocalAgentKernelError> {
+    if tool_name == "bash" {
+        return Ok(vec![".".to_string()]);
+    }
     let field = match tool_name {
-        "fs.read"
-        | "fs.stat"
-        | "fs.list"
-        | "fs.glob"
-        | "fs.diff"
-        | "code.grep"
-        | "fs.create"
-        | "fs.write"
-        | "fs.edit"
-        | "fs.delete"
-        | "fs.ensure_directory"
-        | "document.read" => Some("path"),
-        "process.shell" => Some("cwd"),
+        "fs.read" | "fs.write" | "fs.edit" | "fs.delete" => Some("path"),
         "web.fetch" => Some("url"),
         "web.search" => None,
         _ => None,
@@ -1085,11 +1598,7 @@ fn canonical_logical_targets(
         .unwrap_or_default();
     targets.sort();
     targets.dedup();
-    if matches!(
-        tool_name,
-        "fs.create" | "fs.write" | "fs.edit" | "fs.delete" | "fs.ensure_directory"
-    ) && targets.len() != 1
-    {
+    if matches!(tool_name, "fs.write" | "fs.edit" | "fs.delete") && targets.len() != 1 {
         return Err(LocalAgentKernelError::new(
             "prepared_effect_target_invalid",
             "闭合 workspace mutation 必须解析为一个精确逻辑 target。",
@@ -1112,6 +1621,7 @@ fn authority_matches_identity(
         "revision",
         "decisionId",
         "sessionId",
+        "runId",
         "workspaceId",
         "coveredOperations",
     ];
@@ -1119,6 +1629,7 @@ fn authority_matches_identity(
         return false;
     }
     object.get("sessionId").and_then(Value::as_str) == Some(&request.session_id)
+        && object.get("runId").and_then(Value::as_str) == Some(&request.run_id)
         && object.get("workspaceId").and_then(Value::as_str) == prepared.workspace_id.as_deref()
         && object.get("authorityId").and_then(Value::as_str).is_some()
         && object.get("planId").and_then(Value::as_str).is_some()
@@ -1134,6 +1645,29 @@ fn authority_matches_identity(
 }
 
 fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
+    if prepared.operation == "bash" {
+        let arguments = prepared
+            .canonical_arguments
+            .as_object()
+            .expect("canonical process arguments");
+        return authority
+            .get("coveredOperations")
+            .and_then(Value::as_array)
+            .is_some_and(|operations| {
+                operations.iter().any(|operation| {
+                    let Some(object) = operation.as_object() else {
+                        return false;
+                    };
+                    object.len() == 4
+                        && object.get("workspaceId").and_then(Value::as_str)
+                            == prepared.workspace_id.as_deref()
+                        && object.get("operation").and_then(Value::as_str) == Some("bash")
+                        && object.get("command").and_then(Value::as_str)
+                            == arguments.get("command").and_then(Value::as_str)
+                        && object.get("workspaceMode").and_then(Value::as_str) == Some("write")
+                })
+            });
+    }
     if prepared.logical_targets.len() != 1 {
         return false;
     }
@@ -1213,18 +1747,6 @@ fn permission_setting_id(scope: PreparedEffectScope) -> &'static str {
     }
 }
 
-fn possible_effects(class: ToolEffectClass, scope: ToolEffectScope) -> Vec<&'static str> {
-    match (class, scope) {
-        (_, ToolEffectScope::NetworkRead) => vec!["network"],
-        (_, ToolEffectScope::Process) => vec!["process"],
-        (ToolEffectClass::Read, ToolEffectScope::WorkspaceRead) => vec!["workspaceRead"],
-        (ToolEffectClass::Mutation, ToolEffectScope::WorkspaceWrite) => {
-            vec!["workspaceMutation"]
-        }
-        _ => Vec::new(),
-    }
-}
-
 fn effect_names(scope: PreparedEffectScope) -> Vec<&'static str> {
     match scope {
         PreparedEffectScope::WorkspaceRead => vec!["workspaceRead"],
@@ -1243,43 +1765,55 @@ fn effect_summary(tool_name: &str, targets: &[String]) -> String {
     }
 }
 
-fn schema_requiring_workspace_id(mut schema: Value) -> Value {
-    fn inject(value: &mut Value) {
-        let Some(object) = value.as_object_mut() else {
-            return;
-        };
-        if let Some(one_of) = object.get_mut("oneOf").and_then(Value::as_array_mut) {
-            for branch in one_of {
-                inject(branch);
+fn tool_record_from_execution_result(
+    request: &LocalToolExecutionRequest,
+    prepared: &PreparedEffect,
+    authority: Value,
+    started_at: &str,
+    completed_at: &str,
+    result: KernelToolExecutionResult,
+) -> Result<Value, LocalAgentKernelError> {
+    match result.outcome {
+        KernelToolExecutionOutcome::Completed => {
+            if result.error.is_some() {
+                return Err(LocalAgentKernelError::new(
+                    "tool_execution_result_invalid",
+                    "Kernel completed result 不能携带 failure。",
+                ));
             }
-            return;
+            tool_record(
+                request,
+                prepared,
+                authority,
+                started_at,
+                completed_at,
+                "completed",
+                Some(result.output),
+                None,
+            )
         }
-        if object.get("type").and_then(Value::as_str) != Some("object") {
-            return;
-        }
-        object
-            .entry("properties")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.insert(
-                "workspaceId".to_string(),
-                json!({ "type": "string", "minLength": 1, "maxLength": 128 }),
-            );
-        }
-        let required = object
-            .entry("required")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(required) = required.as_array_mut() {
-            if !required
-                .iter()
-                .any(|item| item.as_str() == Some("workspaceId"))
-            {
-                required.push(json!("workspaceId"));
-            }
+        KernelToolExecutionOutcome::Failed => {
+            let error = result.error.ok_or_else(|| {
+                LocalAgentKernelError::new(
+                    "tool_execution_result_invalid",
+                    "Kernel failed result 缺少 failure。",
+                )
+            })?;
+            tool_record(
+                request,
+                prepared,
+                authority,
+                started_at,
+                completed_at,
+                "failed",
+                Some(result.output),
+                Some(json!({
+                    "code": error.code,
+                    "message": error.message,
+                })),
+            )
         }
     }
-    inject(&mut schema);
-    schema
 }
 
 fn tool_record(
@@ -1296,6 +1830,9 @@ fn tool_record(
         "recordId": random_id("record")?,
         "sessionId": request.session_id,
         "runId": request.run_id,
+        "extensionGenerationRef": request.extension_generation_ref,
+        "kernelCatalogSnapshotRef": request.kernel_catalog_snapshot_ref,
+        "toolBindingRef": request.tool_binding_ref,
         "callId": request.call_id,
         "attemptId": request.attempt_id,
         "toolName": request.tool_name,
@@ -1348,6 +1885,15 @@ fn validate_record_replay(
     let exact = [
         ("sessionId", request.session_id.as_str()),
         ("runId", request.run_id.as_str()),
+        (
+            "extensionGenerationRef",
+            request.extension_generation_ref.as_str(),
+        ),
+        (
+            "kernelCatalogSnapshotRef",
+            request.kernel_catalog_snapshot_ref.as_str(),
+        ),
+        ("toolBindingRef", request.tool_binding_ref.as_str()),
         ("callId", request.call_id.as_str()),
         ("attemptId", request.attempt_id.as_str()),
         ("toolName", request.tool_name.as_str()),
@@ -1434,113 +1980,29 @@ fn sqlite_is_empty(connection: &Connection) -> Result<bool, LocalAgentKernelErro
 }
 
 #[cfg(test)]
-mod tests {
+mod attempt_control_tests {
     use super::*;
 
     #[test]
-    fn noncurrent_tool_record_store_is_rejected() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-tool-record-outdated-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let outdated_schema =
-            TOOL_RECORD_SCHEMA.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;");
-        Connection::open(&path)
-            .expect("open outdated tool store")
-            .execute_batch(&outdated_schema)
-            .expect("create outdated tool store");
+    fn first_cancel_phase_is_frozen_for_the_execution_owner() {
+        let control = AttemptControl::default();
+        control.request_cancel(ActivePhase::Prepared);
+        control.request_cancel(ActivePhase::Executing);
 
-        let error = match LocalToolRecordStore::open(&path) {
-            Ok(_) => panic!("noncurrent store must be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, "tool_record_store_version_unsupported");
-        assert!(error.message.contains("schema 2"));
-
-        let _ = std::fs::remove_file(path);
+        assert!(control.is_cancelled());
+        assert_eq!(control.claim_outcome(), Some(ActivePhase::Prepared));
+        control.finish();
+        assert!(control.wait_complete(Duration::ZERO));
     }
 
     #[test]
-    fn workspace_tool_schema_requires_explicit_workspace_id() {
-        let kernel = KernelToolRegistry::new();
-        let schema = schema_requiring_workspace_id(
-            kernel.descriptor("fs.write").unwrap().input_schema.clone(),
-        );
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "workspaceId"));
-        assert!(schema["properties"].get("workspaceId").is_some());
-    }
+    fn cancellation_after_outcome_claim_does_not_rewrite_the_result() {
+        let control = AttemptControl::default();
+        assert_eq!(control.claim_outcome(), None);
+        control.request_cancel(ActivePhase::Executing);
 
-    #[test]
-    fn plan_coverage_is_exact_in_workspace_operation_target_and_delete_kind() {
-        let request = LocalToolExecutionRequest {
-            schema_version: KERNEL_REQUEST_VERSION.to_string(),
-            request_type: "tool.execute".to_string(),
-            request_id: "request:test".to_string(),
-            session_id: "session:test".to_string(),
-            run_id: "run:test".to_string(),
-            call_id: "call:test".to_string(),
-            attempt_id: "attempt:test".to_string(),
-            tool_name: "fs.delete".to_string(),
-            input: json!({ "workspaceId": "workspace:test", "path": "src/a.rs" }),
-            workspace_bindings: vec!["workspace:test".to_string()],
-            plan_authorities: Vec::new(),
-            non_workspace_authority: None,
-        };
-        let prepared = PreparedEffect {
-            scope: PreparedEffectScope::WorkspaceMutation,
-            workspace_id: Some("workspace:test".to_string()),
-            operation: "fs.delete".to_string(),
-            logical_targets: vec!["src/a.rs".to_string()],
-            private_resolved_targets: Vec::new(),
-            canonical_invocation: json!({}),
-            canonical_arguments: json!({}),
-            workspace_root: None,
-            delete_target_kind: Some("file".to_string()),
-            adapter: PreparedToolAdapter::Builtin,
-        };
-        let authority = json!({
-            "authorityId": "authority:test",
-            "planId": "plan:test",
-            "revision": 1,
-            "decisionId": "decision:test",
-            "sessionId": "session:test",
-            "workspaceId": "workspace:test",
-            "coveredOperations": [{
-                "workspaceId": "workspace:test",
-                "operation": "fs.delete",
-                "target": "src/a.rs",
-                "targetKind": "file"
-            }]
-        });
-        assert!(authority_matches_identity(&authority, &request, &prepared));
-        assert!(authority_covers(&authority, &prepared));
-        let mut wrong = authority.clone();
-        wrong["coveredOperations"][0]["targetKind"] = json!("directoryTree");
-        assert!(!authority_covers(&wrong, &prepared));
-    }
-
-    #[test]
-    fn workspace_mutation_setting_defaults_to_plan_and_can_explicitly_allow() {
-        let default_policy = LocalAgentPermissionPolicy::from_settings(&json!({}))
-            .expect("default permission policy");
-        assert_eq!(
-            default_policy.workspace_mutation,
-            WorkspaceMutationMode::Plan
-        );
-        assert_eq!(default_policy.network, PermissionMode::Allow);
-        assert_eq!(default_policy.external, PermissionMode::Ask);
-
-        let autonomous_policy = LocalAgentPermissionPolicy::from_settings(&json!({
-            "agent.permissions.workspaceMutation": "allow"
-        }))
-        .expect("workspace autonomy policy");
-        assert_eq!(
-            autonomous_policy.workspace_mutation,
-            WorkspaceMutationMode::Allow
-        );
+        assert!(!control.is_cancelled());
+        control.finish();
+        assert!(control.wait_complete(Duration::ZERO));
     }
 }

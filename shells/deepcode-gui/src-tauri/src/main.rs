@@ -9,7 +9,6 @@ use deepcode_kernel_abi::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -58,7 +57,6 @@ struct HostStartupLease<'a> {
 
 const HOST_STARTUP_STATUS_SCHEMA: &str = "deepcode.host-shell.startup-status";
 const HOST_STARTUP_LOG_LIMIT_BYTES: u64 = 1024 * 1024;
-const MESSAGE_ATTACHMENT_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,14 +80,6 @@ struct HostStartupStatusV1 {
 
 struct HostStartupStatusStore {
     status: Mutex<HostStartupStatusV1>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageAttachmentFileSnapshot {
-    name: String,
-    media_type: &'static str,
-    content: String,
 }
 
 impl HostStartupStatusStore {
@@ -314,13 +304,13 @@ impl Drop for HostStartupLease<'_> {
 
 impl OwnedHostChildren {
     fn shutdown(&mut self) {
+        terminate_owned_process_tree(&mut self.proxy);
         let requested = request_daemon_shutdown(
             &self.daemon_host,
             &self.daemon_port,
             &self.daemon_token,
             &self.daemon_identity,
         );
-        terminate_owned_process_tree(&mut self.proxy);
         if !requested || !wait_for_child_exit(&mut self.daemon, 80) {
             terminate_owned_process_tree(&mut self.daemon);
         }
@@ -341,7 +331,6 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
             deepcode_default_workspace_path,
-            deepcode_read_message_attachment_file,
             deepcode_host_startup_status,
             deepcode_start_kernel_after_permission,
             deepcode_window_minimize,
@@ -533,54 +522,6 @@ fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
 #[tauri::command]
 fn deepcode_default_workspace_path() -> Option<String> {
     default_workspace_path().map(|path| path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn deepcode_read_message_attachment_file(
-    path: String,
-) -> Result<MessageAttachmentFileSnapshot, String> {
-    let requested = PathBuf::from(path);
-    if !requested.is_absolute() {
-        return Err("message_attachment_path_must_be_absolute".to_string());
-    }
-    let canonical = requested
-        .canonicalize()
-        .map_err(|error| format!("message_attachment_path_unavailable:{error}"))?;
-    let metadata = canonical
-        .metadata()
-        .map_err(|error| format!("message_attachment_metadata_unavailable:{error}"))?;
-    if !metadata.is_file() {
-        return Err("message_attachment_path_not_file".to_string());
-    }
-    if metadata.len() > MESSAGE_ATTACHMENT_MAX_BYTES {
-        return Err("message_attachment_too_large".to_string());
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(&canonical)
-        .and_then(|file| {
-            file.take(MESSAGE_ATTACHMENT_MAX_BYTES + 1)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(|error| format!("message_attachment_read_failed:{error}"))?;
-    if bytes.len() as u64 > MESSAGE_ATTACHMENT_MAX_BYTES {
-        return Err("message_attachment_too_large".to_string());
-    }
-    if bytes.contains(&0) {
-        return Err("message_attachment_not_text".to_string());
-    }
-    let content =
-        String::from_utf8(bytes).map_err(|_| "message_attachment_not_utf8".to_string())?;
-    let name = canonical
-        .file_name()
-        .and_then(OsStr::to_str)
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| "message_attachment_name_unavailable".to_string())?
-        .to_string();
-    Ok(MessageAttachmentFileSnapshot {
-        name,
-        media_type: message_attachment_media_type(&canonical),
-        content,
-    })
 }
 
 #[tauri::command]
@@ -833,28 +774,6 @@ fn content_type_for_path(path: &Path) -> &'static str {
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         _ => "application/octet-stream",
-    }
-}
-
-fn message_attachment_media_type(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" | "mdx" => "text/markdown",
-        "json" => "application/json",
-        "toml" => "application/toml",
-        "yaml" | "yml" => "application/yaml",
-        "csv" => "text/csv",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" | "mjs" | "cjs" => "text/javascript",
-        "ts" | "tsx" => "text/typescript",
-        "xml" | "svg" => "application/xml",
-        _ => "text/plain",
     }
 }
 
@@ -1780,27 +1699,37 @@ fn wait_for_child_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool 
     false
 }
 
-fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
-    if process.child.try_wait().ok().flatten().is_some() {
-        process.join_capture_threads();
-        return;
+#[cfg(unix)]
+fn owned_process_group_exists(process_group_id: libc::pid_t) -> bool {
+    if unsafe { libc::kill(-process_group_id, 0) } == 0 {
+        return true;
     }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn wait_for_owned_process_group_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        let _ = process.child.try_wait();
+        if !owned_process_group_exists(process.process_group_id) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    !owned_process_group_exists(process.process_group_id)
+}
+
+fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
     #[cfg(unix)]
     {
-        let pid = process.child.id() as libc::pid_t;
-        if unsafe { libc::getpgid(pid) } == process.process_group_id {
-            unsafe {
-                libc::kill(-process.process_group_id, libc::SIGTERM);
-            }
+        unsafe {
+            libc::kill(-process.process_group_id, libc::SIGTERM);
         }
-        if !wait_for_child_exit(process, 20) {
-            if unsafe { libc::getpgid(pid) } == process.process_group_id {
-                unsafe {
-                    libc::kill(-process.process_group_id, libc::SIGKILL);
-                }
-            } else {
-                let _ = process.child.kill();
+        if !wait_for_owned_process_group_exit(process, 20) {
+            unsafe {
+                libc::kill(-process.process_group_id, libc::SIGKILL);
             }
+            let _ = wait_for_owned_process_group_exit(process, 20);
         }
     }
     #[cfg(windows)]
@@ -2176,15 +2105,4 @@ mod tests {
         startup_thread.join().expect("startup thread exits");
     }
 
-    #[test]
-    fn message_attachment_media_type_is_derived_from_selected_file() {
-        assert_eq!(
-            message_attachment_media_type(Path::new("notes.md")),
-            "text/markdown"
-        );
-        assert_eq!(
-            message_attachment_media_type(Path::new("source.cpp")),
-            "text/plain"
-        );
-    }
 }

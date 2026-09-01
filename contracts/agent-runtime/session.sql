@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = FULL;
-PRAGMA user_version = 3;
+PRAGMA user_version = 7;
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY NOT NULL CHECK(length(session_id) > 0),
@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS session_events (
         'session.directory-index.detached',
         'input.accepted',
         'run.started',
-        'run.profile.selected',
         'message.committed',
         'message.feedback.updated',
         'narrative.committed',
@@ -53,8 +52,12 @@ CREATE TABLE IF NOT EXISTS session_events (
         'context.compaction.requested',
         'context.compacted',
         'context.composed',
+        'provider.turn.settled',
         'context.updated',
         'run.waiting',
+        'run.finishing',
+        'run.runtime.released',
+        'run.runtime.release_failed',
         'run.settled'
     )),
     run_id TEXT,
@@ -77,6 +80,14 @@ CREATE TABLE IF NOT EXISTS session_commands (
 CREATE UNIQUE INDEX IF NOT EXISTS one_run_settlement
     ON session_events(session_id, run_id)
     WHERE event_type = 'run.settled';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_run_finishing
+    ON session_events(session_id, run_id)
+    WHERE event_type = 'run.finishing';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_run_runtime_release
+    ON session_events(session_id, run_id)
+    WHERE event_type = 'run.runtime.released';
 
 CREATE INDEX IF NOT EXISTS session_events_run_idx
     ON session_events(session_id, run_id, sequence);

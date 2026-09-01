@@ -6,18 +6,21 @@ import type {
   InteractionProjection,
   NewSessionEvent,
   PlanAuthority,
+  RunSettlement,
   SessionEvent,
   SessionProjection,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
-import { COMMAND_REPLY_VERSION, SESSION_EVENT_VERSION } from '@deepcode/protocol';
+import {
+  COMMAND_REPLY_VERSION,
+  SESSION_EVENT_VERSION,
+} from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
 import {
   loopSnapshot,
   runAgentLoop,
   type LoopCommand,
   type LoopSnapshot,
-  type ProviderRunTransientState,
 } from './loop.js';
 import { projectSession, reduceSession } from './reducer.js';
 
@@ -32,9 +35,7 @@ interface ActiveRun {
   task: Promise<void>;
 }
 
-const MAX_ATTACHMENT_COUNT = 8;
-const MAX_ATTACHMENT_BYTES = 512 * 1024;
-const MAX_DIRECTORY_ATTACHMENT_COUNT = 8;
+const MAX_FILESYSTEM_REFERENCE_COUNT = 8;
 
 export class SessionActor {
   readonly #journal: CommandJournalPort;
@@ -44,9 +45,9 @@ export class SessionActor {
   #mailbox = Promise.resolve();
   #active?: ActiveRun;
   #disposed = false;
+  #loopFailure?: Error;
   #projectionState?: LoopSnapshot['state'];
   #assistantDraft: AssistantDraftProjection | null = null;
-  #providerRunState?: ProviderRunTransientState;
 
   constructor(
     readonly sessionId: string,
@@ -63,25 +64,53 @@ export class SessionActor {
   async recover(): Promise<void> {
     await this.enqueue(async () => {
       const snapshot = await this.loadSnapshot();
-      if (snapshot.state.run?.status === 'running') {
-        this.startLoop({ type: 'resume', runId: snapshot.state.run.runId });
+      const run = snapshot.state.run;
+      if (!run) return;
+      if (isTerminal(run.status)) return;
+      if (run.status === 'releasing' || run.status === 'releaseFailed') {
+        const settlement = snapshot.state.pendingRunSettlements[run.runId];
+        if (!settlement) throw new Error('run_finishing_settlement_missing');
+        await this.finalizeRunRuntime(snapshot, run.runId, settlement);
+        return;
+      }
+      const restored = await this.restoreRunRuntime(snapshot, run.runId);
+      if (restored && run.status === 'running') {
+        this.startLoop({ type: 'recover', runId: run.runId });
       }
     });
   }
 
   async submit(command: ConversationCommand): Promise<CommandReply> {
-    return await this.enqueue(async () => this.handleCommand(command));
+    return await this.enqueue(async () => {
+      this.assertOperational();
+      return await this.handleCommand(command);
+    });
   }
 
   async snapshot(): Promise<SessionProjection> {
+    this.assertOperational();
     return projectSession((await this.loadSnapshot()).state, this.#assistantDraft);
+  }
+
+  hasLoopFailure(): boolean {
+    return this.#loopFailure !== undefined;
   }
 
   async dispose(): Promise<void> {
     this.#disposed = true;
     this.#active?.controller.abort('session_service_stopped');
-    await this.#active?.task;
-    await this.#composition.dispose();
+    const errors: unknown[] = [];
+    try {
+      await this.#active?.task;
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await this.#composition.dispose();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length > 0) throw new AggregateError(errors, 'session_actor_dispose_failed');
   }
 
   private async handleCommand(command: ConversationCommand): Promise<CommandReply> {
@@ -111,10 +140,10 @@ export class SessionActor {
         return await this.handleDirectoryIndexDetach(command);
       case 'message.submit':
         return await this.handleMessage(command);
+      case 'context.focus':
+        return await this.handleFocus(command);
       case 'message.feedback.set':
         return await this.handleMessageFeedback(command);
-      case 'run.profile.select':
-        return await this.handleProfileSelection(command);
       case 'run.cancel':
         return await this.handleCancel(command);
       case 'interaction.respond':
@@ -218,31 +247,39 @@ export class SessionActor {
   private async handleMessage(
     command: Extract<ConversationCommand, { type: 'message.submit' }>,
   ): Promise<CommandReply> {
-    if (!command.text.trim()) {
+    return await this.handleRunInput(command, command.text, null);
+  }
+
+  private async handleFocus(
+    command: Extract<ConversationCommand, { type: 'context.focus' }>,
+  ): Promise<CommandReply> {
+    return await this.handleRunInput(command, command.task, command.task);
+  }
+
+  private async handleRunInput(
+    command: Extract<ConversationCommand, { type: 'message.submit' | 'context.focus' }>,
+    submittedText: string,
+    focusTask: string | null,
+  ): Promise<CommandReply> {
+    if (!submittedText.trim()) {
+      if (command.type === 'context.focus') {
+        return await this.recordRejection(
+          command,
+          'context_focus_task_empty',
+          '/focus 后必须提供新的任务正文。',
+        );
+      }
       return await this.recordRejection(command, 'message_empty', '用户消息不能为空。');
     }
-    const focusTask = explicitFocusTask(command.text);
-    if (focusTask === '') {
-      return await this.recordRejection(
-        command,
-        'context_focus_task_empty',
-        '/focus 后必须提供新的任务正文。',
-      );
-    }
-    const submittedText = focusTask ?? command.text;
     if (command.profileId !== undefined && !validProfileId(command.profileId)) {
       return await this.recordRejection(command, 'llm_profile_invalid', '模型 Profile 标识无效。');
     }
-    const attachmentError = validateAttachments(command.attachments);
-    if (attachmentError) {
-      return await this.recordRejection(command, 'message_attachment_invalid', attachmentError);
-    }
-    const directoryAttachmentError = validateDirectoryAttachments(command.directoryAttachments);
-    if (directoryAttachmentError) {
+    const filesystemReferenceError = validateFilesystemReferences(command.filesystemReferences);
+    if (filesystemReferenceError) {
       return await this.recordRejection(
         command,
-        'message_directory_attachment_invalid',
-        directoryAttachmentError,
+        'message_filesystem_reference_invalid',
+        filesystemReferenceError,
       );
     }
     const before = await this.loadSnapshot();
@@ -273,13 +310,35 @@ export class SessionActor {
     const profileId = command.profileId ?? this.#profileId;
     const runWorkspaceBindings = mergeWorkspaceBindings(
       before.state.workspaceBindings,
-      command.directoryAttachments ?? [],
+      (command.filesystemReferences ?? []).map((reference) => ({
+        workspaceId: reference.workspaceId,
+        displayName: reference.displayName,
+      })),
     );
+    const prepared = await this.#composition.runPreparation.prepare({
+      sessionId: this.sessionId,
+      runId,
+      ...(profileId ? { profileId } : {}),
+      ...(command.pluginCatalogRevision
+        ? { pluginCatalogRevision: command.pluginCatalogRevision }
+        : {}),
+      ...(command.pluginSelections?.length
+        ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
+        : {}),
+    });
+    const runtimeSnapshot = prepared.runtimeSnapshot;
     const events: NewSessionEvent[] = [
       {
         type: 'input.accepted',
         sessionId: this.sessionId,
-        payload: { commandId: command.commandId, messageId, text: submittedText },
+        payload: {
+          commandId: command.commandId,
+          messageId,
+          text: submittedText,
+          ...(command.pluginSelections?.length
+            ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
+            : {}),
+        },
       },
       {
         type: 'message.committed',
@@ -288,15 +347,15 @@ export class SessionActor {
           messageId,
           role: 'user',
           content: submittedText,
-          ...(command.attachments?.length
-            ? { attachments: command.attachments.map((attachment) => ({ ...attachment })) }
-            : {}),
-          ...(command.directoryAttachments?.length
+          ...(command.filesystemReferences?.length
             ? {
-                directoryAttachments: command.directoryAttachments.map((attachment) => ({
-                  ...attachment,
+                filesystemReferences: command.filesystemReferences.map((reference) => ({
+                  ...reference,
                 })),
               }
+            : {}),
+          ...(command.pluginSelections?.length
+            ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
             : {}),
         },
       },
@@ -307,7 +366,7 @@ export class SessionActor {
         payload: {
           inputMessageId: messageId,
           workspaceBindings: runWorkspaceBindings,
-          ...(profileId ? { profileId } : {}),
+          runtimeSnapshot,
         },
       },
     ];
@@ -326,11 +385,25 @@ export class SessionActor {
         },
       });
     }
-    const reply = await this.#journal.commitCommand(
-      command,
-      events,
-      acceptedReply(command),
-    );
+    let reply: CommandReply;
+    try {
+      reply = await this.#journal.commitCommand(
+        command,
+        events,
+        acceptedReply(command),
+      );
+    } catch (error) {
+      try {
+        await this.#composition.runPreparation.release({
+          sessionId: this.sessionId,
+          runId,
+          kernelCatalogSnapshotRef: runtimeSnapshot.kernelCatalogSnapshotRef,
+        });
+      } catch (releaseError) {
+        throw new AggregateError([error, releaseError], 'run_admission_release_failed');
+      }
+      throw error;
+    }
     this.startLoop({ type: 'start', runId });
     return reply;
   }
@@ -598,37 +671,6 @@ export class SessionActor {
     return reply;
   }
 
-  private async handleProfileSelection(
-    command: Extract<ConversationCommand, { type: 'run.profile.select' }>,
-  ): Promise<CommandReply> {
-    if (!validProfileId(command.profileId)) {
-      return await this.recordRejection(command, 'llm_profile_invalid', '模型 Profile 标识无效。');
-    }
-    const snapshot = await this.loadSnapshot();
-    if (
-      !snapshot.state.run
-      || snapshot.state.run.runId !== command.runId
-      || isTerminal(snapshot.state.run.status)
-    ) {
-      return await this.recordRejection(
-        command,
-        'run_not_current',
-        '模型切换目标不是当前活动运行。',
-      );
-    }
-    const reply = await this.#journal.commitCommand(
-      command,
-      [{
-        type: 'run.profile.selected',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        payload: { commandId: command.commandId, profileId: command.profileId },
-      }],
-      acceptedReply(command),
-    );
-    return reply;
-  }
-
   private async handleCancel(
     command: Extract<ConversationCommand, { type: 'run.cancel' }>,
   ): Promise<CommandReply> {
@@ -681,15 +723,13 @@ export class SessionActor {
   private startLoop(command: LoopCommand): void {
     if (this.#active) throw new Error('session_run_already_active');
     this.#assistantDraft = null;
-    if (command.type === 'start') {
-      this.#providerRunState = providerRunState(command.runId);
-    } else if (this.#providerRunState?.runId !== command.runId) {
-      this.#providerRunState = providerRunState(command.runId);
-    }
     const controller = new AbortController();
     const active: ActiveRun = { runId: command.runId, controller, task: Promise.resolve() };
     active.task = this.runLoop(command, controller.signal)
       .then(() => undefined)
+      .catch(async (error: unknown) => {
+        this.#loopFailure = await this.containLoopFailure(command.runId, error);
+      })
       .finally(() => {
         if (this.#active === active) this.#active = undefined;
       });
@@ -701,15 +741,11 @@ export class SessionActor {
     signal = new AbortController().signal,
   ): Promise<void> {
     const snapshot = await this.loadSnapshot();
-    const providerRunState = this.#providerRunState ?? providerRunStateForRecovery(command.runId);
-    this.#providerRunState = providerRunState;
     const result = await runAgentLoop(
       snapshot,
       command,
       {
         composition: this.#composition,
-        providerRunState,
-        ...(this.#profileId ? { defaultProfileId: this.#profileId } : {}),
         commit: async (events) => {
           const batch = Array.isArray(events) ? events : [events];
           const previousDraft = this.#assistantDraft;
@@ -749,9 +785,172 @@ export class SessionActor {
       },
       signal,
     );
-    if (result.status === 'settled' && this.#providerRunState === providerRunState) {
-      this.#providerRunState = undefined;
+    if (result.status === 'finishing') {
+      const current = await this.loadSnapshot();
+      const settlement = current.state.pendingRunSettlements[command.runId];
+      if (!settlement) throw new Error('run_finishing_settlement_missing');
+      await this.finalizeRunRuntime(current, command.runId, settlement);
     }
+  }
+
+  private async containLoopFailure(runId: string, error: unknown): Promise<Error> {
+    const failure = asError(error);
+    let snapshot: LoopSnapshot;
+    try {
+      snapshot = await this.loadSnapshot();
+    } catch (snapshotError) {
+      return new AggregateError(
+        [failure, asError(snapshotError)],
+        failure.message,
+      );
+    }
+    const runtime = snapshot.state.runRuntimeSnapshots[runId];
+    if (!runtime || snapshot.state.runRuntimeReleases[runId]) return failure;
+    try {
+      await this.#composition.runPreparation.release({
+        sessionId: this.sessionId,
+        runId,
+        kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
+      });
+    } catch (releaseError) {
+      return new AggregateError(
+        [failure, asError(releaseError)],
+        failure.message,
+      );
+    }
+    return failure;
+  }
+
+  private async restoreRunRuntime(snapshot: LoopSnapshot, runId: string): Promise<boolean> {
+    const runtime = snapshot.state.runRuntimeSnapshots[runId];
+    if (!runtime) throw new Error('run_runtime_snapshot_missing');
+    let prepared;
+    try {
+      prepared = await this.#composition.runPreparation.prepare({
+        sessionId: this.sessionId,
+        runId,
+        profileId: runtime.provider.profileId,
+        ...recoveryPluginSelection(snapshot, runId, runtime),
+      });
+    } catch (error) {
+      await this.settleRecoveryFailure(runId, error);
+      return false;
+    }
+    const restored = prepared.runtimeSnapshot;
+    if (canonicalJson(restored) !== canonicalJson(runtime)) {
+      const mismatch = new Error('run_runtime_recovery_identity_mismatch');
+      try {
+        await this.#composition.runPreparation.release({
+          sessionId: this.sessionId,
+          runId,
+          kernelCatalogSnapshotRef: prepared.runtimeSnapshot.kernelCatalogSnapshotRef,
+        });
+      } finally {
+        await this.settleRecoveryFailure(runId, mismatch);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  private async settleRecoveryFailure(runId: string, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    await this.appendLifecycleEvents([{
+      type: 'run.finishing',
+      sessionId: this.sessionId,
+      runId,
+      payload: {
+        outcome: 'failed',
+        error: { code: errorCode(message), message },
+      },
+    }]);
+    const snapshot = await this.loadSnapshot();
+    const settlement = snapshot.state.pendingRunSettlements[runId];
+    if (!settlement) throw new Error('run_finishing_settlement_missing');
+    await this.finalizeRunRuntime(snapshot, runId, settlement);
+  }
+
+  private async finalizeRunRuntime(
+    snapshot: LoopSnapshot,
+    runId: string,
+    settlement: RunSettlement,
+  ): Promise<boolean> {
+    const runtime = snapshot.state.runRuntimeSnapshots[runId];
+    if (!runtime) throw new Error('run_runtime_snapshot_missing');
+    if (snapshot.state.runRuntimeReleases[runId]) {
+      await this.appendLifecycleEvents([{
+        type: 'run.settled',
+        sessionId: this.sessionId,
+        runId,
+        payload: cloneSettlement(settlement),
+      }]);
+      return true;
+    }
+    let released;
+    try {
+      released = await this.#composition.runPreparation.release({
+        sessionId: this.sessionId,
+        runId,
+        kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.appendLifecycleEvents([{
+        type: 'run.runtime.release_failed',
+        sessionId: this.sessionId,
+        runId,
+        payload: {
+          runRuntimeSnapshotRef: runtime.runRuntimeSnapshotRef,
+          extensionGenerationRef: runtime.extensionGenerationRef,
+          kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
+          providerRuntimeRef: runtime.provider.providerRuntimeRef,
+          error: { code: errorCode(message), message },
+        },
+      }]);
+      return false;
+    }
+    await this.appendLifecycleEvents([
+      {
+        type: 'run.runtime.released',
+        sessionId: this.sessionId,
+        runId,
+        payload: {
+          runRuntimeSnapshotRef: runtime.runRuntimeSnapshotRef,
+          extensionGenerationRef: runtime.extensionGenerationRef,
+          kernelCatalogSnapshotRef: released.kernelCatalogSnapshotRef,
+          providerRuntimeRef: runtime.provider.providerRuntimeRef,
+          pluginInstanceRefs: runtime.selectedPlugins.plugins.map((plugin) => (
+            plugin.pluginInstanceRef
+          )),
+          alreadyReleased: released.alreadyReleased,
+        },
+      },
+      {
+        type: 'run.settled',
+        sessionId: this.sessionId,
+        runId,
+        payload: cloneSettlement(settlement),
+      },
+    ]);
+    return true;
+  }
+
+  private async appendLifecycleEvents(events: readonly NewSessionEvent[]): Promise<void> {
+    const current = await this.loadSnapshot();
+    let previewState = current.state;
+    for (const [index, event] of events.entries()) {
+      previewState = reduceSession(previewState, {
+        ...event,
+        schemaVersion: SESSION_EVENT_VERSION,
+        eventId: `preflight:${current.state.revision + index + 1}`,
+        sequence: current.state.revision + index + 1,
+        occurredAt: '1970-01-01T00:00:00.000Z',
+      } as SessionEvent);
+    }
+    const committed = events.length === 1
+      ? [await this.#journal.append(events[0]!)]
+      : await this.#journal.appendBatch(events);
+    for (const event of committed) await this.observe(event);
   }
 
   private async loadSnapshot(): Promise<LoopSnapshot> {
@@ -796,19 +995,18 @@ export class SessionActor {
     this.#mailbox = result.then(() => undefined, () => undefined);
     return await result;
   }
+
+  private assertOperational(): void {
+    if (this.#loopFailure) {
+      throw new Error(`session_loop_failed:${this.#loopFailure.message}`, {
+        cause: this.#loopFailure,
+      });
+    }
+  }
 }
 
-function providerRunState(runId: string): ProviderRunTransientState {
-  return {
-    runId,
-    observedCallIds: new Set(),
-    reasoningByCallId: new Map(),
-    reasoningSignatureByCallId: new Map(),
-  };
-}
-
-function providerRunStateForRecovery(runId: string): ProviderRunTransientState {
-  return providerRunState(runId);
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function planAuthoritiesForConfirmation(
@@ -824,6 +1022,7 @@ function planAuthoritiesForConfirmation(
     revision: plan.revision,
     decisionId,
     sessionId,
+    runId: plan.runId,
     workspaceId,
     coveredOperations: plan.mutationManifest
       .filter((operation) => operation.workspaceId === workspaceId)
@@ -908,6 +1107,13 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(sortJsonValue(value));
 }
 
+function errorCode(message: string): string {
+  const [candidate] = message.split(':', 1);
+  return candidate && /^[a-z][a-z0-9_.-]{0,127}$/u.test(candidate)
+    ? candidate
+    : 'run_runtime_recovery_failed';
+}
+
 function sortJsonValue(value: unknown): unknown {
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value)) throw new TypeError('command_requires_safe_integer_numbers');
@@ -930,6 +1136,42 @@ function isTerminal(status: string): boolean {
   return ['completed', 'failed', 'cancelled', 'indeterminate'].includes(status);
 }
 
+function recoveryPluginSelection(
+  snapshot: LoopSnapshot,
+  runId: string,
+  runtime: LoopSnapshot['state']['runRuntimeSnapshots'][string],
+): {
+  pluginCatalogRevision?: string;
+  pluginSelections?: Extract<ConversationCommand, { type: 'message.submit' }>['pluginSelections'];
+} {
+  const started = snapshot.events.find((event): event is Extract<
+    SessionEvent,
+    { type: 'run.started' }
+  > => event.type === 'run.started' && event.runId === runId);
+  if (!started) throw new Error('run_started_event_missing');
+  const input = snapshot.events.find((event): event is Extract<
+    SessionEvent,
+    { type: 'input.accepted' }
+  > => (
+    event.type === 'input.accepted'
+    && event.payload.messageId === started.payload.inputMessageId
+  ));
+  const selections = input?.payload.pluginSelections ?? [];
+  if (selections.length === 0) return {};
+  return {
+    pluginCatalogRevision: runtime.selectedPlugins.catalogRevision,
+    pluginSelections: selections.map((selection) => ({ ...selection })),
+  };
+}
+
+function cloneSettlement(settlement: RunSettlement): RunSettlement {
+  if (settlement.outcome === 'completed') return { ...settlement };
+  if (settlement.outcome === 'failed' || settlement.outcome === 'indeterminate') {
+    return { outcome: settlement.outcome, error: { ...settlement.error } };
+  }
+  return { outcome: 'cancelled' };
+}
+
 function closesAssistantDraft(
   events: readonly (NewSessionEvent | SessionEvent)[],
   runId: string,
@@ -942,17 +1184,11 @@ function closesAssistantDraft(
       || event.type === 'interaction.requested'
       || event.type === 'plan.published'
       || event.type === 'tool.requested'
+      || event.type === 'run.finishing'
       || event.type === 'run.settled'
       || event.type === 'message.committed' && event.payload.role === 'assistant'
     )
   ));
-}
-
-function explicitFocusTask(text: string): string | null {
-  if (!text.startsWith('/focus')) return null;
-  const suffix = text.slice('/focus'.length);
-  if (suffix && !/^\s/u.test(suffix)) return null;
-  return suffix.trim();
 }
 
 function validProfileId(value: string): boolean {
@@ -962,55 +1198,61 @@ function validProfileId(value: string): boolean {
     && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
-function validateAttachments(
-  attachments: Extract<ConversationCommand, { type: 'message.submit' }>['attachments'],
+function validateFilesystemReferences(
+  references: Extract<ConversationCommand, { type: 'message.submit' }>['filesystemReferences'],
 ): string | null {
-  if (attachments === undefined) return null;
-  if (!Array.isArray(attachments) || attachments.length > MAX_ATTACHMENT_COUNT) {
-    return `单次消息最多附加 ${MAX_ATTACHMENT_COUNT} 个文件。`;
+  if (references === undefined) return null;
+  if (!Array.isArray(references) || references.length > MAX_FILESYSTEM_REFERENCE_COUNT) {
+    return `单次消息最多附加 ${MAX_FILESYSTEM_REFERENCE_COUNT} 个文件系统引用。`;
   }
-  const seen = new Set<string>();
-  let bytes = 0;
-  for (const attachment of attachments) {
+  const referenceIds = new Set<string>();
+  const targets = new Set<string>();
+  for (const reference of references) {
     if (
-      !attachment
-      || typeof attachment !== 'object'
-      || typeof attachment.attachmentId !== 'string'
-      || !validProfileId(attachment.attachmentId)
-      || seen.has(attachment.attachmentId)
-      || typeof attachment.name !== 'string'
-      || !attachment.name.trim()
-      || attachment.name.length > 255
-      || attachment.name.includes('\0')
-      || typeof attachment.mediaType !== 'string'
-      || !attachment.mediaType.trim()
-      || attachment.mediaType.length > 128
-      || typeof attachment.content !== 'string'
-    ) return '附件标识、名称、类型或内容无效。';
-    seen.add(attachment.attachmentId);
-    bytes += new TextEncoder().encode(attachment.content).byteLength;
-    if (bytes > MAX_ATTACHMENT_BYTES) {
-      return `附件文本总计不能超过 ${MAX_ATTACHMENT_BYTES} 字节。`;
+      !reference
+      || typeof reference !== 'object'
+      || typeof reference.referenceId !== 'string'
+      || !validProfileId(reference.referenceId)
+      || referenceIds.has(reference.referenceId)
+      || !validWorkspaceBinding({
+        workspaceId: reference.workspaceId,
+        displayName: reference.displayName,
+      })
+      || typeof reference.logicalPath !== 'string'
+      || !validLogicalPath(reference.logicalPath)
+      || targets.has(`${reference.workspaceId}\0${reference.logicalPath}`)
+    ) {
+      return '文件系统引用的 identity、workspace 或逻辑路径无效或重复。';
     }
+    if (reference.kind === 'file') {
+      if (
+        reference.logicalPath === '.'
+        || typeof reference.mediaType !== 'string'
+        || !reference.mediaType.trim()
+        || reference.mediaType.length > 128
+        || !Number.isSafeInteger(reference.byteLength)
+        || reference.byteLength < 0
+      ) return '文件引用的 kind、mediaType 或 byteLength 无效。';
+    } else if (reference.kind === 'directory') {
+      if (
+        reference.logicalPath !== '.'
+        || Object.hasOwn(reference, 'mediaType')
+        || Object.hasOwn(reference, 'byteLength')
+      ) return '目录引用必须指向 workspace 根且不能携带文件元数据。';
+    } else {
+      return '文件系统引用 kind 无效。';
+    }
+    referenceIds.add(reference.referenceId);
+    targets.add(`${reference.workspaceId}\0${reference.logicalPath}`);
   }
   return null;
 }
 
-function validateDirectoryAttachments(
-  attachments: Extract<ConversationCommand, { type: 'message.submit' }>['directoryAttachments'],
-): string | null {
-  if (attachments === undefined) return null;
-  if (!Array.isArray(attachments) || attachments.length > MAX_DIRECTORY_ATTACHMENT_COUNT) {
-    return `单次消息最多附加 ${MAX_DIRECTORY_ATTACHMENT_COUNT} 个目录。`;
-  }
-  const seen = new Set<string>();
-  for (const attachment of attachments) {
-    if (!validWorkspaceBinding(attachment) || seen.has(attachment.workspaceId)) {
-      return '目录附件的 workspace identity 无效或重复。';
-    }
-    seen.add(attachment.workspaceId);
-  }
-  return null;
+function validLogicalPath(value: string): boolean {
+  if (!value || value.length > 4_096 || value.includes('\0') || value.includes('\\')) return false;
+  if (value === '.') return true;
+  if (value.startsWith('/') || value.endsWith('/')) return false;
+  return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 
 function mergeWorkspaceBindings(

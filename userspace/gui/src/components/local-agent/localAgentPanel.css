@@ -1393,6 +1393,73 @@
   font: var(--dc-font-micro)/1 var(--dc-font-mono);
 }
 
+.local-agent__plugin-picker {
+  position: absolute;
+  z-index: 10;
+  right: 10px;
+  bottom: calc(100% + 7px);
+  left: 10px;
+  max-height: min(360px, 48vh);
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--dc-border-strong);
+  border-radius: 12px;
+  background: var(--dc-surface-raised);
+  box-shadow: 0 18px 42px -24px color-mix(in srgb, var(--dc-foreground-strong) 42%, transparent),
+    0 2px 8px color-mix(in srgb, var(--dc-foreground-strong) 8%, transparent);
+}
+
+.local-agent__plugin-picker-heading,
+.local-agent__plugin-picker-empty {
+  padding: 7px 9px;
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+}
+
+.local-agent .local-agent__plugin-picker > button {
+  display: grid;
+  width: 100%;
+  min-height: 50px;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+}
+
+.local-agent .local-agent__plugin-picker > button:hover,
+.local-agent .local-agent__plugin-picker > button[aria-selected='true'] {
+  background: var(--dc-surface-hover);
+}
+
+.local-agent__plugin-picker > button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.local-agent__plugin-picker b {
+  color: var(--dc-foreground-strong);
+  font-size: var(--dc-font-label);
+}
+
+.local-agent__plugin-picker small,
+.local-agent__plugin-picker code {
+  overflow: hidden;
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-agent__plugin-picker code {
+  max-width: 190px;
+  font-family: var(--dc-font-mono);
+}
+
 .local-agent__resource-overlay {
   position: absolute;
   z-index: 20;
@@ -1499,6 +1566,11 @@
 
 .local-agent__draft-attachments {
   padding: 0 13px 5px;
+}
+
+.local-agent__draft-plugin {
+  border-color: color-mix(in srgb, var(--dc-accent) 38%, var(--dc-border)) !important;
+  color: var(--dc-accent) !important;
 }
 
 .local-agent__draft-attachments button {
@@ -1666,7 +1738,7 @@
   box-shadow: var(--dc-shadow-panel);
 }
 
-.local-agent__permission-restart-notice {
+.local-agent__permission-activation-notice {
   padding: 7px 8px;
   border: 1px solid color-mix(in srgb, var(--dc-accent) 38%, var(--dc-border));
   border-radius: 8px;

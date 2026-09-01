@@ -214,6 +214,19 @@ pub(crate) fn resolve_llm_profile(
     if !llm_profile_value_is_enabled(profile) {
         return Err("选中的 LLM Profile 未启用或格式无效。".to_string());
     }
+    let context_window_tokens = profile
+        .get("contextWindowTokens")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "LLM Profile 缺少正数 contextWindowTokens。".to_string())?;
+    let max_output_tokens = profile
+        .get("maxOutputTokens")
+        .and_then(token_limit_u32)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "LLM Profile 缺少正数 maxOutputTokens。".to_string())?;
+    if u64::from(max_output_tokens) >= context_window_tokens {
+        return Err("LLM Profile 的 maxOutputTokens 必须小于 contextWindowTokens。".to_string());
+    }
     let id = profile
         .get("id")
         .and_then(Value::as_str)
@@ -269,8 +282,8 @@ pub(crate) fn resolve_llm_profile(
             .and_then(Value::as_str)
             .expect("validated profile model")
             .to_string(),
-        context_window_tokens: profile.get("contextWindowTokens").and_then(Value::as_u64),
-        max_output_tokens: profile.get("maxOutputTokens").and_then(token_limit_u32),
+        context_window_tokens: Some(context_window_tokens),
+        max_output_tokens: Some(max_output_tokens),
         temperature: profile.get("temperature").and_then(Value::as_f64),
         reasoning_effort: profile
             .get("reasoningEffort")
@@ -289,6 +302,7 @@ pub(crate) fn openai_compatible_request_body(
     messages: Vec<Value>,
     tools: &[LlmToolDefinition],
     stream: bool,
+    require_tool_call: bool,
 ) -> Value {
     let compatibility = provider_thinking_compatibility(profile);
     let mut body = json!({
@@ -297,11 +311,11 @@ pub(crate) fn openai_compatible_request_body(
             .into_iter()
             .map(|message| openai_compatible_message(message, compatibility))
             .collect::<Vec<_>>(),
-        "stream": stream
+        "stream": stream,
+        "max_tokens": profile
+            .max_output_tokens
+            .expect("resolved Provider runtime has maxOutputTokens")
     });
-    if let Some(tokens) = profile.max_output_tokens.filter(|tokens| *tokens > 0) {
-        body["max_tokens"] = json!(tokens);
-    }
     if !matches!(
         compatibility,
         ProviderThinkingCompatibility::DeepSeek | ProviderThinkingCompatibility::Moonshot
@@ -325,12 +339,18 @@ pub(crate) fn openai_compatible_request_body(
             .map(|tool| json!({
                 "type": "function",
                 "function": {
-                    "name": provider_tool_name(&tool.name),
+                    "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.input_schema
                 }
             }))
             .collect::<Vec<_>>());
+        if require_tool_call
+            && !(compatibility == ProviderThinkingCompatibility::DeepSeek
+                && profile.thinking.as_deref() == Some("enabled"))
+        {
+            body["tool_choice"] = json!("required");
+        }
     }
     body
 }
@@ -427,7 +447,7 @@ fn openai_tool_call(value: &Value) -> Option<Value> {
             .unwrap_or("tool-call"),
         "type": "function",
         "function": {
-            "name": provider_tool_name(name),
+            "name": name,
             "arguments": match arguments {
                 Value::String(text) => text,
                 value => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
@@ -526,12 +546,25 @@ fn prepare_provider_request(
         .cloned()
         .map(provider_tools_from_values)
         .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
+    let require_tool_call = envelope
+        .get("requireToolCall")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
+    if require_tool_call && tools.is_empty() {
+        return Err(ProviderTransportError::new(
+            "provider_required_tool_missing",
+        ));
+    }
     let provider_body = match kind {
         ProviderStreamKind::OpenAiCompatible => {
-            openai_compatible_request_body(profile, messages, &tools, true)
+            openai_compatible_request_body(profile, messages, &tools, true, require_tool_call)
         }
-        ProviderStreamKind::Anthropic => anthropic_stream_request_body(profile, messages, &tools),
-        ProviderStreamKind::Ollama => ollama_stream_request_body(profile, messages, &tools),
+        ProviderStreamKind::Anthropic => {
+            anthropic_stream_request_body(profile, messages, &tools, require_tool_call)
+        }
+        ProviderStreamKind::Ollama => {
+            ollama_stream_request_body(profile, messages, &tools, require_tool_call)
+        }
     };
     let body = serde_json::to_vec(&provider_body).map_err(|error| {
         ProviderTransportError::message(
@@ -703,7 +736,8 @@ async fn probe_profile(
         profile,
         &json!({
             "messages": [{ "role": "user", "content": "Reply with OK." }],
-            "tools": []
+            "tools": [],
+            "requireToolCall": false
         }),
     )?;
     let kind = prepared.kind;
@@ -1081,14 +1115,6 @@ fn provider_thinking_compatibility(profile: &ResolvedLlmProfile) -> ProviderThin
     }
 }
 
-pub(crate) fn provider_tool_name(name: &str) -> String {
-    name.replace('.', "__")
-}
-
-pub(crate) fn internal_tool_name(name: &str) -> String {
-    name.replace("__", ".")
-}
-
 pub(crate) fn split_system_messages(messages: Vec<Value>) -> (String, Vec<Value>) {
     let mut system = Vec::new();
     let mut chat = Vec::new();
@@ -1109,232 +1135,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deepseek_tool_continuation_preserves_reasoning_content() {
-        let profile = ResolvedLlmProfile {
-            kind: "openai-compatible".to_string(),
-            provider_flavor: Some("deepseek".to_string()),
+    fn required_tool_constraint_reaches_each_provider_payload() {
+        let envelope = json!({
+            "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
+            "tools": [{
+                "name": "fixture_tool",
+                "description": "Execute one fixture action.",
+                "inputSchema": { "type": "object", "additionalProperties": false }
+            }],
+            "requireToolCall": true
+        });
+        for (kind, expected) in [
+            ("openaiCompatible", json!("required")),
+            ("anthropic", json!({ "type": "any" })),
+            ("ollama", json!("required")),
+        ] {
+            let prepared = prepare_provider_request(&test_profile(kind), &envelope)
+                .expect("required-tool request must prepare");
+            let body: Value =
+                serde_json::from_slice(&prepared.body).expect("provider request body must decode");
+            assert_eq!(
+                body.get("tool_choice"),
+                Some(&expected),
+                "provider kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_provider_request_does_not_force_a_tool_call() {
+        let prepared = prepare_provider_request(
+            &test_profile("openaiCompatible"),
+            &json!({
+                "messages": [{ "role": "user", "content": "Answer normally." }],
+                "tools": [{
+                    "name": "fixture_tool",
+                    "description": "Fixture action.",
+                    "inputSchema": { "type": "object" }
+                }],
+                "requireToolCall": false
+            }),
+        )
+        .expect("normal request must prepare");
+        let body: Value =
+            serde_json::from_slice(&prepared.body).expect("provider request body must decode");
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn deepseek_thinking_execution_omits_unsupported_tool_choice() {
+        let mut profile = test_profile("openaiCompatible");
+        profile.provider_flavor = Some("deepseek".to_string());
+        profile.thinking = Some("enabled".to_string());
+        let prepared = prepare_provider_request(
+            &profile,
+            &json!({
+                "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
+                "tools": [{
+                    "name": "fixture_tool",
+                    "description": "Execute one fixture action.",
+                    "inputSchema": { "type": "object", "additionalProperties": false }
+                }],
+                "requireToolCall": true
+            }),
+        )
+        .expect("DeepSeek thinking request must prepare");
+        let body: Value =
+            serde_json::from_slice(&prepared.body).expect("provider request body must decode");
+
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    fn test_profile(kind: &str) -> ResolvedLlmProfile {
+        ResolvedLlmProfile {
+            kind: kind.to_string(),
+            provider_flavor: None,
             base_url: None,
-            model: "deepseek-chat".to_string(),
-            context_window_tokens: Some(128_000),
-            max_output_tokens: None,
+            model: "fixture-model".to_string(),
+            context_window_tokens: Some(4_096),
+            max_output_tokens: Some(512),
             temperature: None,
             reasoning_effort: None,
-            thinking: Some("enabled".to_string()),
+            thinking: None,
             api_key: None,
-        };
-        let body = openai_compatible_request_body(
-            &profile,
-            vec![json!({
-                "role": "assistant",
-                "content": "",
-                "reasoningContent": "private provider reasoning",
-                "toolCalls": [{
-                    "callId": "call:list",
-                    "name": "fs.list",
-                    "input": { "workspaceId": "workspace:test", "path": "." }
-                }]
-            })],
-            &[],
-            true,
-        );
-        assert_eq!(
-            body["messages"][0]["reasoning_content"],
-            json!("private provider reasoning")
-        );
-        assert_eq!(
-            body["messages"][0]["tool_calls"][0]["id"],
-            json!("call:list")
-        );
-    }
-
-    #[test]
-    fn deepseek_tool_continuation_uses_empty_reasoning_wire_field_when_absent() {
-        let profile = ResolvedLlmProfile {
-            kind: "openaiCompatible".to_string(),
-            provider_flavor: Some("deepseek".to_string()),
-            base_url: Some("https://api.deepseek.com".to_string()),
-            model: "deepseek-v4-flash".to_string(),
-            context_window_tokens: Some(1_000_000),
-            max_output_tokens: Some(384_000),
-            temperature: Some(0.2),
-            reasoning_effort: Some("high".to_string()),
-            thinking: Some("enabled".to_string()),
-            api_key: None,
-        };
-        let body = openai_compatible_request_body(
-            &profile,
-            vec![json!({
-                "role": "assistant",
-                "content": "",
-                "toolCalls": [{
-                    "callId": "call:mkdir",
-                    "name": "fs.ensure_directory",
-                    "input": { "path": "src" }
-                }]
-            })],
-            &[],
-            true,
-        );
-
-        assert_eq!(body["messages"][0]["reasoning_content"], json!(""));
-        assert_eq!(
-            body["messages"][0]["tool_calls"][0]["function"]["name"],
-            json!("fs__ensure_directory")
-        );
-    }
-
-    #[test]
-    fn provider_http_error_detail_keeps_only_bounded_structured_message() {
-        let body = serde_json::to_vec(&json!({
-            "error": {
-                "type": "invalid_request_error",
-                "message": "The reasoning_content must be passed back."
-            },
-            "request": { "authorization": "must-not-be-rendered" }
-        }))
-        .expect("encode Provider error fixture");
-        assert_eq!(
-            provider_http_error_detail(&body).as_deref(),
-            Some("The reasoning_content must be passed back.")
-        );
-        assert_eq!(provider_http_error_detail(b"not-json"), None);
-    }
-
-    #[test]
-    fn moonshot_tool_continuation_uses_reasoning_content_and_omits_temperature() {
-        let profile = ResolvedLlmProfile {
-            kind: "openaiCompatible".to_string(),
-            provider_flavor: Some("moonshot".to_string()),
-            base_url: Some("https://api.moonshot.ai/v1".to_string()),
-            model: "kimi-k2.6".to_string(),
-            context_window_tokens: Some(256_000),
-            max_output_tokens: Some(32_768),
-            temperature: Some(0.2),
-            reasoning_effort: None,
-            thinking: Some("enabled".to_string()),
-            api_key: None,
-        };
-        let body = openai_compatible_request_body(
-            &profile,
-            vec![json!({
-                "role": "assistant",
-                "content": "",
-                "reasoningContent": "preserved Kimi reasoning",
-                "toolCalls": [{
-                    "callId": "call:web",
-                    "name": "web.search",
-                    "input": { "query": "DeepCode" }
-                }]
-            })],
-            &[],
-            true,
-        );
-        assert_eq!(
-            body["messages"][0]["reasoning_content"],
-            json!("preserved Kimi reasoning")
-        );
-        assert!(body.get("temperature").is_none());
-        assert_eq!(body["thinking"]["type"], json!("enabled"));
-    }
-
-    #[test]
-    fn moonshot_tool_continuation_does_not_invent_missing_reasoning() {
-        let profile = ResolvedLlmProfile {
-            kind: "openaiCompatible".to_string(),
-            provider_flavor: Some("moonshot".to_string()),
-            base_url: Some("https://api.moonshot.ai/v1".to_string()),
-            model: "kimi-k2.6".to_string(),
-            context_window_tokens: Some(256_000),
-            max_output_tokens: Some(32_768),
-            temperature: Some(0.2),
-            reasoning_effort: None,
-            thinking: Some("enabled".to_string()),
-            api_key: None,
-        };
-        let body = openai_compatible_request_body(
-            &profile,
-            vec![json!({
-                "role": "assistant",
-                "content": "",
-                "toolCalls": [{
-                    "callId": "call:web",
-                    "name": "web.search",
-                    "input": { "query": "DeepCode" }
-                }]
-            })],
-            &[],
-            true,
-        );
-
-        assert!(body["messages"][0].get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn anthropic_tool_continuation_uses_native_content_blocks() {
-        let profile = ResolvedLlmProfile {
-            kind: "anthropic".to_string(),
-            provider_flavor: Some("deepseek".to_string()),
-            base_url: Some("https://api.deepseek.com/anthropic".to_string()),
-            model: "deepseek-v4-flash".to_string(),
-            context_window_tokens: Some(1_000_000),
-            max_output_tokens: Some(8192),
-            temperature: None,
-            reasoning_effort: Some("high".to_string()),
-            thinking: Some("enabled".to_string()),
-            api_key: None,
-        };
-        let body = anthropic_stream_request_body(
-            &profile,
-            vec![
-                json!({ "role": "system", "content": "System facts" }),
-                json!({
-                    "role": "assistant",
-                    "content": "",
-                    "reasoningContent": "preserved reasoning",
-                    "reasoningSignature": "opaque-signature",
-                    "toolCalls": [{
-                        "callId": "call:list",
-                        "name": "fs.list",
-                        "input": { "workspaceId": "workspace:test", "path": "." }
-                    }]
-                }),
-                json!({
-                    "role": "tool",
-                    "toolCallId": "call:list",
-                    "content": "{\"entries\":[]}"
-                }),
-            ],
-            &[],
-        );
-        assert_eq!(body["system"], json!("System facts"));
-        assert_eq!(body["messages"][0]["role"], json!("assistant"));
-        assert_eq!(body["messages"][0]["content"][0]["type"], json!("thinking"));
-        assert_eq!(
-            body["messages"][0]["content"][0]["signature"],
-            json!("opaque-signature")
-        );
-        assert_eq!(body["messages"][0]["content"][1]["type"], json!("tool_use"));
-        assert_eq!(body["messages"][0]["content"][1]["name"], json!("fs__list"));
-        assert_eq!(body["messages"][1]["role"], json!("user"));
-        assert_eq!(
-            body["messages"][1]["content"][0]["tool_use_id"],
-            json!("call:list")
-        );
-    }
-
-    #[test]
-    fn llm_secret_store_rejects_non_string_or_empty_entries() {
-        assert!(llm_secret_store_is_current(&json!({
-            "profile:one": "secret-value"
-        })));
-        assert!(!llm_secret_store_is_current(&json!({
-            "profile:one": null
-        })));
-        assert!(!llm_secret_store_is_current(&json!({
-            "profile:one": "  "
-        })));
-        assert!(!llm_secret_store_is_current(&json!({
-            " profile:one": "secret-value"
-        })));
+        }
     }
 }

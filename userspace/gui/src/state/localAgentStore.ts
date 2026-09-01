@@ -5,9 +5,10 @@ import type {
   ConversationCommand,
   LlmProviderProfile,
   MessageFeedback,
+  PluginCatalogProjection,
+  PluginSelectionInput,
   PlanResponse,
   SessionProjection,
-  UserMessageAttachment,
 } from '@deepcode/protocol';
 import { CONVERSATION_COMMAND_VERSION } from '@deepcode/protocol';
 import { getLlmProfiles } from '../services/apiClient';
@@ -20,8 +21,9 @@ import {
   deleteConversationSession as deleteSessionRequest,
   getConversationCatalog,
   getConversationCatalogManagement,
+  getPluginCatalog,
   getLocalAgentProjection,
-  resolveConversationDirectoryAttachments,
+  resolveConversationFilesystemReferences,
   submitLocalAgentCommand,
   updateConversationProject as updateProjectRequest,
   updateConversationSession as updateSessionRequest,
@@ -29,6 +31,12 @@ import {
 
 const SESSION_STORAGE_KEY = 'deepcode.local-agent.active-session';
 const EMPTY_CATALOG: ConversationCatalog = { projects: [], sessions: [] };
+const EMPTY_PLUGIN_CATALOG: PluginCatalogProjection = { revision: 'plugin-catalog:empty', plugins: [] };
+
+interface PendingFilesystemPath {
+  path: string;
+  kind: 'file' | 'directory';
+}
 
 interface LocalAgentState {
   sessionId: string | null;
@@ -37,6 +45,7 @@ interface LocalAgentState {
   profiles: LlmProviderProfile[];
   defaultProfileId: string | null;
   catalog: ConversationCatalog;
+  pluginCatalog: PluginCatalogProjection;
   projection: SessionProjection | null;
   loading: boolean;
   refreshing: boolean;
@@ -45,14 +54,20 @@ interface LocalAgentState {
   error: string | null;
   initialize(): Promise<void>;
   refreshCatalog(): Promise<void>;
+  refreshPluginCatalog(): Promise<void>;
   startNewSession(projectId?: string | null): void;
   activateSession(sessionId: string): Promise<void>;
-  selectProfile(profileId: string): Promise<void>;
+  selectProfile(profileId: string): void;
   refresh(): Promise<void>;
   sendMessage(
     text: string,
-    attachments?: UserMessageAttachment[],
-    directoryPaths?: string[],
+    filesystemPaths?: PendingFilesystemPath[],
+    pluginSelections?: PluginSelectionInput[],
+  ): Promise<CommandReply>;
+  focusContext(
+    task: string,
+    filesystemPaths?: PendingFilesystemPath[],
+    pluginSelections?: PluginSelectionInput[],
   ): Promise<CommandReply>;
   setMessageFeedback(messageId: string, feedback: MessageFeedback | null): Promise<CommandReply>;
   attachSessionDirectory(canonicalRoot: string): Promise<void>;
@@ -79,6 +94,7 @@ interface LocalAgentState {
 type StoreSet = (
   state: Partial<LocalAgentState> | ((state: LocalAgentState) => Partial<LocalAgentState>),
 ) => void;
+type StoreGet = () => LocalAgentState;
 
 let initialization: Promise<void> | null = null;
 let generation = 0;
@@ -90,6 +106,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   profiles: [],
   defaultProfileId: null,
   catalog: EMPTY_CATALOG,
+  pluginCatalog: EMPTY_PLUGIN_CATALOG,
   projection: null,
   loading: false,
   refreshing: false,
@@ -103,8 +120,9 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     initialization = (async () => {
       set({ loading: true, error: null });
       try {
-        const [catalog, profileResult] = await Promise.all([
+        const [catalog, pluginCatalog, profileResult] = await Promise.all([
           getConversationCatalog(),
+          getPluginCatalog(),
           getLlmProfiles(),
         ]);
         if (currentGeneration !== generation) return;
@@ -129,11 +147,10 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         if (currentGeneration !== generation) return;
         set({
           catalog,
+          pluginCatalog,
           profiles,
           defaultProfileId,
-          selectedProfileId: projection?.run?.profileId
-            ?? candidate?.profileId
-            ?? defaultProfileId,
+          selectedProfileId: candidate?.profileId ?? defaultProfileId,
           sessionId: projection?.sessionId ?? candidate?.id ?? null,
           projection,
           draftProjectId: null,
@@ -158,6 +175,15 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     try {
       const catalog = await getConversationCatalog();
       set({ catalog, error: null });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    }
+  },
+
+  refreshPluginCatalog: async () => {
+    try {
+      const pluginCatalog = await getPluginCatalog();
+      set({ pluginCatalog, error: null });
     } catch (error) {
       set({ error: errorMessage(error) });
     }
@@ -192,9 +218,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       rememberSession(sessionId);
       set({
         sessionId,
-        selectedProfileId: projection.run?.profileId
-          ?? summary.profileId
-          ?? get().defaultProfileId,
+        selectedProfileId: summary.profileId ?? get().defaultProfileId,
         projection,
         loading: false,
       });
@@ -203,28 +227,9 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     }
   },
 
-  selectProfile: async (profileId) => {
+  selectProfile: (profileId) => {
     if (!get().profiles.some((profile) => profile.id === profileId && profile.enabled)) return;
-    const previous = get().selectedProfileId;
     set({ selectedProfileId: profileId, error: null });
-    const { sessionId, projection } = get();
-    const run = projection?.run;
-    if (!sessionId || !run || isTerminalRun(run.status)) return;
-    try {
-      const reply = await submitLocalAgentCommand({
-        schemaVersion: CONVERSATION_COMMAND_VERSION,
-        type: 'run.profile.select',
-        commandId: nextId('command'),
-        sessionId,
-        runId: run.runId,
-        profileId,
-      });
-      assertAccepted(reply);
-      await get().refresh();
-    } catch (error) {
-      set({ selectedProfileId: previous, error: errorMessage(error) });
-      throw error;
-    }
   },
 
   refresh: async () => {
@@ -238,15 +243,9 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         const nextProjection = shouldApplyProjection(state.projection, projection)
           ? projection
           : state.projection;
-        const nextProfileId = projection.run?.profileId ?? state.selectedProfileId;
-        if (
-          nextProjection === state.projection
-          && nextProfileId === state.selectedProfileId
-          && state.error === null
-        ) return state;
+        if (nextProjection === state.projection && state.error === null) return state;
         return {
           projection: nextProjection,
-          selectedProfileId: nextProfileId,
           error: null,
         };
       });
@@ -257,13 +256,18 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     }
   },
 
-  sendMessage: async (text, attachments = [], directoryPaths = []) => {
+  sendMessage: async (
+    text,
+    filesystemPaths = [],
+    pluginSelections = [],
+  ) => {
     const trimmed = text.trim();
     if (!trimmed) throw new Error('message_empty');
+    if (trimmed.startsWith('/')) throw new Error(`conversation_command_unknown:${trimmed}`);
     const { projection } = get();
     if (projection?.pendingPlan) {
-      if (attachments.length || directoryPaths.length) {
-        throw new Error('plan_revision_attachments_unsupported');
+      if (filesystemPaths.length || pluginSelections.length) {
+        throw new Error('plan_revision_filesystem_references_unsupported');
       }
       return await get().respondPlan({ kind: 'requestRevision', text: trimmed });
     }
@@ -271,59 +275,40 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       throw new Error('approval_response_requires_explicit_command');
     }
     if (projection?.pendingInteraction) {
-      if (attachments.length || directoryPaths.length) {
-        throw new Error('interaction_response_attachments_unsupported');
+      if (filesystemPaths.length || pluginSelections.length) {
+        throw new Error('interaction_response_filesystem_references_unsupported');
       }
       return await get().respondInteraction(trimmed);
     }
 
-    set({ submitting: true, error: null });
-    try {
-      let { sessionId } = get();
-      if (!sessionId) {
-        const { draftProjectId, selectedProfileId } = get();
-        if (!selectedProfileId) throw new Error('llm_profile_unavailable');
-        const created = await createLocalAgentSession({
-          ...(draftProjectId ? { projectId: draftProjectId } : {}),
-          profileId: selectedProfileId,
-        });
-        sessionId = created.sessionId;
-        rememberSession(sessionId);
-        set({ sessionId, projection: created, draftProjectId: null });
-        await get().refreshCatalog();
-      }
-      const directoryAttachments = directoryPaths.length
-        ? await resolveConversationDirectoryAttachments(sessionId, directoryPaths)
-        : [];
-      if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
-      const messageProfileId = get().selectedProfileId;
-      const reply = await submitLocalAgentCommand({
-        schemaVersion: CONVERSATION_COMMAND_VERSION,
-        type: 'message.submit',
-        commandId: nextId('command'),
-        sessionId,
-        text,
-        ...(attachments.length
-          ? { attachments: attachments.map((attachment) => ({ ...attachment })) }
-          : {}),
-        ...(directoryAttachments.length
-          ? {
-              directoryAttachments: directoryAttachments.map((attachment) => ({
-                ...attachment,
-              })),
-            }
-          : {}),
-        ...(messageProfileId ? { profileId: messageProfileId } : {}),
-      });
-      assertAccepted(reply);
-      await Promise.all([get().refresh(), get().refreshCatalog()]);
-      return reply;
-    } catch (error) {
-      set({ error: errorMessage(error) });
-      throw error;
-    } finally {
-      set({ submitting: false });
+    return await submitNewRun(
+      set,
+      get,
+      'message.submit',
+      text,
+      filesystemPaths,
+      pluginSelections,
+    );
+  },
+
+  focusContext: async (
+    task,
+    filesystemPaths = [],
+    pluginSelections = [],
+  ) => {
+    if (!task.trim()) throw new Error('context_focus_task_empty');
+    const { projection } = get();
+    if (projection?.pendingPlan || projection?.pendingApproval || projection?.pendingInteraction) {
+      throw new Error('context_focus_run_waiting');
     }
+    return await submitNewRun(
+      set,
+      get,
+      'context.focus',
+      task,
+      filesystemPaths,
+      pluginSelections,
+    );
   },
 
   setMessageFeedback: async (messageId, feedback) => {
@@ -508,6 +493,84 @@ async function submitPlanResponse(
   });
 }
 
+async function submitNewRun(
+  set: StoreSet,
+  get: StoreGet,
+  type: 'message.submit' | 'context.focus',
+  text: string,
+  filesystemPaths: PendingFilesystemPath[],
+  pluginSelections: PluginSelectionInput[],
+): Promise<CommandReply> {
+  set({ submitting: true, error: null });
+  try {
+    const messageProfileId = get().selectedProfileId;
+    if (!messageProfileId) throw new Error('llm_profile_unavailable');
+    const pluginCatalog = get().pluginCatalog;
+    const effectivePluginSelections = requiredFilesystemPluginSelections(
+      pluginCatalog,
+      filesystemPaths,
+      pluginSelections,
+    );
+    const availableUris = new Set(pluginCatalog.plugins.map((plugin) => plugin.uri));
+    if (effectivePluginSelections.some((selection) => !availableUris.has(selection.uri))) {
+      throw new Error('plugin_selection_unavailable');
+    }
+    let { sessionId } = get();
+    if (!sessionId) {
+      const { draftProjectId } = get();
+      const created = await createLocalAgentSession({
+        ...(draftProjectId ? { projectId: draftProjectId } : {}),
+      });
+      sessionId = created.sessionId;
+      rememberSession(sessionId);
+      set({ sessionId, projection: created, draftProjectId: null });
+      await get().refreshCatalog();
+    }
+    const filesystemReferences = filesystemPaths.length
+      ? await resolveConversationFilesystemReferences(sessionId, filesystemPaths)
+      : [];
+    if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
+    const common = {
+      schemaVersion: CONVERSATION_COMMAND_VERSION,
+      commandId: nextId('command'),
+      sessionId,
+      ...(filesystemReferences.length
+        ? {
+            filesystemReferences: filesystemReferences.map((reference) => ({
+              ...reference,
+            })),
+          }
+        : {}),
+      profileId: messageProfileId,
+      ...(effectivePluginSelections.length
+        ? {
+            pluginCatalogRevision: pluginCatalog.revision,
+            pluginSelections: effectivePluginSelections.map((selection) => ({ ...selection })),
+          }
+        : {}),
+    };
+    const command: ConversationCommand = type === 'message.submit'
+      ? { ...common, type, text }
+      : { ...common, type, task: text };
+    const reply = await submitLocalAgentCommand(command);
+    assertAccepted(reply);
+    await Promise.all([
+      get().refresh(),
+      get().refreshCatalog(),
+      get().refreshPluginCatalog(),
+    ]);
+    return reply;
+  } catch (error) {
+    if (errorMessage(error).includes('plugin_selection_stale')) {
+      await get().refreshPluginCatalog();
+    }
+    set({ error: errorMessage(error) });
+    throw error;
+  } finally {
+    set({ submitting: false });
+  }
+}
+
 async function submitExisting(
   set: StoreSet,
   get: () => LocalAgentState,
@@ -578,10 +641,6 @@ function enabledProfileId(
   return profiles.find((profile) => profile.id === preferred)?.id ?? profiles[0]?.id ?? null;
 }
 
-function isTerminalRun(status: NonNullable<SessionProjection['run']>['status']): boolean {
-  return ['completed', 'failed', 'cancelled', 'indeterminate'].includes(status);
-}
-
 function shouldApplyProjection(
   current: SessionProjection | null,
   incoming: SessionProjection,
@@ -599,6 +658,37 @@ function sameAssistantDraft(
   return left.runId === right.runId
     && left.turnId === right.turnId
     && left.content === right.content;
+}
+
+function requiredFilesystemPluginSelections(
+  catalog: PluginCatalogProjection,
+  filesystemPaths: readonly PendingFilesystemPath[],
+  explicitSelections: readonly PluginSelectionInput[],
+): PluginSelectionInput[] {
+  const selections = explicitSelections.map((selection) => ({ ...selection }));
+  const selectedUris = new Set(selections.map((selection) => selection.uri));
+  const requiredMediaTypes = new Set(filesystemPaths.flatMap((reference) => (
+    reference.kind === 'file' && reference.path.toLocaleLowerCase().endsWith('.pdf')
+      ? ['application/pdf']
+      : []
+  )));
+  for (const mediaType of requiredMediaTypes) {
+    const matches = catalog.plugins.filter((plugin) => (
+      plugin.activationMediaTypes.includes(mediaType)
+    ));
+    if (matches.length !== 1) {
+      throw new Error(`plugin_selection_unavailable:${mediaType}`);
+    }
+    const plugin = matches[0]!;
+    if (selectedUris.has(plugin.uri)) continue;
+    selections.push({
+      selectionId: nextId('plugin-selection'),
+      uri: plugin.uri,
+      label: plugin.displayName,
+    });
+    selectedUris.add(plugin.uri);
+  }
+  return selections;
 }
 
 function nextId(kind: string): string {

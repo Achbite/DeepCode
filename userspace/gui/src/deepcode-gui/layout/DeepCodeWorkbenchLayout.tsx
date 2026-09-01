@@ -677,7 +677,7 @@ function cacheHitSummary(
       : usage
         ? t(language, 'deepcodeGui.cache.partialTitle', {
             calls: usage.providerCallCount.toLocaleString(language),
-            reported: usage.cacheReportedCallCount.toLocaleString(language),
+            reported: usage.reportedCallCount.toLocaleString(language),
           })
         : t(language, 'deepcodeGui.cache.emptyTitle'),
   };

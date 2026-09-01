@@ -1,6 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import DeepCodeGuiApp from './DeepCodeGuiApp';
+import {
+  createGuiPresentationRegistry,
+  GuiPresentationProvider,
+} from '../presentation/PresentationRuntime';
 import { installNativeContextMenuGuard } from '../utils/nativeContextMenuGuard';
 import { activeT } from '../i18n';
 
@@ -98,17 +102,37 @@ document.documentElement.dataset.shell = isTauriShell ? 'tauri' : 'browser';
 
 installNativeContextMenuGuard();
 
+const root = ReactDOM.createRoot(rootEl);
+const presentationRegistry = createGuiPresentationRegistry();
+let compositionDisposed = false;
+const disposeComposition = () => {
+  if (compositionDisposed) return;
+  compositionDisposed = true;
+  window.removeEventListener('pagehide', handlePageHide);
+  root.unmount();
+  void presentationRegistry.dispose().catch((error) => {
+    console.error('[DeepCode-GUI presentation disposal]', error);
+  });
+};
+const handlePageHide = (event: PageTransitionEvent) => {
+  if (!event.persisted) disposeComposition();
+};
+window.addEventListener('pagehide', handlePageHide);
+import.meta.hot?.dispose(disposeComposition);
+
 try {
-  const root = ReactDOM.createRoot(rootEl);
   reactRootCreated = true;
   root.render(
     <React.StrictMode>
       <ErrorBoundary>
-        <DeepCodeGuiApp />
+        <GuiPresentationProvider registry={presentationRegistry}>
+          <DeepCodeGuiApp />
+        </GuiPresentationProvider>
       </ErrorBoundary>
     </React.StrictMode>
   );
 } catch (error) {
+  disposeComposition();
   if (!reactRootCreated) {
     renderBootstrapError(error);
   } else {

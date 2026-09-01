@@ -5,29 +5,30 @@ import type {
   ModelInteractionRequest,
   PlanOperation,
   ProviderToolDefinition,
-  TodoProgressUpdate,
 } from '@deepcode/protocol';
 import {
-  SESSION_CONTROL_CONTEXT_FOCUS,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_TODO_PROGRESS,
 } from '@deepcode/protocol';
 
-export const SESSION_CONTROL_INSTRUCTIONS = `直接输出 Markdown。一个 Provider turn 有工具或 control call 时，普通文本是过程说明；无调用且正常结束时，普通文本是最终答复。
-需要用户补充或确认时调用 interaction.request。需要执行计划时调用 plan.publish，发布一份完整方案而非强制多选；mutationManifest 必须覆盖实际调用的全部 fs.* 修改，具体字段遵循工具 schema。
-Plan 确认后 Session 生成 Todo；仅用 todo.progress 更新已有 todoId 的状态。一个 turn 最多调用一次 todo.progress，且不能与 interaction.request 或 plan.publish 同时调用。
-当前任务需要主动丢弃无关历史并转向明确焦点时调用 context.focus；它只请求 Session 压缩此前上下文，不回答任务，也不执行工具，且必须独占当前 turn。
-工具调用前仅用一句话说明。interaction.request 与 plan.publish 是阻塞 control，同一 turn 只能调用其中一个且不能并用其他工具。workspace 工具使用当前 binding 的 workspaceId 和工作区相对路径。`;
+export interface SessionControlWireNames {
+  interactionRequest: string;
+  planPublish: string;
+}
 
-const CONTEXT_FOCUS_SCHEMA: JsonObject = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['focus'],
-  properties: {
-    focus: { type: 'string', minLength: 1, maxLength: 16_384 },
-  },
-};
+export function confirmedPlanExecutionInstruction(names: SessionControlWireNames): string {
+  return `The Plan is confirmed. Execute it now; do not ask for confirmation again. The Session tracks Todo progress from completed tool results. Use ${names.interactionRequest} only for a required user decision. Use ${names.planPublish} only when the confirmed Plan must change.`;
+}
+
+export function sessionControlInstructions(
+  names: SessionControlWireNames,
+  hasWorkspaceBindings = true,
+): string {
+  if (!hasWorkspaceBindings) {
+    return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
+  }
+  return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must be the only call in their turn. Use a logical workspace handle from the current Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
+}
 
 const INTERACTION_SCHEMA: JsonObject = {
   type: 'object',
@@ -59,12 +60,12 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
     {
       type: 'object',
       additionalProperties: false,
-      required: ['workspaceId', 'operation', 'target'],
+      required: ['workspace', 'operation', 'target'],
       properties: {
-        workspaceId: { type: 'string', minLength: 1 },
+        workspace: { type: 'string', minLength: 1 },
         operation: {
           type: 'string',
-          enum: ['fs.create', 'fs.write', 'fs.edit', 'fs.ensure_directory'],
+          enum: ['fs.write', 'fs.edit'],
         },
         target: { type: 'string', minLength: 1 },
       },
@@ -72,12 +73,23 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
     {
       type: 'object',
       additionalProperties: false,
-      required: ['workspaceId', 'operation', 'target', 'targetKind'],
+      required: ['workspace', 'operation', 'target', 'targetKind'],
       properties: {
-        workspaceId: { type: 'string', minLength: 1 },
+        workspace: { type: 'string', minLength: 1 },
         operation: { type: 'string', enum: ['fs.delete'] },
         target: { type: 'string', minLength: 1 },
         targetKind: { type: 'string', enum: ['file', 'directoryTree'] },
+      },
+    },
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['workspace', 'operation', 'command', 'workspaceMode'],
+      properties: {
+        workspace: { type: 'string', minLength: 1 },
+        operation: { type: 'string', enum: ['bash'] },
+        command: { type: 'string', minLength: 1, maxLength: 16_384 },
+        workspaceMode: { type: 'string', enum: ['write'] },
       },
     },
   ],
@@ -118,52 +130,16 @@ const PLAN_SCHEMA: JsonObject = {
   },
 };
 
-const TODO_SCHEMA: JsonObject = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['planId', 'revision', 'updates'],
-  properties: {
-    planId: { type: 'string', minLength: 1, maxLength: 128 },
-    revision: { type: 'integer', minimum: 1 },
-    updates: {
-      type: 'array',
-      minItems: 1,
-      maxItems: 12,
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['todoId', 'status'],
-        properties: {
-          todoId: { type: 'string', minLength: 1, maxLength: 128 },
-          status: { type: 'string', enum: ['pending', 'inProgress', 'completed'] },
-        },
-      },
-    },
-  },
-};
-
 export type SessionControlCall =
   | {
       kind: 'interaction';
-      interactionId: string;
+      callId: string;
       request: ModelInteractionRequest;
     }
   | {
       kind: 'plan';
       callId: string;
       draft: PlanPublicationDraft;
-    }
-  | {
-      kind: 'todo';
-      callId: string;
-      planId: string;
-      revision: number;
-      updates: TodoProgressUpdate[];
-    }
-  | {
-      kind: 'focus';
-      callId: string;
-      focus: string;
     };
 
 export interface PlanPublicationDraft {
@@ -177,23 +153,13 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
   return [
     {
       name: SESSION_CONTROL_INTERACTION_REQUEST,
-      description: '主动请求用户补充信息或作出确认，并暂停当前 run 等待回应。',
+      description: 'Ask the user for missing information or a required decision, then pause the run.',
       inputSchema: structuredClone(INTERACTION_SCHEMA) as JsonObject,
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: '发布一份已经收敛的实际执行方案。Session 分配 planId/revision；正文步骤在用户确认后原子生成 Todo。',
+      description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation, including bash with workspaceMode=write; confirmation creates the Todo list.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
-    },
-    {
-      name: SESSION_CONTROL_TODO_PROGRESS,
-      description: '仅更新当前已确认 Plan 所生成 Todo 的状态；不能重写标题、顺序或来源。',
-      inputSchema: structuredClone(TODO_SCHEMA) as JsonObject,
-    },
-    {
-      name: SESSION_CONTROL_CONTEXT_FOCUS,
-      description: '请求 Session 压缩此前上下文并把后续工作聚焦到给定任务；必须独占当前 Provider turn。',
-      inputSchema: structuredClone(CONTEXT_FOCUS_SCHEMA) as JsonObject,
     },
   ];
 }
@@ -206,91 +172,19 @@ export function decodeSessionControlCall(
   if (
     name !== SESSION_CONTROL_INTERACTION_REQUEST
     && name !== SESSION_CONTROL_PLAN_PUBLISH
-    && name !== SESSION_CONTROL_TODO_PROGRESS
-    && name !== SESSION_CONTROL_CONTEXT_FOCUS
   ) return null;
   const canonicalCallId = requiredIdentifier(callId, 'callId');
   if (name === SESSION_CONTROL_INTERACTION_REQUEST) {
     return {
       kind: 'interaction',
-      interactionId: canonicalCallId,
+      callId: canonicalCallId,
       request: decodeInteraction(input),
-    };
-  }
-  if (name === SESSION_CONTROL_TODO_PROGRESS) {
-    const progress = decodeTodoProgress(input);
-    return {
-      kind: 'todo',
-      callId: canonicalCallId,
-      ...progress,
-    };
-  }
-  if (name === SESSION_CONTROL_CONTEXT_FOCUS) {
-    assertExactKeys(input, ['focus']);
-    if (typeof input.focus !== 'string' || !input.focus.trim() || input.focus.length > 16_384) {
-      throw new SessionControlError(
-        'session_control_focus_invalid',
-        'context.focus focus 必须是一至 16384 字符的非空文本。',
-      );
-    }
-    return {
-      kind: 'focus',
-      callId: canonicalCallId,
-      focus: input.focus.trim(),
     };
   }
   return {
     kind: 'plan',
     callId: canonicalCallId,
     draft: decodePlan(input),
-  };
-}
-
-function decodeTodoProgress(value: Record<string, unknown>): {
-  planId: string;
-  revision: number;
-  updates: TodoProgressUpdate[];
-} {
-  assertExactKeys(value, ['planId', 'revision', 'updates']);
-  if (!Array.isArray(value.updates) || value.updates.length < 1 || value.updates.length > 12) {
-    throw new SessionControlError(
-      'session_control_todo_updates_invalid',
-      'todo.progress updates 必须是一至十二项的数组。',
-    );
-  }
-  const seen = new Set<string>();
-  const updates = value.updates.map((candidate): TodoProgressUpdate => {
-    if (!isRecord(candidate)) {
-      throw new SessionControlError(
-        'session_control_todo_item_invalid',
-        'todo.progress update 必须是对象。',
-      );
-    }
-    assertExactKeys(candidate, ['todoId', 'status']);
-    const todoId = requiredIdentifier(candidate.todoId, 'todoId');
-    if (seen.has(todoId)) {
-      throw new SessionControlError(
-        'session_control_todo_id_duplicate',
-        'todo.progress todoId 不能重复。',
-      );
-    }
-    seen.add(todoId);
-    if (
-      candidate.status !== 'pending'
-      && candidate.status !== 'inProgress'
-      && candidate.status !== 'completed'
-    ) {
-      throw new SessionControlError(
-        'session_control_todo_status_invalid',
-        'todo.progress status 必须是 pending、inProgress 或 completed。',
-      );
-    }
-    return { todoId, status: candidate.status };
-  });
-  return {
-    planId: requiredIdentifier(value.planId, 'planId'),
-    revision: requiredPositiveInteger(value.revision, 'revision'),
-    updates,
   };
 }
 
@@ -390,8 +284,24 @@ function decodePlanOperation(value: unknown): PlanOperation {
     );
   }
   const operation = value.operation;
-  const target = normalizedTarget(value.target);
   const workspaceId = requiredIdentifier(value.workspaceId, 'workspaceId');
+  if (operation === 'bash') {
+    assertExactKeys(value, ['workspaceId', 'operation', 'command', 'workspaceMode']);
+    const command = requiredText(value.command, 'command');
+    if (command.length > 16_384 || value.workspaceMode !== 'write') {
+      throw new SessionControlError(
+        'session_control_plan_shell_invalid',
+        'bash Plan operation 必须声明有界 command 和 workspaceMode=write。',
+      );
+    }
+    return {
+      workspaceId,
+      operation,
+      command,
+      workspaceMode: 'write',
+    };
+  }
+  const target = normalizedTarget(value.target);
   if (operation === 'fs.delete') {
     assertExactKeys(value, ['workspaceId', 'operation', 'target', 'targetKind']);
     if (value.targetKind !== 'file' && value.targetKind !== 'directoryTree') {
@@ -403,7 +313,7 @@ function decodePlanOperation(value: unknown): PlanOperation {
     return { workspaceId, operation, target, targetKind: value.targetKind };
   }
   assertExactKeys(value, ['workspaceId', 'operation', 'target']);
-  if (!['fs.create', 'fs.write', 'fs.edit', 'fs.ensure_directory'].includes(String(operation))) {
+  if (!['fs.write', 'fs.edit'].includes(String(operation))) {
     throw new SessionControlError(
       'session_control_plan_operation_unknown',
       'Plan operation 不属于 v2 闭合集合。',
@@ -411,7 +321,7 @@ function decodePlanOperation(value: unknown): PlanOperation {
   }
   return {
     workspaceId,
-    operation: operation as Exclude<PlanOperation['operation'], 'fs.delete'>,
+    operation: operation as Exclude<PlanOperation['operation'], 'fs.delete' | 'bash'>,
     target,
   };
 }

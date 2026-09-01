@@ -1551,13 +1551,13 @@
   --deepcode-context-color: var(--deepcode-context-messages);
 }
 
-.deepcode-session-model__context-detail > span[data-context-key='messageAttachments'],
-.deepcode-session-model__context-sections > button[data-context-key='messageAttachments'] > span:first-child,
-.deepcode-session-model__composition-segment[data-context-key='messageAttachments'] {
+.deepcode-session-model__context-detail > span[data-context-key='filesystemReferences'],
+.deepcode-session-model__context-sections > button[data-context-key='filesystemReferences'] > span:first-child,
+.deepcode-session-model__composition-segment[data-context-key='filesystemReferences'] {
   background: var(--deepcode-context-attachments);
 }
 
-.deepcode-session-model__context-sections > button[data-context-key='messageAttachments'] {
+.deepcode-session-model__context-sections > button[data-context-key='filesystemReferences'] {
   --deepcode-context-color: var(--deepcode-context-attachments);
 }
 

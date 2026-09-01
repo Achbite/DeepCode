@@ -18,7 +18,7 @@ const SHELL_ENVIRONMENT_FIELDS = [
 ] as const;
 
 export function isShellActivityResult(value: unknown): boolean {
-  return isExactRecord(value, SHELL_ACTIVITY_RESULT_FIELDS, ['environment'])
+  return isExactRecord(value, [...SHELL_ACTIVITY_RESULT_FIELDS, 'environment'])
     && typeof value.stdout === 'string'
     && typeof value.stderr === 'string'
     && (value.exitCode === null
@@ -28,7 +28,7 @@ export function isShellActivityResult(value: unknown): boolean {
     && typeof value.truncated === 'boolean'
     && isNaturalNumber(value.capturedBytes)
     && isNaturalNumber(value.durationMs)
-    && (value.environment === undefined || isShellExecutionEnvironment(value.environment));
+    && isShellExecutionEnvironment(value.environment);
 }
 
 export function isShellExecutionEnvironment(value: unknown): boolean {
@@ -37,7 +37,10 @@ export function isShellExecutionEnvironment(value: unknown): boolean {
     && value.shell.trim().length > 0
     && value.interactive === false
     && value.pathSource === 'hostPlusStandardDeveloperPaths'
-    && value.writeScope === 'workspaceAndKernelTemporary'
+    && (
+      value.writeScope === 'kernelTemporaryOnly'
+      || value.writeScope === 'workspaceAndKernelTemporary'
+    )
     && value.homeWritable === false;
 }
 

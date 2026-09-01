@@ -12,23 +12,11 @@ pub(crate) type KernelInvocationCanonicalizer =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelExecutorBinding {
     FsRead,
-    FsStat,
-    FsList,
-    FsGlob,
-    FsDiff,
-    FsCreate,
     FsWrite,
     FsEdit,
     FsDelete,
-    FsEnsureDirectory,
-    CodeGrep,
-    DocumentRead,
     WebSearch,
     WebFetch,
-    GithubSearch,
-    GithubRead,
-    ArxivSearch,
-    ArxivRead,
     ProcessShell,
 }
 
@@ -76,38 +64,11 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
 
     [
         tool(Tool::FsRead, Executor::FsRead, Read, WorkspaceRead),
-        tool(Tool::FsStat, Executor::FsStat, Read, WorkspaceRead),
-        tool(Tool::FsList, Executor::FsList, Read, WorkspaceRead),
-        tool(Tool::FsGlob, Executor::FsGlob, Read, WorkspaceRead),
-        tool(Tool::FsDiff, Executor::FsDiff, Read, WorkspaceRead),
-        tool(Tool::CodeGrep, Executor::CodeGrep, Read, WorkspaceRead),
-        tool(Tool::FsCreate, Executor::FsCreate, Mutation, WorkspaceWrite),
         tool(Tool::FsWrite, Executor::FsWrite, Mutation, WorkspaceWrite),
         tool(Tool::FsEdit, Executor::FsEdit, Mutation, WorkspaceWrite),
         tool(Tool::FsDelete, Executor::FsDelete, Mutation, WorkspaceWrite),
-        tool(
-            Tool::FsEnsureDirectory,
-            Executor::FsEnsureDirectory,
-            Mutation,
-            WorkspaceWrite,
-        ),
-        tool(
-            Tool::DocumentRead,
-            Executor::DocumentRead,
-            Read,
-            WorkspaceRead,
-        ),
         tool(Tool::WebSearch, Executor::WebSearch, Read, NetworkRead),
         tool(Tool::WebFetch, Executor::WebFetch, Read, NetworkRead),
-        tool(
-            Tool::GithubSearch,
-            Executor::GithubSearch,
-            Read,
-            NetworkRead,
-        ),
-        tool(Tool::GithubRead, Executor::GithubRead, Read, NetworkRead),
-        tool(Tool::ArxivSearch, Executor::ArxivSearch, Read, NetworkRead),
-        tool(Tool::ArxivRead, Executor::ArxivRead, Read, NetworkRead),
         tool(
             Tool::ProcessShell,
             Executor::ProcessShell,
@@ -164,100 +125,35 @@ macro_rules! invocation_canonicalizer {
 }
 
 invocation_canonicalizer!(canonicalize_fs_read, KernelToolKind::FsRead);
-invocation_canonicalizer!(canonicalize_fs_stat, KernelToolKind::FsStat);
-invocation_canonicalizer!(canonicalize_fs_list, KernelToolKind::FsList);
-invocation_canonicalizer!(canonicalize_fs_glob, KernelToolKind::FsGlob);
-invocation_canonicalizer!(canonicalize_fs_diff, KernelToolKind::FsDiff);
-invocation_canonicalizer!(canonicalize_code_grep, KernelToolKind::CodeGrep);
-invocation_canonicalizer!(canonicalize_fs_create, KernelToolKind::FsCreate);
 invocation_canonicalizer!(canonicalize_fs_write, KernelToolKind::FsWrite);
 invocation_canonicalizer!(canonicalize_fs_edit, KernelToolKind::FsEdit);
 invocation_canonicalizer!(canonicalize_fs_delete, KernelToolKind::FsDelete);
-invocation_canonicalizer!(
-    canonicalize_fs_ensure_directory,
-    KernelToolKind::FsEnsureDirectory
-);
-invocation_canonicalizer!(canonicalize_document_read, KernelToolKind::DocumentRead);
 invocation_canonicalizer!(canonicalize_web_search, KernelToolKind::WebSearch);
 invocation_canonicalizer!(canonicalize_web_fetch, KernelToolKind::WebFetch);
-invocation_canonicalizer!(canonicalize_github_search, KernelToolKind::GithubSearch);
-invocation_canonicalizer!(canonicalize_github_read, KernelToolKind::GithubRead);
-invocation_canonicalizer!(canonicalize_arxiv_search, KernelToolKind::ArxivSearch);
-invocation_canonicalizer!(canonicalize_arxiv_read, KernelToolKind::ArxivRead);
 invocation_canonicalizer!(canonicalize_process_shell, KernelToolKind::ProcessShell);
 
 fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
     match tool {
         KernelToolKind::FsRead => canonicalize_fs_read,
-        KernelToolKind::FsStat => canonicalize_fs_stat,
-        KernelToolKind::FsList => canonicalize_fs_list,
-        KernelToolKind::FsGlob => canonicalize_fs_glob,
-        KernelToolKind::FsDiff => canonicalize_fs_diff,
-        KernelToolKind::CodeGrep => canonicalize_code_grep,
-        KernelToolKind::FsCreate => canonicalize_fs_create,
         KernelToolKind::FsWrite => canonicalize_fs_write,
         KernelToolKind::FsEdit => canonicalize_fs_edit,
         KernelToolKind::FsDelete => canonicalize_fs_delete,
-        KernelToolKind::FsEnsureDirectory => canonicalize_fs_ensure_directory,
-        KernelToolKind::DocumentRead => canonicalize_document_read,
         KernelToolKind::WebSearch => canonicalize_web_search,
         KernelToolKind::WebFetch => canonicalize_web_fetch,
-        KernelToolKind::GithubSearch => canonicalize_github_search,
-        KernelToolKind::GithubRead => canonicalize_github_read,
-        KernelToolKind::ArxivSearch => canonicalize_arxiv_search,
-        KernelToolKind::ArxivRead => canonicalize_arxiv_read,
         KernelToolKind::ProcessShell => canonicalize_process_shell,
     }
 }
 
 fn tool_description(tool: KernelToolKind) -> &'static str {
     match tool {
-        KernelToolKind::CodeGrep => {
-            "Search workspace text with a bounded literal or regular expression query. Omit path for the workspace root; never pass an empty path."
-        }
-        KernelToolKind::DocumentRead => "Read bounded text from a workspace PDF document.",
-        KernelToolKind::FsCreate => {
-            "Create a new workspace file without overwriting an existing target. The parent directory must already exist; call fs.ensure_directory first when needed, and include both mutations in any required Plan manifest."
-        }
-        KernelToolKind::FsDelete => {
-            "Delete one explicitly selected workspace file or directory tree."
-        }
-        KernelToolKind::FsDiff => {
-            "Preview the textual difference for proposed workspace file content."
-        }
-        KernelToolKind::FsEdit => {
-            "Apply one exact, preconditioned edit to an existing workspace file. Match and replacement strings are literal file content; encode JSON line breaks once as \\n. A lineRange digest must be copied in full from fs.read, including its sha256: prefix."
-        }
-        KernelToolKind::FsEnsureDirectory => {
-            "Ensure that an explicitly selected workspace directory exists. This is a distinct workspace mutation and must be listed explicitly in any required Plan manifest."
-        }
-        KernelToolKind::FsGlob => {
-            "Find workspace paths matching a bounded glob pattern. Omit path for the workspace root; never pass an empty path."
-        }
-        KernelToolKind::FsList => {
-            "List a bounded workspace directory tree. Omit path for the workspace root; never pass an empty path."
-        }
-        KernelToolKind::FsRead => "Read bounded text from a workspace file.",
-        KernelToolKind::FsStat => {
-            "Inspect the exact existence and type of one workspace-relative path."
-        }
-        KernelToolKind::FsWrite => "Replace the content of an existing workspace file.",
+        KernelToolKind::FsDelete => "Delete one explicitly named workspace file or directory tree.",
+        KernelToolKind::FsEdit => "Apply exact, non-overlapping text replacements to one existing workspace file.",
+        KernelToolKind::FsRead => "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files.",
+        KernelToolKind::FsWrite => "Create or replace one workspace file and any missing parent directories.",
         KernelToolKind::WebFetch => "Fetch bounded HTTP or HTTPS text.",
         KernelToolKind::WebSearch => {
             "Search the web through the built-in RSS backend or an explicitly configured JSON endpoint."
         }
-        KernelToolKind::GithubSearch => {
-            "Search GitHub repositories, code, or issues with explicit paging."
-        }
-        KernelToolKind::GithubRead => {
-            "Read repository contents from GitHub by owner/name, path, and optional ref."
-        }
-        KernelToolKind::ArxivSearch => {
-            "Search arXiv metadata with explicit field, paging, and ordering."
-        }
-        KernelToolKind::ArxivRead => "Read one arXiv paper's canonical metadata and links.",
-        KernelToolKind::ProcessShell => {
-            "Run one bounded non-interactive /bin/sh command from a canonical workspace-relative directory. PATH includes Host and standard developer-tool directories. Writes are limited to the workspace and Kernel-owned $TMPDIR; HOME is read-only. Point mutable tool state at $TMPDIR or the workspace."
-        }
+        KernelToolKind::ProcessShell => "Execute a non-interactive Bash command in the bound workspace. Use workspaceMode \"read\" unless the command changes workspace files; read mode may write temporary files only under $TMPDIR. Use \"write\" only for confirmed workspace mutations. Output and execution time are bounded.",
     }
 }
