@@ -29,6 +29,12 @@ COMMAND_VERSION = "deepcode.command.v3"
 GENERATION_ONE = "SKILL_GENERATION_ONE"
 GENERATION_TWO = "SKILL_GENERATION_TWO"
 ATTACHMENT_CONTENT = "LOCAL_ATTACHMENT_CONTENT_MUST_NOT_REACH_PROVIDER"
+PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
+FIRST_PARTY_PLUGIN_URIS = {
+    "plugin://github@first-party",
+    "plugin://arxiv@first-party",
+    "plugin://pdf@first-party",
+}
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -88,6 +94,33 @@ class ProviderState:
             for message in messages
             if isinstance(message, dict)
         )
+        guidance_messages = [
+            message_text(message.get("content"))
+            for message in messages
+            if isinstance(message, dict)
+            and message.get("role") == "system"
+            and message_text(message.get("content")).startswith("Active tool guidance:")
+        ]
+        require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
+        guidance = guidance_messages[0]
+        require(
+            "- fs_read: Read UTF-8 workspace text directly or in bounded segments." in guidance,
+            "fs.read prompt snippet 未进入 Provider 请求",
+        )
+        require(
+            "instead of shell commands such as cat or sed" in guidance,
+            "fs.read 优先于 shell 文本读取的 guidance 缺失",
+        )
+        require(
+            "- bash: List, search, discover, build, test, and run commands." in guidance,
+            "bash prompt snippet 未进入 Provider 请求",
+        )
+        require(
+            "Do not use this as the default way to read a known UTF-8 workspace text file."
+            in guidance,
+            "bash 与 fs.read 的职责边界 guidance 缺失",
+        )
+        require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
         tools_by_description: dict[str, list[str]] = {}
         for item in body["tools"]:
             function = item.get("function") if isinstance(item, dict) else None
@@ -119,6 +152,28 @@ class ProviderState:
         fetch_tools = tools_by_description.get("Fetch bounded HTTP or HTTPS text.", [])
         require(len(search_tools) == 1, "Provider 请求没有唯一的 web.search 工具")
         require(len(fetch_tools) == 1, "Provider 请求没有唯一的 web.fetch 工具")
+        expected_first_party_descriptions = {
+            "Search GitHub repositories, code, or issues with GitHub's native Search API.",
+            "Read a GitHub repository directory listing or UTF-8 file through the Contents API.",
+            "Search arXiv paper metadata through the arXiv Atom API.",
+            "Read one canonical arXiv paper metadata record by arXiv identifier.",
+            "Extract text from a bounded page range of a PDF in the current workspace binding.",
+        }
+        require(
+            all(len(tools_by_description.get(description, [])) == 1
+                for description in expected_first_party_descriptions),
+            "Provider 请求没有精确暴露 GitHub/arXiv/PDF first-party 工具",
+        )
+        pdf_tools = tools_by_description[
+            "Extract text from a bounded page range of a PDF in the current workspace binding."
+        ]
+        require(
+            "Search GitHub repositories, code, and issues through GitHub's native API." in guidance
+            and "Search arXiv paper metadata through its native Atom API." in guidance
+            and "Read bounded page ranges from a PDF attached to the current workspace binding."
+            in guidance,
+            "first-party tool prompt contribution 未进入 Provider 请求",
+        )
         results = {
             str(message.get("tool_call_id")): message_text(message.get("content"))
             for message in messages
@@ -157,6 +212,10 @@ class ProviderState:
                 any(ATTACHMENT_CONTENT in content for content in results.values()),
                 "第一轮 fs.read 未按逻辑引用惰性读取文件快照",
             )
+            require(
+                any(PDF_CONTENT in content for content in results.values()),
+                "第一轮 pdf.read 未从 Kernel prepared workspace binding 提取正文",
+            )
         elif ordinal == 3:
             require(GENERATION_TWO in joined, "下一 run 未加载新 Skill generation")
             require(GENERATION_ONE not in joined, "下一 run 仍暴露旧 Skill generation")
@@ -184,6 +243,7 @@ class ProviderState:
         return {
             "read": provider_tool_names[0],
             "reverse": wire_name,
+            "pdf": pdf_tools[0],
             "search": search_tools[0],
             "fetch": fetch_tools[0],
         }
@@ -256,6 +316,12 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
                         "path": "e2e-note.txt",
                     }),
                     ("provider-call-one", wire_names["reverse"], {"text": "alpha"}),
+                    ("provider-call-pdf-one", wire_names["pdf"], {
+                        "workspace": "primary",
+                        "path": "fixture.pdf",
+                        "startPage": 1,
+                        "endPage": 1,
+                    }),
                     ("provider-call-search-one", wire_names["search"], {
                         "query": "fixture",
                         "limit": 1,
@@ -384,6 +450,41 @@ def message_text(value: Any) -> str:
     if value is None:
         return ""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def write_pdf_fixture(path: Path, text: str) -> None:
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET\n".encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        ),
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
+        + stream + b"endstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    encoded = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, value in enumerate(objects, start=1):
+        offsets.append(len(encoded))
+        encoded.extend(f"{index} 0 obj\n".encode("ascii"))
+        encoded.extend(value)
+        encoded.extend(b"\nendobj\n")
+    xref_offset = len(encoded)
+    encoded.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    encoded.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        encoded.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    encoded.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(encoded)
 
 
 class OwnedDaemon:
@@ -598,6 +699,7 @@ def wait_completed(
         if run.get("status") in {"failed", "cancelled", "indeterminate"}:
             raise AssertionError(
                 f"Session 在到达 {label} 前终止：{run.get('status')} {current.get('terminalError')}"
+                f"\ndaemon:\n{daemon.log_tail()}"
             )
         return None
 
@@ -642,6 +744,30 @@ def assert_legacy_attachment_command_rejected(
     require(envelope.get("ok") is False, "旧附件字段被当前 Session wire 合同接受")
 
 
+def selected_plugin_catalog(daemon: OwnedDaemon, label: str) -> tuple[str, list[dict[str, Any]]]:
+    catalog = api_json(
+        daemon.base_url,
+        "/api/conversation/plugins",
+        token=daemon.token,
+    )
+    require(isinstance(catalog, dict), f"{label} PluginCatalogProjection 不是对象")
+    revision = catalog.get("revision")
+    plugins = catalog.get("plugins")
+    require(isinstance(revision, str) and revision, f"{label} 插件目录 revision 无效")
+    require(isinstance(plugins, list), f"{label} 插件目录不是数组")
+    typed_plugins = [plugin for plugin in plugins if isinstance(plugin, dict)]
+    require(len(typed_plugins) == len(plugins), f"{label} 插件目录项不是对象")
+    uris = {plugin.get("uri") for plugin in typed_plugins}
+    require(FIRST_PARTY_PLUGIN_URIS.issubset(uris), f"{label} 缺少 first-party 插件")
+    require(
+        len(typed_plugins) == 5
+        and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@skill")]) == 1
+        and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@mcp")]) == 1,
+        f"{label} 必须精确暴露三项 first-party 插件及当前 Skill/MCP fixture",
+    )
+    return revision, typed_plugins
+
+
 def submit_message(
     daemon: OwnedDaemon,
     session_id: str,
@@ -649,16 +775,7 @@ def submit_message(
     text: str,
     filesystem_references: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    catalog = api_json(
-        daemon.base_url,
-        "/api/conversation/plugins",
-        token=daemon.token,
-    )
-    require(isinstance(catalog, dict), "PluginCatalogProjection 不是对象")
-    revision = catalog.get("revision")
-    plugins = catalog.get("plugins")
-    require(isinstance(revision, str) and revision, "插件目录 revision 无效")
-    require(isinstance(plugins, list) and len(plugins) == 2, "fixture 必须暴露 Skill 与 MCP 两个插件")
+    revision, plugins = selected_plugin_catalog(daemon, "message.submit")
     selections = []
     for index, plugin in enumerate(plugins):
         require(isinstance(plugin, dict), "插件目录项不是对象")
@@ -700,14 +817,7 @@ def start_cli_ask_with_file(
     file_path: Path,
     text: str,
 ) -> subprocess.Popen[str]:
-    catalog = api_json(
-        daemon.base_url,
-        "/api/conversation/plugins",
-        token=daemon.token,
-    )
-    require(isinstance(catalog, dict), "CLI ask 前插件目录无效")
-    plugins = catalog.get("plugins")
-    require(isinstance(plugins, list) and len(plugins) == 2, "CLI ask 缺少两个 fixture 插件")
+    _, plugins = selected_plugin_catalog(daemon, "CLI ask")
     command = [
         str(CLI_BINARY),
         "--api", daemon.base_url,
@@ -835,8 +945,8 @@ def assert_projection_flow(value: dict[str, Any]) -> None:
         if activity.get("kind") == "tool" and activity.get("status") == "completed"
     ]
     require(
-        len(completed_tools) == 7,
-        "两轮惰性文件读取/MCP/web 调用未形成七个 completed activity",
+        len(completed_tools) == 8,
+        "两轮惰性文件读取/MCP/PDF/web 调用未形成八个 completed activity",
     )
 
     usage = value.get("tokenUsage") or {}
@@ -880,7 +990,7 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
             "WHERE session_id=? ORDER BY completed_at, call_id",
             (session_id,),
         ).fetchall()
-    require(len(record_rows) == 7, "两轮链路没有七个文件读取/MCP/web ToolRecord")
+    require(len(record_rows) == 8, "两轮链路没有八个文件读取/MCP/PDF/web ToolRecord")
     records_by_run: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for run_id, call_id, encoded in record_rows:
         records_by_run.setdefault(run_id, []).append((call_id, json.loads(encoded)))
@@ -899,6 +1009,10 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
         payload = json.loads(encoded)
         runtime = payload.get("runtimeSnapshot")
         require(isinstance(runtime, dict), "run.started 缺少 runtimeSnapshot")
+        workspace_bindings = payload.get("workspaceBindings")
+        require(isinstance(workspace_bindings, list) and workspace_bindings, "run.started 缺少 workspace bindings")
+        primary_workspace_id = workspace_bindings[0].get("workspaceId")
+        require(isinstance(primary_workspace_id, str) and primary_workspace_id, "primary workspaceId 无效")
         runtime_tools = runtime.get("tools", [])
         require(isinstance(runtime_tools, list), "run runtime tools 不是数组")
         runtime_core_tools = [
@@ -914,6 +1028,38 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
             ],
             "Kernel runtime snapshot 未包含精确七项基础工具",
         )
+        runtime_tools_by_name = {
+            tool.get("name"): tool for tool in runtime_tools if isinstance(tool, dict)
+        }
+        prompt_contributions = runtime.get("toolPromptContributions")
+        require(isinstance(prompt_contributions, list), "run runtime 缺少 tool prompt snapshot")
+        require(
+            [item.get("canonicalToolName") for item in prompt_contributions]
+            == [
+                "fs.read", "bash",
+                "arxiv.read", "arxiv.search",
+                "github.read", "github.search",
+                "pdf.read",
+            ],
+            "run runtime 未按稳定顺序冻结 core/first-party tool guidance",
+        )
+        for contribution in prompt_contributions:
+            tool_name = contribution.get("canonicalToolName")
+            target = runtime_tools_by_name.get(tool_name)
+            require(isinstance(target, dict), "tool prompt 指向不存在的 runtime tool")
+            if tool_name in {"fs.read", "bash"}:
+                require(contribution.get("origin") == "coreBuiltin", "core tool prompt origin 漂移")
+                require("pluginUri" not in contribution, "core tool prompt 错误携带 pluginUri")
+            else:
+                require(contribution.get("origin") == "extension", "first-party prompt origin 漂移")
+                require(
+                    contribution.get("pluginUri") in FIRST_PARTY_PLUGIN_URIS,
+                    "first-party prompt 缺少精确 pluginUri",
+                )
+            require(
+                contribution.get("preparedToolBindingRef") == target.get("toolBindingRef"),
+                "tool prompt 没有绑定当前 run 的 prepared tool",
+            )
         reverse_tools = [
             tool
             for tool in runtime_tools
@@ -927,7 +1073,7 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
             "MCP prepared tool 缺少精确 pluginUri",
         )
         run_records = records_by_run.get(run_id, [])
-        expected_record_count = 4 if run_index == 0 else 3
+        expected_record_count = 5 if run_index == 0 else 3
         require(
             len(run_records) == expected_record_count,
             f"当前 run 没有精确 {expected_record_count} 个 ToolRecord",
@@ -956,6 +1102,22 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
         require(isinstance(plugin_instance, str) and plugin_instance, "MCP 缺少 PluginInstanceRef")
         plugin_instances.append(plugin_instance)
         web_records = {candidate.get("toolName"): candidate for _, candidate in run_records}
+        if run_index == 0:
+            pdf_tool = runtime_tools_by_name.get("pdf.read")
+            require(isinstance(pdf_tool, dict), "run snapshot 缺少 pdf.read")
+            require(pdf_tool.get("possibleEffects") == ["workspaceRead"], "pdf.read effect scope 错误")
+            require(pdf_tool.get("pluginUri") == "plugin://pdf@first-party", "pdf.read plugin owner 错误")
+            pdf_record = web_records.get("pdf.read")
+            require(isinstance(pdf_record, dict), "第一轮缺少 pdf.read ToolRecord")
+            require(pdf_record.get("outcome") == "completed", "pdf.read ToolRecord 未完成")
+            require(pdf_record.get("input", {}).get("path") == "fixture.pdf", "pdf.read 输入路径漂移")
+            require(
+                PDF_CONTENT in json.dumps(pdf_record.get("output"), ensure_ascii=False),
+                "pdf.read ToolRecord 未包含真实提取正文",
+            )
+            pdf_effect = pdf_record.get("preparedEffect") or {}
+            require(pdf_effect.get("workspaceId") == primary_workspace_id, "pdf.read workspace binding 错误")
+            require(pdf_effect.get("logicalTargets") == ["fixture.pdf"], "pdf.read logical target 漂移")
         require("Fixture search result" in json.dumps(
             web_records["web.search"].get("output"), ensure_ascii=False,
         ), "web.search 没有真实返回结构化结果")
@@ -986,8 +1148,8 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
         )
         require(released_payload.get("alreadyReleased") is False, "首次 release 被错误标为重放")
         require(
-            len(released_payload.get("pluginInstanceRefs", [])) == 2,
-            "release receipt 未列出当前 run 的 Skill/MCP plugin lease",
+            len(released_payload.get("pluginInstanceRefs", [])) == 5,
+            "release receipt 未列出当前 run 的三项 first-party/Skill/MCP plugin lease",
         )
         completed_order = [
             event_payload.get("record", {}).get("toolName")
@@ -995,7 +1157,7 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
             if event_type == "tool.completed"
         ]
         expected_completed_order = (
-            ["fs.read", tool.get("name"), "web.search", "web.fetch"]
+            ["fs.read", tool.get("name"), "pdf.read", "web.search", "web.fetch"]
             if run_index == 0
             else [tool.get("name"), "web.search", "web.fetch"]
         )
@@ -1039,6 +1201,16 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
     ):
         require(snapshots[0].get(key) != snapshots[1].get(key), f"下一 run 未更新 {key}")
     require(snapshots[0]["tools"] != snapshots[1]["tools"], "下一 run 的工具 snapshot 未更新")
+    prompt_bindings = [
+        [item.get("preparedToolBindingRef") for item in snapshot["toolPromptContributions"]]
+        for snapshot in snapshots
+    ]
+    require(prompt_bindings[0] != prompt_bindings[1], "下一 run 未重新绑定 tool prompt snapshot")
+    prompt_content = [[
+        {key: value for key, value in item.items() if key != "preparedToolBindingRef"}
+        for item in snapshot["toolPromptContributions"]
+    ] for snapshot in snapshots]
+    require(prompt_content[0] == prompt_content[1], "稳定 core tool guidance 文本发生漂移")
     require(plugin_instances[0] != plugin_instances[1], "两代 MCP 复用了 PluginInstanceRef")
     require(
         first_receipts[0]["stableCoreHash"] == first_receipts[1]["stableCoreHash"],
@@ -1138,6 +1310,7 @@ def main() -> None:
             config_root.mkdir()
             workspace_root.mkdir()
             skill_root.mkdir()
+            write_pdf_fixture(workspace_root / "fixture.pdf", PDF_CONTENT)
             attachment_file = root / "e2e-note.txt"
             attachment_file.write_text(ATTACHMENT_CONTENT, encoding="utf-8")
             skill_file = skill_root / "SKILL.md"
@@ -1273,7 +1446,8 @@ def main() -> None:
 
             print(
                 "[local-agent-e2e] PASS "
-                "basic-loop/sequential-tools/web/plugin/cache/release/restart/filesystem-reference/shared-projection "
+                "basic-loop/sequential-tools/web/first-party-plugin/pdf-binding/cache/release/restart/"
+                "filesystem-reference/shared-projection "
                 "(CLI chain verification only; not GUI, package, or release acceptance)"
             )
     finally:

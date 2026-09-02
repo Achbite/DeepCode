@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "deepcode.first-party-plugin.v1",
+  "id": "pdf",
+  "uri": "plugin://pdf@first-party",
+  "displayName": "PDF Reader",
+  "shortDescription": "Extract bounded page ranges from PDF files in the current prepared workspace binding.",
+  "activationMediaTypes": ["application/pdf"],
+  "providerRef": "tool-provider:first-party:pdf",
+  "capabilityRefs": [
+    "pdf:paged-text-read"
+  ],
+  "capabilitySummary": "Reads bounded page ranges from PDF files attached through the current workspace binding.",
+  "tools": [
+    {
+      "remoteName": "read",
+      "canonicalName": "pdf.read",
+      "description": "Extract text from a bounded page range of a PDF in the current workspace binding.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "description": "Workspace-relative path from an attached filesystem reference." },
+          "startPage": { "type": "integer", "minimum": 1, "default": 1 },
+          "endPage": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      },
+      "effect": "workspaceRead",
+      "binding": { "kind": "workspacePath", "argument": "path" },
+      "toolContributionRef": "tool-contribution:first-party:pdf.read",
+      "promptContribution": {
+        "contributionRef": "tool-prompt-contribution:first-party:pdf.read",
+        "promptSnippet": "Read bounded page ranges from a PDF attached to the current workspace binding.",
+        "usageGuidelines": [
+          "Use the logical workspace handle and workspace-relative path shown in the message's filesystem references.",
+          "Read another bounded page range when the result reports remaining pages or truncated output."
+        ]
+      }
+    }
+  ]
+}

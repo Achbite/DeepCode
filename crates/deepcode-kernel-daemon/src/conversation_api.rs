@@ -1775,25 +1775,14 @@ mod tests {
 
     #[test]
     fn pdf_reference_requires_the_declared_media_type_plugin_selection() {
-        let skill_tree = TemporaryTree::new("deepcode-pdf-skill");
-        let skill_path = skill_tree.0.join("SKILL.md");
-        std::fs::write(&skill_path, "# PDF reader\nRead PDF files lazily.\n")
-            .expect("write PDF Skill fixture");
-        let mounts = json!([{
-            "id": "pdf-reader",
-            "path": skill_path.to_string_lossy(),
-            "enabled": true,
-            "activationMediaTypes": ["application/pdf"],
-        }]);
-        let settings = json!({
-            "skills.mounts": serde_json::to_string(&mounts).expect("encode Skill mounts"),
-        });
+        let settings = json!({});
         let required_uri = crate::local_agent_plugins::plugin_uri_for_activation_media_type(
             &settings,
             "application/pdf",
         )
         .expect("resolve activation owner")
         .expect("PDF activation owner");
+        assert_eq!(required_uri, "plugin://pdf@first-party");
         let mut command = json!({
             "filesystemReferences": [{
                 "referenceId": "reference:pdf",
@@ -1818,11 +1807,5 @@ mod tests {
             "label": "PDF reader",
         }]);
         assert!(validate_required_filesystem_plugins(&settings, &command).is_ok());
-        assert_eq!(
-            validate_required_filesystem_plugins(&json!({}), &command)
-                .expect_err("unavailable PDF plugin")
-                .0,
-            "plugin_selection_unavailable"
-        );
     }
 }

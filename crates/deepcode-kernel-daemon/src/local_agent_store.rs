@@ -3744,6 +3744,7 @@ fn validate_run_runtime_snapshot(
             "provider",
             "instructions",
             "tools",
+            "toolPromptContributions",
             "providerToolAliases",
             "selectedPlugins",
         ],
@@ -3845,6 +3846,7 @@ fn validate_run_runtime_snapshot(
     let mut tool_names = std::collections::HashSet::with_capacity(tools.len());
     let mut binding_refs = std::collections::HashSet::with_capacity(tools.len());
     let mut callable_tool_names = std::collections::HashSet::with_capacity(tools.len());
+    let mut tool_prompt_targets = std::collections::HashMap::with_capacity(tools.len());
     for tool in tools {
         let has_plugin_uri = tool.get("pluginUri").is_some();
         exact_object(
@@ -3928,7 +3930,7 @@ fn validate_run_runtime_snapshot(
                 "runtimeSnapshot tool origin 无效。",
             ));
         }
-        if origin == "extension" {
+        let plugin_uri = if origin == "extension" {
             let plugin_uri = required_string(tool, "pluginUri")?;
             if !plugin_uri.starts_with("plugin://")
                 || plugin_uri.split('@').count() != 2
@@ -3939,10 +3941,153 @@ fn validate_run_runtime_snapshot(
                     "extension runtimeSnapshot tool 缺少合法 pluginUri。",
                 ));
             }
+            Some(plugin_uri.to_string())
         } else if has_plugin_uri {
             return Err(LocalAgentStoreError::new(
                 "session_event_invalid",
                 "core runtimeSnapshot tool 不能携带 pluginUri。",
+            ));
+        } else {
+            None
+        };
+        tool_prompt_targets.insert(
+            name.to_string(),
+            (
+                binding_ref.to_string(),
+                availability.to_string(),
+                origin.to_string(),
+                plugin_uri,
+            ),
+        );
+    }
+
+    let tool_prompt_contributions = value
+        .get("toolPromptContributions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot toolPromptContributions 必须是数组。",
+            )
+        })?;
+    if tool_prompt_contributions.len() > 128 {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot toolPromptContributions 超过单次上限。",
+        ));
+    }
+    let mut prompt_contribution_refs =
+        std::collections::HashSet::with_capacity(tool_prompt_contributions.len());
+    let mut prompt_tool_names =
+        std::collections::HashSet::with_capacity(tool_prompt_contributions.len());
+    let mut prompt_binding_refs =
+        std::collections::HashSet::with_capacity(tool_prompt_contributions.len());
+    let mut prompt_plugin_uris = std::collections::HashSet::new();
+    for contribution in tool_prompt_contributions {
+        let has_plugin_uri = contribution.get("pluginUri").is_some();
+        let has_prompt_snippet = contribution.get("promptSnippet").is_some();
+        let mut optional = Vec::new();
+        if has_plugin_uri {
+            optional.push("pluginUri");
+        }
+        if has_prompt_snippet {
+            optional.push("promptSnippet");
+        }
+        exact_object(
+            contribution,
+            &[
+                "contributionRef",
+                "preparedToolBindingRef",
+                "canonicalToolName",
+                "origin",
+                "usageGuidelines",
+            ],
+            &optional,
+        )?;
+        let contribution_ref = required_string(contribution, "contributionRef")?;
+        let prepared_binding_ref = required_string(contribution, "preparedToolBindingRef")?;
+        let canonical_tool_name = required_string(contribution, "canonicalToolName")?;
+        validate_runtime_identity("toolPromptContributionRef", contribution_ref)?;
+        validate_runtime_identity("preparedToolBindingRef", prepared_binding_ref)?;
+        validate_runtime_identity("toolPromptCanonicalName", canonical_tool_name)?;
+        if !prompt_contribution_refs.insert(contribution_ref)
+            || !prompt_tool_names.insert(canonical_tool_name)
+            || !prompt_binding_refs.insert(prepared_binding_ref)
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot tool prompt contribution、tool 与 binding 必须分别唯一。",
+            ));
+        }
+        let (tool_binding_ref, availability, tool_origin, tool_plugin_uri) = tool_prompt_targets
+            .get(canonical_tool_name)
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "runtimeSnapshot tool prompt contribution 指向不存在的工具。",
+                )
+            })?;
+        if availability != "callable" || tool_binding_ref != prepared_binding_ref {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot tool prompt contribution 未绑定 callable prepared tool。",
+            ));
+        }
+        let origin = required_string(contribution, "origin")?;
+        if origin != tool_origin {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot tool prompt contribution origin 与工具不一致。",
+            ));
+        }
+        match origin {
+            "coreBuiltin" if !has_plugin_uri && tool_plugin_uri.is_none() => {}
+            "extension" => {
+                let plugin_uri = required_string(contribution, "pluginUri")?;
+                if tool_plugin_uri.as_deref() != Some(plugin_uri) {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "runtimeSnapshot tool prompt contribution pluginUri 与工具不一致。",
+                    ));
+                }
+                prompt_plugin_uris.insert(plugin_uri.to_string());
+            }
+            _ => {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "runtimeSnapshot tool prompt contribution origin 或 pluginUri 无效。",
+                ))
+            }
+        }
+        let prompt_snippet = contribution.get("promptSnippet").and_then(Value::as_str);
+        if has_prompt_snippet
+            && prompt_snippet.is_none_or(|text| !valid_tool_prompt_line(text, 512))
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot tool prompt snippet 无效。",
+            ));
+        }
+        let usage_guidelines = contribution
+            .get("usageGuidelines")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "runtimeSnapshot tool prompt usageGuidelines 必须是数组。",
+                )
+            })?;
+        if usage_guidelines.len() > 8
+            || usage_guidelines.iter().any(|guideline| {
+                guideline
+                    .as_str()
+                    .is_none_or(|text| !valid_tool_prompt_line(text, 1_024))
+            })
+            || prompt_snippet.is_none() && usage_guidelines.is_empty()
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot tool prompt guidelines 无效。",
             ));
         }
     }
@@ -4057,6 +4202,15 @@ fn validate_run_runtime_snapshot(
         }
         validate_unique_ids(plugin, "capabilityRefs")?;
     }
+    if prompt_plugin_uris
+        .iter()
+        .any(|plugin_uri| !plugin_uris.contains(plugin_uri.as_str()))
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot extension tool prompt contribution 未绑定 selected plugin。",
+        ));
+    }
 
     Ok(RunProviderRuntime {
         provider_runtime_ref: provider_runtime_ref.to_string(),
@@ -4075,6 +4229,13 @@ fn validate_runtime_identity(field: &str, value: &str) -> Result<(), LocalAgentS
         ));
     }
     Ok(())
+}
+
+fn valid_tool_prompt_line(value: &str, max_length: usize) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= max_length
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 fn validate_local_agent_error(value: &Value) -> Result<(), LocalAgentStoreError> {
@@ -4333,6 +4494,7 @@ mod tests {
             },
             "instructions": [],
             "tools": [],
+            "toolPromptContributions": [],
             "providerToolAliases": [
                 {"canonicalName":"interaction.request","wireName":"interaction_request"},
                 {"canonicalName":"plan.publish","wireName":"plan_publish"}
@@ -4342,6 +4504,47 @@ mod tests {
                 "plugins": []
             }
         })
+    }
+
+    #[test]
+    fn runtime_snapshot_requires_tool_prompt_to_match_a_callable_prepared_binding() {
+        let mut runtime = runtime_snapshot();
+        runtime["tools"] = json!([{
+            "toolBindingRef": "tool-binding:read:test",
+            "name": "fs.read",
+            "description": "Read UTF-8 workspace text.",
+            "inputSchema": {"type": "object"},
+            "possibleEffects": ["workspaceRead"],
+            "availability": "callable",
+            "origin": "coreBuiltin"
+        }]);
+        runtime["providerToolAliases"]
+            .as_array_mut()
+            .expect("provider aliases")
+            .push(json!({"canonicalName":"fs.read","wireName":"fs_read"}));
+        runtime["toolPromptContributions"] = json!([{
+            "contributionRef": "tool-prompt-contribution:read:test",
+            "preparedToolBindingRef": "tool-binding:read:test",
+            "canonicalToolName": "fs.read",
+            "origin": "coreBuiltin",
+            "promptSnippet": "Read known text files directly.",
+            "usageGuidelines": ["Use bounded offsets when only a segment is needed."]
+        }]);
+
+        validate_run_runtime_snapshot(&runtime).expect("valid prepared prompt contribution");
+
+        let mut stale_binding = runtime.clone();
+        stale_binding["toolPromptContributions"][0]["preparedToolBindingRef"] =
+            json!("tool-binding:read:stale");
+        let error = validate_run_runtime_snapshot(&stale_binding)
+            .expect_err("stale prompt binding must fail");
+        assert_eq!(error.code, "session_event_invalid");
+
+        let mut blocked = runtime;
+        blocked["tools"][0]["availability"] = json!("blocked");
+        let error = validate_run_runtime_snapshot(&blocked)
+            .expect_err("blocked tools must not retain prepared prompt contributions");
+        assert_eq!(error.code, "session_event_invalid");
     }
 
     #[test]

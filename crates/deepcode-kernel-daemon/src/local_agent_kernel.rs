@@ -909,14 +909,21 @@ impl LocalAgentKernel {
             }
         }
         let arguments = binding.canonicalize(tool_input).map_err(catalog_error)?;
-        let mut logical_targets = if scope == PreparedEffectScope::External {
-            binding
-                .logical_target()
-                .map(|target| vec![target.to_string()])
-                .unwrap_or_default()
-        } else {
-            canonical_logical_targets(&request.tool_name, &arguments)?
+        let mut logical_targets = match binding
+            .binding_logical_targets(&arguments)
+            .map_err(catalog_error)?
+        {
+            Some(targets) => targets,
+            None => canonical_logical_targets(&request.tool_name, &arguments)?,
         };
+        if matches!(
+            scope,
+            PreparedEffectScope::Network | PreparedEffectScope::External
+        ) {
+            if let Some(target) = binding.logical_target() {
+                logical_targets.push(target.to_string());
+            }
+        }
         if let Some(target) = resolved_network_target(
             request.tool_name.as_str(),
             &arguments,
@@ -1636,7 +1643,9 @@ fn validate_id(field: &str, value: &str) -> Result<(), LocalAgentKernelError> {
 }
 
 fn take_workspace_id(input: &mut Value) -> Result<String, LocalAgentKernelError> {
-    let object = input.as_object_mut().expect("validated tool input object");
+    let object = input
+        .as_object_mut()
+        .ok_or_else(|| LocalAgentKernelError::new("tool_input_invalid", "工具输入必须是对象。"))?;
     let value = object.remove("workspaceId").ok_or_else(|| {
         LocalAgentKernelError::new(
             "workspace_identity_required",

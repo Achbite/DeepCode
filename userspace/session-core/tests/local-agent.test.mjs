@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  decodeToolPromptProviderSnapshots,
   InMemoryCommandJournal,
+  prepareToolPromptContributions,
+  renderActiveToolGuidance,
   SessionActor,
   SessionService,
   loopSnapshot,
@@ -10,6 +13,7 @@ import {
   sessionControlToolDefinitions,
 } from '../dist/index.js';
 import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
+import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
 
 const workspaceBinding = {
   workspaceId: 'workspace:test',
@@ -180,6 +184,7 @@ test('A1: filesystem references reach Provider as logical metadata without embed
   assert.match(userMessage.content, /"mediaType":"application\/pdf"/u);
   assert.doesNotMatch(userMessage.content, /workspace:attachment/u);
   assert.doesNotMatch(userMessage.content, /SECRET_CONTENT/u);
+  assert.doesNotMatch(userMessage.content, /filesystem or Bash tools/u);
   assert.deepEqual(completed.messages[0].filesystemReferences, command.filesystemReferences);
   const events = await readEvents(journal, sessionId);
   assert.deepEqual(
@@ -232,6 +237,412 @@ test('A2: the current RunRuntimeSnapshot contract rejects missing Provider alias
     () => loopSnapshot(sessionId, events),
     /run_runtime_provider_tool_aliases_missing/u,
   );
+});
+
+test('A3: the current RunRuntimeSnapshot contract rejects missing tool prompt contributions explicitly', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:tool-prompt-contract';
+  const runId = 'run:tool-prompt-contract';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const runtime = runtimeSnapshot(runId);
+  delete runtime.toolPromptContributions;
+  await journal.append({
+    type: 'message.committed',
+    sessionId,
+    payload: {
+      messageId: 'message:tool-prompt-contract',
+      role: 'user',
+      content: 'Verify the current runtime snapshot contract.',
+    },
+  });
+  await journal.append({
+    type: 'run.started',
+    sessionId,
+    runId,
+    payload: {
+      inputMessageId: 'message:tool-prompt-contract',
+      workspaceBindings: [workspaceBinding],
+      runtimeSnapshot: runtime,
+    },
+  });
+
+  const events = await readEvents(journal, sessionId);
+  assert.throws(
+    () => loopSnapshot(sessionId, events),
+    /run_runtime_tool_prompt_contributions_missing/u,
+  );
+});
+
+test('A4: tool prompt preparation binds exact callable tools and rejects invalid ownership', () => {
+  const readTool = {
+    toolBindingRef: 'tool-binding:read:g1',
+    name: 'fs.read',
+    description: 'Read UTF-8 text.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['path'],
+      properties: { path: { type: 'string' } },
+    },
+    possibleEffects: ['workspaceRead'],
+    availability: 'callable',
+    origin: 'coreBuiltin',
+  };
+  const bashTool = {
+    toolBindingRef: 'tool-binding:bash:g1',
+    name: 'bash',
+    description: 'Run a command.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['command'],
+      properties: { command: { type: 'string' } },
+    },
+    possibleEffects: ['process'],
+    availability: 'callable',
+    origin: 'coreBuiltin',
+  };
+  const selectedPlugins = {
+    catalogRevision: 'plugin-catalog:fixture',
+    plugins: [],
+  };
+  const providers = decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:core',
+    origin: 'coreBuiltin',
+    contributions: [{
+      contributionRef: 'tool-prompt-contribution:bash',
+      canonicalToolName: 'bash',
+      promptSnippet: 'Run commands.',
+      usageGuidelines: ['Use this for command execution.'],
+    }, {
+      contributionRef: 'tool-prompt-contribution:read',
+      canonicalToolName: 'fs.read',
+      promptSnippet: 'Read known text files.',
+      usageGuidelines: ['Use this instead of shell text readers.'],
+    }],
+  }]);
+  assert.throws(() => decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:invalid',
+    origin: 'coreBuiltin',
+    contributions: [],
+    undeclared: true,
+  }]), /tool_prompt_providers_invalid/u);
+  assert.throws(() => decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:invalid-line',
+    origin: 'coreBuiltin',
+    contributions: [{
+      contributionRef: 'tool-prompt-contribution:invalid-line',
+      canonicalToolName: 'fs.read',
+      usageGuidelines: ['Invalid\nline.'],
+    }],
+  }]), /tool_prompt_contribution_invalid/u);
+  assert.throws(() => decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:duplicate-ref',
+    origin: 'coreBuiltin',
+    contributions: [{
+      contributionRef: 'tool-prompt-contribution:duplicate',
+      canonicalToolName: 'fs.read',
+      usageGuidelines: ['First contribution.'],
+    }, {
+      contributionRef: 'tool-prompt-contribution:duplicate',
+      canonicalToolName: 'bash',
+      usageGuidelines: ['Second contribution.'],
+    }],
+  }]), /tool_prompt_contribution_duplicate/u);
+  const prepared = prepareToolPromptContributions(
+    providers,
+    [bashTool, readTool],
+    selectedPlugins,
+  );
+
+  assert.deepEqual(prepared.map((item) => ({
+    name: item.canonicalToolName,
+    binding: item.preparedToolBindingRef,
+  })), [{
+    name: 'fs.read',
+    binding: 'tool-binding:read:g1',
+  }, {
+    name: 'bash',
+    binding: 'tool-binding:bash:g1',
+  }]);
+  assert.ok(Object.isFrozen(providers));
+  assert.ok(Object.isFrozen(providers[0].contributions));
+  assert.ok(Object.isFrozen(providers[0].contributions[0].usageGuidelines));
+  assert.ok(Object.isFrozen(prepared));
+  assert.ok(Object.isFrozen(prepared[0].usageGuidelines));
+  assert.deepEqual(
+    prepareToolPromptContributions(providers, [bashTool, readTool], selectedPlugins),
+    prepared,
+  );
+  const rendered = renderActiveToolGuidance(prepared, [{
+    canonicalName: 'fs.read',
+    wireName: 'fs_read',
+  }, {
+    canonicalName: 'bash',
+    wireName: 'bash',
+  }], [readTool, bashTool]);
+  assert.ok(rendered);
+  const [snippetSection, guidelineSection] = rendered.split('\n\n');
+  assert.deepEqual(snippetSection.split('\n'), [
+    'Active tool guidance:',
+    '- fs_read: Read known text files.',
+    '- bash: Run commands.',
+  ]);
+  assert.deepEqual(guidelineSection.split('\n'), [
+    'Guidelines:',
+    '- fs_read: Use this instead of shell text readers.',
+    '- bash: Use this for command execution.',
+  ]);
+
+  const readOnlyProviders = decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:read',
+    origin: 'coreBuiltin',
+    contributions: [{
+      contributionRef: 'tool-prompt-contribution:read-only',
+      canonicalToolName: 'fs.read',
+      usageGuidelines: ['Read known text files directly.'],
+    }],
+  }]);
+  assert.deepEqual(prepareToolPromptContributions(readOnlyProviders, [{
+    ...readTool,
+    availability: 'blocked',
+  }], selectedPlugins), []);
+  assert.throws(
+    () => prepareToolPromptContributions(readOnlyProviders, [], selectedPlugins),
+    /tool_prompt_target_missing:fs\.read/u,
+  );
+
+  const conflictingProviders = decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:conflict',
+    origin: 'coreBuiltin',
+    contributions: [{
+      contributionRef: 'tool-prompt-contribution:owner-one',
+      canonicalToolName: 'fs.read',
+      usageGuidelines: ['First owner.'],
+    }, {
+      contributionRef: 'tool-prompt-contribution:owner-two',
+      canonicalToolName: 'fs.read',
+      usageGuidelines: ['Second owner.'],
+    }],
+  }]);
+  assert.throws(
+    () => prepareToolPromptContributions(conflictingProviders, [readTool], selectedPlugins),
+    /tool_prompt_owner_conflict:fs\.read/u,
+  );
+  assert.throws(
+    () => prepareToolPromptContributions(readOnlyProviders, [{
+      ...readTool,
+      origin: 'extension',
+      pluginUri: 'plugin://fixture@mcp',
+    }], selectedPlugins),
+    /tool_prompt_origin_mismatch:fs\.read/u,
+  );
+
+  const extensionTool = {
+    ...readTool,
+    toolBindingRef: 'tool-binding:fixture-read:g1',
+    name: 'fixture.read',
+    origin: 'extension',
+    pluginUri: 'plugin://fixture@mcp',
+  };
+  const extensionProviders = decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:fixture',
+    origin: 'extension',
+    pluginUri: 'plugin://fixture@mcp',
+    contributions: [{
+      contributionRef: 'tool-prompt-contribution:fixture-read',
+      canonicalToolName: 'fixture.read',
+      usageGuidelines: ['Use the selected fixture reader.'],
+    }],
+  }]);
+  const selectedWithFixture = {
+    catalogRevision: 'plugin-catalog:fixture',
+    plugins: [{
+      uri: 'plugin://fixture@mcp',
+      pluginArtifactRef: 'plugin-artifact:fixture',
+      pluginInstanceRef: 'plugin-instance:fixture:g1',
+      extensionGenerationRef: 'extension-generation:g1',
+      capabilityRefs: ['mcp-tool:fixture.read'],
+    }],
+  };
+  const firstGenerationPrepared = prepareToolPromptContributions(
+    extensionProviders,
+    [extensionTool],
+    selectedWithFixture,
+  );
+  assert.deepEqual(firstGenerationPrepared.map((item) => ({
+    binding: item.preparedToolBindingRef,
+    origin: item.origin,
+    pluginUri: item.pluginUri,
+  })), [{
+    binding: 'tool-binding:fixture-read:g1',
+    origin: 'extension',
+    pluginUri: 'plugin://fixture@mcp',
+  }]);
+  const nextGenerationPrepared = prepareToolPromptContributions(
+    extensionProviders,
+    [{ ...extensionTool, toolBindingRef: 'tool-binding:fixture-read:g2' }],
+    {
+      ...selectedWithFixture,
+      plugins: selectedWithFixture.plugins.map((plugin) => ({
+        ...plugin,
+        pluginInstanceRef: 'plugin-instance:fixture:g2',
+        extensionGenerationRef: 'extension-generation:g2',
+      })),
+    },
+  );
+  assert.equal(firstGenerationPrepared[0].preparedToolBindingRef, 'tool-binding:fixture-read:g1');
+  assert.equal(nextGenerationPrepared[0].preparedToolBindingRef, 'tool-binding:fixture-read:g2');
+  assert.throws(
+    () => prepareToolPromptContributions(extensionProviders, [extensionTool], selectedPlugins),
+    /tool_prompt_provider_plugin_unselected:plugin:\/\/fixture@mcp/u,
+  );
+  assert.throws(
+    () => prepareToolPromptContributions(extensionProviders, [{
+      ...extensionTool,
+      pluginUri: 'plugin://different@mcp',
+    }], selectedWithFixture),
+    /tool_prompt_plugin_mismatch:fixture\.read/u,
+  );
+
+  const collidingTools = [extensionTool, {
+    ...extensionTool,
+    toolBindingRef: 'tool-binding:fixture-dash-read:g1',
+    name: 'fixture-read',
+  }];
+  const collidingProviders = decodeToolPromptProviderSnapshots([{
+    providerRef: 'tool-prompt-provider:colliding-fixture',
+    origin: 'extension',
+    pluginUri: 'plugin://fixture@mcp',
+    contributions: collidingTools.map((tool, index) => ({
+      contributionRef: `tool-prompt-contribution:collision:${index}`,
+      canonicalToolName: tool.name,
+      promptSnippet: `Route ${index}.`,
+      usageGuidelines: [],
+    })),
+  }]);
+  const collidingPrepared = prepareToolPromptContributions(
+    collidingProviders,
+    collidingTools,
+    selectedWithFixture,
+  );
+  const collidingAliases = createProviderToolAliases(collidingTools.map((tool) => tool.name));
+  assert.equal(new Set(collidingAliases.map((alias) => alias.wireName)).size, 2);
+  const collidingGuidance = renderActiveToolGuidance(
+    collidingPrepared,
+    collidingAliases,
+    collidingTools,
+  );
+  assert.ok(collidingGuidance);
+  const collidingLines = new Set(collidingGuidance.split('\n'));
+  for (const [index, tool] of collidingTools.entries()) {
+    const wireName = collidingAliases.find((alias) => alias.canonicalName === tool.name)?.wireName;
+    assert.ok(wireName);
+    assert.ok(collidingLines.has(`- ${wireName}: Route ${index}.`));
+  }
+});
+
+test('A5: Session renders one run-scoped tool guidance message with Provider aliases', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:tool-guidance';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const tools = [{
+    toolBindingRef: 'tool-binding:read:g1',
+    name: 'fs.read',
+    description: 'Read UTF-8 text.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['path'],
+      properties: { path: { type: 'string' } },
+    },
+    possibleEffects: ['workspaceRead'],
+    availability: 'callable',
+    origin: 'coreBuiltin',
+  }, {
+    toolBindingRef: 'tool-binding:bash:g1',
+    name: 'bash',
+    description: 'Run a command.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['command'],
+      properties: { command: { type: 'string' } },
+    },
+    possibleEffects: ['process'],
+    availability: 'callable',
+    origin: 'coreBuiltin',
+  }];
+  const toolPromptContributions = [{
+    contributionRef: 'tool-prompt-contribution:read',
+    preparedToolBindingRef: 'tool-binding:read:g1',
+    canonicalToolName: 'fs.read',
+    origin: 'coreBuiltin',
+    promptSnippet: 'Read UTF-8 workspace text directly.',
+    usageGuidelines: ['Use this for a known text file.'],
+  }, {
+    contributionRef: 'tool-prompt-contribution:bash',
+    preparedToolBindingRef: 'tool-binding:bash:g1',
+    canonicalToolName: 'bash',
+    origin: 'coreBuiltin',
+    promptSnippet: 'Run commands.',
+    usageGuidelines: ['Use this for search, builds, tests, and command execution.'],
+  }];
+  const preparation = fakeRunPreparation({ tools, toolPromptContributions });
+  const requests = [];
+  const provider = {
+    async *stream(request) {
+      requests.push(structuredClone(request));
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'provider-message:tool-guidance',
+        content: 'Done.',
+      });
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  };
+  const actor = actorWith(
+    journal,
+    sessionId,
+    provider,
+    emptyKernel(),
+    preparation.port,
+    'tool-guidance',
+  );
+
+  await actor.submit(messageCommand(sessionId, 'command:tool-guidance', 'Inspect one known file.'));
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(requests.length, 1);
+  const systemMessages = requests[0].messages.filter((message) => message.role === 'system');
+  const guidanceMessages = systemMessages.filter((message) => (
+    message.content.startsWith('Active tool guidance:')
+  ));
+  assert.equal(guidanceMessages.length, 1);
+  assert.equal(systemMessages.indexOf(guidanceMessages[0]), 1);
+  const aliases = new Map(preparation.snapshots[0].providerToolAliases.map((alias) => (
+    [alias.canonicalName, alias.wireName]
+  )));
+  const providerToolNames = new Set(requests[0].tools.map((tool) => tool.name));
+  const guidanceLines = new Set(guidanceMessages[0].content.split('\n'));
+  for (const contribution of toolPromptContributions) {
+    const alias = aliases.get(contribution.canonicalToolName);
+    assert.ok(alias);
+    assert.ok(providerToolNames.has(alias));
+    assert.ok(guidanceLines.has(`- ${alias}: ${contribution.promptSnippet}`));
+    for (const guideline of contribution.usageGuidelines) {
+      assert.ok(guidanceLines.has(`- ${alias}: ${guideline}`));
+    }
+  }
+  assert.equal(guidanceMessages[0].content.match(/^- /gmu)?.length, 4);
+  const events = await readEvents(journal, sessionId);
+  const composition = singleEvent(events, 'context.composed');
+  const guidanceReceipts = composition.payload.messages.filter((message) => (
+    message.contributionId === 'instruction:deepcode.tool-guidance'
+  ));
+  assert.equal(guidanceReceipts.length, 1);
+  assert.equal(guidanceReceipts[0].contributionKind, 'instructions');
+  assert.equal(guidanceReceipts[0].role, 'system');
+  assert.deepEqual(guidanceReceipts[0].blocks.map((block) => block.kind), ['text']);
+  await actor.dispose();
 });
 
 test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolRecord, and continuation', async () => {
@@ -2267,6 +2678,7 @@ function fakeRunPreparation(options = {}) {
           contextWindowTokens: options.contextWindowTokens,
           maxOutputTokens: options.maxOutputTokens,
           tools: options.tools,
+          toolPromptContributions: options.toolPromptContributions,
         });
         snapshots.push(structuredClone(snapshot));
         return { runtimeSnapshot: snapshot };
@@ -2305,6 +2717,8 @@ function runtimeSnapshot(runId, options = {}) {
     },
     instructions: [{ id: 'deepcode.coding-agent', text: 'Stable core instruction.' }],
     tools,
+    toolPromptContributions: (options.toolPromptContributions ?? [])
+      .map((contribution) => structuredClone(contribution)),
     providerToolAliases,
     selectedPlugins: {
       catalogRevision: 'plugin-catalog:fixture',

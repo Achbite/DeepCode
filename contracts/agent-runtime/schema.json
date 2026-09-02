@@ -240,12 +240,97 @@
         }
       }
     },
+    "ToolPromptContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contributionRef", "canonicalToolName", "usageGuidelines"],
+      "properties": {
+        "contributionRef": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "canonicalToolName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "promptSnippet": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+        },
+        "usageGuidelines": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+          }
+        }
+      },
+      "anyOf": [
+        { "required": ["promptSnippet"] },
+        { "properties": { "usageGuidelines": { "minItems": 1 } } }
+      ]
+    },
+    "PreparedToolPromptContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contributionRef", "preparedToolBindingRef", "canonicalToolName", "origin",
+        "usageGuidelines"
+      ],
+      "properties": {
+        "contributionRef": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "preparedToolBindingRef": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "canonicalToolName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "origin": { "enum": ["coreBuiltin", "extension"] },
+        "pluginUri": {
+          "type": "string",
+          "pattern": "^plugin://[^@\\s]+@[^@\\s]+$"
+        },
+        "promptSnippet": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+        },
+        "usageGuidelines": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+          }
+        }
+      },
+      "anyOf": [
+        { "required": ["promptSnippet"] },
+        { "properties": { "usageGuidelines": { "minItems": 1 } } }
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "origin": { "const": "coreBuiltin" } } },
+          "then": { "not": { "required": ["pluginUri"] } },
+          "else": { "required": ["pluginUri"] }
+        }
+      ]
+    },
     "RunRuntimeSnapshot": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "runRuntimeSnapshotRef", "extensionGenerationRef", "kernelCatalogSnapshotRef",
-        "provider", "instructions", "tools", "providerToolAliases", "selectedPlugins"
+        "provider", "instructions", "tools", "toolPromptContributions",
+        "providerToolAliases", "selectedPlugins"
       ],
       "properties": {
         "runRuntimeSnapshotRef": { "$ref": "#/$defs/Id" },
@@ -267,6 +352,11 @@
         "tools": {
           "type": "array",
           "items": { "$ref": "#/$defs/PreparedToolDescriptor" }
+        },
+        "toolPromptContributions": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/PreparedToolPromptContribution" }
         },
         "providerToolAliases": {
           "type": "array",

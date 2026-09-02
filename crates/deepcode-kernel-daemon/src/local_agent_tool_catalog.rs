@@ -1,7 +1,8 @@
-use crate::local_agent_mcp::{McpRuntime, McpTool};
+use crate::local_agent_mcp::{McpRuntime, McpTool, McpToolBindingRequirement, McpToolEffectScope};
 use deepcode_kernel_runtime::executors::{
     builtin_executors, KernelExecutorConfig, KernelExecutorRegistry, KernelToolExecutionContext,
-    KernelToolExecutionOutcome, KernelToolExecutionResult, KernelToolInvocation, SecretProvider,
+    KernelToolExecutionFailure, KernelToolExecutionOutcome, KernelToolExecutionResult,
+    KernelToolInvocation, SecretProvider,
 };
 use deepcode_kernel_tools::{
     hash_bytes, KernelToolRegistry, ToolAvailability, ToolEffectClass, ToolEffectScope,
@@ -41,7 +42,7 @@ enum ToolExecutorBinding {
         registry: Arc<KernelToolRegistry>,
         executors: Arc<KernelExecutorRegistry>,
     },
-    Mcp(McpTool),
+    Mcp(Box<McpTool>),
 }
 
 struct PendingToolContribution {
@@ -151,23 +152,44 @@ impl ToolProvider for McpToolProvider {
             .runtime
             .tools()
             .map(|tool| {
-                let stable_binding_identity =
-                    format!("mcp-binding:{}", hash_bytes(tool.target.as_bytes()));
+                let binding_requirement = match &tool.binding_requirement {
+                    McpToolBindingRequirement::None => "none".to_string(),
+                    McpToolBindingRequirement::WorkspacePath { argument } => {
+                        format!("workspacePath:{argument}")
+                    }
+                };
+                let stable_binding_identity = format!(
+                    "mcp-binding:{}",
+                    hash_bytes(
+                        format!(
+                            "{}\n{}\n{}\n{}",
+                            tool.plugin_instance_ref,
+                            tool.public_name,
+                            tool.target,
+                            binding_requirement,
+                        )
+                        .as_bytes(),
+                    )
+                );
                 PendingToolContribution {
                     origin: "extension",
-                    provider_ref: "tool-provider:mcp".to_string(),
+                    provider_ref: tool.provider_ref.clone(),
                     plugin_uri: Some(tool.plugin_uri.clone()),
                     plugin_instance_ref: Some(tool.plugin_instance_ref.clone()),
-                    contribution_ref: format!("tool-contribution:mcp:{}", tool.public_name),
+                    contribution_ref: tool.contribution_ref.clone(),
                     binding_identity: stable_binding_identity,
                     name: tool.public_name.clone(),
                     description: tool.description.clone(),
                     input_schema: tool.input_schema.clone(),
                     effect_class: None,
-                    effect_scope: CatalogEffectScope::External,
+                    effect_scope: match tool.effect_scope {
+                        McpToolEffectScope::WorkspaceRead => CatalogEffectScope::WorkspaceRead,
+                        McpToolEffectScope::Network => CatalogEffectScope::Network,
+                        McpToolEffectScope::External => CatalogEffectScope::External,
+                    },
                     availability: ToolAvailability::Callable,
                     logical_target: Some(tool.target.clone()),
-                    binding: ToolExecutorBinding::Mcp(tool.clone()),
+                    binding: ToolExecutorBinding::Mcp(Box::new(tool.clone())),
                 }
             })
             .collect();
@@ -323,6 +345,7 @@ impl ToolCatalogSnapshot {
                         "origin": tool.origin,
                         "providerRef": tool.provider_ref,
                         "pluginUri": tool.plugin_uri,
+                        "pluginInstanceRef": tool.plugin_instance_ref,
                         "contributionRef": tool.contribution_ref,
                         "bindingIdentity": tool.binding_identity,
                         "logicalTarget": tool.logical_target,
@@ -538,6 +561,19 @@ impl PreparedCatalogBinding {
         }
     }
 
+    pub(crate) fn binding_logical_targets(
+        &self,
+        arguments: &Value,
+    ) -> Result<Option<Vec<String>>, ToolCatalogError> {
+        match &self.entry().binding {
+            ToolExecutorBinding::Builtin { .. } => Ok(None),
+            ToolExecutorBinding::Mcp(tool) => tool
+                .logical_targets(arguments)
+                .map(Some)
+                .map_err(|error| ToolCatalogError::new(error.code, error.message)),
+        }
+    }
+
     pub(crate) fn invoke(
         &self,
         invocation_id: &str,
@@ -557,12 +593,26 @@ impl PreparedCatalogBinding {
                 )
                 .map_err(|error| ToolCatalogError::new("tool_execution_failed", error.to_string())),
             ToolExecutorBinding::Mcp(tool) => tool
-                .call(input, &context.cancellation)
-                .map(|output| KernelToolExecutionResult {
-                    invocation_id: invocation_id.to_string(),
-                    outcome: KernelToolExecutionOutcome::Completed,
-                    output,
-                    error: None,
+                .call(input, &context)
+                .map(|result| {
+                    let crate::local_agent_mcp::McpToolCallResult { output, failure } = result;
+                    match failure {
+                        Some(failure) => KernelToolExecutionResult {
+                            invocation_id: invocation_id.to_string(),
+                            outcome: KernelToolExecutionOutcome::Failed,
+                            output,
+                            error: Some(KernelToolExecutionFailure {
+                                code: failure.code,
+                                message: failure.message,
+                            }),
+                        },
+                        None => KernelToolExecutionResult {
+                            invocation_id: invocation_id.to_string(),
+                            outcome: KernelToolExecutionOutcome::Completed,
+                            output,
+                            error: None,
+                        },
+                    }
                 })
                 .map_err(|error| ToolCatalogError::new(error.code, error.message)),
         }

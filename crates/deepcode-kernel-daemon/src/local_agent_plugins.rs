@@ -44,7 +44,7 @@ struct PublicPluginCatalogItem {
 #[derive(Debug, Clone)]
 enum PluginContribution {
     Skill,
-    Mcp { server_id: String },
+    Mcp { plugin_uri: String },
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +54,7 @@ struct PluginSource {
     plugin_instance_ref: String,
     capability_refs: Vec<String>,
     capability_summary: String,
+    tool_prompt_provider: Option<Value>,
     contribution: PluginContribution,
 }
 
@@ -61,12 +62,19 @@ struct PluginSource {
 pub(crate) struct ResolvedPluginSelection {
     catalog_revision: String,
     plugins: Vec<PluginSource>,
-    mcp_server_ids: BTreeSet<String>,
+    mcp_plugin_instances: BTreeMap<String, String>,
 }
 
 impl ResolvedPluginSelection {
-    pub(crate) fn mcp_server_ids(&self) -> &BTreeSet<String> {
-        &self.mcp_server_ids
+    pub(crate) fn mcp_plugin_instances(&self) -> &BTreeMap<String, String> {
+        &self.mcp_plugin_instances
+    }
+
+    pub(crate) fn extension_tool_prompt_providers(&self) -> Vec<Value> {
+        self.plugins
+            .iter()
+            .filter_map(|plugin| plugin.tool_prompt_provider.clone())
+            .collect()
     }
 }
 
@@ -108,7 +116,7 @@ pub(crate) fn resolve_plugin_selection(
     let mut selection_ids = BTreeSet::new();
     let mut uris = BTreeSet::new();
     let mut plugins = Vec::new();
-    let mut mcp_server_ids = BTreeSet::new();
+    let mut mcp_plugin_instances = BTreeMap::new();
     for selection in selections {
         if !valid_identifier(&selection.selection_id)
             || selection.label.trim().is_empty()
@@ -118,22 +126,29 @@ pub(crate) fn resolve_plugin_selection(
         {
             return Err("plugin_selection_invalid: 插件选择字段无效或重复。".to_string());
         }
-        let source = sources.get(&selection.uri).ok_or_else(|| {
+        let mut source = sources.get(&selection.uri).cloned().ok_or_else(|| {
             format!(
                 "plugin_selection_unavailable: 显式选择的插件不可用：{}",
                 selection.uri
             )
         })?;
-        if let PluginContribution::Mcp { server_id } = &source.contribution {
-            mcp_server_ids.insert(server_id.clone());
+        if !source.public.available || !source.public.enabled {
+            return Err(format!(
+                "plugin_selection_unavailable: 显式选择的插件不可用：{}",
+                selection.uri
+            ));
         }
-        plugins.push(source.clone());
+        source.plugin_instance_ref = new_plugin_instance_ref()?;
+        if let PluginContribution::Mcp { plugin_uri } = &source.contribution {
+            mcp_plugin_instances.insert(plugin_uri.clone(), source.plugin_instance_ref.clone());
+        }
+        plugins.push(source);
     }
     plugins.sort_by(|left, right| left.public.uri.cmp(&right.public.uri));
     Ok(ResolvedPluginSelection {
         catalog_revision: revision,
         plugins,
-        mcp_server_ids,
+        mcp_plugin_instances,
     })
 }
 
@@ -228,29 +243,28 @@ fn plugin_catalog(settings: &Value) -> Result<(String, BTreeMap<String, PluginSo
     for source in skill_plugins(settings)? {
         insert_plugin_source(&mut sources, source)?;
     }
-    for descriptor in crate::local_agent_mcp::configured_plugins(settings)
+    for descriptor in crate::local_agent_mcp::available_plugins(settings)
         .map_err(|error| format!("{}: {}", error.code, error.message))?
     {
         insert_plugin_source(
             &mut sources,
             PluginSource {
                 public: PublicPluginCatalogItem {
-                    uri: descriptor.uri,
+                    uri: descriptor.uri.clone(),
                     display_name: descriptor.name.clone(),
-                    short_description: format!("MCP service {}", descriptor.name),
+                    short_description: descriptor.short_description,
                     icon_ref: None,
-                    activation_media_types: Vec::new(),
+                    activation_media_types: descriptor.activation_media_types,
                     enabled: true,
                     available: true,
                 },
                 plugin_artifact_ref: descriptor.plugin_artifact_ref,
-                plugin_instance_ref: descriptor.plugin_instance_ref,
-                capability_refs: vec![descriptor.capability_ref],
-                capability_summary: format!(
-                    "The selected MCP service exposes its callable capabilities in the current tool catalog."
-                ),
+                plugin_instance_ref: String::new(),
+                capability_refs: descriptor.capability_refs,
+                capability_summary: descriptor.capability_summary,
+                tool_prompt_provider: descriptor.tool_prompt_provider,
                 contribution: PluginContribution::Mcp {
-                    server_id: descriptor.id,
+                    plugin_uri: descriptor.uri,
                 },
             },
         )?;
@@ -275,7 +289,6 @@ fn plugin_catalog(settings: &Value) -> Result<(String, BTreeMap<String, PluginSo
             json!({
                 "public": source.public,
                 "pluginArtifactRef": source.plugin_artifact_ref,
-                "pluginInstanceRef": source.plugin_instance_ref,
                 "capabilityRefs": source.capability_refs,
             })
         })
@@ -381,6 +394,7 @@ fn skill_plugin(
         plugin_instance_ref,
         capability_refs: vec![format!("skill:{id}")],
         capability_summary: truncate_utf8(&instructions, MAX_DYNAMIC_PLUGIN_BYTES),
+        tool_prompt_provider: None,
         contribution: PluginContribution::Skill,
     })
 }
@@ -526,6 +540,18 @@ fn valid_identifier(value: &str) -> bool {
         && value.len() <= 128
         && value.trim() == value
         && !value.chars().any(char::is_control)
+}
+
+fn new_plugin_instance_ref() -> Result<String, String> {
+    let mut entropy = [0_u8; 16];
+    getrandom::fill(&mut entropy)
+        .map_err(|error| format!("生成 PluginInstanceRef 失败：{error}"))?;
+    let mut reference = String::from("plugin-instance:");
+    for byte in entropy {
+        use std::fmt::Write as _;
+        write!(&mut reference, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(reference)
 }
 
 const fn enabled_by_default() -> bool {

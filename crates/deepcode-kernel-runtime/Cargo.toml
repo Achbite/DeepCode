@@ -10,7 +10,6 @@ description = "DeepCode local Kernel tool executors."
 [dependencies]
 deepcode-kernel-abi.workspace = true
 deepcode-kernel-tools.workspace = true
-pdf-extract.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true

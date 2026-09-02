@@ -6,6 +6,7 @@ import type {
   PrepareRunRuntimeRequest,
   PreparedRunRuntime,
   PreparedToolDescriptor,
+  PreparedToolPromptContribution,
   ProviderRuntimeSnapshot,
   NewSessionEvent,
   ProviderEvent,
@@ -36,6 +37,10 @@ import {
   runtimeInstructions,
   type InstructionContribution,
 } from './skillPlugins.js';
+import {
+  decodeToolPromptProviderSnapshots,
+  prepareToolPromptContributions,
+} from './toolPromptContributions.js';
 
 interface HttpPortOptions {
   apiBase: string;
@@ -266,6 +271,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
       'extensionGenerationRef',
       'kernelCatalogSnapshotRef',
       'tools',
+      'toolPromptProviders',
       'pluginConfig',
       'selectedPlugins',
     ])) throw new Error('run_runtime_prepared_invalid');
@@ -297,6 +303,12 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
         value.extensionGenerationRef,
         request,
       );
+      const toolPromptProviders = decodeToolPromptProviderSnapshots(value.toolPromptProviders);
+      const toolPromptContributions = prepareToolPromptContributions(
+        toolPromptProviders,
+        tools,
+        selectedPlugins,
+      );
       const providerToolAliases = createProviderToolAliases([
         ...tools
           .filter((tool) => tool.availability === 'callable')
@@ -321,6 +333,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
           })],
           tools,
+          toolPromptContributions: toolPromptContributions as PreparedToolPromptContribution[],
           providerToolAliases,
           selectedPlugins,
         }),

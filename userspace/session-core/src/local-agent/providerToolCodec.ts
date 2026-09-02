@@ -15,7 +15,7 @@ import { LoopFailure } from './loopFailure.js';
 const PROVIDER_TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/u;
 const CANONICAL_TOOL_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/u;
 const HASH_SUFFIX_LENGTH = 10;
-const CORE_TOOL_ORDER = [
+export const CORE_TOOL_ORDER = [
   'fs.read',
   'fs.write',
   'fs.edit',

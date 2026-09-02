@@ -945,11 +945,23 @@ function cloneRun(run: NonNullable<SessionProjection['run']>): NonNullable<Sessi
 function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapshot {
   const storedAliases = (snapshot as unknown as { providerToolAliases?: unknown })
     .providerToolAliases;
+  const storedToolPromptContributions = (
+    snapshot as unknown as { toolPromptContributions?: unknown }
+  ).toolPromptContributions;
   if (!Array.isArray(storedAliases)) {
     throw new Error('run_runtime_provider_tool_aliases_missing');
   }
+  if (!Array.isArray(storedToolPromptContributions)) {
+    throw new Error('run_runtime_tool_prompt_contributions_missing');
+  }
   const providerToolAliases = (storedAliases as RunRuntimeSnapshot['providerToolAliases'])
     .map((alias) => ({ ...alias }));
+  const toolPromptContributions = (
+    storedToolPromptContributions as RunRuntimeSnapshot['toolPromptContributions']
+  ).map((contribution) => ({
+    ...contribution,
+    usageGuidelines: [...contribution.usageGuidelines],
+  }));
   return {
     ...snapshot,
     provider: { ...snapshot.provider },
@@ -959,6 +971,7 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
       inputSchema: structuredClone(tool.inputSchema),
       possibleEffects: [...tool.possibleEffects],
     })),
+    toolPromptContributions,
     providerToolAliases,
     selectedPlugins: {
       catalogRevision: snapshot.selectedPlugins.catalogRevision,

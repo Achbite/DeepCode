@@ -176,7 +176,7 @@ impl LocalAgentRuntime {
                 })?;
         let mcp = crate::local_agent_mcp::McpRuntime::from_selected_settings(
             settings,
-            plugin_selection.mcp_server_ids(),
+            plugin_selection.mcp_plugin_instances(),
         )
         .map_err(|error| RunPreparationError::new(error.code, error.message))?;
         let extension_generation_ref =
@@ -260,6 +260,9 @@ impl LocalAgentRuntime {
             "extensionGenerationRef": plugin_config["extensionGenerationRef"],
             "kernelCatalogSnapshotRef": catalog["kernelCatalogSnapshotRef"],
             "tools": catalog["tools"],
+            "toolPromptProviders": crate::local_agent_tool_prompts::run_tool_prompt_providers(
+                &plugin_selection,
+            ),
             "pluginConfig": plugin_config,
             "selectedPlugins": selected_plugins,
         });

@@ -36,6 +36,7 @@ import {
   sessionControlInstructions,
   sessionControlToolDefinitions,
 } from './sessionControls.js';
+import { renderActiveToolGuidance } from './toolPromptContributions.js';
 
 export interface PreparedProviderRequest {
   request: ProviderRequest;
@@ -64,6 +65,13 @@ export async function buildAgentProviderRequest(input: {
     interactionRequest: providerWireName(input.runtime, SESSION_CONTROL_INTERACTION_REQUEST),
     planPublish: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PUBLISH),
   };
+  const runtimeTools = hasWorkspaceBindings
+    ? input.runtime.tools
+    : input.runtime.tools.filter((tool) => !tool.possibleEffects.some((effect) => (
+      effect === 'workspaceRead'
+      || effect === 'workspaceMutation'
+      || effect === 'process'
+    )));
   const journalMessages = messagesFromJournal(input.events, input.runId, input.workspaceBindings);
   const contextMessages = (
     await Promise.all(input.contextProviders.map(async (provider) => (
@@ -83,6 +91,28 @@ export async function buildAgentProviderRequest(input: {
       label: instruction.id,
       message: { role: 'system', content: instruction.text },
     }));
+  const toolGuidance = renderActiveToolGuidance(
+    input.runtime.toolPromptContributions,
+    input.runtime.providerToolAliases,
+    runtimeTools,
+  );
+  if (toolGuidance) {
+    const stableCoreIndex = instructions.findIndex((instruction) => (
+      instruction.contributionId === 'instruction:deepcode.coding-agent'
+    ));
+    if (stableCoreIndex < 0) {
+      throw new LoopFailure(
+        'stable_core_instruction_missing',
+        'Run runtime 缺少唯一稳定 Core System Prompt。',
+      );
+    }
+    instructions.splice(stableCoreIndex + 1, 0, {
+      contributionId: 'instruction:deepcode.tool-guidance',
+      contributionKind: 'instructions',
+      label: 'deepcode.tool-guidance',
+      message: { role: 'system', content: toolGuidance },
+    });
+  }
   instructions.push({
     contributionId: 'session:controls',
     contributionKind: 'sessionControls',
@@ -122,13 +152,6 @@ export async function buildAgentProviderRequest(input: {
     messages: [...instructions, ...contextMessages, ...journalMessages, ...turnControls],
   });
   assertContextContributions(selected);
-  const runtimeTools = hasWorkspaceBindings
-    ? input.runtime.tools
-    : input.runtime.tools.filter((tool) => !tool.possibleEffects.some((effect) => (
-      effect === 'workspaceRead'
-      || effect === 'workspaceMutation'
-      || effect === 'process'
-    )));
   const controlTools = hasWorkspaceBindings
     ? sessionControlToolDefinitions()
     : sessionControlToolDefinitions().filter((tool) => (
@@ -868,7 +891,7 @@ function messageContentForModel(
       binding.workspaceId,
       index === 0 ? 'primary' : `workspace${index + 1}`,
     ]));
-    sections.push(`Filesystem references attached to this message. Read them lazily with the current run's filesystem or Bash tools; no file content is embedded here:\n${JSON.stringify(
+    sections.push(`Filesystem references attached to this message. No file content is embedded here:\n${JSON.stringify(
       payload.filesystemReferences.map((reference) => ({
         referenceId: reference.referenceId,
         workspace: workspaceHandleById.get(reference.workspaceId) ?? 'unavailable',

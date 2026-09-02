@@ -1104,6 +1104,40 @@ export interface PreparedToolDescriptor extends ToolDescriptor {
   pluginUri?: PluginUri;
 }
 
+export interface ToolPromptContribution {
+  contributionRef: string;
+  canonicalToolName: string;
+  promptSnippet?: string;
+  usageGuidelines: string[];
+}
+
+export type ToolPromptProviderSnapshot = {
+  providerRef: string;
+  contributions: ToolPromptContribution[];
+} & (
+  | {
+      origin: 'coreBuiltin';
+      pluginUri?: never;
+    }
+  | {
+      origin: 'extension';
+      pluginUri: PluginUri;
+    }
+);
+
+export type PreparedToolPromptContribution = ToolPromptContribution & {
+  preparedToolBindingRef: string;
+} & (
+  | {
+      origin: 'coreBuiltin';
+      pluginUri?: never;
+    }
+  | {
+      origin: 'extension';
+      pluginUri: PluginUri;
+    }
+);
+
 export interface ProviderToolAlias {
   canonicalName: string;
   wireName: string;
@@ -1116,6 +1150,7 @@ export interface RunRuntimeSnapshot {
   provider: ProviderRuntimeSnapshot;
   instructions: { id: string; text: string }[];
   tools: PreparedToolDescriptor[];
+  toolPromptContributions: PreparedToolPromptContribution[];
   providerToolAliases: ProviderToolAlias[];
   selectedPlugins: SelectedPluginSnapshot;
 }

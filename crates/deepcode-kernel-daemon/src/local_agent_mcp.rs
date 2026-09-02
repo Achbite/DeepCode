@@ -1,4 +1,8 @@
-use deepcode_kernel_runtime::executors::KernelCancellationToken;
+use crate::local_agent_first_party_plugins::{
+    self, FirstPartyPluginDescriptor, FirstPartyToolBinding, FirstPartyToolDescriptor,
+    FirstPartyToolEffect,
+};
+use deepcode_kernel_runtime::executors::{KernelCancellationToken, KernelToolExecutionContext};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,12 +21,28 @@ const MCP_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone)]
 pub(crate) struct McpPluginDescriptor {
-    pub(crate) id: String,
     pub(crate) uri: String,
     pub(crate) name: String,
+    pub(crate) short_description: String,
+    pub(crate) activation_media_types: Vec<String>,
     pub(crate) plugin_artifact_ref: String,
-    pub(crate) plugin_instance_ref: String,
-    pub(crate) capability_ref: String,
+    pub(crate) provider_ref: String,
+    pub(crate) capability_refs: Vec<String>,
+    pub(crate) capability_summary: String,
+    pub(crate) tool_prompt_provider: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolEffectScope {
+    WorkspaceRead,
+    Network,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpToolBindingRequirement {
+    None,
+    WorkspacePath { argument: String },
 }
 
 #[derive(Debug, Clone)]
@@ -49,17 +69,69 @@ pub(crate) struct McpTool {
     pub(crate) target: String,
     pub(crate) plugin_uri: String,
     pub(crate) plugin_instance_ref: String,
+    pub(crate) provider_ref: String,
+    pub(crate) contribution_ref: String,
+    pub(crate) effect_scope: McpToolEffectScope,
+    pub(crate) binding_requirement: McpToolBindingRequirement,
     client: McpClient,
+}
+
+#[derive(Debug)]
+pub(crate) struct McpToolCallResult {
+    pub(crate) output: Value,
+    pub(crate) failure: Option<McpToolCallFailure>,
+}
+
+#[derive(Debug)]
+pub(crate) struct McpToolCallFailure {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 impl McpTool {
     pub(crate) fn call(
         &self,
         input: Value,
-        cancellation: &KernelCancellationToken,
-    ) -> Result<Value, McpRuntimeError> {
+        context: &KernelToolExecutionContext,
+    ) -> Result<McpToolCallResult, McpRuntimeError> {
+        let metadata = match &self.binding_requirement {
+            McpToolBindingRequirement::None => None,
+            McpToolBindingRequirement::WorkspacePath { .. } => {
+                let workspace_id = context.workspace_id.as_deref().ok_or_else(|| {
+                    McpRuntimeError::new(
+                        "mcp_workspace_binding_missing",
+                        "First-party workspace tool 缺少 prepared workspace identity。",
+                    )
+                })?;
+                Some(json!({
+                    "deepcode": {
+                        "workspaceId": workspace_id,
+                        "resolvedWorkspaceTargets": context.private_resolved_targets,
+                    }
+                }))
+            }
+        };
         self.client
-            .call_tool(&self.remote_name, input, cancellation)
+            .call_tool(&self.remote_name, input, metadata, &context.cancellation)
+    }
+
+    pub(crate) fn logical_targets(&self, input: &Value) -> Result<Vec<String>, McpRuntimeError> {
+        match &self.binding_requirement {
+            McpToolBindingRequirement::None => Ok(Vec::new()),
+            McpToolBindingRequirement::WorkspacePath { argument } => {
+                let target = input
+                    .get(argument)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        McpRuntimeError::new(
+                            "mcp_workspace_target_invalid",
+                            format!("Workspace tool requires logical path field {argument}."),
+                        )
+                    })?;
+                Ok(vec![target.to_string()])
+            }
+        }
     }
 }
 
@@ -83,38 +155,42 @@ impl Default for McpRuntime {
 impl McpRuntime {
     pub(crate) fn from_selected_settings(
         settings: &Value,
-        selected_server_ids: &BTreeSet<String>,
+        selected_plugin_instances: &BTreeMap<String, String>,
     ) -> Result<Self, McpRuntimeError> {
-        if selected_server_ids.is_empty() {
+        if selected_plugin_instances.is_empty() {
             return Ok(Self::default());
         }
-        let servers = configured_servers(settings)?;
+        let servers = available_server_sources(settings)?;
         let available = servers
             .iter()
-            .map(|server| server.id.as_str())
+            .map(|server| server.descriptor.uri.as_str())
             .collect::<BTreeSet<_>>();
-        if let Some(missing) = selected_server_ids
-            .iter()
-            .find(|server_id| !available.contains(server_id.as_str()))
+        if let Some(missing) = selected_plugin_instances
+            .keys()
+            .find(|uri| !available.contains(uri.as_str()))
         {
             return Err(McpRuntimeError::new(
                 "plugin_selection_unavailable",
-                format!("显式选择的 MCP 插件不可用：{missing}"),
+                format!("显式选择的 MCP-backed 插件不可用：{missing}"),
             ));
         }
         Self::from_servers(
             servers
                 .into_iter()
-                .filter(|server| selected_server_ids.contains(&server.id))
+                .filter(|server| selected_plugin_instances.contains_key(&server.descriptor.uri))
                 .collect(),
+            selected_plugin_instances,
         )
     }
 
-    fn from_servers(servers: Vec<McpServerSetting>) -> Result<Self, McpRuntimeError> {
+    fn from_servers(
+        servers: Vec<McpServerSource>,
+        selected_plugin_instances: &BTreeMap<String, String>,
+    ) -> Result<Self, McpRuntimeError> {
         let mut servers_by_id = BTreeMap::new();
         for server in servers {
-            validate_server(&server)?;
-            let server_id = server.id.clone();
+            validate_server(&server.setting)?;
+            let server_id = server.setting.id.clone();
             if servers_by_id.insert(server_id.clone(), server).is_some() {
                 return Err(McpRuntimeError::new(
                     "mcp_server_duplicate",
@@ -127,11 +203,13 @@ impl McpRuntime {
                 .values()
                 .map(|server| {
                     json!({
-                        "id": server.id,
-                        "name": server.name,
-                        "transport": server.transport,
-                        "command": server.command,
-                        "args": server.args,
+                        "id": server.setting.id,
+                        "uri": server.descriptor.uri,
+                        "pluginArtifactRef": server.descriptor.plugin_artifact_ref,
+                        "name": server.setting.name,
+                        "transport": server.setting.transport,
+                        "command": server.setting.command,
+                        "args": server.setting.args,
                     })
                 })
                 .collect(),
@@ -139,20 +217,30 @@ impl McpRuntime {
         let mut tools = BTreeMap::new();
         let mut clients = Vec::new();
         for (_, server) in servers_by_id {
-            let client = McpClient::start(&server)?;
+            let client = McpClient::start(&server.setting)?;
             let definitions = client.list_tools()?;
+            validate_first_party_tool_set(&server, &definitions)?;
+            let plugin_instance_ref = selected_plugin_instances
+                .get(&server.descriptor.uri)
+                .expect("selected server has a plugin instance")
+                .clone();
             for definition in definitions {
-                let public_name = public_tool_name(&server.id, &definition.name)?;
+                let contract = tool_contract(&server, &definition)?;
+                let public_name = contract.public_name;
                 let tool = McpTool {
                     public_name: public_name.clone(),
                     remote_name: definition.name.clone(),
-                    description: definition
-                        .description
-                        .unwrap_or_else(|| format!("MCP tool {}", definition.name)),
-                    input_schema: definition.input_schema,
-                    target: format!("{}: {}", server.name, definition.name),
-                    plugin_uri: mcp_plugin_uri(&server.id),
-                    plugin_instance_ref: format!("plugin-instance:mcp:{}", server.id),
+                    description: contract.description,
+                    input_schema: contract.input_schema,
+                    target: contract
+                        .logical_target
+                        .unwrap_or_else(|| format!("{}: {}", server.setting.name, definition.name)),
+                    plugin_uri: server.descriptor.uri.clone(),
+                    plugin_instance_ref: plugin_instance_ref.clone(),
+                    provider_ref: contract.provider_ref,
+                    contribution_ref: contract.contribution_ref,
+                    effect_scope: contract.effect_scope,
+                    binding_requirement: contract.binding_requirement,
                     client: client.clone(),
                 };
                 if tools.insert(public_name.clone(), tool).is_some() {
@@ -191,6 +279,10 @@ impl McpRuntime {
                 "inputSchema": tool.input_schema,
                 "target": tool.target,
                 "pluginUri": tool.plugin_uri,
+                "providerRef": tool.provider_ref,
+                "contributionRef": tool.contribution_ref,
+                "effectScope": mcp_effect_scope_name(tool.effect_scope),
+                "bindingRequirement": mcp_binding_identity(&tool.binding_requirement),
             })).collect::<Vec<_>>(),
         })
     }
@@ -206,38 +298,274 @@ impl McpRuntime {
     }
 }
 
-pub(crate) fn configured_plugins(
+pub(crate) fn available_plugins(
     settings: &Value,
 ) -> Result<Vec<McpPluginDescriptor>, McpRuntimeError> {
-    configured_servers(settings)?
+    Ok(available_server_sources(settings)?
         .into_iter()
-        .map(|server| {
-            let identity = json!({
-                "id": server.id,
-                "name": server.name,
-                "transport": server.transport,
-                "command": server.command,
-                "args": server.args,
-            });
-            let encoded = serde_json::to_vec(&identity).map_err(|error| {
-                McpRuntimeError::new(
-                    "mcp_config_invalid",
-                    format!("编码 MCP 插件身份失败：{error}"),
-                )
-            })?;
-            Ok(McpPluginDescriptor {
-                id: server.id.clone(),
-                uri: mcp_plugin_uri(&server.id),
-                name: server.name.clone(),
-                plugin_artifact_ref: format!(
-                    "plugin-artifact:{}",
-                    deepcode_kernel_tools::hash_bytes(&encoded)
-                ),
-                plugin_instance_ref: format!("plugin-instance:mcp:{}", server.id),
-                capability_ref: format!("mcp-server:{}", server.id),
+        .map(|server| server.descriptor)
+        .collect())
+}
+
+#[derive(Clone)]
+struct McpServerSource {
+    setting: McpServerSetting,
+    descriptor: McpPluginDescriptor,
+    contract: McpServerContract,
+}
+
+#[derive(Clone)]
+enum McpServerContract {
+    External,
+    FirstParty(Vec<FirstPartyToolDescriptor>),
+}
+
+struct McpToolContract {
+    public_name: String,
+    description: String,
+    input_schema: Value,
+    provider_ref: String,
+    contribution_ref: String,
+    effect_scope: McpToolEffectScope,
+    logical_target: Option<String>,
+    binding_requirement: McpToolBindingRequirement,
+}
+
+fn available_server_sources(settings: &Value) -> Result<Vec<McpServerSource>, McpRuntimeError> {
+    let mut sources = configured_servers(settings)?
+        .into_iter()
+        .map(external_server_source)
+        .collect::<Result<Vec<_>, _>>()?;
+    let provider_binary = local_agent_first_party_plugins::provider_binary()
+        .map_err(|message| McpRuntimeError::new("first_party_provider_unavailable", message))?;
+    let provider_binary = provider_binary.to_str().ok_or_else(|| {
+        McpRuntimeError::new(
+            "first_party_provider_unavailable",
+            "First-party provider 路径不是 UTF-8。",
+        )
+    })?;
+    for descriptor in local_agent_first_party_plugins::descriptors()
+        .map_err(|message| McpRuntimeError::new("first_party_manifest_invalid", message))?
+    {
+        sources.push(first_party_server_source(descriptor, provider_binary));
+    }
+    let mut ids = BTreeSet::new();
+    let mut uris = BTreeSet::new();
+    for source in &sources {
+        if !ids.insert(source.setting.id.clone()) {
+            return Err(McpRuntimeError::new(
+                "mcp_server_duplicate",
+                format!("MCP Server id 重复：{}", source.setting.id),
+            ));
+        }
+        if !uris.insert(source.descriptor.uri.clone()) {
+            return Err(McpRuntimeError::new(
+                "plugin_uri_duplicate",
+                format!("MCP-backed plugin URI 重复：{}", source.descriptor.uri),
+            ));
+        }
+    }
+    Ok(sources)
+}
+
+fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, McpRuntimeError> {
+    let identity = json!({
+        "id": setting.id,
+        "name": setting.name,
+        "transport": setting.transport,
+        "command": setting.command,
+        "args": setting.args,
+    });
+    let encoded = serde_json::to_vec(&identity).map_err(|error| {
+        McpRuntimeError::new(
+            "mcp_config_invalid",
+            format!("编码 MCP 插件身份失败：{error}"),
+        )
+    })?;
+    let descriptor = McpPluginDescriptor {
+        uri: mcp_plugin_uri(&setting.id),
+        name: setting.name.clone(),
+        short_description: format!("MCP service {}", setting.name),
+        activation_media_types: Vec::new(),
+        plugin_artifact_ref: format!(
+            "plugin-artifact:{}",
+            deepcode_kernel_tools::hash_bytes(&encoded)
+        ),
+        provider_ref: "tool-provider:mcp".to_string(),
+        capability_refs: vec![format!("mcp-server:{}", setting.id)],
+        capability_summary: "The selected MCP service is active for this run. Its callable tools are supplied separately by the current tool catalog.".to_string(),
+        tool_prompt_provider: None,
+    };
+    Ok(McpServerSource {
+        setting,
+        descriptor,
+        contract: McpServerContract::External,
+    })
+}
+
+fn first_party_server_source(
+    plugin: FirstPartyPluginDescriptor,
+    provider_binary: &str,
+) -> McpServerSource {
+    let FirstPartyPluginDescriptor {
+        id,
+        uri,
+        display_name,
+        short_description,
+        activation_media_types,
+        provider_ref,
+        plugin_artifact_ref,
+        capability_refs,
+        capability_summary,
+        tools,
+    } = plugin;
+    let prompt_contributions = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "contributionRef": tool.prompt_contribution.contribution_ref,
+                "canonicalToolName": tool.canonical_name,
+                "promptSnippet": tool.prompt_contribution.prompt_snippet,
+                "usageGuidelines": tool.prompt_contribution.usage_guidelines,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let descriptor = McpPluginDescriptor {
+        uri: uri.clone(),
+        name: display_name.clone(),
+        short_description,
+        activation_media_types,
+        plugin_artifact_ref,
+        provider_ref,
+        capability_refs,
+        capability_summary,
+        tool_prompt_provider: Some(json!({
+            "providerRef": format!("tool-prompt-provider:first-party:{id}"),
+            "origin": "extension",
+            "pluginUri": uri,
+            "contributions": prompt_contributions,
+        })),
+    };
+    McpServerSource {
+        setting: McpServerSetting {
+            id: format!("first-party.{id}"),
+            name: display_name,
+            transport: "stdio".to_string(),
+            command: provider_binary.to_string(),
+            args: format!("--plugin {id}"),
+            enabled: true,
+        },
+        descriptor,
+        contract: McpServerContract::FirstParty(tools),
+    }
+}
+
+fn validate_first_party_tool_set(
+    server: &McpServerSource,
+    definitions: &[RemoteToolDefinition],
+) -> Result<(), McpRuntimeError> {
+    let McpServerContract::FirstParty(expected) = &server.contract else {
+        return Ok(());
+    };
+    if definitions.len() != expected.len() {
+        return Err(McpRuntimeError::new(
+            "first_party_descriptor_mismatch",
+            format!(
+                "First-party provider {} tool 数量与 manifest 不一致。",
+                server.descriptor.uri
+            ),
+        ));
+    }
+    for tool in expected {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == tool.remote_name)
+            .ok_or_else(|| {
+                McpRuntimeError::new(
+                    "first_party_descriptor_mismatch",
+                    format!("First-party provider 缺少工具：{}", tool.remote_name),
+                )
+            })?;
+        if definition.description.as_deref() != Some(tool.description.as_str())
+            || definition.input_schema != tool.input_schema
+        {
+            return Err(McpRuntimeError::new(
+                "first_party_descriptor_mismatch",
+                format!(
+                    "First-party provider 工具 schema/description 与 manifest 不一致：{}",
+                    tool.remote_name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn tool_contract(
+    server: &McpServerSource,
+    definition: &RemoteToolDefinition,
+) -> Result<McpToolContract, McpRuntimeError> {
+    match &server.contract {
+        McpServerContract::External => Ok(McpToolContract {
+            public_name: public_tool_name(&server.setting.id, &definition.name)?,
+            description: definition
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("MCP tool {}", definition.name)),
+            input_schema: definition.input_schema.clone(),
+            provider_ref: "tool-provider:mcp".to_string(),
+            contribution_ref: format!(
+                "tool-contribution:mcp:{}",
+                public_tool_name(&server.setting.id, &definition.name)?
+            ),
+            effect_scope: McpToolEffectScope::External,
+            logical_target: None,
+            binding_requirement: McpToolBindingRequirement::None,
+        }),
+        McpServerContract::FirstParty(tools) => {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.remote_name == definition.name)
+                .expect("validated first-party tool set");
+            Ok(McpToolContract {
+                public_name: tool.canonical_name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                provider_ref: server.descriptor.provider_ref.clone(),
+                contribution_ref: tool.tool_contribution_ref.clone(),
+                effect_scope: match tool.effect {
+                    FirstPartyToolEffect::NetworkRead => McpToolEffectScope::Network,
+                    FirstPartyToolEffect::WorkspaceRead => McpToolEffectScope::WorkspaceRead,
+                },
+                logical_target: tool.logical_target.clone(),
+                binding_requirement: match &tool.binding {
+                    FirstPartyToolBinding::None => McpToolBindingRequirement::None,
+                    FirstPartyToolBinding::WorkspacePath { argument } => {
+                        McpToolBindingRequirement::WorkspacePath {
+                            argument: argument.clone(),
+                        }
+                    }
+                },
+            })
+        }
+    }
+}
+
+fn mcp_effect_scope_name(scope: McpToolEffectScope) -> &'static str {
+    match scope {
+        McpToolEffectScope::WorkspaceRead => "workspaceRead",
+        McpToolEffectScope::Network => "network",
+        McpToolEffectScope::External => "external",
+    }
+}
+
+fn mcp_binding_identity(binding: &McpToolBindingRequirement) -> Value {
+    match binding {
+        McpToolBindingRequirement::None => json!({ "kind": "none" }),
+        McpToolBindingRequirement::WorkspacePath { argument } => {
+            json!({ "kind": "workspacePath", "argument": argument })
+        }
+    }
 }
 
 fn mcp_plugin_uri(server_id: &str) -> String {
@@ -286,7 +614,7 @@ fn configured_servers(settings: &Value) -> Result<Vec<McpServerSetting>, McpRunt
         .collect()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct McpServerSetting {
     id: String,
@@ -440,20 +768,15 @@ impl McpClient {
         &self,
         name: &str,
         arguments: Value,
+        metadata: Option<Value>,
         cancellation: &KernelCancellationToken,
-    ) -> Result<Value, McpRuntimeError> {
-        let result = self.request(
-            "tools/call",
-            json!({ "name": name, "arguments": arguments }),
-            Some(cancellation),
-        )?;
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(McpRuntimeError::new(
-                "mcp_tool_failed",
-                format!("MCP 工具 {name} 返回错误：{result}"),
-            ));
+    ) -> Result<McpToolCallResult, McpRuntimeError> {
+        let mut params = json!({ "name": name, "arguments": arguments });
+        if let Some(metadata) = metadata {
+            params["_meta"] = metadata;
         }
-        Ok(result)
+        let result = self.request("tools/call", params, Some(cancellation))?;
+        decode_tool_call_result(name, result)
     }
 
     fn request(
@@ -485,6 +808,41 @@ impl McpClient {
         })?;
         process.stop()
     }
+}
+
+fn decode_tool_call_result(
+    name: &str,
+    output: Value,
+) -> Result<McpToolCallResult, McpRuntimeError> {
+    let is_error = match output.get("isError") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            McpRuntimeError::new(
+                "mcp_response_invalid",
+                format!("MCP 工具 {name} 的 isError 不是布尔值。"),
+            )
+        })?,
+    };
+    let failure = is_error.then(|| {
+        let provider_error = output
+            .pointer("/structuredContent/error")
+            .and_then(Value::as_object);
+        McpToolCallFailure {
+            code: provider_error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .filter(|code| !code.is_empty())
+                .unwrap_or("mcp_tool_failed")
+                .to_string(),
+            message: provider_error
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("MCP 工具 {name} 返回错误：{output}")),
+        }
+    });
+    Ok(McpToolCallResult { output, failure })
 }
 
 struct ChildStartupGuard {
@@ -854,7 +1212,10 @@ mod tests {
         });
         let runtime = McpRuntime::from_selected_settings(
             &settings,
-            &BTreeSet::from(["fixture.mcp.text-tools".to_string()]),
+            &BTreeMap::from([(
+                mcp_plugin_uri("fixture.mcp.text-tools"),
+                "plugin-instance:test:text-tools".to_string(),
+            )]),
         )
         .expect("start selected MCP runtime");
         let tool = runtime
@@ -864,11 +1225,42 @@ mod tests {
         let result = tool
             .call(
                 json!({ "text": "DeepCode" }),
-                &KernelCancellationToken::default(),
+                &KernelToolExecutionContext {
+                    workspace_root: None,
+                    workspace_id: None,
+                    private_resolved_targets: Vec::new(),
+                    cancellation: KernelCancellationToken::default(),
+                },
             )
             .expect("call tool");
-        assert_eq!(result.pointer("/content/0/text"), Some(&json!("edoCpeeD")));
+        assert!(result.failure.is_none());
+        assert_eq!(
+            result.output.pointer("/content/0/text"),
+            Some(&json!("edoCpeeD"))
+        );
         runtime.shutdown().expect("shutdown MCP runtime");
+    }
+
+    #[test]
+    fn structured_tool_failure_preserves_provider_error() {
+        let result = decode_tool_call_result(
+            "read",
+            json!({
+                "content": [{ "type": "text", "text": "failure" }],
+                "structuredContent": {
+                    "error": {
+                        "code": "pdf_extract_failed",
+                        "message": "invalid PDF"
+                    }
+                },
+                "isError": true
+            }),
+        )
+        .expect("valid MCP tool failure");
+        let failure = result.failure.expect("provider failure");
+        assert_eq!(failure.code, "pdf_extract_failed");
+        assert_eq!(failure.message, "invalid PDF");
+        assert_eq!(result.output["isError"], true);
     }
 
     #[test]
@@ -890,15 +1282,24 @@ mod tests {
         });
         let runtime = McpRuntime::from_selected_settings(
             &settings,
-            &BTreeSet::from(["fixture.mcp.cancelled".to_string()]),
+            &BTreeMap::from([(
+                mcp_plugin_uri("fixture.mcp.cancelled"),
+                "plugin-instance:test:cancelled".to_string(),
+            )]),
         )
         .expect("start selected MCP runtime");
         let tool = runtime.tools().next().expect("mapped tool");
         let cancellation = KernelCancellationToken::default();
         cancellation.cancel();
+        let context = KernelToolExecutionContext {
+            workspace_root: None,
+            workspace_id: None,
+            private_resolved_targets: Vec::new(),
+            cancellation,
+        };
 
         let error = tool
-            .call(json!({ "text": "DeepCode" }), &cancellation)
+            .call(json!({ "text": "DeepCode" }), &context)
             .expect_err("cancelled MCP call must fail after process cleanup");
         assert_eq!(error.code, "mcp_tool_cancelled");
         runtime
