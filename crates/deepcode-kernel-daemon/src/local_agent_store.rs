@@ -283,7 +283,7 @@ impl LocalAgentJournal {
         let reply = object.get("reply").expect("required reply");
         validate_command(command)?;
         validate_reply(reply)?;
-        validate_command_event_batch(command, events)?;
+        validate_command_event_batch(command, events, reply)?;
         let session_id = required_string(command, "sessionId")?;
         let command_id = required_string(command, "commandId")?;
         if required_string(reply, "sessionId")? != session_id
@@ -2510,7 +2510,17 @@ fn todo_state_for_plan(
 fn validate_command_event_batch(
     command: &Value,
     events: &[Value],
+    reply: &Value,
 ) -> Result<(), LocalAgentStoreError> {
+    if reply.get("status").and_then(Value::as_str) == Some("rejected") {
+        if !events.is_empty() {
+            return Err(LocalAgentStoreError::new(
+                "rejected_command_event_batch_invalid",
+                "rejected 命令不能提交 Session 状态事件。",
+            ));
+        }
+        return Ok(());
+    }
     if command.get("type").and_then(Value::as_str) != Some("plan.respond") {
         return Ok(());
     }
@@ -4283,6 +4293,33 @@ fn sql_error(code: &'static str) -> impl FnOnce(rusqlite::Error) -> LocalAgentSt
 mod tests {
     use super::*;
 
+    fn plan_response_command(response: Value) -> Value {
+        json!({
+            "schemaVersion": COMMAND_VERSION,
+            "type": "plan.respond",
+            "commandId": "command:plan-response",
+            "sessionId": "session:plan-response",
+            "runId": "run:plan-response",
+            "planId": "plan:plan-response",
+            "revision": 1,
+            "response": response
+        })
+    }
+
+    fn command_reply(status: &str) -> Value {
+        json!({
+            "schemaVersion": REPLY_VERSION,
+            "commandId": "command:plan-response",
+            "sessionId": "session:plan-response",
+            "status": status,
+            "revision": 0,
+            "error": {
+                "code": "plan_not_pending",
+                "message": "The Plan is no longer pending."
+            }
+        })
+    }
+
     fn runtime_snapshot() -> Value {
         json!({
             "runRuntimeSnapshotRef": "run-runtime:test",
@@ -4602,5 +4639,33 @@ mod tests {
         let error = validate_new_event(&reused, false).expect_err("identity reuse must fail");
         assert_eq!(error.code, "session_event_invalid");
         assert!(error.message.contains("不能复用"));
+    }
+
+    #[test]
+    fn rejected_commands_are_eventless_while_accepted_plan_responses_remain_atomic() {
+        let command = plan_response_command(json!({"kind": "cancel"}));
+        let rejected = command_reply("rejected");
+        validate_command_event_batch(&command, &[], &rejected)
+            .expect("persist the real stale Plan rejection without lifecycle events");
+
+        let rejected_with_event = [json!({
+            "type": "plan.cancelled",
+            "payload": {
+                "planId": "plan:plan-response",
+                "revision": 1,
+                "commandId": "command:plan-response"
+            }
+        })];
+        let error = validate_command_event_batch(&command, &rejected_with_event, &rejected)
+            .expect_err("a rejected command must never mutate Session facts");
+        assert_eq!(error.code, "rejected_command_event_batch_invalid");
+
+        let accepted = command_reply("accepted");
+        let error = validate_command_event_batch(&command, &[], &accepted)
+            .expect_err("an accepted Plan response must carry its lifecycle fact");
+        assert_eq!(error.code, "plan_command_event_batch_invalid");
+
+        validate_command_event_batch(&command, &rejected_with_event, &accepted)
+            .expect("the matching accepted Plan lifecycle fact remains valid");
     }
 }

@@ -392,7 +392,7 @@ export function messagesFromJournal(
   }
   const todoList = currentTodoList(events);
   if (todoList) {
-    messages.push({
+    const currentTodo: ContextMessageContribution = {
       contributionId: `todo-current:${todoList.sourcePlanId}:${todoList.sourcePlanRevision}`,
       contributionKind: 'journalMessages',
       label: 'Session Todo current state',
@@ -405,7 +405,26 @@ export function messagesFromJournal(
           items: todoList.items,
         }),
       },
-    });
+    };
+    let subsequentUserMessageId: string | null = null;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]!;
+      if (
+        event.type === 'message.committed'
+        && event.payload.role === 'user'
+        && event.sequence > todoList.sequence
+      ) {
+        subsequentUserMessageId = event.payload.messageId;
+        break;
+      }
+    }
+    const userBoundary = subsequentUserMessageId
+      ? messages.findIndex((message) => (
+          message.contributionId === `message:${subsequentUserMessageId}`
+        ))
+      : -1;
+    if (userBoundary >= 0) messages.splice(userBoundary, 0, currentTodo);
+    else messages.push(currentTodo);
   }
   applyProviderTurnCompletions(messages, events);
   return messages;

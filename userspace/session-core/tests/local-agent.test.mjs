@@ -9,6 +9,7 @@ import {
   runtimeInstructions,
   sessionControlToolDefinitions,
 } from '../dist/index.js';
+import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
 
 const workspaceBinding = {
   workspaceId: 'workspace:test',
@@ -955,6 +956,22 @@ test('E: one Plan confirmation resumes the same run into Todo-backed execution',
     response: { kind: 'confirm' },
   });
   assert.equal(confirmationReply.status, 'accepted');
+  const stalePlanReply = await actor.submit({
+    schemaVersion: 'deepcode.command.v3',
+    type: 'plan.respond',
+    commandId: 'command:plan-stale',
+    sessionId,
+    runId: waiting.run.runId,
+    planId: plan.planId,
+    revision: plan.revision,
+    response: { kind: 'cancel' },
+  });
+  assert.equal(stalePlanReply.status, 'rejected');
+  assert.equal(stalePlanReply.error?.code, 'plan_not_pending');
+  assert.equal(
+    (await journal.readCommand(sessionId, 'command:plan-stale'))?.reply.status,
+    'rejected',
+  );
 
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
   await waitUntil(() => preparation.released.length === 1, 'confirmed Plan runtime release');
@@ -1618,6 +1635,222 @@ test('H1: Provider cache fields are absent together or exactly partition one cal
     assert.equal(events.some((event) => event.type === 'context.updated'), false);
     await actor.dispose();
   }
+});
+
+test('I0: current Todo state precedes later inserted user input without splitting its tool result', () => {
+  const sessionId = 'session:todo-user-boundary';
+  const runId = 'run:todo-user-boundary';
+  const events = [
+    {
+      schemaVersion: 'deepcode.session-event.v4',
+      eventId: 'event:1',
+      sessionId,
+      sequence: 1,
+      occurredAt: '2026-09-02T00:00:00.000Z',
+      type: 'message.committed',
+      runId,
+      payload: {
+        messageId: 'message:initial',
+        role: 'user',
+        content: 'Initial request.',
+      },
+    },
+    {
+      schemaVersion: 'deepcode.session-event.v4',
+      eventId: 'event:2',
+      sessionId,
+      sequence: 2,
+      occurredAt: '2026-09-02T00:00:01.000Z',
+      type: 'todo.seeded',
+      runId,
+      payload: {
+        sourcePlanId: 'plan:todo-user-boundary',
+        sourcePlanRevision: 1,
+        items: [{
+          todoId: 'todo:one',
+          sourceStepId: 'step:one',
+          label: 'Execute the fixture step.',
+          status: 'inProgress',
+        }],
+      },
+    },
+    {
+      schemaVersion: 'deepcode.session-event.v4',
+      eventId: 'event:3',
+      sessionId,
+      sequence: 3,
+      occurredAt: '2026-09-02T00:00:02.000Z',
+      type: 'interaction.requested',
+      runId,
+      callId: 'call:interaction',
+      payload: {
+        interactionId: 'interaction:one',
+        kind: 'question',
+        prompt: 'Choose one option.',
+        allowFreeform: true,
+      },
+    },
+    {
+      schemaVersion: 'deepcode.session-event.v4',
+      eventId: 'event:4',
+      sessionId,
+      sequence: 4,
+      occurredAt: '2026-09-02T00:00:03.000Z',
+      type: 'provider.turn.settled',
+      runId,
+      payload: {
+        providerRequestId: 'provider-request:interaction',
+        purpose: 'agent',
+        providerRuntimeRef: 'provider-runtime:test',
+        outcome: 'completed',
+        orderedCallIds: ['call:interaction'],
+      },
+    },
+    {
+      schemaVersion: 'deepcode.session-event.v4',
+      eventId: 'event:5',
+      sessionId,
+      sequence: 5,
+      occurredAt: '2026-09-02T00:00:04.000Z',
+      type: 'interaction.resolved',
+      runId,
+      payload: {
+        interactionId: 'interaction:one',
+        commandId: 'command:interaction',
+        response: 'Option A',
+      },
+    },
+    {
+      schemaVersion: 'deepcode.session-event.v4',
+      eventId: 'event:6',
+      sessionId,
+      sequence: 6,
+      occurredAt: '2026-09-02T00:00:05.000Z',
+      type: 'message.committed',
+      runId,
+      payload: {
+        messageId: 'message:interaction-response',
+        role: 'user',
+        content: 'Option A',
+      },
+    },
+  ];
+
+  const contributions = messagesFromJournal(events, runId, []);
+  const resultIndex = contributions.findIndex((item) => (
+    item.contributionId === 'interaction-result:interaction:one'
+  ));
+  const todoIndex = contributions.findIndex((item) => (
+    item.contributionId === 'todo-current:plan:todo-user-boundary:1'
+  ));
+  const userIndex = contributions.findIndex((item) => (
+    item.contributionId === 'message:message:interaction-response'
+  ));
+  assert.ok(resultIndex >= 0);
+  assert.ok(todoIndex > resultIndex, 'Todo current state must follow the completed tool result');
+  assert.ok(userIndex > todoIndex, 'the later tagged user input must remain the final boundary');
+  assert.equal(contributions.at(-1)?.message.role, 'user');
+});
+
+test('I: an interaction response is inserted after its tool result and a stale second response is durable', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:interaction-resume';
+  await createSession(journal, sessionId);
+  const preparation = fakeRunPreparation();
+  const providerRequests = [];
+  const provider = {
+    async *stream(request) {
+      providerRequests.push(structuredClone(request));
+      if (providerRequests.length === 1) {
+        const interactionDefinition = request.tools.find((candidate) => (
+          candidate.inputSchema?.properties?.prompt !== undefined
+          && candidate.inputSchema?.properties?.allowFreeform !== undefined
+        ));
+        assert.ok(interactionDefinition, 'interaction control must be available');
+        yield providerEvent(request.requestId, 'tool.call', {
+          callId: 'provider-call:interaction-resume',
+          name: interactionDefinition.name,
+          input: {
+            kind: 'question',
+            prompt: 'Which fixture option?',
+            allowFreeform: true,
+          },
+        });
+        yield providerEvent(request.requestId, 'completed', {});
+        return;
+      }
+
+      assert.equal(providerRequests.length, 2);
+      const callIndex = request.messages.findIndex((message) => (
+        message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0
+      ));
+      const resultIndex = request.messages.findIndex((message) => message.role === 'tool');
+      const responseIndex = request.messages.findLastIndex((message) => (
+        message.role === 'user' && message.content === 'Use option A.'
+      ));
+      assert.ok(callIndex >= 0, 'the prior interaction call must remain in context');
+      assert.ok(resultIndex > callIndex, 'the interaction result must follow its call');
+      assert.ok(responseIndex > resultIndex, 'the tagged user response must follow the tool result');
+      assert.equal(request.messages.at(-1)?.role, 'user');
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'provider-message:interaction-resume',
+        content: 'Option A accepted.',
+      });
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  };
+  const actor = actorWith(
+    journal,
+    sessionId,
+    provider,
+    emptyKernel(),
+    preparation.port,
+    'interaction-resume',
+  );
+
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:interaction-start',
+    'Ask for one fixture decision.',
+  ));
+  const waiting = await waitForProjection(actor, (value) => (
+    value.run?.status === 'waiting' && value.pendingInteraction !== null
+  ));
+  const interaction = waiting.pendingInteraction;
+  const accepted = await actor.submit({
+    schemaVersion: 'deepcode.command.v3',
+    type: 'interaction.respond',
+    commandId: 'command:interaction-accepted',
+    sessionId,
+    runId: waiting.run.runId,
+    interactionId: interaction.interactionId,
+    response: 'Use option A.',
+  });
+  assert.equal(accepted.status, 'accepted');
+  const stale = await actor.submit({
+    schemaVersion: 'deepcode.command.v3',
+    type: 'interaction.respond',
+    commandId: 'command:interaction-stale',
+    sessionId,
+    runId: waiting.run.runId,
+    interactionId: interaction.interactionId,
+    response: 'Use option B.',
+  });
+  assert.equal(stale.status, 'rejected');
+  assert.equal(stale.error?.code, 'interaction_not_pending');
+  assert.equal(
+    (await journal.readCommand(sessionId, 'command:interaction-stale'))?.reply.status,
+    'rejected',
+  );
+
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(completed.pendingInteraction, null);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.filter((event) => event.type === 'interaction.resolved').length, 1);
+  assert.equal(events.filter((event) => (
+    event.type === 'message.committed' && event.payload.role === 'user'
+  )).length, 2);
+  await actor.dispose();
 });
 
 async function verifyExplicitFocusCompaction() {

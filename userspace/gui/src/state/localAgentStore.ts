@@ -38,6 +38,14 @@ interface PendingFilesystemPath {
   kind: 'file' | 'directory';
 }
 
+type StoreErrorSource =
+  | 'initialization'
+  | 'projection'
+  | 'catalog'
+  | 'pluginCatalog'
+  | 'command'
+  | 'operation';
+
 interface LocalAgentState {
   sessionId: string | null;
   draftProjectId: string | null;
@@ -48,10 +56,10 @@ interface LocalAgentState {
   pluginCatalog: PluginCatalogProjection;
   projection: SessionProjection | null;
   loading: boolean;
-  refreshing: boolean;
   submitting: boolean;
   catalogBusy: boolean;
   error: string | null;
+  errorSource: StoreErrorSource | null;
   initialize(): Promise<void>;
   refreshCatalog(): Promise<void>;
   refreshPluginCatalog(): Promise<void>;
@@ -98,6 +106,13 @@ type StoreGet = () => LocalAgentState;
 
 let initialization: Promise<void> | null = null;
 let generation = 0;
+let activeSubmissionCount = 0;
+const decisionSubmissions = new Map<string, Promise<CommandReply>>();
+let projectionRefreshFlight: {
+  sessionId: string;
+  generation: number;
+  promise: Promise<void>;
+} | null = null;
 
 export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   sessionId: null,
@@ -109,16 +124,16 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   pluginCatalog: EMPTY_PLUGIN_CATALOG,
   projection: null,
   loading: false,
-  refreshing: false,
   submitting: false,
   catalogBusy: false,
   error: null,
+  errorSource: null,
 
   initialize: async () => {
     if (initialization) return await initialization;
     const currentGeneration = ++generation;
     initialization = (async () => {
-      set({ loading: true, error: null });
+      set({ loading: true, error: null, errorSource: null });
       try {
         const [catalog, pluginCatalog, profileResult] = await Promise.all([
           getConversationCatalog(),
@@ -157,10 +172,15 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           loading: false,
           error: projectionError
             ?? (profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable')),
+          errorSource: projectionError || !profileResult.ok ? 'initialization' : null,
         });
       } catch (error) {
         if (currentGeneration === generation) {
-          set({ loading: false, error: errorMessage(error) });
+          set({
+            loading: false,
+            error: errorMessage(error),
+            errorSource: 'initialization',
+          });
         }
       }
     })();
@@ -174,18 +194,26 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   refreshCatalog: async () => {
     try {
       const catalog = await getConversationCatalog();
-      set({ catalog, error: null });
+      set((state) => ({
+        catalog,
+        ...(state.errorSource === 'catalog' ? { error: null, errorSource: null } : {}),
+      }));
     } catch (error) {
-      set({ error: errorMessage(error) });
+      set({ error: errorMessage(error), errorSource: 'catalog' });
     }
   },
 
   refreshPluginCatalog: async () => {
     try {
       const pluginCatalog = await getPluginCatalog();
-      set({ pluginCatalog, error: null });
+      set((state) => ({
+        pluginCatalog,
+        ...(state.errorSource === 'pluginCatalog'
+          ? { error: null, errorSource: null }
+          : {}),
+      }));
     } catch (error) {
-      set({ error: errorMessage(error) });
+      set({ error: errorMessage(error), errorSource: 'pluginCatalog' });
     }
   },
 
@@ -198,20 +226,27 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       draftProjectId: projectId,
       selectedProfileId: get().defaultProfileId,
       loading: false,
-      refreshing: false,
-      submitting: false,
+      submitting: activeSubmissionCount > 0,
       error: null,
+      errorSource: null,
     });
   },
 
   activateSession: async (sessionId) => {
     const summary = get().catalog.sessions.find((session) => session.id === sessionId);
     if (!summary) {
-      set({ error: 'conversation_session_not_found' });
+      set({ error: 'conversation_session_not_found', errorSource: 'operation' });
       return;
     }
     const currentGeneration = ++generation;
-    set({ loading: true, error: null, sessionId, projection: null, draftProjectId: null });
+    set({
+      loading: true,
+      error: null,
+      errorSource: null,
+      sessionId,
+      projection: null,
+      draftProjectId: null,
+    });
     try {
       const projection = await getLocalAgentProjection(sessionId);
       if (currentGeneration !== generation) return;
@@ -223,36 +258,62 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         loading: false,
       });
     } catch (error) {
-      if (currentGeneration === generation) set({ loading: false, error: errorMessage(error) });
+      if (currentGeneration === generation) {
+        set({
+          loading: false,
+          error: errorMessage(error),
+          errorSource: 'projection',
+        });
+      }
     }
   },
 
   selectProfile: (profileId) => {
     if (!get().profiles.some((profile) => profile.id === profileId && profile.enabled)) return;
-    set({ selectedProfileId: profileId, error: null });
+    set({ selectedProfileId: profileId, error: null, errorSource: null });
   },
 
   refresh: async () => {
-    const { sessionId, refreshing } = get();
-    if (!sessionId || refreshing) return;
-    set({ refreshing: true });
+    const { sessionId } = get();
+    if (!sessionId) return;
+    const refreshGeneration = generation;
+    if (
+      projectionRefreshFlight?.sessionId === sessionId
+      && projectionRefreshFlight.generation === refreshGeneration
+    ) {
+      return await projectionRefreshFlight.promise;
+    }
+
+    const promise = (async () => {
+      try {
+        const projection = await getLocalAgentProjection(sessionId);
+        if (generation !== refreshGeneration || get().sessionId !== sessionId) return;
+        set((state) => {
+          const nextProjection = shouldApplyProjection(state.projection, projection)
+            ? projection
+            : state.projection;
+          if (
+            nextProjection === state.projection
+            && state.errorSource !== 'projection'
+          ) return state;
+          return {
+            projection: nextProjection,
+            ...(state.errorSource === 'projection'
+              ? { error: null, errorSource: null }
+              : {}),
+          };
+        });
+      } catch (error) {
+        if (generation === refreshGeneration && get().sessionId === sessionId) {
+          set({ error: errorMessage(error), errorSource: 'projection' });
+        }
+      }
+    })();
+    projectionRefreshFlight = { sessionId, generation: refreshGeneration, promise };
     try {
-      const projection = await getLocalAgentProjection(sessionId);
-      if (get().sessionId !== sessionId) return;
-      set((state) => {
-        const nextProjection = shouldApplyProjection(state.projection, projection)
-          ? projection
-          : state.projection;
-        if (nextProjection === state.projection && state.error === null) return state;
-        return {
-          projection: nextProjection,
-          error: null,
-        };
-      });
-    } catch (error) {
-      if (get().sessionId === sessionId) set({ error: errorMessage(error) });
+      await promise;
     } finally {
-      if (get().sessionId === sessionId) set({ refreshing: false });
+      if (projectionRefreshFlight?.promise === promise) projectionRefreshFlight = null;
     }
   },
 
@@ -328,13 +389,13 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   attachSessionDirectory: async (canonicalRoot) => {
     const sessionId = requiredSession(get());
-    set({ catalogBusy: true, error: null });
+    set({ catalogBusy: true, error: null, errorSource: null });
     try {
       const projection = await attachConversationDirectoryIndex(sessionId, canonicalRoot);
       if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
       set({ projection });
     } catch (error) {
-      set({ error: errorMessage(error) });
+      set({ error: errorMessage(error), errorSource: 'operation' });
       throw error;
     } finally {
       set({ catalogBusy: false });
@@ -343,13 +404,13 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   detachSessionDirectory: async (workspaceId) => {
     const sessionId = requiredSession(get());
-    set({ catalogBusy: true, error: null });
+    set({ catalogBusy: true, error: null, errorSource: null });
     try {
       const projection = await detachConversationDirectoryIndex(sessionId, workspaceId);
       if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
       set({ projection });
     } catch (error) {
-      set({ error: errorMessage(error) });
+      set({ error: errorMessage(error), errorSource: 'operation' });
       throw error;
     } finally {
       set({ catalogBusy: false });
@@ -361,15 +422,20 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     const sessionId = requiredSession(state);
     const interaction = state.projection?.pendingInteraction;
     if (!interaction || !response.trim()) throw new Error('interaction_response_missing');
-    return await submitExisting(set, get, {
-      schemaVersion: CONVERSATION_COMMAND_VERSION,
-      type: 'interaction.respond',
-      commandId: nextId('command'),
-      sessionId,
-      runId: interaction.runId,
-      interactionId: interaction.interactionId,
-      response: response.trim(),
-    });
+    return await submitDecision(
+      set,
+      get,
+      `interaction:${sessionId}:${interaction.runId}:${interaction.interactionId}`,
+      () => ({
+        schemaVersion: CONVERSATION_COMMAND_VERSION,
+        type: 'interaction.respond',
+        commandId: nextId('command'),
+        sessionId,
+        runId: interaction.runId,
+        interactionId: interaction.interactionId,
+        response: response.trim(),
+      }),
+    );
   },
 
   respondApproval: async (decision) => {
@@ -377,16 +443,21 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     const sessionId = requiredSession(state);
     const approval = state.projection?.pendingApproval;
     if (!approval) throw new Error('approval_response_missing');
-    return await submitExisting(set, get, {
-      schemaVersion: CONVERSATION_COMMAND_VERSION,
-      type: 'approval.respond',
-      commandId: nextId('command'),
-      sessionId,
-      runId: approval.runId,
-      callId: approval.callId,
-      approvalId: approval.approvalId,
-      decision,
-    });
+    return await submitDecision(
+      set,
+      get,
+      `approval:${sessionId}:${approval.runId}:${approval.approvalId}`,
+      () => ({
+        schemaVersion: CONVERSATION_COMMAND_VERSION,
+        type: 'approval.respond',
+        commandId: nextId('command'),
+        sessionId,
+        runId: approval.runId,
+        callId: approval.callId,
+        approvalId: approval.approvalId,
+        decision,
+      }),
+    );
   },
 
   respondPlan: async (response) => await submitPlanResponse(set, get, response),
@@ -469,7 +540,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     if (get().sessionId === sessionId) get().startNewSession(projectId ?? null);
   },
 
-  clearError: () => set({ error: null }),
+  clearError: () => set({ error: null, errorSource: null }),
 }));
 
 async function submitPlanResponse(
@@ -481,16 +552,21 @@ async function submitPlanResponse(
   const sessionId = requiredSession(state);
   const plan = state.projection?.pendingPlan;
   if (!plan) throw new Error('plan_response_missing');
-  return await submitExisting(set, get, {
-    schemaVersion: CONVERSATION_COMMAND_VERSION,
-    type: 'plan.respond',
-    commandId: nextId('command'),
-    sessionId,
-    runId: plan.runId,
-    planId: plan.planId,
-    revision: plan.revision,
-    response,
-  });
+  return await submitDecision(
+    set,
+    get,
+    `plan:${sessionId}:${plan.runId}:${plan.planId}:${plan.revision}`,
+    () => ({
+      schemaVersion: CONVERSATION_COMMAND_VERSION,
+      type: 'plan.respond',
+      commandId: nextId('command'),
+      sessionId,
+      runId: plan.runId,
+      planId: plan.planId,
+      revision: plan.revision,
+      response,
+    }),
+  );
 }
 
 async function submitNewRun(
@@ -501,7 +577,7 @@ async function submitNewRun(
   filesystemPaths: PendingFilesystemPath[],
   pluginSelections: PluginSelectionInput[],
 ): Promise<CommandReply> {
-  set({ submitting: true, error: null });
+  beginSubmission(set);
   try {
     const messageProfileId = get().selectedProfileId;
     if (!messageProfileId) throw new Error('llm_profile_unavailable');
@@ -552,10 +628,8 @@ async function submitNewRun(
     const command: ConversationCommand = type === 'message.submit'
       ? { ...common, type, text }
       : { ...common, type, task: text };
-    const reply = await submitLocalAgentCommand(command);
-    assertAccepted(reply);
+    const reply = await submitCommandAndReconcile(set, get, command);
     await Promise.all([
-      get().refresh(),
       get().refreshCatalog(),
       get().refreshPluginCatalog(),
     ]);
@@ -564,10 +638,29 @@ async function submitNewRun(
     if (errorMessage(error).includes('plugin_selection_stale')) {
       await get().refreshPluginCatalog();
     }
-    set({ error: errorMessage(error) });
+    set({ error: errorMessage(error), errorSource: 'command' });
     throw error;
   } finally {
-    set({ submitting: false });
+    endSubmission(set);
+  }
+}
+
+async function submitDecision(
+  set: StoreSet,
+  get: StoreGet,
+  decisionKey: string,
+  command: () => ConversationCommand,
+): Promise<CommandReply> {
+  const existing = decisionSubmissions.get(decisionKey);
+  if (existing) return await existing;
+  const submission = submitExisting(set, get, command());
+  decisionSubmissions.set(decisionKey, submission);
+  try {
+    return await submission;
+  } finally {
+    if (decisionSubmissions.get(decisionKey) === submission) {
+      decisionSubmissions.delete(decisionKey);
+    }
   }
 }
 
@@ -576,30 +669,75 @@ async function submitExisting(
   get: () => LocalAgentState,
   command: ConversationCommand,
 ): Promise<CommandReply> {
-  set({ submitting: true, error: null });
+  beginSubmission(set);
   try {
-    const reply = await submitLocalAgentCommand(command);
-    assertAccepted(reply);
-    await get().refresh();
-    return reply;
+    return await submitCommandAndReconcile(set, get, command);
   } catch (error) {
-    set({ error: errorMessage(error) });
+    set({ error: errorMessage(error), errorSource: 'command' });
     throw error;
   } finally {
-    set({ submitting: false });
+    endSubmission(set);
   }
+}
+
+async function submitCommandAndReconcile(
+  set: StoreSet,
+  get: StoreGet,
+  command: ConversationCommand,
+): Promise<CommandReply> {
+  const reply = await submitLocalAgentCommand(command);
+  const rejection = reply.status === 'rejected' ? commandRejectionMessage(reply) : null;
+  try {
+    await reconcileProjectionAfterReply(set, get, command.sessionId, reply.revision);
+  } catch (error) {
+    const reconciliation = `conversation_projection_reconcile_failed:${errorMessage(error)}`;
+    throw new Error(rejection ? `${rejection};${reconciliation}` : reconciliation);
+  }
+  if (rejection) throw new Error(rejection);
+  set({ error: null, errorSource: null });
+  return reply;
+}
+
+async function reconcileProjectionAfterReply(
+  set: StoreSet,
+  get: StoreGet,
+  sessionId: string,
+  replyRevision: number,
+): Promise<void> {
+  const projection = await getLocalAgentProjection(sessionId);
+  if (projection.revision < replyRevision) {
+    throw new Error(
+      `conversation_projection_behind_command_reply:${projection.revision}:${replyRevision}`,
+    );
+  }
+  if (get().sessionId !== sessionId) return;
+  set((state) => ({
+    projection: shouldApplyProjection(state.projection, projection)
+      ? projection
+      : state.projection,
+  }));
+}
+
+function beginSubmission(set: StoreSet): void {
+  activeSubmissionCount += 1;
+  set({ submitting: true, error: null, errorSource: null });
+}
+
+function endSubmission(set: StoreSet): void {
+  activeSubmissionCount -= 1;
+  set({ submitting: activeSubmissionCount > 0 });
 }
 
 async function mutateCatalog(
   set: StoreSet,
   operation: () => Promise<ConversationCatalog>,
 ): Promise<void> {
-  set({ catalogBusy: true, error: null });
+  set({ catalogBusy: true, error: null, errorSource: null });
   try {
     const activeCatalog = await operation();
     set({ catalog: activeCatalog });
   } catch (error) {
-    set({ error: errorMessage(error) });
+    set({ error: errorMessage(error), errorSource: 'operation' });
     throw error;
   } finally {
     set({ catalogBusy: false });
@@ -617,10 +755,8 @@ function rootsForProject(
   });
 }
 
-function assertAccepted(reply: CommandReply): void {
-  if (reply.status === 'rejected') {
-    throw new Error(`${reply.error?.code ?? 'conversation_command_rejected'}:${reply.error?.message ?? ''}`);
-  }
+function commandRejectionMessage(reply: CommandReply): string {
+  return `${reply.error?.code ?? 'conversation_command_rejected'}:${reply.error?.message ?? ''}`;
 }
 
 function requiredSession(state: LocalAgentState): string {

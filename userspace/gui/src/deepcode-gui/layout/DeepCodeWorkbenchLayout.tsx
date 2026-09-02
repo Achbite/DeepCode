@@ -663,30 +663,14 @@ function cacheHitSummary(
   const cache = inputCacheMetric(usage);
   if (cache) {
     const percent = `${formatCachePercent(cache.hitPercent)}%`;
-    return cache.complete
-      ? {
-          label: t(language, 'deepcodeGui.cache.summary', { value: percent }),
-          title: t(language, 'deepcodeGui.cache.completeTitle', {
-            calls: cache.providerCallCount.toLocaleString(language),
-            input: cache.inputTokens.toLocaleString(language),
-            hit: cache.hitTokens.toLocaleString(language),
-            miss: cache.missTokens.toLocaleString(language),
-          }),
-        }
-      : {
-          label: t(language, 'deepcodeGui.cache.partialSummary', {
-            value: percent,
-            reported: cache.reportedCallCount.toLocaleString(language),
-            calls: cache.providerCallCount.toLocaleString(language),
-          }),
-          title: t(language, 'deepcodeGui.cache.partialTitle', {
-            calls: cache.providerCallCount.toLocaleString(language),
-            reported: cache.reportedCallCount.toLocaleString(language),
-            input: cache.inputTokens.toLocaleString(language),
-            hit: cache.hitTokens.toLocaleString(language),
-            miss: cache.missTokens.toLocaleString(language),
-          }),
-        };
+    return {
+      label: t(language, 'deepcodeGui.cache.summary', { value: percent }),
+      title: t(language, 'deepcodeGui.cache.calculatedTitle', {
+        input: cache.inputTokens.toLocaleString(language),
+        hit: cache.hitTokens.toLocaleString(language),
+        miss: cache.missTokens.toLocaleString(language),
+      }),
+    };
   }
   return {
     label: t(language, 'deepcodeGui.cache.unavailableSummary'),

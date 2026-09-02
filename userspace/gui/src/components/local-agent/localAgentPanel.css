@@ -120,7 +120,6 @@
 .local-agent__body {
   min-height: 0;
   overflow: auto;
-  scroll-behavior: smooth;
   scrollbar-gutter: stable;
 }
 

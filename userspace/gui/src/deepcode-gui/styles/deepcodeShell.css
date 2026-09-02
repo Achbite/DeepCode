@@ -573,6 +573,8 @@
   align-items: center;
   border-radius: var(--dc-radius-control);
   transition: background-color 120ms ease;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .deepcode-gui-session-row:hover,
@@ -831,6 +833,8 @@
   background: color-mix(in srgb, var(--dc-surface-raised) 96%, transparent);
   box-shadow: var(--dc-shadow-panel);
   backdrop-filter: blur(18px);
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .deepcode-gui-project-create-menu button,

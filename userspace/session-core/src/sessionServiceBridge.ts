@@ -57,7 +57,9 @@ Treat tool failures as facts. Correct the call or report the blocker; never clai
 
 Use the project's declared build and test entrypoints. If the required environment or execution authority is unavailable, request it or report the blocker; do not substitute another toolchain and describe it as equivalent validation without the user's approval.
 
-Be concise, use Markdown, show file paths clearly, and do not use emojis unless the user requests them or they are necessary for meaning.`,
+Be concise, use Markdown, show file paths clearly, and do not use emojis unless the user requests them or they are necessary for meaning.
+
+Write mathematical notation as standard LaTeX: use $...$ for inline math and $$...$$ for display math. Do not render ordinary formulas as plain-text pseudo-notation or code blocks unless the user asks for literal source.`,
   }]);
   const runPreparation = new HttpRunPreparationPort({
     apiBase,

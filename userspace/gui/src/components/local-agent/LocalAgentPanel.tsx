@@ -44,6 +44,15 @@ interface SessionViewport {
   scrollTop: number;
 }
 
+interface ComposerState {
+  draft: string;
+  filesystemPaths: PendingFilesystemPath[];
+  pluginSelections: PluginSelectionInput[];
+  selectionStart: number;
+  selectionEnd: number;
+  focused: boolean;
+}
+
 async function copyTextToClipboard(text: string): Promise<void> {
   if (window.navigator.clipboard?.writeText) {
     await window.navigator.clipboard.writeText(text);
@@ -75,6 +84,18 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const profiles = useLocalAgentStore((state) => state.profiles);
   const selectedProfileId = useLocalAgentStore((state) => state.selectedProfileId);
   const projection = useLocalAgentStore((state) => state.projection);
+  const pendingInteraction = projection?.pendingInteraction ?? null;
+  const pendingApproval = projection?.pendingApproval ?? null;
+  const pendingPlan = projection?.pendingPlan ?? null;
+  const composerViewKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const composerModeKey = pendingPlan
+    ? `plan:${pendingPlan.planId}:${pendingPlan.revision}`
+    : pendingInteraction
+      ? `interaction:${pendingInteraction.interactionId}`
+      : pendingApproval
+        ? `approval:${pendingApproval.approvalId}`
+        : 'normal';
+  const composerStateKey = `${composerViewKey}\u0000${composerModeKey}`;
   const presentation = usePresentedCommittedContent(projection, language);
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
@@ -106,6 +127,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const [resourcePreview, setResourcePreview] = useState<ResourcePreviewState | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [uiActionError, setUiActionError] = useState<string | null>(null);
+  const [, setProviderStreamCompletionRevision] = useState(0);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -113,12 +135,20 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const pluginPickerRef = useRef<HTMLDivElement | null>(null);
   const permissionControlRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerStatesRef = useRef(new Map<string, ComposerState>());
+  const activeComposerStateKeyRef = useRef(composerStateKey);
+  const pendingComposerRestoreRef = useRef<{
+    key: string;
+    state: ComposerState;
+  } | null>(null);
   const compositionActiveRef = useRef(false);
   const compositionCommitPendingRef = useRef(false);
   const compositionGuardFrameRef = useRef<number | null>(null);
   const activeViewRef = useRef<string | null>(sessionId);
   const sessionViewportsRef = useRef(new Map<string, SessionViewport>());
   const pendingViewportRestoreRef = useRef<string | null>(null);
+  const providerStreamProgressRef = useRef(new Map<string, number>());
+  const transitioningProviderStreamsRef = useRef(new Set<string>());
   const followingLatestRef = useRef(true);
   const userDetachedFromLatestRef = useRef(false);
   const lastScrollTopRef = useRef(0);
@@ -134,6 +164,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     || t(language, 'agent.session.newTitle');
   const conversationItems = useMemo(() => projectionItems(projection), [projection]);
   const assistantDraft = projection?.assistantDraft ?? null;
+  const assistantDraftStreamIdentity = projection && assistantDraft
+    ? providerStreamIdentity(projection.sessionId, assistantDraft.runId, assistantDraft.turnId)
+    : null;
+  const projectionPollingActive = Boolean(
+    projection?.run && ['running', 'waiting', 'releasing'].includes(projection.run.status),
+  );
   const timelineExtentKey = projection?.timeline.map((item) => (
     item.kind === 'toolGroup'
       ? `${item.timelineId}:${item.activityIds.length}`
@@ -145,9 +181,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     || Boolean(projection?.pendingApproval)
     || Boolean(projection?.pendingPlan)
     || Boolean(projection?.terminalError);
-  const pendingInteraction = projection?.pendingInteraction ?? null;
-  const pendingApproval = projection?.pendingApproval ?? null;
-  const pendingPlan = projection?.pendingPlan ?? null;
   const latestRunComposition = useMemo(() => {
     const runId = projection?.run?.runId;
     if (!runId) return null;
@@ -159,6 +192,62 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   }, [projection?.contextCompositions, projection?.run?.runId]);
   const contextCompacting = projection?.run?.status === 'running'
     && latestRunComposition?.purpose === 'contextCompaction';
+
+  const recordProviderStreamProgress = useCallback((identity: string, length: number) => {
+    providerStreamProgressRef.current.set(identity, length);
+  }, []);
+
+  const finishProviderStream = useCallback((identity: string) => {
+    providerStreamProgressRef.current.delete(identity);
+    if (transitioningProviderStreamsRef.current.delete(identity)) {
+      setProviderStreamCompletionRevision((revision) => revision + 1);
+    }
+  }, []);
+
+  const committedProviderContent = (
+    runId: string,
+    providerRequestId: string,
+    content: string,
+    committed: React.ReactNode,
+  ): React.ReactNode => {
+    if (!projection) throw new Error('conversation_projection_missing_for_committed_content');
+    const identity = providerStreamIdentity(projection.sessionId, runId, providerRequestId);
+    if (!transitioningProviderStreamsRef.current.has(identity)) return committed;
+    return (
+      <BufferedMarkdown
+        key={`committed:${identity}`}
+        text={content}
+        streamIdentity={identity}
+        initialVisibleLength={providerStreamProgressRef.current.get(identity) ?? 0}
+        onVisibleLengthChange={recordProviderStreamProgress}
+        onCaughtUp={finishProviderStream}
+      />
+    );
+  };
+
+  const recordComposerElementState = (
+    element: HTMLTextAreaElement,
+    focused: boolean,
+  ) => {
+    composerStatesRef.current.set(activeComposerStateKeyRef.current, {
+      draft: element.value,
+      filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
+      pluginSelections: pluginSelections.map((item) => ({ ...item })),
+      selectionStart: element.selectionStart ?? element.value.length,
+      selectionEnd: element.selectionEnd ?? element.value.length,
+      focused,
+    });
+  };
+
+  const setComposerStateForKey = (key: string, state: ComposerState) => {
+    const copy = cloneComposerState(state);
+    composerStatesRef.current.set(key, copy);
+    if (activeComposerStateKeyRef.current !== key) return;
+    setDraft(copy.draft);
+    setPendingFilesystemPaths(copy.filesystemPaths);
+    setPluginSelections(copy.pluginSelections);
+    pendingComposerRestoreRef.current = { key, state: copy };
+  };
 
   const setLatestFollowMode = useCallback((following: boolean) => {
     followingLatestRef.current = following;
@@ -197,14 +286,10 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     let timeout: number | null = null;
 
     const schedule = () => {
-      if (cancelled) return;
-      const current = useLocalAgentStore.getState().projection;
-      const active = Boolean(
-        current?.run && ['running', 'waiting', 'releasing'].includes(current.run.status),
-      );
+      if (cancelled || timeout !== null) return;
       const delay = document.visibilityState === 'hidden'
         ? 10_000
-        : active
+        : projectionPollingActive
           ? 750
           : 4_000;
       timeout = window.setTimeout(() => {
@@ -226,7 +311,59 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       document.removeEventListener('visibilitychange', refreshWhenVisible);
       if (timeout !== null) window.clearTimeout(timeout);
     };
-  }, [refresh, sessionId]);
+  }, [projectionPollingActive, refresh, sessionId]);
+
+  useLayoutEffect(() => {
+    if (assistantDraftStreamIdentity) {
+      transitioningProviderStreamsRef.current.add(assistantDraftStreamIdentity);
+    }
+  }, [assistantDraftStreamIdentity]);
+
+  useLayoutEffect(() => {
+    const previousKey = activeComposerStateKeyRef.current;
+    if (previousKey === composerStateKey) return;
+    const textarea = textareaRef.current;
+    const previous = composerStatesRef.current.get(previousKey);
+    const outgoing: ComposerState = {
+      draft: textarea?.value ?? draft,
+      filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
+      pluginSelections: pluginSelections.map((item) => ({ ...item })),
+      selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
+      selectionEnd: textarea?.selectionEnd ?? previous?.selectionEnd ?? draft.length,
+      focused: document.activeElement === textarea || previous?.focused === true,
+    };
+    composerStatesRef.current.set(previousKey, outgoing);
+
+    const cachedIncoming = composerStatesRef.current.get(composerStateKey);
+    const incoming = cloneComposerState(
+      cachedIncoming ?? { ...emptyComposerState(), focused: outgoing.focused },
+    );
+    activeComposerStateKeyRef.current = composerStateKey;
+    pendingComposerRestoreRef.current = { key: composerStateKey, state: incoming };
+    setDraft(incoming.draft);
+    setPendingFilesystemPaths(incoming.filesystemPaths);
+    setPluginSelections(incoming.pluginSelections);
+    setPluginPickerOpen(false);
+    setAttachmentMenuOpen(false);
+    setAttachmentDialogOpen(false);
+    setPermissionMenuOpen(false);
+    setAttachmentError(null);
+  }, [composerStateKey]);
+
+  useLayoutEffect(() => {
+    const pending = pendingComposerRestoreRef.current;
+    if (!pending || pending.key !== activeComposerStateKeyRef.current) return;
+    const textarea = textareaRef.current;
+    if (!textarea || textarea.value !== pending.state.draft) return;
+    const selectionStart = Math.min(pending.state.selectionStart, textarea.value.length);
+    const selectionEnd = Math.min(
+      Math.max(selectionStart, pending.state.selectionEnd),
+      textarea.value.length,
+    );
+    textarea.setSelectionRange(selectionStart, selectionEnd);
+    if (pending.state.focused && !textarea.disabled) textarea.focus({ preventScroll: true });
+    pendingComposerRestoreRef.current = null;
+  });
 
   useLayoutEffect(() => {
     if (activeViewRef.current !== sessionId) {
@@ -236,18 +373,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       }
       pendingViewportRestoreRef.current = sessionId;
       suppressScrollEventsUntilRef.current = window.performance.now() + 220;
-      if (!submitting) {
-        setPendingFilesystemPaths([]);
-        setPluginSelections([]);
-        setPluginPickerOpen(false);
-        setAttachmentMenuOpen(false);
-        setAttachmentDialogOpen(false);
-      }
+      setPluginPickerOpen(false);
+      setAttachmentMenuOpen(false);
+      setAttachmentDialogOpen(false);
       activeViewRef.current = sessionId;
       const saved = sessionId ? sessionViewportsRef.current.get(sessionId) : undefined;
       setLatestFollowMode(saved?.mode !== 'detached');
     }
-  }, [sessionId, setLatestFollowMode, submitting]);
+  }, [sessionId, setLatestFollowMode]);
 
   useLayoutEffect(() => {
     if (!sessionId || !loading || projection !== null) return;
@@ -273,17 +406,18 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     const following = saved?.mode !== 'detached';
     setLatestFollowMode(following);
     suppressScrollEventsUntilRef.current = window.performance.now() + 220;
-    body.scrollTo({
-      top: following ? body.scrollHeight : saved.scrollTop,
-      behavior: 'auto',
-    });
+    if (following) body.scrollTop = body.scrollHeight;
+    else if (saved) body.scrollTop = saved.scrollTop;
     lastScrollTopRef.current = body.scrollTop;
-    sessionViewportsRef.current.set(sessionId, {
-      mode: following ? 'following' : 'detached',
-      scrollTop: body.scrollTop,
-    });
     pendingViewportRestoreRef.current = null;
-  }, [loading, projection?.sessionId, sessionId, setLatestFollowMode, timelineExtentKey]);
+  }, [
+    loading,
+    presentation.layoutKey,
+    projection?.sessionId,
+    sessionId,
+    setLatestFollowMode,
+    timelineExtentKey,
+  ]);
 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
@@ -350,8 +484,18 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       || compositionActiveRef.current
       || compositionCommitPendingRef.current
     ) return;
+    const submittedComposerKey = activeComposerStateKeyRef.current;
     const submittedFilesystemPaths = pendingFilesystemPaths;
     const submittedPluginSelections = pluginSelections;
+    const submittedTextarea = textareaRef.current;
+    const submittedComposerState: ComposerState = {
+      draft: submittedText,
+      filesystemPaths: submittedFilesystemPaths.map((item) => ({ ...item })),
+      pluginSelections: submittedPluginSelections.map((item) => ({ ...item })),
+      selectionStart: submittedTextarea?.selectionStart ?? submittedText.length,
+      selectionEnd: submittedTextarea?.selectionEnd ?? submittedText.length,
+      focused: document.activeElement === submittedTextarea,
+    };
     setDraft('');
     setPluginPickerOpen(false);
     setLatestFollowMode(true);
@@ -370,12 +514,19 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           submittedPluginSelections,
         );
       }
-      setPendingFilesystemPaths([]);
-      setPluginSelections([]);
-      setAttachmentError(null);
+      setComposerStateForKey(submittedComposerKey, {
+        ...submittedComposerState,
+        draft: '',
+        filesystemPaths: [],
+        pluginSelections: [],
+        selectionStart: 0,
+        selectionEnd: 0,
+      });
+      if (activeComposerStateKeyRef.current === submittedComposerKey) {
+        setAttachmentError(null);
+      }
     } catch {
-      setDraft(submittedText);
-      setPluginSelections(submittedPluginSelections);
+      setComposerStateForKey(submittedComposerKey, submittedComposerState);
     }
   };
 
@@ -556,9 +707,16 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     response: Extract<PlanResponse, { kind: 'confirm' | 'cancel' }>,
   ) => {
     if (!pendingPlan || submitting) return;
+    const submittedComposerKey = activeComposerStateKeyRef.current;
     try {
       await respondPlan(response);
-      setDraft('');
+      const cached = composerStatesRef.current.get(submittedComposerKey) ?? emptyComposerState();
+      setComposerStateForKey(submittedComposerKey, {
+        ...cached,
+        draft: '',
+        selectionStart: 0,
+        selectionEnd: 0,
+      });
     } catch {
       // The store preserves the authoritative command error for the shared error panel.
     }
@@ -749,6 +907,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           ) return;
           const scrolledUp = body.scrollTop < lastScrollTopRef.current - 2;
           lastScrollTopRef.current = body.scrollTop;
+          if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
           const distanceFromLatest = body.scrollHeight - body.scrollTop - body.clientHeight;
           if (sessionId) {
             sessionViewportsRef.current.set(sessionId, {
@@ -756,7 +915,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               scrollTop: body.scrollTop,
             });
           }
-          if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
           if (scrolledUp) {
             setLatestFollowMode(false);
             return;
@@ -785,7 +943,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               className={`local-agent__message local-agent__message--${item.value.role}`}
             >
               <div className="local-agent__message-content">
-                {presentation.content(`message:${item.value.messageId}:content`)}
+                {item.value.role === 'assistant'
+                  ? committedProviderContent(
+                      item.value.runId,
+                      item.value.providerRequestId,
+                      item.value.content,
+                      presentation.content(`message:${item.value.messageId}:content`),
+                    )
+                  : presentation.content(`message:${item.value.messageId}:content`)}
                 {item.value.filesystemReferences.length > 0 && (
                   <div className="local-agent__message-attachments">
                     {item.value.filesystemReferences.map((reference) => (
@@ -856,7 +1021,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           ) : item.type === 'narrative' ? (
             <article className="local-agent__narrative" key={`narrative:${item.value.narrativeId}`}>
               <div>
-                {presentation.content(`narrative:${item.value.narrativeId}`)}
+                {committedProviderContent(
+                  item.value.runId,
+                  item.value.providerRequestId,
+                  item.value.content,
+                  presentation.content(`narrative:${item.value.narrativeId}`),
+                )}
               </div>
             </article>
           ) : item.type === 'plan' ? (
@@ -874,12 +1044,17 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
-          {assistantDraft && (
+          {assistantDraft && assistantDraftStreamIdentity && (
             <article className="local-agent__message local-agent__message--assistant local-agent__message--draft">
               <div className="local-agent__message-content">
                 <BufferedMarkdown
+                  key={assistantDraftStreamIdentity}
                   text={assistantDraft.content}
-                  streamIdentity={`${assistantDraft.runId}:${assistantDraft.turnId}`}
+                  streamIdentity={assistantDraftStreamIdentity}
+                  initialVisibleLength={providerStreamProgressRef.current.get(
+                    assistantDraftStreamIdentity,
+                  ) ?? 0}
+                  onVisibleLengthChange={recordProviderStreamProgress}
                 />
               </div>
             </article>
@@ -997,6 +1172,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     ? t(language, 'agent.composer.placeholder.plan')
                     : t(language, 'agent.composer.placeholder.interaction')}
                   onChange={(event) => setDraft(event.target.value)}
+                  onFocus={(event) => recordComposerElementState(event.currentTarget, true)}
+                  onBlur={(event) => recordComposerElementState(event.currentTarget, false)}
+                  onSelect={(event) => recordComposerElementState(
+                    event.currentTarget,
+                    document.activeElement === event.currentTarget,
+                  )}
                   onCompositionStart={beginComposition}
                   onCompositionEnd={endComposition}
                   onKeyDown={submitOnComposerEnter}
@@ -1128,6 +1309,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             onChange={(event) => updateDraft(
               event.target.value,
               event.target.selectionStart ?? event.target.value.length,
+            )}
+            onFocus={(event) => recordComposerElementState(event.currentTarget, true)}
+            onBlur={(event) => recordComposerElementState(event.currentTarget, false)}
+            onSelect={(event) => recordComposerElementState(
+              event.currentTarget,
+              document.activeElement === event.currentTarget,
             )}
             onCompositionStart={beginComposition}
             onCompositionEnd={endComposition}
@@ -1851,6 +2038,33 @@ function toolGroupStatus(
   ];
   return priority.find((status) => activities.some((activity) => activity.status === status))
     ?? 'indeterminate';
+}
+
+function emptyComposerState(): ComposerState {
+  return {
+    draft: '',
+    filesystemPaths: [],
+    pluginSelections: [],
+    selectionStart: 0,
+    selectionEnd: 0,
+    focused: false,
+  };
+}
+
+function cloneComposerState(state: ComposerState): ComposerState {
+  return {
+    ...state,
+    filesystemPaths: state.filesystemPaths.map((item) => ({ ...item })),
+    pluginSelections: state.pluginSelections.map((item) => ({ ...item })),
+  };
+}
+
+function providerStreamIdentity(
+  sessionId: string,
+  runId: string,
+  providerRequestId: string,
+): string {
+  return `${sessionId}\u0000${runId}\u0000${providerRequestId}`;
 }
 
 function nextPanelId(kind: string): string {

@@ -3,7 +3,6 @@ import React, {
   useCallback,
   useContext,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useState,
 } from 'react';
@@ -159,6 +158,7 @@ export function useGuiPresentationRegistry(): GuiPresentationRegistry {
 export interface PresentedCommittedContent {
   registry: GuiPresentationRegistry;
   snapshot: PresentationRendererRegistrySnapshot;
+  layoutKey: string;
   content(blockId: string): React.ReactNode;
 }
 
@@ -177,30 +177,24 @@ export function usePresentedCommittedContent(
   const inputBlocks = useMemo(() => {
     if (!projection) return [];
     return committedContentBlocks(projectSessionPresentation(projection));
-  }, [projection]);
+  }, [projection?.revision, projection?.sessionId]);
   const renderKey = projection
     ? `${projection.sessionId}:${projection.revision}:${snapshot.revision}:${locale}`
     : `empty:${snapshot.revision}:${locale}`;
-  const [rendered, setRendered] = useState<{
-    key: string;
-    nodes: ReadonlyMap<string, React.ReactNode>;
-  } | null>(null);
-
-  useLayoutEffect(() => {
+  const rendered = useMemo(() => {
     const nodes = new Map<string, React.ReactNode>();
     for (const block of inputBlocks) {
       const output = registry.render([block], { locale }).at(-1);
       if (output !== undefined) nodes.set(block.blockId, output);
     }
-    setRendered({ key: renderKey, nodes });
+    return nodes;
   }, [inputBlocks, locale, registry, renderKey]);
 
   const content = useCallback((blockId: string) => {
-    if (rendered?.key !== renderKey) return null;
-    return rendered.nodes.get(blockId);
-  }, [renderKey, rendered]);
+    return rendered.get(blockId);
+  }, [rendered]);
 
-  return { registry, snapshot, content };
+  return { registry, snapshot, layoutKey: renderKey, content };
 }
 
 function committedContentBlocks(blocks: readonly PresentationBlock[]): PresentationBlock[] {
