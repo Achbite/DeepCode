@@ -134,6 +134,8 @@ export type PlanOperation =
       operation: 'bash';
       command: string;
       workspaceMode: 'write';
+      executionScope: 'workspace' | 'host';
+      terminal?: { stdin: string };
     };
 
 export interface ExecutionPlanStep {
@@ -922,6 +924,8 @@ export interface ToolActivityProjection {
 export interface ShellActivityProjection {
   command: string;
   cwd: string;
+  executionScope: 'workspace' | 'host';
+  terminal: boolean;
   result?: ShellActivityResultProjection;
 }
 
@@ -939,10 +943,13 @@ export interface ShellActivityResultProjection {
 
 export interface ShellExecutionEnvironmentProjection {
   shell: string;
-  interactive: false;
+  interactive: boolean;
+  executionScope: 'workspace' | 'host';
+  terminal: boolean;
   pathSource: 'hostPlusStandardDeveloperPaths';
-  writeScope: 'kernelTemporaryOnly' | 'workspaceAndKernelTemporary';
-  homeWritable: false;
+  writeScope: 'kernelTemporaryOnly' | 'workspaceAndKernelTemporary' | 'hostUser';
+  homeWritable: boolean;
+  networkAccess: boolean;
 }
 
 export interface ArtifactProjection {
@@ -1168,6 +1175,7 @@ export interface PreparedEffectProjection {
   toolName: string;
   workspaceId?: string;
   processWorkspaceMode?: 'read' | 'write';
+  processExecutionScope?: 'workspace' | 'host';
   operation: string;
   logicalTargets: string[];
   canonicalInvocation: {
@@ -1197,7 +1205,7 @@ export interface ToolExecutionRequest {
   };
 }
 
-export type AuthorityDecision =
+export type WorkspaceAuthorityDecision =
   | { decision: 'allow'; source: 'workspaceBinding'; workspaceId: string }
   | {
       decision: 'allow';
@@ -1208,8 +1216,27 @@ export type AuthorityDecision =
       revision: number;
       decisionId: string;
     }
+  | {
+      decision: 'allow';
+      source: 'userSetting';
+      authorityId: string;
+      workspaceId: string;
+    };
+
+export type NonWorkspaceAuthorityDecision =
   | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string }
-  | { decision: 'deny'; source: 'kernel' | 'user' | 'userSetting'; reason: string };
+  | { decision: 'deny'; source: 'user'; authorityId: string }
+  | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
+
+export type AuthorityDecision =
+  | WorkspaceAuthorityDecision
+  | NonWorkspaceAuthorityDecision
+  | {
+      decision: 'allow' | 'deny';
+      source: 'composite';
+      workspaceAuthority: WorkspaceAuthorityDecision;
+      externalAuthority: NonWorkspaceAuthorityDecision;
+    };
 
 interface ToolExecutionRecordBase {
   recordId: string;

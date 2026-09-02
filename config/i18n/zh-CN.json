@@ -504,12 +504,14 @@
     "agent.context.windowShare": "整窗 {percent}%",
     "agent.context.focusCommand": "聚焦压缩",
     "agent.context.focusCommandDescription": "压缩此前内容，并将输入作为新的任务焦点",
+    "agent.context.compacting": "上下文压缩中",
     "agent.plugin.picker": "插件",
     "agent.plugin.empty": "没有匹配的插件",
     "agent.plugin.menu": "插件",
     "agent.plugin.menuDescription": "为本次请求启用能力",
     "agent.plugin.remove": "移除插件 {name}",
     "agent.context.inputCache": "输入缓存",
+    "agent.context.cachePartial": "已报告 {reported}/{calls}",
     "agent.context.cacheHit": "命中",
     "agent.context.cacheMiss": "未命中",
     "agent.context.capacity.input": "Provider 输入",
@@ -525,6 +527,7 @@
     "agent.context.tokensUnavailable": "Token 不可用",
     "agent.context.tokenMetric": "{estimate}{tokens} Token{percent}",
     "agent.context.cacheAria": "输入 {input} Token，缓存命中 {hit} Token，未命中 {miss} Token",
+    "agent.context.cachePartialAria": "缓存字段已报告 {reported}/{calls} 次调用；已报告输入 {input} Token，缓存命中 {hit} Token，未命中 {miss} Token",
     "agent.context.itemCount": "{count} 项",
     "agent.chat.independent": "独立对话",
     "agent.chat.connecting": "连接中",
@@ -592,19 +595,19 @@
     "agent.attachment.attachSelected": "附加所选项目",
     "agent.attachment.size.bytes": "{value} B",
     "agent.attachment.size.kibibytes": "{value} KiB",
-    "agent.permission.summary.plan": "读取/Shell：允许 · fs.* 修改：Plan 门禁",
-    "agent.permission.summary.allow": "读取/Shell/fs.* 修改：工作区内允许",
+    "agent.permission.summary.plan": "工作区读取/只读 Shell：允许 · 工作区修改：Plan 门禁 · Host Shell/外部：{external}",
+    "agent.permission.summary.allow": "工作区读取/只读 Shell/修改：允许 · Host Shell/外部：{external}",
     "agent.permission.nextRunActivationPending": "已保存的选项将在下一个 run 激活。上方摘要继续显示当前 Runtime；无需重启 DeepCode。",
     "agent.permission.workspaceRead": "工作区读取",
     "agent.permission.workspaceReadAllowed": "绑定目录内允许",
-    "agent.permission.workspaceMutation": "结构化文件修改",
-    "agent.permission.workspaceMutationPlan": "确认 Plan 后执行 fs.* 修改",
-    "agent.permission.workspaceMutationAllow": "绑定工作区内直接允许 fs.* 修改",
+    "agent.permission.workspaceMutation": "工作区修改",
+    "agent.permission.workspaceMutationPlan": "确认 Plan 后执行 fs.* 或写入 Shell",
+    "agent.permission.workspaceMutationAllow": "绑定工作区内直接允许 fs.* 或写入 Shell",
     "agent.permission.engineeringDecisions": "工程路线抉择",
     "agent.permission.engineeringDecisionsAsk": "遇到不明确项时询问",
     "agent.permission.engineeringDecisionsDelegate": "委托给 Agent",
     "agent.permission.networkRead": "网络读取",
-    "agent.permission.externalEffects": "外部操作",
+    "agent.permission.externalEffects": "Host Shell 与外部操作",
     "agent.permission.allow": "允许",
     "agent.permission.ask": "询问",
     "agent.permission.deny": "拒绝",
@@ -679,8 +682,11 @@
     "deepcodeGui.tasks.status.inProgress": "进行中",
     "deepcodeGui.tasks.status.completed": "完成",
     "deepcodeGui.cache.summary": "总缓存命中 {value}",
+    "deepcodeGui.cache.partialSummary": "已报告缓存命中 {value} · {reported}/{calls}",
+    "deepcodeGui.cache.unavailableSummary": "缓存命中 不可用",
     "deepcodeGui.cache.completeTitle": "当前会话累计：{calls} 次 Provider 调用；输入 {input} Token；缓存读取 {hit}；缓存未命中 {miss}。总命中率按全会话缓存读取输入 / 全会话输入 Token 计算。",
-    "deepcodeGui.cache.partialTitle": "当前会话有 {calls} 次 Provider 调用，缓存字段报告 {reported}/{calls} 次，无法给出完整会话的精确总缓存命中率。",
+    "deepcodeGui.cache.partialTitle": "当前会话有 {calls} 次 Provider 调用，其中 {reported} 次完整报告缓存字段；已报告输入 {input} Token，缓存读取 {hit}，缓存未命中 {miss}。显示值只覆盖已报告调用，不是全会话总命中率。",
+    "deepcodeGui.cache.unavailableTitle": "当前会话有 {calls} 次 Provider 调用，但均未报告缓存读取与未命中字段。",
     "deepcodeGui.cache.emptyTitle": "当前会话尚无 Provider 用量。",
     "deepcodeGui.titlebar.api": "API",
     "deepcodeGui.titlebar.agent": "Agent"
@@ -823,11 +829,11 @@
       "description": "附加到内置编码 Agent 指令之后；所有 UI 壳启动的新会话共享该内容。"
     },
     "agent.permissions.workspaceMutation": {
-      "label": "结构化文件修改",
-      "description": "要求 fs.* 修改先确认 Plan，或允许它们在绑定工作区内直接执行。项目调试 Shell 在工作区内独立允许；其写入边界与破坏性命令硬拒绝始终保留。",
+      "label": "工作区修改",
+      "description": "控制 fs.* 与 workspaceMode=write 的 Bash 是否要求先确认 Plan。workspaceMode=read 的工作区 Shell 由绑定目录授权；写入边界与破坏性命令硬拒绝始终保留。",
       "options": {
-        "plan": "确认 Plan 后执行 fs.* 修改",
-        "allow": "绑定工作区内直接允许 fs.* 修改"
+        "plan": "确认 Plan 后执行 fs.* 或写入 Shell",
+        "allow": "绑定工作区内直接允许 fs.* 或写入 Shell"
       }
     },
     "agent.permissions.engineeringDecisions": {
@@ -848,8 +854,8 @@
       }
     },
     "agent.permissions.external": {
-      "label": "外部插件工具",
-      "description": "Kernel 对外部插件贡献工具采用的默认决策。",
+      "label": "Host Shell 与外部工具",
+      "description": "Kernel 对 executionScope=host 的 Bash 与外部插件贡献工具采用的默认决策。",
       "options": {
         "allow": "允许",
         "ask": "每次询问",

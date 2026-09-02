@@ -1432,11 +1432,11 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                 let miss = required_u64(payload, "cacheMissInputTokens")?;
                 if read
                     .checked_add(miss)
-                    .is_none_or(|total| total > input_tokens)
+                    .is_none_or(|total| total != input_tokens)
                 {
                     return Err(LocalAgentStoreError::new(
                         "session_event_invalid",
-                        "context.updated 缓存 token 超过输入 token。",
+                        "context.updated 缓存 token 必须完整划分输入 token。",
                     ));
                 }
             }
@@ -1699,9 +1699,16 @@ fn validate_event_facts(
                          SELECT 1 FROM session_events
                          WHERE session_id=?1 AND run_id=?2 AND event_type='tool.completed'
                            AND json_extract(payload_json, '$.record.recordId')=?3
-                           AND json_extract(payload_json, '$.record.authority.source')='plan'
-                           AND json_extract(payload_json, '$.record.authority.planId')=?4
-                           AND json_extract(payload_json, '$.record.authority.revision')=?5
+                           AND (
+                             (json_extract(payload_json, '$.record.authority.source')='plan'
+                              AND json_extract(payload_json, '$.record.authority.planId')=?4
+                              AND json_extract(payload_json, '$.record.authority.revision')=?5)
+                             OR
+                             (json_extract(payload_json, '$.record.authority.source')='composite'
+                              AND json_extract(payload_json, '$.record.authority.workspaceAuthority.source')='plan'
+                              AND json_extract(payload_json, '$.record.authority.workspaceAuthority.planId')=?4
+                              AND json_extract(payload_json, '$.record.authority.workspaceAuthority.revision')=?5)
+                           )
                      )",
                     params![session_id, run_id, source_fact_ref, plan_id, revision_sql],
                     |row| row.get(0),
@@ -2826,18 +2833,44 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
         if name == "bash" {
             exact_object(
                 operation,
-                &["workspaceId", "operation", "command", "workspaceMode"],
-                &[],
+                &[
+                    "workspaceId",
+                    "operation",
+                    "command",
+                    "workspaceMode",
+                    "executionScope",
+                ],
+                &["terminal"],
             )?;
             let command = required_string(operation, "command")?;
+            let execution_scope = required_string(operation, "executionScope")?;
             if command.len() > 16_384
                 || command.contains('\0')
                 || required_string(operation, "workspaceMode")? != "write"
+                || !matches!(execution_scope, "workspace" | "host")
             {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "bash Plan operation 必须声明有界 command 和 workspaceMode=write。",
+                    "bash Plan operation 必须声明有界 command、workspaceMode=write 和 executionScope。",
                 ));
+            }
+            if let Some(terminal) = operation.get("terminal") {
+                exact_object(terminal, &["stdin"], &[])?;
+                let stdin = terminal
+                    .get("stdin")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "bash Plan operation terminal.stdin 必须是字符串。",
+                        )
+                    })?;
+                if stdin.len() > 65_536 {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "bash Plan operation terminal.stdin 超过 65536 bytes。",
+                    ));
+                }
             }
         } else if name == "fs.delete" {
             exact_object(

@@ -7,7 +7,7 @@ import type {
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useLocalAgentStore } from '../../state/localAgentStore';
-import { completeInputCacheMetric } from '../../utils/providerUsage';
+import { inputCacheMetric } from '../../utils/providerUsage';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar from './DeepCodeSidebar';
 import DeepCodeTaskPanel from './DeepCodeTaskPanel';
@@ -660,26 +660,41 @@ function cacheHitSummary(
   language: UiLanguage,
 ): { label: string; title: string } {
   const usage = projection?.tokenUsage;
-  const cache = completeInputCacheMetric(usage);
-  const percent = cache ? formatCachePercent(cache.hitPercent) : null;
-  const providerCallCount = usage?.providerCallCount ?? 0;
+  const cache = inputCacheMetric(usage);
+  if (cache) {
+    const percent = `${formatCachePercent(cache.hitPercent)}%`;
+    return cache.complete
+      ? {
+          label: t(language, 'deepcodeGui.cache.summary', { value: percent }),
+          title: t(language, 'deepcodeGui.cache.completeTitle', {
+            calls: cache.providerCallCount.toLocaleString(language),
+            input: cache.inputTokens.toLocaleString(language),
+            hit: cache.hitTokens.toLocaleString(language),
+            miss: cache.missTokens.toLocaleString(language),
+          }),
+        }
+      : {
+          label: t(language, 'deepcodeGui.cache.partialSummary', {
+            value: percent,
+            reported: cache.reportedCallCount.toLocaleString(language),
+            calls: cache.providerCallCount.toLocaleString(language),
+          }),
+          title: t(language, 'deepcodeGui.cache.partialTitle', {
+            calls: cache.providerCallCount.toLocaleString(language),
+            reported: cache.reportedCallCount.toLocaleString(language),
+            input: cache.inputTokens.toLocaleString(language),
+            hit: cache.hitTokens.toLocaleString(language),
+            miss: cache.missTokens.toLocaleString(language),
+          }),
+        };
+  }
   return {
-    label: t(language, 'deepcodeGui.cache.summary', {
-      value: cache ? `${percent}%` : t(language, 'common.notAvailable'),
-    }),
-    title: cache
-      ? t(language, 'deepcodeGui.cache.completeTitle', {
-          calls: providerCallCount.toLocaleString(language),
-          input: cache.inputTokens.toLocaleString(language),
-          hit: cache.hitTokens.toLocaleString(language),
-          miss: cache.missTokens.toLocaleString(language),
+    label: t(language, 'deepcodeGui.cache.unavailableSummary'),
+    title: usage
+      ? t(language, 'deepcodeGui.cache.unavailableTitle', {
+          calls: usage.providerCallCount.toLocaleString(language),
         })
-      : usage
-        ? t(language, 'deepcodeGui.cache.partialTitle', {
-            calls: usage.providerCallCount.toLocaleString(language),
-            reported: usage.reportedCallCount.toLocaleString(language),
-          })
-        : t(language, 'deepcodeGui.cache.emptyTitle'),
+      : t(language, 'deepcodeGui.cache.emptyTitle'),
   };
 }
 

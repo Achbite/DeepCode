@@ -92,14 +92,18 @@ export async function buildAgentProviderRequest(input: {
       content: sessionControlInstructions(controlNames, hasWorkspaceBindings),
     },
   });
-  if (input.responseConstraint === 'toolRequired') {
-    instructions.push({
+  // Keep turn-scoped controls behind the journal so they cannot invalidate the stable prefix.
+  const turnControls: ContextMessageContribution[] = input.responseConstraint === 'toolRequired'
+    ? [{
       contributionId: 'session:confirmed-plan-execution',
       contributionKind: 'sessionControls',
       label: 'Confirmed Plan execution',
-      message: { role: 'system', content: confirmedPlanExecutionInstruction(controlNames) },
-    });
-  }
+      message: {
+        role: 'user',
+        content: confirmedPlanExecutionInstruction(controlNames),
+      },
+    }]
+    : [];
   instructions.push({
     contributionId: 'session:workspace-bindings',
     contributionKind: 'workspaceBindings',
@@ -115,7 +119,7 @@ export async function buildAgentProviderRequest(input: {
   });
   const selected = await input.memory.select({
     events: input.events,
-    messages: [...instructions, ...contextMessages, ...journalMessages],
+    messages: [...instructions, ...contextMessages, ...journalMessages, ...turnControls],
   });
   assertContextContributions(selected);
   const runtimeTools = hasWorkspaceBindings

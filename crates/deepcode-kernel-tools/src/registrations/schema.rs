@@ -88,24 +88,42 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
         }),
         KernelToolKind::ProcessShell => serde_json::json!({
             "type": "object",
-            "required": ["command", "workspaceMode"],
+            "required": ["command", "workspaceMode", "executionScope"],
             "properties": {
                 "command": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 16384,
-                    "description": "One bounded non-interactive Bash command. stdin is closed. Use cd within the command when a workspace subdirectory is required."
+                    "description": "One bounded Bash command. Use cd within the command when a workspace subdirectory is required."
                 },
                 "workspaceMode": {
                     "type": "string",
                     "enum": ["read", "write"],
                     "description": "Required workspace access declaration. read denies workspace writes; write requires mutation authority."
                 },
+                "executionScope": {
+                    "type": "string",
+                    "enum": ["workspace", "host"],
+                    "description": "Required execution boundary. workspace requires a registered platform workspace sandbox and fails explicitly when unavailable; host uses the host user environment and requires external-effect authority."
+                },
                 "timeout": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 600,
                     "description": "Optional wall-clock timeout in seconds. Defaults to 120."
+                },
+                "terminal": {
+                    "type": "object",
+                    "required": ["stdin"],
+                    "properties": {
+                        "stdin": {
+                            "type": "string",
+                            "maxLength": 65536,
+                            "description": "Exact bounded input written once to a temporary PTY. Include commands that terminate the interactive program and shell."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "description": "Optional one-call PTY. When omitted, stdin is closed. No persistent terminal session is created."
                 }
             },
             "additionalProperties": false

@@ -1,4 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import type {
   ActivityProjection,
   MessageFeedback,
@@ -30,6 +37,11 @@ interface LocalAgentPanelProps {
 interface PendingFilesystemPath {
   path: string;
   kind: 'file' | 'directory';
+}
+
+interface SessionViewport {
+  mode: 'following' | 'detached';
+  scrollTop: number;
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -105,6 +117,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const compositionCommitPendingRef = useRef(false);
   const compositionGuardFrameRef = useRef<number | null>(null);
   const activeViewRef = useRef<string | null>(sessionId);
+  const sessionViewportsRef = useRef(new Map<string, SessionViewport>());
+  const pendingViewportRestoreRef = useRef<string | null>(null);
   const followingLatestRef = useRef(true);
   const userDetachedFromLatestRef = useRef(false);
   const lastScrollTopRef = useRef(0);
@@ -134,11 +148,29 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const pendingInteraction = projection?.pendingInteraction ?? null;
   const pendingApproval = projection?.pendingApproval ?? null;
   const pendingPlan = projection?.pendingPlan ?? null;
+  const latestRunComposition = useMemo(() => {
+    const runId = projection?.run?.runId;
+    if (!runId) return null;
+    for (let index = projection.contextCompositions.length - 1; index >= 0; index -= 1) {
+      const composition = projection.contextCompositions[index];
+      if (composition?.runId === runId) return composition;
+    }
+    return null;
+  }, [projection?.contextCompositions, projection?.run?.runId]);
+  const contextCompacting = projection?.run?.status === 'running'
+    && latestRunComposition?.purpose === 'contextCompaction';
 
   const setLatestFollowMode = useCallback((following: boolean) => {
     followingLatestRef.current = following;
     userDetachedFromLatestRef.current = !following;
     setFollowingLatest(following);
+    const activeSessionId = activeViewRef.current;
+    if (activeSessionId && pendingViewportRestoreRef.current !== activeSessionId) {
+      sessionViewportsRef.current.set(activeSessionId, {
+        mode: following ? 'following' : 'detached',
+        scrollTop: bodyRef.current?.scrollTop ?? lastScrollTopRef.current,
+      });
+    }
   }, []);
 
   const scrollToLatestNow = useCallback((behavior: ScrollBehavior = 'auto') => {
@@ -149,11 +181,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   }, []);
 
   const scheduleScrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
-    if (!followingLatestRef.current) return;
+    if (!followingLatestRef.current || pendingViewportRestoreRef.current !== null) return;
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null;
-      if (followingLatestRef.current) scrollToLatestNow(behavior);
+      if (followingLatestRef.current && pendingViewportRestoreRef.current === null) {
+        scrollToLatestNow(behavior);
+      }
     });
   }, [scrollToLatestNow]);
 
@@ -194,8 +228,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     };
   }, [refresh, sessionId]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (activeViewRef.current !== sessionId) {
+      if (scrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
+        scrollFrameRef.current = null;
+      }
+      pendingViewportRestoreRef.current = sessionId;
+      suppressScrollEventsUntilRef.current = window.performance.now() + 220;
       if (!submitting) {
         setPendingFilesystemPaths([]);
         setPluginSelections([]);
@@ -203,10 +243,47 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         setAttachmentMenuOpen(false);
         setAttachmentDialogOpen(false);
       }
-      setLatestFollowMode(true);
       activeViewRef.current = sessionId;
+      const saved = sessionId ? sessionViewportsRef.current.get(sessionId) : undefined;
+      setLatestFollowMode(saved?.mode !== 'detached');
     }
   }, [sessionId, setLatestFollowMode, submitting]);
+
+  useLayoutEffect(() => {
+    if (!sessionId || !loading || projection !== null) return;
+    if (pendingViewportRestoreRef.current === sessionId) return;
+    if (scrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = null;
+    }
+    pendingViewportRestoreRef.current = sessionId;
+    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
+  }, [loading, projection, sessionId]);
+
+  useLayoutEffect(() => {
+    if (
+      !sessionId
+      || pendingViewportRestoreRef.current !== sessionId
+      || loading
+      || projection?.sessionId !== sessionId
+    ) return;
+    const body = bodyRef.current;
+    if (!body) return;
+    const saved = sessionViewportsRef.current.get(sessionId);
+    const following = saved?.mode !== 'detached';
+    setLatestFollowMode(following);
+    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
+    body.scrollTo({
+      top: following ? body.scrollHeight : saved.scrollTop,
+      behavior: 'auto',
+    });
+    lastScrollTopRef.current = body.scrollTop;
+    sessionViewportsRef.current.set(sessionId, {
+      mode: following ? 'following' : 'detached',
+      scrollTop: body.scrollTop,
+    });
+    pendingViewportRestoreRef.current = null;
+  }, [loading, projection?.sessionId, sessionId, setLatestFollowMode, timelineExtentKey]);
 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
@@ -647,6 +724,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         className="local-agent__body"
         aria-live="polite"
         onWheel={(event) => {
+          if (pendingViewportRestoreRef.current === sessionId) return;
           if (event.deltaY < 0) setLatestFollowMode(false);
         }}
         onTouchStart={(event) => {
@@ -665,9 +743,19 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         }}
         onScroll={(event) => {
           const body = event.currentTarget;
+          if (
+            pendingViewportRestoreRef.current === sessionId
+            || (loading && projection === null)
+          ) return;
           const scrolledUp = body.scrollTop < lastScrollTopRef.current - 2;
           lastScrollTopRef.current = body.scrollTop;
           const distanceFromLatest = body.scrollHeight - body.scrollTop - body.clientHeight;
+          if (sessionId) {
+            sessionViewportsRef.current.set(sessionId, {
+              mode: followingLatestRef.current ? 'following' : 'detached',
+              scrollTop: body.scrollTop,
+            });
+          }
           if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
           if (scrolledUp) {
             setLatestFollowMode(false);
@@ -799,7 +887,10 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           {projection?.run?.status === 'running' && (
             <div className="local-agent__run-thinking" role="status" aria-live="polite">
               <span className="local-agent__run-spinner" aria-hidden="true" />
-              <span>{t(language, 'agent.run.thinking')}</span>
+              <span>{t(
+                language,
+                contextCompacting ? 'agent.context.compacting' : 'agent.run.thinking',
+              )}</span>
             </div>
           )}
           {projection?.terminalError && (
@@ -1161,6 +1252,16 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
                       ? 'agent.permission.summary.allow'
                       : 'agent.permission.summary.plan',
+                    {
+                      external: t(
+                        language,
+                        runtimeEffectiveSettings['agent.permissions.external'] === 'allow'
+                          ? 'agent.permission.allow'
+                          : runtimeEffectiveSettings['agent.permissions.external'] === 'deny'
+                            ? 'agent.permission.deny'
+                            : 'agent.permission.ask',
+                      ),
+                    },
                   )}
                 </button>
                 {permissionMenuOpen && (

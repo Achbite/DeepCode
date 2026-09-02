@@ -786,12 +786,23 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["workspaceId", "operation", "command", "workspaceMode"],
+          "required": [
+            "workspaceId", "operation", "command", "workspaceMode", "executionScope"
+          ],
           "properties": {
             "workspaceId": { "$ref": "#/$defs/Id" },
             "operation": { "const": "bash" },
             "command": { "type": "string", "minLength": 1, "maxLength": 16384 },
-            "workspaceMode": { "const": "write" }
+            "workspaceMode": { "const": "write" },
+            "executionScope": { "enum": ["workspace", "host"] },
+            "terminal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["stdin"],
+              "properties": {
+                "stdin": { "type": "string", "maxLength": 65536 }
+              }
+            }
           }
         }
       ]
@@ -828,6 +839,7 @@
         "toolName": { "$ref": "#/$defs/Id" },
         "workspaceId": { "$ref": "#/$defs/Id" },
         "processWorkspaceMode": { "enum": ["read", "write"] },
+        "processExecutionScope": { "enum": ["workspace", "host"] },
         "operation": { "type": "string", "minLength": 1 },
         "logicalTargets": {
           "type": "array",

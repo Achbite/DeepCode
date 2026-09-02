@@ -1379,7 +1379,7 @@ function decodeContextUsage(data: Record<string, unknown>): ProviderTokenUsage |
     || cacheReadPresent !== cacheMissPresent
     || cacheReadPresent && (cacheReadInputTokens === undefined || cacheMissInputTokens === undefined)
     || cacheReadInputTokens !== undefined && cacheMissInputTokens !== undefined
-      && cacheReadInputTokens + cacheMissInputTokens > inputTokens
+      && cacheReadInputTokens + cacheMissInputTokens !== inputTokens
   ) {
     throw new LoopFailure('provider_usage_invalid', 'Provider 完成事件中的上下文计数无效。');
   }
@@ -1538,10 +1538,10 @@ function automaticTodoProgress(
   for (const event of snapshot.events) {
     if (event.type !== 'tool.completed' || event.runId !== runId) continue;
     const record = event.payload.record;
+    const authority = planAuthority(record);
     if (
-      record.authority.source !== 'plan'
-      || record.authority.planId !== active.planId
-      || record.authority.revision !== active.revision
+      authority?.planId !== active.planId
+      || authority?.revision !== active.revision
     ) continue;
     const key = recordOperationKey(record);
     if (!key || (remaining.get(key) ?? 0) === 0) continue;
@@ -1593,12 +1593,18 @@ function recordOperationKey(record: ToolExecutionRecord): string | null {
     if (
       typeof invocation.command !== 'string'
       || invocation.workspaceMode !== 'write'
+      || invocation.executionScope !== 'workspace' && invocation.executionScope !== 'host'
+      || invocation.terminal !== undefined && !isCanonicalTerminalInput(invocation.terminal)
     ) return null;
     return planOperationKey({
       workspaceId,
       operation: 'bash',
       command: invocation.command,
       workspaceMode: 'write',
+      executionScope: invocation.executionScope,
+      ...(invocation.terminal === undefined
+        ? {}
+        : { terminal: invocation.terminal as { stdin: string } }),
     });
   }
   if (
@@ -1628,6 +1634,24 @@ function recordOperationKey(record: ToolExecutionRecord): string | null {
 function recordCanonicalArguments(record: ToolExecutionRecord): JsonObject | null {
   const invocation = record.preparedEffect.canonicalInvocation;
   return invocation.toolName === record.toolName ? invocation.arguments : null;
+}
+
+function planAuthority(record: ToolExecutionRecord): Extract<
+  ToolExecutionRecord['authority'],
+  { source: 'plan' }
+> | null {
+  const authority = record.authority;
+  if (authority.source === 'plan') return authority;
+  return authority.source === 'composite' && authority.workspaceAuthority.source === 'plan'
+    ? authority.workspaceAuthority
+    : null;
+}
+
+function isCanonicalTerminalInput(value: unknown): value is { stdin: string } {
+  return isRecord(value)
+    && Object.keys(value).length === 1
+    && typeof value.stdin === 'string'
+    && new TextEncoder().encode(value.stdin).byteLength <= 65_536;
 }
 
 function completedPlanAwaitingLifecycle(

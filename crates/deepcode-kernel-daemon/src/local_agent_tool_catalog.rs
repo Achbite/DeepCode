@@ -594,7 +594,7 @@ fn possible_effects(
     match scope {
         CatalogEffectScope::WorkspaceRead => vec!["workspaceRead"],
         CatalogEffectScope::WorkspaceMutation => vec!["workspaceMutation"],
-        CatalogEffectScope::Process => vec!["process", "workspaceMutation"],
+        CatalogEffectScope::Process => vec!["process", "workspaceMutation", "external"],
         CatalogEffectScope::Network => match effect_class {
             Some(ToolEffectClass::Mutation) => vec!["network", "external"],
             _ => vec!["network"],

@@ -106,14 +106,7 @@ fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
 }
 
 const fn process_shell_availability() -> ToolAvailability {
-    #[cfg(target_os = "macos")]
-    {
-        ToolAvailability::Callable
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        ToolAvailability::Blocked
-    }
+    ToolAvailability::Callable
 }
 
 macro_rules! invocation_canonicalizer {
@@ -154,6 +147,15 @@ fn tool_description(tool: KernelToolKind) -> &'static str {
         KernelToolKind::WebSearch => {
             "Search the web through the built-in RSS backend or an explicitly configured JSON endpoint."
         }
-        KernelToolKind::ProcessShell => "Execute a non-interactive Bash command in the bound workspace. Use workspaceMode \"read\" unless the command changes workspace files; read mode may write temporary files only under $TMPDIR. Use \"write\" only for confirmed workspace mutations. Output and execution time are bounded.",
+        KernelToolKind::ProcessShell => {
+            #[cfg(target_os = "macos")]
+            {
+                "Execute one bounded Bash command from the bound workspace. executionScope \"workspace\" uses the macOS workspace sandbox; \"host\" uses the host user environment and external-effect authority. Use workspaceMode \"write\" for workspace mutations. terminal optionally supplies exact one-call PTY input; otherwise stdin is closed. The result follows the shell command's final exit status, so use fail-fast shell logic when every step must succeed."
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                "Execute one bounded Bash command from the bound workspace. On this platform executionScope \"workspace\" is unavailable because no workspace sandbox is registered; use \"host\" only when host execution is intended and external-effect authority is available. Use workspaceMode \"write\" for workspace mutations. terminal optionally supplies exact one-call PTY input; otherwise stdin is closed. The result follows the shell command's final exit status, so use fail-fast shell logic when every step must succeed."
+            }
+        }
     }
 }

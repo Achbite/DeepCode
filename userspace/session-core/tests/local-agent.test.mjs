@@ -286,7 +286,15 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
           name: wireToolName,
           input: { workspace: 'primary', path: 'README.md' },
         });
-        yield providerEvent(request.requestId, 'completed', {});
+        yield providerEvent(request.requestId, 'completed', {
+          usage: {
+            inputTokens: 100,
+            outputTokens: 10,
+            contextWindowTokens: 4_096,
+            cacheReadInputTokens: 40,
+            cacheMissInputTokens: 60,
+          },
+        });
         return;
       }
 
@@ -308,7 +316,13 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
         messageId: 'provider-message:tool-answer',
         content: 'Tool continuation completed.',
       });
-      yield providerEvent(request.requestId, 'completed', {});
+      yield providerEvent(request.requestId, 'completed', {
+        usage: {
+          inputTokens: 50,
+          outputTokens: 5,
+          contextWindowTokens: 4_096,
+        },
+      });
     },
   };
   const actor = actorWith(
@@ -329,6 +343,17 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
 
   assert.equal(providerRequests.length, 2);
   assert.equal(kernelRequests.length, 1);
+  assert.deepEqual(projection.tokenUsage, {
+    providerCallCount: 2,
+    reportedCallCount: 1,
+    inputTokens: 150,
+    outputTokens: 15,
+    cacheReadInputTokens: 40,
+    cacheMissInputTokens: 60,
+    cacheAvailable: true,
+    cacheComplete: false,
+    cacheHitRatio: 0.4,
+  });
   assert.deepEqual(projection.timeline.map((item) => item.kind), [
     'message',
     'narrative',
@@ -399,18 +424,19 @@ test('B1: read-only bash result projects its real write scope and continues the 
   const preparedTool = {
     toolBindingRef: 'tool-binding:bash:g1',
     name: 'bash',
-    description: 'Execute one bounded non-interactive Bash command.',
+    description: 'Execute one bounded Bash command.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['command', 'workspaceMode'],
+      required: ['command', 'workspaceMode', 'executionScope'],
       properties: {
         command: { type: 'string' },
         workspaceMode: { type: 'string', enum: ['read', 'write'] },
+        executionScope: { type: 'string', enum: ['workspace', 'host'] },
         timeout: { type: 'integer' },
       },
     },
-    possibleEffects: ['process', 'workspaceMutation'],
+    possibleEffects: ['process', 'workspaceMutation', 'external'],
     availability: 'callable',
     origin: 'coreBuiltin',
   };
@@ -424,6 +450,8 @@ test('B1: read-only bash result projects its real write scope and continues the 
         command: request.input.command,
         cwd: '.',
         workspaceMode: request.input.workspaceMode,
+        executionScope: request.input.executionScope,
+        terminal: false,
         stdout: 'probe-ok',
         stderr: '',
         exitCode: 0,
@@ -435,6 +463,8 @@ test('B1: read-only bash result projects its real write scope and continues the 
         environment: {
           shell: '/bin/bash',
           interactive: false,
+          executionScope: request.input.executionScope,
+          terminal: false,
           pathSource: 'hostPlusStandardDeveloperPaths',
           writeScope: 'kernelTemporaryOnly',
           homeWritable: false,
@@ -443,6 +473,7 @@ test('B1: read-only bash result projects its real write scope and continues the 
       });
       reply.record.preparedEffect.logicalTargets = ['.'];
       reply.record.preparedEffect.processWorkspaceMode = 'read';
+      reply.record.preparedEffect.processExecutionScope = 'workspace';
       return reply;
     },
   });
@@ -462,6 +493,7 @@ test('B1: read-only bash result projects its real write scope and continues the 
             workspace: 'primary',
             command: "printf 'probe-ok'",
             workspaceMode: 'read',
+            executionScope: 'workspace',
           },
         });
         yield providerEvent(request.requestId, 'completed', {});
@@ -472,6 +504,8 @@ test('B1: read-only bash result projects its real write scope and continues the 
         .map(jsonMessagePayload)
         .find((payload) => payload?.outcome === 'completed');
       assert.equal(toolResult?.output?.workspaceMode, 'read');
+      assert.equal(toolResult?.output?.executionScope, 'workspace');
+      assert.equal(toolResult?.output?.terminal, false);
       assert.equal(toolResult?.output?.workspaceId, undefined);
       assert.equal(toolResult?.output?.environment?.writeScope, 'kernelTemporaryOnly');
       yield providerEvent(request.requestId, 'assistant.message', {
@@ -549,7 +583,7 @@ test('B2: a run without workspace bindings never exposes workspace-scoped tools'
           command: { type: 'string' },
         },
       },
-      possibleEffects: ['process', 'workspaceMutation'],
+      possibleEffects: ['process', 'workspaceMutation', 'external'],
       availability: 'callable',
       origin: 'coreBuiltin',
     },
@@ -833,6 +867,21 @@ test('E: one Plan confirmation resumes the same run into Todo-backed execution',
 
       if (providerRequests.length === 2) {
         assert.equal(request.responseConstraint, 'toolRequired');
+        const preConfirmationRequest = providerRequests[0];
+        assert.deepEqual(
+          request.messages.slice(0, preConfirmationRequest.messages.length),
+          preConfirmationRequest.messages,
+          'Plan confirmation must preserve the preceding Provider message prefix',
+        );
+        const executionDirective = request.messages.at(-1);
+        assert.equal(executionDirective?.role, 'user');
+        assert.match(executionDirective?.content ?? '', /^The Plan is confirmed\. Execute it now;/u);
+        assert.equal(
+          request.messages.slice(0, preConfirmationRequest.messages.length)
+            .some((message) => message.content.startsWith('The Plan is confirmed.')),
+          false,
+          'the transient execution directive must not be inserted into the stable prefix',
+        );
         const confirmation = request.messages
           .map(jsonMessagePayload)
           .find((payload) => payload?.response?.kind === 'confirm');
@@ -947,27 +996,35 @@ test('E: one Plan confirmation resumes the same run into Todo-backed execution',
   await actor.dispose();
 });
 
-test('E1: confirmed bash failure preserves output and only a successful retry completes Todo', async () => {
+test('E1: confirmed Host Bash uses composite authority and only a successful retry completes Todo', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:confirmed-bash-retry';
   await createSession(journal, sessionId, [workspaceBinding]);
 
   const command = "printf ready > marker.txt";
+  const terminal = { stdin: 'ready\n' };
   const preparedTool = {
     toolBindingRef: 'tool-binding:bash:g1',
     name: 'bash',
-    description: 'Execute a non-interactive Bash command in the bound workspace.',
+    description: 'Execute a bounded Bash command from the bound workspace.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['command', 'workspaceMode'],
+      required: ['command', 'workspaceMode', 'executionScope'],
       properties: {
         command: { type: 'string' },
         workspaceMode: { type: 'string', enum: ['read', 'write'] },
+        executionScope: { type: 'string', enum: ['workspace', 'host'] },
         timeout: { type: 'integer', minimum: 1, maximum: 600 },
+        terminal: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['stdin'],
+          properties: { stdin: { type: 'string' } },
+        },
       },
     },
-    possibleEffects: ['process', 'workspaceMutation'],
+    possibleEffects: ['process', 'workspaceMutation', 'external'],
     availability: 'callable',
     origin: 'coreBuiltin',
   };
@@ -978,6 +1035,8 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
     command: request.input.command,
     cwd: '.',
     workspaceMode: request.input.workspaceMode,
+    executionScope: request.input.executionScope,
+    terminal: request.input.terminal !== undefined,
     stdout: exitCode === 0 ? 'ready' : '',
     stderr,
     exitCode,
@@ -988,11 +1047,13 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
     durationMs: 1,
     environment: {
       shell: '/bin/bash',
-      interactive: false,
+      interactive: request.input.terminal !== undefined,
+      executionScope: request.input.executionScope,
+      terminal: request.input.terminal !== undefined,
       pathSource: 'hostPlusStandardDeveloperPaths',
-      writeScope: 'workspaceAndKernelTemporary',
-      homeWritable: false,
-      networkAccess: false,
+      writeScope: 'hostUser',
+      homeWritable: true,
+      networkAccess: true,
     },
   });
   const kernel = emptyKernel({
@@ -1004,6 +1065,8 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
         operation: 'bash',
         command,
         workspaceMode: 'write',
+        executionScope: 'host',
+        terminal,
       }]);
       const reply = kernelRequests.length === 1
         ? failedExecutionReply(
@@ -1014,6 +1077,17 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
         : completedExecutionReply(request, shellOutput(request, 0));
       reply.record.preparedEffect.logicalTargets = ['.'];
       reply.record.preparedEffect.processWorkspaceMode = 'write';
+      reply.record.preparedEffect.processExecutionScope = 'host';
+      reply.record.authority = {
+        decision: 'allow',
+        source: 'composite',
+        workspaceAuthority: reply.record.authority,
+        externalAuthority: {
+          decision: 'allow',
+          source: 'userSetting',
+          authorityId: 'user-setting:agent.permissions.external',
+        },
+      };
       return reply;
     },
   });
@@ -1046,6 +1120,8 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
               operation: 'bash',
               command,
               workspaceMode: 'write',
+              executionScope: 'host',
+              terminal,
             }],
           },
         });
@@ -1058,7 +1134,13 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'provider-call:bash-first',
           name: bashDefinition.name,
-          input: { workspace: 'primary', command, workspaceMode: 'write' },
+          input: {
+            workspace: 'primary',
+            command,
+            workspaceMode: 'write',
+            executionScope: 'host',
+            terminal,
+          },
         });
         yield providerEvent(request.requestId, 'completed', {});
         return;
@@ -1080,7 +1162,13 @@ test('E1: confirmed bash failure preserves output and only a successful retry co
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'provider-call:bash-retry',
           name: bashDefinition.name,
-          input: { workspace: 'primary', command, workspaceMode: 'write' },
+          input: {
+            workspace: 'primary',
+            command,
+            workspaceMode: 'write',
+            executionScope: 'host',
+            terminal,
+          },
         });
         yield providerEvent(request.requestId, 'completed', {});
         return;
@@ -1437,7 +1525,7 @@ test('G: built-in runtime and control prompts stay concise and policy-scoped', (
       },
       {
         name: 'plan.publish',
-        description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation, including bash with workspaceMode=write; confirmation creates the Todo list.',
+        description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation. A bash mutation must exactly include workspaceMode=write, executionScope, and terminal stdin when PTY input will be used. Confirmation creates the Todo list.',
       },
     ],
   );
@@ -1484,6 +1572,52 @@ test('H: an explicit Provider failure remains failed with its original error', a
   assertEventOrder(composition, providerSettlement, settlement);
 
   await actor.dispose();
+});
+
+test('H1: Provider cache fields are absent together or exactly partition one call input', async () => {
+  const invalidCases = [
+    { label: 'missing-miss', cacheReadInputTokens: 40 },
+    { label: 'undercount', cacheReadInputTokens: 40, cacheMissInputTokens: 50 },
+    { label: 'overcount', cacheReadInputTokens: 60, cacheMissInputTokens: 50 },
+  ];
+  for (const { label, ...cacheFields } of invalidCases) {
+    const journal = new InMemoryCommandJournal();
+    const sessionId = `session:invalid-cache-${label}`;
+    await createSession(journal, sessionId);
+    const preparation = fakeRunPreparation({ contextWindowTokens: 1_000 });
+    const provider = {
+      async *stream(request) {
+        yield providerEvent(request.requestId, 'completed', {
+          usage: {
+            inputTokens: 100,
+            outputTokens: 0,
+            contextWindowTokens: 1_000,
+            ...cacheFields,
+          },
+        });
+      },
+    };
+    const actor = actorWith(
+      journal,
+      sessionId,
+      provider,
+      emptyKernel(),
+      preparation.port,
+      `invalid-cache-${label}`,
+    );
+
+    await actor.submit(messageCommand(
+      sessionId,
+      `command:invalid-cache-${label}`,
+      'Validate the cache usage contract.',
+    ));
+    const failed = await waitForProjection(actor, (value) => value.run?.status === 'indeterminate');
+    await waitUntil(() => preparation.released.length === 1, 'invalid cache runtime release');
+    assert.equal(failed.terminalError?.code, 'provider_turn_outcome_unknown');
+    const events = await readEvents(journal, sessionId);
+    assert.equal(events.some((event) => event.type === 'context.updated'), false);
+    await actor.dispose();
+  }
 });
 
 async function verifyExplicitFocusCompaction() {

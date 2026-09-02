@@ -84,12 +84,21 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
     {
       type: 'object',
       additionalProperties: false,
-      required: ['workspace', 'operation', 'command', 'workspaceMode'],
+      required: ['workspace', 'operation', 'command', 'workspaceMode', 'executionScope'],
       properties: {
         workspace: { type: 'string', minLength: 1 },
         operation: { type: 'string', enum: ['bash'] },
         command: { type: 'string', minLength: 1, maxLength: 16_384 },
         workspaceMode: { type: 'string', enum: ['write'] },
+        executionScope: { type: 'string', enum: ['workspace', 'host'] },
+        terminal: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['stdin'],
+          properties: {
+            stdin: { type: 'string', maxLength: 65_536 },
+          },
+        },
       },
     },
   ],
@@ -158,7 +167,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation, including bash with workspaceMode=write; confirmation creates the Todo list.',
+      description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation. A bash mutation must exactly include workspaceMode=write, executionScope, and terminal stdin when PTY input will be used. Confirmation creates the Todo list.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
   ];
@@ -286,19 +295,32 @@ function decodePlanOperation(value: unknown): PlanOperation {
   const operation = value.operation;
   const workspaceId = requiredIdentifier(value.workspaceId, 'workspaceId');
   if (operation === 'bash') {
-    assertExactKeys(value, ['workspaceId', 'operation', 'command', 'workspaceMode']);
+    assertExactKeys(
+      value,
+      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal'],
+      ['terminal'],
+    );
     const command = requiredText(value.command, 'command');
-    if (command.length > 16_384 || value.workspaceMode !== 'write') {
+    if (
+      command.length > 16_384
+      || value.workspaceMode !== 'write'
+      || value.executionScope !== 'workspace' && value.executionScope !== 'host'
+    ) {
       throw new SessionControlError(
         'session_control_plan_shell_invalid',
-        'bash Plan operation 必须声明有界 command 和 workspaceMode=write。',
+        'bash Plan operation 必须声明有界 command、workspaceMode=write 和 executionScope。',
       );
     }
+    const terminal = value.terminal === undefined
+      ? undefined
+      : decodeTerminalInput(value.terminal);
     return {
       workspaceId,
       operation,
       command,
       workspaceMode: 'write',
+      executionScope: value.executionScope,
+      ...(terminal ? { terminal } : {}),
     };
   }
   const target = normalizedTarget(value.target);
@@ -324,6 +346,26 @@ function decodePlanOperation(value: unknown): PlanOperation {
     operation: operation as Exclude<PlanOperation['operation'], 'fs.delete' | 'bash'>,
     target,
   };
+}
+
+function decodeTerminalInput(value: unknown): { stdin: string } {
+  if (!isRecord(value)) {
+    throw new SessionControlError(
+      'session_control_plan_shell_invalid',
+      'bash terminal 必须是对象。',
+    );
+  }
+  assertExactKeys(value, ['stdin']);
+  if (
+    typeof value.stdin !== 'string'
+    || new TextEncoder().encode(value.stdin).byteLength > 65_536
+  ) {
+    throw new SessionControlError(
+      'session_control_plan_shell_invalid',
+      'bash terminal.stdin 必须是不超过 65536 bytes 的字符串。',
+    );
+  }
+  return { stdin: value.stdin };
 }
 
 function decodeInteractionOptions(value: unknown): InteractionOption[] {

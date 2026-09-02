@@ -998,6 +998,20 @@ impl LocalAgentKernel {
         } else {
             None
         };
+        let process_execution_scope = if request.tool_name == "bash" {
+            match arguments.get("executionScope").and_then(Value::as_str) {
+                Some("workspace") => Some("workspace".to_string()),
+                Some("host") => Some("host".to_string()),
+                _ => {
+                    return Err(LocalAgentKernelError::new(
+                        "tool_input_invalid",
+                        "bash 必须显式声明 executionScope=workspace 或 host。",
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         Ok(PreparedEffect {
             generation,
             binding,
@@ -1014,6 +1028,7 @@ impl LocalAgentKernel {
             workspace_root,
             delete_target_kind,
             process_workspace_mode,
+            process_execution_scope,
         })
     }
 
@@ -1044,77 +1059,135 @@ impl LocalAgentKernel {
                 })))
             }
             PreparedEffectScope::Process => {
-                if prepared.process_workspace_mode.as_deref() == Some("read") {
-                    let workspace_id = prepared
-                        .workspace_id
-                        .as_deref()
-                        .expect("prepared process workspace");
-                    Ok(Admission::Allowed(json!({
+                let workspace_admission =
+                    if prepared.process_workspace_mode.as_deref() == Some("read") {
+                        let workspace_id = prepared
+                            .workspace_id
+                            .as_deref()
+                            .expect("prepared process workspace");
+                        Admission::Allowed(json!({
+                            "decision": "allow",
+                            "source": "workspaceBinding",
+                            "workspaceId": workspace_id,
+                        }))
+                    } else {
+                        self.admit_workspace_mutation(request, prepared)?
+                    };
+                if prepared.process_execution_scope.as_deref() != Some("host") {
+                    return Ok(workspace_admission);
+                }
+                let workspace_authority = match workspace_admission {
+                    Admission::Allowed(authority) => authority,
+                    denied @ Admission::Denied { .. } => return Ok(denied),
+                    Admission::ApprovalRequired => {
+                        unreachable!("workspace admission never requests approval")
+                    }
+                };
+                match self.admit_non_workspace(
+                    request,
+                    prepared,
+                    PreparedEffectScope::External,
+                    "用户拒绝了 Host Shell 的外部 effect。",
+                )? {
+                    Admission::ApprovalRequired => Ok(Admission::ApprovalRequired),
+                    Admission::Allowed(external_authority) => Ok(Admission::Allowed(json!({
                         "decision": "allow",
-                        "source": "workspaceBinding",
-                        "workspaceId": workspace_id,
-                    })))
-                } else {
-                    self.admit_workspace_mutation(request, prepared)
+                        "source": "composite",
+                        "workspaceAuthority": workspace_authority,
+                        "externalAuthority": external_authority,
+                    }))),
+                    Admission::Denied {
+                        authority: external_authority,
+                        error,
+                    } => Ok(Admission::Denied {
+                        authority: json!({
+                            "decision": "deny",
+                            "source": "composite",
+                            "workspaceAuthority": workspace_authority,
+                            "externalAuthority": external_authority,
+                        }),
+                        error,
+                    }),
                 }
             }
             PreparedEffectScope::WorkspaceMutation => {
                 self.admit_workspace_mutation(request, prepared)
             }
-            PreparedEffectScope::Network | PreparedEffectScope::External => {
-                if let Some(authority) = request.non_workspace_authority.as_ref() {
-                    validate_id("authorityId", &authority.authority_id)?;
-                    if !matches!(authority.decision.as_str(), "allow" | "deny")
-                        || !self.journal.non_workspace_authority_is_committed(
-                            &request.session_id,
-                            &request.run_id,
-                            &request.call_id,
-                            &authority.authority_id,
-                            &authority.decision,
-                        )?
-                    {
-                        return Err(LocalAgentKernelError::new(
-                            "non_workspace_authority_invalid",
-                            "非 workspace authority 与当前 journal fact 不一致。",
-                        ));
-                    }
-                    if authority.decision == "allow" {
-                        return Ok(Admission::Allowed(json!({
-                            "decision": "allow",
-                            "source": "user",
-                            "authorityId": authority.authority_id,
-                        })));
-                    }
-                    return Ok(Admission::Denied {
-                        authority: json!({
-                            "decision": "deny",
-                            "source": "user",
-                            "authorityId": authority.authority_id,
-                        }),
-                        error: json!({
-                            "code": "tool_effect_denied",
-                            "message": "用户拒绝了该非 workspace effect。",
-                        }),
-                    });
-                }
-                match prepared
-                    .generation
-                    .permissions
-                    .mode(prepared.scope)
-                    .expect("non-workspace policy")
-                {
-                    PermissionMode::Allow => Ok(Admission::Allowed(json!({
-                        "decision": "allow",
-                        "source": "userSetting",
-                        "authorityId": permission_setting_id(prepared.scope),
-                    }))),
-                    PermissionMode::Ask => Ok(Admission::ApprovalRequired),
-                    PermissionMode::Deny => Ok(Admission::denied(
-                        "tool_effect_denied_by_setting",
-                        "用户设置拒绝了该非 workspace effect。",
-                    )),
-                }
+            PreparedEffectScope::Network | PreparedEffectScope::External => self
+                .admit_non_workspace(
+                    request,
+                    prepared,
+                    prepared.scope,
+                    "用户拒绝了该非 workspace effect。",
+                ),
+        }
+    }
+
+    fn admit_non_workspace(
+        &self,
+        request: &LocalToolExecutionRequest,
+        prepared: &PreparedEffect,
+        scope: PreparedEffectScope,
+        denial_message: &str,
+    ) -> Result<Admission, LocalAgentKernelError> {
+        if let Some(authority) = request.non_workspace_authority.as_ref() {
+            validate_id("authorityId", &authority.authority_id)?;
+            if !matches!(authority.decision.as_str(), "allow" | "deny")
+                || !self.journal.non_workspace_authority_is_committed(
+                    &request.session_id,
+                    &request.run_id,
+                    &request.call_id,
+                    &authority.authority_id,
+                    &authority.decision,
+                )?
+            {
+                return Err(LocalAgentKernelError::new(
+                    "non_workspace_authority_invalid",
+                    "非 workspace authority 与当前 journal fact 不一致。",
+                ));
             }
+            if authority.decision == "allow" {
+                return Ok(Admission::Allowed(json!({
+                    "decision": "allow",
+                    "source": "user",
+                    "authorityId": authority.authority_id,
+                })));
+            }
+            return Ok(Admission::Denied {
+                authority: json!({
+                    "decision": "deny",
+                    "source": "user",
+                    "authorityId": authority.authority_id,
+                }),
+                error: json!({
+                    "code": "tool_effect_denied",
+                    "message": denial_message,
+                }),
+            });
+        }
+        match prepared
+            .generation
+            .permissions
+            .mode(scope)
+            .expect("non-workspace policy")
+        {
+            PermissionMode::Allow => Ok(Admission::Allowed(json!({
+                "decision": "allow",
+                "source": "userSetting",
+                "authorityId": permission_setting_id(scope),
+            }))),
+            PermissionMode::Ask => Ok(Admission::ApprovalRequired),
+            PermissionMode::Deny => Ok(Admission::Denied {
+                authority: json!({
+                    "decision": "deny",
+                    "source": "userSetting",
+                    "reason": "用户设置拒绝了该非 workspace effect。",
+                }),
+                error: json!({
+                    "code": "tool_effect_denied_by_setting",
+                    "message": "用户设置拒绝了该非 workspace effect。",
+                }),
+            }),
         }
     }
 
@@ -1313,6 +1386,7 @@ struct PreparedEffect {
     workspace_root: Option<String>,
     delete_target_kind: Option<String>,
     process_workspace_mode: Option<String>,
+    process_execution_scope: Option<String>,
 }
 
 impl PreparedEffect {
@@ -1342,19 +1416,16 @@ impl PreparedEffect {
         if let Some(workspace_mode) = self.process_workspace_mode.as_deref() {
             projection["processWorkspaceMode"] = json!(workspace_mode);
         }
+        if let Some(execution_scope) = self.process_execution_scope.as_deref() {
+            projection["processExecutionScope"] = json!(execution_scope);
+        }
         projection
     }
 
     fn preview(&self, tool_name: &str) -> Value {
         json!({
             "summary": effect_summary(tool_name, &self.logical_targets),
-            "effects": if self.scope == PreparedEffectScope::Process
-                && self.process_workspace_mode.as_deref() == Some("write")
-            {
-                vec!["process", "workspaceMutation"]
-            } else {
-                effect_names(self.scope)
-            },
+            "effects": process_effect_names(self),
             "logicalTargets": self.logical_targets,
         })
     }
@@ -1658,13 +1729,21 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                     let Some(object) = operation.as_object() else {
                         return false;
                     };
-                    object.len() == 4
+                    object.len()
+                        == if arguments.get("terminal").is_some() {
+                            6
+                        } else {
+                            5
+                        }
                         && object.get("workspaceId").and_then(Value::as_str)
                             == prepared.workspace_id.as_deref()
                         && object.get("operation").and_then(Value::as_str) == Some("bash")
                         && object.get("command").and_then(Value::as_str)
                             == arguments.get("command").and_then(Value::as_str)
                         && object.get("workspaceMode").and_then(Value::as_str) == Some("write")
+                        && object.get("executionScope").and_then(Value::as_str)
+                            == arguments.get("executionScope").and_then(Value::as_str)
+                        && object.get("terminal") == arguments.get("terminal")
                 })
             });
     }
@@ -1755,6 +1834,20 @@ fn effect_names(scope: PreparedEffectScope) -> Vec<&'static str> {
         PreparedEffectScope::Network => vec!["network"],
         PreparedEffectScope::External => vec!["external"],
     }
+}
+
+fn process_effect_names(prepared: &PreparedEffect) -> Vec<&'static str> {
+    if prepared.scope != PreparedEffectScope::Process {
+        return effect_names(prepared.scope);
+    }
+    let mut effects = vec!["process"];
+    if prepared.process_workspace_mode.as_deref() == Some("write") {
+        effects.push("workspaceMutation");
+    }
+    if prepared.process_execution_scope.as_deref() == Some("host") {
+        effects.push("external");
+    }
+    effects
 }
 
 fn effect_summary(tool_name: &str, targets: &[String]) -> String {

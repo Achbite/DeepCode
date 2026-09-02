@@ -23,8 +23,9 @@ export function inputCacheMetric(
   usage: CanonicalProviderInputCacheUsage | null | undefined,
 ): InputCacheMetric | null {
   if (!usage?.cacheAvailable || usage.cacheHitRatio === null) return null;
+  const reportedInputTokens = usage.cacheReadInputTokens + usage.cacheMissInputTokens;
   return {
-    inputTokens: usage.inputTokens,
+    inputTokens: reportedInputTokens,
     hitTokens: usage.cacheReadInputTokens,
     missTokens: usage.cacheMissInputTokens,
     hitPercent: usage.cacheHitRatio * 100,

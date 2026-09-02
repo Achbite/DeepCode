@@ -22,17 +22,13 @@ fn catalog_exposes_basic_callable_tools() {
     );
     for name in names {
         let descriptor = registry.descriptor(name).unwrap();
-        if name != "bash" || cfg!(target_os = "macos") {
-            assert_eq!(descriptor.availability, ToolAvailability::Callable);
-        } else {
-            assert_eq!(descriptor.availability, ToolAvailability::Blocked);
-        }
+        assert_eq!(descriptor.availability, ToolAvailability::Callable);
     }
     let bash = registry.descriptor("bash").expect("bash descriptor");
     assert!(registry.descriptor("process.shell").is_none());
     assert_eq!(
         bash.input_schema["required"],
-        json!(["command", "workspaceMode"])
+        json!(["command", "workspaceMode", "executionScope"])
     );
     assert_eq!(
         bash.input_schema["properties"]
@@ -41,7 +37,13 @@ fn catalog_exposes_basic_callable_tools() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        vec!["command", "timeout", "workspaceMode"]
+        vec![
+            "command",
+            "executionScope",
+            "terminal",
+            "timeout",
+            "workspaceMode"
+        ]
     );
 }
 
@@ -73,18 +75,21 @@ fn canonical_arguments_reach_the_executor_boundary() {
     assert_eq!(write.arguments["path"], "src/generated/main.rs");
     assert!(write.arguments.get("executable").is_none());
 
-    #[cfg(target_os = "macos")]
-    {
-        let shell = registry
-            .canonicalize(
-                "bash",
-                json!({"command":"printf ready","workspaceMode":"read"}),
-            )
-            .unwrap();
-        assert_eq!(shell.arguments["command"], "printf ready");
-        assert_eq!(shell.arguments["workspaceMode"], "read");
-        assert_eq!(shell.arguments["timeout"], 120);
-        assert!(shell.arguments.get("cwd").is_none());
-        assert!(shell.arguments.get("maxOutputBytes").is_none());
-    }
+    let shell = registry
+        .canonicalize(
+            "bash",
+            json!({
+                "command":"printf ready",
+                "workspaceMode":"read",
+                "executionScope":"workspace"
+            }),
+        )
+        .unwrap();
+    assert_eq!(shell.arguments["command"], "printf ready");
+    assert_eq!(shell.arguments["workspaceMode"], "read");
+    assert_eq!(shell.arguments["executionScope"], "workspace");
+    assert_eq!(shell.arguments["timeout"], 120);
+    assert!(shell.arguments.get("terminal").is_none());
+    assert!(shell.arguments.get("cwd").is_none());
+    assert!(shell.arguments.get("maxOutputBytes").is_none());
 }

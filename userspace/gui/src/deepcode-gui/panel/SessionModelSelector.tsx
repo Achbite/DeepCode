@@ -284,7 +284,13 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
 
             <div className="deepcode-session-model__cache">
               <div className="deepcode-session-model__cache-head">
-                <strong>{t(language, 'agent.context.inputCache')}</strong>
+                <strong>
+                  {t(language, 'agent.context.inputCache')}
+                  {cache && !cache.complete && ` · ${t(language, 'agent.context.cachePartial', {
+                    reported: cache.reportedCallCount,
+                    calls: cache.providerCallCount,
+                  })}`}
+                </strong>
                 <span>{cache
                   ? `${formatPercent(cache.hitPercent)}%`
                   : t(language, 'common.notAvailable')}</span>
@@ -522,10 +528,14 @@ function cacheAriaLabel(
   cache: InputCacheMetric,
   language: UiLanguage,
 ): string {
-  return t(language, 'agent.context.cacheAria', {
+  return t(language, cache.complete
+    ? 'agent.context.cacheAria'
+    : 'agent.context.cachePartialAria', {
     input: formatTokens(cache.inputTokens, language),
     hit: formatTokens(cache.hitTokens, language),
     miss: formatTokens(cache.missTokens, language),
+    reported: cache.reportedCallCount,
+    calls: cache.providerCallCount,
   });
 }
 

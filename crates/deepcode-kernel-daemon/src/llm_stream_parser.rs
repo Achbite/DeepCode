@@ -537,14 +537,14 @@ fn cache_usage_from_total(
         (Some(read), Some(miss))
             if read
                 .checked_add(miss)
-                .is_some_and(|sum| sum <= input_tokens) =>
+                .is_some_and(|sum| sum == input_tokens) =>
         {
             (read, miss)
         }
         _ => {
             return Err(ProviderStreamError::new(
                 "provider_usage_invalid",
-                "Provider 缓存 token 计数超过输入 token 总量。",
+                "Provider 缓存 token 必须完整划分输入 token 总量。",
             ));
         }
     };
@@ -736,6 +736,20 @@ mod tests {
                 cache_miss_input_tokens: Some(12),
             })
         );
+    }
+
+    #[test]
+    fn provider_cache_fields_must_partition_the_full_input() {
+        assert_eq!(
+            cache_usage_from_total(30, Some(18), None).unwrap(),
+            Some((18, 12))
+        );
+        assert_eq!(
+            cache_usage_from_total(30, None, Some(12)).unwrap(),
+            Some((18, 12))
+        );
+        assert!(cache_usage_from_total(30, Some(18), Some(10)).is_err());
+        assert!(cache_usage_from_total(30, Some(18), Some(14)).is_err());
     }
 
     #[test]

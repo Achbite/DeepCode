@@ -120,7 +120,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
 
 function planOperationDetail(operation: PlanOperation): string {
   if (operation.operation === 'bash') {
-    return `${operation.command} · workspaceMode=${operation.workspaceMode}`;
+    return `${operation.command} · executionScope=${operation.executionScope} · workspaceMode=${operation.workspaceMode}${operation.terminal ? ' · PTY' : ''}`;
   }
   return operation.target;
 }

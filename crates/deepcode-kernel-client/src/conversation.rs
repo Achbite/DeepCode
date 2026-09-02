@@ -300,7 +300,7 @@ impl SessionProjection {
                     .zip(usage.cache_miss_input_tokens)
                     .is_some_and(|(read, miss)| {
                         read.checked_add(miss)
-                            .is_none_or(|sum| sum > usage.input_tokens)
+                            .is_none_or(|sum| sum != usage.input_tokens)
                     })
         }) {
             return Err("shared Session projection has invalid context usage".to_string());
@@ -417,8 +417,12 @@ impl SessionProjection {
                             tool.operation != "bash"
                                 || shell.command.trim().is_empty()
                                 || !is_normalized_logical_path(&shell.cwd)
+                                || !matches!(shell.execution_scope.as_str(), "workspace" | "host")
                                 || shell.result.as_ref().is_some_and(|result| {
                                     !valid_shell_execution_environment(&result.environment)
+                                        || result.environment.execution_scope
+                                            != shell.execution_scope
+                                        || result.environment.terminal != shell.terminal
                                         || result.success
                                             && (result.timed_out || result.exit_code != Some(0))
                                 })
@@ -998,6 +1002,14 @@ pub struct PlanOperation {
     pub target_kind: Option<String>,
     pub command: Option<String>,
     pub workspace_mode: Option<String>,
+    pub execution_scope: Option<String>,
+    pub terminal: Option<PlanTerminalInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanTerminalInput {
+    pub stdin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1243,6 +1255,8 @@ pub struct ToolActivityProjection {
 pub struct ShellActivityProjection {
     pub command: String,
     pub cwd: String,
+    pub execution_scope: String,
+    pub terminal: bool,
     pub result: Option<ShellActivityResultProjection>,
 }
 
@@ -1265,9 +1279,12 @@ pub struct ShellActivityResultProjection {
 pub struct ShellExecutionEnvironmentProjection {
     pub shell: String,
     pub interactive: bool,
+    pub execution_scope: String,
+    pub terminal: bool,
     pub path_source: String,
     pub write_scope: String,
     pub home_writable: bool,
+    pub network_access: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1590,6 +1607,8 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             .is_some_and(|target| !target.is_empty())
                             && operation.command.is_none()
                             && operation.workspace_mode.is_none()
+                            && operation.execution_scope.is_none()
+                            && operation.terminal.is_none()
                     }
                     "fs.write" | "fs.edit" => {
                         operation
@@ -1599,6 +1618,8 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation.target_kind.is_none()
                             && operation.command.is_none()
                             && operation.workspace_mode.is_none()
+                            && operation.execution_scope.is_none()
+                            && operation.terminal.is_none()
                     }
                     "bash" => {
                         operation.target.is_none()
@@ -1608,6 +1629,14 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 .as_deref()
                                 .is_some_and(|command| !command.is_empty())
                             && operation.workspace_mode.as_deref() == Some("write")
+                            && matches!(
+                                operation.execution_scope.as_deref(),
+                                Some("workspace" | "host")
+                            )
+                            && operation
+                                .terminal
+                                .as_ref()
+                                .is_none_or(|terminal| terminal.stdin.len() <= 65_536)
                     }
                     _ => false,
                 }
@@ -1703,13 +1732,20 @@ fn valid_token_usage_fields(
 
 fn valid_shell_execution_environment(environment: &ShellExecutionEnvironmentProjection) -> bool {
     !environment.shell.trim().is_empty()
-        && !environment.interactive
+        && matches!(environment.execution_scope.as_str(), "workspace" | "host")
+        && environment.interactive == environment.terminal
         && environment.path_source == "hostPlusStandardDeveloperPaths"
-        && matches!(
-            environment.write_scope.as_str(),
-            "kernelTemporaryOnly" | "workspaceAndKernelTemporary"
-        )
-        && !environment.home_writable
+        && if environment.execution_scope == "host" {
+            environment.write_scope == "hostUser"
+                && environment.home_writable
+                && environment.network_access
+        } else {
+            matches!(
+                environment.write_scope.as_str(),
+                "kernelTemporaryOnly" | "workspaceAndKernelTemporary"
+            ) && !environment.home_writable
+                && !environment.network_access
+        }
 }
 
 fn is_normalized_logical_path(value: &str) -> bool {
@@ -2021,6 +2057,8 @@ mod tests {
             "shell": {
                 "command": "make build",
                 "cwd": ".",
+                "executionScope": "workspace",
+                "terminal": false,
                 "result": {
                     "stdout": "built\n",
                     "stderr": "",
@@ -2033,9 +2071,12 @@ mod tests {
                     "environment": {
                         "shell": "/bin/sh",
                         "interactive": false,
+                        "executionScope": "workspace",
+                        "terminal": false,
                         "pathSource": "hostPlusStandardDeveloperPaths",
                         "writeScope": "workspaceAndKernelTemporary",
-                        "homeWritable": false
+                        "homeWritable": false,
+                        "networkAccess": false
                     }
                 }
             }
@@ -2057,6 +2098,19 @@ mod tests {
         let read_projection: SessionProjection =
             serde_json::from_value(value.clone()).expect("read shell projection decodes");
         assert_eq!(read_projection.validate(), Ok(()));
+
+        value["activities"][0]["tool"]["shell"]["executionScope"] = json!("host");
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["executionScope"] =
+            json!("host");
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] =
+            json!("hostUser");
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["homeWritable"] =
+            json!(true);
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["networkAccess"] =
+            json!(true);
+        let host_projection: SessionProjection =
+            serde_json::from_value(value.clone()).expect("host shell projection decodes");
+        assert_eq!(host_projection.validate(), Ok(()));
 
         value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] =
             json!("unexpectedScope");

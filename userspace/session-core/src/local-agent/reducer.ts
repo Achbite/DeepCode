@@ -734,7 +734,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           && addTokenCount(
             event.payload.cacheReadInputTokens!,
             event.payload.cacheMissInputTokens!,
-          ) > event.payload.inputTokens
+          ) !== event.payload.inputTokens
       ) {
         throw new Error('provider_usage_cache_invalid');
       }
@@ -1402,10 +1402,14 @@ function projectShellActivity(
   const command = canonicalArguments.command;
   const cwd = '.';
   const workspaceMode = canonicalArguments.workspaceMode;
+  const executionScope = canonicalArguments.executionScope;
+  const terminal = canonicalArguments.terminal !== undefined;
   if (
     typeof command !== 'string'
     || !command.trim()
     || !matchesProcessWorkspaceMode(workspaceMode)
+    || !matchesProcessExecutionScope(executionScope)
+    || terminal && !isCanonicalTerminalInput(canonicalArguments.terminal)
   ) {
     throw new Error('bash_projection_input_invalid');
   }
@@ -1414,13 +1418,15 @@ function projectShellActivity(
     : record.outcome === 'failed'
       ? record.output
       : undefined;
-  if (output === undefined) return { command, cwd };
+  if (output === undefined) return { command, cwd, executionScope, terminal };
   if (!isRecord(output)) throw new Error('bash_projection_output_invalid');
   const {
     command: outputCommand,
     cwd: outputCwd,
     workspaceId: outputWorkspaceId,
     workspaceMode: outputWorkspaceMode,
+    executionScope: outputExecutionScope,
+    terminal: outputTerminal,
     stdout,
     stderr,
     exitCode,
@@ -1435,6 +1441,8 @@ function projectShellActivity(
     || outputCwd !== cwd
     || outputWorkspaceId !== record.preparedEffect.workspaceId
     || outputWorkspaceMode !== workspaceMode
+    || outputExecutionScope !== executionScope
+    || outputTerminal !== terminal
     || typeof stdout !== 'string'
     || typeof stderr !== 'string'
     || !(exitCode === null || typeof exitCode === 'number' && Number.isSafeInteger(exitCode))
@@ -1446,10 +1454,17 @@ function projectShellActivity(
   ) {
     throw new Error('bash_projection_output_invalid');
   }
-  const environment = projectShellEnvironment(output.environment, workspaceMode);
+  const environment = projectShellEnvironment(
+    output.environment,
+    workspaceMode,
+    executionScope,
+    terminal,
+  );
   return {
     command,
     cwd,
+    executionScope,
+    terminal,
     result: {
       stdout,
       stderr,
@@ -1467,34 +1482,65 @@ function projectShellActivity(
 function projectShellEnvironment(
   value: unknown,
   workspaceMode: 'read' | 'write',
+  executionScope: 'workspace' | 'host',
+  terminal: boolean,
 ): ShellExecutionEnvironmentProjection {
   if (!isRecord(value)) throw new Error('bash_projection_environment_invalid');
-  const { shell, interactive, pathSource, writeScope, homeWritable, networkAccess } = value;
+  const {
+    shell,
+    interactive,
+    executionScope: outputExecutionScope,
+    terminal: outputTerminal,
+    pathSource,
+    writeScope,
+    homeWritable,
+    networkAccess,
+  } = value;
   const expectedWriteScope: ShellExecutionEnvironmentProjection['writeScope'] = (
-    workspaceMode === 'read' ? 'kernelTemporaryOnly' : 'workspaceAndKernelTemporary'
+    executionScope === 'host'
+      ? 'hostUser'
+      : workspaceMode === 'read'
+        ? 'kernelTemporaryOnly'
+        : 'workspaceAndKernelTemporary'
   );
   if (
     typeof shell !== 'string'
     || !shell.trim()
-    || interactive !== false
+    || interactive !== terminal
+    || outputExecutionScope !== executionScope
+    || outputTerminal !== terminal
     || pathSource !== 'hostPlusStandardDeveloperPaths'
     || writeScope !== expectedWriteScope
-    || homeWritable !== false
-    || networkAccess !== false
+    || homeWritable !== (executionScope === 'host')
+    || networkAccess !== (executionScope === 'host')
   ) {
     throw new Error('bash_projection_environment_invalid');
   }
   return {
     shell,
     interactive,
+    executionScope,
+    terminal,
     pathSource,
     writeScope: expectedWriteScope,
     homeWritable,
+    networkAccess,
   };
 }
 
 function matchesProcessWorkspaceMode(value: unknown): value is 'read' | 'write' {
   return value === 'read' || value === 'write';
+}
+
+function matchesProcessExecutionScope(value: unknown): value is 'workspace' | 'host' {
+  return value === 'workspace' || value === 'host';
+}
+
+function isCanonicalTerminalInput(value: unknown): value is { stdin: string } {
+  return isRecord(value)
+    && Object.keys(value).length === 1
+    && typeof value.stdin === 'string'
+    && new TextEncoder().encode(value.stdin).byteLength <= 65_536;
 }
 
 function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] {

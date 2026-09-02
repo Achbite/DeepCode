@@ -266,6 +266,7 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
                 input: serde_json::json!({
                     "command": "cd build && printf 'stdout-value' && printf 'generated' > generated.txt",
                     "workspaceMode": "write",
+                    "executionScope": "workspace",
                     "timeout": 5
                 }),
             },
@@ -277,6 +278,8 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
     assert_eq!(result.output["workspaceId"], "workspace:test");
     assert_eq!(result.output["cwd"], ".");
     assert_eq!(result.output["workspaceMode"], "write");
+    assert_eq!(result.output["executionScope"], "workspace");
+    assert_eq!(result.output["terminal"], false);
     assert_eq!(result.output["exitCode"], 0, "{:?}", result.output);
     assert_eq!(result.output["success"], true, "{:?}", result.output);
     assert_eq!(
@@ -286,6 +289,8 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
     );
     assert_eq!(result.output["environment"]["shell"], "/bin/bash");
     assert_eq!(result.output["environment"]["interactive"], false);
+    assert_eq!(result.output["environment"]["executionScope"], "workspace");
+    assert_eq!(result.output["environment"]["terminal"], false);
     assert_eq!(
         result.output["environment"]["pathSource"],
         "hostPlusStandardDeveloperPaths"
@@ -314,6 +319,7 @@ fn bash_cleans_its_owned_temporary_directory() {
                 input: serde_json::json!({
                     "command": "printf '%s' \"$TMPDIR\"; printf temporary > \"$TMPDIR/owned.txt\"",
                     "workspaceMode": "read",
+                    "executionScope": "workspace",
                     "timeout": 5
                 }),
             },
@@ -348,6 +354,7 @@ fn bash_nonzero_exit_is_a_known_failure_with_structured_output() {
                 input: serde_json::json!({
                     "command": "printf 'stdout-value'; printf 'stderr-value' >&2; exit 7",
                     "workspaceMode": "read",
+                    "executionScope": "workspace",
                     "timeout": 5
                 }),
             },
@@ -378,6 +385,7 @@ fn bash_timeout_is_a_known_failure_and_releases_its_temporary_directory() {
                 input: serde_json::json!({
                     "command": "printf '%s' \"$TMPDIR\"; sleep 2",
                     "workspaceMode": "read",
+                    "executionScope": "workspace",
                     "timeout": 1
                 }),
             },
@@ -397,6 +405,74 @@ fn bash_timeout_is_a_known_failure_and_releases_its_temporary_directory() {
         .expect("temporary directory is reported before timeout");
     assert!(temporary.contains("deepcode-agent-shell-"));
     assert!(!Path::new(temporary).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_host_scope_reports_the_host_execution_boundary() {
+    let workspace = TempWorkspace::new("bash-host");
+    let result = ProcessShellExecutor
+        .invoke(
+            KernelToolInvocation {
+                id: "bash-host".to_string(),
+                tool_id: "bash".to_string(),
+                input: serde_json::json!({
+                    "command": "printf 'host-scope'",
+                    "workspaceMode": "read",
+                    "executionScope": "host",
+                    "timeout": 5
+                }),
+            },
+            context_with_target(&workspace.0, "."),
+        )
+        .expect("host Bash executes from the bound workspace");
+
+    assert_eq!(result.outcome, KernelToolExecutionOutcome::Completed);
+    assert_eq!(result.output["stdout"], "host-scope");
+    assert_eq!(result.output["executionScope"], "host");
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["environment"]["interactive"], false);
+    assert_eq!(result.output["environment"]["executionScope"], "host");
+    assert_eq!(result.output["environment"]["terminal"], false);
+    assert_eq!(result.output["environment"]["writeScope"], "hostUser");
+    assert_eq!(result.output["environment"]["homeWritable"], true);
+    assert_eq!(result.output["environment"]["networkAccess"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_terminal_writes_exact_bounded_input_to_one_call_pty() {
+    let workspace = TempWorkspace::new("bash-terminal");
+    let result = ProcessShellExecutor
+        .invoke(
+            KernelToolInvocation {
+                id: "bash-terminal".to_string(),
+                tool_id: "bash".to_string(),
+                input: serde_json::json!({
+                    "command": "IFS= read -r value; if [ -t 0 ]; then tty=yes; else tty=no; fi; printf 'value=%s tty=%s\\n' \"$value\" \"$tty\"",
+                    "workspaceMode": "read",
+                    "executionScope": "host",
+                    "timeout": 5,
+                    "terminal": { "stdin": "ready\n" }
+                }),
+            },
+            context_with_target(&workspace.0, "."),
+        )
+        .expect("one-call PTY accepts exact input and exits");
+
+    assert_eq!(result.outcome, KernelToolExecutionOutcome::Completed);
+    assert_eq!(result.output["executionScope"], "host");
+    assert_eq!(result.output["terminal"], true);
+    assert_eq!(result.output["environment"]["interactive"], true);
+    assert_eq!(result.output["environment"]["terminal"], true);
+    assert!(
+        result.output["stdout"]
+            .as_str()
+            .expect("PTY output")
+            .contains("value=ready tty=yes"),
+        "{:?}",
+        result.output
+    );
 }
 
 #[test]

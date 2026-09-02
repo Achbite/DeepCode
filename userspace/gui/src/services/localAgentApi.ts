@@ -734,9 +734,19 @@ function isPlanOperation(value: unknown): boolean {
     return false;
   }
   if (value.operation === 'bash') {
-    return isExactRecord(value, ['workspaceId', 'operation', 'command', 'workspaceMode'])
+    return isExactRecord(
+      value,
+      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope'],
+      ['terminal'],
+    )
       && isNonEmptyText(value.command)
-      && value.workspaceMode === 'write';
+      && value.workspaceMode === 'write'
+      && (value.executionScope === 'workspace' || value.executionScope === 'host')
+      && (value.terminal === undefined || (
+        isExactRecord(value.terminal, ['stdin'])
+        && typeof value.terminal.stdin === 'string'
+        && new TextEncoder().encode(value.terminal.stdin).byteLength <= 65_536
+      ));
   }
   if (!isNonEmptyText(value.target)) return false;
   if (value.operation === 'fs.delete') {
@@ -817,7 +827,7 @@ function isContextUsage(value: unknown): boolean {
     && (!hasRead || (
       isNaturalNumber(value.cacheReadInputTokens)
       && isNaturalNumber(value.cacheMissInputTokens)
-      && value.cacheReadInputTokens + value.cacheMissInputTokens <= value.inputTokens
+      && value.cacheReadInputTokens + value.cacheMissInputTokens === value.inputTokens
     ));
 }
 
@@ -1095,9 +1105,18 @@ function isShellActivity(value: unknown, activityStatus: string): boolean {
   const resultValid = isRecord(value) && value.result !== undefined
     ? isShellActivityResult(value.result)
     : false;
-  return isExactRecord(value, ['command', 'cwd'], ['result'])
+  const resultMatchesShell = !isRecord(value) || value.result === undefined || (
+    isRecord(value.result)
+    && isRecord(value.result.environment)
+    && value.result.environment.executionScope === value.executionScope
+    && value.result.environment.terminal === value.terminal
+  );
+  return isExactRecord(value, ['command', 'cwd', 'executionScope', 'terminal'], ['result'])
     && isNonEmptyText(value.command)
     && isNonEmptyText(value.cwd)
+    && (value.executionScope === 'workspace' || value.executionScope === 'host')
+    && typeof value.terminal === 'boolean'
+    && resultMatchesShell
     && (activityStatus === 'completed'
       ? resultValid
       : activityStatus === 'failed'

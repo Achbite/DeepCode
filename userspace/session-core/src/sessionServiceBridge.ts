@@ -55,6 +55,8 @@ When workspace mutations require a Plan, publish one complete Plan and wait for 
 
 Treat tool failures as facts. Correct the call or report the blocker; never claim unperformed work as complete.
 
+Use the project's declared build and test entrypoints. If the required environment or execution authority is unavailable, request it or report the blocker; do not substitute another toolchain and describe it as equivalent validation without the user's approval.
+
 Be concise, use Markdown, show file paths clearly, and do not use emojis unless the user requests them or they are necessary for meaning.`,
   }]);
   const runPreparation = new HttpRunPreparationPort({

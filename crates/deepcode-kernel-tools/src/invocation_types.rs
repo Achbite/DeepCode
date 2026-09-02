@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 pub const MAX_CANONICAL_INVOCATION_BYTES: usize = 1024 * 1024;
 const MAX_ORDINARY_STRING_BYTES: usize = 16 * 1024;
+pub const MAX_TERMINAL_STDIN_BYTES: usize = 64 * 1024;
 
 fn empty_field(field: &'static str) -> ToolValidationError {
     ToolValidationError::EmptyField { field }
@@ -59,6 +60,19 @@ pub enum KernelWorkspaceMode {
     Write,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelExecutionScope {
+    Workspace,
+    Host,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelTerminalInput {
+    pub stdin: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KernelTextEdit {
@@ -111,7 +125,9 @@ pub enum KernelCanonicalInvocation {
     ProcessShell {
         command: String,
         workspace_mode: KernelWorkspaceMode,
+        execution_scope: KernelExecutionScope,
         timeout: u32,
+        terminal: Option<KernelTerminalInput>,
     },
     #[serde(rename = "web.search")]
     WebSearch { query: String, limit: u32 },
@@ -179,10 +195,17 @@ impl KernelCanonicalInvocation {
             Self::ProcessShell {
                 command,
                 workspace_mode: _,
+                execution_scope: _,
                 timeout,
+                terminal,
             } => {
                 validate_text("command", command, false)?;
                 validate_u32("timeout", *timeout, 1, 600)?;
+                if let Some(terminal) = terminal {
+                    if terminal.stdin.as_bytes().len() > MAX_TERMINAL_STDIN_BYTES {
+                        return Err(field_too_large("terminal.stdin", MAX_TERMINAL_STDIN_BYTES));
+                    }
+                }
                 if let Some(reason) = process_shell_hard_deny_reason(command) {
                     return Err(invalid_value("command", reason));
                 }
@@ -244,12 +267,21 @@ impl KernelCanonicalInvocation {
             Self::ProcessShell {
                 command,
                 workspace_mode,
+                execution_scope,
                 timeout,
-            } => json!({
-                "command": command,
-                "workspaceMode": workspace_mode,
-                "timeout": timeout,
-            }),
+                terminal,
+            } => {
+                let mut value = json!({
+                    "command": command,
+                    "workspaceMode": workspace_mode,
+                    "executionScope": execution_scope,
+                    "timeout": timeout,
+                });
+                if let Some(terminal) = terminal {
+                    value["terminal"] = json!(terminal);
+                }
+                value
+            }
             Self::WebSearch { query, limit } => json!({ "query": query, "limit": limit }),
             Self::WebFetch { url, max_bytes } => json!({ "url": url, "maxBytes": max_bytes }),
         }

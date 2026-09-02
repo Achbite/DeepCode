@@ -114,7 +114,17 @@ fn adapt_public_arguments(
             ensure_allowed_fields(fields, &["path", "edits"], tool_id)?;
         }
         Tool::ProcessShell => {
-            ensure_allowed_fields(fields, &["command", "workspaceMode", "timeout"], tool_id)?;
+            ensure_allowed_fields(
+                fields,
+                &[
+                    "command",
+                    "workspaceMode",
+                    "executionScope",
+                    "timeout",
+                    "terminal",
+                ],
+                tool_id,
+            )?;
         }
         Tool::WebSearch => {
             ensure_allowed_fields(fields, &["query", "limit"], tool_id)?;

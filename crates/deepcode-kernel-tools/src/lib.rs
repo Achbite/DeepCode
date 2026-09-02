@@ -23,6 +23,7 @@ pub mod kernel_internal {
     pub use crate::invocation_types::{
         process_shell_hard_deny_reason, KernelCanonicalInvocation, KernelDeleteTarget,
         KernelTextEdit, KernelToolKind, KernelWorkspaceMode, MAX_CANONICAL_INVOCATION_BYTES,
+        MAX_TERMINAL_STDIN_BYTES,
     };
     pub use crate::registrations::KernelExecutorBinding;
     pub use crate::types::Platform;
