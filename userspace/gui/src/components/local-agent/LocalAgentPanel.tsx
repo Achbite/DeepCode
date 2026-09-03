@@ -150,11 +150,15 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const providerStreamProgressRef = useRef(new Map<string, number>());
   const transitioningProviderStreamsRef = useRef(new Set<string>());
   const followingLatestRef = useRef(true);
-  const userDetachedFromLatestRef = useRef(false);
   const lastScrollTopRef = useRef(0);
   const lastTouchYRef = useRef<number | null>(null);
-  const suppressScrollEventsUntilRef = useRef(0);
+  const touchScrollActiveRef = useRef(false);
+  const pointerScrollActiveRef = useRef(false);
+  const transientUserScrollRef = useRef(false);
+  const transientUserScrollFrameRef = useRef<number | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
+  const viewportRestoreFrameRef = useRef<number | null>(null);
+  const detachedViewportFrameRef = useRef<number | null>(null);
   const activeSummary = catalog.sessions.find((session) => session.id === sessionId);
   const activeProject = catalog.projects.find((project) => (
     project.id === (activeSummary?.projectId ?? draftProjectId)
@@ -249,10 +253,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     pendingComposerRestoreRef.current = { key, state: copy };
   };
 
-  const setLatestFollowMode = useCallback((following: boolean) => {
+  const applyLatestFollowMode = useCallback((following: boolean) => {
     followingLatestRef.current = following;
-    userDetachedFromLatestRef.current = !following;
     setFollowingLatest(following);
+  }, []);
+
+  const setLatestFollowMode = useCallback((following: boolean) => {
+    applyLatestFollowMode(following);
     const activeSessionId = activeViewRef.current;
     if (activeSessionId && pendingViewportRestoreRef.current !== activeSessionId) {
       sessionViewportsRef.current.set(activeSessionId, {
@@ -260,12 +267,11 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         scrollTop: bodyRef.current?.scrollTop ?? lastScrollTopRef.current,
       });
     }
-  }, []);
+  }, [applyLatestFollowMode]);
 
   const scrollToLatestNow = useCallback((behavior: ScrollBehavior = 'auto') => {
     const body = bodyRef.current;
     if (!body) return;
-    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
     body.scrollTo({ top: body.scrollHeight, behavior });
   }, []);
 
@@ -279,6 +285,19 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       }
     });
   }, [scrollToLatestNow]);
+
+  const markTransientUserScroll = useCallback(() => {
+    transientUserScrollRef.current = true;
+    if (transientUserScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(transientUserScrollFrameRef.current);
+    }
+    transientUserScrollFrameRef.current = window.requestAnimationFrame(() => {
+      transientUserScrollFrameRef.current = window.requestAnimationFrame(() => {
+        transientUserScrollRef.current = false;
+        transientUserScrollFrameRef.current = null;
+      });
+    });
+  }, []);
 
   useEffect(() => {
     if (!sessionId) return undefined;
@@ -372,15 +391,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         scrollFrameRef.current = null;
       }
       pendingViewportRestoreRef.current = sessionId;
-      suppressScrollEventsUntilRef.current = window.performance.now() + 220;
       setPluginPickerOpen(false);
       setAttachmentMenuOpen(false);
       setAttachmentDialogOpen(false);
       activeViewRef.current = sessionId;
       const saved = sessionId ? sessionViewportsRef.current.get(sessionId) : undefined;
-      setLatestFollowMode(saved?.mode !== 'detached');
+      applyLatestFollowMode(saved?.mode !== 'detached');
     }
-  }, [sessionId, setLatestFollowMode]);
+  }, [applyLatestFollowMode, sessionId]);
 
   useLayoutEffect(() => {
     if (!sessionId || !loading || projection !== null) return;
@@ -390,7 +408,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       scrollFrameRef.current = null;
     }
     pendingViewportRestoreRef.current = sessionId;
-    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
   }, [loading, projection, sessionId]);
 
   useLayoutEffect(() => {
@@ -400,22 +417,31 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       || loading
       || projection?.sessionId !== sessionId
     ) return;
-    const body = bodyRef.current;
-    if (!body) return;
-    const saved = sessionViewportsRef.current.get(sessionId);
-    const following = saved?.mode !== 'detached';
-    setLatestFollowMode(following);
-    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
-    if (following) body.scrollTop = body.scrollHeight;
-    else if (saved) body.scrollTop = saved.scrollTop;
-    lastScrollTopRef.current = body.scrollTop;
-    pendingViewportRestoreRef.current = null;
+    if (viewportRestoreFrameRef.current !== null) {
+      window.cancelAnimationFrame(viewportRestoreFrameRef.current);
+    }
+    const targetSessionId = sessionId;
+    viewportRestoreFrameRef.current = window.requestAnimationFrame(() => {
+      viewportRestoreFrameRef.current = null;
+      if (
+        activeViewRef.current !== targetSessionId
+        || pendingViewportRestoreRef.current !== targetSessionId
+      ) return;
+      const body = bodyRef.current;
+      if (!body) return;
+      const saved = sessionViewportsRef.current.get(targetSessionId);
+      const following = saved?.mode !== 'detached';
+      applyLatestFollowMode(following);
+      body.scrollTop = following ? body.scrollHeight : (saved?.scrollTop ?? 0);
+      lastScrollTopRef.current = body.scrollTop;
+      pendingViewportRestoreRef.current = null;
+    });
   }, [
+    applyLatestFollowMode,
     loading,
     presentation.layoutKey,
     projection?.sessionId,
     sessionId,
-    setLatestFollowMode,
     timelineExtentKey,
   ]);
 
@@ -430,16 +456,66 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   ]);
 
   useEffect(() => {
-    if (typeof ResizeObserver === 'undefined' || !transcriptRef.current) return undefined;
+    const body = bodyRef.current;
+    const transcript = transcriptRef.current;
+    if (typeof ResizeObserver === 'undefined' || !body || !transcript) return undefined;
     const observer = new ResizeObserver(() => {
-      if (followingLatestRef.current) scheduleScrollToLatest();
+      if (pendingViewportRestoreRef.current !== null) return;
+      if (followingLatestRef.current) {
+        scheduleScrollToLatest();
+        return;
+      }
+      const activeSessionId = activeViewRef.current;
+      const saved = activeSessionId
+        ? sessionViewportsRef.current.get(activeSessionId)
+        : undefined;
+      const userScrolling = transientUserScrollRef.current
+        || touchScrollActiveRef.current
+        || pointerScrollActiveRef.current;
+      if (!activeSessionId || saved?.mode !== 'detached' || userScrolling) return;
+      if (detachedViewportFrameRef.current !== null) {
+        window.cancelAnimationFrame(detachedViewportFrameRef.current);
+      }
+      detachedViewportFrameRef.current = window.requestAnimationFrame(() => {
+        detachedViewportFrameRef.current = null;
+        const currentBody = bodyRef.current;
+        const currentSaved = sessionViewportsRef.current.get(activeSessionId);
+        if (
+          !currentBody
+          || activeViewRef.current !== activeSessionId
+          || followingLatestRef.current
+          || pendingViewportRestoreRef.current !== null
+          || currentSaved?.mode !== 'detached'
+          || transientUserScrollRef.current
+          || touchScrollActiveRef.current
+          || pointerScrollActiveRef.current
+        ) return;
+        currentBody.scrollTop = currentSaved.scrollTop;
+        lastScrollTopRef.current = currentBody.scrollTop;
+      });
     });
-    observer.observe(transcriptRef.current);
-    return () => observer.disconnect();
-  }, [scheduleScrollToLatest]);
+    observer.observe(transcript);
+    observer.observe(body);
+    return () => {
+      observer.disconnect();
+      if (detachedViewportFrameRef.current !== null) {
+        window.cancelAnimationFrame(detachedViewportFrameRef.current);
+        detachedViewportFrameRef.current = null;
+      }
+    };
+  }, [scheduleScrollToLatest, sessionId]);
 
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+    if (viewportRestoreFrameRef.current !== null) {
+      window.cancelAnimationFrame(viewportRestoreFrameRef.current);
+    }
+    if (detachedViewportFrameRef.current !== null) {
+      window.cancelAnimationFrame(detachedViewportFrameRef.current);
+    }
+    if (transientUserScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(transientUserScrollFrameRef.current);
+    }
     if (compositionGuardFrameRef.current !== null) {
       window.cancelAnimationFrame(compositionGuardFrameRef.current);
     }
@@ -467,6 +543,20 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     document.addEventListener('pointerdown', closeOnOutsidePointer);
     return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
   }, [attachmentMenuOpen, permissionMenuOpen, pluginPickerOpen]);
+
+  useEffect(() => {
+    const finishPointerScroll = () => {
+      if (!pointerScrollActiveRef.current) return;
+      pointerScrollActiveRef.current = false;
+      markTransientUserScroll();
+    };
+    window.addEventListener('pointerup', finishPointerScroll);
+    window.addEventListener('pointercancel', finishPointerScroll);
+    return () => {
+      window.removeEventListener('pointerup', finishPointerScroll);
+      window.removeEventListener('pointercancel', finishPointerScroll);
+    };
+  }, [markTransientUserScroll]);
 
   useEffect(() => {
     if (pendingPlan || pendingInteraction || pendingApproval) {
@@ -889,9 +979,21 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         aria-live="polite"
         onWheel={(event) => {
           if (pendingViewportRestoreRef.current === sessionId) return;
+          markTransientUserScroll();
           if (event.deltaY < 0) setLatestFollowMode(false);
         }}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) pointerScrollActiveRef.current = true;
+        }}
+        onKeyDown={(event) => {
+          const scrollsAway = ['ArrowUp', 'PageUp', 'Home'].includes(event.key);
+          const scrollsTowardLatest = ['ArrowDown', 'PageDown', 'End'].includes(event.key);
+          if (!scrollsAway && !scrollsTowardLatest) return;
+          markTransientUserScroll();
+          if (scrollsAway) setLatestFollowMode(false);
+        }}
         onTouchStart={(event) => {
+          touchScrollActiveRef.current = true;
           lastTouchYRef.current = event.touches[0]?.clientY ?? null;
         }}
         onTouchMove={(event) => {
@@ -903,6 +1005,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           }
         }}
         onTouchEnd={() => {
+          touchScrollActiveRef.current = false;
+          lastTouchYRef.current = null;
+          markTransientUserScroll();
+        }}
+        onTouchCancel={() => {
+          touchScrollActiveRef.current = false;
           lastTouchYRef.current = null;
         }}
         onScroll={(event) => {
@@ -913,20 +1021,21 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           ) return;
           const scrolledUp = body.scrollTop < lastScrollTopRef.current - 2;
           lastScrollTopRef.current = body.scrollTop;
-          if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
+          const userDriven = transientUserScrollRef.current
+            || touchScrollActiveRef.current
+            || pointerScrollActiveRef.current;
+          if (!userDriven) return;
           const distanceFromLatest = body.scrollHeight - body.scrollTop - body.clientHeight;
+          if (scrolledUp && followingLatestRef.current) setLatestFollowMode(false);
+          if (!followingLatestRef.current && distanceFromLatest <= 2) {
+            setLatestFollowMode(true);
+            return;
+          }
           if (sessionId) {
             sessionViewportsRef.current.set(sessionId, {
               mode: followingLatestRef.current ? 'following' : 'detached',
               scrollTop: body.scrollTop,
             });
-          }
-          if (scrolledUp) {
-            setLatestFollowMode(false);
-            return;
-          }
-          if (userDetachedFromLatestRef.current && distanceFromLatest <= 2) {
-            setLatestFollowMode(true);
           }
         }}
       >
@@ -1051,17 +1160,25 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             />
           ))}
           {assistantDraft?.reasoningContent && (
-            <article className="local-agent__reasoning-draft">
-              {!assistantDraft.content && (
-                <div className="local-agent__run-thinking" role="status" aria-live="polite">
+            <details className="local-agent__reasoning-draft">
+              <summary>
+                {!assistantDraft.content && (
                   <span className="local-agent__run-spinner" aria-hidden="true" />
-                  <span>{t(language, 'agent.run.thinking')}</span>
-                </div>
-              )}
+                )}
+                <span role="status" aria-live="polite">
+                  {t(
+                    language,
+                    assistantDraft.content
+                      ? 'agent.reasoning.available'
+                      : 'agent.reasoning.running',
+                  )}
+                </span>
+                <DeepCodeShellIcon name="chevronDown" />
+              </summary>
               <div className="local-agent__reasoning-draft-content">
                 <MarkdownContent>{assistantDraft.reasoningContent}</MarkdownContent>
               </div>
-            </article>
+            </details>
           )}
           {assistantDraft?.content && assistantDraftStreamIdentity && (
             <article className="local-agent__message local-agent__message--assistant local-agent__message--draft">
@@ -1108,7 +1225,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         )}
       </div>
 
-      <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction
+      <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
         ? ' local-agent__composer-shell--decision'
         : ''}`}>
         {error && <div className="local-agent__error">{error}</div>}
@@ -1226,7 +1343,68 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             )}
           </section>
         )}
-        {!pendingPlan && !pendingInteraction && <div
+        {pendingApproval && (
+          <section
+            className="local-agent__decision"
+            aria-labelledby={`approval-${pendingApproval.approvalId}`}
+          >
+            <header className="local-agent__decision-heading">
+              <span className="local-agent__decision-mark" aria-hidden="true">
+                <DeepCodeShellIcon name="tool" />
+              </span>
+              <span className="local-agent__decision-title">
+                <strong id={`approval-${pendingApproval.approvalId}`}>
+                  {t(language, 'agent.approval.question')}
+                </strong>
+                <small>{t(language, 'agent.approval.required')}</small>
+              </span>
+            </header>
+            <pre className="local-agent__decision-command">
+              <code>{pendingApproval.preview.summary}</code>
+            </pre>
+            {(pendingApproval.preview.effects.length > 0
+              || pendingApproval.preview.logicalTargets.length > 0) && (
+              <details className="local-agent__decision-scope">
+                <summary>
+                  <span>{t(language, 'agent.approval.scope')}</span>
+                  <DeepCodeShellIcon name="chevronDown" />
+                </summary>
+                <dl>
+                  {pendingApproval.preview.effects.length > 0 && (
+                    <div>
+                      <dt>{t(language, 'agent.approval.effects')}</dt>
+                      <dd>{pendingApproval.preview.effects.map((effect) => (
+                        <code key={effect}>{effect}</code>
+                      ))}</dd>
+                    </div>
+                  )}
+                  {pendingApproval.preview.logicalTargets.length > 0 && (
+                    <div>
+                      <dt>{t(language, 'agent.approval.targets')}</dt>
+                      <dd>{pendingApproval.preview.logicalTargets.map((target) => (
+                        <code key={target}>{target}</code>
+                      ))}</dd>
+                    </div>
+                  )}
+                </dl>
+              </details>
+            )}
+            <div className="local-agent__decision-actions">
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => void respondApproval('deny')}
+              >{t(language, 'agent.approval.deny')}</button>
+              <button
+                type="button"
+                className="local-agent__button--primary"
+                disabled={submitting}
+                onClick={() => void respondApproval('allow')}
+              >{t(language, 'agent.approval.allow')}</button>
+            </div>
+          </section>
+        )}
+        {!pendingPlan && !pendingInteraction && !pendingApproval && <div
           className="local-agent__composer"
           onMouseDown={(event) => {
             const target = event.target as HTMLElement;
@@ -1289,42 +1467,11 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               </button>
             </div>
           )}
-          {pendingApproval && (
-            <div className="local-agent__decision">
-              <div className="local-agent__decision-heading">
-                <strong>{pendingApproval.preview.summary}</strong>
-                <span>{t(language, 'agent.approval.required')}</span>
-              </div>
-              {pendingApproval.preview.logicalTargets.length > 0 && (
-                <ul className="local-agent__decision-targets">
-                  {pendingApproval.preview.logicalTargets.map((target) => (
-                    <li key={target}>{target}</li>
-                  ))}
-                </ul>
-              )}
-              <div className="local-agent__decision-actions">
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => void respondApproval('deny')}
-                >{t(language, 'agent.approval.deny')}</button>
-                <button
-                  type="button"
-                  className="local-agent__button--primary"
-                  disabled={submitting}
-                  onClick={() => void respondApproval('allow')}
-                >{t(language, 'agent.approval.allow')}</button>
-              </div>
-            </div>
-          )}
           <textarea
             ref={textareaRef}
             value={draft}
-            disabled={Boolean(pendingApproval)}
-            rows={pendingApproval ? 2 : 3}
-            placeholder={pendingApproval
-              ? t(language, 'agent.composer.placeholder.approval')
-              : t(language, 'agent.composer.placeholder.task')}
+            rows={3}
+            placeholder={t(language, 'agent.composer.placeholder.task')}
             onChange={(event) => updateDraft(
               event.target.value,
               event.target.selectionStart ?? event.target.value.length,
@@ -1394,7 +1541,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   title={t(language, 'agent.attachment.menu')}
                   aria-expanded={attachmentMenuOpen}
                   aria-haspopup="menu"
-                  disabled={Boolean(pendingApproval || catalogBusy)}
+                  disabled={catalogBusy}
                   onClick={() => {
                     setAttachmentMenuOpen((open) => !open);
                     setPermissionMenuOpen(false);
@@ -1579,7 +1726,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             </div>
           </div>
         </div>}
-        {!pendingPlan && !pendingInteraction && (
+        {!pendingPlan && !pendingInteraction && !pendingApproval && (
           <div className="local-agent__composer-hint">
             {t(language, 'agent.composer.hint')}
           </div>
